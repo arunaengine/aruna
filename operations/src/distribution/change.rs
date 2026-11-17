@@ -27,8 +27,8 @@ use super::sharding::{range_sample, split_point};
 use super::status::{Reach, node_reach, read_view};
 use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
-use crate::metadata::protocol::AuthToken;
 use crate::placement::process_placements::load_realm_config;
+use aruna_core::metadata::AuthToken;
 
 /// The caller of an admin change: its own token context and, for a remote publisher, the
 /// bearer token forwarded there.
@@ -166,7 +166,7 @@ pub struct SplitPlan {
 
 /// The split of `range_id` at `split_key`, or at the middle of this node's key sample of the
 /// range by object count when no key is given.
-pub async fn plan_split(
+async fn plan_split(
     context: &DriverContext,
     snapshot: &DistributionSnapshot,
     range_id: Ulid,

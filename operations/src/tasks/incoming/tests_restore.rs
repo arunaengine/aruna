@@ -187,8 +187,10 @@ async fn drain_keeps_timer() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     }))
     .await;
 
@@ -217,8 +219,10 @@ async fn outbox_sync_retry() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let record = crate::sync::outbox_record::new_outbox_record(
@@ -266,8 +270,10 @@ async fn retained_outbox_timer() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let record = crate::sync::outbox_record::new_outbox_record(
@@ -318,8 +324,10 @@ async fn tombstones_are_return() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let document_id = Ulid::from_parts(17, 1);
@@ -381,8 +389,10 @@ async fn drain_reconcile_wakes() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -495,8 +505,10 @@ async fn drain_reconcile_summary() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -590,8 +602,10 @@ async fn drain_reconcile_config() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
@@ -670,8 +684,10 @@ async fn placement_storage_rearms() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     let before_ms = unix_timestamp_millis();

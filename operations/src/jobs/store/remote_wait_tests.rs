@@ -56,8 +56,10 @@ async fn wake_until_acknowledged() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     for generation in [1, 2] {
         let register = WaitRowOperation::register(key(generation), waiter(), job(), &auth());

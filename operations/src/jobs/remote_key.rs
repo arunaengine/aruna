@@ -412,8 +412,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let storage = &context.storage_handle;
         let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
@@ -501,8 +503,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([1; 32]);
         let owner = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
@@ -699,8 +703,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 

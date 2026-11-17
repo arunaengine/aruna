@@ -4,14 +4,13 @@
 
 use super::lifecycle::records_for_group;
 use super::search::{GraphVisibilityScope, LifecycleVisibility, record_for_graph};
-use super::search::{
-    HitDescribe, ScopeAuthorizer, describe_hits_parallel, filter_candidate_records,
-    select_visible_records,
-};
+use super::search::{filter_candidate_records, select_visible_records};
 use super::*;
 use aruna_core::auth::bearer_token_hash;
+use aruna_core::events::Event;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::ApplyRoCrateRequest;
+use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::storage_entries::graph_lifecycle_key;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::{RealmNodeKind, TokenRevocation};
@@ -32,6 +31,24 @@ const ROCRATE_13: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/roundtrip-1.3.json"
 ));
+
+/// A context with this storage, metadata handle and graph store and nothing else.
+fn graph_context(
+    storage: StorageHandle,
+    metadata: MetadataHandle,
+    graph: GraphHandle,
+) -> DriverContext {
+    DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    }
+}
 
 mod auth;
 mod effect;

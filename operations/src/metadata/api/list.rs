@@ -11,11 +11,13 @@ use super::{
     LIST_METADATA_SIZE, ListGroupOperation, MetadataApiError, MetadataEventRecord,
     MetadataRegistryRecord, PENDING_PROJECTION_KEYSPACE, REGISTRY_CANDIDATE_LIMIT, RealmId,
     StorageEffect, StorageEvent, drive, ensure_record_materialized, event_log_key,
-    export_summary_jsonld, filter_live_records, iter_registry_effect, metadata_read_request,
-    parse_registry_iter, pending_projection_target, stream,
+    export_summary_jsonld, iter_registry_effect, metadata_read_request, parse_registry_iter,
+    pending_projection_target, stream,
 };
 use aruna_core::handle::Handle;
 use futures_util::StreamExt;
+
+use crate::metadata::live_records::LiveRecordsOperation;
 
 // Bounded so a single summary page cannot saturate the craqle read permits.
 pub(super) const FANOUT_LIMIT: usize = 8;
@@ -187,11 +189,10 @@ pub(super) async fn load_group_records(
     group_id: GroupId,
     limit: usize,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    let records = if let Some(metadata_handle) = context.metadata_handle.as_ref() {
+    let records = if context.metadata_handle.is_some() {
         // Listing remains eventually consistent: the handle-owned visibility
         // cache serves stale snapshots while one refill updates the read path.
-        metadata_handle
-            .list_group_records(group_id, limit)
+        crate::metadata::list_group_records(context, group_id, limit)
             .await
             .map_err(|_| MetadataApiError::ServiceUnavailable)?
             .as_ref()
@@ -217,7 +218,7 @@ pub(super) async fn load_group_records(
         }
         records
     };
-    filter_live_records(&context.storage_handle, &records).await
+    Ok(drive(LiveRecordsOperation::new(records, None), context).await?)
 }
 
 pub(super) async fn load_pending_records(
@@ -249,7 +250,7 @@ pub(super) async fn load_pending_records(
             Event::Storage(StorageEvent::Error { error }) => {
                 return Err(MetadataApiError::Internal(error.to_string()));
             }
-            other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+            other => return Err(MetadataApiError::Internal(other.label().to_string())),
         };
         scanned = scanned.saturating_add(values.len());
         if scanned > limit {
@@ -304,7 +305,7 @@ pub(super) async fn load_pending_records(
         Event::Storage(StorageEvent::Error { error }) => {
             return Err(MetadataApiError::Internal(error.to_string()));
         }
-        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => return Err(MetadataApiError::Internal(other.label().to_string())),
     };
 
     let mut pending = Vec::with_capacity(event_values.len());
@@ -334,7 +335,7 @@ pub(super) async fn load_pending_records(
         return Ok(HashMap::new());
     }
 
-    let pending = filter_live_records(&context.storage_handle, &pending).await?;
+    let pending = drive(LiveRecordsOperation::new(pending, None), context).await?;
     let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
     for (count, record) in pending.into_iter().enumerate() {
         if count >= limit {

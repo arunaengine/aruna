@@ -6,12 +6,13 @@ use std::sync::Arc;
 
 use aruna_core::compute::SecretBytes;
 use aruna_core::errors::StorageError;
+use aruna_core::outbound::SmtpSettings;
 use aruna_core::realm_vault::RealmVaultKey;
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
-use aruna_operations::notifications::email::{SmtpMailer, SmtpSettings, refresh_mail};
+use aruna_operations::notifications::email::{check_smtp, refresh_mail};
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_email::{
     EmailInput, SetEmailConfig, SetEmailError, SetEmailOperation,
@@ -226,7 +227,7 @@ pub async fn set_email_profile(
         password: None,
         from: request.from.trim().to_string(),
     };
-    SmtpMailer::new(&settings).map_err(ServerError::BadRequestReason)?;
+    check_smtp(&settings).map_err(ServerError::BadRequestReason)?;
     let input = EmailInput {
         host: settings.host,
         port: request.port,
@@ -304,8 +305,7 @@ async fn change_profile(
     )
     .await
     .map_err(map_email_error)?;
-    let mail = state.jobs_runtime().mail();
-    refresh_mail(&state.get_ctx(), state.get_realm_id(), Some(&mail)).await;
+    refresh_mail(&state.get_ctx(), state.get_realm_id()).await;
     Ok(stored)
 }
 

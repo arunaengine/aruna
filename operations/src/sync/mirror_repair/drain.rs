@@ -29,12 +29,12 @@ use super::{
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::AuthToken;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, RemoveOutgoingOperation, StoreRelationshipOperation,
     SyncRelationshipDirection,
 };
+use aruna_core::metadata::AuthToken;
 
 /// Forwards a user-authorized sync mirror creation request to the target
 /// node so routes never orchestrate metadata effects directly.

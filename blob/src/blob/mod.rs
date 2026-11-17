@@ -107,6 +107,8 @@ pub struct BlobHandler {
     spool_files: Arc<Semaphore>,
     /// Disk budget of local spools in MiB permits.
     spool_budget: Arc<Semaphore>,
+    /// Node-local Git repositories, installed once by the node that serves Git.
+    git: Arc<std::sync::OnceLock<Arc<crate::git::GitStore>>>,
 }
 
 #[derive(Clone, Debug)]

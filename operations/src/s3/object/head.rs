@@ -905,8 +905,10 @@ mod tests {
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let location = location_with_hash();
@@ -1019,8 +1021,10 @@ mod tests {
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let location = location_with_hash();
@@ -1217,8 +1221,10 @@ mod tests {
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let version_id = Ulid::generate();

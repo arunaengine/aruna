@@ -37,6 +37,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_graph::GraphHandle;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
@@ -294,27 +295,31 @@ async fn build_node(
         net.clone(),
     )
     .await?;
-    let metadata = if with_metadata {
+    let (metadata, graph) = if with_metadata {
         let metadata_path = root.path().join("metadata");
         std::fs::create_dir_all(&metadata_path)?;
-        Some(MetadataHandle::new(
+        let graph = GraphHandle::open(
             &metadata_path,
             net.node_id(),
-            storage.clone(),
             None,
             None,
-            None,
-        )?)
+            Default::default(),
+        )?;
+        let metadata =
+            MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
+        (Some(metadata), Some(graph))
     } else {
-        None
+        (None, None)
     };
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
         metadata_handle: metadata,
+        graph_handle: graph,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(Node {
         _root: root,
@@ -608,7 +613,6 @@ async fn claim_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        mail: Default::default(),
     })
 }
 

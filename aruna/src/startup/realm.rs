@@ -388,8 +388,10 @@ mod tests {
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();

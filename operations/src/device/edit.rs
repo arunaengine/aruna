@@ -25,7 +25,8 @@ use ulid::Ulid;
 
 use crate::device::enqueue_draft::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
 use crate::device::publish_queue::{PublishEntry, PublishKind, PublishState};
-use crate::device::replica::{ReplicaRecord, mark_edited, store_replica};
+use crate::device::replica::{ReplicaRecord, mark_edited};
+use crate::device::replica_store::store_replica;
 use crate::device::sync_status::read_publish_entries;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::update_document::UpdateDocumentMutation;
@@ -61,7 +62,7 @@ pub async fn apply_local_edit(
     let authored = authored_source(mutation).ok_or_else(|| {
         DeviceEditError::Invalid("this mutation is not authored on a device".to_string())
     })?;
-    let _guard = crate::metadata::update_document::document_lock(record.document_id).await;
+    let _guard = crate::metadata::update_entry::document_lock(record.document_id).await;
     let current = read_actor(context, record.document_id).await?;
     let mut draft_id = Ulid::generate();
     if let Some(current) = &current
@@ -133,7 +134,7 @@ pub(super) async fn reject_edit(
     document_id: Ulid,
     dot: ([u8; 32], u64),
 ) -> bool {
-    let _guard = crate::metadata::update_document::document_lock(document_id).await;
+    let _guard = crate::metadata::update_entry::document_lock(document_id).await;
     let Ok(Some(mut current)) = read_actor(context, document_id).await else {
         return false;
     };
@@ -202,12 +203,15 @@ async fn plan_local(
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
     match metadata
-        .send_metadata_effect(MetadataEffect::PlanBatch {
-            graph_iri: record.graph_iri.clone(),
-            actor,
-            counter,
-            source: authored.clone(),
-        })
+        .run_effect(
+            context,
+            MetadataEffect::PlanBatch {
+                graph_iri: record.graph_iri.clone(),
+                actor,
+                counter,
+                source: authored.clone(),
+            },
+        )
         .await
     {
         Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => Ok(batch),
@@ -236,10 +240,13 @@ async fn merge_local(
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
     match metadata
-        .send_metadata_effect(MetadataEffect::MergeBatch {
-            graph_iri: batch.graph_iri.clone(),
-            batch: batch.clone(),
-        })
+        .run_effect(
+            context,
+            MetadataEffect::MergeBatch {
+                graph_iri: batch.graph_iri.clone(),
+                batch: batch.clone(),
+            },
+        )
         .await
     {
         Event::Metadata(MetadataEvent::BatchMerged { .. }) => Ok(()),
@@ -256,13 +263,16 @@ async fn render(context: &Arc<DriverContext>, graph_iri: &str) -> Result<String,
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    metadata
-        .export_rocrate_jsonld(graph_iri.to_string())
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "Could not render an edited replica");
-            DeviceEditError::Unavailable
-        })
+    let export = MetadataEffect::ExportRoCrate {
+        graph_iri: graph_iri.to_string(),
+    };
+    match metadata.run_effect(context, export).await {
+        Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => Ok(jsonld),
+        other => {
+            warn!(event = ?other, "Could not render an edited replica");
+            Err(DeviceEditError::Unavailable)
+        }
+    }
 }
 
 /// Wakes the publish drain so a reachable realm sees the edit at once.
@@ -281,10 +291,10 @@ async fn arm_drain(context: &Arc<DriverContext>) {
 /// Asks the metadata backend to make what it just wrote durable. Best effort:
 /// a failure leaves exactly the queued work the replay covers.
 async fn request_persist(context: &Arc<DriverContext>) {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
+    let Some(graph) = context.graph_handle.as_ref() else {
         return;
     };
-    if let Err(error) = metadata.flush_persistence().await {
+    if let Err(error) = graph.flush_persistence().await {
         warn!(error = %error, "Could not persist an offline edit's graph");
     }
 }
@@ -292,7 +302,7 @@ async fn request_persist(context: &Arc<DriverContext>) {
 /// Whether one queued entry's batch must be re-merged after a restart: only an
 /// edit still on its way to the realm, which nothing else restores. A published
 /// entry returns by refresh; a parked one is not this device's state.
-pub fn replays_edit(entry: &PublishEntry) -> bool {
+fn replays_edit(entry: &PublishEntry) -> bool {
     matches!(entry.kind, PublishKind::Edit { .. })
         && matches!(
             entry.state,
@@ -316,10 +326,13 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
             continue;
         }
         match metadata
-            .send_metadata_effect(MetadataEffect::MergeBatch {
-                graph_iri: batch.graph_iri.clone(),
-                batch: (**batch).clone(),
-            })
+            .run_effect(
+                context,
+                MetadataEffect::MergeBatch {
+                    graph_iri: batch.graph_iri.clone(),
+                    batch: (**batch).clone(),
+                },
+            )
             .await
         {
             Event::Metadata(MetadataEvent::BatchMerged { applied, .. }) => {
@@ -350,7 +363,8 @@ mod tests {
     };
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::driver::DriverContext;
-    use crate::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+    use crate::metadata::MetadataHandle;
+    use crate::tests::device::record;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -359,7 +373,6 @@ mod tests {
         MetadataGraphPolicy, MetadataRequestDurability,
     };
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use craqle::VectorClock;
     use std::sync::Arc;
@@ -367,25 +380,6 @@ mod tests {
 
     fn node(seed: u8) -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn record() -> MetadataRegistryRecord {
-        let document_id = Ulid::from_bytes([2u8; 16]);
-        MetadataRegistryRecord {
-            realm_id: RealmId::from_bytes([3u8; 32]),
-            group_id: Ulid::from_bytes([1u8; 16]),
-            document_id,
-            document_path: "notes".to_string(),
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-            public: false,
-            permission_path: "/notes".to_string(),
-            placement: PlacementRef::NIL,
-            holder_node_ids: Vec::new(),
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            establishing_event_id: Ulid::from_bytes([4u8; 16]),
-            last_event_id: Ulid::from_bytes([5u8; 16]),
-        }
     }
 
     fn edit(state: PublishState) -> PublishEntry {
@@ -420,23 +414,30 @@ mod tests {
             dir.path().join("storage").to_str().expect("storage path"),
         )
         .unwrap();
-        let metadata = MetadataHandle::new_with_options(
+        let graph = aruna_graph::GraphHandle::open(
             dir.path().join("metadata"),
             node(1),
-            storage.clone(),
             None,
             None,
-            None,
-            MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+            aruna_graph::GraphOptions::default()
+                .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
         )
         .unwrap();
+        let metadata = MetadataHandle::new(
+            dir.path().join("metadata"),
+            storage.clone(),
+            None,
+            Default::default(),
+        );
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata),
+            graph_handle: Some(graph),
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let record = record();
         assert!(matches!(
@@ -444,21 +445,24 @@ mod tests {
                 .metadata_handle
                 .as_ref()
                 .unwrap()
-                .send_metadata_effect(MetadataEffect::CreateCrate {
-                    request: MetadataCrateRequest {
-                        graph_iri: record.graph_iri.clone(),
-                        name: "Notes".to_string(),
-                        description: "Offline notes".to_string(),
-                        date_published: "2026-08-29".to_string(),
-                        license: None,
-                        policy: MetadataGraphPolicy {
-                            public: false,
-                            permission_paths: vec![record.permission_path.clone()],
+                .run_effect(
+                    &context,
+                    MetadataEffect::CreateCrate {
+                        request: MetadataCrateRequest {
+                            graph_iri: record.graph_iri.clone(),
+                            name: "Notes".to_string(),
+                            description: "Offline notes".to_string(),
+                            date_published: "2026-08-29".to_string(),
+                            license: None,
+                            policy: MetadataGraphPolicy {
+                                public: false,
+                                permission_paths: vec![record.permission_path.clone()],
+                            },
+                            durability: MetadataRequestDurability::Durable,
+                            deterministic_actor: Some([1u8; 32]),
                         },
-                        durability: MetadataRequestDurability::Durable,
-                        deterministic_actor: Some([1u8; 32]),
-                    },
-                })
+                    }
+                )
                 .await,
             Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         ));
@@ -503,7 +507,7 @@ mod tests {
     // fails, while a plain edit of the same read copy still queues.
     #[tokio::test]
     async fn forwards_visibility_change() {
-        use crate::metadata::forward::route_metadata_update;
+        use crate::metadata::forward::write::route_metadata_update;
         use aruna_core::document::DocumentTarget;
         use aruna_core::structs::identity::auth::Actor;
         use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -532,7 +536,7 @@ mod tests {
         let mut read = replica(&record);
         read.selected = false;
         read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
-        assert!(crate::device::replica::store_replica(&context, &read).await);
+        assert!(crate::device::replica_store::store_replica(&context, &read).await);
         let update = |public: Option<bool>| {
             route_metadata_update(
                 &context,
@@ -639,11 +643,7 @@ mod tests {
             ReplicaOrigin::Realm,
         );
         replica.record = Some(Box::new(record.clone()));
-        let metadata = context.metadata_handle.as_ref().unwrap();
-        let before = metadata
-            .export_rocrate_jsonld(record.graph_iri.clone())
-            .await
-            .unwrap();
+        let before = super::render(&context, &record.graph_iri).await.unwrap();
 
         assert_eq!(
             apply_local_edit(
@@ -664,10 +664,7 @@ mod tests {
         // The refused edit must not consume a dot either.
         assert_eq!(read_actor(&context, record.document_id).await, Ok(None));
         assert_eq!(
-            metadata
-                .export_rocrate_jsonld(record.graph_iri.clone())
-                .await
-                .unwrap(),
+            super::render(&context, &record.graph_iri).await.unwrap(),
             before
         );
     }

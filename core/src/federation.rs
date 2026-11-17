@@ -18,6 +18,9 @@ pub const DESCRIPTOR_DOMAIN: &str = "aruna-realm-descriptor-v1";
 pub const REGISTRATION_DOMAIN: &str = "aruna-registry-registration-v1";
 pub const WITHDRAWAL_DOMAIN: &str = "aruna-registry-withdrawal-v1";
 pub const TOTALS_DOMAIN: &str = "aruna-registry-totals-v1";
+/// Delay of the first registry publication after a settings change, so renames reach the
+/// registry at once.
+pub const PUBLISH_SOON: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Longest realm name a descriptor carries.
 pub const MAX_NAME_LEN: usize = 128;

@@ -1142,8 +1142,10 @@ mod tests {
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let actor = Actor {
             node_id: fixture.node_id,

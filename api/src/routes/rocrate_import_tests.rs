@@ -485,8 +485,10 @@ async fn plain_state(limits: RoCrateLimits) -> (TempDir, Arc<ServerState>, UserI
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = Arc::new(
         ServerState::new(
@@ -573,8 +575,10 @@ async fn blob_state(limits: RoCrateLimits) -> (TempDir, TempDir, Arc<ServerState
         net_handle: Some(net),
         blob_handle: Some(blob),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = Arc::new(
         ServerState::new(

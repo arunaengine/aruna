@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use aruna_operations::driver::drive;
+use aruna_operations::staging::bucket_guard::BucketGuardOperation;
+use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -85,12 +87,16 @@ pub async fn write_text_object(
             request.text.len()
         )));
     }
-    guard_bucket_write(state.get_ctx().as_ref(), &bucket)
-        .await
-        .map_err(|error| match error {
-            OfferedDirectoryError::ReadOnly(_) => ServerError::Forbidden,
-            error => ServerError::InternalError(error.into()),
-        })?;
+    drive(
+        BucketGuardOperation::new(bucket.as_str()),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(OfferedDirectoryError::from)
+    .map_err(|error| match error {
+        OfferedDirectoryError::ReadOnly(_) => ServerError::Forbidden,
+        error => ServerError::InternalError(error.into()),
+    })?;
     let info = bucket_info(&state, &bucket).await?;
     let path = object_permission_path(
         state.get_realm_id(),

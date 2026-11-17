@@ -13,8 +13,8 @@ use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
-pub const UNREAD_COUNT_CAP: usize = 100;
-pub const SCAN_MAX_ROWS: usize = 2_000;
+pub(crate) const UNREAD_COUNT_CAP: usize = 100;
+pub(crate) const SCAN_MAX_ROWS: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnreadCountInput {

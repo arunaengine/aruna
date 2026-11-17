@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
+use aruna_core::structs::storage::blob::CurrentVersionPointer;
 
 use super::super::preflight::{
     assemble_preflight_execution, index_state, plan_preflight_request, resolve_all_preflight,
@@ -44,8 +46,10 @@ async fn preflight_fanout_reports() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let local = iroh::SecretKey::from_bytes(&[61u8; 32]).public();
     let healthy = iroh::SecretKey::from_bytes(&[62u8; 32]).public();

@@ -406,8 +406,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         // The submitter may read the source, except the manifest's own path.
         let mut spec = spec();
@@ -424,7 +426,6 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
-            mail: Default::default(),
         };
         let mut checkpoint = checkpoint();
         // Digests an earlier chunk stored, and one of another folder's manifest.

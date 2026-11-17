@@ -68,15 +68,16 @@ use crate::blob::managed_copy::{
 };
 use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolvePathsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::metadata::AuthToken;
-use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use crate::metadata::forward::export_rocrate_routed;
+use crate::metadata::forward::read::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::jobs::WaitTarget;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::AuthContext;
 
 pub(crate) mod archive;
@@ -710,7 +711,6 @@ pub(crate) async fn unheld_bucket(
             &aruna_core::structs::execution::job::JobProgress::new("entries"),
         ),
         range_turns: Default::default(),
-        mail: Default::default(),
     };
     resolve_entries(
         &ctx,
@@ -1836,7 +1836,7 @@ async fn probe_sources_checked(
         }
         // No copy opened and one of them needs a bucket key the caller lacks.
         if let Some(bucket) = unheld {
-            let refused = crate::federation::export::GrantError::NotHolder(bucket);
+            let refused = aruna_core::transfer::GrantError::NotHolder(bucket);
             return Err(ExportFailure::Permanent(refused.to_string()));
         }
 

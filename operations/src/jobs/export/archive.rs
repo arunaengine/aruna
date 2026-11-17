@@ -689,12 +689,7 @@ fn property_key(
         .unwrap_or_else(|| safe_term(keywords, compact, values, absolute))
 }
 
-fn safe_term(
-    keywords: &JsonLdKeywords,
-    compact: &str,
-    values: &[&str],
-    absolute: &str,
-) -> String {
+fn safe_term(keywords: &JsonLdKeywords, compact: &str, values: &[&str], absolute: &str) -> String {
     if keywords.term_matches(compact, values) {
         compact.to_string()
     } else {
@@ -1108,7 +1103,7 @@ pub(crate) struct ExportFacts {
     pub(crate) revision: Ulid,
     pub(crate) dataset_digest: [u8; 32],
     pub(crate) versions: Vec<aruna_core::transfer::SelectedVersion>,
-    pub(crate) sources: Vec<crate::federation::export::PinnedSource>,
+    pub(crate) sources: Vec<aruna_core::transfer::PinnedSource>,
     pub(crate) artifact: ArtifactRef,
 }
 
@@ -1141,7 +1136,7 @@ impl ExportCheckpoint {
                     return None;
                 };
                 (candidate.resolved_version == Some(version_id)).then(|| {
-                    crate::federation::export::PinnedSource {
+                    aruna_core::transfer::PinnedSource {
                         bucket: bucket.clone(),
                         key: key.clone(),
                         path: permission_path.clone(),
@@ -1338,17 +1333,7 @@ pub(crate) async fn persist_checkpoint<T: Serialize>(
 pub(super) fn map_crate_error(error: craqle::RoCrateError) -> ExportFailure {
     match error {
         craqle::RoCrateError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
-            ExportFailure::Validation(
-                violations
-                    .into_iter()
-                    .map(|violation| MetadataValidationViolation {
-                        code: violation.code.to_string(),
-                        message: violation.message,
-                        pointer: violation.pointer,
-                        entity_id: violation.entity_id,
-                    })
-                    .collect(),
-            )
+            ExportFailure::Validation(violations.into_iter().map(Into::into).collect())
         }
         error => ExportFailure::Permanent(error.to_string()),
     }

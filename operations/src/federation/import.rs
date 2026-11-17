@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome, StaleUpload};
 use crate::jobs::import::upload_store::load_rocrate_upload;
 use crate::jobs::key_wake::read_row;
@@ -36,7 +36,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::execution::job::dedup_index_key;
 use aruna_core::structs::execution::job::upload_stale;
 
-pub const IMPORT_OPERATION: &str = "federation.import";
+const IMPORT_OPERATION: &str = "federation.import";
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ImportError {
@@ -110,7 +110,7 @@ fn answer_error(status: reqwest::StatusCode) -> ImportError {
 
 /// Before a bound import starts or resumes: a confirmation the source gave since the last start
 /// (a pull or a push), or else a fresh confirmation of the grant by the source now.
-pub async fn confirm_source(
+pub(crate) async fn confirm_source(
     context: &DriverContext,
     spec: &ImportRoCrateSpec,
     timeout: std::time::Duration,
@@ -124,7 +124,8 @@ pub async fn confirm_source(
     let change = RecordChange::ConsumeConfirmation {
         record_key: record_key(*upload_id),
     };
-    match drive(RecordOperation::new(change), context).await {
+    let consume = || RecordOperation::new(change.clone());
+    match drive_retry(consume, context, change.key()).await {
         Ok(RecordOutcome::Confirmed(true)) => Ok(()),
         Ok(_) => source_request(context, reqwest::Method::HEAD, &record.grant, timeout)
             .await
@@ -217,7 +218,8 @@ pub async fn write_import(
 
 /// Runs one binding change and returns the upload bound to the import key afterwards.
 async fn drive_binding(context: &DriverContext, change: RecordChange) -> Result<Ulid, ImportError> {
-    match drive(RecordOperation::new(change), context).await {
+    let bind = || RecordOperation::new(change.clone());
+    match drive_retry(bind, context, change.key()).await {
         Ok(RecordOutcome::Bound(bound)) => Ok(bound),
         Ok(other) => Err(ImportError::Storage(format!(
             "unexpected outcome {other:?}"
@@ -367,7 +369,7 @@ fn bound(spec: &ImportRoCrateSpec, intent: &ImportIntent) -> bool {
 
 /// Rechecks an import of another realm's artifact at every step; other imports pass. An expired
 /// intent or grant, or a superseded descriptor, pauses the job until a fresh consent rebinds it.
-pub async fn recheck_import(
+pub(crate) async fn recheck_import(
     context: &DriverContext,
     spec: &ImportRoCrateSpec,
     node_id: NodeId,
@@ -437,8 +439,10 @@ pub(crate) mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         (dir, context)
     }

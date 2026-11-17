@@ -26,6 +26,7 @@ use crate::jobs::records::audit::{AuditPage, AuditScope, FamilyAuditConfig, Fami
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::route::JobRouteError;
 use crate::storage_read::iter_prefix_page;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
 
@@ -138,9 +139,9 @@ pub async fn family_report(
         if output_endpoints.contains_key(&output.node_id) {
             continue;
         }
-        if let Ok(Some(document)) =
-            crate::node::node_info::read_info_document(&context.storage_handle, output.node_id)
-                .await
+        let read = drive(ReadInfoOperation::new(vec![output.node_id]), context).await;
+        if let Ok(mut documents) = read
+            && let Some(document) = documents.remove(&output.node_id)
             && let Some(endpoint) = document.urls.s3
         {
             output_endpoints.insert(output.node_id, endpoint);
@@ -466,9 +467,9 @@ pub async fn audit_endpoints(
             if endpoints.contains_key(&object.node_id) {
                 continue;
             }
-            if let Ok(Some(document)) =
-                crate::node::node_info::read_info_document(&context.storage_handle, object.node_id)
-                    .await
+            let read = drive(ReadInfoOperation::new(vec![object.node_id]), context).await;
+            if let Ok(mut documents) = read
+                && let Some(document) = documents.remove(&object.node_id)
                 && let Some(endpoint) = document.urls.s3
             {
                 endpoints.insert(object.node_id, endpoint);

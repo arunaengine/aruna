@@ -17,9 +17,10 @@ use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_operations::device::replica::{
-    ReplicaOrigin, ReplicaRecord, cache_budget, cache_usage, list_replicas,
+    ReplicaOrigin, ReplicaRecord, SelectionError, cache_budget,
 };
-use aruna_operations::device::selection::{SelectionError, deselect_document, select_document};
+use aruna_operations::device::replica_store::{cache_usage, list_replicas};
+use aruna_operations::device::selection::{deselect_document, select_document};
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()

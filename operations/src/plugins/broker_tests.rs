@@ -8,10 +8,12 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::metadata::MetadataHandle;
-use crate::metadata::api::{DocumentQueryRequest, query_metadata_document};
+use crate::metadata::api::read::query_metadata_document;
+use crate::metadata::api::read_types::DocumentQueryRequest;
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
+use crate::metadata::create_entry::create_metadata_document;
 use crate::metadata::materialization_queue::process_materialization_batch;
 use crate::metadata::projector::drain_projection_queue;
 use crate::plugins::dataset::merge_into;
@@ -41,15 +43,21 @@ async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
     let installed = fixture.install(&request).await.unwrap();
     let mut ctx = fixture.ctx.clone();
     let dir = tempfile::tempdir().unwrap();
-    let metadata = MetadataHandle::new(
+    let graph = aruna_graph::GraphHandle::open(
         dir.path().join("meta"),
         fixture.actor.node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    );
+    let metadata = MetadataHandle::new(
+        dir.path().join("meta"),
         fixture.ctx.storage_handle.clone(),
         None,
-        None,
-        None,
+        Default::default(),
     );
-    ctx.metadata_handle = Some(metadata.unwrap());
+    ctx.metadata_handle = Some(metadata);
+    ctx.graph_handle = Some(graph.unwrap());
     let ctx = Arc::new(ctx);
     let create = CreateDocumentOperation::new(CreateDocumentConfig {
         actor: fixture.actor.clone(),
@@ -1023,8 +1031,8 @@ async fn object_references() {
 async fn superseded_merge_journaled() {
     // A merge older than the materialized status whose change is not applied yet is still
     // journaled as an update once; the sender holds it until its own dot is applied.
-    use crate::metadata::get_document::load_document_record;
     use crate::metadata::projector::project_create_event;
+    use crate::metadata::record_reads::load_document_record;
     use aruna_core::events::Event;
     use aruna_core::metadata::{
         MetadataBatchSource, MetadataEffect, MetadataEvent, MetadataEventPayload,
@@ -1047,15 +1055,16 @@ async fn superseded_merge_journaled() {
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./d.txt","@type":"File","name":"d"}"#.to_string(),
     };
-    let handle = broker.ctx.metadata_handle.as_ref().unwrap();
-    let planned = handle
-        .send_metadata_effect(MetadataEffect::PlanBatch {
+    let planned = crate::metadata::send_metadata_effect(
+        &broker.ctx,
+        MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
             actor: [9u8; 32],
             counter: 1,
             source: source.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) = planned else {
         panic!("expected a planned batch, got {planned:?}");
     };
@@ -1402,7 +1411,7 @@ async fn removal_keeps_rest() {
     // descriptor and other entities are refused, and the other files stay.
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
-    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
     let record = record.unwrap().unwrap();
     let remove = |id: &str, revision| {
         let mutation = UpdateDocumentMutation::RemoveDataEntity { id: id.to_string() };
@@ -1505,7 +1514,7 @@ async fn pending_graph_refused() {
         .metadata_remove_file(&cx(), removal(document, "./a.txt", &pending, 1))
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Unavailable);
-    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
     let record = record.unwrap().unwrap();
     let remove = || {
         let mutation = UpdateDocumentMutation::RemoveDataEntity {
@@ -1549,12 +1558,11 @@ async fn unprojected_event_refused() {
     use aruna_core::storage_entries::{event_log_key, pending_projection_key};
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
-    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
     let record = record.unwrap().unwrap();
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./a.txt","@type":"File","name":"older"}"#.to_string(),
     };
-    let handle = broker.ctx.metadata_handle.as_ref().unwrap();
     let plan = MetadataEffect::PlanBatch {
         graph_iri: record.graph_iri.clone(),
         actor: [9u8; 32],
@@ -1562,7 +1570,7 @@ async fn unprojected_event_refused() {
         source: source.clone(),
     };
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) =
-        handle.send_metadata_effect(plan).await
+        crate::metadata::send_metadata_effect(&broker.ctx, plan).await
     else {
         panic!("expected a planned batch");
     };

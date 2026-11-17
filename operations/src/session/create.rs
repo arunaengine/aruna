@@ -798,8 +798,10 @@ mod pure_tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(aruna_tasks::TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let config = session_config();
         let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();

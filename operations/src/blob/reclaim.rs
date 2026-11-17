@@ -26,8 +26,8 @@ use ulid::Ulid;
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::records::{blob_location_read, iter_index_effect, owners_scan_effect};
-use crate::blob::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::groups::backends::{RecordReadError, backend_key, parse_read};
+use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 
 /// What one candidate resolved to. `Dropped` covers every reason the queue row
 /// is stale: retain, a vanished backend, or a location that is already gone.
@@ -606,8 +606,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 

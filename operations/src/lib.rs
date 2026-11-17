@@ -34,6 +34,7 @@ pub mod placement;
 pub mod plugins;
 pub mod realm;
 pub mod realm_vault;
+pub mod recorder;
 pub mod replication;
 pub mod s3;
 pub mod secrets;
@@ -46,6 +47,7 @@ pub mod sync;
 pub mod tasks;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
+pub mod triggers;
 pub mod users;
 
 #[cfg(test)]

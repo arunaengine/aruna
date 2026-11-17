@@ -14,7 +14,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use lru::LruCache;
 
-use super::api::MetadataFanoutStats;
+use super::api::fanout_types::MetadataFanoutStats;
 
 /// Backstop staleness of a cached result. Matches the visibility cache TTL so
 /// a query never promises fresher data than the listing path does.

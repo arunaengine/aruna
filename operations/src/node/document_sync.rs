@@ -90,7 +90,7 @@ pub(crate) async fn run_maintenance(context: &DriverContext, source: &'static st
     let Some(metadata_handle) = context.metadata_handle.as_ref() else {
         return;
     };
-    if let Err(error) = metadata_handle.reconcile_document_sync().await {
+    if let Err(error) = metadata_handle.reconcile_document_sync(context).await {
         warn!(
             source,
             attempt,
@@ -98,7 +98,7 @@ pub(crate) async fn run_maintenance(context: &DriverContext, source: &'static st
             "Metadata document sync reconciliation failed"
         );
     }
-    match metadata_handle.prune_deleted_graphs().await {
+    match metadata_handle.prune_deleted_graphs(context).await {
         Ok(pruned) if pruned > 0 => {
             debug!(source, attempt, pruned, "Metadata graph prune completed")
         }
@@ -151,8 +151,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let result = DocumentReconcileResult {
             targets: vec![DocumentTarget::MetadataCreateEvent {

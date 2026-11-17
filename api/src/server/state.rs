@@ -21,7 +21,6 @@ use aruna_operations::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
     realm_token_revoked, realm_user_cutoff,
 };
-use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation, StateError};
@@ -32,6 +31,7 @@ use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
 use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_tasks::wipe::DeviceWipe;
 use aruna_wire::address::client_host_url;
 use aruna_wire::info::PortalStatus;
 use async_trait::async_trait;
@@ -560,7 +560,7 @@ impl ServerState {
     }
 
     pub async fn load_realm_nodes(&self) -> Vec<NodeId> {
-        aruna_operations::metadata::api::load_realm_nodes(
+        aruna_operations::metadata::api::preflight::load_realm_nodes(
             self.driver_ctx.as_ref(),
             self.identity.realm_id,
             self.identity.node_id,

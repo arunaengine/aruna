@@ -48,7 +48,7 @@ use crate::blob::managed_copy::{
 };
 use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
-use crate::distribution::pull::{HeldElsewhere, kept_location, kept_reads};
+use crate::distribution::held::{HeldElsewhere, kept_location, kept_reads};
 use crate::driver::now_ms;
 use crate::placement::policy::{
     GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,

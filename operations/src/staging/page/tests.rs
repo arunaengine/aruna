@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::connectors::descriptor::build_source_binding;
 use crate::s3::purge_fence::PurgeFenceError;
-use crate::staging::descriptor::build_source_binding;
 use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES};
 use aruna_core::UserId;
 use aruna_core::id::NodeId;

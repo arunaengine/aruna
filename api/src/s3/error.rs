@@ -11,7 +11,6 @@ use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
-use aruna_operations::blob::usage::UsageUpdateError;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::inventory::InventoryError;
 use aruna_operations::driver::{GateContextError, RoutingInputsError};
@@ -38,6 +37,7 @@ use aruna_operations::s3::object::list::ListBucketError;
 use aruna_operations::s3::object::put::PutObjectError;
 use aruna_operations::s3::object::versions::ListVersionsError;
 use aruna_operations::s3::purge_fence::PurgeFenceError;
+use aruna_operations::s3::usage::UsageUpdateError;
 use aruna_operations::staging::reference::MaterializeReferenceError;
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use std::fmt::Display;
@@ -1170,8 +1170,9 @@ mod tests {
     fn maps_usage_failure() {
         // The counter fault must not leak a Rust error string to an S3 client.
         let error = DeleteObjectError::UsageUpdateError(
-            aruna_operations::blob::usage::UsageUpdateError::UnexpectedEvent(
-                "BlobEvent::DeleteFinished",
+            aruna_operations::s3::usage::UsageUpdateError::UnexpectedEvent(
+                aruna_core::events::Event::Blob(aruna_core::events::BlobEvent::DeleteFinished)
+                    .label(),
             ),
         )
         .into_s3_error();
@@ -1336,7 +1337,7 @@ mod tests {
         let accounting = S3ErrorCode::Custom("UsageAccountingFailed".into());
         let other = UsageUpdateError::Inventory(InventoryError::Storage(StorageError::KeyNotFound));
         assert_eq!(*usage_update_error(&other).code(), accounting);
-        let event = UsageUpdateError::UnexpectedEvent("Event::Search");
+        let event = UsageUpdateError::UnexpectedEvent(aruna_core::events::Event::Search().label());
         assert_eq!(*usage_update_error(&event).code(), accounting);
         let deleted = DeleteObjectError::UsageUpdateError(UsageUpdateError::Inventory(
             InventoryError::Collision(set_id),

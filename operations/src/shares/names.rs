@@ -221,8 +221,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let claim = |now| ClaimNameOperation::new("data", "in/a.txt", now, 200);
         assert!(drive(claim(100), &context).await.unwrap());

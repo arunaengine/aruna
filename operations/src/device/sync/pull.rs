@@ -19,11 +19,11 @@ use crate::metadata::protocol::MetadataTransportMessage;
 const FIRST_POLL_AFTER: Duration = Duration::from_millis(50);
 
 /// Delay between two polls of a running pull.
-pub const PULL_POLL_AFTER: Duration = Duration::from_secs(1);
+const PULL_POLL_AFTER: Duration = Duration::from_secs(1);
 
 /// Polls in a row at the full delay a running pull may report no new bytes before it counts as
 /// stalled.
-pub const STALL_POLLS: u32 = 10;
+const STALL_POLLS: u32 = 10;
 
 /// Times a pull follows a refusal that names the coordinator of its key before it gives up.
 const MAX_MOVES: u32 = 2;

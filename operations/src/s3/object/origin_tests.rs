@@ -115,8 +115,10 @@ fn test_context(temp: &tempfile::TempDir) -> DriverContext {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 
@@ -169,7 +171,7 @@ async fn connector_name_read() {
         source_version: None,
         digests: Default::default(),
     };
-    let binding = crate::staging::descriptor::build_source_binding(
+    let binding = crate::connectors::descriptor::build_source_binding(
         StagingStrategy::Reference,
         &connector,
         &observed,

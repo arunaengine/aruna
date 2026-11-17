@@ -8,9 +8,9 @@
 use aruna_core::NodeId;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::get_document::load_document_record;
-use crate::node::holder_choice::{HolderCandidate, choose_holder as choose};
+use crate::driver::{DriverContext, drive};
+use crate::metadata::record_reads::load_document_record;
+use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
 
 /// The holder that should serve `document_id`, or `None` to serve it here: this node holds
 /// no registry record of it, no holder is a fresh candidate, or this node was chosen.
@@ -21,7 +21,8 @@ pub async fn choose_holder(
     now_ms: u64,
 ) -> Option<HolderCandidate> {
     let record = load_document_record(context, document_id).await.ok()??;
-    choose(context, &record.holder_node_ids, now_ms)
-        .await
+    let choice = HolderChoiceOperation::new(&record.holder_node_ids, now_ms);
+    let candidates = drive(choice, context).await.unwrap_or_default();
+    pick(candidates, Ulid::generate().random())
         .filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
 }

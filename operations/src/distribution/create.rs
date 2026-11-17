@@ -29,8 +29,9 @@ use super::forward::{PublishRefusal, admit_member, publish_local};
 use super::status::{StatusError, read_view};
 use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
-use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
+use aruna_core::metadata::AuthToken;
 
 /// How often and how far apart admission rereads a record that lags the accepted revision.
 const RECORD_POLLS: u32 = 50;
@@ -374,7 +375,7 @@ pub(crate) async fn send_admin(
 
 /// Sends one request to the set's publisher; an unreachable publisher means configuration
 /// changes are unavailable, never a queued request.
-pub(crate) async fn publish_remote(
+async fn publish_remote(
     context: &Arc<DriverContext>,
     publisher: NodeId,
     message: MetadataTransportMessage,
@@ -400,7 +401,7 @@ pub(crate) async fn publish_remote(
 }
 
 /// Asks a member's node to create and admit its local bucket under the caller's bearer token.
-pub(crate) async fn request_admission(
+async fn request_admission(
     context: &Arc<DriverContext>,
     (node_id, member_id, sizes): (NodeId, Ulid, &[RangeSize]),
     auth_token: AuthToken,

@@ -4,13 +4,13 @@
 
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
 use crate::s3::bucket::create::CreateBucketError;
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::NodeId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{

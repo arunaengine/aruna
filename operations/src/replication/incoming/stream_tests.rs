@@ -61,8 +61,10 @@ async fn rejects_foreign_peer() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let unknown = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
@@ -99,8 +101,10 @@ async fn checks_advance_policy() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([4u8; 32]);
     let foreign_realm = RealmId::from_bytes([5u8; 32]);
@@ -231,7 +235,7 @@ async fn checks_advance_policy() {
 
 #[tokio::test]
 async fn denies_offered_bucket() {
-    use crate::device::sync::folders::folder_bucket;
+    use crate::device::sync::repository::folder_bucket;
     use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 
     let fixture = crate::tests::staging::setup_driver_context().await;
@@ -303,8 +307,10 @@ async fn foreign_reads_denied() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([9u8; 32]);
     let foreign_realm = RealmId::from_bytes([10u8; 32]);

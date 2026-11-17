@@ -50,10 +50,9 @@ use tracing::{debug, warn};
 
 use crate::blob::managed_copy::ManagedCopyError;
 use crate::blob::records::blob_location_read;
-use crate::blob::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::distribution::pull::{
+use crate::distribution::held::{
     HeldElsewhere, kept_location, kept_reads, kept_source_location, kept_source_reads,
 };
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
@@ -63,6 +62,7 @@ use crate::s3::object::lookup::{
 };
 use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use crate::s3::object::source::choice::{Candidate, choose_source};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 
 /// Maximum successors attempted before a still-changing current read fails.
 const MAX_DRIFT_ATTEMPTS: u8 = 3;

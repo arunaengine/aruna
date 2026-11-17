@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::usage::count_upload;
 use crate::distribution::guard::{
     GuardError, WriteAuthority, authority_reads, check_authority, record_authority, record_read,
 };
@@ -15,6 +14,7 @@ use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, parse_abe};
 use crate::s3::object::put::{owner_read, owns_path, same_name_path};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::usage::count_upload;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};

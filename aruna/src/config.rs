@@ -28,7 +28,7 @@ use crate::settings::{Settings, invalid_config_value, normalize_env_value, valid
 use aruna_core::structs::identity::node_state::{
     BootOrigin, PersistedNodeState, PersistedNodeStatus,
 };
-use aruna_operations::metadata::MetadataSearchStorage;
+use aruna_graph::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
 use byteview::ByteView;
 use iroh::EndpointAddr;

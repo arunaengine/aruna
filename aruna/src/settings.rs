@@ -19,8 +19,8 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConf
 use aruna_core::structs::storage::node_info::{
     CLASS_LABEL_PREFIX, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
 };
+use aruna_graph::MetadataSearchStorage;
 use aruna_net::IrohRuntimeConfig;
-use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::{CACHE_BYTES, FjallPersistPolicy};
 
 use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
@@ -88,6 +88,9 @@ pub struct Settings {
     pub cors_allowed_origins: Vec<String>,
     pub desktop_cors: bool,
     pub mcp_enabled: bool,
+    /// Records every operation run and its events for replay, from `EVENT_RECORDING`; off by
+    /// default.
+    pub event_recording: bool,
     pub portal_csp_origins: Vec<String>,
     pub p2p_addr: SocketAddr,
     pub additional_relay_urls: Vec<String>,
@@ -263,6 +266,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
     let cors_allowed_origins = parse_list_env(env, "CORS_ALLOWED_ORIGINS");
     let desktop_cors = desktop_cors_env(env);
     let mcp_enabled = mcp_env(env)?;
+    let event_recording = event_recording_env(env)?;
     let portal_csp_origins = parse_list_env(env, "PORTAL_CSP_EXTRA_ORIGINS");
     let p2p_addr = SocketAddr::from_str(
         &env.var("P2P_SOCKET_ADDRESS")
@@ -350,6 +354,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         cors_allowed_origins,
         desktop_cors,
         mcp_enabled,
+        event_recording,
         portal_csp_origins,
         p2p_addr,
         additional_relay_urls,
@@ -908,6 +913,20 @@ fn mcp_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
     }
 }
 
+fn event_recording_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
+    const KEY: &str = "EVENT_RECORDING";
+    match env.var(KEY).as_deref().map(normalize_env_value) {
+        None => Ok(false),
+        Some(value) if value == "enabled" => Ok(true),
+        Some(value) if value == "disabled" => Ok(false),
+        Some(value) => Err(invalid_config_value(
+            KEY,
+            value,
+            "expected one of: enabled, disabled",
+        )),
+    }
+}
+
 /// Parses the placement-map initialization/onboarding input `ARUNA_NODE_LABELS`
 /// in `k=v,k2=v2` form. Rejects malformed pairs and every derived-only label,
 /// which the owning node stamps for itself.
@@ -1434,6 +1453,17 @@ mod tests {
         assert_eq!(raised.fjall_cache_bytes, 4 << 30);
         let error = parse(&[("ARUNA_FJALL_CACHE_MIB", "0")]).unwrap_err();
         assert_eq!(invalid_key(error), "ARUNA_FJALL_CACHE_MIB");
+    }
+
+    #[test]
+    fn event_recording_conventions() {
+        assert!(!parse(&[]).unwrap().event_recording);
+        let enabled = parse(&[("EVENT_RECORDING", "enabled")]).unwrap();
+        assert!(enabled.event_recording);
+        assert_eq!(
+            invalid_key(parse(&[("EVENT_RECORDING", "maybe")]).unwrap_err()),
+            "EVENT_RECORDING"
+        );
     }
 
     #[test]

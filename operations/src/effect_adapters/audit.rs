@@ -62,7 +62,7 @@ pub(super) async fn dispatch_audit_page(
             };
             let result = tokio::time::timeout_at(
                 peer_deadline,
-                crate::metadata::audit::send_audit_request(context, node, request),
+                crate::metadata::audit_entry::send_audit_request(context, node, request),
             )
             .await;
             (node, result)

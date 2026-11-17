@@ -549,7 +549,7 @@ pub async fn lookup_identifier_distributed(
     let local_call: MetadataNodeCall<Matches> = metadata_node_call(
         (context.clone(), auth, realm_id, identifier.clone()),
         |(context, auth, realm_id, (kind, value, endpoint)), _| async move {
-            crate::metadata::secondary_ids::lookup_local(
+            crate::metadata::identifier_lookup::lookup_local(
                 &context,
                 realm_id,
                 auth.as_ref(),

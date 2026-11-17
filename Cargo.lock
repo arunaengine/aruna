@@ -325,9 +325,11 @@ dependencies = [
  "aruna-cli",
  "aruna-compute",
  "aruna-core",
+ "aruna-graph",
  "aruna-kpabe",
  "aruna-net",
  "aruna-operations",
+ "aruna-outbound",
  "aruna-storage",
  "aruna-tasks",
  "aruna-wire",
@@ -384,6 +386,7 @@ dependencies = [
  "aruna-blob",
  "aruna-compute",
  "aruna-core",
+ "aruna-graph",
  "aruna-net",
  "aruna-operations",
  "aruna-storage",
@@ -670,6 +673,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-graph"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-core",
+ "chrono",
+ "craqle",
+ "fjall",
+ "futures-util",
+ "iroh",
+ "irokle",
+ "oxrdf",
+ "oxttl",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aruna-kpabe"
 version = "3.0.0-alpha.207"
 dependencies = [
@@ -734,8 +756,10 @@ dependencies = [
  "aruna-blob",
  "aruna-compute",
  "aruna-core",
+ "aruna-graph",
  "aruna-net",
  "aruna-operations",
+ "aruna-outbound",
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
@@ -761,7 +785,6 @@ dependencies = [
  "iroh",
  "irokle",
  "jsonwebtoken",
- "lettre",
  "lru",
  "md5",
  "opentelemetry",
@@ -781,7 +804,6 @@ dependencies = [
  "spareval",
  "spargebra",
  "sysinfo",
- "tantivy",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -793,6 +815,18 @@ dependencies = [
  "unicode-normalization",
  "url",
  "zip",
+]
+
+[[package]]
+name = "aruna-outbound"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-core",
+ "async-trait",
+ "lettre",
+ "reqwest 0.13.5",
+ "tokio",
+ "ulid 3.0.0",
 ]
 
 [[package]]
@@ -883,6 +917,7 @@ dependencies = [
  "crossfire",
  "fjall",
  "hex",
+ "tantivy",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -897,6 +932,7 @@ dependencies = [
  "aruna-core",
  "async-trait",
  "iroh",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

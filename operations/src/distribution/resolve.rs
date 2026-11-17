@@ -23,12 +23,11 @@ use aruna_core::structs::storage::distribution::{
 use tokio::time::Instant;
 use ulid::Ulid;
 
+use crate::distribution::counts::MAX_SETS;
 use crate::distribution::version_key::{MemberAnswer, VersionKeyOperation};
 use crate::driver::{DriverContext, drive, drive_until};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
-/// At most this many distribution records are read to find a version's candidate sets.
-const MAX_SETS: usize = 4096;
 /// At most this many candidate sets are looked at for one id.
 const MAX_CANDIDATES: usize = 4;
 /// At most this many members are asked for one id, over all candidate sets.
@@ -149,7 +148,7 @@ fn ready_here(snapshot: &DistributionSnapshot, local: NodeId) -> bool {
 
 /// The snapshots of this node's records that `keep` accepts, at most `wanted` of them, and
 /// whether accepted records were dropped or records left unread because [`MAX_SETS`] were read.
-pub(crate) async fn scan_sets(
+async fn scan_sets(
     context: &DriverContext,
     keep: impl Fn(&DistributionSnapshot) -> bool,
     wanted: usize,
@@ -172,7 +171,7 @@ pub(crate) async fn scan_sets(
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected storage answer {other:?}")),
+            other => return Err(format!("unexpected storage answer {}", other.label())),
         };
         for (_, value) in values {
             seen += 1;
@@ -195,7 +194,7 @@ pub(crate) async fn scan_sets(
 
 /// The snapshots of the sets whose hint `version_id` carries, from this node's records, and
 /// whether some candidates were left out.
-pub async fn candidate_sets(
+async fn candidate_sets(
     context: &DriverContext,
     version_id: Ulid,
 ) -> Result<(Vec<DistributionSnapshot>, bool), String> {
@@ -218,7 +217,7 @@ pub async fn indexed_key(
     let value = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected storage answer {other:?}")),
+        other => return Err(format!("unexpected storage answer {}", other.label())),
     };
     let Some(value) = value else {
         return Ok(None);
@@ -367,7 +366,7 @@ pub async fn content_versions(
     let values = match context.storage_handle.send_storage_effect(iter).await {
         Event::Storage(StorageEvent::IterResult { values, .. }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected storage answer {other:?}")),
+        other => return Err(format!("unexpected storage answer {}", other.label())),
     };
     let more = values.len() > limit;
     let mut versions = Vec::new();

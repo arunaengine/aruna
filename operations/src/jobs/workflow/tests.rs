@@ -266,8 +266,10 @@ fn context(storage: StorageHandle) -> Arc<DriverContext> {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     })
 }
 
@@ -853,8 +855,10 @@ async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     (context, net)
 }
@@ -1567,7 +1571,6 @@ async fn crate_write_idempotent() {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
-        mail: Default::default(),
     };
     let outcome = super::run_crate::write_run_crate(&ctx, job_id).await;
     match outcome {
@@ -1706,8 +1709,10 @@ fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: Some(Arc::new(registry)),
+        outbound_handle: None,
     })
 }
 

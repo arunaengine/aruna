@@ -353,7 +353,7 @@ fn rekey_waits_transition() {
 
 mod envelopes {
     use super::*;
-    use crate::blob::usage::{RowChange, StoredDelta};
+    use crate::s3::usage::{RowChange, StoredDelta};
     use aruna_core::compute::SecretBytes;
     use aruna_core::keyspaces::*;
     use aruna_core::structs::identity::realm::QuotaConfig;

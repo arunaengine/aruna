@@ -8,32 +8,29 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::events::Event;
-use aruna_core::metadata::{
-    AuthToken, MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
-};
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use rand::seq::SliceRandom;
-use tracing::{debug, warn};
+use tracing::debug;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::api::load_realm_config;
+use crate::driver::{DriverContext, drive};
+use crate::realm::load_config::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
 use crate::placement::read_holder_sets;
 use crate::realm::mutate_placement::node_kind;
 
-use super::replica::{
-    ReplicaRecord, ReplicaState, list_replicas, read_replica, record_graph, store_replica,
-};
+use super::install_graph::InstallGraphOperation;
+use super::replica::{ReplicaRecord, ReplicaState};
+use super::replica_store::{list_replicas, read_replica, store_replica};
 
 /// Replicas one pass refreshes. The rest follow on the next beat, so a large
 /// working set converges instead of blocking one pass.
-pub const MAX_REFRESH_PASS: usize = 32;
+const MAX_REFRESH_PASS: usize = 32;
 
 /// Bounds one document's exchange with the realm.
 const REFRESH_BUDGET: Duration = Duration::from_secs(10);
@@ -110,10 +107,13 @@ async fn refresh_with_plan(
         return RefreshOutcome::Unreachable;
     };
     match answer {
-        Some(Ok(state)) => match install_state(context, &mut replica, *state).await {
-            true => RefreshOutcome::Installed,
-            false => RefreshOutcome::Unreachable,
-        },
+        Some(Ok(state)) => {
+            let install = InstallGraphOperation::new(replica, *state, unix_timestamp_millis());
+            match drive(install, context).await {
+                Ok(true) => RefreshOutcome::Installed,
+                _ => RefreshOutcome::Unreachable,
+            }
+        }
         // An authoritative refusal is what the owner has to see; silence only
         // means the realm is out of reach and the replica keeps serving.
         Some(Err(refusal)) => {
@@ -195,78 +195,4 @@ fn holders_for(plan: &RefreshPlan, document_id: Ulid) -> Vec<NodeId> {
     let mut holders = read_holder_sets(&plan.config, &placement).unwrap_or_default();
     holders.shuffle(&mut rand::rng());
     holders
-}
-
-/// Joins one holder's answer into the local replica.
-async fn install_state(
-    context: &Arc<DriverContext>,
-    replica: &mut ReplicaRecord,
-    state: GraphState,
-) -> bool {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return false;
-    };
-    let graph_iri = state.record.graph_iri.clone();
-    let clock = state.snapshot.clock.clone();
-    let graph_bytes = postcard::to_allocvec(&state.snapshot).map_or(0, |bytes| bytes.len() as u64);
-    let preserve_display = local_is_ahead(&replica.local_clock, &clock);
-    match metadata
-        .send_metadata_effect(MetadataEffect::InstallSnapshot {
-            graph_iri: graph_iri.clone(),
-            snapshot: Box::new(state.snapshot),
-        })
-        .await
-    {
-        Event::Metadata(MetadataEvent::SnapshotInstalled { .. }) => {}
-        other => {
-            warn!(document_id = %replica.document_id, event = ?other, "Could not install a graph snapshot");
-            return false;
-        }
-    }
-    record_graph(context, replica.document_id, graph_bytes).await;
-    replica.local_clock.merge(&clock);
-    replica.realm_clock = clock;
-    replica.last_synced_ms = Some(unix_timestamp_millis());
-    if !preserve_display {
-        replica.displayed_jsonld = state.displayed_jsonld;
-        replica.dataset_digest = state.dataset_digest;
-    }
-    replica.group_id = state.record.group_id;
-    replica.document_path = state.record.document_path.clone();
-    replica.graph_iri = graph_iri;
-    replica.record = Some(Box::new(state.record));
-    replica.last_error = None;
-    replica.findings = state.findings;
-    replica.state = match state.findings {
-        0 => ReplicaState::Synced,
-        _ => ReplicaState::Invalid,
-    };
-    store_replica(context, replica).await
-}
-
-fn local_is_ahead(local: &craqle::VectorClock, remote: &craqle::VectorClock) -> bool {
-    matches!(
-        compare_metadata_clocks(local, remote),
-        MetadataClockRelation::LocalAhead | MetadataClockRelation::Concurrent
-    )
-}
-
-#[cfg(test)]
-mod pure_tests {
-    use super::local_is_ahead;
-    use craqle::{ActorId, VectorClock};
-
-    #[test]
-    fn detects_local_ahead() {
-        let mut local = VectorClock::default();
-        local.advance(ActorId::from_bytes([1u8; 32]), 2);
-        let mut remote = VectorClock::default();
-        remote.advance(ActorId::from_bytes([1u8; 32]), 1);
-        assert!(local_is_ahead(&local, &remote));
-        assert!(!local_is_ahead(&remote, &local));
-
-        remote.advance(ActorId::from_bytes([2u8; 32]), 1);
-        assert!(local_is_ahead(&local, &remote));
-        assert!(!local_is_ahead(&local, &local));
-    }
 }

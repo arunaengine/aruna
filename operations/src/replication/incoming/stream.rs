@@ -43,7 +43,8 @@ use crate::replication::protocol::{
     BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use crate::staging::bucket_guard::BucketGuardOperation;
+use crate::staging::offered_directory::OfferedDirectoryError;
 
 const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -552,7 +553,10 @@ async fn manifest_policy(
 ) -> Result<(Option<String>, Option<String>), String> {
     // Denied like a missing policy, so the sender stops and no destination is created. An unbound
     // folder stays `Deleting` until its row is gone, so checking before the create suffices.
-    match guard_bucket_write(context, &manifest.bucket).await {
+    match drive(BucketGuardOperation::new(manifest.bucket.as_str()), context)
+        .await
+        .map_err(OfferedDirectoryError::from)
+    {
         Ok(()) => {}
         Err(OfferedDirectoryError::ReadOnly(_)) => return Ok((None, None)),
         Err(error) => return Err(error.to_string()),

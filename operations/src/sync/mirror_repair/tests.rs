@@ -74,8 +74,10 @@ async fn setup_auth(expression: Option<&str>) -> (tempfile::TempDir, DriverConte
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let relationship = relationship();
     let realm_id = relationship.source.realm_id;
@@ -164,8 +166,10 @@ fn storage_context() -> (tempfile::TempDir, DriverContext) {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     (tempdir, context)
 }
@@ -412,8 +416,10 @@ async fn delete_supersedes_reconcile() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let relationship = relationship();
 
@@ -446,8 +452,10 @@ async fn delete_blocks_status() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let relationship = relationship();
     drive(
@@ -481,8 +489,10 @@ async fn status_stages_reconcile() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let mut relationship = relationship();
     relationship.state = SyncState::Failed {
@@ -591,8 +601,10 @@ async fn failure_needs_commit() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let mut relationship = relationship;
     stored(&context, &relationship).await;
@@ -610,8 +622,10 @@ async fn status_stays_handling() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let mut current = relationship();
     let stale = current.clone();

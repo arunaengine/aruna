@@ -168,8 +168,10 @@ async fn corrupt_job_only() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = process_materialization_batch(&context)
@@ -191,7 +193,7 @@ async fn jobs_exist_deletes() {
         Ulid::from_parts(12, 1),
         "valid",
     );
-    let valid_job = new_materialization_job(&event, 1);
+    let valid_job = MetadataMaterializationRecord::new(&event, 1);
     write_entries(
         &storage,
         vec![
@@ -245,8 +247,10 @@ async fn corrupt_global_job() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = process_materialization_batch(&context)
@@ -344,8 +348,10 @@ async fn orphan_global_job() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = process_materialization_batch(&context)
@@ -996,7 +1002,7 @@ async fn requeue_aborts_raced() {
     };
     let status = MaterializationStatusRecord {
         failures: job.failures,
-        ..new_pending_status(&old_event, 1)
+        ..MaterializationStatusRecord::pending(&old_event, 1)
     };
     write_entries(&storage, vec![create_event_entry(&old_event).unwrap()]).await;
 
@@ -1449,7 +1455,8 @@ async fn finish_keeps_newer() {
         &storage,
         vec![
             create_event_entry(&newer_event).unwrap(),
-            materialization_status_entry(&new_pending_status(&newer_event, 2)).unwrap(),
+            materialization_status_entry(&MaterializationStatusRecord::pending(&newer_event, 2))
+                .unwrap(),
             materialization_job_entry(&newer_job).unwrap(),
             document_job_entry(&newer_job).unwrap(),
         ],
@@ -1662,8 +1669,10 @@ async fn late_merges_chain() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let document_id = Ulid::from_bytes([6u8; 16]);
     let newer = create_event(document_id, Ulid::from_parts(9, 1), "newer");
@@ -1758,7 +1767,7 @@ async fn prune_keeps_retry() {
         &storage,
         vec![
             create_event_entry(&event).unwrap(),
-            materialization_status_entry(&new_pending_status(&event, 1)).unwrap(),
+            materialization_status_entry(&MaterializationStatusRecord::pending(&event, 1)).unwrap(),
             materialization_job_entry(&first).unwrap(),
             document_job_entry(&first).unwrap(),
             capture_mark(document_id, event.event_id),
@@ -2162,8 +2171,10 @@ async fn failing_apply_reschedules() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = process_materialization_batch(&context)

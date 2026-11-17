@@ -7,87 +7,33 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::federation::{FederationError, Signed};
+use aruna_core::effects::BlobEffect;
+use aruna_core::events::{BlobEvent, Event};
+use aruna_core::federation::Signed;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE, JOB_STATE_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, ExportSelection, JobId};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
-use aruna_core::transfer::{
-    ExportGrant, MAX_TRANSFER_SECS, TransferError, check_issued, selection_digest,
-};
-use aruna_core::types::Effects;
-use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
-use thiserror::Error;
+use aruna_core::transfer::{ExportGrant, GrantError, GrantRecord, PinnedSource, check_issued};
 use ulid::Ulid;
 use url::Url;
 
 use crate::auth::bearer_token::realm_user_cutoff;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
+use crate::federation::grant::{IssueGrantConfig, IssueGrantOperation, record_key};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
-use crate::jobs::export::{ExportCheckpoint, crate_jsonld, unheld_bucket};
+use crate::jobs::export::{crate_jsonld, unheld_bucket};
 use crate::jobs::key_wake::read_row;
 use crate::replication::plaintext::HolderCheckOperation;
 
-pub const EXPORT_OPERATION: &str = "federation.export";
-
-/// The node-local record beside a finished export job that its grant is checked against.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GrantRecord {
-    pub grant: Signed<ExportGrant>,
-    pub principal: UserId,
-    pub document_path: String,
-    pub with_files: bool,
-    pub sources: Vec<PinnedSource>,
-    pub revoked: bool,
-}
-
-/// A selected file version read on this node, rechecked on every artifact read.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PinnedSource {
-    pub bucket: String,
-    pub key: String,
-    pub path: String,
-    pub version_id: Ulid,
-    pub blake3: [u8; 32],
-    pub size: u64,
-    /// The bucket key generation of an encrypted version.
-    pub key_ref: Option<BucketKeyRef>,
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum GrantError {
-    #[error("the export is not finished or left out a selected file")]
-    Unfinished,
-    #[error("no grant was issued for this export")]
-    Missing,
-    #[error("the grant was revoked")]
-    Revoked,
-    #[error("the export is no longer allowed")]
-    Denied,
-    #[error("only a current key holder of the encrypted bucket `{0}` may export its files")]
-    NotHolder(String),
-    #[error(transparent)]
-    Transfer(#[from] TransferError),
-    #[error(transparent)]
-    Sign(#[from] FederationError),
-    #[error("grant storage failed: {0}")]
-    Storage(String),
-}
-
-pub(crate) fn record_key(job_id: JobId) -> Vec<u8> {
-    [&b"grant/"[..], &job_id.to_bytes()].concat()
-}
+const EXPORT_OPERATION: &str = "federation.export";
 
 fn principal(user_id: UserId, realm_id: RealmId) -> AuthContext {
     AuthContext {
@@ -154,7 +100,10 @@ async fn unlocked(context: &DriverContext, key: BucketKeyRef) -> Result<bool, Gr
         Event::Blob(BlobEvent::KeyStatus { generations }) => Ok(generations
             .iter()
             .any(|status| status.key == key && status.active)),
-        other => Err(GrantError::Storage(format!("key status failed: {other:?}"))),
+        other => Err(GrantError::Storage(format!(
+            "key status failed: {}",
+            other.label()
+        ))),
     }
 }
 
@@ -232,7 +181,8 @@ async fn change_record(
     context: &DriverContext,
     change: RecordChange,
 ) -> Result<RecordOutcome, GrantError> {
-    drive(RecordOperation::new(change), context)
+    let run = || RecordOperation::new(change.clone());
+    drive_retry(run, context, change.key())
         .await
         .map_err(|error| GrantError::Storage(error.to_string()))
 }
@@ -263,142 +213,6 @@ pub struct GrantRequest<'a> {
     pub artifact_url: Url,
     pub capabilities: &'a NodeCapabilities,
     pub now: u64,
-}
-
-/// Owned inputs of [`IssueGrantOperation`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct IssueGrantConfig {
-    pub realm_id: RealmId,
-    pub principal: UserId,
-    pub job_id: JobId,
-    pub document_id: Ulid,
-    pub document_path: String,
-    pub selection: ExportSelection,
-    pub artifact_url: Url,
-    pub capabilities: NodeCapabilities,
-    pub now: u64,
-}
-
-/// Reads the grant record and checkpoint of an export, then returns the stored grant while it
-/// is valid, or signs a new one from the finished checkpoint. Nothing is written here.
-#[derive(Debug, PartialEq)]
-pub struct IssueGrantOperation {
-    config: IssueGrantConfig,
-    output: Option<Result<(bool, GrantRecord), GrantError>>,
-}
-
-impl IssueGrantOperation {
-    pub fn new(config: IssueGrantConfig) -> Self {
-        Self {
-            config,
-            output: None,
-        }
-    }
-
-    fn stored(&self, record: GrantRecord) -> Result<(bool, GrantRecord), GrantError> {
-        if record.revoked {
-            return Err(GrantError::Revoked);
-        }
-        let config = &self.config;
-        check_issued(
-            &record.grant,
-            &config.realm_id,
-            config.job_id.as_ulid(),
-            config.now,
-        )?;
-        Ok((true, record))
-    }
-
-    fn sign(&self, checkpoint: ExportCheckpoint) -> Result<(bool, GrantRecord), GrantError> {
-        let config = &self.config;
-        let selection = &config.selection;
-        let facts = checkpoint
-            .export_facts(&selection.files)
-            .ok_or(GrantError::Unfinished)?;
-        let grant = ExportGrant {
-            source: config.realm_id,
-            audience: selection.audience,
-            intent_digest: selection.intent_digest.clone(),
-            export_job_id: config.job_id.as_ulid(),
-            document_id: config.document_id,
-            source_revision: facts.revision,
-            dataset_digest: hex::encode(facts.dataset_digest),
-            selection_digest: selection_digest(facts.revision, &facts.versions)?,
-            artifact_url: config.artifact_url.clone(),
-            artifact_blake3: hex::encode(facts.artifact.blake3),
-            artifact_size: facts.artifact.size,
-            issued_at: config.now,
-            expires_at: config.now.saturating_add(MAX_TRANSFER_SECS),
-        };
-        let record = GrantRecord {
-            grant: Signed::sign(grant, &config.capabilities)?,
-            principal: config.principal,
-            document_path: config.document_path.clone(),
-            with_files: !selection.files.is_empty(),
-            sources: facts.sources,
-            revoked: false,
-        };
-        Ok((false, record))
-    }
-
-    fn decide(&self, event: Event) -> Result<(bool, GrantRecord), GrantError> {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return Err(GrantError::Storage(format!("unexpected event {event:?}")));
-        };
-        let [(_, record), (_, checkpoint)] = values.as_slice() else {
-            return Err(GrantError::Storage("unexpected read result".to_string()));
-        };
-        let decode = |error: postcard::Error| GrantError::Storage(error.to_string());
-        if let Some(record) = record {
-            return self.stored(postcard::from_bytes(record).map_err(decode)?);
-        }
-        let checkpoint = checkpoint.as_ref().ok_or(GrantError::Unfinished)?;
-        self.sign(postcard::from_bytes(checkpoint).map_err(decode)?)
-    }
-}
-
-impl Operation for IssueGrantOperation {
-    /// Whether the record was stored before, and the record.
-    type Output = (bool, GrantRecord);
-    type Error = GrantError;
-
-    fn start(&mut self) -> Effects {
-        let job_id = self.config.job_id;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (FEDERATION_KEYSPACE.to_string(), record_key(job_id).into()),
-                (
-                    JOB_STATE_KEYSPACE.to_string(),
-                    job_id.to_bytes().to_vec().into()
-                ),
-            ],
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        // Only the one read answers; a decided grant takes no further event.
-        self.output = Some(match self.output {
-            Some(_) => Err(GrantError::Storage(
-                "unexpected event after the grant".to_string(),
-            )),
-            None => self.decide(event),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(GrantError::Storage("not finished".to_string())))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
 }
 
 /// Issues the grant of a finished export after the current checks and stores its record. A
@@ -467,6 +281,9 @@ pub async fn revoke_grant(context: &DriverContext, job_id: JobId) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::transfer::{MAX_TRANSFER_SECS, TransferError, selection_digest};
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
 
@@ -490,8 +307,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         (dir, context)
     }

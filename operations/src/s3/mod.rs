@@ -17,4 +17,5 @@ mod row_fence;
 pub mod session;
 pub mod sweeps;
 pub mod unlock_limit;
+pub mod usage;
 mod write_cleanup;

@@ -32,11 +32,10 @@ use aruna_operations::notifications::dispatch::{
 };
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
+use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::notifications::watch::emit::emit_watch_event;
-use aruna_operations::notifications::watch::interest::{
-    ensure_interest_digest, mark_interest_dirty, refresh_target_interest,
-};
-use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
+use aruna_operations::notifications::watch::interest::refresh_target_interest;
+use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -501,9 +500,10 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     .await?;
     let old_holder_node = node_by_id(&nodes, old_holder);
     wait_for(|| async {
-        list_watch_subscriptions(&old_holder_node.context.storage_handle, watcher)
+        let list = ListWatchesOperation::new(WatchScope::Owner(watcher));
+        drive(list, old_holder_node.context.as_ref())
             .await
-            .is_ok_and(|rows| rows.contains(&subscription))
+            .is_ok_and(|page| page.subscriptions.contains(&subscription))
     })
     .await?;
     // The row and outbox record commit atomically; wait until the record has
@@ -571,13 +571,14 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     };
     refresh_target_interest(new_holder_node.context.as_ref(), &reconciled).await;
     for node in &nodes {
-        mark_interest_dirty(node.context.as_ref(), realm_id).await?;
+        drive(InterestOperation::mark(realm_id), node.context.as_ref()).await?;
     }
 
     wait_for(|| async {
-        list_watch_subscriptions(&new_holder_node.context.storage_handle, watcher)
+        let list = ListWatchesOperation::new(WatchScope::Owner(watcher));
+        drive(list, new_holder_node.context.as_ref())
             .await
-            .is_ok_and(|rows| rows.contains(&subscription))
+            .is_ok_and(|page| page.subscriptions.contains(&subscription))
     })
     .await?;
     wait_for(|| async {
@@ -877,7 +878,11 @@ async fn bootstrap_interest_topic(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (index, node) in nodes.iter().enumerate() {
         let node_id = node.net.node_id();
-        ensure_interest_digest(&node.context.storage_handle, realm_id, node_id).await?;
+        drive(
+            InterestOperation::ensure(realm_id, node_id),
+            node.context.as_ref(),
+        )
+        .await?;
         drive(
             ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
                 realm_id,

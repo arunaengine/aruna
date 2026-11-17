@@ -25,8 +25,9 @@ use ulid::Ulid;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{ForwardAuthError, authorize_write};
-use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
+use aruna_core::metadata::AuthToken;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;

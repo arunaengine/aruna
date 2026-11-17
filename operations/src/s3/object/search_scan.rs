@@ -83,10 +83,7 @@ pub async fn search_local_objects(
             Err(error) => return Err(SearchObjectsError::Storage(error.to_string())),
         };
         if let Some(binding) = binding {
-            let indexes = context
-                .metadata_handle
-                .as_ref()
-                .map(|handle| handle.range_indexes());
+            let indexes = context.storage_handle.range_indexes();
             let search = index_search::RangeSearch {
                 binding,
                 indexes,
@@ -714,8 +711,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();

@@ -9,7 +9,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::plugin_runs::HookRequest;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::distribution::delegate::node_urls;
+use aruna_operations::node::node_info::node_urls;
 use aruna_operations::plugins::bound::ReleaseKeys;
 use aruna_operations::plugins::dispatch::{admit_hook, checks_authorization};
 use aruna_operations::plugins::hooks::HookError;

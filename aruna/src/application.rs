@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::device::wipe as device_wipe;
+use aruna_tasks::wipe as device_wipe;
 
 use crate::shutdown::{
     NodeShutdown, ShutdownOutcome, arm_signal_exit, shutdown_grace_env, wait_for_signal,
@@ -386,7 +386,7 @@ async fn run_node_owned(
         task_handle: resources.task_handle,
         jobs_runtime: resources.jobs_runtime,
         net_handle: resources.driver_ctx.net_handle.clone(),
-        metadata_handle: resources.driver_ctx.metadata_handle.clone(),
+        graph_handle: resources.driver_ctx.graph_handle.clone(),
         blob_handle: resources.driver_ctx.blob_handle.clone(),
         storage_handle: resources.driver_ctx.storage_handle.clone(),
         ops: Some(resources.ops_handle),
@@ -549,7 +549,7 @@ async fn release_unready(
         task_handle,
         jobs_runtime,
         net_handle: driver_ctx.net_handle.clone(),
-        metadata_handle: driver_ctx.metadata_handle.clone(),
+        graph_handle: driver_ctx.graph_handle.clone(),
         blob_handle: driver_ctx.blob_handle.clone(),
         storage_handle: driver_ctx.storage_handle.clone(),
         ops: Some(ops_handle),
@@ -1204,7 +1204,7 @@ mod tests {
             task_handle: aruna_tasks::TaskHandle::new(),
             jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
             net_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             blob_handle: None,
             storage_handle,
             ops: None,

@@ -23,10 +23,10 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::repository::StorageReadError;
 use crate::metadata::timestamp_index::delete_index_keys;
-use crate::metadata::timestamp_index::enumerate_updated;
+use crate::metadata::updated_page::{UpdatedPageError, UpdatedPageOperation};
 use crate::storage_read::parse_storage_scan;
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.
@@ -127,6 +127,16 @@ pub enum VisibilityError {
 impl From<StorageReadError> for VisibilityError {
     fn from(error: StorageReadError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<UpdatedPageError> for VisibilityError {
+    fn from(error: UpdatedPageError) -> Self {
+        Self::Storage(match error {
+            UpdatedPageError::Storage(error) => StorageReadError::Storage(error),
+            UpdatedPageError::Conversion(error) => StorageReadError::Conversion(error),
+            error => StorageReadError::Storage(StorageError::ReadError(error.to_string())),
+        })
     }
 }
 
@@ -409,7 +419,7 @@ pub async fn visible_page(
             if effective_ms >= from_ms
                 && effective_ms <= until_ms
                 && let Some(record) =
-                    crate::metadata::get_document::load_document_record(context, document_id)
+                    crate::metadata::record_reads::load_document_record(context, document_id)
                         .await?
                 && record.updated_at_ms == updated_at_ms
             {
@@ -536,7 +546,7 @@ fn fold_visible(digest: &mut [u8; 32], updated_at_ms: u64, document_id: Ulid) {
 /// One bounded step of index maintenance. A cycle writes a new generation only
 /// once the visible set differs, so a steady-state pass rewrites nothing; every
 /// mutation is gated on `token` and a persisted cursor keeps the walk bounded.
-pub async fn visibility_pass(
+pub(crate) async fn visibility_pass(
     context: &DriverContext,
     token: &CancellationToken,
 ) -> Result<PassOutcome, VisibilityError> {
@@ -569,7 +579,11 @@ async fn pass_bounded(
             return Ok(PassOutcome::Cancelled);
         }
         let cursor = pass.cursor.clone().map(Key::from);
-        let page = enumerate_updated(context, 0, u64::MAX, cursor, bounds.batch).await?;
+        let page = drive(
+            UpdatedPageOperation::new(0, u64::MAX, cursor, bounds.batch),
+            context,
+        )
+        .await?;
         let evaluators = build_evaluators(context, &page.records).await;
         let visible: Vec<&MetadataRegistryRecord> = page
             .records
@@ -765,7 +779,7 @@ async fn write_index_keys(
 /// Keeps the index current on the shutdown supervisor, one bounded pass per tick.
 /// Changed visibility is picked up next cycle; until then the reader's per-record
 /// re-check keeps a newly-hidden record from being served.
-pub fn spawn_visibility_index(context: Arc<DriverContext>, shutdown: &Shutdown) {
+pub(crate) fn spawn_visibility_index(context: Arc<DriverContext>, shutdown: &Shutdown) {
     let token = shutdown.token();
     shutdown.spawn(async move {
         loop {
@@ -796,9 +810,6 @@ mod tests {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::{
-        MetadataAuditOperation, MetadataAuditRecord,
-    };
     use aruna_core::{NodeId, UserId};
     use aruna_storage::storage;
     use std::collections::{HashMap, HashSet};
@@ -855,20 +866,6 @@ mod tests {
         }
     }
 
-    fn audit(record: &MetadataRegistryRecord) -> MetadataAuditRecord {
-        MetadataAuditRecord {
-            realm_id: record.realm_id,
-            group_id: record.group_id,
-            document_id: record.document_id,
-            graph_iri: record.graph_iri.clone(),
-            user_id: Default::default(),
-            node_id: NodeId::from_bytes(&[1u8; 32]).expect("node id"),
-            operation: MetadataAuditOperation::Create,
-            occurred_at_ms: record.updated_at_ms,
-            details: None,
-        }
-    }
-
     fn context() -> (DriverContext, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
@@ -876,8 +873,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         (context, dir)
     }
@@ -943,7 +942,13 @@ mod tests {
     }
 
     async fn seed_record(context: &DriverContext, record: &MetadataRegistryRecord) {
-        let writes = create_outbox_entries(record, &audit(record), Ulid::generate(), None).unwrap();
+        let writes = create_outbox_entries(
+            record,
+            &crate::tests::metadata::create_audit(record),
+            Ulid::generate(),
+            None,
+        )
+        .unwrap();
         write(context, writes).await;
     }
 

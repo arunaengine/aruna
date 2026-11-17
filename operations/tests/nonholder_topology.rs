@@ -7,6 +7,7 @@ use crate::topology;
 use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::registry_delete_entries;
@@ -30,22 +31,23 @@ use aruna_operations::jobs::service::{
 };
 use aruna_operations::jobs::store::query::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
-use aruna_operations::metadata::AuthToken;
-use aruna_operations::metadata::api::{
-    ApiQueryMode, DocumentQueryRequest, ExportMetadataRequest, ExportMetadataResult,
-    MetadataApiError, RoCrateExportView, query_metadata_document,
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
+use aruna_operations::metadata::api::read::query_metadata_document;
+use aruna_operations::metadata::api::read_types::{ApiQueryMode, DocumentQueryRequest};
 use aruna_operations::metadata::create_document::{
     CreateDocumentOperation, CreateDocumentPayload, mint_forward_document, mint_local_document,
     resolve_metadata_id,
 };
-use aruna_operations::metadata::forward::{
-    PinnedCreate, create_with_id, export_rocrate_routed, route_metadata_create,
-    route_metadata_delete, route_metadata_update,
+use aruna_operations::metadata::forward::read::export_rocrate_routed;
+use aruna_operations::metadata::forward::write::{
+    PinnedCreate, create_with_id, route_metadata_create, route_metadata_delete,
+    route_metadata_update,
 };
-use aruna_operations::metadata::get_document::{
-    GetDocumentError, GetDocumentOperation, load_document_record,
-};
+use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
+use aruna_operations::metadata::record_reads::load_document_record;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;

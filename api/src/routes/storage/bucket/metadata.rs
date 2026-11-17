@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::identifier::Identifier;
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
@@ -12,7 +13,6 @@ use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_met
 use aruna_core::structs::storage::dataset_description::DatasetDescription;
 use aruna_operations::distribution::change::change_metadata;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::AuthToken;
 use aruna_operations::s3::bucket::dataset::{
     DescriptionError, bucket_metadata, dataset_description,
 };

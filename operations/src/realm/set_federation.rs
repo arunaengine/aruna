@@ -9,7 +9,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::federation::{
-    AcceptedRealms, FederationSettings, LoginProvider, RealmDescriptor, RegistrationMode, Signed,
+    AcceptedRealms, FederationSettings, LoginProvider, PUBLISH_SOON, RealmDescriptor,
+    RegistrationMode, Signed,
 };
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -31,7 +32,6 @@ use url::Url;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::federation::publish::PUBLISH_SOON;
 use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
@@ -609,8 +609,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 

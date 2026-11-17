@@ -65,7 +65,8 @@ use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::staging::native_source::{body_stream, granted_read};
+use crate::staging::native_source::granted_read;
+use aruna_blob::native::body_stream;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::SourcePin;
@@ -484,9 +485,9 @@ async fn serving_pin(context: &DriverContext, source: VersionSourceBinding) -> S
     };
     let event = context
         .storage_handle
-        .send_storage_effect(crate::staging::root_record::read_root(digest, None))
+        .send_storage_effect(crate::connectors::root_record::read_root(digest, None))
         .await;
-    let root = crate::staging::root_record::parse_root(event)
+    let root = crate::connectors::root_record::parse_root(event)
         .ok()
         .flatten();
     let full = root.and_then(|root| RootEntry::hydrate(&source, &root).ok().flatten());
@@ -1989,8 +1990,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         assert!(
@@ -2014,8 +2017,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let error = collect_outputs(
@@ -2179,8 +2184,10 @@ mod tests {
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let job_id = JobId::from_bytes([4; 16]);
         let record = JobRecord::new(
@@ -2451,7 +2458,7 @@ mod tests {
             mirrors: Vec::new(),
         };
         let (compact, root) = RootEntry::compact(&full).unwrap().unwrap();
-        let (key_space, key, value) = crate::staging::root_record::root_write(&root).unwrap();
+        let (key_space, key, value) = crate::connectors::root_record::root_write(&root).unwrap();
         let write = aruna_core::effects::StorageEffect::Write {
             key_space,
             key,
@@ -2555,8 +2562,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([1; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
@@ -2628,8 +2637,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut record = JobRecord::new(
             JobId::from_bytes([4; 16]),

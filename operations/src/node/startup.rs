@@ -2,303 +2,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::backoff::capped_backoff;
-use aruna_core::document::{
-    DocumentNetEvent, DocumentReconcileResult, DocumentTarget, shard_topic_id,
-};
+use aruna_core::document::{DocumentNetEvent, DocumentReconcileResult, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::node::document_sync::apply_metadata;
-use crate::node::usage_stats::refresh_usage_targets;
+use crate::node::recovery::{RecoveryError, RecoveryOutcome, RecoveryStatus};
+use crate::node::restore_plan::{
+    RestoreKind, RestoreRange, RestoreShardSummary, RestoreUnit, RestoreUnitOutcome,
+    ShardRestoreCursor, ShardRestorePass, bind_restore_plan, plan_shard_groups, restore_range,
+    sync_eligible_node,
+};
+use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::refresh_target_interest;
-use crate::placement::{draining_former_holders, resolve_shard_holders};
-
-/// Shared realm-scoped topics every node subscribes to (placement is inert on
-/// these; see [`DocumentTarget::sync_topic_id`]).
-pub const RESTORE_TOPIC_COUNT: usize = 5;
-
-fn shared_targets(realm_id: RealmId, node_id: NodeId) -> [DocumentTarget; RESTORE_TOPIC_COUNT] {
-    [
-        DocumentTarget::RealmAuthorization { realm_id },
-        DocumentTarget::RealmConfig { realm_id },
-        DocumentTarget::NodeUsage {
-            realm_id,
-            node_id,
-            group_id: None,
-        },
-        DocumentTarget::NodeInfo { realm_id, node_id },
-        DocumentTarget::WatchInterest { realm_id, node_id },
-    ]
-}
-
-/// Whether a shared target belongs to the realm rather than to one node.
-/// Node-owned targets are planned by that node alone; realm-wide ones need a
-/// single designated minter.
-pub(crate) fn realm_wide_target(target: &DocumentTarget) -> bool {
-    matches!(
-        target,
-        DocumentTarget::RealmConfig { .. } | DocumentTarget::RealmAuthorization { .. }
-    )
-}
-
-fn sync_eligible_node(config: &RealmConfigDocument, node_id: NodeId) -> bool {
-    let node_id = node_id.to_string();
-    config
-        .nodes
-        .iter()
-        .any(|node| node.node_id == node_id && node.kind.is_sync_eligible())
-}
-
-fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<NodeId> {
-    config
-        .nodes
-        .iter()
-        .filter(|node| node.kind.is_sync_eligible())
-        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-        .filter(|candidate| *candidate != node_id)
-        .collect()
-}
-
-/// Work units one bounded restore pass may process. A work-unit limit, never a
-/// wall-clock deadline, so the bound holds however many shards share a
-/// co-holder set.
-pub const RESTORE_UNIT_BUDGET: usize = 8;
-/// Topics per work unit; one unit still fills a document sync topic batch.
-pub const RESTORE_CHUNK_TOPICS: usize = 64;
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
 /// Longest wait between passes once the remainder is blocked on absent peers.
 const RECOVERY_RETRY_MAX: Duration = Duration::from_secs(30);
-
-/// Remote-recovery lifecycle. A locally safe node keeps serving while this is
-/// [`RecoveryState::Degraded`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RecoveryState {
-    /// Remote recovery has not started.
-    #[default]
-    Pending,
-    /// A bounded recovery pass is active.
-    Running,
-    /// A pass completed with retryable unavailable-peer work.
-    Degraded,
-    /// The latest pass has no known remote-recovery remainder.
-    Converged,
-}
-
-impl RecoveryState {
-    /// Every state, so the one-hot metric can seed all of them.
-    pub const ALL: [Self; 4] = [
-        Self::Pending,
-        Self::Running,
-        Self::Degraded,
-        Self::Converged,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Running => "running",
-            Self::Degraded => "degraded",
-            Self::Converged => "converged",
-        }
-    }
-
-    fn code(self) -> u8 {
-        match self {
-            Self::Pending => 0,
-            Self::Running => 1,
-            Self::Degraded => 2,
-            Self::Converged => 3,
-        }
-    }
-
-    fn from_code(code: u8) -> Self {
-        match code {
-            1 => Self::Running,
-            2 => Self::Degraded,
-            3 => Self::Converged,
-            _ => Self::Pending,
-        }
-    }
-}
-
-/// Why the last pass left work behind. Closed set: readiness and metrics never
-/// carry peer ids, topic ids, or raw error strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecoveryError {
-    /// A co-holder could not be reached or refused a genesis probe.
-    PeerUnavailable,
-    /// Local storage could not supply a trustworthy config or scan.
-    Storage,
-    /// The recovery driver panicked and stopped.
-    Panicked,
-}
-
-impl RecoveryError {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::PeerUnavailable => "peer_unavailable",
-            Self::Storage => "storage",
-            Self::Panicked => "panicked",
-        }
-    }
-
-    fn code(self) -> u8 {
-        match self {
-            Self::PeerUnavailable => 1,
-            Self::Storage => 2,
-            Self::Panicked => 3,
-        }
-    }
-
-    fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::PeerUnavailable),
-            2 => Some(Self::Storage),
-            3 => Some(Self::Panicked),
-            _ => None,
-        }
-    }
-
-    fn merge(current: Option<Self>, next: Option<Self>) -> Option<Self> {
-        match (current, next) {
-            (Some(Self::Panicked), _) | (_, Some(Self::Panicked)) => Some(Self::Panicked),
-            (Some(Self::Storage), _) | (_, Some(Self::Storage)) => Some(Self::Storage),
-            (Some(Self::PeerUnavailable), _) | (_, Some(Self::PeerUnavailable)) => {
-                Some(Self::PeerUnavailable)
-            }
-            (None, None) => None,
-        }
-    }
-}
-
-/// How a completed pass is counted in `aruna_recovery_pass_total`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecoveryOutcome {
-    Success,
-    Partial,
-    Failed,
-}
-
-impl RecoveryOutcome {
-    pub const ALL: [Self; 3] = [Self::Success, Self::Partial, Self::Failed];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::Partial => "partial",
-            Self::Failed => "failed",
-        }
-    }
-
-    fn index(self) -> usize {
-        match self {
-            Self::Success => 0,
-            Self::Partial => 1,
-            Self::Failed => 2,
-        }
-    }
-}
-
-/// Low-cardinality recovery view shared by the driver, `/readyz`, and the
-/// scrape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RecoverySnapshot {
-    pub state: RecoveryState,
-    pub topics_remaining: u64,
-    /// Unix seconds when recovery started or last made measurable progress.
-    pub last_progress_timestamp: u64,
-    pub last_error: Option<RecoveryError>,
-}
-
-#[derive(Debug, Default)]
-struct RecoveryInner {
-    state: AtomicU8,
-    topics_remaining: AtomicU64,
-    last_progress_ms: AtomicU64,
-    last_error: AtomicU8,
-    passes: [AtomicU64; 3],
-}
-
-/// Handle onto the recovery status. Cloning shares one status.
-#[derive(Clone, Debug, Default)]
-pub struct RecoveryStatus {
-    inner: Arc<RecoveryInner>,
-}
-
-impl RecoveryStatus {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn snapshot(&self) -> RecoverySnapshot {
-        RecoverySnapshot {
-            state: RecoveryState::from_code(self.inner.state.load(Ordering::Relaxed)),
-            topics_remaining: self.inner.topics_remaining.load(Ordering::Relaxed),
-            last_progress_timestamp: self.inner.last_progress_ms.load(Ordering::Relaxed) / 1_000,
-            last_error: RecoveryError::from_code(self.inner.last_error.load(Ordering::Relaxed)),
-        }
-    }
-
-    pub fn pass_total(&self, outcome: RecoveryOutcome) -> u64 {
-        self.inner.passes[outcome.index()].load(Ordering::Relaxed)
-    }
-
-    /// Marks a bounded pass as started.
-    pub fn begin_pass(&self) {
-        self.inner
-            .state
-            .store(RecoveryState::Running.code(), Ordering::Relaxed);
-        let _ = self.inner.last_progress_ms.compare_exchange(
-            0,
-            unix_timestamp_millis(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
-
-    /// Publishes progress after a completed work unit.
-    pub fn note_progress(&self, topics_remaining: u64) {
-        self.set_remaining(topics_remaining);
-        self.inner
-            .last_progress_ms
-            .store(unix_timestamp_millis(), Ordering::Relaxed);
-    }
-
-    fn set_remaining(&self, topics_remaining: u64) {
-        self.inner
-            .topics_remaining
-            .store(topics_remaining, Ordering::Relaxed);
-    }
-
-    pub fn finish_pass(&self, outcome: RecoveryOutcome, error: Option<RecoveryError>) {
-        self.inner.passes[outcome.index()].fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .last_error
-            .store(error.map_or(0, RecoveryError::code), Ordering::Relaxed);
-        let state = match outcome {
-            RecoveryOutcome::Success => RecoveryState::Converged,
-            RecoveryOutcome::Partial | RecoveryOutcome::Failed => RecoveryState::Degraded,
-        };
-        self.inner.state.store(state.code(), Ordering::Relaxed);
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct RecoveryConfig {
@@ -765,7 +499,7 @@ async fn usage_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    let result = crate::node::usage_stats::publish_refresh_snapshots(
+    let result = crate::node::usage_publish::publish_refresh_snapshots(
         context.as_ref(),
         config.node_id,
         config.realm_id,
@@ -787,29 +521,6 @@ async fn usage_phase(
                 error: Some(RecoveryError::Storage),
             }
         }
-    }
-}
-
-/// What a [`restore_shard_subscriptions`] pass touched. The load-bearing
-/// invariant is `shard_topics == held_shards`, i.e. one topic per held shard,
-/// never one per stored document, as asserted by the restart-traffic gate.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RestoreShardSummary {
-    /// Shards the local node resolves into a holder of.
-    pub held_shards: usize,
-    /// Shard sync topics ensured (rank-0) or joined that this pass touched.
-    pub shard_topics: usize,
-    /// Fixed shared realm topics restored ([`RESTORE_TOPIC_COUNT`]).
-    pub shared_topics: usize,
-    /// Held topics this pass could not finish because a co-holder was absent or
-    /// refused a genesis probe. Retryable background state, never a start error.
-    pub withheld_topics: usize,
-}
-
-impl RestoreShardSummary {
-    /// Total distinct topics the restore ensured or joined.
-    pub fn total_topics(&self) -> usize {
-        self.shard_topics + self.shared_topics
     }
 }
 
@@ -836,32 +547,6 @@ pub async fn restore_shard_subscriptions(
             return summary;
         }
     }
-}
-
-/// Where a bounded restore resumes, bound to the exact current work plan.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ShardRestoreCursor {
-    next_unit: usize,
-    plan_hash: Option<[u8; 32]>,
-}
-
-/// What one bounded [`restore_shard_pass`] did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ShardRestorePass {
-    pub summary: RestoreShardSummary,
-    /// Never more than [`RESTORE_UNIT_BUDGET`].
-    pub units_processed: usize,
-    pub topics_completed: usize,
-    pub units_total: usize,
-    pub unvisited_topics: usize,
-    pub unresolved_topics: BTreeSet<::irokle::TopicId>,
-    pub error: Option<RecoveryError>,
-    pub plan_changed: bool,
-    /// Whether the cursor reached the end and wrapped back to the head.
-    pub wrapped: bool,
-    /// False when storage failed before the plan could be read: the pass
-    /// observed nothing about outstanding work.
-    pub enumerated: bool,
 }
 
 /// Runs at most [`RESTORE_UNIT_BUDGET`] restore work units from `cursor`,
@@ -1039,108 +724,6 @@ async fn restore_batch(
     }
 }
 
-type ShardGroup = (Vec<NodeId>, Vec<NodeId>, BTreeSet<NodeId>);
-
-/// Restore work grouped by co-holder and retained peer sets, so matching shards
-/// ride one ensure and one sync instead of one round trip each.
-struct ShardPlan {
-    summary: RestoreShardSummary,
-    shared_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
-    shared_join_groups: BTreeMap<Vec<NodeId>, Vec<::irokle::TopicId>>,
-    rank0_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
-    join_groups: BTreeMap<ShardGroup, Vec<::irokle::TopicId>>,
-}
-
-/// Derives the restore plan from the realm config alone. I/O-free, so the local
-/// serving gate and the bounded remote pass read the same view.
-fn plan_shard_groups(
-    config: &RealmConfigDocument,
-    node_id: NodeId,
-    realm_id: RealmId,
-    now_ms: u64,
-) -> ShardPlan {
-    let mut plan = ShardPlan {
-        summary: RestoreShardSummary::default(),
-        shared_groups: BTreeMap::new(),
-        shared_join_groups: BTreeMap::new(),
-        rank0_groups: BTreeMap::new(),
-        join_groups: BTreeMap::new(),
-    };
-
-    let mut shared_peers = shared_topic_peers(config, node_id);
-    shared_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    // The lowest sync-eligible node mints realm-wide topics.
-    // Applying this bound everywhere prevents concurrent minters from forking documents.
-    let realm_minter = sync_eligible_node(config, node_id)
-        && shared_peers
-            .iter()
-            .all(|peer| node_id.as_bytes() < peer.as_bytes());
-    let device_local = !sync_eligible_node(config, node_id);
-    for target in shared_targets(realm_id, node_id) {
-        let wide = realm_wide_target(&target);
-        // Devices route realm-wide reads and mint only their private local topics.
-        if device_local && wide {
-            continue;
-        }
-        let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
-        let groups = if wide && !realm_minter {
-            &mut plan.shared_join_groups
-        } else {
-            &mut plan.shared_groups
-        };
-        let peers = match device_local {
-            true => Vec::new(),
-            false => shared_peers.clone(),
-        };
-        groups.entry(peers).or_default().push(topic);
-        plan.summary.shared_topics += 1;
-    }
-
-    for strategy in &config.strategies {
-        for shard in 0..strategy.shard_count {
-            let placement = PlacementRef {
-                strategy_id: strategy.strategy_id,
-                shard,
-            };
-            let holders = resolve_shard_holders(config, &placement);
-            // During transitions, target and retained departing holders stay members.
-            // Publishers remain the authority set.
-            let membership = crate::placement::bucket_membership(config, &placement, now_ms);
-            if !membership.members.contains(&node_id) {
-                continue;
-            }
-            plan.summary.held_shards += 1;
-            let local_is_rank0 = holders.first() == Some(&node_id);
-            let mut co_members: Vec<NodeId> = membership
-                .members
-                .into_iter()
-                .filter(|candidate| *candidate != node_id)
-                .collect();
-            co_members.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-            if co_members.is_empty() {
-                continue;
-            }
-            let mut publishers = membership.publishers;
-            publishers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-            let topic = shard_topic_id(realm_id, &placement);
-            let retained: BTreeSet<NodeId> = draining_former_holders(config, &placement)
-                .into_iter()
-                .collect();
-            let groups = if local_is_rank0 {
-                &mut plan.rank0_groups
-            } else {
-                &mut plan.join_groups
-            };
-            groups
-                .entry((co_members, publishers, retained))
-                .or_default()
-                .push(topic);
-            plan.summary.shard_topics += 1;
-        }
-    }
-    plan
-}
-
 /// Installs publisher and membership policy for the shard topics this node
 /// already holds a genesis for, without contacting a peer. Missing geneses and
 /// anti-entropy are remote convergence and belong to [`run_recovery`].
@@ -1188,156 +771,6 @@ pub async fn prepare_shard_policy(
         "Prepared local shard topic policy"
     );
     plan.summary
-}
-
-/// The half-open unit range one bounded pass processes, and whether it wraps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RestoreRange {
-    start: usize,
-    end: usize,
-    wrapped: bool,
-}
-
-fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> RestoreRange {
-    let start = cursor.next_unit.min(units_total);
-    let end = (start + RESTORE_UNIT_BUDGET).min(units_total);
-    RestoreRange {
-        start,
-        end,
-        wrapped: end >= units_total,
-    }
-}
-
-/// One bounded unit of restore work: one co-holder group's ensure and sync over
-/// a chunk of topics.
-#[derive(Clone, Debug)]
-struct RestoreUnit {
-    kind: RestoreKind,
-    peers: Vec<NodeId>,
-    publishers: Vec<NodeId>,
-    retained: BTreeSet<NodeId>,
-    topics: Vec<::irokle::TopicId>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RestoreKind {
-    /// Shared topics this node may mint: its own node-owned ones, and the
-    /// realm-wide ones when it is the designated minter.
-    Shared,
-    /// Realm-wide topics minted elsewhere: probe and adopt, never create.
-    SharedJoin,
-    /// Rank-0: create a genesis only with positive co-holder confirmation.
-    Rank0,
-    /// Held at another rank: join-only.
-    Join,
-}
-
-fn bind_restore_plan(cursor: &mut ShardRestoreCursor, units: &[RestoreUnit]) -> bool {
-    let plan_hash = restore_plan_hash(units);
-    let changed = cursor.plan_hash != Some(plan_hash);
-    if changed {
-        cursor.next_unit = 0;
-        cursor.plan_hash = Some(plan_hash);
-    }
-    changed
-}
-
-fn restore_plan_hash(units: &[RestoreUnit]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    for unit in units {
-        let kind = match unit.kind {
-            RestoreKind::Shared => 0,
-            RestoreKind::Rank0 => 1,
-            RestoreKind::Join => 2,
-            RestoreKind::SharedJoin => 3,
-        };
-        hasher.update(&[kind]);
-        hasher.update(&(unit.peers.len() as u64).to_be_bytes());
-        for peer in &unit.peers {
-            hasher.update(peer.as_bytes());
-        }
-        hasher.update(&(unit.publishers.len() as u64).to_be_bytes());
-        for peer in &unit.publishers {
-            hasher.update(peer.as_bytes());
-        }
-        hasher.update(&(unit.retained.len() as u64).to_be_bytes());
-        for peer in &unit.retained {
-            hasher.update(peer.as_bytes());
-        }
-        hasher.update(&(unit.topics.len() as u64).to_be_bytes());
-        for topic in &unit.topics {
-            hasher.update(topic.as_bytes());
-        }
-    }
-    *hasher.finalize().as_bytes()
-}
-
-impl ShardPlan {
-    /// Flattens the plan into a deterministic list of bounded work units.
-    fn into_units(self) -> Vec<RestoreUnit> {
-        let mut units = Vec::new();
-        // A unit without peers still has local work: its topics are ensured and
-        // minted here, and only the peer exchange is skipped.
-        let mut push = |kind,
-                        peers: Vec<NodeId>,
-                        publishers: Vec<NodeId>,
-                        retained: BTreeSet<NodeId>,
-                        topics: Vec<_>| {
-            if topics.is_empty() {
-                return;
-            }
-            for chunk in topics.chunks(RESTORE_CHUNK_TOPICS) {
-                units.push(RestoreUnit {
-                    kind,
-                    peers: peers.clone(),
-                    publishers: publishers.clone(),
-                    retained: retained.clone(),
-                    topics: chunk.to_vec(),
-                });
-            }
-        };
-        for (peers, topics) in self.shared_groups {
-            push(
-                RestoreKind::Shared,
-                peers,
-                Vec::new(),
-                BTreeSet::new(),
-                topics,
-            );
-        }
-        for (peers, topics) in self.shared_join_groups {
-            push(
-                RestoreKind::SharedJoin,
-                peers,
-                Vec::new(),
-                BTreeSet::new(),
-                topics,
-            );
-        }
-        for ((peers, publishers, retained), topics) in self.rank0_groups {
-            push(RestoreKind::Rank0, peers, publishers, retained, topics);
-        }
-        for ((peers, publishers, retained), topics) in self.join_groups {
-            push(RestoreKind::Join, peers, publishers, retained, topics);
-        }
-        units
-    }
-}
-
-#[derive(Default)]
-struct RestoreUnitOutcome {
-    unresolved_topics: BTreeSet<::irokle::TopicId>,
-    error: Option<RecoveryError>,
-}
-
-impl RestoreUnitOutcome {
-    fn fail_topics(&mut self, topics: impl IntoIterator<Item = ::irokle::TopicId>) {
-        let before = self.unresolved_topics.len();
-        self.unresolved_topics.extend(topics);
-        if self.unresolved_topics.len() > before {
-            self.error = RecoveryError::merge(self.error, Some(RecoveryError::PeerUnavailable));
-        }
-    }
 }
 
 async fn process_restore_unit(
@@ -1548,7 +981,11 @@ pub(crate) async fn apply_restored_reconcile(
         }
     };
 
-    refresh_usage_targets(context, node_id, &result.targets).await;
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let refresh = RefreshUsageOperation::new(node_id, realm_id, &result.targets, Ulid::generate());
+    if let Err(error) = crate::driver::drive(refresh, context.as_ref()).await {
+        warn!(%error, "Realm usage refresh stopped after the shard restore");
+    }
     refresh_target_interest(context, &result.targets).await;
     crate::notifications::email::config_applied(context, &result.targets).await;
     apply_metadata(context, Some(node_id), result, false).await;
@@ -1581,7 +1018,7 @@ async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> R
             RealmConfigLoad::StorageFailure
         }
         other => {
-            warn!(%realm_id, event = ?other, "Unexpected realm config read result for recovery");
+            warn!(%realm_id, event = other.label(), "Unexpected realm config read result for recovery");
             RealmConfigLoad::StorageFailure
         }
     }
@@ -1590,11 +1027,17 @@ async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::recovery::RecoveryState;
+    use crate::node::restore_plan::{
+        RESTORE_CHUNK_TOPICS, RESTORE_TOPIC_COUNT, RESTORE_UNIT_BUDGET, shared_topic_peers,
+    };
     use aruna_core::UserId;
+    use aruna_core::document::shard_topic_id;
     use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
     use aruna_core::events::{DhtEntry, DhtEvent, NetEvent};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
+    use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::placement::record::{PlacementOverride, PlacementStrategy};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage::FjallStorage;
@@ -1917,8 +1360,10 @@ mod tests {
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         });
         crate::sync::incoming::initialize_incoming_fixture(context.clone());
         RecoveryNode {
@@ -2463,8 +1908,10 @@ mod tests {
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let units = vec![RestoreUnit {
             kind: RestoreKind::Shared,
@@ -2518,8 +1965,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         // A failed config read must not unbind the cursor from its plan.
         let bound = ShardRestoreCursor {

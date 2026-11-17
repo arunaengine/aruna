@@ -9,60 +9,25 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_STATE_KEYSPACE};
+use aruna_core::keyspaces::{DEVICE_INTAKE_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_STATE_KEYSPACE};
 use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::GroupId;
 use byteview::ByteView;
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
-use super::drain::claim_state;
-use super::publish_queue::{PublishEntry, PublishState, scan_publish_queue};
-use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state, list_replicas};
+use super::publish_queue::{PUBLISH_PAGE_SIZE, PublishEntry, PublishState, RequeueFailedOperation};
+use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state};
+use super::replica_store::list_replicas;
+use super::scan_rows::ScanRowsOperation;
 use super::sync::folders::{list_folders, list_transfers};
 use super::sync::outbox::requeue_uploads;
-use super::sync::repository::{scan_folder, scan_page};
-
-/// How recently the realm must have answered for the device to call it
-/// reachable. Two folder beats, so one missed pass does not flip the view.
-pub const REALM_CONTACT_WINDOW: Duration = Duration::from_secs(90);
-
-/// How long a run stays active without finishing. A crashed run must not block
-/// the next one for longer than this.
-pub const SYNC_RUN_LIFETIME: Duration = Duration::from_secs(120);
-
-/// The one row this device keeps about its exchange with the realm.
-const SYNC_STATE_KEY: [u8; 1] = [0];
-
-/// When the realm last answered, when the last pass finished, and whether one
-/// is in flight.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceSyncState {
-    /// When the realm last answered. A failed contact attempt clears it, so the device shows
-    /// disconnected at once and connected again after the next answer.
-    pub last_contact_ms: Option<u64>,
-    pub last_sync_ms: Option<u64>,
-    pub run_started_ms: Option<u64>,
-}
-
-impl DeviceSyncState {
-    pub fn realm_reachable(&self, now_ms: u64) -> bool {
-        self.last_contact_ms.is_some_and(|contact| {
-            now_ms.saturating_sub(contact) <= REALM_CONTACT_WINDOW.as_millis() as u64
-        })
-    }
-
-    pub fn run_active(&self, now_ms: u64) -> bool {
-        self.run_started_ms.is_some_and(|started| {
-            now_ms.saturating_sub(started) <= SYNC_RUN_LIFETIME.as_millis() as u64
-        })
-    }
-}
+use super::sync::repository::{SYNC_PAGE_SIZE, folder_prefix};
+use super::sync_note::{DeviceSyncState, read_state, sync_state_key};
 
 /// One selected document in the Sync view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,11 +130,7 @@ fn entry_error(entries: &[&PublishEntry]) -> Option<String> {
 }
 
 /// One folder's row from the rows the device already holds for it.
-pub fn dataset_row(
-    folder: &SyncedFolder,
-    bases: &[SyncBase],
-    pending_uploads: usize,
-) -> DatasetRow {
+fn dataset_row(folder: &SyncedFolder, bases: &[SyncBase], pending_uploads: usize) -> DatasetRow {
     let mut unsynced_files = 0usize;
     let mut conflicts = 0usize;
     for base in bases {
@@ -266,11 +227,8 @@ pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
 }
 
 async fn requeue_publish(context: &Arc<DriverContext>, now_ms: u64) {
-    for entry in read_publish_entries(context).await {
-        let Some(state) = entry.retry_failed(now_ms) else {
-            continue;
-        };
-        claim_state(context, &entry, state).await;
+    if let Err(error) = drive(RequeueFailedOperation::new(now_ms), context).await {
+        warn!(error = %error, "Failed to requeue the failed publish entries");
     }
 }
 
@@ -286,46 +244,13 @@ pub(crate) async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
     }
 }
 
-/// Records that the realm answered this device.
-pub async fn note_contact(context: &Arc<DriverContext>) {
-    let mut state = read_sync_state(context).await;
-    state.last_contact_ms = Some(unix_timestamp_millis());
-    write_sync_state(context, &state).await;
-}
-
-/// Records that the realm did not answer this device's last contact attempt.
-pub async fn note_failure(context: &Arc<DriverContext>) {
-    let mut state = read_sync_state(context).await;
-    if state.last_contact_ms.take().is_some() {
-        write_sync_state(context, &state).await;
-    }
-}
-
-/// Records that a sync pass finished, which also ends the run it belonged to.
-pub async fn note_sync(context: &Arc<DriverContext>) {
-    let now = unix_timestamp_millis();
-    let mut state = read_sync_state(context).await;
-    state.last_contact_ms = Some(now);
-    state.last_sync_ms = Some(now);
-    state.run_started_ms = None;
-    write_sync_state(context, &state).await;
-}
-
 pub async fn read_sync_state(context: &Arc<DriverContext>) -> DeviceSyncState {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_STATE_KEYSPACE.to_string(),
-            key: sync_state_key(),
-            txn_id: None,
-        })
-        .await
-    else {
-        return DeviceSyncState::default();
+    let read = StorageEffect::Read {
+        key_space: SYNC_STATE_KEYSPACE.to_string(),
+        key: sync_state_key(),
+        txn_id: None,
     };
-    postcard::from_bytes(&bytes).unwrap_or_default()
+    read_state(&context.storage_handle.send_storage_effect(read).await)
 }
 
 async fn write_sync_state(context: &Arc<DriverContext>, state: &DeviceSyncState) {
@@ -346,28 +271,12 @@ async fn write_sync_state(context: &Arc<DriverContext>, state: &DeviceSyncState)
     }
 }
 
-fn sync_state_key() -> Key {
-    ByteView::from(SYNC_STATE_KEY.to_vec())
-}
-
 pub(crate) async fn read_publish_entries(context: &Arc<DriverContext>) -> Vec<PublishEntry> {
-    let mut entries = Vec::new();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Some((values, next)) = scan_page(context, scan_publish_queue(cursor, None)).await
-        else {
-            return entries;
-        };
-        entries.extend(
-            values
-                .into_iter()
-                .filter_map(|(_, bytes)| PublishEntry::from_bytes(&bytes).ok()),
-        );
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return entries,
-        }
-    }
+    let scan = ScanRowsOperation::new(DEVICE_INTAKE_KEYSPACE, None, PUBLISH_PAGE_SIZE);
+    let rows = drive(scan, context).await.unwrap_or_default();
+    rows.iter()
+        .filter_map(|bytes| PublishEntry::from_bytes(bytes).ok())
+        .collect()
 }
 
 async fn read_datasets(context: &Arc<DriverContext>) -> Vec<DatasetRow> {
@@ -388,27 +297,12 @@ async fn read_datasets(context: &Arc<DriverContext>) -> Vec<DatasetRow> {
 }
 
 async fn read_bases(context: &Arc<DriverContext>, folder_id: Ulid) -> Vec<SyncBase> {
-    let mut bases = Vec::new();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Some((values, next)) = scan_page(
-            context,
-            scan_folder(SYNC_BASE_KEYSPACE, folder_id, cursor, None),
-        )
-        .await
-        else {
-            return bases;
-        };
-        bases.extend(
-            values
-                .into_iter()
-                .filter_map(|(_, bytes)| SyncBase::from_bytes(&bytes).ok()),
-        );
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return bases,
-        }
-    }
+    let prefix = Some(folder_prefix(folder_id));
+    let scan = ScanRowsOperation::new(SYNC_BASE_KEYSPACE, prefix, SYNC_PAGE_SIZE);
+    let rows = drive(scan, context).await.unwrap_or_default();
+    rows.iter()
+        .filter_map(|bytes| SyncBase::from_bytes(bytes).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -416,6 +310,7 @@ mod tests {
     use super::*;
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
+    use crate::device::sync_note::{NoteSyncOperation, SyncNote};
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderMode, RemoteBinding};
@@ -590,8 +485,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task),
             compute_handle: None,
+            outbound_handle: None,
         });
 
         assert!(start_sync_run(&context).await);
@@ -621,15 +518,18 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
-        note_contact(&context).await;
         let now = unix_timestamp_millis();
+        let note = |note| crate::driver::drive(NoteSyncOperation::new(note, now), &context);
+        note(SyncNote::Contact).await.unwrap();
         assert!(read_sync_state(&context).await.realm_reachable(now));
-        note_failure(&context).await;
+        note(SyncNote::Failure).await.unwrap();
         assert!(!read_sync_state(&context).await.realm_reachable(now));
-        note_contact(&context).await;
+        note(SyncNote::Contact).await.unwrap();
         assert!(read_sync_state(&context).await.realm_reachable(now));
     }
 
@@ -643,8 +543,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let document_id = Ulid::generate();
         let retryable = draft(PublishState::Failed {

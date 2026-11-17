@@ -19,6 +19,7 @@ use aruna_core::structs::storage::share::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::distribution::nonce::SpendNonceOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::s3::object::get::GetObjectInput;
@@ -32,7 +33,7 @@ use aruna_operations::shares::rules::{
     NodeScope, numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
 use aruna_operations::shares::store::GetShareOperation;
-use aruna_operations::staging::offered_directory::guard_bucket_write;
+use aruna_operations::staging::bucket_guard::BucketGuardOperation;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
@@ -726,10 +727,8 @@ pub async fn download_file(
     )
     .await?;
     let ctx = state.get_ctx();
-    aruna_operations::distribution::delegate::spend_nonce(&ctx, ticket.nonce, ticket.expires_at)
-        .await
-        .map_err(|_| unavailable())?;
-    aruna_operations::distribution::delegate::prune_nonces(&ctx, now).await;
+    let spend = SpendNonceOperation::new(ticket.nonce, ticket.expires_at, now);
+    drive(spend, &ctx).await.map_err(|_| unavailable())?;
     let permit = download::admit(&state, LocalKey::Ip(ip)).map_err(|error| match error {
         AdmissionError::Total => {
             ServerError::ServiceUnavailableReason("download capacity exhausted".into())
@@ -885,9 +884,12 @@ pub async fn upload_file(
     crate::s3::util::validate_object_key(&wanted)
         .map_err(|_| ServerError::BadRequestReason("the name is not a valid object key".into()))?;
     let (bucket, info, auth) = visit_scope(&state, &link).await?;
-    guard_bucket_write(state.get_ctx().as_ref(), &bucket)
-        .await
-        .map_err(|_| ServerError::Forbidden)?;
+    drive(
+        BucketGuardOperation::new(bucket.as_str()),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|_| ServerError::Forbidden)?;
     let user = share_access(&state, &link, (&auth, &info), visit_end);
     let key = claim_key(&state, &auth, (&bucket, &info), &wanted, &user).await?;
     let content_length = headers

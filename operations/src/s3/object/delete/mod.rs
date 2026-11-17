@@ -8,15 +8,15 @@ use crate::blob::records::{
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
     write_version_effect,
 };
-use crate::blob::usage::{
-    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
-};
 use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, HeadChange, InventoryChange, stamp_head, stamp_version, version_written,
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::row_fence::{FenceError, RowFence};
+use crate::s3::usage::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use aruna_core::UserId;
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};

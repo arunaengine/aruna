@@ -29,15 +29,17 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::create::submit;
-use super::rebuild::{RebuildConfig, RebuildOperation, RebuildOutcome};
+use super::rebuild::{
+    BeginRebuildsOperation, RebuildConfig, RebuildOperation, RebuildOutcome, decode,
+};
 use super::refill::{RefillConfig, RefillOperation};
-use super::sign_statement;
+use super::refresh::{RefreshCursor, RefreshRangesOperation};
 use super::split::{SplitConfig, SplitError, SplitOperation};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::mark_dirty;
+use crate::s3::usage::MarkDirtyOperation;
 
 /// How long a pass that found nothing to do waits before it looks again.
-pub const MAINTAIN_AFTER: Duration = Duration::from_secs(60);
+const MAINTAIN_AFTER: Duration = Duration::from_secs(60);
 /// Account rows one page reads.
 const ACCOUNT_PAGE: usize = 64;
 /// Account pages one pass reads before it yields to the next timer run.
@@ -49,6 +51,8 @@ const WALK_PAGES: usize = 8;
 
 /// The account row after which the next pass continues; a restart begins again at the start.
 static CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Where the periodic source refresh goes on; a restart begins again at the start.
+static REFRESH_CURSOR: Mutex<Option<RefreshCursor>> = Mutex::new(None);
 
 /// What tending one range left behind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,10 +71,31 @@ pub async fn maintain_ranges(context: &Arc<DriverContext>) -> Duration {
         warn!(%error, "Handed over imports could not start");
     }
     // Coordinators walk their ranges for the periodic source refresh, a few pages per pass.
-    match super::refresh::refresh_ranges(context).await {
-        Ok(true) => after = Duration::ZERO,
-        Ok(false) => {}
-        Err(error) => warn!(%error, "The periodic source refresh could not run"),
+    if let Some(net) = context.net_handle.as_ref() {
+        let cursor = (REFRESH_CURSOR.lock().ok()).and_then(|mut cursor| cursor.take());
+        let (realm_id, now) = (*net.realm_id(), std::time::SystemTime::now());
+        let pass =
+            RefreshRangesOperation::new(realm_id, net.node_id(), now, cursor.unwrap_or_default());
+        let (busy, cursor) = match drive(pass, context).await {
+            Ok(pass) => (pass.busy, pass.cursor),
+            Err(error) => {
+                warn!(%error, "The periodic source refresh could not run");
+                let record = error.record;
+                (
+                    false,
+                    RefreshCursor {
+                        record,
+                        sweep: None,
+                    },
+                )
+            }
+        };
+        if busy {
+            after = Duration::ZERO;
+        }
+        if let Ok(mut kept) = REFRESH_CURSOR.lock() {
+            *kept = Some(cursor);
+        }
     }
     // Version links metadata could not verify in a set are retried here, a page per pass.
     match crate::metadata::data_links::retry_unverified(context).await {
@@ -138,49 +163,14 @@ async fn maintain_accounts(context: &Arc<DriverContext>) -> Duration {
     }
 }
 
-/// Begins a counter rebuild of every active range account without one, a page at a time, so
-/// range counters are confirmed again after a node-wide usage rebuild started. The range
-/// maintenance runs the rebuilds; until they activate, the counters report incomplete.
+/// Begins a counter rebuild of every active range account without one, so range counters are
+/// confirmed again after a node-wide usage rebuild started. The range maintenance runs the
+/// rebuilds; until they activate, the counters report incomplete.
 pub async fn begin_range_rebuilds(context: &DriverContext) -> Result<usize, String> {
-    let mut start = None;
-    let mut begun = 0usize;
-    loop {
-        let (rows, more) = accounts(context, start.take()).await?;
-        for (key, value) in rows {
-            start = Some(key.clone());
-            let Some((set_id, range_id, account)) = decode(&key, &value) else {
-                continue;
-            };
-            if account.rebuild.is_some() || !matches!(account.charge, Charge::Active(_)) {
-                continue;
-            }
-            // No page budget: the run only records the new generation's rebuild.
-            let config = RebuildConfig {
-                set_id,
-                range_id,
-                page_rows: WALK_ROWS,
-                page_bytes: WALK_BYTES,
-                max_pages: 0,
-                group_id: None,
-            };
-            match drive(RebuildOperation::new(config), context).await {
-                Ok(_) => begun += 1,
-                Err(error) => {
-                    warn!(%set_id, %range_id, %error, "A range counter rebuild did not begin")
-                }
-            }
-        }
-        if !more {
-            return Ok(begun);
-        }
-    }
-}
-
-fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
-    let set_id = Ulid::from_bytes(key.get(..16)?.try_into().ok()?);
-    let range_id = Ulid::from_bytes(key.get(16..32)?.try_into().ok()?);
-    let account = RangeAccount::from_bytes(value).ok()?;
-    (key.len() == 32).then_some((set_id, range_id, account))
+    let begin = BeginRebuildsOperation::new(ACCOUNT_PAGE, (WALK_ROWS, WALK_BYTES));
+    drive(begin, context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn accounts(
@@ -206,7 +196,7 @@ async fn accounts(
             next_start_after.is_some(),
         )),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected answer {other:?}")),
+        other => Err(format!("unexpected answer {}", other.label())),
     }
 }
 
@@ -284,7 +274,8 @@ impl Tending<'_> {
     /// A finished accounting transition moves the charged rows a replica share reads.
     async fn republish(&self, context: &DriverContext) {
         let group = self.snapshot.config.owner_group;
-        if let Err(error) = mark_dirty(context, [group]).await {
+        let mark = MarkDirtyOperation::new([group], Ulid::generate());
+        if let Err(error) = drive(mark, context).await {
             warn!(set_id = %self.set_id(), %error, "The replica share was not marked for a publish");
         }
     }
@@ -388,7 +379,10 @@ impl Tending<'_> {
             signer: self.local,
             statement,
         };
-        let signed = match sign_statement(context, claim) {
+        let signed = match context.net_handle.as_ref().map_or_else(
+            || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
+            |net| net.sign_statement(claim),
+        ) {
             StatementSignEvent::Signed(signed) => *signed,
             StatementSignEvent::Unavailable(reason) => {
                 warn!(%reason, "A range split could not be signed");

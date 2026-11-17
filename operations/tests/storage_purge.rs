@@ -124,8 +124,10 @@ async fn setup_context() -> TestContext {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let actor = Actor {
         node_id,
@@ -745,7 +747,6 @@ async fn claimed_job(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        mail: Default::default(),
     }
 }
 

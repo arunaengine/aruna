@@ -36,7 +36,7 @@ use crate::driver::drive;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};
+use crate::staging::reference::{MaterializeReferenceInput, MaterializeReferenceOperation};
 use crate::staging::snapshot::{MaterializeSnapshotInput, stage_snapshot_blob};
 use aruna_core::structs::checksum::ExpectedChecksum;
 
@@ -361,23 +361,27 @@ pub(super) async fn stage_item(
     let expected_bucket = ensure_item_permission(ctx, spec, source_path, target_key).await?;
     let mirrors = mirrors::item_mirrors(ctx, spec, source_path).await?;
     let (size, version_id) = match spec.strategy {
-        StagingStrategy::Reference => stage_reference_blob(
+        StagingStrategy::Reference => drive(
+            MaterializeReferenceOperation::new(
+                MaterializeReferenceInput {
+                    group_id: spec.group_id,
+                    user_id: spec.auth_context.user_id,
+                    realm_id: spec.auth_context.realm_id,
+                    node_id: spec.node_id,
+                    connector_id: spec.connector_id,
+                    source_path: source_path.to_string(),
+                    bucket: spec.bucket.clone(),
+                    key: target_key.to_string(),
+                    expected_bucket,
+                    inherited_policies: Vec::new(),
+                    restrictions: spec.auth_context.path_restrictions.clone(),
+                    mirrors,
+                    job_id: Some(ctx.job_id.as_ulid()),
+                },
+                std::time::SystemTime::now(),
+                ulid::Ulid::generate(),
+            ),
             &ctx.driver,
-            MaterializeReferenceInput {
-                group_id: spec.group_id,
-                user_id: spec.auth_context.user_id,
-                realm_id: spec.auth_context.realm_id,
-                node_id: spec.node_id,
-                connector_id: spec.connector_id,
-                source_path: source_path.to_string(),
-                bucket: spec.bucket.clone(),
-                key: target_key.to_string(),
-                expected_bucket,
-                inherited_policies: Vec::new(),
-                restrictions: spec.auth_context.path_restrictions.clone(),
-                mirrors,
-                job_id: Some(ctx.job_id.as_ulid()),
-            },
         )
         .await
         .map(|result| (result.source_metadata.content_length, result.version_id))
@@ -485,10 +489,7 @@ pub(super) async fn pinned_bucket(
     Ok(bucket_info)
 }
 
-async fn load_live_bucket(
-    ctx: &JobContext,
-    bucket: &str,
-) -> Result<BucketInfo, ItemFailure> {
+async fn load_live_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, ItemFailure> {
     match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
         Ok(bucket_info) => Ok(bucket_info),
         Err(GetBucketError::NotFound) => Err(ItemFailure::Stage(
@@ -767,7 +768,6 @@ mod pure_tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
-            mail: Default::default(),
         };
 
         let pinned = StagingJobSpec {

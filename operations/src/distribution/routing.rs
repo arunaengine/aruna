@@ -38,7 +38,8 @@ pub async fn route_read(
             Err(GuardError::Unreadable(error.to_string()))
         }
         other => Err(GuardError::Unreadable(format!(
-            "unexpected answer {other:?}"
+            "unexpected answer {}",
+            other.label()
         ))),
     }
 }
@@ -104,7 +105,8 @@ pub async fn bound_view(
         }
         other => {
             return Err(GuardError::Unreadable(format!(
-                "unexpected answer {other:?}"
+                "unexpected answer {}",
+                other.label()
             )));
         }
     };
@@ -136,7 +138,8 @@ pub async fn local_fence(context: &DriverContext, set_id: Ulid) -> Result<LocalF
             Err(GuardError::Unreadable(error.to_string()))
         }
         other => Err(GuardError::Unreadable(format!(
-            "unexpected answer {other:?}"
+            "unexpected answer {}",
+            other.label()
         ))),
     }
 }

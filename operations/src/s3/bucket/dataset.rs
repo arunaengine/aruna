@@ -15,11 +15,12 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::AuthToken;
-use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use crate::metadata::forward::export_rocrate_routed;
+use crate::metadata::forward::read::export_rocrate_routed;
+use aruna_core::metadata::AuthToken;
 
 /// The current metadata of a local bucket: its distributed set's settings, or the row of this
 /// bucket's current incarnation. `None` when there is none.

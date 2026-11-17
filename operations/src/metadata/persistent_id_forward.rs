@@ -5,19 +5,19 @@
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::get_document::load_document_record;
-use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::PersistentIdOutcome;
 use crate::metadata::protocol::PersistentIdRequest;
 use crate::metadata::protocol::PersistentIdResolution;
+use crate::metadata::record_reads::load_document_record;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::resolve_shard_holders;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::UserId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::PersistentIdFailure;
 use aruna_core::structs::PersistentIdMapping;
@@ -171,7 +171,7 @@ pub async fn mint_pid_routed(
 /// Queue the PID mint job on the document's authority. The job store is
 /// node-local, so a document-scoped dedup row only deduplicates when one node
 /// owns it; alternating ingress nodes would otherwise open a job each.
-pub async fn submit_pid_routed(
+pub(crate) async fn submit_pid_routed(
     context: &Arc<DriverContext>,
     document_id: Ulid,
     minted_by: UserId,
@@ -383,7 +383,7 @@ pub async fn read_pid_routed(
 
 /// Store a terminal provider failure on the authority. Only the internal mint
 /// worker calls this; HTTP callers have no transition that can forge failures.
-pub async fn fail_pid_routed(
+pub(crate) async fn fail_pid_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     document_id: Ulid,
@@ -509,7 +509,9 @@ pub(super) async fn local_pid_resolution(
             Err(MetadataApiError::ServiceUnavailable)
         };
     };
-    if crate::metadata::api::can_read_record(context.as_ref(), realm_id, None, &record).await? {
+    if crate::metadata::api::read::can_read_record(context.as_ref(), realm_id, None, &record)
+        .await?
+    {
         Ok(PersistentIdResolution::Redirect)
     } else {
         Ok(PersistentIdResolution::Missing)
@@ -748,8 +750,8 @@ pub(crate) async fn apply_forwarded_pid(
             result: Ok(outcome),
         },
         Err(
-            crate::metadata::persistent_id::PersistentIdError::DocumentMissing
-            | crate::metadata::persistent_id::PersistentIdError::IntentMissing,
+            crate::metadata::id_mapping::PersistentIdError::DocumentMissing
+            | crate::metadata::id_mapping::PersistentIdError::IntentMissing,
         ) => MetadataTransportMessage::WriteNotFound,
         Err(error) => {
             warn!(%document_id, ?error, "Forwarded persistent id transition failed");
@@ -758,12 +760,10 @@ pub(crate) async fn apply_forwarded_pid(
     }
 }
 
-pub(super) fn pid_error(
-    error: crate::metadata::persistent_id::PersistentIdError,
-) -> MetadataApiError {
+pub(super) fn pid_error(error: crate::metadata::id_mapping::PersistentIdError) -> MetadataApiError {
     match error {
-        crate::metadata::persistent_id::PersistentIdError::DocumentMissing
-        | crate::metadata::persistent_id::PersistentIdError::IntentMissing => {
+        crate::metadata::id_mapping::PersistentIdError::DocumentMissing
+        | crate::metadata::id_mapping::PersistentIdError::IntentMissing => {
             MetadataApiError::NotFound
         }
         error => MetadataApiError::Internal(error.to_string()),

@@ -187,8 +187,10 @@ async fn setup_pattern(pattern: &str) -> TestContext {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
@@ -355,7 +357,6 @@ async fn claimed(context: &TestContext, tag: u8, payload: JobPayload) -> JobCont
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        mail: Default::default(),
     }
 }
 

@@ -7,16 +7,23 @@ use std::time::Duration;
 
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_blob::blob::{BackendRegistry, BlobHandle, BlobHandler};
+use aruna_core::NodeId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::metrics::NodeMetrics;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::distribution::sharding::begin_range_rebuilds;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
-use aruna_operations::node::startup::RecoveryStatus;
+use aruna_operations::node::recovery::RecoveryStatus;
+use aruna_operations::node::usage_publish::publish_refresh_snapshots;
+use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
+use aruna_storage::FjallPersistPolicy;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
@@ -26,6 +33,15 @@ use crate::compute_setup::build_registry;
 use crate::config::{Config, open_storage, resolve_config};
 use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
+
+/// How much event recording keeps in memory when `EVENT_RECORDING` is enabled.
+const RECORD_LIMITS: aruna_operations::recorder::RecordLimits =
+    aruna_operations::recorder::RecordLimits {
+        total_bytes: 64 << 20,
+        entry_bytes: 16 << 10,
+    };
+/// Pause before a failed background usage rebuild starts again from a new snapshot.
+const REBUILD_RETRY_PAUSE: Duration = Duration::from_secs(30);
 
 /// The node resources a running process owns. This is not the Tokio runtime.
 pub struct NodeResources {
@@ -59,7 +75,7 @@ struct Acquired {
     readiness: Readiness,
     recovery: RecoveryStatus,
     net_handle: Option<NetHandle>,
-    metadata_handle: Option<MetadataHandle>,
+    graph_handle: Option<GraphHandle>,
     blob_handle: Option<BlobHandle>,
     driver_ctx: Option<Arc<DriverContext>>,
     monitoring: Option<Arc<MonitoringState>>,
@@ -80,7 +96,7 @@ impl Acquired {
             readiness: Readiness::new(),
             recovery: RecoveryStatus::new(),
             net_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             blob_handle: None,
             driver_ctx: None,
             monitoring: None,
@@ -110,7 +126,7 @@ impl Acquired {
             task_handle: self.task_handle,
             jobs_runtime: self.jobs_runtime,
             net_handle: self.net_handle,
-            metadata_handle: self.metadata_handle,
+            graph_handle: self.graph_handle,
             blob_handle: self.blob_handle,
             storage_handle: self.storage_handle,
             ops: None,
@@ -226,6 +242,9 @@ pub(crate) async fn acquire(
     // Parsing operator settings is pure; the store is the first owned
     // resource, established before identity and enrollment I/O.
     let settings = crate::settings::read_settings()?;
+    if settings.event_recording {
+        aruna_operations::recorder::enable(RECORD_LIMITS);
+    }
     let storage_handle = open_storage(&settings)?;
     // The node runtime always exists here; a missing one is a concrete startup
     // error, never a scheduler-less handle that only looks started.
@@ -364,8 +383,10 @@ async fn fill(
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         aruna_operations::groups::deletion::install_onboarding(
             &context,
@@ -405,9 +426,7 @@ async fn fill(
     checkpoint(StartupStage::Net)?;
     stopped(stop)?;
 
-    let mut metadata_options = MetadataHandleOptions::default()
-        .with_search_storage(config.metadata_search_storage)
-        .with_sync_policy(config.fjall_persist_policy);
+    let mut metadata_options = MetadataHandleOptions::default();
     // Only holders of the realm signing key derive the realm vault and seal keys.
     if let aruna_core::structs::identity::auth::NodeCapabilities::Management {
         realm_signing_key,
@@ -418,16 +437,22 @@ async fn fill(
         let seal_key = aruna_core::realm_vault::RealmSealKey::derive(realm_signing_key);
         metadata_options = metadata_options.with_vault_key(key).with_seal_key(seal_key);
     }
-    let metadata_handle = MetadataHandle::new_with_options(
+    let graph_handle = GraphHandle::open(
         &config.metadata_storage_path,
         config.node_id,
-        acquired.storage_handle.clone(),
-        Some(net_handle.clone()),
         Some(net_handle.document_sync_node()),
         Some(net_handle.document_sync_database()),
-        metadata_options,
+        GraphOptions::default()
+            .with_search_storage(config.metadata_search_storage)
+            .with_sync_all(config.fjall_persist_policy == FjallPersistPolicy::SyncAll),
     )?;
-    metadata_handle.share_mail(acquired.jobs_runtime.mail());
+    acquired.graph_handle = Some(graph_handle.clone());
+    let metadata_handle = MetadataHandle::new(
+        &config.metadata_storage_path,
+        acquired.storage_handle.clone(),
+        Some(net_handle.clone()),
+        metadata_options,
+    );
     acquired.metadata_handle = Some(metadata_handle.clone());
     checkpoint(StartupStage::Metadata)?;
     stopped(stop)?;
@@ -456,13 +481,16 @@ async fn fill(
     checkpoint(StartupStage::Compute)?;
     stopped(stop)?;
 
+    let (http, policy) = blob_handle.repository_client();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: acquired.storage_handle.clone(),
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: Some(acquired.task_handle.clone()),
         compute_handle: compute_handle.clone(),
+        outbound_handle: Some(aruna_outbound::OutboundHandle::new(http, policy)),
     });
     // The driver context and the monitoring refresher it feeds are owned before
     // the ops listener can fail to bind.
@@ -493,7 +521,7 @@ async fn fill(
     acquired.usage_counters_rebuilt =
         drive(CounterCheckOperation::new(), driver_ctx.as_ref()).await?;
     if acquired.usage_counters_rebuilt {
-        aruna_operations::node::usage_stats::spawn_usage_rebuild(
+        spawn_usage_rebuild(
             driver_ctx.clone(),
             config.realm_id,
             config.node_id,
@@ -507,9 +535,7 @@ async fn fill(
     open_managed_keys(driver_ctx.as_ref(), config).await?;
     record_restart_locks(driver_ctx.as_ref(), config).await?;
     // Cached realm secrets the config no longer names go before any email job runs.
-    let mail = acquired.jobs_runtime.mail();
-    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id, Some(&mail))
-        .await;
+    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id).await;
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
     aruna_operations::s3::sweeps::spawn_recovery_sweep(
@@ -618,6 +644,44 @@ async fn record_restart_locks(
     Ok(())
 }
 
+/// Rebuilds the usage counters in the background until one rebuild finishes, then publishes
+/// full usage snapshots. Startup does not wait; until then quota-limited writes are refused.
+fn spawn_usage_rebuild(
+    context: Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: NodeId,
+    shutdown: &Shutdown,
+) {
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        // Range counters of distributed buckets are confirmed again by their own rebuilds.
+        match begin_range_rebuilds(&context).await {
+            Ok(begun) if begun > 0 => info!(ranges = begun, "Range counter rebuilds begun"),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Range counter rebuilds could not begin"),
+        }
+        loop {
+            let rebuild = drive(RebuildStatsOperation::new().with_realm(realm_id), &context);
+            let result = tokio::select! {
+                _ = token.cancelled() => return,
+                result = rebuild => result,
+            };
+            match result {
+                Ok(_) => break,
+                Err(error) => warn!(error = %error, "Usage counter rebuild failed; retrying"),
+            }
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(REBUILD_RETRY_PAUSE) => {}
+            }
+        }
+        info!("Usage counters rebuilt");
+        if let Err(error) = publish_refresh_snapshots(&context, node_id, realm_id, true).await {
+            warn!(error = %error, "Usage snapshots were not published after the rebuild");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,8 +702,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 
@@ -667,7 +733,7 @@ mod tests {
     }
 
     async fn rebuild(driver_ctx: &DriverContext) {
-        use aruna_operations::node::usage_stats::RebuildStatsOperation;
+        use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
         drive(RebuildStatsOperation::new(), driver_ctx)
             .await
             .expect("usage rebuild finishes");
@@ -788,7 +854,7 @@ mod tests {
         let task_handle = TaskHandle::new();
         let acquired = Acquired::new(storage_handle.clone(), task_handle);
         assert!(acquired.net_handle.is_none());
-        assert!(acquired.metadata_handle.is_none());
+        assert!(acquired.graph_handle.is_none());
         assert!(acquired.ops_handle.is_none());
 
         let outcome = acquired.cleanup(MIN_SHUTDOWN_GRACE).await;

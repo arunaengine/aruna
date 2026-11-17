@@ -708,8 +708,10 @@ async fn missing_version_rejected() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = drive(
@@ -761,8 +763,10 @@ async fn creates_tombstone() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
@@ -913,8 +917,10 @@ async fn deletes_version() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
@@ -1273,7 +1279,7 @@ async fn read_counters(
 
 #[tokio::test]
 async fn pending_archive_shared() {
-    use crate::blob::usage::StoredDelta;
+    use crate::s3::usage::StoredDelta;
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, COPY_OWNER_KEYSPACE};
     use aruna_core::structs::storage::blob::BlobCleanupWork;
     use aruna_core::structs::storage::usage::{
@@ -1287,8 +1293,10 @@ async fn pending_archive_shared() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     // Two versions of one key share the archive, as a same-bucket copy does.
     let (first, second) = (Ulid::generate(), Ulid::generate());
@@ -1368,8 +1376,10 @@ async fn malformed_owner_aborts() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let version_id = Ulid::generate();
     let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1404,7 +1414,7 @@ async fn malformed_owner_aborts() {
 
 #[tokio::test]
 async fn removes_envelope_rows() {
-    use crate::blob::usage::StoredDelta;
+    use crate::s3::usage::StoredDelta;
     use aruna_core::keyspaces::{
         ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     };
@@ -1417,8 +1427,10 @@ async fn removes_envelope_rows() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let version_id = Ulid::generate();
     let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1469,7 +1481,7 @@ async fn removes_envelope_rows() {
 async fn removes_pending_copy() {
     // Deleting a copy that waits for its envelope deletes its pending row and its charge, also
     // after a key rotation or with encryption off.
-    use crate::blob::usage::StoredDelta;
+    use crate::s3::usage::StoredDelta;
     use aruna_core::keyspaces::{ABE_COPY_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
     use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
     use aruna_core::structs::storage::usage::usage_group_key;
@@ -1483,8 +1495,10 @@ async fn removes_pending_copy() {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let version_id = Ulid::generate();
         let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1600,7 +1614,7 @@ async fn delete_then_recount(
         .unwrap();
     let counters = read_counters(context, usage_group_key(offer.group_id)).await;
     drive(
-        crate::node::usage_stats::RebuildStatsOperation::new(),
+        crate::node::usage_rebuild::RebuildStatsOperation::new(),
         context,
     )
     .await
@@ -1717,7 +1731,7 @@ fn marker_needs_head() {
 /// exact and the group row their sum, and a rebuild finds the same rows.
 #[tokio::test]
 async fn bucket_rows_sum() {
-    use crate::node::usage_stats::RebuildStatsOperation;
+    use crate::node::usage_rebuild::RebuildStatsOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;
@@ -1752,8 +1766,10 @@ async fn bucket_rows_sum() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);

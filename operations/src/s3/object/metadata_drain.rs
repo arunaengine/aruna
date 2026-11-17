@@ -25,11 +25,11 @@ use super::metadata::{
     ReferenceRefresh, ReferenceRefreshError, ReferenceRefreshRecord, due_key, job_entries, job_key,
     split_due,
 };
-use crate::blob::usage::schedule_snapshot_publish;
 use crate::driver::{DriverContext, drive};
 use crate::replication::queue::schedule_blob_drain;
 use crate::s3::object::refresh_mint::{MintError, MintSuccessorOperation};
 use crate::s3::object::refresh_observe::ObserveSourceOperation;
+use crate::s3::usage::schedule_snapshot_publish;
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 use crate::tasks::task_persistence::persist_task_effect;
 

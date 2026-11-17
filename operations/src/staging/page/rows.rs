@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::usage::UsageUpdateError;
+use crate::connectors::descriptor::build_source_binding;
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
+use crate::connectors::root_record::{compact_version, root_write};
 use crate::distribution::guard::GuardError;
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
-use crate::staging::descriptor::build_source_binding;
-use crate::staging::root_record::{compact_version, root_write};
+use crate::s3::usage::UsageUpdateError;
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};

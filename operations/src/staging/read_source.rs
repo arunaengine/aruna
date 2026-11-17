@@ -192,13 +192,10 @@ impl Operation for ReadSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::tests::staging::{create_http_connector, setup_driver_context};
-    use aruna_core::structs::execution::source_access::{
-        ResolvedSourceAccess, ResolvedSourceConnector,
+    use crate::tests::staging::{
+        create_http_connector, sample_connector, sample_resolved_connector, setup_driver_context,
     };
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use futures_util::{StreamExt, stream};
-    use std::collections::HashMap;
     use std::time::SystemTime;
 
     fn sample_input() -> ReadSourceInput {
@@ -208,32 +205,6 @@ mod tests {
             source_path: "folder/file.txt".to_string(),
             range: Some(5..11),
             expected: None,
-        }
-    }
-
-    fn sample_connector() -> SourceConnector {
-        SourceConnector::new(
-            Ulid::from_bytes([2u8; 16]),
-            Ulid::from_bytes([1u8; 16]),
-            "staging-http".to_string(),
-            SourceConnectorKind::Http,
-            HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
-            SystemTime::UNIX_EPOCH,
-            SystemTime::UNIX_EPOCH,
-            Default::default(),
-        )
-    }
-
-    fn sample_resolved_connector() -> ResolvedSourceConnector {
-        ResolvedSourceConnector {
-            connector: sample_connector(),
-            secret_fingerprint: None,
-            access: ResolvedSourceAccess::OpenDal {
-                kind: SourceConnectorKind::Http,
-                config: HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
-                path: "folder/file.txt".to_string(),
-                version: None,
-            },
         }
     }
 

@@ -18,20 +18,21 @@ use tokio::time::{timeout, timeout_at};
 use tracing::{Span, field};
 use ulid::Ulid;
 
-use super::effects::{record_error, record_query_counts};
+use super::effects::record_query_counts;
 use super::{
     METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
     MetadataInner, MetadataRequestError, PAGE_ANSWER_TIMEOUT, SYNC_MIRROR_TIMEOUT,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::protocol::{
-    AuthToken, MetadataReadError, MetadataTransportMessage, encode_message, frame_class,
-    read_message, read_message_budget, read_message_cap, response_cap, write_encoded_message,
-    write_message,
+    MetadataReadError, MetadataTransportMessage, encode_message, frame_class, read_message,
+    read_message_budget, read_message_cap, response_cap, write_encoded_message, write_message,
 };
 use crate::s3::bucket::search::BucketPage;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
+use aruna_core::telemetry::record_error;
 
 #[tracing::instrument(
     name = "metadata.remote.request",
@@ -112,8 +113,10 @@ pub(super) async fn send_export_request(
     inner: &MetadataInner,
     node_id: NodeId,
     message: MetadataTransportMessage,
-) -> Result<Result<super::super::api::ExportMetadataResult, MetadataReadError>, MetadataRequestError>
-{
+) -> Result<
+    Result<super::super::api::export_types::ExportMetadataResult, MetadataReadError>,
+    MetadataRequestError,
+> {
     let metadata_bytes = match &message {
         MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => *metadata_bytes,
         // The channel carries one Profile document; the holder caps the body.
@@ -558,7 +561,7 @@ impl MetadataHandle {
         node_id: NodeId,
         message: MetadataTransportMessage,
     ) -> Result<
-        Result<super::super::api::ExportMetadataResult, MetadataReadError>,
+        Result<super::super::api::export_types::ExportMetadataResult, MetadataReadError>,
         MetadataRequestError,
     > {
         send_export_request(&self.inner, node_id, message).await
@@ -578,7 +581,7 @@ impl MetadataHandle {
             triple_count = field::Empty,
         )
         )]
-    pub async fn query_remote_graphs(
+    pub(crate) async fn query_remote_graphs(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -656,7 +659,7 @@ impl MetadataHandle {
         )
     )]
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_remote_graphs(
+    pub(crate) async fn search_remote_graphs(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -672,12 +675,12 @@ impl MetadataHandle {
     }
 
     /// Asks one node which readable documents its reverse index lists for the identifier.
-    pub async fn request_data_links(
+    pub(crate) async fn request_data_links(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        request: crate::metadata::api::LinkNodeRequest,
-    ) -> Result<crate::metadata::api::LinkNodePage, MetadataReadError> {
+        request: crate::metadata::api::links::types::LinkNodeRequest,
+    ) -> Result<crate::metadata::api::links::types::LinkNodePage, MetadataReadError> {
         match send_remote_request(
             &self.inner,
             &Span::current(),
@@ -695,12 +698,12 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn request_set_preview(
+    pub(crate) async fn request_set_preview(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
         (set_id, limit): (Ulid, usize),
-    ) -> Result<crate::metadata::api::SetPreviewPage, MetadataReadError> {
+    ) -> Result<crate::metadata::api::links::types::SetPreviewPage, MetadataReadError> {
         let request = MetadataTransportMessage::SetPreview {
             auth_token,
             set_id,
@@ -715,7 +718,7 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn request_staging_spec(
+    pub(crate) async fn request_staging_spec(
         &self,
         node_id: NodeId,
         transfer_id: Ulid,
@@ -765,7 +768,7 @@ impl MetadataHandle {
     }
 
     /// The current revision of a realm vault entry from the management node `node_id`.
-    pub async fn request_realm_secret(
+    pub(crate) async fn request_realm_secret(
         &self,
         node_id: NodeId,
         reference: aruna_core::realm_vault::RealmSecretRef,
@@ -785,7 +788,7 @@ impl MetadataHandle {
 
     /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
     /// it holds the whole, checked artifact.
-    pub async fn request_store_artifact(
+    pub(crate) async fn request_store_artifact(
         &self,
         node_id: NodeId,
         chunk: aruna_core::plugins::Chunk,
@@ -801,7 +804,7 @@ impl MetadataHandle {
     }
 
     /// One chunk of a published plugin artifact from the management node `node_id`, unchecked.
-    pub async fn request_artifact(
+    pub(crate) async fn request_artifact(
         &self,
         node_id: NodeId,
         digest: String,
@@ -818,7 +821,7 @@ impl MetadataHandle {
     }
 
     /// The clock of the infrastructure node `node_id`, in Unix milliseconds.
-    pub async fn request_clock(&self, node_id: NodeId) -> Result<u64, MetadataReadError> {
+    pub(crate) async fn request_clock(&self, node_id: NodeId) -> Result<u64, MetadataReadError> {
         let request = MetadataTransportMessage::ProbeClock;
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
             .await
@@ -830,7 +833,7 @@ impl MetadataHandle {
     }
 
     /// Hands matched plugin events to the install's receiver `node_id` and returns its decisions.
-    pub async fn request_forward(
+    pub(crate) async fn request_forward(
         &self,
         node_id: NodeId,
         batch: aruna_core::plugin_runs::EventBatch,
@@ -847,7 +850,7 @@ impl MetadataHandle {
 
     /// Whether the node `node_id` holds the node secret `name` with `kind`, and the header the
     /// secret checks.
-    pub async fn request_node_check(
+    pub(crate) async fn request_node_check(
         &self,
         node_id: NodeId,
         name: aruna_core::secrets::SecretName,
@@ -862,7 +865,7 @@ impl MetadataHandle {
     }
 
     /// The secret bound to a plugin install's slot, released by the management node `node_id`.
-    pub async fn request_release(
+    pub(crate) async fn request_release(
         &self,
         node_id: NodeId,
         request: aruna_core::plugins::ReleaseRequest,
@@ -877,7 +880,7 @@ impl MetadataHandle {
     }
 
     /// The sealed secret of a setting document, opened by the management node `node_id`.
-    pub async fn request_open(
+    pub(crate) async fn request_open(
         &self,
         node_id: NodeId,
         target: aruna_core::document::DocumentTarget,
@@ -894,7 +897,7 @@ impl MetadataHandle {
     }
 
     /// One input page of a job family from `node_id`; `None` when it does not keep it.
-    pub async fn request_input_page(
+    pub(crate) async fn request_input_page(
         &self,
         node_id: NodeId,
         submission: aruna_core::structs::execution::job::SubmissionId,
@@ -912,7 +915,7 @@ impl MetadataHandle {
     }
 
     /// Sends a reference page to a member; an error leaves its outcome unknown.
-    pub async fn request_reference_page(
+    pub(crate) async fn request_reference_page(
         &self,
         node_id: NodeId,
         page: crate::replication::page::ReferencePage,
@@ -930,27 +933,7 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn request_bucket_owner(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        bucket: String,
-    ) -> Result<aruna_core::types::GroupId, MetadataReadError> {
-        match send_remote_request(
-            &self.inner,
-            &Span::current(),
-            node_id,
-            MetadataTransportMessage::BucketOwner { auth_token, bucket },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::BucketOwnerResult { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    pub async fn request_identifier_lookup(
+    pub(crate) async fn request_identifier_lookup(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1018,7 +1001,7 @@ impl MetadataHandle {
             hit_count = field::Empty,
         )
     )]
-    pub async fn request_bucket_search(
+    pub(crate) async fn request_bucket_search(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1074,7 +1057,7 @@ impl MetadataHandle {
         )
     )]
     #[allow(clippy::too_many_arguments)]
-    pub async fn request_object_search(
+    pub(crate) async fn request_object_search(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1118,7 +1101,7 @@ impl MetadataHandle {
         result
     }
 
-    pub async fn request_sync_create(
+    pub(crate) async fn request_sync_create(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1146,12 +1129,13 @@ impl MetadataHandle {
             MetadataTransportMessage::SyncMirrorCreated => Ok(()),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
             other => Err(MetadataError::Backend(format!(
-                "unexpected sync mirror response: {other:?}"
+                "unexpected sync mirror response: {}",
+                transport_message_kind(&other)
             ))),
         }
     }
 
-    pub async fn request_sync_delete(
+    pub(crate) async fn request_sync_delete(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1175,13 +1159,14 @@ impl MetadataHandle {
             MetadataTransportMessage::SyncMirrorDeleted => Ok(()),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
             other => Err(MetadataError::Backend(format!(
-                "unexpected sync mirror response: {other:?}"
+                "unexpected sync mirror response: {}",
+                transport_message_kind(&other)
             ))),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_remote_filtered(
+    pub(crate) async fn search_remote_filtered(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1253,12 +1238,12 @@ impl MetadataHandle {
         result
     }
 
-    pub async fn request_remote_preflight(
+    pub(crate) async fn request_remote_preflight(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        request: super::super::api::ReferenceNodeRequest,
-    ) -> Result<super::super::api::ReferenceNodeExecution, MetadataReadError> {
+        request: super::super::api::preflight_types::ReferenceNodeRequest,
+    ) -> Result<super::super::api::preflight_types::ReferenceNodeExecution, MetadataReadError> {
         match send_remote_request(
             &self.inner,
             &Span::current(),

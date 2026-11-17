@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::usage::{QuotaGate, RowChange, UsageCounterUpdate};
 use crate::driver::{DriverContext, drive};
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::object::put::abe::{abe_reads, envelope_rows, parse_abe};
+use crate::s3::usage::{QuotaGate, RowChange, UsageCounterUpdate};
 use crate::storage_read::iter_prefix_page;
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

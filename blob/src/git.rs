@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::git::{DocumentLocks, GitEffect, GitEvent, MAX_GIT_BYTES};
+use aruna_core::git::{GitEffect, GitEvent, MAX_GIT_BYTES};
 use aruna_core::repo_layout::Layout;
 use aruna_core::telemetry::{record_stage, time_stage};
 use bytes::Bytes;
@@ -12,12 +12,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use ulid::Ulid;
 
 #[derive(Debug)]
 pub struct GitStore {
     root: PathBuf,
     helper: PathBuf,
+    /// Held while one effect runs on a repository.
     locks: DocumentLocks,
+    /// Held across a projection, snapshot or push of one document, which runs several effects.
+    documents: DocumentLocks,
     slots: Semaphore,
     /// The layout of each seen commit; a commit never changes, so the answer stays valid.
     layouts: std::sync::Mutex<lru::LruCache<(ulid::Ulid, String), Layout>>,
@@ -26,12 +30,46 @@ pub struct GitStore {
 /// Commits whose layout is kept; older answers are read from the repository again.
 const LAYOUTS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4096).unwrap();
 
+/// One async lock per document, created on first use and dropped once nobody holds it.
+#[derive(Debug, Default)]
+struct DocumentLocks(
+    std::sync::Mutex<std::collections::HashMap<Ulid, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+);
+
+impl DocumentLocks {
+    async fn lock(&self, document_id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.mutex(document_id).lock_owned().await
+    }
+
+    /// The lock when no one holds it, without waiting.
+    fn try_lock(&self, document_id: Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.mutex(document_id).try_lock_owned().ok()
+    }
+
+    fn mutex(&self, document_id: Ulid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&document_id).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(document_id, std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        }
+    }
+}
+
 impl GitStore {
     pub fn new(root: PathBuf, helper: PathBuf) -> Self {
         Self {
             root,
             helper,
             locks: DocumentLocks::default(),
+            documents: DocumentLocks::default(),
             slots: Semaphore::new(2),
             layouts: std::sync::Mutex::new(lru::LruCache::new(LAYOUTS)),
         }
@@ -45,6 +83,16 @@ impl GitStore {
         }
         let mut layouts = self.layouts.lock().ok()?;
         layouts.get(&(document_id, revision.to_string())).copied()
+    }
+
+    /// Serializes projection, snapshots and pushes of one document on this node.
+    pub async fn lock(&self, document_id: ulid::Ulid) -> tokio::sync::OwnedMutexGuard<()> {
+        time_stage("git_document_lock", self.documents.lock(document_id)).await
+    }
+
+    /// The document lock when it is free; reads use it to avoid waiting for a running snapshot.
+    pub fn try_lock(&self, document_id: ulid::Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.documents.try_lock(document_id)
     }
 
     /// Whether the local repository still has the required files and settings.
@@ -661,5 +709,22 @@ mod tests {
             .expect("broken repository is repaired");
         assert!(repository.join("HEAD").exists());
         assert!(store.configured(id).await);
+    }
+
+    #[tokio::test]
+    async fn reads_skip_busy() {
+        let locks = DocumentLocks::default();
+        let id = ulid::Ulid::from(1);
+        let held = locks.lock(id).await;
+        assert!(
+            locks.try_lock(id).is_none(),
+            "a held lock is not handed out"
+        );
+        assert!(
+            locks.try_lock(ulid::Ulid::from(2)).is_some(),
+            "other documents stay free"
+        );
+        drop(held);
+        assert!(locks.try_lock(id).is_some());
     }
 }

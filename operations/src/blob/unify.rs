@@ -881,7 +881,7 @@ impl Stage<'_> {
 
     /// Charges the kept file's new location row, as reclaim debits the released one.
     async fn charge(&self, location: &BackendLocation) -> Result<(), String> {
-        use crate::blob::usage::{StoredDelta, UsageCounterUpdate};
+        use crate::s3::usage::{StoredDelta, UsageCounterUpdate};
         let bytes = i128::from(location.stored_size());
         let Some(stored) = StoredDelta::of_copy(location, 1, bytes) else {
             return Ok(());

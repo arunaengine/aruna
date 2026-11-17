@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use crate::blob::reclaim::{ReclaimBlobError, ReclaimVerdict};
 use crate::blob::records::owners_scan_effect;
-use crate::blob::usage::{StoredDelta, UsageCounterUpdate};
+use crate::s3::usage::{StoredDelta, UsageCounterUpdate};
 
 #[derive(Debug, PartialEq)]
 enum State {
@@ -342,8 +342,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let layout = PithosLayout {
             stored_size: 130,

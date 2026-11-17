@@ -3,28 +3,31 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::imports::{page, read_value};
-use std::sync::Mutex;
+use std::collections::VecDeque;
 use std::time::SystemTime;
 
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::NodeId;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DISTRIBUTION_KEYSPACE, NODE_STATE_KEYSPACE,
 };
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionView, KeyRange, WriteRoute,
 };
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::{Effects, Key, Value};
 use serde::{Deserialize, Serialize};
+use smallvec::smallvec;
+use thiserror::Error;
 use ulid::Ulid;
 
 use super::guard::{authority_reads, authority_rows, write_target};
-use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 
@@ -36,14 +39,9 @@ const PAGES_PER_PASS: usize = 16;
 const SETS_PER_PASS: usize = 64;
 const ROUND_PREFIX: &[u8] = b"refresh_round/";
 
-/// The record after which the next pass continues; a restart begins again at the start.
-static CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-/// The set and the lower key of the range after which the set's sweep goes on in the next pass.
-static RANGE_CURSOR: Mutex<Option<(Ulid, String)>> = Mutex::new(None);
-
 /// One range's refresh round on this coordinator.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct RefreshRound {
+struct RefreshRound {
     /// The last key queued in this round; `None` before its first page.
     pub after: Option<String>,
     pub started_ms: u64,
@@ -72,75 +70,489 @@ fn round_key(set_id: Ulid, range_id: Ulid) -> Vec<u8> {
     [ROUND_PREFIX, &set_id.to_bytes(), &range_id.to_bytes()].concat()
 }
 
-/// One bounded pass over the distributed buckets with a refresh interval. Returns whether a
-/// round has more pages, so the next pass should come soon.
-pub(crate) async fn refresh_ranges(context: &DriverContext) -> Result<bool, String> {
-    let Some(net) = context.net_handle.as_ref() else {
-        return Ok(false);
-    };
-    let realm_id = *net.realm_id();
-    let after = CURSOR.lock().ok().and_then(|cursor| cursor.clone());
-    let start = after.clone().map(|after| IterStart::After(after.into()));
-    let (records, next) = page(context, DISTRIBUTION_KEYSPACE, None, start, SETS_PER_PASS).await?;
-    let resume = |position: Option<Vec<u8>>| {
-        if let Ok(mut cursor) = CURSOR.lock() {
-            *cursor = position;
+/// Where the next pass goes on: the record after which it reads, and the set and lower key of
+/// the range after which a set's sweep continues.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RefreshCursor {
+    pub record: Option<Vec<u8>>,
+    pub sweep: Option<(Ulid, String)>,
+}
+
+/// What one pass did: whether a round has more pages, and where the next pass goes on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RefreshPass {
+    pub busy: bool,
+    pub cursor: RefreshCursor,
+}
+
+/// A failed pass, with the record cursor the next pass resumes at.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("the periodic source refresh failed: {reason}")]
+pub(crate) struct RefreshError {
+    pub reason: String,
+    pub record: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum State {
+    Init,
+    Records,
+    Bucket,
+    Authority,
+    Round,
+    Heads,
+    Version,
+    Queue,
+    WriteRound,
+    Finish,
+    Error,
+}
+
+/// The record whose ranges the pass walks.
+#[derive(Debug, PartialEq)]
+struct SetWalk {
+    record_key: Vec<u8>,
+    set_id: Ulid,
+    bucket: String,
+    refresh_secs: u64,
+    binding: Option<DistributionBinding>,
+    after: Option<String>,
+}
+
+/// The range page being walked.
+#[derive(Debug, PartialEq)]
+struct RangeWalk {
+    range: KeyRange,
+    key: Vec<u8>,
+    walked: RefreshRound,
+    heads: VecDeque<(Key, Value)>,
+    head: Option<(String, Ulid)>,
+}
+
+/// One bounded pass over the distributed buckets with a refresh interval. `now` is the time
+/// rounds start at and refreshes are stamped with.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RefreshRangesOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    now: SystemTime,
+    now_ms: u64,
+    after: Option<Vec<u8>>,
+    record: Option<Vec<u8>>,
+    sweep: Option<(Ulid, String)>,
+    state: State,
+    records: VecDeque<(Key, Value)>,
+    set: Option<SetWalk>,
+    ranges: VecDeque<KeyRange>,
+    last: Option<String>,
+    walk: Option<RangeWalk>,
+    bucket: Option<GetBucketOperation>,
+    queue: Option<QueueRefreshOperation>,
+    pages: usize,
+    busy: bool,
+    done: Option<Vec<u8>>,
+    output: Option<Result<RefreshPass, RefreshError>>,
+}
+
+impl RefreshRangesOperation {
+    pub(crate) fn new(
+        realm_id: RealmId,
+        node_id: NodeId,
+        now: SystemTime,
+        cursor: RefreshCursor,
+    ) -> Self {
+        let now_ms = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        Self {
+            realm_id,
+            node_id,
+            now,
+            now_ms,
+            after: cursor.record.clone(),
+            record: cursor.record.clone(),
+            sweep: cursor.sweep,
+            state: State::Init,
+            records: VecDeque::new(),
+            set: None,
+            ranges: VecDeque::new(),
+            last: None,
+            walk: None,
+            bucket: None,
+            queue: None,
+            pages: 0,
+            busy: false,
+            done: cursor.record,
+            output: None,
         }
-    };
-    resume(next.map(|next| next.to_vec()));
-    let (mut pages, mut busy, mut done) = (0usize, false, after);
-    let mut sweep = RANGE_CURSOR
-        .lock()
-        .ok()
-        .and_then(|mut cursor| cursor.take());
-    for (record_key, value) in records {
-        let Ok(view) = DistributionView::from_bytes(&value) else {
-            continue;
+    }
+
+    fn finish(&mut self, busy: bool, sweep: Option<(Ulid, String)>) -> Effects {
+        let cursor = RefreshCursor {
+            record: self.record.clone(),
+            sweep,
         };
-        let snapshot = view.snapshot();
-        let Some(refresh_secs) = snapshot.config.settings.refresh_secs else {
-            continue;
-        };
-        let bucket = &snapshot.config.bucket;
-        let Ok(info) = drive(GetBucketOperation::new(bucket.clone()), context).await else {
-            continue;
-        };
-        let Some(binding) = info.distribution.filter(|b| b.set_id == snapshot.set_id()) else {
-            continue;
-        };
-        let now_ms = unix_timestamp_millis();
-        let after = (sweep.take())
-            .filter(|(set_id, _)| *set_id == binding.set_id)
-            .map(|(_, lower)| lower);
-        let mut last = None;
-        // One sweep visits each range once; once it ends, the next set follows.
-        for range in after_range(coordinated(context, &binding).await?, after.as_deref()) {
-            // A pass that runs out of pages comes back to this set, after its last range.
-            if pages >= PAGES_PER_PASS {
-                resume(done);
-                if let (Ok(mut cursor), Some(lower)) = (RANGE_CURSOR.lock(), last) {
-                    *cursor = Some((binding.set_id, lower));
-                }
-                return Ok(true);
-            }
-            last = Some(range.lower.clone());
-            let key = round_key(binding.set_id, range.range_id);
-            let first = RefreshRound {
-                started_ms: now_ms,
-                ..RefreshRound::default()
-            };
-            let round = read_round(context, &key).await?.unwrap_or(first);
-            let Some(round) = round.due(now_ms, refresh_secs) else {
+        self.state = State::Finish;
+        self.output = Some(Ok(RefreshPass { busy, cursor }));
+        smallvec![]
+    }
+
+    fn fail(&mut self, reason: impl ToString) -> Effects {
+        self.state = State::Error;
+        self.output = Some(Err(RefreshError {
+            reason: reason.to_string(),
+            record: self.record.clone(),
+        }));
+        smallvec![]
+    }
+
+    fn next_record(&mut self) -> Effects {
+        while let Some((record_key, value)) = self.records.pop_front() {
+            let Ok(view) = DistributionView::from_bytes(&value) else {
                 continue;
             };
-            let walked = walk_page(context, (bucket, &range), round, realm_id).await?;
-            pages += 1;
-            busy |= !walked.finished;
-            write_round(context, key, &walked).await?;
+            let snapshot = view.snapshot();
+            let Some(refresh_secs) = snapshot.config.settings.refresh_secs else {
+                continue;
+            };
+            self.set = Some(SetWalk {
+                record_key: record_key.to_vec(),
+                set_id: snapshot.set_id(),
+                bucket: snapshot.config.bucket.clone(),
+                refresh_secs,
+                binding: None,
+                after: None,
+            });
+            let mut bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
+            let effects = bucket.start();
+            self.state = State::Bucket;
+            return self.bucket_step(bucket, effects);
         }
-        done = Some(record_key.to_vec());
+        let busy = self.busy;
+        self.finish(busy, None)
     }
-    Ok(busy)
+
+    /// Keeps a running bucket read; a finished one decides whether the set is walked here.
+    fn bucket_step(&mut self, bucket: GetBucketOperation, effects: Effects) -> Effects {
+        if !bucket.is_complete() {
+            self.bucket = Some(bucket);
+            return effects;
+        }
+        let Some(set) = self.set.as_mut() else {
+            return self.fail("no set is walked");
+        };
+        let binding = (bucket.finalize().ok())
+            .and_then(|info| info.distribution)
+            .filter(|binding| binding.set_id == set.set_id);
+        let Some(binding) = binding else {
+            return self.next_record();
+        };
+        set.after = (self.sweep.take())
+            .filter(|(set_id, _)| *set_id == binding.set_id)
+            .map(|(_, lower)| lower);
+        let reads = authority_reads(binding.set_id);
+        set.binding = Some(binding);
+        self.state = State::Authority;
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })]
+    }
+
+    /// Walks the next range the set's sweep visits, while the pass has pages left.
+    fn next_range(&mut self) -> Effects {
+        let Some(set) = self.set.as_ref() else {
+            return self.fail("no set is walked");
+        };
+        let Some(range) = self.ranges.pop_front() else {
+            self.done = Some(set.record_key.clone());
+            return self.next_record();
+        };
+        // A pass that runs out of pages comes back to this set, after its last range.
+        if self.pages >= PAGES_PER_PASS {
+            self.record = self.done.clone();
+            let sweep = self.last.take().map(|lower| (set.set_id, lower));
+            return self.finish(true, sweep);
+        }
+        self.last = Some(range.lower.clone());
+        let key = round_key(set.set_id, range.range_id);
+        self.walk = Some(RangeWalk {
+            range,
+            key: key.clone(),
+            walked: RefreshRound::default(),
+            heads: VecDeque::new(),
+            head: None,
+        });
+        self.state = State::Round;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        })]
+    }
+
+    /// Reads the next page of the range's heads for a due round.
+    fn walk_page(&mut self, round: RefreshRound) -> Effects {
+        let (Some(set), Some(walk)) = (self.set.as_ref(), self.walk.as_mut()) else {
+            return self.fail("no range is walked");
+        };
+        let bucket = &set.bucket;
+        let start = match &round.after {
+            Some(after) => {
+                (BlobHeadKey::new(bucket, after).to_bytes()).map(|key| IterStart::After(key.into()))
+            }
+            None => (BlobHeadKey::new(bucket, &walk.range.lower).to_bytes())
+                .map(|key| IterStart::At(key.into())),
+        };
+        let page = start.and_then(|start| Ok((BlobHeadKey::bucket_prefix(bucket)?, start)));
+        let (prefix, start) = match page {
+            Ok(page) => page,
+            Err(error) => return self.fail(error),
+        };
+        walk.walked = round;
+        self.state = State::Heads;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
+            start: Some(start),
+            limit: PAGE,
+            txn_id: None,
+        })]
+    }
+
+    /// Reads the version of the next head of the page, or writes the round once the page ends.
+    fn next_head(&mut self) -> Effects {
+        let (Some(set), Some(walk)) = (self.set.as_ref(), self.walk.as_mut()) else {
+            return self.fail("no range is walked");
+        };
+        let Some((key, value)) = walk.heads.pop_front() else {
+            return self.write_round();
+        };
+        let found = BlobHeadKey::from_bytes(&key).and_then(|head| {
+            let pointer = CurrentVersionPointer::from_bytes(&value)?;
+            let row = VersionKey::new(&set.bucket, &head.key, pointer.version_id).to_bytes()?;
+            Ok((head.key, pointer.version_id, row))
+        });
+        let (name, version_id, row) = match found {
+            Ok(found) => found,
+            Err(error) => return self.fail(error),
+        };
+        if !walk.range.contains(&name) {
+            walk.walked.finished = true;
+            return self.write_round();
+        }
+        walk.head = Some((name, version_id));
+        self.state = State::Version;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: row.into(),
+            txn_id: None,
+        })]
+    }
+
+    /// Notes the head as walked and moves to the next one.
+    fn walked_head(&mut self) -> Effects {
+        if let Some(walk) = self.walk.as_mut()
+            && let Some((name, _)) = walk.head.take()
+        {
+            walk.walked.after = Some(name);
+        }
+        self.next_head()
+    }
+
+    fn write_round(&mut self) -> Effects {
+        let Some(walk) = self.walk.as_ref() else {
+            return self.fail("no range is walked");
+        };
+        let value = match postcard::to_allocvec(&walk.walked) {
+            Ok(value) => value,
+            Err(error) => return self.fail(error),
+        };
+        self.state = State::WriteRound;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: walk.key.clone().into(),
+            value: value.into(),
+            txn_id: None,
+        })]
+    }
+
+    /// Keeps a running refresh queue write; a finished one moves to the next head.
+    fn queue_step(&mut self, queue: QueueRefreshOperation, effects: Effects) -> Effects {
+        if !queue.is_complete() {
+            self.queue = Some(queue);
+            return effects;
+        }
+        match queue.finalize() {
+            Ok(_) => self.walked_head(),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn refresh(&self, version: &BlobVersion) -> Option<ReferenceRefresh> {
+        let (set, walk) = (self.set.as_ref()?, self.walk.as_ref()?);
+        let (key, version_id) = walk.head.clone()?;
+        Some(ReferenceRefresh {
+            bucket: set.bucket.clone(),
+            key,
+            version_id,
+            metadata: None,
+            refreshed_at: self.now,
+            node_id: self.node_id,
+            auth_context: AuthContext {
+                user_id: version.created_by,
+                realm_id: self.realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+        })
+    }
+}
+
+impl Operation for RefreshRangesOperation {
+    type Output = RefreshPass;
+    type Error = RefreshError;
+
+    fn start(&mut self) -> Effects {
+        self.state = State::Records;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: DISTRIBUTION_KEYSPACE.to_string(),
+            prefix: None,
+            start: self
+                .after
+                .clone()
+                .map(|after| IterStart::After(after.into())),
+            limit: SETS_PER_PASS,
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (self.state, event) {
+            (
+                State::Records,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                self.record = next_start_after.map(|next| next.to_vec());
+                self.records = values.into();
+                self.next_record()
+            }
+            (State::Bucket, event) => match self.bucket.take() {
+                Some(mut bucket) => {
+                    let effects = bucket.step(event);
+                    self.bucket_step(bucket, effects)
+                }
+                None => self.fail("no bucket is read"),
+            },
+            (State::Authority, event) => {
+                let rows = authority_rows(event).map_err(|error| error.to_string());
+                let Some(set) = self.set.as_ref() else {
+                    return self.fail("no set is walked");
+                };
+                let ranges = rows.and_then(|(record, fence)| {
+                    coordinated(set.binding.as_ref(), record.as_deref(), fence.as_deref())
+                });
+                match ranges.map(|ranges| after_range(ranges, set.after.as_deref())) {
+                    Ok(ranges) => {
+                        self.ranges = ranges.into();
+                        self.last = None;
+                        self.next_range()
+                    }
+                    Err(reason) => self.fail(reason),
+                }
+            }
+            (State::Round, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let stored = (value.as_deref())
+                    .map(postcard::from_bytes::<RefreshRound>)
+                    .transpose();
+                let round = match stored {
+                    Ok(round) => round.unwrap_or(RefreshRound {
+                        started_ms: self.now_ms,
+                        ..RefreshRound::default()
+                    }),
+                    Err(error) => return self.fail(error),
+                };
+                let refresh_secs = self.set.as_ref().map_or(0, |set| set.refresh_secs);
+                match round.due(self.now_ms, refresh_secs) {
+                    Some(round) => self.walk_page(round),
+                    None => self.next_range(),
+                }
+            }
+            (
+                State::Heads,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                let Some(walk) = self.walk.as_mut() else {
+                    return self.fail("no range is walked");
+                };
+                walk.walked.finished = next_start_after.is_none();
+                walk.heads = values.into();
+                self.next_head()
+            }
+            (State::Version, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let version = match (value.as_deref()).map(BlobVersion::from_bytes).transpose() {
+                    Ok(version) => version,
+                    Err(error) => return self.fail(error),
+                };
+                // The worker observes the source; only a confirmed change mints a successor.
+                let refresh = version
+                    .filter(|version| matches!(version.state, BlobVersionState::Reference { .. }))
+                    .and_then(|version| self.refresh(&version));
+                let Some(refresh) = refresh else {
+                    return self.walked_head();
+                };
+                let mut queue = QueueRefreshOperation::new(refresh);
+                let effects = queue.start();
+                self.state = State::Queue;
+                self.queue_step(queue, effects)
+            }
+            (State::Queue, event) => match self.queue.take() {
+                Some(mut queue) => {
+                    let effects = queue.step(event);
+                    self.queue_step(queue, effects)
+                }
+                None => self.fail("no refresh is queued"),
+            },
+            (State::WriteRound, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.pages += 1;
+                self.busy |= self.walk.take().is_some_and(|walk| !walk.walked.finished);
+                self.next_range()
+            }
+            (state, event) => self.fail(format!(
+                "unexpected event in state {state:?}: {}",
+                event.label()
+            )),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, State::Finish | State::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(RefreshError {
+            reason: "the pass did not finish".to_string(),
+            record: self.record,
+        }))
+    }
+
+    fn abort(&mut self) -> Effects {
+        if let Some(queue) = self.queue.as_mut() {
+            return queue.abort();
+        }
+        match self.bucket.as_mut() {
+            Some(bucket) => bucket.abort(),
+            None => smallvec![],
+        }
+    }
 }
 
 /// The ranges a sweep still visits, in key order: those whose lower key follows `after`.
@@ -151,125 +563,24 @@ fn after_range(mut ranges: Vec<KeyRange>, after: Option<&str>) -> Vec<KeyRange> 
 }
 
 /// The ranges this member coordinates now; a range it fenced for a transfer is left out.
-async fn coordinated(
-    context: &DriverContext,
-    binding: &DistributionBinding,
+fn coordinated(
+    binding: Option<&DistributionBinding>,
+    record: Option<&[u8]>,
+    fence: Option<&[u8]>,
 ) -> Result<Vec<KeyRange>, String> {
-    let read = StorageEffect::BatchRead {
-        reads: authority_reads(binding.set_id),
-        txn_id: None,
+    let Some(binding) = binding else {
+        return Err("no binding is walked".to_string());
     };
-    let event = context.storage_handle.send_storage_effect(read).await;
-    let (record, fence) = authority_rows(event).map_err(|error| error.to_string())?;
-    let Some(view) = (record.as_deref())
-        .map(DistributionView::from_bytes)
-        .transpose()
+    let Some(view) = (record.map(DistributionView::from_bytes).transpose())
         .map_err(|error| error.to_string())?
     else {
         return Ok(Vec::new());
     };
     let ranges = view.snapshot().config.ranges.iter().filter(|range| {
-        let target = write_target(binding, &range.lower, record.as_deref(), fence.as_deref());
+        let target = write_target(binding, &range.lower, record, fence);
         matches!(target, Ok(WriteRoute::Local { .. }))
     });
     Ok(ranges.cloned().collect())
-}
-
-/// Queues the reference heads of one page of the range and returns the round after it.
-async fn walk_page(
-    context: &DriverContext,
-    (bucket, range): (&str, &KeyRange),
-    round: RefreshRound,
-    realm_id: aruna_core::structs::identity::realm::RealmId,
-) -> Result<RefreshRound, String> {
-    let error = |error: aruna_core::errors::ConversionError| error.to_string();
-    let prefix = BlobHeadKey::bucket_prefix(bucket).map_err(error)?;
-    let start = match &round.after {
-        Some(after) => IterStart::After(
-            BlobHeadKey::new(bucket, after)
-                .to_bytes()
-                .map_err(error)?
-                .into(),
-        ),
-        None => IterStart::At(
-            BlobHeadKey::new(bucket, &range.lower)
-                .to_bytes()
-                .map_err(error)?
-                .into(),
-        ),
-    };
-    let (heads, more) = page(context, BLOB_HEAD_KEYSPACE, Some(prefix), Some(start), PAGE).await?;
-    let mut next = RefreshRound {
-        finished: more.is_none(),
-        ..round
-    };
-    let node_id = context.net_handle.as_ref().map(|net| net.node_id());
-    for (key, value) in heads {
-        let head = BlobHeadKey::from_bytes(&key).map_err(error)?;
-        if !range.contains(&head.key) {
-            next.finished = true;
-            break;
-        }
-        let pointer = CurrentVersionPointer::from_bytes(&value).map_err(error)?;
-        let row = VersionKey::new(bucket, &head.key, pointer.version_id)
-            .to_bytes()
-            .map_err(error)?;
-        let version = read_value(context, BLOB_VERSIONS_KEYSPACE, row.into()).await?;
-        let version = (version.as_deref())
-            .map(BlobVersion::from_bytes)
-            .transpose()
-            .map_err(error)?;
-        if let (Some(version), Some(node_id)) = (version, node_id)
-            && matches!(version.state, BlobVersionState::Reference { .. })
-        {
-            // The worker observes the source; only a confirmed change mints a successor.
-            let refresh = ReferenceRefresh {
-                bucket: bucket.to_string(),
-                key: head.key.clone(),
-                version_id: pointer.version_id,
-                metadata: None,
-                refreshed_at: SystemTime::now(),
-                node_id,
-                auth_context: AuthContext {
-                    user_id: version.created_by,
-                    realm_id,
-                    path_restrictions: None,
-                    session: None,
-                },
-            };
-            drive(QueueRefreshOperation::new(refresh), context)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        next.after = Some(head.key);
-    }
-    Ok(next)
-}
-
-async fn read_round(context: &DriverContext, key: &[u8]) -> Result<Option<RefreshRound>, String> {
-    let value = read_value(context, NODE_STATE_KEYSPACE, key.to_vec().into()).await?;
-    (value.as_deref())
-        .map(postcard::from_bytes)
-        .transpose()
-        .map_err(|error| error.to_string())
-}
-
-async fn write_round(
-    context: &DriverContext,
-    key: Vec<u8>,
-    round: &RefreshRound,
-) -> Result<(), String> {
-    let value = postcard::to_allocvec(round).map_err(|error| error.to_string())?;
-    let write = StorageEffect::Write {
-        key_space: NODE_STATE_KEYSPACE.to_string(),
-        key: key.into(),
-        value: value.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(format!("refresh round not written: {other:?}")),
-    }
 }
 
 #[cfg(test)]
@@ -322,5 +633,123 @@ mod tests {
             (next.after, next.started_ms, next.finished),
             (None, 61_000, false)
         );
+    }
+    use crate::distribution::test_record::with_settings;
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::storage::distribution::DistributionSettings;
+
+    fn pass(cursor: RefreshCursor) -> RefreshRangesOperation {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        RefreshRangesOperation::new(realm_id, node_id, now, cursor)
+    }
+
+    fn records(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: (values.into_iter())
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            next_start_after: next.map(Key::from),
+        })
+    }
+
+    fn record_page(after: Option<Vec<u8>>) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: DISTRIBUTION_KEYSPACE.to_string(),
+            prefix: None,
+            start: after.map(|after| IterStart::After(after.into())),
+            limit: SETS_PER_PASS,
+            txn_id: None,
+        })
+    }
+
+    // Records without a refresh interval are skipped; the record cursor moves past the page.
+    #[test]
+    fn skips_unrefreshed_sets() {
+        let (_, plain) = with_settings(true, 0, DistributionSettings::default());
+        let mut operation = pass(RefreshCursor {
+            record: Some(vec![1]),
+            sweep: None,
+        });
+        check_trace(
+            &mut operation,
+            &[record_page(Some(vec![1]))],
+            vec![(
+                records(vec![(vec![2], plain), (vec![3], vec![0xFF])], Some(vec![3])),
+                Vec::new(),
+            )],
+        );
+        let cursor = RefreshCursor {
+            record: Some(vec![3]),
+            sweep: None,
+        };
+        assert_eq!(
+            operation.finalize(),
+            Ok(RefreshPass {
+                busy: false,
+                cursor
+            })
+        );
+    }
+
+    // A set whose bucket is not readable here is skipped, and the pass goes on.
+    #[test]
+    fn unreadable_bucket_skipped() {
+        let settings = DistributionSettings {
+            refresh_secs: Some(60),
+            ..DistributionSettings::default()
+        };
+        let (snapshot, refreshed) = with_settings(true, 0, settings);
+        let mut operation = pass(RefreshCursor::default());
+        operation.start();
+        let effects = operation.step(records(vec![(vec![2], refreshed)], None));
+        let mut bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
+        assert_eq!(effects, bucket.start());
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert!(operation.step(failed).is_empty());
+        let pass = operation.finalize().unwrap();
+        assert_eq!((pass.busy, pass.cursor), (false, RefreshCursor::default()));
+    }
+
+    // A failed record page keeps the cursor the pass began at.
+    #[test]
+    fn failure_keeps_cursor() {
+        let mut operation = pass(RefreshCursor {
+            record: Some(vec![1]),
+            sweep: Some((Ulid::nil(), "a".to_string())),
+        });
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        let error = operation.finalize().unwrap_err();
+        assert_eq!(error.record, Some(vec![1]));
+    }
+
+    // Events outside the record read are refused; nothing is cleaned up before a child runs.
+    #[test]
+    fn rejects_unexpected() {
+        let started = || {
+            let mut operation = pass(RefreshCursor::default());
+            operation.start();
+            operation
+        };
+        let refused = rejects_events(started, sample_events, |event| {
+            matches!(event, Event::Storage(StorageEvent::IterResult { .. }))
+        });
+        assert_eq!(refused.len(), sample_events().len() - 1);
+        let fresh = || pass(RefreshCursor::default());
+        assert_eq!(
+            rejects_events(fresh, sample_events, |_| false).len(),
+            sample_events().len()
+        );
+        assert!(started().abort().is_empty());
+        rejects_finalize(started());
     }
 }

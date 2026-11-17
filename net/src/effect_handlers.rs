@@ -17,6 +17,8 @@ use aruna_core::events::{
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
+use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
 use parking_lot::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -42,6 +44,8 @@ const PUT_ANSWER_DEADLINE: Duration = Duration::from_secs(180);
 /// Everything a net effect needs besides the effect itself.
 pub struct NetEffectContext {
     pub dht: Arc<DhtHandle>,
+    /// This node's key, which signs snapshots and statements naming this node.
+    pub secret_key: iroh::SecretKey,
     pub document_sync: Arc<DocumentSyncService>,
     pub presence: RealmPresenceCache,
     pub tasks: TaskTracker,
@@ -242,16 +246,22 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::VaultSign(_) => NetEvent::VaultSign(VaultSignEvent::Unavailable(
             "vault signing must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::SnapshotSign(_) => NetEvent::SnapshotSign(SnapshotSignEvent::Unavailable(
-            "snapshot signing must be dispatched by the operations runner".to_string(),
-        )),
-        NetEffect::StatementSign(_) => NetEvent::StatementSign(StatementSignEvent::Unavailable(
-            "statement signing must be dispatched by the operations runner".to_string(),
-        )),
+        NetEffect::SnapshotSign(claim) => {
+            NetEvent::SnapshotSign(sign_snapshot(&ctx.secret_key, *claim))
+        }
+        NetEffect::StatementSign(claim) => {
+            NetEvent::StatementSign(sign_statement(&ctx.secret_key, *claim))
+        }
         NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
         )),
+        // Notification requests and inbox wakes need the net handle, which the runner holds.
+        NetEffect::Notification(_) => NetEvent::Notification(Err(
+            "notification requests must be dispatched by the operations runner".to_string(),
+        )),
+        NetEffect::WakeInbox(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
+        NetEffect::Heartbeat(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
     }
 }
 
@@ -259,6 +269,35 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
 fn release_unavailable() -> aruna_core::structs::storage::release::ReleaseEvent {
     let reason = "release reads must be dispatched by the operations runner".to_string();
     aruna_core::structs::storage::release::ReleaseEvent::Holder(Err(reason))
+}
+
+/// Signs a snapshot with this node's key, only when this node is the set's bound publisher.
+pub(crate) fn sign_snapshot(key: &iroh::SecretKey, claim: SnapshotClaim) -> SnapshotSignEvent {
+    if claim.snapshot.root.publisher != key.public() {
+        return SnapshotSignEvent::Unavailable("snapshot names another publisher".to_string());
+    }
+    let Ok(bytes) = claim.snapshot.signing_bytes(claim.realm_id) else {
+        return SnapshotSignEvent::Unavailable("snapshot does not encode".to_string());
+    };
+    SnapshotSignEvent::Signed(Box::new(SignedSnapshot {
+        signature: key.sign(&bytes),
+        snapshot: claim.snapshot,
+    }))
+}
+
+/// Signs a member statement with this node's key, only when the claim names this node.
+pub(crate) fn sign_statement(key: &iroh::SecretKey, claim: StatementClaim) -> StatementSignEvent {
+    if claim.signer != key.public() {
+        return StatementSignEvent::Unavailable("statement names another signer".to_string());
+    }
+    let Ok(bytes) = claim.statement.signing_bytes() else {
+        return StatementSignEvent::Unavailable("statement does not encode".to_string());
+    };
+    StatementSignEvent::Signed(Box::new(SignedStatement {
+        signature: key.sign(&bytes),
+        signer: claim.signer,
+        statement: claim.statement,
+    }))
 }
 
 fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
@@ -535,6 +574,9 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::StatementSign(_) => "statement_sign",
         NetEffect::Release(_) => "release",
         NetEffect::ArtifactStore(_) => "artifact_store",
+        NetEffect::Notification(_) => "notification",
+        NetEffect::WakeInbox(_) => "wake_inbox",
+        NetEffect::Heartbeat(_) => "heartbeat",
     }
 }
 
@@ -584,6 +626,7 @@ mod tests {
         .expect("test net handle");
         let context = NetEffectContext {
             dht: handle.inner.dht.clone(),
+            secret_key: handle.inner.endpoint.secret_key().clone(),
             document_sync: handle.inner.document_sync.clone(),
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
@@ -651,6 +694,7 @@ mod tests {
         second.add_peer_addr(first.endpoint_addr()).await;
         let context = NetEffectContext {
             dht: first.inner.dht.clone(),
+            secret_key: first.inner.endpoint.secret_key().clone(),
             document_sync: first.inner.document_sync.clone(),
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),

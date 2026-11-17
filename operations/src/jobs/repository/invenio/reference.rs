@@ -18,10 +18,11 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::connect;
+use crate::connectors::descriptor::build_source_binding;
+use crate::driver::drive;
 use crate::jobs::executor::JobContext;
 use crate::jobs::repository::{TransferError, interruptible};
-use crate::staging::descriptor::build_source_binding;
-use crate::staging::reference::{ReferenceWrite, write_reference_version};
+use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
 
 pub(crate) async fn write_reference(
     ctx: &JobContext,
@@ -102,25 +103,29 @@ pub(crate) async fn write_reference(
     if ctx.shutdown.is_cancelled() {
         return Err(TransferError::Interrupted);
     }
-    write_reference_version(
+    drive(
+        WriteReferenceOperation::new(
+            ReferenceWrite {
+                preassigned_version_id: Some(version_id),
+                group_id: *group_id,
+                user_id: spec.auth_context.user_id,
+                realm_id: spec.auth_context.realm_id,
+                node_id: ctx.owner_node_id,
+                bucket: spec.target.bucket.clone(),
+                key: key.into(),
+                expected_bucket: Some(bucket),
+                version_source: source,
+                metadata: metadata.clone(),
+                inherited_policies: Vec::new(),
+                connector_guard: None,
+                restrictions: spec.auth_context.path_restrictions.clone(),
+                mirror_guards: Vec::new(),
+                job_id: Some(ctx.job_id.as_ulid()),
+            },
+            std::time::SystemTime::now(),
+            ulid::Ulid::generate(),
+        ),
         &ctx.driver,
-        ReferenceWrite {
-            preassigned_version_id: Some(version_id),
-            group_id: *group_id,
-            user_id: spec.auth_context.user_id,
-            realm_id: spec.auth_context.realm_id,
-            node_id: ctx.owner_node_id,
-            bucket: spec.target.bucket.clone(),
-            key: key.into(),
-            expected_bucket: Some(bucket),
-            version_source: source,
-            metadata: metadata.clone(),
-            inherited_policies: Vec::new(),
-            connector_guard: None,
-            restrictions: spec.auth_context.path_restrictions.clone(),
-            mirror_guards: Vec::new(),
-            job_id: Some(ctx.job_id.as_ulid()),
-        },
     )
     .await
     .map_err(|error| TransferError::Retryable(error.to_string()))?;

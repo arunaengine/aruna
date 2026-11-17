@@ -25,7 +25,9 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::live_records::LiveRecordsOperation;
+use crate::metadata::record_reads::load_document_record;
 
 use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows, iter_page};
 use super::queue_storage::{
@@ -33,14 +35,11 @@ use super::queue_storage::{
     start_write_transaction,
 };
 use super::repository::{
-    StorageReadError, parse_registry_iter, parse_registry_read, parse_status_read,
-    read_status_effect,
+    StorageReadError, parse_registry_iter, parse_status_read, read_status_effect,
 };
 
 const INDEX_PAGE_SIZE: usize = 128;
 const INDEX_BATCH_SIZE: usize = 128;
-
-pub(crate) const DCTERMS_CONFORMS_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 /// Keeps the storage cause intact so callers can tell an overloaded backend
 /// apart from a genuine index or document problem.
@@ -257,11 +256,12 @@ fn group_key(prefix: &[u8], document_id: Ulid) -> Vec<u8> {
 /// their subjects: backlink pages by document id and one point read per document, at most
 /// `limit` documents and a bounded number of index rows. Never a walk over the registry.
 pub(crate) async fn lookup_iri_references(
-    storage: &StorageHandle,
+    context: &DriverContext,
     predicate_iri: &str,
     object_iri: &str,
     limit: usize,
 ) -> Result<(Vec<MetadataRegistryRecord>, BTreeMap<Ulid, Vec<String>>), MetadataError> {
+    let storage = &context.storage_handle;
     let mut budget = LinkBudget {
         seeks: limit.max(INDEX_PAGE_SIZE),
         rows: limit.saturating_mul(2).max(INDEX_PAGE_SIZE * 2),
@@ -287,17 +287,12 @@ pub(crate) async fn lookup_iri_references(
         };
         let mut records = Vec::with_capacity(page.documents.len());
         for document_id in page.documents.keys() {
-            let read = storage
-                .send_effect(super::repository::read_document_registry(
-                    *document_id,
-                    None,
-                ))
-                .await;
-            if let Some(record) = parse_registry_read(read).map_err(status_error)? {
+            let record = load_document_record(context, *document_id).await;
+            if let Some(record) = record.map_err(status_error)? {
                 records.push(record);
             }
         }
-        let live = super::api::filter_live_records(storage, &records)
+        let live = drive(LiveRecordsOperation::new(records, None), context)
             .await
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
         let postings = page.documents.into_values().flatten().collect();
@@ -411,12 +406,12 @@ async fn rebuild_page(
     context: &DriverContext,
     records: &[MetadataRegistryRecord],
 ) -> Result<usize, MetadataError> {
-    let metadata_handle = context
-        .metadata_handle
+    let graph = context
+        .graph_handle
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
     let storage = &context.storage_handle;
-    let registry_records = super::api::filter_live_records(storage, records)
+    let registry_records = drive(LiveRecordsOperation::new(records.to_vec(), None), context)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     let mut written = 0usize;
@@ -429,9 +424,7 @@ async fn rebuild_page(
             continue;
         }
 
-        let references = metadata_handle
-            .snapshot_iri_references(record.graph_iri.clone())
-            .await?;
+        let references = graph.iri_references(record.graph_iri.clone()).await?;
         let mut links =
             super::data_links::project_links(&record.graph_iri, record.last_event_id, &references);
         super::data_links::associate_versions(storage, &mut links).await?;
@@ -515,7 +508,7 @@ fn expect_batch(event: Event) -> Result<(), MetadataIriError> {
         Event::Storage(StorageEvent::BatchWriteResult { .. })
         | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataIriError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataIriError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -614,6 +607,7 @@ async fn read_materialization_status(
 mod tests {
     use super::super::data_links::apply_rows;
     use super::*;
+    use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
     use aruna_core::storage_entries::{iri_reference_key, materialization_status_entry};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
@@ -794,13 +788,23 @@ mod tests {
             };
             storage.send_storage_effect(write).await;
         }
-        let (found, matches) = lookup_iri_references(&storage, "p", OBJECT, 8)
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        };
+        let (found, matches) = lookup_iri_references(&context, "p", OBJECT, 8)
             .await
             .unwrap();
         let ids: Vec<Ulid> = found.iter().map(|record| record.document_id).collect();
         assert_eq!(ids, [first, last], "a stale posting names no document");
         assert_eq!(matches.len(), 2);
-        let (capped, _) = lookup_iri_references(&storage, "p", OBJECT, 1)
+        let (capped, _) = lookup_iri_references(&context, "p", OBJECT, 1)
             .await
             .unwrap();
         assert_eq!(capped.len(), 1);

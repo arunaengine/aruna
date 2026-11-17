@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::usage::{RowChange, UsageCounterUpdate};
 use crate::connectors::repository::source_connector_key;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::BaoReadError;
@@ -14,6 +13,7 @@ use crate::s3::object::get::{
 use crate::s3::object::read::{
     HolderFailures, RoutedRead, get_object_routed, promote_leased, routed_info, slice_blob,
 };
+use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
@@ -673,8 +673,10 @@ pub async fn test_get_object() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let operation = GetObjectOperation::new(GetObjectInput {
         bucket,
@@ -773,8 +775,10 @@ async fn routed_missing_blob() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let read = get_object_routed(
@@ -935,8 +939,10 @@ pub async fn hash_mismatch_rejected() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let operation = GetObjectOperation::new(GetObjectInput {
         bucket,
@@ -999,8 +1005,10 @@ async fn bound_connector_used() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let bucket = "s3test".to_string();
@@ -1181,8 +1189,10 @@ async fn drift_creates_successor() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let version_id = Ulid::generate();
@@ -2225,7 +2235,7 @@ async fn offered_drift_replaces() {
     let counters = usage().await;
     assert_eq!((counters.objects, counters.referenced_bytes), (1, 11));
     drive(
-        crate::node::usage_stats::RebuildStatsOperation::new(),
+        crate::node::usage_rebuild::RebuildStatsOperation::new(),
         context,
     )
     .await
@@ -2267,8 +2277,10 @@ async fn historical_drift_fails() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let version_id = Ulid::generate();

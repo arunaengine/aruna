@@ -24,7 +24,6 @@ use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::store::state::read_job_record;
-use crate::node::dashboard::notify_dashboard_change;
 
 /// Spacing between retries of a terminal publication that stayed pending.
 pub const SETTLE_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -187,7 +186,7 @@ pub async fn publish_state(
             debug!(state = state.name(), "Execution update published");
             // A duplicate is a retry of a stored state; only a new record is a change.
             if matches!(outcome.admission, Admission::Authentic) {
-                notify_dashboard_change(context);
+                context.notify_dashboard_change();
             }
             // An infrastructure error ends this execution without deciding the
             // job, so the family must be planned again from here too.

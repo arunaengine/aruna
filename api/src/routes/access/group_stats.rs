@@ -22,7 +22,7 @@ use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::groups::tokens::list::{GroupTokensConfig, ListTokensOperation};
 use aruna_operations::groups::tokens::{GroupTokensError, TokenStatus};
 use aruna_operations::jobs::recent::RecentJobsOperation;
-use aruna_operations::node::usage_stats::RealmUsageScope;
+use aruna_operations::node::realm_usage::RealmUsageScope;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::Json;
 use axum::extract::{Path, Query, State};

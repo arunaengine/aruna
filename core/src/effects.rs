@@ -11,7 +11,8 @@ use crate::compute::{ExecutionTargetId, SharedSecret};
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
-use crate::metadata::{AuthToken, MetadataEffect};
+use crate::metadata::AuthToken;
+use crate::metadata::MetadataEffect;
 use crate::node_vault::VaultEntry;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
@@ -52,9 +53,14 @@ pub enum Effect {
     Task(TaskEffect),
     Search(),
     Stream(),
+    Index(Box<crate::key_index::IndexEffect>),
     /// Independent effects the runner runs at the same time; never persisted.
     Group(EffectGroup),
     Session(Box<crate::compute::session::SessionEffect>),
+    Outbound(crate::outbound::OutboundEffect),
+    /// Wakes the operation with `Event::Delayed` after this long on the runner's clock; never
+    /// persisted. A run deadline that passes first cuts it off like any other effect.
+    Delay(Duration),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at
@@ -755,6 +761,12 @@ pub enum NetEffect {
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
     /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.
     ArtifactStore(Box<crate::plugins::ArtifactStore>),
+    /// Sends one notification request frame to a holder and reads its answer frame.
+    Notification(Box<crate::structs::execution::notification::NotificationRequest>),
+    /// Wakes the live inbox streams of these local recipients.
+    WakeInbox(Vec<crate::UserId>),
+    /// Records, sends or keeps a heartbeat; the runner carries it out with the net handle.
+    Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

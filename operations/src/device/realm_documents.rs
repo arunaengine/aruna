@@ -32,14 +32,14 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::driver::DriverContext;
-use crate::metadata::api::load_realm_config;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
-use crate::node::node_info::{read_info_document, write_info_document};
+use crate::realm::load_config::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
+use aruna_core::node_state::InstallInfoOperation;
 
 /// Attempts in which every answering peer served a copy the marker does not
 /// cover before the marker is treated as wrong. The realm agreeing against a
@@ -682,29 +682,14 @@ pub async fn install_group_docs(
 }
 
 async fn install_node_infos(context: &Arc<DriverContext>, documents: &[NodeInfoDocument]) -> bool {
-    for document in documents {
-        match read_info_document(&context.storage_handle, document.node_id).await {
-            Ok(Some(stored)) if stored == *document => continue,
-            Ok(_) => {}
-            Err(error) => {
-                warn!(
-                    node_id = %document.node_id,
-                    %error,
-                    "Failed to read a fetched node info document"
-                );
-                return false;
-            }
-        }
-        if let Err(error) = write_info_document(&context.storage_handle, document).await {
-            warn!(
-                node_id = %document.node_id,
-                %error,
-                "Failed to install a fetched node info document"
-            );
-            return false;
+    let install = InstallInfoOperation::new(documents.to_vec());
+    match drive(install, context.as_ref()).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "Failed to install the fetched node info documents");
+            false
         }
     }
-    true
 }
 
 /// The management api urls a realm node last served this device, in the order
@@ -1067,8 +1052,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let target = DocumentTarget::RealmConfig { realm_id: realm() };
         let bytes = config

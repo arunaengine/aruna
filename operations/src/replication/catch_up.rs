@@ -30,7 +30,6 @@ use super::members::ReadRecordOperation;
 use super::queue::schedule_blob_drain;
 use crate::distribution::create::submit;
 use crate::distribution::lifecycle::settle_marker;
-use crate::distribution::sign_statement;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::GetBucketOperation;
 
@@ -417,7 +416,10 @@ impl SetWalk {
             signer: self.local,
             statement,
         };
-        let signed = match sign_statement(context, claim) {
+        let signed = match context.net_handle.as_ref().map_or_else(
+            || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
+            |net| net.sign_statement(claim),
+        ) {
             StatementSignEvent::Signed(signed) => *signed,
             StatementSignEvent::Unavailable(reason) => return Err(reason),
         };

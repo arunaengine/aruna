@@ -13,6 +13,7 @@ use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
 use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
+    NotificationTransportMessage,
 };
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::WebhookSubscription;
@@ -23,7 +24,9 @@ use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
-use aruna_operations::notifications::client::{mark_read_remote, unread_count_remote};
+use aruna_operations::notifications::client::{
+    HolderRequestOperation, marked_read, unread_counted,
+};
 use aruna_operations::notifications::dispatch::{
     NotificationDispatchError, list_for_user, mark_for_user, unread_for_user,
 };
@@ -61,6 +64,30 @@ struct TestNode {
     _shutdown: aruna_tasks::shutdown::Shutdown,
 }
 
+async fn unread_count_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    recipient: UserId,
+) -> Result<(u32, bool), String> {
+    let count = NotificationTransportMessage::UnreadCount { recipient };
+    unread_counted(drive(HolderRequestOperation::new(holder, count), ctx).await)
+}
+
+async fn mark_read_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    recipient: UserId,
+    ids: Vec<Ulid>,
+    up_to_ms: Option<u64>,
+) -> Result<u32, String> {
+    let mark = NotificationTransportMessage::MarkRead {
+        recipient,
+        ids,
+        up_to_ms,
+    };
+    marked_read(drive(HolderRequestOperation::new(holder, mark), ctx).await)
+}
+
 #[tokio::test]
 async fn notification_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([12u8; 32]);
@@ -84,7 +111,7 @@ async fn notification_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> 
     })
     .await?;
 
-    let (count, capped) = unread_count_remote(&nodes[1].net, holder, recipient).await?;
+    let (count, capped) = unread_count_remote(&nodes[1].context, holder, recipient).await?;
     assert_eq!((count, capped), (1, false));
 
     shutdown_nodes(nodes).await;
@@ -174,7 +201,7 @@ async fn duplicate_delivery_idempotent() -> Result<(), Box<dyn std::error::Error
     })
     .await?;
 
-    let marked = mark_read_remote(&nodes[1].net, holder, recipient, vec![target], None).await?;
+    let marked = mark_read_remote(&nodes[1].context, holder, recipient, vec![target], None).await?;
     assert_eq!(marked, 1);
 
     emit_on(&nodes[0], vec![record]).await?;
@@ -224,19 +251,19 @@ async fn unread_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    let (count, _) = unread_count_remote(&nodes[1].net, holder, recipient).await?;
+    let (count, _) = unread_count_remote(&nodes[1].context, holder, recipient).await?;
     assert_eq!(count, 3);
 
-    let marked = mark_read_remote(&nodes[1].net, holder, recipient, ids.clone(), None).await?;
+    let marked = mark_read_remote(&nodes[1].context, holder, recipient, ids.clone(), None).await?;
     assert_eq!(marked, 2);
 
-    let (count, _) = unread_count_remote(&nodes[1].net, holder, recipient).await?;
+    let (count, _) = unread_count_remote(&nodes[1].context, holder, recipient).await?;
     assert_eq!(count, 1);
 
-    let (count_from_a, _) = unread_count_remote(&nodes[0].net, holder, recipient).await?;
+    let (count_from_a, _) = unread_count_remote(&nodes[0].context, holder, recipient).await?;
     assert_eq!(count_from_a, 1);
 
-    let marked_again = mark_read_remote(&nodes[1].net, holder, recipient, ids, None).await?;
+    let marked_again = mark_read_remote(&nodes[1].context, holder, recipient, ids, None).await?;
     assert_eq!(marked_again, 0);
 
     shutdown_nodes(nodes).await;
@@ -316,8 +343,10 @@ async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> 
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let unavailable = list_for_user(
         no_net.as_ref(),
@@ -497,21 +526,21 @@ async fn build_node(
     )
     .await?;
     let task_handle = TaskHandle::new();
-    let (metadata_dir, metadata_handle) = match metadata {
+    let (metadata_dir, metadata_handle, graph_handle) = match metadata {
         Some(options) => {
             let dir = tempfile::tempdir()?;
-            let handle = MetadataHandle::new_with_options(
+            let graph = aruna_graph::GraphHandle::open(
                 dir.path().join("metadata"),
                 net.node_id(),
-                storage.clone(),
-                Some(net.clone()),
                 Some(net.document_sync_node()),
                 Some(net.document_sync_database()),
-                options,
+                aruna_graph::GraphOptions::default(),
             )?;
-            (Some(dir), Some(handle))
+            let path = dir.path().join("metadata");
+            let handle = MetadataHandle::new(path, storage.clone(), Some(net.clone()), options);
+            (Some(dir), Some(handle), Some(graph))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     let context = Arc::new(DriverContext {
@@ -519,8 +548,10 @@ async fn build_node(
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle,
+        graph_handle,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
@@ -716,17 +747,16 @@ impl SettingRealm {
             unix_timestamp_millis(),
         );
         let context = self.context(index);
-        let metadata = context.metadata_handle.as_ref().expect("metadata handle");
         let peers = MetadataPeers {
             ctx: context,
             local: self.id(index),
         };
         let managers = self.managers();
         let channel = SettingChannel::Webhook;
-        let backoffs = metadata.setting_backoffs();
+        let backoffs = aruna_outbound::Backoffs::default();
         let now = unix_timestamp_millis();
         let managers = Some(managers.as_slice());
-        delivery_setting(context, &peers, backoffs, &record, channel, managers, now).await
+        delivery_setting(context, &peers, &backoffs, &record, channel, managers, now).await
     }
 
     async fn set(&self, index: usize, owner: UserId, url: &str) -> TestResult<WebhookOutcome> {

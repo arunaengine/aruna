@@ -47,7 +47,8 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
-use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use crate::staging::bucket_guard::BucketGuardOperation;
+use crate::staging::offered_directory::OfferedDirectoryError;
 
 /// Pulls this node is running, by receipt key. The registry lives as long as the process, so a
 /// restart forgets a running pull and the device asks for it again.
@@ -115,7 +116,7 @@ impl PullRegistry {
 }
 
 /// Serves one forwarded sync pull.
-pub async fn serve_sync_pull(
+pub(crate) async fn serve_sync_pull(
     context: &Arc<DriverContext>,
     peer: NodeId,
     message: MetadataTransportMessage,
@@ -128,7 +129,7 @@ pub async fn serve_sync_pull(
 }
 
 /// Serves one poll of an accepted sync pull.
-pub async fn serve_pull_status(
+pub(crate) async fn serve_pull_status(
     context: &Arc<DriverContext>,
     peer: NodeId,
     message: MetadataTransportMessage,
@@ -247,7 +248,10 @@ async fn admit_pull(
 
 /// A pull writes like a client, so a bucket that is read-only for clients refuses it too.
 async fn guard_target(context: &DriverContext, bucket: &str) -> Result<(), SyncRefusal> {
-    match guard_bucket_write(context, bucket).await {
+    match drive(BucketGuardOperation::new(bucket), context)
+        .await
+        .map_err(OfferedDirectoryError::from)
+    {
         Ok(()) => Ok(()),
         Err(OfferedDirectoryError::ReadOnly(_)) => Err(SyncRefusal::Forbidden),
         Err(error) => {
@@ -652,7 +656,7 @@ async fn applied_version(context: &Arc<DriverContext>, request: &SyncPull) -> Op
 }
 
 /// Serves one bounded listing of the current heads under a bucket prefix.
-pub async fn serve_list_versions(
+pub(crate) async fn serve_list_versions(
     context: &Arc<DriverContext>,
     peer: NodeId,
     message: MetadataTransportMessage,
@@ -1047,8 +1051,10 @@ mod tests {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             auth: AuthContext {
                 user_id,
@@ -1146,7 +1152,8 @@ mod tests {
     // being unbound after its offer is gone. The cleanup on this node still deletes the bucket.
     #[tokio::test]
     async fn guards_folder_pull() {
-        use crate::device::sync::folders::{finish_unbind, folder_bucket, store_folder};
+        use crate::device::sync::folders::{finish_unbind, store_folder};
+        use crate::device::sync::repository::folder_bucket;
         use crate::staging::offered_directory::{
             OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
         };

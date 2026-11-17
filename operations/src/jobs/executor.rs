@@ -110,8 +110,6 @@ pub struct JobContext {
     pub shutdown: CancellationToken,
     pub progress: ProgressReporter,
     pub range_turns: RangeTurns,
-    /// Senders of the realm email profile, shared by every job of this node.
-    pub mail: Arc<crate::notifications::email::MailProfiles>,
 }
 
 /// One turn per distribution range, shared by every job on this node: page imports into one

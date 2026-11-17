@@ -4,7 +4,11 @@
 
 use super::export::{seed_registry_cache, write_entry, write_pending_marker};
 use super::*;
+use crate::metadata::live_records::LiveRecordsOperation;
 use aruna_core::StructuredId;
+use aruna_core::keyspaces::DOCUMENT_LIFECYCLE_KEYSPACE;
+use aruna_core::metadata::MetadataLifecycleRecord;
+use aruna_core::storage_entries::document_lifecycle_key;
 
 #[tokio::test]
 async fn filters_graph_delete() {
@@ -25,9 +29,12 @@ async fn filters_graph_delete() {
     )
     .await;
 
-    let records = filter_live_records(&test.context.storage_handle, &[live.clone(), deleted])
-        .await
-        .expect("lifecycle filter succeeds");
+    let records = drive(
+        LiveRecordsOperation::new(vec![live.clone(), deleted], None),
+        &test.context,
+    )
+    .await
+    .expect("lifecycle filter succeeds");
     assert_eq!(records, vec![live]);
 }
 
@@ -56,9 +63,12 @@ async fn filters_document_delete() {
     )
     .await;
 
-    let records = filter_live_records(&test.context.storage_handle, &[deleted])
-        .await
-        .expect("lifecycle filter succeeds");
+    let records = drive(
+        LiveRecordsOperation::new(vec![deleted], None),
+        &test.context,
+    )
+    .await
+    .expect("lifecycle filter succeeds");
     assert!(records.is_empty());
 }
 
@@ -77,7 +87,7 @@ async fn rejects_bad_lifecycle() {
     .await;
 
     assert!(
-        filter_live_records(&test.context.storage_handle, &[record])
+        drive(LiveRecordsOperation::new(vec![record], None), &test.context)
             .await
             .is_err()
     );
@@ -125,14 +135,20 @@ async fn foreign_lifecycle_rejected() {
     .await;
 
     assert!(
-        filter_live_records(&test.context.storage_handle, &[graph_record])
-            .await
-            .is_err()
+        drive(
+            LiveRecordsOperation::new(vec![graph_record], None),
+            &test.context
+        )
+        .await
+        .is_err()
     );
     assert!(
-        filter_live_records(&test.context.storage_handle, &[document_record])
-            .await
-            .is_err()
+        drive(
+            LiveRecordsOperation::new(vec![document_record], None),
+            &test.context
+        )
+        .await
+        .is_err()
     );
 }
 
@@ -156,8 +172,10 @@ async fn group_scan_capped() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let within = load_group_records(&context, group_id, 2)

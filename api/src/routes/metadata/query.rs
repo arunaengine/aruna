@@ -11,11 +11,12 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::metadata::api::{
-    DocumentQueryRequest, MetadataQueryRequest, MetadataSearchRequest,
+use aruna_operations::metadata::api::read::{
     query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
-    search_metadata as run_search_metadata,
 };
+use aruna_operations::metadata::api::read_types::{DocumentQueryRequest, MetadataQueryRequest};
+use aruna_operations::metadata::api::search::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

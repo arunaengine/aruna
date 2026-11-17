@@ -20,4 +20,3 @@ pub(crate) mod release;
 pub(crate) mod trail;
 pub mod unify;
 pub(crate) mod unlocked;
-pub mod usage;

@@ -13,6 +13,8 @@ mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
+use aruna_core::outbound::{OutboundEffect, OutboundError, OutboundEvent};
+use aruna_core::key_index::{IndexError, IndexEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -79,18 +81,15 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::VaultSign(records)) => Event::Net(NetEvent::VaultSign(
             crate::users::vault_route::sign_records(context, *records),
         )),
-        Effect::Net(NetEffect::SnapshotSign(claim)) => Event::Net(NetEvent::SnapshotSign(
-            crate::distribution::sign_snapshot(context, *claim),
-        )),
+        Effect::Net(NetEffect::Heartbeat(effect)) => {
+            Box::pin(net::dispatch_heartbeat(*effect, context)).await
+        }
         // Release crate reads and holder requests need the runner's handles.
         Effect::Net(NetEffect::Release(effect)) => Event::Net(NetEvent::Release(
             Box::pin(crate::s3::bucket::release::publish::dispatch_release(
                 context, *effect,
             ))
             .await,
-        )),
-        Effect::Net(NetEffect::StatementSign(claim)) => Event::Net(NetEvent::StatementSign(
-            crate::distribution::sign_statement(context, *claim),
         )),
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
@@ -117,7 +116,29 @@ pub(crate) async fn dispatch_effect_until(
             };
             Event::Net(NetEvent::ArtifactStored(stored))
         }
+        // Notification frames and inbox wakes need the net handle the runner holds.
+        Effect::Net(NetEffect::Notification(request)) => {
+            Event::Net(NetEvent::Notification(match context.net_handle.as_ref() {
+                Some(net_handle) => {
+                    let answer = net_handle.notification_request(request.node, &request.message);
+                    Box::pin(answer).await.map(Box::new)
+                }
+                None => Err("the notification transport is unavailable".to_string()),
+            }))
+        }
+        Effect::Net(NetEffect::WakeInbox(recipients)) => {
+            if let Some(net_handle) = context.net_handle.as_ref() {
+                for recipient in recipients {
+                    net_handle.notify_inbox_activity(recipient);
+                }
+            }
+            Event::Net(NetEvent::InboxWoken)
+        }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
+        Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
+            Some(outbound) => Event::Outbound(Box::pin(outbound.run(effect)).await),
+            None => Event::Outbound(outbound_unavailable(&effect)),
+        },
         Effect::Metadata(metadata_effect) => {
             metadata::dispatch_metadata(metadata_effect, context).await
         }
@@ -132,6 +153,10 @@ pub(crate) async fn dispatch_effect_until(
             }
         }
         Effect::Task(task_effect) => task::dispatch_task(task_effect, context).await,
+        Effect::Index(index_effect) => Event::Index(match context.storage_handle.range_indexes() {
+            Some(indexes) => indexes.execute(*index_effect).await,
+            None => IndexEvent::Error(IndexError::Unavailable),
+        }),
         Effect::Search() => {
             warn!(
                 depth,
@@ -147,6 +172,10 @@ pub(crate) async fn dispatch_effect_until(
                 "Top-level stream effect is not handled by driver yet"
             );
             Event::Stream()
+        }
+        Effect::Delay(after) => {
+            tokio::time::sleep(after).await;
+            Event::Delayed
         }
         // The effect loop runs groups itself; a group never reaches a single dispatch.
         Effect::Group(group) => {
@@ -177,7 +206,7 @@ pub(crate) async fn dispatch_effect_until(
     event
 }
 
-fn effect_kind(effect: &Effect) -> &'static str {
+pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
@@ -189,7 +218,19 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Outbound(_) => "outbound",
+        Effect::Delay(_) => "delay",
+    }
+}
+
+/// The answer to an outbound effect on a node without the outbound backend.
+fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
+    let error = OutboundError::Retryable("the outbound backend is unavailable".to_string());
+    match effect {
+        OutboundEffect::Post(_) => OutboundEvent::Posted { result: Err(error) },
+        OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
     }
 }

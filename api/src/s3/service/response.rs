@@ -433,8 +433,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
         let service = ArunaS3Service::new(context, RealmId([7u8; 32]), node_id).await;

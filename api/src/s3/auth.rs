@@ -29,7 +29,8 @@ use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::auth::request_policy::{
     PolicyRequestExtras, enforce_policies, policy_request_with,
 };
-use aruna_operations::distribution::delegate::{DelegateError, accept_delegation};
+use aruna_operations::distribution::accept_delegation::DelegateError;
+use aruna_operations::distribution::delegate::accept_delegation;
 use aruna_operations::distribution::routing::{delegated_range, delegated_read};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::workflow::input_view::view_job;
@@ -40,7 +41,8 @@ use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::session::{
     GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,
 };
-use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use aruna_operations::staging::bucket_guard::BucketGuardOperation;
+use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, Uri};
 use s3s::access::{S3Access, S3AccessContext};
@@ -277,9 +279,13 @@ impl S3Access for AuthProvider {
         if matches!(action, Action::Write)
             && let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned)
         {
-            guard_bucket_write(self.driver_ctx.as_ref(), &bucket)
-                .await
-                .map_err(map_offered_error)?;
+            drive(
+                BucketGuardOperation::new(bucket.as_str()),
+                self.driver_ctx.as_ref(),
+            )
+            .await
+            .map_err(OfferedDirectoryError::from)
+            .map_err(map_offered_error)?;
         }
 
         // Reuse this request context for ordinary and per-object policy checks.
@@ -1215,8 +1221,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         AuthProvider {
             driver_ctx,

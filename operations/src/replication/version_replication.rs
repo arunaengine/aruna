@@ -8,7 +8,8 @@ use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use crate::blob::records::blob_location_read;
-use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, NATIVE_SET_ID};
+use crate::connectors::resolver::NATIVE_SET_ID;
+use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::groups::backends::{RecordReadError, parse_read};
 use crate::groups::storage_routing::load_group_inputs;
@@ -20,7 +21,6 @@ use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectMetadata, VersionReplicationManifest,
     VersionReplicationMessage, VersionReplicationRequest,
 };
-use crate::staging::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
@@ -32,6 +32,7 @@ use aruna_core::keyspaces::{
     OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
     SYNC_REFERENCE_KEYSPACE,
 };
+use aruna_core::native_reference::NATIVE_RELATIONSHIP_ID;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::checksum::unmatched_checksum;
 use aruna_core::structs::execution::source_access::{
@@ -3268,8 +3269,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = input.auth_context.realm_id;
         let group_id = Ulid::from_bytes([3u8; 16]);
