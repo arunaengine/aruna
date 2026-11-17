@@ -23,7 +23,7 @@ use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
 use crate::notifications::prune::{
     NOTIFICATION_RETRY_AFTER, PRUNE_PAGE_SIZE, PruneNotificationsOperation,
 };
-use crate::notifications::serve::{InboxRequest, ServeInboxOperation};
+use crate::notifications::serve::{InboxRequest, ServeInboxOperation, WatchEventsOperation};
 use crate::notifications::watch::remove::RemoveWatchOperation;
 
 /// What the timer shell knows when a timer fires.
@@ -224,6 +224,8 @@ pub enum PeerOperation {
     RemoveWatch(RemoveWatchOperation),
     /// An inbox read, mark or watch request for a user whose inbox this node holds.
     ServeInbox(ServeInboxOperation),
+    /// Watch events expanded into the inboxes this node holds.
+    WatchEvents(WatchEventsOperation),
 }
 
 /// The operation that answers `input`, or `None` while its protocol or request kind is not
@@ -245,6 +247,10 @@ pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
                 Ok(NotificationTransportMessage::DeleteWatch { owner, watch_id }) => {
                     let operation = RemoveWatchOperation::new(deliver, owner, watch_id);
                     Some(PeerOperation::RemoveWatch(operation))
+                }
+                Ok(NotificationTransportMessage::DeliverWatchEvents { events }) => {
+                    let operation = WatchEventsOperation::new(deliver, events);
+                    Some(PeerOperation::WatchEvents(operation))
                 }
                 Ok(message) => {
                     let (user, request) = inbox_request(message, input.now_ms)?;
@@ -286,6 +292,12 @@ impl PeerRun for RemoveWatchOperation {
 }
 
 impl PeerRun for ServeInboxOperation {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+        notification_answer(result)
+    }
+}
+
+impl PeerRun for WatchEventsOperation {
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
         notification_answer(result)
     }
@@ -349,6 +361,7 @@ macro_rules! each_peer {
             PeerOperation::DeliverNotifications($operation) => $body,
             PeerOperation::RemoveWatch($operation) => $body,
             PeerOperation::ServeInbox($operation) => $body,
+            PeerOperation::WatchEvents($operation) => $body,
         }
     };
 }
@@ -518,8 +531,8 @@ mod tests {
                 assert!(peer_operation(peer_input(alpn, &[])).is_none());
             }
         }
-        let events = NotificationTransportMessage::DeliverWatchEvents { events: Vec::new() };
-        let frame = postcard::to_allocvec(&events).unwrap();
+        let ack = NotificationTransportMessage::WatchEventsAck { written: 0 };
+        let frame = postcard::to_allocvec(&ack).unwrap();
         assert!(peer_operation(peer_input(Alpn::Notification, &frame)).is_none());
         let list = NotificationTransportMessage::ListWatches {
             owner: crate::tests::notifications::user(1, 2),

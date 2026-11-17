@@ -1,21 +1,25 @@
-//! Answers a peer's inbox and watch requests for a user whose inbox this node holds: list,
-//! unread count, mark read, list watches and create a watch.
+//! Answers a peer's inbox and watch requests for a user whose inbox this node holds (list,
+//! unread count, mark read, list and create watches) and expands its watch events.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{
-    WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
+    WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
+use aruna_core::structs::identity::realm::RealmId;
+use tracing::warn;
 
-use crate::notifications::checks::{peer_config, verify_recipient_holder};
+use crate::notifications::checks::{
+    events_realm, peer_config, validate_watch_events, verify_recipient_holder,
+};
 use crate::notifications::deliver::{AnswerTurn, DeliverError, DeliverInput, reject};
 use crate::notifications::holder::{
     HolderAnswer, HolderRead, HolderReadError, HolderReadOperation,
@@ -26,6 +30,7 @@ use crate::notifications::watch::check::{
     AuthorizedWatchSubscriptions, WatchCheckError, WatchCheckOperation, WatchFilterOperation,
 };
 use crate::notifications::watch::digest::{InterestError, InterestOperation};
+use crate::notifications::watch::expansion::{ExpandError, ExpandOutcome, WatchExpandOperation};
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE, WatchSubscriptionError,
@@ -249,6 +254,146 @@ impl Operation for ServeInboxOperation {
                     Event::Net(NetEvent::InboxWoken) => Ok(Next::Done(answer)),
                     other => Err(unexpected_event("NetEvent::InboxWoken", &other).into()),
                 },
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+enum EventsState {
+    #[default]
+    Config,
+    Expand,
+    /// Asks for an interest publish after dropped watches, then wakes the recipients.
+    Mark {
+        recipients: Vec<UserId>,
+        written: u32,
+    },
+    Wake {
+        written: u32,
+    },
+}
+
+/// Expands a peer's watch events into the inboxes this node holds, once more after a conflict.
+/// Dropped watches ask for a new interest publish; recipients of new records are woken.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WatchEventsOperation {
+    input: DeliverInput,
+    events: Vec<WatchEvent>,
+    state: EventsState,
+}
+
+impl WatchEventsOperation {
+    pub fn new(input: DeliverInput, events: Vec<WatchEvent>) -> Self {
+        Self {
+            input,
+            events,
+            state: EventsState::Config,
+        }
+    }
+
+    fn realm(&self) -> Option<RealmId> {
+        self.events.first().map(|event| event.realm_id)
+    }
+
+    fn checked(&mut self, value: Option<&[u8]>) -> AnswerTurn {
+        let input = self.input;
+        let realm_id = match events_realm(&self.events) {
+            Ok(realm_id) => realm_id,
+            Err(reason) => return reject(reason),
+        };
+        let config = match peer_config(input.peer, realm_id, value) {
+            Ok(config) => config,
+            Err(reason) => return reject(reason),
+        };
+        if let Err(reason) = validate_watch_events(&self.events, realm_id, input.now_ms) {
+            return reject(reason);
+        }
+        let events = self.events.clone();
+        let build = move || {
+            let (config, events) = (config.clone(), events.clone());
+            WatchExpandOperation::new(realm_id, config, input.local, events, None)
+        };
+        let expand = boxed_retry(build, realm_id.as_bytes(), |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        self.state = EventsState::Expand;
+        Ok(Next::Call(IoCall::Child(expand)))
+    }
+
+    fn expanded(&mut self, outcome: Result<ExpandOutcome, ExpandError>) -> AnswerTurn {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return reject(error.to_string()),
+        };
+        let recipients = outcome.inbox.recipients;
+        let written = outcome.inbox.written as u32;
+        let Some(realm_id) = self.realm().filter(|_| outcome.dropped) else {
+            return self.wake(recipients, written);
+        };
+        self.state = EventsState::Mark {
+            recipients,
+            written,
+        };
+        Ok(Next::Call(IoCall::child(InterestOperation::mark(realm_id))))
+    }
+
+    fn wake(&mut self, recipients: Vec<UserId>, written: u32) -> AnswerTurn {
+        if recipients.is_empty() {
+            return Ok(Next::Done(NotificationTransportMessage::WatchEventsAck {
+                written,
+            }));
+        }
+        self.state = EventsState::Wake { written };
+        let wake = Effect::Net(NetEffect::WakeInbox(recipients));
+        Ok(Next::Call(IoCall::from(wake)))
+    }
+}
+
+impl Operation for WatchEventsOperation {
+    type Output = NotificationTransportMessage;
+    type Error = DeliverError;
+
+    fn first(&mut self) -> AnswerTurn {
+        let realm_id = match events_realm(&self.events) {
+            Ok(realm_id) => realm_id,
+            Err(reason) => return reject(reason),
+        };
+        if realm_id != self.input.local_realm {
+            let peer = self.input.peer;
+            return reject(format!(
+                "notification peer `{peer}` addressed foreign realm `{realm_id}`"
+            ));
+        }
+        Ok(Next::Call(read_row(
+            REALM_CONFIG_KEYSPACE,
+            realm_id.as_bytes().to_vec(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> AnswerTurn {
+        match std::mem::take(&mut self.state) {
+            EventsState::Config => {
+                let [value] = values::<1>(result)?;
+                self.checked(value.as_deref())
+            }
+            EventsState::Expand => self.expanded(result.child::<ExpandOutcome, ExpandError>()?),
+            EventsState::Mark {
+                recipients,
+                written,
+            } => {
+                if let Err(error) = result.child::<bool, InterestError>()? {
+                    warn!(%error, "Failed to retract dropped watch interest after delivery");
+                }
+                self.wake(recipients, written)
+            }
+            EventsState::Wake { written } => match result.event()? {
+                Event::Net(NetEvent::InboxWoken) => {
+                    Ok(Next::Done(NotificationTransportMessage::WatchEventsAck {
+                        written,
+                    }))
+                }
+                other => Err(unexpected_event("NetEvent::InboxWoken", &other).into()),
             },
         }
     }
