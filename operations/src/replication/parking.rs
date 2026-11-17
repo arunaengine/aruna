@@ -2284,7 +2284,7 @@ mod tests {
         }
 
         #[test]
-        fn stale_key_polls_later() {
+        fn stale_key_polls() {
             // A key that is no longer the bucket's key leaves the job due after the poll delay.
             let mut operation = park(vec![key()]);
             operation.start();
@@ -2334,7 +2334,7 @@ mod tests {
         }
 
         #[test]
-        fn locked_keys_stay_parked() {
+        fn locked_keys_stay() {
             // After the commit each key's status is read; no unlocked key leaves the job parked.
             let mut operation = park(vec![key()]);
             operation.state = ParkState::KeyStatus { index: 0 };
