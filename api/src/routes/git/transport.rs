@@ -171,7 +171,6 @@ async fn serve(
     };
     let result = git::transport(
         &state.get_ctx(),
-        state.git().ok_or(ServerError::ServiceUnavailable)?,
         &auth,
         request,
     )

@@ -6,7 +6,6 @@ use super::map_error;
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_blob::git::GitStore;
 use aruna_core::git::{CommitInfo, FileChange, FileChangeKind};
 use aruna_operations::git::GitError;
 use aruna_operations::git::changes::EntityChangeKind;
@@ -195,10 +194,6 @@ pub struct CompareQuery {
     pub to: String,
 }
 
-pub(super) fn store(state: &ServerState) -> ServerResult<&GitStore> {
-    state.git().ok_or(ServerError::ServiceUnavailable)
-}
-
 /// The version from `If-Match`, with or without quotes.
 pub(crate) fn expected(headers: &HeaderMap) -> Option<String> {
     headers
@@ -373,7 +368,7 @@ pub async fn list(
         cursor: query.cursor.as_deref(),
         limit,
     };
-    let result = versions::list(&state.get_ctx(), store(&state)?, &auth, id, query).await;
+    let result = versions::list(&state.get_ctx(), &auth, id, query).await;
     Ok(match result {
         Ok((list, next_cursor)) => Json(VersionList {
             versions: list.into_iter().map(version_view).collect(),
@@ -398,7 +393,7 @@ pub async fn show(
     RealmAuth(auth): RealmAuth,
     Path((id, revision)): Path<(Ulid, String)>,
 ) -> ServerResult<Response> {
-    let result = versions::show(&state.get_ctx(), store(&state)?, &auth, id, &revision).await;
+    let result = versions::show(&state.get_ctx(), &auth, id, &revision).await;
     Ok(match result {
         Ok((version, files)) => Json(VersionDetail {
             version: version_view(version),
@@ -426,7 +421,6 @@ pub async fn rocrate(
 ) -> ServerResult<Response> {
     let result = aruna_operations::git::snapshot::export(
         &state.get_ctx(),
-        store(&state)?,
         &auth,
         id,
         revision,
@@ -458,7 +452,6 @@ pub async fn compare(
 ) -> ServerResult<Response> {
     let result = versions::compare(
         &state.get_ctx(),
-        store(&state)?,
         &auth,
         id,
         query.from.as_deref(),
@@ -483,7 +476,7 @@ pub async fn conflicts(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let result = versions::conflicts(&state.get_ctx(), store(&state)?, &auth, id).await;
+    let result = versions::conflicts(&state.get_ctx(), &auth, id).await;
     Ok(match result {
         Ok(conflicts) => Json(ConflictList {
             conflicts: conflicts

@@ -27,6 +27,11 @@ async fn git_server(
     capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
     root: std::path::PathBuf,
 ) -> TestResult<(String, tokio_util::sync::CancellationToken, ServerTask)> {
+    let metadata = context.metadata_handle.as_ref().ok_or("metadata handle")?;
+    metadata.install_git(aruna_blob::git::GitStore::new(
+        root,
+        env!("CARGO_BIN_EXE_aruna").into(),
+    ));
     let state = Arc::new(
         ServerState::new(
             context,
@@ -37,8 +42,7 @@ async fn git_server(
             None,
             aruna_operations::jobs::runtime::JobsRuntime::new(),
         )
-        .await
-        .with_git(root, env!("CARGO_BIN_EXE_aruna").into()),
+        .await,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

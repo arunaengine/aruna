@@ -287,6 +287,12 @@ async fn bind_all(
         }
         false => None,
     };
+    if let Some(metadata) = &driver_ctx.metadata_handle {
+        metadata.install_git(aruna_blob::git::GitStore::new(
+            std::path::Path::new(&config.storage_path).join("git"),
+            std::env::current_exe()?,
+        ));
+    }
     let mut state = ServerState::new(
         driver_ctx.clone(),
         config.realm_id,
@@ -297,10 +303,6 @@ async fn bind_all(
         jobs_runtime,
     )
     .await
-    .with_git(
-        std::path::Path::new(&config.storage_path).join("git"),
-        std::env::current_exe()?,
-    )
     .with_metrics(metrics.clone())
     .with_rocrate_limits(config.rocrate_limits.clone())
     .with_assistant_proxy(config.assistant_proxy)

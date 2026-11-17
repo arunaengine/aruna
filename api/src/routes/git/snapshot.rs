@@ -71,7 +71,6 @@ pub async fn repository_status(
 ) -> ServerResult<Json<RepositoryStatus>> {
     let (status, projection, layout, document, pending) = git::snapshot::status(
         &state.get_ctx(),
-        state.git().ok_or(ServerError::ServiceUnavailable)?,
         &auth,
         id,
     )
@@ -128,7 +127,6 @@ pub async fn export_revision(
 ) -> ServerResult<Json<Value>> {
     let bytes = git::snapshot::export(
         &state.get_ctx(),
-        state.git().ok_or(ServerError::ServiceUnavailable)?,
         &auth,
         id,
         query.revision,

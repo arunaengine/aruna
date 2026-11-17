@@ -4,7 +4,7 @@
 
 use super::versions::{
     BranchList, BranchView, MergeConflictView, MergeView, NamedView, TagList, VersionView,
-    expected, failure, named_view, store, version_view,
+    expected, failure, named_view, version_view,
 };
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ServerError, ServerResult};
@@ -72,7 +72,7 @@ pub async fn branches(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let result = versions::branches(&state.get_ctx(), store(&state)?, &auth, id).await;
+    let result = versions::branches(&state.get_ctx(), &auth, id).await;
     Ok(match result {
         Ok(heads) => Json(BranchList {
             branches: heads
@@ -109,7 +109,6 @@ pub async fn create_branch(
     let name = format!("refs/heads/{}", request.name);
     let result = versions::change_ref(
         &state.get_ctx(),
-        store(&state)?,
         &auth,
         id,
         name,
@@ -160,7 +159,6 @@ pub async fn delete_branch(
 ) -> ServerResult<Response> {
     let result = versions::change_ref(
         &state.get_ctx(),
-        store(&state)?,
         &auth,
         id,
         format!("refs/heads/{name}"),
@@ -199,7 +197,6 @@ pub async fn edit(
     let jsonld = serde_json::to_string(&request.rocrate).map_err(|_| ServerError::BadRequest)?;
     let result = merge::edit(
         &state.get_ctx(),
-        store(&state)?,
         &auth,
         id,
         &name,
@@ -238,7 +235,6 @@ pub async fn merge(
 ) -> ServerResult<Response> {
     let result = merge::merge(
         &state.get_ctx(),
-        store(&state)?,
         &auth,
         id,
         &format!("refs/heads/{name}"),
@@ -267,7 +263,7 @@ pub async fn tags(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let result = versions::tags(&state.get_ctx(), store(&state)?, &auth, id).await;
+    let result = versions::tags(&state.get_ctx(), &auth, id).await;
     Ok(match result {
         Ok(names) => Json(TagList {
             tags: names.into_iter().map(named_view).collect(),
@@ -295,7 +291,6 @@ pub async fn create_tag(
 ) -> ServerResult<Response> {
     let result = versions::change_ref(
         &state.get_ctx(),
-        store(&state)?,
         &auth,
         id,
         format!("refs/tags/{}", request.name),
@@ -324,7 +319,6 @@ pub async fn delete_tag(
 ) -> ServerResult<Response> {
     let result = versions::change_ref(
         &state.get_ctx(),
-        store(&state)?,
         &auth,
         id,
         format!("refs/tags/{name}"),
@@ -354,10 +348,8 @@ pub async fn merge_conflict(
     headers: HeaderMap,
 ) -> ServerResult<Response> {
     let expected = expected(&headers);
-    let git = store(&state)?;
     let result = merge::resolve_conflict(
         &state.get_ctx(),
-        git,
         &auth,
         (id, conflict),
         expected.as_deref(),
@@ -383,9 +375,8 @@ pub async fn discard_conflict(
     Path((id, conflict)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Response> {
     let context = state.get_ctx();
-    let git = store(&state)?;
-    let result = match versions::conflict_ref(&context, git, &auth, id, conflict).await {
-        Ok(name) => versions::change_ref(&context, git, &auth, id, name, None, None).await,
+    let result = match versions::conflict_ref(&context, &auth, id, conflict).await {
+        Ok(name) => versions::change_ref(&context, &auth, id, name, None, None).await,
         Err(error) => Err(error),
     };
     Ok(deleted(result))
