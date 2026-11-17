@@ -134,16 +134,26 @@ pub(crate) fn envelope_write(
     location: &BackendLocation,
     rows: (&HashMap<String, String>, u64, Option<TxnId>),
 ) -> Result<(Effect, u64), AbeError> {
+    let (metadata, limit, txn_id) = rows;
+    let (writes, charge) = located_rows(envelope, version, location, (metadata, limit))?;
+    let write = StorageEffect::BatchWrite { writes, txn_id };
+    Ok((Effect::Storage(write), charge))
+}
+
+/// The rows publishing `envelope` for `version` stored at `location`, with its usage charge.
+pub(crate) fn located_rows(
+    envelope: &ObjectEnvelope,
+    version: &VersionKey,
+    location: &BackendLocation,
+    rows: (&HashMap<String, String>, u64),
+) -> Result<(Vec<(KeySpace, Key, Value)>, u64), AbeError> {
     // A pending multipart archive has no location key until it is hashed.
     let location_key = location.location_key().map(|key| key.to_bytes());
     let archive = EnvelopeArchive {
         archive: ArchiveKey::of(location),
         location_key: location_key.unwrap_or_default(),
     };
-    let (metadata, limit, txn_id) = rows;
-    let (writes, charge) = envelope_rows(envelope, version, &archive, (metadata, limit))?;
-    let write = StorageEffect::BatchWrite { writes, txn_id };
-    Ok((Effect::Storage(write), charge))
+    envelope_rows(envelope, version, &archive, rows)
 }
 
 /// The write publishing `envelope` for `version` with its archive mapping, and its usage charge.

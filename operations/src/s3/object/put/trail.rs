@@ -109,9 +109,14 @@ impl TrailScan {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return false;
         };
+        self.set_creation(value.as_deref())
+    }
+
+    /// Takes the creation row's value; `false` once the incarnation is known.
+    pub(crate) fn set_creation(&mut self, value: Option<&[u8]>) -> bool {
         let fresh = self.incarnation.is_none();
         if fresh {
-            self.incarnation = Some(incarnation(value.as_ref().map(|value| value.as_ref())));
+            self.incarnation = Some(incarnation(value));
         }
         fresh
     }
@@ -126,6 +131,18 @@ impl TrailScan {
         let floor = Ulid::from_parts(self.version_id.timestamp_ms(), 0);
         let at = [prefix.as_ref(), &floor.to_bytes()[..]].concat();
         (self.writer && self.range == 0).then(|| IterStart::At(at.into()))
+    }
+
+    /// The key a page of `prefix` reads after, the page form of [`TrailScan::start`]: trail keys
+    /// are the prefix and an audit id, so the id just before the floor starts at the floor.
+    pub(crate) fn after(&self, prefix: &Key) -> Option<Key> {
+        if let Some(after) = &self.after {
+            return Some(after.clone());
+        }
+        let floor = Ulid::from_parts(self.version_id.timestamp_ms(), 0).0;
+        let first = self.writer && self.range == 0;
+        let before = Ulid(floor.checked_sub(1).filter(|_| first)?).to_bytes();
+        Some([prefix.as_ref(), &before[..]].concat().into())
     }
 
     /// A retried transaction reads the whole trail again.

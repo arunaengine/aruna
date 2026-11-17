@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::s3::imports::shared::shares_folder;
+use aruna_core::calls::IoCall;
 use aruna_core::effects::IterStart;
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
 use aruna_core::structs::storage::backend_import::BackendImport;
@@ -66,11 +67,21 @@ impl ReaderScan {
         })
     }
 
+    /// The next page of the group's rules, as a call.
+    pub(crate) fn page_call(&self, group_id: Ulid) -> IoCall {
+        IoCall::Page {
+            space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: group_id.to_bytes().to_vec().into(),
+            after: self.after.clone(),
+            limit: RULE_PAGE,
+        }
+    }
+
     /// Adds a page; the readers once all pages are read.
     pub(crate) fn read(
         &mut self,
         event: Event,
-        (import_id, backend, path): (Ulid, &BackendRef, &str),
+        reading: (Ulid, &BackendRef, &str),
     ) -> Result<Option<Vec<Ulid>>, String> {
         let Event::Storage(StorageEvent::IterResult {
             values,
@@ -79,6 +90,15 @@ impl ReaderScan {
         else {
             return Err(format!("unexpected answer {}", event.label()));
         };
+        self.read_page((values, next_start_after), reading)
+    }
+
+    /// Adds the rows of a page answered to [`ReaderScan::page_call`].
+    pub(crate) fn read_page(
+        &mut self,
+        (values, next_start_after): (Vec<(Key, Value)>, Option<Key>),
+        (import_id, backend, path): (Ulid, &BackendRef, &str),
+    ) -> Result<Option<Vec<Ulid>>, String> {
         for (_, value) in values {
             let rule = BackendImport::from_bytes(&value).map_err(|error| error.to_string())?;
             let reads = *backend == BackendRef::Group(rule.backend_id)

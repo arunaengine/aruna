@@ -8,7 +8,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PURGE_FENCE_KEYSPACE;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use thiserror::Error;
 
@@ -105,15 +105,39 @@ pub fn check_publication(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         event => return Err(PurgeFenceError::Unexpected(event.label().to_string())),
     };
-    let mut values = values.into_iter().map(|(_, value)| value);
-    let (purge, record, fence) = (values.next(), values.next(), values.next());
-    let purge = (purge.flatten())
-        .map(|value| {
-            StoragePurgeFence::from_bytes(value.as_ref()).map_err(|_| PurgeFenceError::Invalid)
-        })
-        .transpose()?;
-    check_decoded_fence(purge.as_ref(), bucket, key)?;
-    let (record, fence) = (record.flatten(), fence.flatten());
+    let values = values.into_iter().map(|(_, value)| value).collect();
+    check_published(values, bucket, key, Some(authority))
+}
+
+/// The rows [`publication_read`] reads, as a call.
+pub fn publication_rows(bucket: &str, authority: Option<&WriteAuthority>) -> Vec<(String, Key)> {
+    let mut reads = vec![(PURGE_FENCE_KEYSPACE.to_string(), fence_key(bucket))];
+    if let Some(authority) = authority {
+        reads.extend(authority_reads(authority.binding.set_id));
+    }
+    reads
+}
+
+/// Checks the values of [`publication_rows`], the value form of [`check_publication`].
+pub fn check_published(
+    values: Vec<Option<Value>>,
+    bucket: &str,
+    key: &str,
+    authority: Option<&WriteAuthority>,
+) -> Result<(), PurgeFenceError> {
+    let expected = 1 + 2 * usize::from(authority.is_some());
+    if values.len() != expected {
+        return Err(PurgeFenceError::Unexpected(
+            "a publication read".to_string(),
+        ));
+    }
+    let mut values = values.into_iter();
+    let purge = values.next().flatten();
+    check_fence_row(purge.as_deref(), bucket, key)?;
+    let Some(authority) = authority else {
+        return Ok(());
+    };
+    let (record, fence) = (values.next().flatten(), values.next().flatten());
     check_authority(authority, key, record.as_deref(), fence.as_deref())
         .map_err(PurgeFenceError::Distribution)
 }
