@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE};
