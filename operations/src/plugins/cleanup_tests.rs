@@ -86,3 +86,49 @@ async fn removed_install_rows() {
         assert_eq!(count(&fixture, space).await, 0, "{space}");
     }
 }
+
+#[test]
+fn sweep_by_standing() {
+    let (removing, kept) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));
+    let mut plan = SweepEvents {
+        installs: BTreeMap::from([(removing, Standing::Removing), (kept, Standing::Kept)]),
+        now_ms: 9,
+        phase: SweepPhase::Scanning(Table::Replays, Table::Replays.scan()),
+        deletes: Vec::new(),
+        dropped: 0,
+    };
+    let replay = |install: Ulid| ([&[b'r'][..], &install.to_bytes()].concat(), Vec::new());
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    let rows = vec![replay(removing), replay(kept)];
+    let gone = vec![(PLUGIN_REPLAYS_KEYSPACE, replay(removing).0)];
+    assert_eq!(
+        plan.next(Answer::Page(rows, None)).unwrap(),
+        Turn::Ask(Ask::Delete(gone))
+    );
+    assert!(matches!(
+        plan.next(Answer::Done).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    // A removing install's waiting row leaves its queue slot first, then the waiting set.
+    let waiting = vec![(removing.to_bytes().to_vec(), Vec::new())];
+    let queue = vec![(PLUGIN_QUEUE_KEYSPACE, removing.to_bytes().to_vec())];
+    let waits = vec![(PLUGIN_WAITING_KEYSPACE, removing.to_bytes().to_vec())];
+    assert_eq!(
+        plan.next(Answer::Page(waiting, None)).unwrap(),
+        Turn::Ask(Ask::Delete(queue))
+    );
+    assert_eq!(
+        plan.next(Answer::Done).unwrap(),
+        Turn::Ask(Ask::Delete(waits))
+    );
+    for _ in 0..2 {
+        assert!(matches!(
+            plan.next(Answer::Done).unwrap(),
+            Turn::Ask(Ask::Page { .. })
+        ));
+        let empty = plan.next(Answer::Page(Vec::new(), None)).unwrap();
+        assert_eq!(empty, Turn::Ask(Ask::Delete(Vec::new())));
+    }
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(2));
+    assert!(plan.next(Answer::Done).is_err());
+}

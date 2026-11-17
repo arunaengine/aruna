@@ -15,6 +15,7 @@ use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::store::Txn;
 use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{created, installed};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 
 /// The batches a fake receiver got; it answers each event with `decide` and acknowledges gaps
@@ -355,4 +356,47 @@ async fn update_waits() {
         .await
         .unwrap();
     assert_eq!(waits().await, Ok(false));
+}
+
+#[test]
+fn apply_decisions() {
+    let install = Ulid::from_parts(1, 1);
+    let keys = BTreeMap::from([
+        ((install, "s1".to_string()), b"k1".to_vec()),
+        ((install, "s2".to_string()), b"k2".to_vec()),
+    ]);
+    let decisions = Decisions {
+        events: vec![
+            (install, "s1".into(), Outcome::Queued),
+            (install, "s2".into(), Outcome::Busy),
+        ],
+        gaps: vec![(install, SourceKind::DatasetCreated, GapReason::Full, 4)],
+    };
+    let mut plan = Apply {
+        count: 1,
+        busy: true,
+        decided: Some(vec![(PLUGIN_OUTBOX_KEYSPACE, b"k1".to_vec())]),
+        acked: vec![(
+            gap_key(install, SourceKind::DatasetCreated, GapReason::Full),
+            4,
+        )],
+        phase: ApplyPhase::Deleting,
+    };
+    assert_eq!(apply(&keys, decisions).start().len(), 1);
+    // A busy event keeps its row; the acknowledged sequence stops at the counted one.
+    let decided = vec![(PLUGIN_OUTBOX_KEYSPACE, b"k1".to_vec())];
+    assert_eq!(plan.first().unwrap(), Turn::Ask(Ask::Delete(decided)));
+    assert!(matches!(
+        plan.next(Answer::Done).unwrap(),
+        Turn::Ask(Ask::Read(_))
+    ));
+    let mut row = GapRow::new(SourceKind::DatasetCreated, GapReason::Full);
+    row.sequence = 3;
+    let read = Answer::Values(vec![Some(encode(&row).unwrap())]);
+    let Turn::Ask(Ask::Write(rows)) = plan.next(read).unwrap() else {
+        panic!("the acknowledgement is written");
+    };
+    let written: GapRow = decode(&rows[0].2).unwrap();
+    assert_eq!(written.acked, 3);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish((1, true)));
 }
