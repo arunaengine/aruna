@@ -26,7 +26,7 @@ use super::store::{
     job_entry_deletes, preserve_artifact_tombstone, prune_delete_entries, read_job_record,
     staging_row_deletes,
 };
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::plugins::work::holds_job;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub(crate) async fn prune_job_page(
                     }
                     // A plugin work keeps its job until its row holds the summary.
                     if let JobPayload::PluginWork(spec) = &record.payload
-                        && (holds_job(context, spec).await).map_err(|error| error.0)?
+                        && (drive(holds_job(spec), context).await).map_err(|error| error.0)?
                     {
                         continue;
                     }

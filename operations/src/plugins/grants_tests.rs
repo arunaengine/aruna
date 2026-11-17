@@ -182,3 +182,20 @@ fn update_keeps_grants() {
     let (_, missing) = carry_grants(&kept, &writer, &scope);
     assert_eq!(missing, vec!["write".to_string()]);
 }
+
+#[test]
+fn account_access_follows() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(4, 4));
+    let realm = install.account.realm_id;
+    let patterns = BTreeSet::from(["/r/g/x/meta/**".to_string()]);
+    let account = restricted_account((&install, realm), &patterns, Permission::ObjectsCopy);
+    let restrictions = account.path_restrictions.unwrap();
+    assert_eq!(restrictions.len(), 1);
+    assert_eq!(restrictions[0].permission, Access::WRITE);
+    assert_eq!(
+        (account.user_id, account.realm_id),
+        (install.account, realm)
+    );
+    let read = restricted_account((&install, realm), &patterns, Permission::MetadataRead);
+    assert_eq!(read.path_restrictions.unwrap()[0].permission, Access::READ);
+}

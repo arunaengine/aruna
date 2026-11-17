@@ -3,80 +3,91 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::keyspaces::{
+    PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
+    PLUGIN_WORK_KEYSPACE,
+};
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{
-    MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
+    DEDUP_RETENTION_MS, EVENTS_QUEUED, ForwardRow, GapReason, GapRow, PluginRun, RUNS_PARALLEL,
+    RunState, RunTrigger, SENDER_GAP, SourceEvent, SourceKind, WAITING_EXPIRY_MS,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::ErrorKind;
+use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::permission::{Grant, Permission};
 use aruna_plugins::{
-    CancellationToken, FailureKind, Field, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
-    WebhookDelivery, WebhookRequest,
+    CancellationToken, Field, Invocation, Runtime, Trigger, WatchEvent, WebhookDelivery,
+    WebhookRequest,
 };
 use aruna_tasks::shutdown::Shutdown;
 use tokio_util::task::TaskTracker;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::account::prerequisites_held;
 use super::artifacts::fetch_artifact;
-use super::broker::{RunBroker, short_path};
+use super::artifacts::local_config;
+use super::bound::ReleaseKeys;
+use super::broker::{RunBroker, absent};
 use super::check::{RunScope, check_call};
 use super::cleanup::sweep_events;
-use super::clock::probe_clock;
-use super::decide::{decide_batch, prune_seen};
-use super::dispatch::{enqueue_timers, event_trigger};
-use super::finished::notify_work;
-use super::forward::{Backoff, Decisions, EventBatch, send_outbox};
-use super::grants::{parse_grants, patterns_for};
+use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start, probe_clock};
+use super::decide::{
+    GapCount, LateEvent, Verdict, WaitingRow, decide_event, keep_reports, prune_seen, seen_outcome,
+};
+use super::dispatch::enqueue_timers;
+use super::dispatch::event_run;
+use super::finished::{NotifyWork, finished_event};
+use super::forward::{
+    Backoff, REQUEST_BYTES, Requests, apply, dataset_facts, drop_rows, expire_rows, next_install,
+    receiver_requests,
+};
+use super::grants::{parse_grants, patterns_for, short_path};
 use super::install::read_config;
 use super::intents::open_intent;
+use super::jobs::{retire_work, settle_work};
+use super::journal::JOURNAL_PAGE;
 use super::journal::prune_journal;
-use super::marks::sweep_marks;
-use super::matcher::match_pending;
+use super::lifecycle::{match_targets, targets};
+use super::marks::{MARK_ROW, Mark, MarkEnded};
+use super::matcher::event_trigger;
+use super::matcher::match_page;
 use super::outbound::Outbound;
-use super::prune::{prune_hooks, prune_uses};
+use super::prune::{self, prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
-use super::release::ReleaseKeys;
-use super::replay::{plan_replays, run_replays};
-use super::runs::{prune_runs, read_run, save_run, unfinished};
-use super::store::StoreError;
-use super::waiting::recheck_waiting;
-use super::work::{prune_work, retire_work, settle_work};
-use crate::driver::DriverContext;
+use super::replay::{
+    COVERAGE_ROW, CoverageRow, StartReplay, growth, replay_page, replay_rows, replay_scan, row_key,
+};
+use super::rows::{
+    RowsOperation, Scan, StoreError, decode, encode, page_rows, row as row_of, scan_rows,
+    write_rows,
+};
+use super::runs::{
+    ADMISSIONS, Ended, RunError, TICK, conclude, drop_run, ended, expired_runs, read_run, save_run,
+    unfinished,
+};
+use super::waiting::SettleWaiting;
+use super::work::{WorkRow, WorkState, prune_work, work_scan};
+use crate::driver::{DriverContext, drive};
+use crate::metadata::projector::dot_applied;
+use crate::metadata::protocol::MetadataReadError;
+use crate::realm::mutate_placement::node_kind;
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_core::plugin_runs::{Decisions, EventBatch};
 
-/// How often the worker looks for due runs.
-pub const TICK: Duration = Duration::from_secs(1);
 /// How often the worker rechecks the events waiting for their install record or account.
 const RECHECK_MS: u64 = 10 * 1000;
 /// How often the worker prunes runs that ended before the retention period.
 const PRUNE_MS: u64 = 3600 * 1000;
 /// How often the worker keeps the summaries of finished plugin work.
 const SETTLE_MS: u64 = 30 * 1000;
-/// Longest wait before a run that failed in the host starts again.
-const MAX_BACKOFF_MS: u64 = 10 * 60 * 1000;
-
-/// How one attempt of a run ended, before its intents are inspected.
-#[derive(Debug)]
-enum Ended {
-    Output(Option<String>),
-    Failed(String),
-    /// A host or infrastructure error: the run starts again later.
-    Retry(String),
-    Cancelled(String),
-    /// The runtime had no free slot: the run waits without using an attempt.
-    Busy(String),
-    /// The node stops; the run starts again from the top at the next start.
-    Stopped,
-}
 
 /// The node service that owns the plugin runtime and the runs it executes.
 pub struct Worker {
@@ -159,10 +170,11 @@ impl Worker {
         if let Err(error) = plan_replays(&self.ctx, &config, self.local, now_ms, probe).await {
             warn!(%error, "Could not plan plugin event replays");
         }
-        if let Err(error) = match_pending(&self.ctx, &config, self.local, now_ms).await {
+        let matched = match_journal(&self.ctx, &config, self.local, (now_ms, EVENTS_QUEUED));
+        if let Err(error) = matched.await {
             warn!(%error, "Could not match plugin events to installs");
         }
-        if let Err(error) = run_replays(&self.ctx, now_ms).await {
+        if let Err(error) = run_replays(&self.ctx, now_ms, (JOURNAL_PAGE, usize::MAX)).await {
             warn!(%error, "Could not replay plugin events");
         }
         let mut backoff = self.backoff.lock().await;
@@ -179,7 +191,7 @@ impl Worker {
                 warn!(%error, "Could not recheck waiting plugin events");
             }
         }
-        let queued = unfinished(&self.ctx)
+        let queued = drive(unfinished(), &self.ctx)
             .await
             .map_err(|error| error.to_string())?;
         let here = eligible(&config, self.local);
@@ -201,7 +213,7 @@ impl Worker {
             if !ready || !here || busy >= RUNS_PARALLEL {
                 continue;
             }
-            let mut run = read_run(&self.ctx, install_id, run_id)
+            let mut run = drive(read_run(install_id, run_id), &self.ctx)
                 .await
                 .map_err(|error| error.to_string())?;
             if run.due_ms > now_ms || run.state.finished() {
@@ -209,9 +221,7 @@ impl Worker {
             }
             run.state = RunState::Running;
             run.attempts += 1;
-            save_run(&self.ctx, &run)
-                .await
-                .map_err(|error| error.to_string())?;
+            self.save(&run).await.map_err(|error| error.to_string())?;
             let cancel = CancellationToken::new();
             self.running().insert(run_id, (install_id, cancel.clone()));
             let worker = self.clone();
@@ -233,9 +243,9 @@ impl Worker {
     async fn sweep(&self, now_ms: u64) -> Result<usize, String> {
         let config = read_config(&self.ctx, self.realm_id).await;
         let config = config.map_err(|error| error.to_string())?;
-        let swept = sweep_events(&self.ctx, &config, now_ms).await;
+        let swept = drive(sweep_events(&config, now_ms), &self.ctx).await;
         let swept = swept.map_err(|error| error.to_string())?;
-        let hooks = prune_hooks(&self.ctx, &config, now_ms).await;
+        let hooks = drive(prune_hooks(&config, now_ms), &self.ctx).await;
         let hooks = hooks.map_err(|error| error.to_string())?;
         let retired = retire_work(&self.ctx, &config, now_ms).await;
         Ok(swept + hooks + retired.map_err(|error| error.to_string())?)
@@ -305,15 +315,18 @@ impl Worker {
 
     /// Ends a queued run whose install is gone, unless its intents decide otherwise.
     async fn drop_run(&self, install_id: Ulid, run_id: Ulid, now_ms: u64) -> Result<(), String> {
-        let mut run = read_run(&self.ctx, install_id, run_id)
+        let mut run = drive(read_run(install_id, run_id), &self.ctx)
             .await
             .map_err(|error| error.to_string())?;
-        let open = open_intent(&self.ctx, run_id).await;
+        let open = drive(open_intent(run_id), &self.ctx).await;
         let ended = Ended::Cancelled("the install was removed".to_string());
         conclude(&mut run, ended, false, open, now_ms);
-        save_run(&self.ctx, &run)
-            .await
-            .map_err(|error| error.to_string())
+        self.save(&run).await.map_err(|error| error.to_string())
+    }
+
+    /// Writes the run; one that ended leaves the queue in the same transaction.
+    async fn save(&self, run: &PluginRun) -> Result<(), RunError> {
+        Ok(drive(save_run(run)?, &self.ctx).await?)
     }
 
     /// Stops claiming, cancels every running guest and waits until each attempt ended.
@@ -357,7 +370,7 @@ impl Worker {
         run.log = broker.take_log();
         let ended = scrub_ended(&broker, ended);
         let now = unix_timestamp_millis();
-        let open = open_intent(&self.ctx, run.run_id).await;
+        let open = drive(open_intent(run.run_id), &self.ctx).await;
         let ended = match ended {
             Ended::Cancelled(message) => {
                 let reason = self.reasons().remove(&run.run_id);
@@ -366,7 +379,7 @@ impl Worker {
             other => other,
         };
         conclude(&mut run, ended, broker.changed(), open, now);
-        if let Err(error) = save_run(&self.ctx, &run).await {
+        if let Err(error) = self.save(&run).await {
             warn!(run = %run.run_id, %error, "Could not save a finished plugin run");
         }
         self.reasons().remove(&run.run_id);
@@ -432,24 +445,6 @@ impl Worker {
     }
 }
 
-/// How an invocation ended. A runtime without a free slot never entered the guest, so the run
-/// waits without using an attempt.
-fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended {
-    match invoked {
-        Ok(output) => Ended::Output(output),
-        Err(InvokeError::Guest(failure)) => match failure.kind {
-            FailureKind::Permanent | FailureKind::InvalidInput => Ended::Failed(failure.message),
-            FailureKind::Retryable => Ended::Retry(failure.message),
-        },
-        Err(InvokeError::Cancelled) if stopping => Ended::Stopped,
-        Err(InvokeError::Cancelled) => Ended::Cancelled("the run was cancelled".into()),
-        Err(error @ (InvokeError::Overloaded | InvokeError::Closed)) => {
-            Ended::Busy(error.to_string())
-        }
-        Err(error) => Ended::Failed(error.to_string()),
-    }
-}
-
 /// The handler call of a run: its saved invocation and the install's grants. An event's object on
 /// this node is named by its short `bucket/key` path; `path` keeps the permission path.
 fn invocation(
@@ -503,8 +498,6 @@ fn invocation(
     }
 }
 
-/// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
-/// makes it need attention, and unreadable intents keep it queued without using an attempt.
 /// The attempt's end with every value handed to the code removed from the text the run keeps.
 fn scrub_ended(broker: &RunBroker, ended: Ended) -> Ended {
     match ended {
@@ -517,55 +510,468 @@ fn scrub_ended(broker: &RunBroker, ended: Ended) -> Ended {
     }
 }
 
-fn conclude(
-    run: &mut PluginRun,
-    ended: Ended,
-    changed: bool,
-    open: Result<Option<String>, StoreError>,
-    now_ms: u64,
-) {
-    match open {
-        Ok(Some(reason)) => return run.finish(RunState::NeedsAttention, Some(reason), now_ms),
-        Err(error) => return hold(run, format!("its calls are not readable: {error}"), now_ms),
-        Ok(None) => {}
-    }
-    if changed {
-        let message = "the run made a call that differs from its earlier attempt";
-        return run.finish(RunState::Failed, Some(message.into()), now_ms);
-    }
-    match ended {
-        Ended::Output(output) => {
-            run.output = output;
-            run.finish(RunState::Succeeded, None, now_ms);
+/// Matches every pending journal row of this node with at most `bound` forward rows per install,
+/// a page per transaction; returns how many rows were read.
+pub(crate) async fn match_journal(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    (now_ms, bound): (u64, usize),
+) -> Result<usize, StoreError> {
+    let (targets, keep) = match_targets(config, local);
+    let mut read = 0;
+    loop {
+        let count = drive(match_page((&targets, keep), now_ms, bound), ctx).await?;
+        read += count;
+        if count < JOURNAL_PAGE {
+            return Ok(read);
         }
-        Ended::Failed(message) => run.finish(RunState::Failed, Some(message), now_ms),
-        Ended::Cancelled(message) => run.finish(RunState::Cancelled, Some(message), now_ms),
-        Ended::Retry(message) => retry(run, message, now_ms),
-        Ended::Busy(message) => hold(run, message, now_ms),
-        Ended::Stopped => {}
     }
 }
 
-/// Queues the run again soon without counting the attempt that just ended.
-fn hold(run: &mut PluginRun, message: String, now_ms: u64) {
-    run.attempts = run.attempts.saturating_sub(1);
-    run.state = RunState::Queued;
-    run.message = Some(message);
-    run.due_ms = now_ms.saturating_add(TICK.as_millis() as u64);
+/// Removes the runs that ended longer than the retention ago, each with its intents in one
+/// transaction; answers how many went.
+pub(crate) async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunError> {
+    let expired = drive(expired_runs(now_ms), ctx).await?;
+    for ids in &expired {
+        drive(drop_run(*ids), ctx).await?;
+    }
+    Ok(expired.len())
 }
 
-/// Queues the run again after a backoff, or fails it after its last attempt.
-fn retry(run: &mut PluginRun, message: String, now_ms: u64) {
-    if run.attempts >= MAX_ATTEMPTS {
-        run.finish(RunState::Failed, Some(message), now_ms);
-        return;
+/// Deletes the use audit rows past their retention, a page per transaction; answers how many
+/// records went.
+pub(crate) async fn prune_audit(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    let mut pruned = 0;
+    loop {
+        let (count, more) = drive(prune_uses(now_ms, prune::PAGE), ctx).await?;
+        pruned += count;
+        if !more {
+            return Ok(pruned);
+        }
     }
-    let backoff = 1000u64
-        .saturating_mul(1 << run.attempts.min(20))
-        .min(MAX_BACKOFF_MS);
-    run.state = RunState::Queued;
-    run.message = Some(message);
-    run.due_ms = now_ms.saturating_add(backoff);
+}
+
+/// Marks one sweep pass reads at a time.
+const MARK_PAGE: usize = 100;
+
+/// Drops the marks nothing can need any more, a page at a time: the work that minted the
+/// version can write no more, as its row is settled or gone, and only then the version is
+/// absent. The delete reads the row again, so it conflicts with a settlement or reservation.
+pub(crate) async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
+    let (mut dropped, mut after) = (0, None);
+    loop {
+        let page = page_rows(PLUGIN_WORK_KEYSPACE, vec![MARK_ROW], after, MARK_PAGE);
+        let (rows, next) = drive(page, ctx).await?;
+        for (key, value) in rows {
+            let mark: Mark = decode(&value)?;
+            let (bucket, object, version_id) = decode::<(String, String, Ulid)>(&key[1..])?;
+            if !drive(MarkEnded::check(&mark, None), ctx).await? {
+                continue;
+            }
+            let head = HeadObjectInput {
+                bucket,
+                key: object,
+                version_id: Some(version_id),
+            };
+            match drive(HeadObjectOperation::new(head), ctx).await {
+                Err(error) if absent(&error) => {}
+                // Present, or not known now: the mark stays.
+                _ => continue,
+            }
+            dropped += usize::from(drive(MarkEnded::check(&mark, Some(key)), ctx).await?);
+        }
+        match next {
+            Some(key) => after = Some(key),
+            None => return Ok(dropped),
+        }
+    }
+}
+
+/// The receiver side of a forward from an infrastructure peer.
+pub(crate) async fn serve_events(
+    ctx: &DriverContext,
+    peer: NodeId,
+    batch: EventBatch,
+) -> Result<Decisions, MetadataReadError> {
+    let (config, local) = local_config(ctx).await?;
+    if !node_kind(&config, peer).is_some_and(|kind| kind.is_sync_eligible()) {
+        return Err(MetadataReadError::Forbidden);
+    }
+    let decided = decide_batch(ctx, &config, (local, peer), batch, unix_timestamp_millis());
+    decided.await.map_err(|_| MetadataReadError::Unavailable)
+}
+
+/// Decides each event of a batch from `sender` and keeps its newest gap reports.
+pub(crate) async fn decide_batch(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    (local, sender): (NodeId, NodeId),
+    batch: EventBatch,
+    now_ms: u64,
+) -> Result<Decisions, StoreError> {
+    let _admitting = ADMISSIONS.lock().await;
+    let mut decisions = Decisions::default();
+    for row in batch.events {
+        let outcome = decide(ctx, config, local, &row, now_ms).await?;
+        decisions
+            .events
+            .push((row.install_id, row.event.source, outcome));
+    }
+    decisions.gaps = drive(keep_reports(sender, batch.gaps), ctx).await?;
+    Ok(decisions)
+}
+
+/// One event's outcome. Busy writes nothing, so the sender keeps the row and sends it again.
+async fn decide(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    row: &ForwardRow,
+    now_ms: u64,
+) -> Result<Outcome, StoreError> {
+    if let Some(outcome) = drive(seen_outcome(row), ctx).await? {
+        return Ok(outcome);
+    }
+    // Its dedup record would be gone, so a run now could repeat one already made.
+    if now_ms > row.event.anchor_ms.saturating_add(DEDUP_RETENTION_MS) {
+        let late = GapCount::new(local, row, GapReason::Late);
+        drive(RowsOperation::transaction(LateEvent(late)), ctx).await?;
+        return Ok(Outcome::Expired);
+    }
+    let verdict = judge(ctx, config, local, row, now_ms).await?;
+    drive(decide_event(verdict, row, now_ms)?, ctx).await
+}
+
+/// Whether the local install record and its prerequisite writes are here, then the check.
+pub(crate) async fn judge(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    row: &ForwardRow,
+    now_ms: u64,
+) -> Result<Verdict, StoreError> {
+    let install = (config.installs.iter()).find(|i| i.install_id == row.install_id);
+    let Some(install) = install.filter(|install| install.revision >= row.revision) else {
+        return Ok(Verdict::Unready);
+    };
+    if !prerequisites_held(ctx, install).await.map_err(StoreError)? {
+        return Ok(Verdict::Unready);
+    }
+    Ok(
+        match trigger_check(ctx, config, local, install, row, now_ms).await {
+            Ok(run) => Verdict::Run(Box::new(run)),
+            Err(error) if error.kind == ErrorKind::Unavailable => Verdict::Unavailable,
+            Err(error) => Verdict::Denied(error.message),
+        },
+    )
+}
+
+/// Steps 0 to 4 for the event's path as a new run of the install would pass them.
+async fn trigger_check(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    install: &PluginInstall,
+    row: &ForwardRow,
+    now_ms: u64,
+) -> Result<PluginRun, HostError> {
+    let none = || HostError::new(ErrorKind::Denied, "the install has no trigger of this kind");
+    let run = event_run(config, install, &row.event, now_ms).ok_or_else(none)?;
+    let scope = RunScope {
+        realm_id: config.realm_id,
+        local,
+        run,
+    };
+    let needs = event_trigger(row.event.kind).needs();
+    let target = needs.map(|permission| (permission, row.event.path.as_str()));
+    check_call(ctx, &scope, target).await?;
+    Ok(scope.run)
+}
+
+/// Sends each reachable receiver its batches and applies their decisions; returns how many
+/// rows were decided. Rows of removed installs are dropped, rows past their send expiry become
+/// gaps.
+pub(crate) async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    send_bounded(ctx, config, (now_ms, REQUEST_BYTES), backoff, send).await
+}
+
+pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    (now_ms, bound): (u64, usize),
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    let mut batches: BTreeMap<NodeId, Requests> = BTreeMap::new();
+    let open = |node: NodeId| lost_reason(config, node).is_none() && backoff.ready(node, now_ms);
+    let mut after = None;
+    while let Some(install_id) = drive(next_install(after), ctx).await? {
+        after = Some(install_id);
+        let install = (config.installs.iter()).find(|i| i.install_id == install_id);
+        let Some(install) = install.filter(|i| i.state != InstallState::Removing) else {
+            let prefix = install_id.to_bytes().to_vec();
+            drive(drop_rows(PLUGIN_OUTBOX_KEYSPACE, prefix), ctx).await?;
+            continue;
+        };
+        let pending = open(install.receiver)
+            .then(|| receiver_requests(&mut batches, install.receiver, bound));
+        collect(ctx, install_id, now_ms, pending).await?;
+    }
+    let gaps = Scan::new(PLUGIN_GAPS_KEYSPACE, vec![SENDER_GAP]);
+    for (key, value) in drive(scan_rows(gaps), ctx).await? {
+        let install_id = Ulid::from_bytes(key[1..17].try_into().unwrap_or_default());
+        let install = (config.installs.iter()).find(|i| i.install_id == install_id);
+        let Some(install) = install.filter(|i| i.state != InstallState::Removing) else {
+            drive(drop_rows(PLUGIN_GAPS_KEYSPACE, key), ctx).await?;
+            continue;
+        };
+        let row: GapRow = decode(&value)?;
+        if row.sequence > row.acked && open(install.receiver) {
+            let (batch, _) =
+                receiver_requests(&mut batches, install.receiver, bound).room(value.len() + 16);
+            batch.gaps.push((install_id, row));
+        }
+    }
+    let mut decided = 0;
+    for (receiver, requests) in batches {
+        let mut failed = false;
+        for ((batch, keys), _) in requests.open {
+            let Ok(decisions) = send(receiver, batch).await else {
+                failed = true;
+                break;
+            };
+            let (count, busy) = drive(apply(&keys, decisions), ctx).await?;
+            decided += count;
+            if busy {
+                failed = true;
+                break;
+            }
+        }
+        match failed {
+            true => backoff.failed(receiver, now_ms),
+            false => backoff.cleared(receiver),
+        }
+    }
+    Ok(decided)
+}
+
+/// Reads the install's first rows: those past their send expiry become gaps, the others join
+/// `pending` unless their dataset is not readable here yet.
+async fn collect(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    now_ms: u64,
+    mut pending: Option<&mut Requests>,
+) -> Result<(), StoreError> {
+    let kept = drive(expire_rows(install_id, now_ms), ctx).await?;
+    let Some(requests) = pending.as_deref_mut() else {
+        return Ok(());
+    };
+    for (key, value) in kept {
+        let row: ForwardRow = decode(&value)?;
+        if unreadable(ctx, &row).await? {
+            continue;
+        }
+        let (batch, keys) = requests.room(value.len());
+        keys.insert((install_id, row.event.source.clone()), key);
+        batch.events.push(row);
+    }
+    Ok(())
+}
+
+/// Whether a dataset event is not readable here yet: its own change is not materialized and the
+/// document is not deleted. A parked job keeps the row until its send expiry counts a gap.
+pub(crate) async fn unreadable(ctx: &DriverContext, row: &ForwardRow) -> Result<bool, StoreError> {
+    let event = &row.event;
+    let parsed = (
+        event.resource.parse::<Ulid>(),
+        event.revision.parse::<Ulid>(),
+    );
+    let (Ok(document), Ok(event_id)) = parsed else {
+        return Ok(false);
+    };
+    let mut facts = match event.kind {
+        SourceKind::DataUploaded
+        | SourceKind::SyncCompleted
+        | SourceKind::SyncFailed
+        | SourceKind::JobFinished => {
+            return Ok(false);
+        }
+        SourceKind::DatasetCreated | SourceKind::DatasetUpdated => {
+            let updated = event.kind == SourceKind::DatasetUpdated;
+            drive(dataset_facts(document, event_id, updated), ctx).await?
+        }
+    };
+    let applied = match (event.kind, facts.batch.take()) {
+        (SourceKind::DatasetCreated, _) => facts.materialized(|id| id >= event_id),
+        (_, Some((graph_iri, batch))) => dot_applied(ctx, &graph_iri, &batch)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?,
+        (_, None) => facts.logged && facts.materialized(|id| id == event_id),
+    };
+    Ok(!applied && !facts.deleted)
+}
+
+/// Admits a `job_finished` run for every settled work whose starting run succeeded and marks the
+/// work notified in the same transaction; a manifest without the trigger is notified without a
+/// run. Answers how many works were notified.
+pub(crate) async fn notify_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<usize, RunError> {
+    let rows = drive(scan_rows(work_scan()), ctx).await?;
+    let mut notified = 0;
+    for (key, value) in rows {
+        let row: WorkRow = decode(&value)?;
+        if row.state != WorkState::Settled || row.notified {
+            continue;
+        }
+        let Some(install) = (config.installs.iter()).find(|install| {
+            key.get(1..17) == Some(&install.install_id.to_bytes()[..])
+                && install.account == row.account
+                && install.receiver == local
+                && install.state != InstallState::Removing
+        }) else {
+            continue;
+        };
+        let run = match drive(read_run(install.install_id, row.run_id), ctx).await {
+            Ok(run) => Some(run),
+            // Runs stay while a completion waits; one that is gone anyway cannot be retried.
+            Err(RunError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        if run.is_some_and(|run| run.state != RunState::Succeeded) {
+            continue;
+        }
+        let event = finished_event(install, &row, now_ms);
+        let finished = event_run(config, install, &event, now_ms);
+        let _admitting = ADMISSIONS.lock().await;
+        let notify = NotifyWork::new(install.install_id, row.work_id, finished);
+        match drive(RowsOperation::transaction(notify), ctx).await {
+            Ok(true) => notified += 1,
+            Ok(false) => {}
+            // A full queue takes the completion at a later pass.
+            Err(RunError::Full(_)) => {}
+            Err(error) => {
+                warn!(%error, work = %row.work_id, "Could not deliver a finished plugin job")
+            }
+        }
+    }
+    Ok(notified)
+}
+
+/// Decides each waiting event that is ready or expired; returns how many left the waiting set.
+pub(crate) async fn recheck_waiting(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    let _admitting = ADMISSIONS.lock().await;
+    let rows = drive(
+        scan_rows(Scan::new(PLUGIN_WAITING_KEYSPACE, Vec::new())),
+        ctx,
+    )
+    .await?;
+    let mut left = 0;
+    for (key, value) in rows {
+        let waiting: WaitingRow = decode(&value)?;
+        let expired = now_ms > waiting.received_ms.saturating_add(WAITING_EXPIRY_MS);
+        let verdict = match expired {
+            true => None,
+            false => match judge(ctx, config, local, &waiting.row, now_ms).await? {
+                Verdict::Unready | Verdict::Unavailable => continue,
+                verdict => Some(verdict),
+            },
+        };
+        let settle = SettleWaiting::new(key, waiting, verdict, (local, now_ms));
+        drive(RowsOperation::transaction(settle), ctx).await?;
+        left += 1;
+    }
+    Ok(left)
+}
+
+/// Starts a replay for each active install whose coverage grew here since its coverage row;
+/// `probe` reads another node's clock. Returns how many replays started.
+pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+    probe: impl Fn(NodeId) -> F,
+) -> Result<usize, StoreError> {
+    if matches!(node_kind(config, local), Some(RealmNodeKind::User { .. })) {
+        return Ok(0);
+    }
+    let mut started = 0;
+    for target in targets(config) {
+        let id = target.install_id;
+        let Some(install) = config.installs.iter().find(|i| i.install_id == id) else {
+            continue;
+        };
+        let (row, task) = drive(replay_rows(id), ctx).await?;
+        let next = CoverageRow {
+            revision: install.revision,
+            active_since_ms: install.active_since_ms,
+            coverage: target.coverage.clone(),
+            note: None,
+        };
+        if task.is_some_and(|task| task.next.revision == next.revision) {
+            continue;
+        }
+        let Some((old, boundary, by)) = growth(install, row.as_ref(), &target.coverage) else {
+            if row
+                .as_ref()
+                .is_some_and(|row| row.revision != next.revision)
+            {
+                let coverage = row_of(
+                    PLUGIN_REPLAYS_KEYSPACE,
+                    row_key(COVERAGE_ROW, id),
+                    encode(&next)?,
+                );
+                drive(write_rows(vec![coverage]), ctx).await?;
+            }
+            continue;
+        };
+        let start = match by {
+            Some(node) if node == local => Some(boundary.saturating_sub(SKEW_MARGIN_MS)),
+            Some(node) => local_start(boundary, probe(node).await),
+            None => None,
+        };
+        let replay = StartReplay::new(target, (next, old), (start, by), now_ms);
+        drive(RowsOperation::direct(replay), ctx).await?;
+        started += 1;
+    }
+    Ok(started)
+}
+
+/// Continues every replay, at most `pages` pages of `page` rows each, a page per transaction;
+/// returns the rows read.
+pub(crate) async fn run_replays(
+    ctx: &DriverContext,
+    now_ms: u64,
+    (page, pages): (usize, usize),
+) -> Result<usize, StoreError> {
+    let mut read = 0;
+    for (key, _) in drive(scan_rows(replay_scan()), ctx).await? {
+        for _ in 0..pages {
+            let (rows, ended) = drive(replay_page(key.clone(), now_ms, page), ctx).await?;
+            read += rows;
+            if ended {
+                break;
+            }
+        }
+    }
+    Ok(read)
 }
 
 /// Runs the worker until the node stops: it claims due runs every tick, then stops the guests.
@@ -604,16 +1010,16 @@ pub fn spawn_worker(
                 if let Err(error) = prune_runs(&worker.ctx, now).await {
                     warn!(%error, "Could not prune finished plugin runs");
                 }
-                if let Err(error) = prune_journal(&worker.ctx, now).await {
+                if let Err(error) = drive(prune_journal(now), &worker.ctx).await {
                     warn!(%error, "Could not prune the plugin event journal");
                 }
-                if let Err(error) = prune_seen(&worker.ctx, now).await {
+                if let Err(error) = drive(prune_seen(now), &worker.ctx).await {
                     warn!(%error, "Could not prune plugin event dedup records");
                 }
-                if let Err(error) = prune_uses(&worker.ctx, now).await {
+                if let Err(error) = prune_audit(&worker.ctx, now).await {
                     warn!(%error, "Could not prune plugin secret use audit rows");
                 }
-                if let Err(error) = prune_work(&worker.ctx, now).await {
+                if let Err(error) = drive(prune_work(now), &worker.ctx).await {
                     warn!(%error, "Could not prune settled plugin work");
                 }
                 if let Err(error) = sweep_marks(&worker.ctx).await {

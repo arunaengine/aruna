@@ -5,12 +5,14 @@
 
 use std::sync::Arc;
 
+use crate::plugins::broker::call_intent;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunState, RunTrigger, SourceKind};
+use aruna_core::plugin_runs::{StateRemoval, StateWrite};
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::{Intent, StatePut, StateRemove};
+use aruna_plugins::broker::Intent;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -18,15 +20,16 @@ use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::plugin_work::run_plugin_work;
 use crate::jobs::plugin_work::tests::job_context;
 use crate::jobs::store::{insert_job, read_job_record};
-use crate::plugins::finished::{drop_completion, notify_work, retry_run, waits_for};
+use crate::plugins::finished::{drop_completion, retry_run, waits_for};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::jobs::settle_work;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, read_run};
 use crate::plugins::state::{MAX_STATE_BYTES, MAX_STATE_VALUE, put_state, remove_state};
-use crate::plugins::work::{list_work, settle_work};
-use crate::plugins::worker::Worker;
+use crate::plugins::work::list_work;
 use crate::plugins::worker::tests::{install_artifact, job_guest, worker_on};
+use crate::plugins::worker::{Worker, notify_work};
 use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
 use crate::s3::object::put::PutObjectOperation;
 
@@ -55,26 +58,32 @@ async fn fill(ctx: &DriverContext, install_id: Ulid) -> u64 {
     for n in 0..count {
         let key = format!("k{n}");
         used += key.len() + value.len();
-        let put = StatePut {
+        let put = StateWrite {
             key,
             value: value.clone(),
             expected: None,
-            intent: Intent::new(n as u32, &[b"fill"]),
+            intent: call_intent(&Intent::new(n as u32, &[b"fill"])),
         };
-        put_state(ctx, Ulid::from_parts(77, 1), install_id, &put)
-            .await
-            .unwrap();
+        drive(
+            put_state(Ulid::from_parts(77, 1), install_id, put.clone()),
+            ctx,
+        )
+        .await
+        .unwrap();
     }
     let left = MAX_STATE_BYTES as usize - used - PAD.len() - 8;
-    let pad = StatePut {
+    let pad = StateWrite {
         key: PAD.into(),
         value: vec![0u8; left],
         expected: None,
-        intent: Intent::new(9_000, &[b"pad"]),
+        intent: call_intent(&Intent::new(9_000, &[b"pad"])),
     };
-    put_state(ctx, Ulid::from_parts(77, 1), install_id, &pad)
-        .await
-        .unwrap()
+    drive(
+        put_state(Ulid::from_parts(77, 1), install_id, pad.clone()),
+        ctx,
+    )
+    .await
+    .unwrap()
 }
 
 /// Runs every due run to its end.
@@ -86,7 +95,9 @@ async fn drain(worker: &Arc<Worker>) -> usize {
 
 /// Runs the install's one copy job on this node and records how it ended.
 async fn run_copy(fixture: &Fixture, blob: &DriverContext, install: &PluginInstall) {
-    let (rows, _) = list_work(blob, install.install_id, None, 10).await.unwrap();
+    let (rows, _) = drive(list_work(install.install_id, None, 10), blob)
+        .await
+        .unwrap();
     let job = rows[0].job.unwrap();
     let record = read_job_record(&blob.storage_handle, job, None).await;
     let record = record.unwrap().unwrap();
@@ -115,7 +126,9 @@ async fn notify(fixture: &Fixture, blob: &DriverContext) -> usize {
 
 /// The finished runs of `install` that `job_finished` started, with their output.
 async fn finish_outputs(blob: &DriverContext, install: &PluginInstall) -> Vec<PluginRun> {
-    let (runs, _) = list_runs(blob, install.install_id, None, 50).await.unwrap();
+    let (runs, _) = drive(list_runs(install.install_id, None, 50), blob)
+        .await
+        .unwrap();
     (runs.into_iter())
         .filter(|run| {
             matches!(&run.trigger, RunTrigger::Event(event) if event.kind == SourceKind::JobFinished)
@@ -146,17 +159,17 @@ async fn held(fixture: &Fixture) -> Held {
         input: input.to_string(),
     };
     (run.handler, run.due_ms) = ("manual".into(), 0);
-    admit(&blob, &run).await.unwrap();
+    drive(admit(run.clone()), &blob).await.unwrap();
     let worker = worker_on(&blob, fixture);
     assert_eq!(drain(&worker).await, 1);
-    let failed = read_run(&blob, install.install_id, run.run_id)
+    let failed = drive(read_run(install.install_id, run.run_id), &blob)
         .await
         .unwrap();
     let why = failed.message.clone().unwrap_or_default();
     assert_eq!(failed.state, RunState::Failed, "{why}");
     assert!(why.contains("would exceed 16 MiB"), "{why}");
     run_copy(fixture, &blob, &install).await;
-    let (rows, _) = list_work(&blob, install.install_id, None, 10)
+    let (rows, _) = drive(list_work(install.install_id, None, 10), &blob)
         .await
         .unwrap();
     assert_eq!(waits_for(&rows[0], Some(failed.state)), Some(run.run_id));
@@ -184,24 +197,31 @@ async fn retry_delivers_once() {
     let fixture = Fixture::new().await;
     let held = held(&fixture).await;
     let (blob, install) = (&held.blob, &held.install);
-    let free = StateRemove {
+    let free = StateRemoval {
         key: PAD.into(),
         expected: held.pad,
-        intent: Intent::new(9_001, &[b"free"]),
+        intent: call_intent(&Intent::new(9_001, &[b"free"])),
     };
-    let freed = remove_state(blob, Ulid::from_parts(77, 1), install.install_id, &free);
+    let freed = drive(
+        remove_state(Ulid::from_parts(77, 1), install.install_id, free),
+        blob,
+    );
     freed.await.unwrap();
     let action = audit(&fixture, AdminAuditAction::PluginRunRetried);
     let ids = (install.install_id, held.run_id);
-    retry_run(blob, ids, &action, 0).await.unwrap();
+    drive(retry_run(ids, &action, 0).unwrap(), blob)
+        .await
+        .unwrap();
     assert_eq!(drain(&held.worker).await, 1);
     // The rerun reached the same copy call and got the same job, then wrote its mapping.
-    let rerun = read_run(blob, install.install_id, held.run_id)
+    let rerun = drive(read_run(install.install_id, held.run_id), blob)
         .await
         .unwrap();
     assert_eq!(rerun.state, RunState::Succeeded, "{:?}", rerun.message);
     assert_eq!(rerun.output, Some(format!("\"{}\"", held.job)));
-    let (rows, _) = list_work(blob, install.install_id, None, 10).await.unwrap();
+    let (rows, _) = drive(list_work(install.install_id, None, 10), blob)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(notify(&fixture, blob).await, 1);
     assert_eq!(drain(&held.worker).await, 1);
@@ -221,9 +241,12 @@ async fn drop_delivers_none() {
     let (blob, install) = (&held.blob, &held.install);
     let action = audit(&fixture, AdminAuditAction::PluginCompletionDropped);
     let work_id = Ulid::from_string(&held.job).unwrap();
-    drop_completion(blob, (install.install_id, work_id), &action)
-        .await
-        .unwrap();
+    drive(
+        drop_completion((install.install_id, work_id), &action).unwrap(),
+        blob,
+    )
+    .await
+    .unwrap();
     assert_eq!(notify(&fixture, blob).await, 0);
     assert_eq!(drain(&held.worker).await, 0);
     assert!(finish_outputs(blob, install).await.is_empty());

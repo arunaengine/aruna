@@ -363,7 +363,7 @@ async fn make_ready(
 
 /// Repairs the account and role of every settled install from its current record on a
 /// management node, as the approving admin, then sweeps accounts no record names any more.
-pub async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallError> {
+pub(crate) async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallError> {
     let Some(net) = ctx.net_handle.as_ref() else {
         return Ok(0);
     };

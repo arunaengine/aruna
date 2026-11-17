@@ -1213,15 +1213,12 @@ impl MetadataHandle {
                 (MetadataTransportMessage::ClockProbed { result }, None)
             }
             MetadataTransportMessage::ForwardEvents { batch } => {
-                let decided = crate::plugins::decide::serve_events(context, peer, batch);
+                let decided = crate::plugins::worker::serve_events(context, peer, batch);
                 let result = Box::pin(decided).await;
                 (MetadataTransportMessage::EventsDecided { result }, None)
             }
             MetadataTransportMessage::ReleaseSecret { request } => {
-                let keys = crate::plugins::release::ReleaseKeys {
-                    seal: self.realm_seal_key(),
-                    vault: self.realm_vault_key(),
-                };
+                let keys = (self.realm_seal_key(), self.realm_vault_key());
                 let released = crate::plugins::release::serve_release(context, keys, peer, request);
                 let result = Box::pin(released).await;
                 (MetadataTransportMessage::SecretReleased { result }, None)

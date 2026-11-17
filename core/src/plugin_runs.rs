@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::UserId;
+use crate::effects::{Effect, StorageEffect};
 use crate::errors::ConversionError;
 use crate::keyspaces::EVENT_JOURNAL_KEYSPACE;
 use crate::metadata::{MetadataEventPayload, MetadataEventRecord};
@@ -432,6 +433,97 @@ pub fn journal_entries(
         event.anchor_ms.to_be_bytes().to_vec().into(),
     ));
     Ok(entries)
+}
+
+/// The version write `effect` with the event's journal rows in the same batch. A single write
+/// becomes a batch, so its caller must accept `BatchWriteResult`.
+pub fn journaled(effect: Effect, event: &SourceEvent) -> Result<Effect, ConversionError> {
+    let rows = journal_entries(event)?;
+    match effect {
+        Effect::Storage(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id,
+        }) => Ok(Effect::Storage(StorageEffect::BatchWrite {
+            writes: [vec![(key_space, key, value)], rows].concat(),
+            txn_id,
+        })),
+        Effect::Storage(StorageEffect::BatchWrite { writes, txn_id }) => {
+            Ok(Effect::Storage(StorageEffect::BatchWrite {
+                writes: [writes, rows].concat(),
+                txn_id,
+            }))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Matched events and unacknowledged gap counts for one receiver.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBatch {
+    pub events: Vec<ForwardRow>,
+    pub gaps: Vec<(Ulid, GapRow)>,
+}
+
+/// How the receiver decided one event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    Queued,
+    Waiting,
+    Denied(String),
+    Expired,
+    /// The install's queue is full: the sender keeps the row and sends it again later.
+    Busy,
+}
+
+/// The receiver's answer: an outcome per event by install and source id, and the gap sequence
+/// it holds per install, kind and reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decisions {
+    pub events: Vec<(Ulid, String, Outcome)>,
+    pub gaps: Vec<(Ulid, SourceKind, GapReason, u64)>,
+}
+
+/// One host call of a run: its ordinal and a digest of its arguments, so a rerun of the run is
+/// checked to ask for the same thing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallIntent {
+    pub ordinal: u32,
+    pub digest: [u8; 32],
+}
+
+/// A compare-and-swap write of a private state value; `expected: None` writes a new value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateWrite {
+    pub key: String,
+    pub value: Vec<u8>,
+    pub expected: Option<u64>,
+    pub intent: CallIntent,
+}
+
+/// A version-checked removal of a private state value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateRemoval {
+    pub key: String,
+    pub expected: u64,
+    pub intent: CallIntent,
+}
+
+/// A private state value and the version it was written at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateEntry {
+    pub version: u64,
+    pub value: Vec<u8>,
+}
+
+/// Why a state write changed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateRefusal {
+    /// The value or the install's state would grow past its bound.
+    Limit,
+    /// The stored version is not the expected one.
+    Conflict,
 }
 
 /// Forward rows of one install a node keeps at most; matching beyond records a gap.

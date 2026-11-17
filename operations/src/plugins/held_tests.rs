@@ -12,7 +12,7 @@ use super::*;
 use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, keys, secret};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::release::Refusal;
+use aruna_core::plugins::Refusal;
 
 fn request(slot: &str) -> ReleaseRequest {
     ReleaseRequest {

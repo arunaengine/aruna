@@ -100,6 +100,17 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
             Box::pin(crate::jobs::records::dispatch_offer(context, *offer)).await,
         )),
+        // A plugin artifact chunk travels over the metadata transport, which the runner holds.
+        Effect::Net(NetEffect::ArtifactStore(store)) => {
+            let stored = match context.metadata_handle.as_ref() {
+                Some(handle) => (handle
+                    .request_store_artifact(store.node_id, store.chunk)
+                    .await)
+                    .map_err(|error| format!("{error:?}")),
+                None => Err("no metadata transport on this node".to_string()),
+            };
+            Event::Net(NetEvent::ArtifactStored(stored))
+        }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Metadata(metadata_effect) => {
             metadata::dispatch_metadata(metadata_effect, context).await

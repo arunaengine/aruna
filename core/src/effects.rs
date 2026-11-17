@@ -753,6 +753,8 @@ pub enum NetEffect {
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
     /// Reads a release crate version or asks a range holder about releases.
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
+    /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.
+    ArtifactStore(Box<crate::plugins::ArtifactStore>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

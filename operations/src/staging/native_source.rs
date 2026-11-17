@@ -1052,11 +1052,9 @@ mod tests {
 
         mark_access_denied(&context, relationship.clone()).await;
 
-        let txn = crate::plugins::store::Txn::direct(&context);
         let pending = aruna_core::plugin_runs::PENDING_ROW;
-        let (rows, _) = crate::plugins::journal::journal_page(&txn, pending, None, 10)
-            .await
-            .unwrap();
+        let page = crate::plugins::journal::journal_page(pending, None, 10);
+        let (rows, _) = crate::driver::drive(page, &context).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.resource, relationship.id.to_string());
         let transition = format!("sync_failed/{source}/{}/", relationship.id);

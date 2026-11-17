@@ -56,7 +56,8 @@ use super::version_replication::{
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_watch_event;
-use crate::plugins::store::{StoreError, Txn, transact};
+use crate::plugins::rows::StoreError;
+use crate::plugins::store::{Txn, transact};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
@@ -3810,14 +3811,7 @@ mod tests {
 
     /// The plugin journal rows this node has not matched yet.
     async fn journaled(context: &DriverContext) -> Vec<SourceEvent> {
-        let txn = Txn::direct(context);
-        let pending = aruna_core::plugin_runs::PENDING_ROW;
-        let page = crate::plugins::journal::journal_page(&txn, pending, None, 100).await;
-        page.unwrap()
-            .0
-            .into_iter()
-            .map(|(_, event)| event)
-            .collect()
+        crate::plugins::journal::pending_events(context).await
     }
 
     #[tokio::test]
