@@ -342,13 +342,16 @@ impl Operation for QueueWakesOperation {
     }
 }
 
+/// Owed wakes of one page and the cursor of the next page.
+pub type OwedPage = (Vec<OwedWake>, Option<Key>);
+
 /// One page of owed wakes after `start_after`, and the cursor of the next page when this one
 /// is full. Undecodable rows are skipped but still advance the cursor.
 #[derive(Debug, PartialEq)]
 pub struct OwedWakesOperation {
     start_after: Option<Key>,
     started: bool,
-    outcome: Option<Result<(Vec<OwedWake>, Option<Key>), JobMutationError>>,
+    outcome: Option<Result<OwedPage, JobMutationError>>,
 }
 
 impl OwedWakesOperation {
@@ -362,7 +365,7 @@ impl OwedWakesOperation {
 }
 
 impl Operation for OwedWakesOperation {
-    type Output = (Vec<OwedWake>, Option<Key>);
+    type Output = OwedPage;
     type Error = JobMutationError;
 
     fn start(&mut self) -> Effects {
@@ -401,7 +404,7 @@ impl Operation for OwedWakesOperation {
     }
 }
 
-fn owed_page(rows: &[(Key, Value)]) -> (Vec<OwedWake>, Option<Key>) {
+fn owed_page(rows: &[(Key, Value)]) -> OwedPage {
     let next = (rows.len() == WAKE_PAGE)
         .then(|| rows.last().map(|(row, _)| row.clone()))
         .flatten();
