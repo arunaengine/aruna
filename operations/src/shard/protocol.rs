@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::shard::manifest_entry_digest;
+use crate::shard::manifest::manifest_entry_digest;
 
 /// A manifest request has only fixed-size identifiers and integer fields. This
 /// small envelope leaves encoding headroom without permitting a large body to
