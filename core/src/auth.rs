@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub const REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
+pub const ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
+pub const ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 
 /// Maximum bearer-token lifetime accepted by replicated revocation admission.
 /// 366 days covers every 12-calendar-month token, including leap years.

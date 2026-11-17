@@ -4,7 +4,6 @@
 
 use crate::error::CliError;
 use aruna::config::load;
-use aruna_api::server::state::load_persisted_state;
 use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::onboarding::{
@@ -17,6 +16,7 @@ use aruna_operations::auth::bearer_token::{
 };
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::node::api_state::LoadStateOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
 use aruna_operations::realm::claim_admin::{
@@ -418,12 +418,13 @@ struct DoctorValidationState {
 impl DoctorValidationState {
     async fn load(driver_ctx: &DriverContext) -> Self {
         let mut revoked_token_hashes = HashSet::<String, ahash::RandomState>::default();
-        let trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
-            driver_ctx,
-            REALMS_LIST_KEY,
-        )
-        .await
-        .unwrap_or_default();
+        let realms =
+            LoadStateOperation::<HashSet<RealmId, ahash::RandomState>>::new(REALMS_LIST_KEY);
+        let trusted_realms = drive(realms, driver_ctx)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         // The replicated realm config is the only revocation authority.
         for realm_id in &trusted_realms {
             if let Ok(config) = drive(GetConfigOperation::new(*realm_id), driver_ctx).await {

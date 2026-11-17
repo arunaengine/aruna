@@ -4,8 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna::identity::PersistedNodeState;
-use aruna_api::server::state::ADMIN_CLAIMED_KEY;
-use aruna_core::auth::REALMS_LIST_KEY;
+use aruna_core::auth::{ADMIN_CLAIMED_KEY, REALMS_LIST_KEY};
 use aruna_core::compute::quota::{ComputeDepartureReport, JobReservationRecord};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
