@@ -31,7 +31,7 @@ use crate::metadata::search_cursor::{MAX_PAGINATION_DEPTH, compare_hits, tie_ord
 #[tracing::instrument(
     name = "metadata.search.local",
     level = "debug",
-    skip(inner, graph, auth_context, query, iri_filter),
+    skip(context, inner, graph, auth_context, query, iri_filter),
     fields(
         query_len = query.len() as u64,
         limit = limit as u64,
