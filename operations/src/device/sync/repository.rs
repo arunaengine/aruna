@@ -473,8 +473,164 @@ impl Operation for RequeueUploadsOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{base_key, key_path};
+    use super::{
+        RequeueUploadsOperation, SYNC_PAGE_SIZE, StoreUploadError, StoreUploadOperation,
+        SyncUpload, UploadState, base_key, key_path, upload_entry,
+    };
+    use crate::device::scan_rows::ScanRowsOperation;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::SYNC_UPLOAD_KEYSPACE;
+    use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
     use ulid::Ulid;
+
+    const TXN: Ulid = Ulid::from_bytes([9; 16]);
+
+    fn upload(state: UploadState) -> SyncUpload {
+        SyncUpload {
+            folder_id: Ulid::from_bytes([4; 16]),
+            relative: "a.txt".to_string(),
+            deleted: false,
+            fingerprint: "1-1".to_string(),
+            blake3: None,
+            size: 1,
+            local_version: Some(Ulid::from_bytes([5; 16])),
+            queued_at_ms: 1,
+            state,
+        }
+    }
+
+    fn failed() -> UploadState {
+        UploadState::Failed {
+            reason: "down".to_string(),
+            retryable: true,
+        }
+    }
+
+    fn due() -> UploadState {
+        UploadState::Pending {
+            due_at_ms: 7,
+            attempts: 0,
+            last_error: Some("down".to_string()),
+        }
+    }
+
+    fn storage(event: StorageEvent) -> Event {
+        Event::Storage(event)
+    }
+
+    fn stored(upload: &SyncUpload) -> Event {
+        storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(upload.to_bytes().unwrap().into()),
+        })
+    }
+
+    // A row still in the read state is written under the new one in one transaction.
+    #[test]
+    fn stores_unchanged_row() {
+        let row = upload(failed());
+        let written = upload_entry(&upload(due())).unwrap();
+        let mut store = StoreUploadOperation::new(row.clone(), due(), true);
+        check_trace(
+            &mut store,
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })],
+            vec![
+                (
+                    storage(StorageEvent::TransactionStarted { txn_id: TXN }),
+                    vec![Effect::Storage(StorageEffect::Read {
+                        key_space: SYNC_UPLOAD_KEYSPACE.to_string(),
+                        key: base_key(row.folder_id, &row.relative),
+                        txn_id: Some(TXN),
+                    })],
+                ),
+                (
+                    stored(&row),
+                    vec![Effect::Storage(StorageEffect::BatchWrite {
+                        writes: vec![written],
+                        txn_id: Some(TXN),
+                    })],
+                ),
+                (
+                    storage(StorageEvent::BatchWriteResult {
+                        entries: Vec::new(),
+                    }),
+                    vec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: TXN,
+                    })],
+                ),
+                (
+                    storage(StorageEvent::TransactionCommitted { txn_id: TXN }),
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(store.finalize(), Ok(true));
+    }
+
+    // A row that moved on is left alone and the transaction aborted; other events are refused.
+    #[test]
+    fn moved_row_kept() {
+        let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN });
+        let mut store = StoreUploadOperation::new(upload(failed()), due(), true);
+        store.start();
+        store.step(storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        assert_eq!(
+            store.step(stored(&upload(due()))).into_vec(),
+            vec![abort.clone()]
+        );
+        store.step(storage(StorageEvent::TransactionAborted { txn_id: TXN }));
+        assert_eq!(store.finalize(), Ok(false));
+        let mut open = StoreUploadOperation::new(upload(failed()), due(), true);
+        open.start();
+        open.step(storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        check_abort(&mut open, &[abort]);
+
+        let fresh = || StoreUploadOperation::new(upload(failed()), due(), true);
+        let refused = rejects_events(fresh, sample_events, |_| false);
+        assert_eq!(refused.len(), sample_events().len());
+        assert!(matches!(refused[0].2, StoreUploadError::UnexpectedEvent(_)));
+        rejects_finalize(fresh());
+        assert!(fresh().abort().is_empty());
+    }
+
+    // A retryable failure is stored again as due; a node without uploads moves nothing.
+    #[test]
+    fn requeues_failed_uploads() {
+        let (key, value) = {
+            let (_, key, value) = upload_entry(&upload(failed())).unwrap();
+            (key, value)
+        };
+        let page = |values| {
+            storage(StorageEvent::IterResult {
+                values,
+                next_start_after: None,
+            })
+        };
+        let scan = ScanRowsOperation::new(SYNC_UPLOAD_KEYSPACE, None, SYNC_PAGE_SIZE).start();
+        let store = StoreUploadOperation::new(upload(failed()), due(), true).start();
+        let mut requeue = RequeueUploadsOperation::new(7);
+        check_trace(
+            &mut requeue,
+            &scan,
+            vec![(page(vec![(key, value)]), store.into_vec())],
+        );
+        assert!(!requeue.is_complete());
+
+        let mut requeue = RequeueUploadsOperation::new(7);
+        requeue.start();
+        assert!(requeue.step(page(Vec::new())).is_empty());
+        assert_eq!(requeue.finalize(), Ok(0));
+        let fresh = || RequeueUploadsOperation::new(7);
+        let refused = rejects_events(fresh, sample_events, |_| false);
+        assert_eq!(refused.len(), sample_events().len());
+        rejects_finalize(fresh());
+    }
 
     #[test]
     fn keys_folder_paths() {
