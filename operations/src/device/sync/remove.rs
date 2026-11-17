@@ -162,7 +162,7 @@ mod tests {
 
     // A moved file writes the audit row, then drops the base row, in the transaction.
     #[test]
-    fn moves_then_drops_base() {
+    fn drops_base_row() {
         let mut remove = remove();
         assert!(remove.transaction());
         assert!(matches!(
