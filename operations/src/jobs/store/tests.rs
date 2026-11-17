@@ -2465,3 +2465,39 @@ async fn capacity_not_conflict() {
 
     assert!(matches!(result, CommitResult::Failed(_)));
 }
+
+// A listing reads the record of an index row that carries none, and a short page ends it.
+#[test]
+fn list_reads_bare_rows() {
+    use super::query::ListJobsOperation;
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    let record = queued_record(job_id(1_000));
+    let owner = record.created_by;
+    let mut listing = ListJobsOperation::new(owner, None, 2, |_: &JobRecord| true);
+    assert!(matches!(
+        listing.first(),
+        Ok(Next::Call(IoCall::Page { limit: 2, .. }))
+    ));
+    let row = (
+        owner_index_key(owner, 1_000, record.job_id),
+        Value::from(&[][..]),
+    );
+    let page = IoResult::Page {
+        rows: vec![row],
+        next: None,
+    };
+    assert!(matches!(
+        listing.next(page),
+        Ok(Next::Call(IoCall::Read(_)))
+    ));
+    let bytes = Value::from(record.to_bytes().unwrap().as_slice());
+    let Ok(Next::Done((records, cursor))) = listing.next(IoResult::Values(vec![Some(bytes)]))
+    else {
+        panic!("a short page ends the listing");
+    };
+    assert_eq!(records, vec![record]);
+    assert_eq!(cursor, None);
+    let mut empty = ListJobsOperation::new(owner, None, 0, |_: &JobRecord| true);
+    assert_eq!(empty.first(), Ok(Next::Done((Vec::new(), None))));
+}

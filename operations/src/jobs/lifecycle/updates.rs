@@ -639,7 +639,238 @@ fn log_tails(result: Option<&JobResultPayload>) -> (Option<ResultMessage>, Optio
 mod pure_tests {
     use super::*;
     use crate::tests::records::{Family, node, payload, user};
-    use aruna_core::structs::execution::job::{ExecutionReceipt, JobError, JobPayload};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::{
+        EffectiveResources, ExecutionReceipt, JobError, JobPayload,
+    };
+    use aruna_core::types::Value;
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn chain_of(family: &Family, receipt: &ExecutionReceipt) -> ExecutionChain {
+        ExecutionChain {
+            family: family.family(),
+            execution_id: receipt.execution_id,
+            executor_node_id: receipt.executor_node_id,
+            spec_digest: receipt.spec_digest,
+            receipt_digest: receipt.digest().expect("receipt digest"),
+            job_id: receipt.job_id,
+        }
+    }
+
+    fn serving(family: &Family) -> Serving {
+        Some((family.target.public(), family.config.realm_id))
+    }
+
+    fn publish(family: &Family, receipt: &ExecutionReceipt) -> PublishStateOperation {
+        let state = (PhysicalExecutionState::Running, None, 5);
+        PublishStateOperation::new(chain_of(family, receipt), state, serving(family), 9)
+    }
+
+    /// A publication that read its receipt and is about to read the updates.
+    fn receipted(family: &Family, receipt: &ExecutionReceipt) -> PublishStateOperation {
+        let mut operation = publish(family, receipt);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let record = JobFamilyRecord::Receipt(Box::new(receipt.clone()));
+        let receipts = vec![family.sign(&family.target, record)];
+        let read = operation.next(child::<_, FamilyReadError>(Ok(receipts)));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Child(_)))));
+        operation
+    }
+
+    fn updates(records: Vec<JobRecordEnvelope>) -> IoResult {
+        child::<_, FamilyReadError>(Ok(records))
+    }
+
+    fn reservation() -> JobReservationRecord {
+        JobReservationRecord {
+            execution_id: Ulid::from_bytes([7; 16]),
+            job_id: JobId::from_bytes([4; 16]),
+            logical_job_id: JobId::from_bytes([5; 16]),
+            resources: EffectiveResources {
+                cpu_cores: 1,
+                ram_bytes: 0,
+                disk_bytes: 0,
+                max_walltime_ms: 1_000,
+                preemptible: false,
+            },
+            created_at_ms: 10,
+            subject_generation: 0,
+            subject_digest: [0; 32],
+        }
+    }
+
+    // The executor signs the next update of its chain, appends it, then wakes the outbox and,
+    // for a new record, the dashboard.
+    #[test]
+    fn publish_signs_next() {
+        let family = Family::new([5u8; 32]);
+        let receipt = receipt(&family);
+        let mut operation = receipted(&family, &receipt);
+        let Ok(Next::Call(IoCall::Effect(effect))) = operation.next(updates(Vec::new())) else {
+            panic!("the next update is signed");
+        };
+        let Effect::Net(NetEffect::ExecutionSign(claim)) = *effect else {
+            panic!("the next update is signed");
+        };
+        assert_eq!(claim.publisher, family.target.public());
+        let JobFamilyRecord::Update(update) = &claim.record else {
+            panic!("an update is signed");
+        };
+        let root = receipt.digest().expect("receipt digest");
+        assert_eq!((update.sequence, update.previous_digest), (0, root));
+        let envelope = family.sign(&family.target, claim.record.clone());
+        let signed = Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Signed(
+            Box::new(envelope.clone()),
+        )));
+        let append = operation.next(IoResult::Event(Box::new(signed)));
+        assert!(matches!(append, Ok(Next::Call(IoCall::Child(_)))));
+        let outcome = AppendOutcome {
+            key: envelope.key(),
+            digest: envelope.digest().expect("update digest"),
+            admission: Admission::Authentic,
+            admitted: 1,
+            deferred: false,
+        };
+        let Ok(Next::Then {
+            output: true,
+            calls,
+        }) = operation.next(child::<_, RecordStoreError>(Ok(outcome)))
+        else {
+            panic!("an admitted update ends the publication");
+        };
+        let changed = IoCall::Effect(Box::new(Effect::Net(NetEffect::DashboardChanged)));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.last(), Some(&changed));
+    }
+
+    // A stored state needs nothing, and a refused signature leaves the publication pending.
+    #[test]
+    fn publish_stored_state() {
+        let family = Family::new([5u8; 32]);
+        let receipt = receipt(&family);
+        let root = receipt.digest().expect("receipt digest");
+        let running = family.update(&receipt, 0, root, PhysicalExecutionState::Running, None);
+        let stored = family.sign(&family.target, JobFamilyRecord::Update(Box::new(running)));
+        let mut operation = receipted(&family, &receipt);
+        assert_eq!(operation.next(updates(vec![stored])), Ok(Next::Done(true)));
+
+        let mut operation = receipted(&family, &receipt);
+        operation.next(updates(Vec::new())).expect("sign call");
+        let refused = Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Unavailable(
+            "no key".to_string(),
+        )));
+        let answer = operation.next(IoResult::Event(Box::new(refused)));
+        assert_eq!(answer, Ok(Next::Done(false)));
+    }
+
+    // Only the receipted executor of a node with a net transport publishes.
+    #[test]
+    fn publish_needs_executor() {
+        let family = Family::new([5u8; 32]);
+        let receipt = receipt(&family);
+        let state = (PhysicalExecutionState::Running, None, 5);
+        let mut detached = PublishStateOperation::new(chain_of(&family, &receipt), state, None, 9);
+        assert_eq!(detached.first(), Ok(Next::Done(false)));
+        let other = Some((family.holder.public(), family.config.realm_id));
+        let state = (PhysicalExecutionState::Running, None, 5);
+        let mut foreign = PublishStateOperation::new(chain_of(&family, &receipt), state, other, 9);
+        assert_eq!(foreign.first(), Ok(Next::Done(false)));
+    }
+
+    // A terminal job publishes its state through its chain, then releases its reservation; a
+    // job without one owes nothing and a running job publishes nothing.
+    #[test]
+    fn terminal_publishes_releases() {
+        let family = Family::new([5u8; 32]);
+        let receipt = receipt(&family);
+        let mut record = terminal(JobError::permanent("exit 1"));
+        let mut operation = PublishTerminalOperation::new(record.clone(), serving(&family), 9);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let held = child::<_, LifecycleError>(Ok(vec![reservation()]));
+        assert!(matches!(
+            operation.next(held),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let chain = child::<_, LifecycleError>(Ok(Some(chain_of(&family, &receipt))));
+        assert!(matches!(
+            operation.next(chain),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let published = child::<_, LifecycleError>(Ok(true));
+        assert!(matches!(
+            operation.next(published),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let released = child::<_, LifecycleError>(Ok(true));
+        assert_eq!(operation.next(released), Ok(Next::Done(true)));
+
+        let mut local = PublishTerminalOperation::new(record.clone(), serving(&family), 9);
+        local.first().expect("reservation read");
+        let none = child::<Vec<JobReservationRecord>, LifecycleError>(Ok(Vec::new()));
+        assert_eq!(local.next(none), Ok(Next::Done(true)));
+
+        record.state = JobState::Running;
+        let mut running = PublishTerminalOperation::new(record, serving(&family), 9);
+        assert_eq!(running.first(), Ok(Next::Done(true)));
+    }
+
+    // An unresolved chain or a failed publication keeps the reservation held.
+    #[test]
+    fn terminal_stays_pending() {
+        let family = Family::new([5u8; 32]);
+        let record = terminal(JobError::permanent("exit 1"));
+        let mut operation = PublishTerminalOperation::new(record.clone(), serving(&family), 9);
+        operation.first().expect("reservation read");
+        operation
+            .next(child::<_, LifecycleError>(Ok(vec![reservation()])))
+            .expect("chain read");
+        let unresolved = child::<Option<ExecutionChain>, LifecycleError>(Ok(None));
+        assert_eq!(operation.next(unresolved), Ok(Next::Done(false)));
+    }
+
+    // Each held reservation's settled job is published; a pending one makes the settle run
+    // again, and a reservation without a job is skipped.
+    #[test]
+    fn settle_reports_pending() {
+        let record = terminal(JobError::permanent("exit 1"));
+        let mut operation = SettleTerminalsOperation::new(None, 9);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let held = child::<_, LifecycleError>(Ok(vec![reservation(), reservation()]));
+        assert!(matches!(
+            operation.next(held),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        let bytes = Value::from(record.to_bytes().expect("job row").as_slice());
+        let read = operation.next(IoResult::Values(vec![Some(bytes)]));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Child(_)))));
+        let pending = operation.next(child::<_, LifecycleError>(Ok(false)));
+        assert!(matches!(pending, Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(
+            operation.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(true))
+        );
+
+        let mut empty = SettleTerminalsOperation::new(None, 9);
+        empty.first().expect("reservation read");
+        let none = child::<Vec<JobReservationRecord>, LifecycleError>(Ok(Vec::new()));
+        assert_eq!(empty.next(none), Ok(Next::Done(false)));
+    }
 
     fn receipt(family: &Family) -> ExecutionReceipt {
         let spec = family.spec();
