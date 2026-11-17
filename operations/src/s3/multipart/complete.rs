@@ -73,8 +73,8 @@ use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use crate::plugins::journal::journaled;
 use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::plugin_runs::journaled;
 use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use tracing::warn;
