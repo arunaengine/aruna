@@ -16,16 +16,14 @@ use aruna_core::types::Key;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::StorageReadError;
+use crate::metadata::timestamp_sweep::{SWEEP_SCAN_LIMIT, TimestampSweepOperation};
 use crate::storage_read::parse_storage_scan;
 
 /// Storage rows scanned per index batch while assembling one enumeration page.
 const INDEX_SCAN_BATCH: usize = 256;
-/// Index keys validated by one sweep pass, and stale keys per delete batch.
-const SWEEP_SCAN_LIMIT: usize = 4_096;
-const SWEEP_DELETE_BATCH: usize = 128;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 /// One page of registry records ordered by `updated_at_ms`, plus stale index
@@ -104,81 +102,6 @@ pub(crate) async fn enumerate_updated(
     })
 }
 
-/// One bounded sweep pass: how many stale keys it deleted and where to resume.
-pub struct SweepPass {
-    pub deleted: usize,
-    pub next_after: Option<Key>,
-}
-
-/// Deletes index keys whose record moved to a newer datestamp or was deleted.
-/// Racing a concurrent write is benign: the writer re-adds the current key,
-/// and readers validate every key against the record regardless.
-pub(crate) async fn sweep_stale_keys(
-    context: &DriverContext,
-    after: Option<Key>,
-) -> Result<SweepPass, StorageReadError> {
-    sweep_bounded(context, after, SWEEP_SCAN_LIMIT).await
-}
-
-async fn sweep_bounded(
-    context: &DriverContext,
-    after: Option<Key>,
-    scan_limit: usize,
-) -> Result<SweepPass, StorageReadError> {
-    let mut start = match after {
-        Some(cursor) => IterStart::After(cursor),
-        None => IterStart::At(updated_index_key(0, Ulid::nil())),
-    };
-    let mut stale = Vec::new();
-    let mut deleted = 0usize;
-    let mut scanned = 0usize;
-    let mut resume = None;
-
-    'scan: loop {
-        let event = context
-            .storage_handle
-            .send_effect(iter_effect(start.clone()))
-            .await;
-        let (entries, iter_next) = parse_storage_scan(event)?;
-        if entries.is_empty() {
-            break;
-        }
-
-        for (key, _) in entries {
-            let (updated_at_ms, document_id) =
-                parse_updated_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
-            scanned += 1;
-            resume = Some(key.clone());
-            match load_document_record(context, document_id).await? {
-                Some(record) if record.updated_at_ms == updated_at_ms => {}
-                _ => stale.push(key),
-            }
-            if stale.len() >= SWEEP_DELETE_BATCH {
-                deleted +=
-                    delete_index_keys(context, UPDATED_INDEX_KEYSPACE, std::mem::take(&mut stale))
-                        .await?;
-            }
-            if scanned >= scan_limit {
-                break 'scan;
-            }
-        }
-
-        match iter_next {
-            Some(next) => start = IterStart::After(next),
-            None => {
-                resume = None;
-                break;
-            }
-        }
-    }
-
-    deleted += delete_index_keys(context, UPDATED_INDEX_KEYSPACE, stale).await?;
-    Ok(SweepPass {
-        deleted,
-        next_after: resume,
-    })
-}
-
 /// Runs the sweep on the shutdown supervisor, resuming from the previous pass so
 /// no single pass walks the whole index.
 pub(crate) fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
@@ -190,7 +113,8 @@ pub(crate) fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown
                 _ = token.cancelled() => return,
                 _ = tokio::time::sleep(SWEEP_INTERVAL) => {}
             }
-            match sweep_stale_keys(&context, cursor.take()).await {
+            let sweep = TimestampSweepOperation::new(cursor.take(), SWEEP_SCAN_LIMIT);
+            match drive(sweep, &context).await {
                 Ok(pass) => cursor = pass.next_after,
                 Err(error) => warn!(error = ?error, "Metadata timestamp-index sweep failed"),
             }
@@ -378,7 +302,12 @@ mod tests {
         let current = record(Ulid::from_bytes([41; 16]), 200);
         store(&context, &current).await;
 
-        let pass = sweep_stale_keys(&context, None).await.unwrap();
+        let pass = drive(
+            TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT),
+            &context,
+        )
+        .await
+        .unwrap();
         assert_eq!(pass.deleted, 1);
         assert!(pass.next_after.is_none());
 
@@ -404,7 +333,9 @@ mod tests {
         let mut cursor = None;
         let mut deleted = 0usize;
         for _ in 0..64 {
-            let pass = sweep_bounded(&context, cursor.take(), 2).await.unwrap();
+            let pass = drive(TimestampSweepOperation::new(cursor.take(), 2), &context)
+                .await
+                .unwrap();
             deleted += pass.deleted;
             cursor = pass.next_after;
             if cursor.is_none() {
