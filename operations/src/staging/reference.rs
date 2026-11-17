@@ -17,7 +17,7 @@ use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use crate::plugins::journal::journaled;
-use crate::replication::queue::build_live_obligation;
+use crate::replication::records::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
@@ -706,7 +706,7 @@ mod tests {
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::driver::drive;
     use crate::node::usage_stats::RebuildStatsOperation;
-    use crate::replication::queue::{LiveObligationRecord, live_obligation_key};
+    use crate::replication::records::{LiveObligationRecord, live_obligation_key};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;

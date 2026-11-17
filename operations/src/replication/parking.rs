@@ -3,7 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::queue::{BlobJobRecord, BlobQueueError, REPLICATION_POLL_AFTER, schedule_blob_drain};
+use super::records::BlobJobRecord;
+
+use super::queue::{BlobQueueError, schedule_blob_drain};
+
+use super::drain::REPLICATION_POLL_AFTER;
 use super::version_replication::ReplicateScopeTarget;
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
@@ -416,8 +420,9 @@ async fn abort(storage: &StorageHandle, txn_id: TxnId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::drain::next_blob_timer;
     use crate::replication::protocol::ReplicationMode;
-    use crate::replication::queue::{blob_job_key, next_blob_timer};
+    use crate::replication::records::blob_job_key;
     use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};

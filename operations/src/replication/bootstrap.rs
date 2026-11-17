@@ -40,7 +40,8 @@ use ulid::Ulid;
 
 use super::members::{MemberTarget, read_record};
 use super::protocol::ReplicationMode;
-use super::queue::{BlobJobRecord, blob_job_key, schedule_blob_drain};
+use super::queue::schedule_blob_drain;
+use super::records::{BlobJobRecord, blob_job_key};
 use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use crate::distribution::create::submit;
 use crate::distribution::lifecycle::settle_marker;

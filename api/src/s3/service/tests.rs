@@ -43,7 +43,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::subscriptions::create_local_watch;
-use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
+use aruna_operations::replication::records::{LiveObligationRecord, live_obligation_key};
 use aruna_operations::s3::object::get::ObjectInfo;
 use aruna_operations::s3::object::list::ListContinuationToken;
 use aruna_operations::s3::object::metadata::{

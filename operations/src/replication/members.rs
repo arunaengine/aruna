@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::protocol::ReplicationMode;
-use super::queue::{BlobJobRecord, LiveObligationRecord, queued_prefixes};
+use super::records::{BlobJobRecord, LiveObligationRecord, queued_prefixes};
 use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -355,7 +355,7 @@ mod tests {
             let context = &context;
             async move { context.storage_handle.send_storage_effect(effect).await }
         };
-        let entry = super::super::queue::live_obligation_entry(&obligation).unwrap();
+        let entry = super::super::records::live_obligation_entry(&obligation).unwrap();
         write(entry.clone()).await;
         assert!(owes(lower.clone()).await, "an obligation is still owed");
         assert!(!owes(upper.clone()).await, "another range owes nothing");
@@ -367,7 +367,7 @@ mod tests {
         context.storage_handle.send_storage_effect(delete).await;
         let jobs = member_jobs(&binding(&snapshot, 1, 5), &snapshot, &obligation, 9);
         let job = &jobs[0];
-        let key = super::super::queue::blob_job_key(job).unwrap();
+        let key = super::super::records::blob_job_key(job).unwrap();
         let value = job.to_bytes().unwrap().into();
         let job_space = aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE.to_string();
         write((job_space, key, value)).await;
@@ -378,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn counts_copy_lag() {
         // Obligations count for every member until their jobs are queued, then the jobs count.
-        use super::super::queue::{
+        use super::super::records::{
             LiveReplicationContinuation, blob_job_key, live_obligation_entry,
         };
         use crate::distribution::test_store::open;

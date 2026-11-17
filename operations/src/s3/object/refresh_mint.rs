@@ -30,7 +30,7 @@ use crate::distribution::inventory::{
 };
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::protocol::ReferenceAdvance;
-use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
+use crate::replication::records::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};

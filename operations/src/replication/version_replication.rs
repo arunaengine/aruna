@@ -4555,7 +4555,7 @@ mod tests {
     fn page_matches_single() {
         // A reference page carries exactly the manifest a single delivery of the job sends.
         use crate::replication::page::build::reference_manifest;
-        use crate::replication::queue::BlobJobRecord;
+        use crate::replication::records::BlobJobRecord;
         use aruna_core::structs::storage::distribution::OriginalEpoch;
         let version_id = Ulid::generate();
         let publication = Publication {

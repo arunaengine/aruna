@@ -22,8 +22,9 @@ use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced, worker,
 };
+use crate::replication::drain::process_blob_batch;
 use crate::replication::protocol::ReplicationMode;
-use crate::replication::queue::{QueueBlobOperation, process_blob_batch};
+use crate::replication::queue::QueueBlobOperation;
 use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use crate::sync::sync_relationship::StoreRelationshipOperation;
 use crate::sync::sync_relationship::SyncRelationshipDirection::Outgoing;

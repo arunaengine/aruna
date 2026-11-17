@@ -20,13 +20,14 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::AuthToken;
+use aruna_operations::replication::drain::relationship_job_stats;
 use aruna_operations::replication::parking::awaiting_jobs;
 use aruna_operations::replication::plaintext::{
     consent_delete, consent_write, read_consent, relationship_consent, source_encrypted,
     store_consent,
 };
 use aruna_operations::replication::protocol::ReplicationMode;
-use aruna_operations::replication::queue::{QueueBlobOperation, relationship_job_stats};
+use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };

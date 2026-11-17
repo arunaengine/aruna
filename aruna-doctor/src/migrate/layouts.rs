@@ -16,7 +16,7 @@ use aruna_core::structs::storage::usage::{
 };
 use aruna_operations::replication::members::MemberTarget;
 use aruna_operations::replication::protocol::{ReferenceAdvance, SyncOrigin};
-use aruna_operations::replication::queue::{BlobJobRecord, blob_job_key};
+use aruna_operations::replication::records::{BlobJobRecord, blob_job_key};
 use aruna_operations::replication::version_replication::ReplicateScopeInput;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;

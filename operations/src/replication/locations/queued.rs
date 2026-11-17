@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::LocationSummaryError;
-use crate::replication::queue::BlobJobRecord;
+use crate::replication::records::BlobJobRecord;
 use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -163,7 +163,7 @@ impl Operation for QueuedNodesOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::QueuedNodesOperation;
-    use crate::replication::queue::BlobJobRecord;
+    use crate::replication::records::BlobJobRecord;
     use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
     use crate::tests::locations::{auth, node_id};
     use aruna_core::events::{Event, StorageEvent};

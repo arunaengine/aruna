@@ -24,9 +24,8 @@ use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     ReferenceAdvance, VersionReplicationManifest, VersionReplicationMessage,
 };
-use crate::replication::queue::{
-    LiveObligationRecord, live_obligation_effect, schedule_blob_drain,
-};
+use crate::replication::queue::schedule_blob_drain;
+use crate::replication::records::{LiveObligationRecord, live_obligation_effect};
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};

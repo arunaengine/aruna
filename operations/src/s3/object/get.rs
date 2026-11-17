@@ -22,9 +22,8 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, m
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReferenceAdvance,
 };
-use crate::replication::queue::{
-    LiveObligationRecord, LiveVersionInput, LiveVersionOperation, live_obligation_entry,
-};
+use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use crate::replication::records::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,

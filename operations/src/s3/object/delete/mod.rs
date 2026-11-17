@@ -15,7 +15,7 @@ use crate::distribution::inventory::{
 use crate::node::usage_stats::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
-use crate::replication::queue::build_live_obligation;
+use crate::replication::records::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::row_fence::{FenceError, RowFence};
 use aruna_core::UserId;

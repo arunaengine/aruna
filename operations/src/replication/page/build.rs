@@ -25,7 +25,7 @@ use thiserror::Error;
 
 use super::{PAGE_BYTES, PAGE_RECORDS};
 use crate::replication::protocol::VersionReplicationManifest;
-use crate::replication::queue::BlobJobRecord;
+use crate::replication::records::BlobJobRecord;
 use crate::replication::version_replication::ReplicateScopeTarget;
 use crate::staging::root_record::{hydrated, named_root};
 

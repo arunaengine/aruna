@@ -23,7 +23,7 @@ use crate::placement::policy::{
     split_drift_reads, union_refs, write_gate,
 };
 use crate::replication::dht_registration::dht_registration_effect;
-use crate::replication::queue::build_live_obligation;
+use crate::replication::records::build_live_obligation;
 use crate::s3::purge_fence::{
     PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
 };
@@ -2407,7 +2407,7 @@ mod pure_tests {
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one obligation write, got {effects:?}")
         };
-        let record = crate::replication::queue::LiveObligationRecord::from_bytes(value.as_ref())
+        let record = crate::replication::records::LiveObligationRecord::from_bytes(value.as_ref())
             .expect("obligation decodes");
         assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
     }

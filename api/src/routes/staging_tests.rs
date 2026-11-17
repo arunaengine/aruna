@@ -31,7 +31,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
+use aruna_operations::replication::records::{LiveObligationRecord, live_obligation_key};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;

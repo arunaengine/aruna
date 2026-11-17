@@ -8,7 +8,7 @@ use crate::driver::{DriverContext, drive};
 use crate::groups::imports::cron::is_running;
 use crate::groups::imports::validate_folder;
 use crate::jobs::store::decode_job_record;
-use crate::replication::queue::queued_prefixes;
+use crate::replication::records::queued_prefixes;
 use crate::s3::purge_fence::fence_key;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

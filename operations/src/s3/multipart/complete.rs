@@ -21,7 +21,7 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
-use crate::replication::queue::build_live_obligation;
+use crate::replication::records::build_live_obligation;
 use crate::s3::multipart::create::storage_current;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};

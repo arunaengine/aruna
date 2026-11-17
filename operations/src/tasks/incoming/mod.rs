@@ -106,7 +106,7 @@ use crate::placement::process_placements::{PlacementReconcileStatus, process_sha
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
-use crate::replication::queue::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
+use crate::replication::drain::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
 use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{read_outbox_records, read_outbox_tails, restore_outbox_timers};

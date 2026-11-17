@@ -38,7 +38,7 @@ use aruna_kpabe::{Envelope, UserKey};
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
+use aruna_operations::replication::records::{LiveObligationRecord, live_obligation_key};
 use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;

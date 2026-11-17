@@ -16,7 +16,7 @@ use crate::replication::protocol::{
     MAX_VALUE_BYTES, MaterializedBlobInfo, ReferenceAdvance, SyncOrigin,
     VersionReplicationManifest, VersionReplicationMessage,
 };
-use crate::replication::queue::LiveObligationRecord;
+use crate::replication::records::LiveObligationRecord;
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
