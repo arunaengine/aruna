@@ -1039,7 +1039,7 @@ async fn put_file_output(
         SnapshotOperation::new(
             &node_routing(context),
             spec.group_id,
-            BucketRules::Named(&write_bucket.to_string()),
+            BucketRules::Named(write_bucket.to_string()),
         ),
         context,
     )

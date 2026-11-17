@@ -409,7 +409,7 @@ mod tests {
                 SnapshotOperation::new(
                     &node_routing(context.as_ref()),
                     group.0.group_id,
-                    BucketRules::Named(&bucket_name.to_string()),
+                    BucketRules::Named(bucket_name.to_string()),
                 ),
                 context.as_ref(),
             )

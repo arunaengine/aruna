@@ -906,7 +906,10 @@ impl Operation for AddRoleOperation {
                 let group = group.clone();
                 self.handle_auth_read(event, txn_id, group)
             }
-            state @ AddRoleState::WriteDocState { .. } => self.handle_document_write(event, state),
+            state @ AddRoleState::WriteDocState { .. } => {
+                let state = state.clone();
+                self.handle_document_write(event, state)
+            }
             AddRoleState::DeleteAdminConflicts {
                 txn_id,
                 group,

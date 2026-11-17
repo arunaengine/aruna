@@ -229,10 +229,11 @@ pub async fn create_metadata_authorized(
     if path.is_empty() {
         return Err(CreateAuthorizedError::EmptyPath);
     }
-    let user_origin = is_user_origin(context, realm_id, local_node_id).await?;
     let realm_config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let user_origin =
+        is_user_origin(&realm_config, local_node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
     let actor = Actor {
         node_id: local_node_id,
         user_id: auth.user_id,
@@ -328,7 +329,8 @@ impl PinnedCreate {
         let config = load_realm_config(context, actor.realm_id)
             .await
             .ok_or(MetadataApiError::ServiceUnavailable)?;
-        let user_origin = is_user_origin(context, actor.realm_id, actor.node_id).await?;
+        let user_origin =
+            is_user_origin(&config, actor.node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
         let local = match user_origin {
             true => Err(CreateDocumentError::HoldsNoBucket),
             false => mint_local_document(&config, actor, group_id, &path),

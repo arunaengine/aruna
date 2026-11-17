@@ -62,7 +62,6 @@ use crate::plugins::store::{StoreError, Txn, transact};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
-use aruna_core::time::unix_timestamp_millis;
 
 const REPLICATION_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;

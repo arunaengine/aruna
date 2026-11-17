@@ -27,7 +27,6 @@ use ulid::Ulid;
 
 use super::executor::{JobContext, JobRunOutcome};
 use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
-use crate::driver::drive;
 use crate::driver::{drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
@@ -133,7 +132,7 @@ pub async fn download_work(
         SnapshotOperation::new(
             &node_routing(&ctx.driver),
             install.group_id,
-            BucketRules::Named(&bucket.to_string()),
+            BucketRules::Named(bucket.to_string()),
         ),
         &ctx.driver,
     )

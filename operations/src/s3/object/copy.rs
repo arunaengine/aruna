@@ -383,7 +383,7 @@ async fn copy_inner(
         SnapshotOperation::new(
             &node_routing(context),
             input.group_id,
-            BucketRules::Named(&input.dest_bucket.to_string()),
+            BucketRules::Named(input.dest_bucket.to_string()),
         ),
         context,
     )

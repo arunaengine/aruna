@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::errors::StorageError;
 
 /// Progress row value: the raised epoch, the phase (grants, then requests) and the last key.
 pub(super) fn progress(epoch: u64, requests: bool, cursor: &[u8]) -> Vec<u8> {

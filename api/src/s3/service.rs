@@ -1125,7 +1125,7 @@ impl S3 for ArunaS3Service {
                     SnapshotOperation::new(
                         &node_routing(&self.state),
                         group_id,
-                        BucketRules::Named(&replication_bucket.to_string()),
+                        BucketRules::Named(replication_bucket.to_string()),
                     ),
                     &self.state,
                 )
@@ -1493,7 +1493,7 @@ impl S3 for ArunaS3Service {
                     SnapshotOperation::new(
                         &node_routing(&self.state),
                         group_id,
-                        BucketRules::Named(&req.input.bucket.to_string()),
+                        BucketRules::Named(req.input.bucket.to_string()),
                     ),
                     &self.state,
                 )
@@ -1948,7 +1948,7 @@ impl S3 for ArunaS3Service {
                     SnapshotOperation::new(
                         &node_routing(&self.state),
                         group_id,
-                        BucketRules::Named(&req.input.bucket.to_string()),
+                        BucketRules::Named(req.input.bucket.to_string()),
                     ),
                     &self.state,
                 )

@@ -64,6 +64,7 @@ use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
     UPLOAD_DEFER_AFTER, restore_sync_timers,
 };
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
@@ -395,15 +396,15 @@ impl OperationsTaskHandler {
         };
         // A User-kind device registers no holdership: the realm refuses its DHT
         // puts. An unreadable config is bootstrap, which registers.
-        if matches!(
-            crate::forward::routing::is_user_origin(
-                &self.context,
-                *net_handle.realm_id(),
-                net_handle.node_id()
-            )
-            .await,
-            Ok(true)
-        ) {
+        let config = drive(
+            GetConfigOperation::new(*net_handle.realm_id()),
+            &self.context,
+        )
+        .await;
+        let origin = config.ok().and_then(|config| {
+            crate::forward::routing::is_user_origin(&config, net_handle.node_id())
+        });
+        if origin == Some(true) {
             return;
         }
         let operation =
@@ -736,10 +737,11 @@ impl OperationsTaskHandler {
             TaskKey::RealmPresence { realm_id, node_id } => Box::pin(async move {
                 // A User-kind device is DHT read-only and never publishes
                 // presence. An unreadable config is bootstrap, which announces.
-                if matches!(
-                    crate::forward::routing::is_user_origin(&self.context, realm_id, node_id).await,
-                    Ok(true)
-                ) {
+                let config = drive(GetConfigOperation::new(realm_id), &self.context).await;
+                let origin = config
+                    .ok()
+                    .and_then(|config| crate::forward::routing::is_user_origin(&config, node_id));
+                if origin == Some(true) {
                     return;
                 }
                 let op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {

@@ -128,7 +128,7 @@ pub async fn stage_snapshot_blob(
         SnapshotOperation::new(
             &node_routing(context),
             input.group_id,
-            BucketRules::Named(&input.bucket.to_string()),
+            BucketRules::Named(input.bucket.to_string()),
         ),
         context,
     )

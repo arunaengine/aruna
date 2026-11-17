@@ -7,10 +7,9 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use crate::driver::{DriverContext, drive};
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, PolicySession,
-    RequestPolicy, policy_set_hash,
+    CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, RequestPolicy,
+    policy_set_hash,
 };
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{GroupId, TxnId};
 use lru::LruCache;

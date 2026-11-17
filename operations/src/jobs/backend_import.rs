@@ -342,7 +342,7 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
         SnapshotOperation::new(
             &node_routing(&ctx.driver),
             rule.group_id,
-            BucketRules::Named(&rule.bucket.to_string()),
+            BucketRules::Named(rule.bucket.to_string()),
         ),
         &ctx.driver,
     )
@@ -1355,7 +1355,10 @@ async fn add_version(
     file: (BackendLocation, Option<String>),
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
-    let version_id = import_version(run, Some(object.modified_ms.unwrap_or_else(now_ms)));
+    let version_id = import_version(
+        run,
+        Some(object.modified_ms.unwrap_or_else(unix_timestamp_millis)),
+    );
     let committed = ImportedObject {
         key: Some(key.to_string()),
         ..ImportedObject::new(version_id, object)

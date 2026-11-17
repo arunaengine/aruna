@@ -517,7 +517,7 @@ async fn commit_pull(
         SnapshotOperation::new(
             &node_routing(context),
             bucket.group_id,
-            BucketRules::Named(&request.target_bucket.to_string()),
+            BucketRules::Named(request.target_bucket.to_string()),
         ),
         context,
     )
