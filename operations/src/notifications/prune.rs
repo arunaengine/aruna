@@ -411,12 +411,242 @@ impl PruneNotificationsOperation {
     }
 }
 
+impl Operation for PruneNotificationsOperation {
+    type Output = NotificationPruneOutcome;
+    type Error = PruneError;
+
+    fn start(&mut self) -> Effects {
+        self.state = PruneState::IndexPage;
+        self.iter(PRUNE_INDEX_KEYSPACE, None)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let state = std::mem::take(&mut self.state);
+        match (state, event) {
+            (
+                PruneState::IndexPage,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.index_page(values, next_start_after),
+            (
+                PruneState::IndexRows { candidates, scan },
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => self.index_rows(candidates, scan, values),
+            (PruneState::IndexDelete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
+                self.inbox_next(None)
+            }
+            (
+                PruneState::InboxPage,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.inbox_page(values, next_start_after),
+            (
+                PruneState::InboxDelete { next },
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
+            ) => self.inbox_after(next),
+            (
+                PruneState::CutoffPage,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.cutoff_page(values, next_start_after),
+            (
+                PruneState::CutoffStart { keys, next },
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+            ) => {
+                let space = || NOTIFICATION_CUTOFF_KEYSPACE.to_string();
+                let reads = keys.into_iter().map(|key| (space(), key)).collect();
+                self.state = PruneState::CutoffRead { txn_id, next };
+                smallvec![Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: Some(txn_id)
+                })]
+            }
+            (
+                PruneState::CutoffRead { txn_id, next },
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => self.cutoff_read(txn_id, next, values),
+            (
+                PruneState::CutoffDelete { txn_id, next },
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
+            ) => self.cutoff_commit(txn_id, next),
+            // A conflict leaves the outlived times to the next sweep.
+            (
+                PruneState::CutoffCommit { next, .. },
+                Event::Storage(
+                    StorageEvent::TransactionCommitted { .. }
+                    | StorageEvent::Error {
+                        error: StorageError::TransactionConflict,
+                    },
+                ),
+            ) => self.cutoff_after(next),
+            (state, event) => {
+                self.state = state;
+                self.unexpected(event)
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, PruneState::Done | PruneState::Failed(_))
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match self.state {
+            PruneState::Done => Ok(self.outcome),
+            PruneState::Failed(error) => Err(error),
+            _ => Err(PruneError::NotFinished),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        match self.state.txn_id() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
+    }
+}
+
+/// Whether a stored deletion time has outlived every notice it could drop; a malformed one has.
+fn cutoff_expired(value: Option<&Value>, now_ms: u64) -> bool {
+    let longest = DIRECT_TTL_MS.max(TRANSIENT_TTL_MS);
+    value.is_some_and(|value| {
+        <[u8; 8]>::try_from(value.as_ref())
+            .ok()
+            .map(u64::from_be_bytes)
+            .is_none_or(|cutoff| cutoff.saturating_add(longest) <= now_ms)
+    })
+}
+
+/// Arms the prune timer at the first due row of the prune index, at the latest after the poll
+/// interval. It only shortens a pending deadline, so the startup and re-arm passes never push it
+/// later; a malformed first row is deleted and the timer fires at once.
+#[derive(Debug, Default, PartialEq)]
+pub struct RestorePruneOperation {
+    now_ms: u64,
+    state: RestoreState,
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum RestoreState {
+    #[default]
+    Init,
+    Scan,
+    Delete,
+    Arm,
+    Done,
+    Failed(PruneError),
+}
+
+impl RestorePruneOperation {
+    pub fn new(now_ms: u64) -> Self {
+        Self {
+            now_ms,
+            state: RestoreState::Init,
+        }
+    }
+
+    fn arm(&mut self, after: Duration) -> Effects {
+        self.state = RestoreState::Arm;
+        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PruneNotifications,
+            after,
+        })]
+    }
+
+    fn scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        let Some((key, _)) = values.into_iter().next() else {
+            return self.arm(NOTIFICATION_POLL_AFTER);
+        };
+        match parse_prune_key(key.as_ref()) {
+            Ok((expires_at_ms, _, _)) => {
+                let due = Duration::from_millis(expires_at_ms.saturating_sub(self.now_ms));
+                self.arm(due.min(NOTIFICATION_POLL_AFTER))
+            }
+            Err(error) => {
+                warn!(%error, key = ?key.as_ref(), "Deleting malformed notification prune index row during restore");
+                self.state = RestoreState::Delete;
+                smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                    deletes: vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)],
+                    txn_id: None,
+                })]
+            }
+        }
+    }
+}
+
+impl Operation for RestorePruneOperation {
+    type Output = ();
+    type Error = PruneError;
+
+    fn start(&mut self) -> Effects {
+        self.state = RestoreState::Scan;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: PRUNE_INDEX_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (std::mem::take(&mut self.state), event) {
+            (RestoreState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.scanned(values)
+            }
+            (RestoreState::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
+                self.arm(Duration::ZERO)
+            }
+            (RestoreState::Arm, Event::Task(TaskEvent::TimerScheduled { .. })) => {
+                self.state = RestoreState::Done;
+                smallvec![]
+            }
+            (_, event) => {
+                self.state = RestoreState::Failed(match event {
+                    Event::Storage(StorageEvent::Error { error }) => PruneError::Storage(error),
+                    other => PruneError::UnexpectedEvent {
+                        state: "restore",
+                        got: format!("{other:?}"),
+                    },
+                });
+                smallvec![]
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, RestoreState::Done | RestoreState::Failed(_))
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match self.state {
+            RestoreState::Done => Ok(()),
+            RestoreState::Failed(error) => Err(error),
+            _ => Err(PruneError::NotFinished),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context, record, temp_storage, user};
     use aruna_core::UserId;
+    use aruna_core::handle::Handle;
+    use aruna_core::time::unix_timestamp_millis;
+    use aruna_storage::StorageHandle;
+    use aruna_tasks::TaskHandle;
     use aruna_core::storage_entries::{inbox_update_entry, inbox_write_entries};
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
@@ -530,6 +760,51 @@ mod tests {
             notification_prune_key(record),
         )
         .await
+    }
+
+    async fn process_prune_page(
+        context: &DriverContext,
+        page_size: usize,
+    ) -> Result<NotificationPruneOutcome, PruneError> {
+        let operation = PruneNotificationsOperation::new(unix_timestamp_millis(), page_size);
+        drive(operation, context).await
+    }
+
+    async fn process_prune_batch(
+        context: &DriverContext,
+    ) -> Result<NotificationPruneOutcome, PruneError> {
+        process_prune_page(context, PRUNE_PAGE_SIZE).await
+    }
+
+    async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+        let mut context = context(storage);
+        context.task_handle = Some(task_handle.clone());
+        let restore = RestorePruneOperation::new(unix_timestamp_millis());
+        drive(restore, &context).await.expect("restore arms the timer");
+    }
+
+    async fn iter_page(
+        storage: &StorageHandle,
+        key_space: &str,
+        start_after: Option<Key>,
+        limit: usize,
+    ) -> Result<(Vec<(Key, Value)>, Option<Key>), String> {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: None,
+                start: start_after.map(IterStart::After),
+                limit,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => Ok((values, next_start_after)),
+            other => Err(format!("unexpected storage event: {other:?}")),
+        }
     }
 
     async fn records_for(storage: &StorageHandle, recipient: UserId) -> Vec<NotificationRecord> {
