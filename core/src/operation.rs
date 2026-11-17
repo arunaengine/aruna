@@ -58,6 +58,15 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
         false
     }
 
+    /// How often the runner's conflict retry reruns the operation after a conflict before it
+    /// returns the error: reruns after the first run, so three attempts are two retries.
+    fn conflict_retries() -> u32
+    where
+        Self: Sized,
+    {
+        3
+    }
+
     /// Whether a deadline must still run `abort` after one of the operation's
     /// transactions committed. Only an operation whose `abort` protects already
     /// committed work may opt in.

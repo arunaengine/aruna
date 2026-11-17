@@ -95,8 +95,6 @@ impl std::fmt::Debug for DriverContext {
 pub(crate) const MAX_SUBOP_DEPTH: usize = 32;
 const SUBOP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TRACKED_TRANSACTIONS: usize = 32;
-/// Reruns after a transaction conflict before [`drive_retry`] returns the conflict.
-const CONFLICT_RETRIES: usize = 3;
 
 /// Reserves every tenant backend an effect names for the rest of the operation.
 /// The bytes land inside one effect, but the transaction naming them commits
@@ -1084,9 +1082,9 @@ pub async fn drive<O: Operation>(
     result
 }
 
-/// Drives a fresh operation from `build` and, after an error that [`Operation::is_conflict`]
-/// names, waits a backoff seeded by `seed` and drives a new one, at most [`CONFLICT_RETRIES`]
-/// times. The same seed gives the same waits; distinct seeds spread conflicting writers out.
+/// Drives a fresh operation from `build`; after a conflict ([`Operation::is_conflict`]) it
+/// waits a backoff seeded by `seed` and reruns, at most [`Operation::conflict_retries`] times.
+/// The same seed gives the same waits; distinct seeds spread conflicting writers out.
 pub async fn drive_retry<O: Operation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
@@ -1095,8 +1093,9 @@ pub async fn drive_retry<O: Operation>(
     let mut attempt = 0;
     loop {
         match drive(build(), context).await {
-            Err(error) if O::is_conflict(&error) && attempt < CONFLICT_RETRIES => {
-                tokio::time::sleep(conflict_backoff(attempt, seed)).await;
+            Err(error) if O::is_conflict(&error) && attempt < O::conflict_retries() => {
+                let wait = conflict_backoff(usize::try_from(attempt).unwrap_or(usize::MAX), seed);
+                tokio::time::sleep(wait).await;
                 attempt += 1;
             }
             result => return result,
@@ -2972,14 +2971,15 @@ mod test {
         assert!(blob.idle_generation(backend_id).is_some());
     }
 
-    /// Fails with a conflict until attempt `conflicts`, then answers its attempt.
+    /// Fails with a conflict until attempt `conflicts`, then answers its attempt; the runner
+    /// reruns it at most `RETRIES` times.
     #[derive(Debug, PartialEq)]
-    struct Conflicted {
+    struct Conflicted<const RETRIES: u32> {
         attempt: usize,
         conflicts: usize,
     }
 
-    impl Operation for Conflicted {
+    impl<const RETRIES: u32> Operation for Conflicted<RETRIES> {
         type Output = usize;
         type Error = StorageError;
 
@@ -3009,26 +3009,43 @@ mod test {
         fn is_conflict(error: &Self::Error) -> bool {
             matches!(error, StorageError::TransactionConflict)
         }
+
+        fn conflict_retries() -> u32 {
+            RETRIES
+        }
+    }
+
+    /// The result of a conflict retry and how many operations it built.
+    async fn retried<const RETRIES: u32>(
+        context: &DriverContext,
+        conflicts: usize,
+    ) -> (Result<usize, StorageError>, usize) {
+        let mut built = 0;
+        let build = || {
+            built += 1;
+            Conflicted::<RETRIES> {
+                attempt: built - 1,
+                conflicts,
+            }
+        };
+        let result = drive_retry(build, context, &[7u8; 16]).await;
+        (result, built)
     }
 
     #[tokio::test(start_paused = true)]
     async fn retry_reruns_conflict() {
         let context = bare_context();
-        for (conflicts, expected, attempts) in [
-            (2, Ok(2), 3),
-            (usize::MAX, Err(StorageError::TransactionConflict), 4),
-        ] {
-            let mut built = 0;
-            let build = || {
-                built += 1;
-                Conflicted {
-                    attempt: built - 1,
-                    conflicts,
-                }
-            };
-            assert_eq!(drive_retry(build, &context, &[7u8; 16]).await, expected);
-            assert_eq!(built, attempts);
-        }
+        let conflict = Err(StorageError::TransactionConflict);
+        assert_eq!(retried::<3>(&context, 2).await, (Ok(2), 3));
+        assert_eq!(
+            retried::<3>(&context, usize::MAX).await,
+            (conflict.clone(), 4)
+        );
+        assert_eq!(
+            retried::<5>(&context, usize::MAX).await,
+            (conflict.clone(), 6)
+        );
+        assert_eq!(retried::<0>(&context, usize::MAX).await, (conflict, 1));
     }
 
     /// Logs its name at start, then spools a stream that ends once `gate` opens, or without a
@@ -3190,4 +3207,5 @@ mod test {
         tokio::time::resume();
         assert!(reconcile_free(&context));
     }
+
 }
