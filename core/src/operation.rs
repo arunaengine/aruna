@@ -4,7 +4,7 @@
 
 use std::any::Any;
 
-use crate::calls::{CallRun, IoError, IoResult, Next};
+use crate::calls::{CallRun, IoCall, IoError, IoResult, Next};
 use crate::{events::Event, types::Effects};
 
 /// A backend scope at most one operation holds at a time.
@@ -31,6 +31,12 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     /// Whether the storage calls run in one write transaction; otherwise each runs on its own.
     fn transaction(&self) -> bool {
         false
+    }
+
+    /// Cleanup calls the runner sends once when the run ends in an error before its commit is
+    /// acknowledged (deadline, hang limit, refused event, own error); unanswered, best effort.
+    fn abort(&mut self) -> Vec<IoCall> {
+        Vec::new()
     }
 
     /// See [`EffectOperation::stamp`].

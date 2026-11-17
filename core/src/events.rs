@@ -65,6 +65,8 @@ pub enum Event {
     Hung {
         effect: &'static str,
     },
+    /// The typed outcome of a child made with `IoCall::child`; never persisted.
+    Child(crate::calls::ChildOutcome),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -1024,6 +1026,7 @@ impl Event {
             ),
             Event::Delayed => "Event::Delayed",
             Event::Hung { .. } => "Event::Hung",
+            Event::Child(_) => "Event::Child",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(
