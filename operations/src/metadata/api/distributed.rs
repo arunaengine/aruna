@@ -152,17 +152,18 @@ pub(super) async fn run_query_distributed(
         .map(|((_, order), limit)| (order.clone(), limit));
     let local_call: MetadataNodeCall<MetadataQueryResults> = metadata_node_call(
         (
-            handle.clone(),
+            context.clone(),
             auth.clone(),
             graph_iris.clone(),
             partition_query.clone(),
             ties.clone(),
         ),
-        move |(handle, auth, graph_iris, query, ties), _| async move {
+        move |(context, auth, graph_iris, query, ties), _| async move {
             fetch_ties(query, ties, deadline, MERGE_PERMITS.clone(), |query| {
-                let (handle, auth, graph_iris) = (handle.clone(), auth.clone(), graph_iris.clone());
+                let (context, auth, graph_iris) =
+                    (context.clone(), auth.clone(), graph_iris.clone());
                 async move {
-                    crate::metadata::query_authorized_local(context, auth, graph_iris, query)
+                    crate::metadata::query_authorized_local(&context, auth, graph_iris, query)
                         .await
                         .map_err(crate::metadata::handle::metadata_read_error)
                 }
@@ -336,7 +337,7 @@ pub(super) async fn run_search_distributed(
 
     let local_call: MetadataNodeCall<(Vec<MetadataSearchHit>, usize)> = metadata_node_call(
         (
-            handle.clone(),
+            context.clone(),
             auth.clone(),
             graph_iris.clone(),
             query.clone(),
@@ -345,7 +346,7 @@ pub(super) async fn run_search_distributed(
             resume.clone(),
             page_size,
         ),
-        |(handle, auth, graph_iris, query, conforms_to, group_id, resume, page_size), node_id| async move {
+        |(context, auth, graph_iris, query, conforms_to, group_id, resume, page_size), node_id| async move {
             let limit = resume_fetch_limit(&resume, node_id, page_size, MAX_PAGINATION_DEPTH);
             let hits = match conforms_to {
                 Some(object_iri) => {
@@ -354,7 +355,7 @@ pub(super) async fn run_search_distributed(
                         crate::metadata::profile::validation::equivalent_profile_iris(&object_iri)
                     {
                         hits.extend(
-                            crate::metadata::search_local_filtered(context, auth.clone(),
+                            crate::metadata::search_local_filtered(&context, auth.clone(),
                                     graph_iris.clone(),
                                     query.clone(),
                                     limit,
@@ -368,7 +369,7 @@ pub(super) async fn run_search_distributed(
                     }
                     merge_search_hits(hits).into_iter().take(limit).collect()
                 }
-                None => crate::metadata::search_authorized_local(context, auth, graph_iris, query, limit, group_id)
+                None => crate::metadata::search_authorized_local(&context, auth, graph_iris, query, limit, group_id)
                     .await
                     .map_err(crate::metadata::handle::metadata_read_error)?,
             };

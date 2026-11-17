@@ -197,7 +197,7 @@ async fn plan_local(
     dot: ([u8; 32], u64),
 ) -> Result<MetadataBatch, DeviceEditError> {
     let (actor, counter) = dot;
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
@@ -230,7 +230,7 @@ async fn merge_local(
     context: &Arc<DriverContext>,
     batch: &MetadataBatch,
 ) -> Result<(), DeviceEditError> {
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
@@ -250,7 +250,7 @@ async fn merge_local(
 
 /// The render of the merged graph this device displays from now on.
 async fn render(context: &Arc<DriverContext>, graph_iri: &str) -> Result<String, DeviceEditError> {
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
@@ -301,9 +301,9 @@ pub fn replays_edit(entry: &PublishEntry) -> bool {
 ///
 /// A crash between the WAL write and persist can leave the graph behind; merging is idempotent by dot.
 pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         return 0;
-    };
+    }
     let mut replayed = 0usize;
     for entry in read_publish_entries(context).await {
         let PublishKind::Edit { batch, .. } = &entry.kind else {

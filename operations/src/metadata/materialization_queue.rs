@@ -477,12 +477,11 @@ async fn schedule_completed_syncs(
     if syncs.is_empty() {
         return;
     }
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         return;
-    };
+    }
     for sync in syncs {
-        match metadata_handle
-            .send_effect(Effect::Metadata(MetadataEffect::SyncBestEffort {
+        match send_graph_effect(context, Effect::Metadata(MetadataEffect::SyncBestEffort {
                 graph_iri: sync.graph_iri.clone(),
                 peers: sync.peers,
             }))
@@ -867,6 +866,20 @@ fn requeue_after_ms(parks: u32) -> u64 {
     let cap = Duration::from_millis(REQUEUE_MAX_MS);
     let delay = capped_backoff(base, cap, parks.saturating_sub(1), 0);
     u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+}
+
+
+/// Runs one metadata effect on the graph store; any other effect is refused.
+async fn send_graph_effect(context: &DriverContext, effect: Effect) -> Event {
+    match effect {
+        Effect::Metadata(effect) => {
+            crate::metadata::handle::send_metadata_effect(context, effect).await
+        }
+        _ => Event::Metadata(MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::InvalidEffect,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -2164,12 +2177,11 @@ async fn materialize_create_event(
     }
     let raw_plan =
         crate::metadata::raw_revision::prepare_raw_event(context, event, raw_state_cache).await?;
-    let metadata_handle = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataMaterializationError::MetadataHandleMissing)?;
-    match metadata_handle
-        .send_effect(graph_materialization_effect(
+    match send_graph_effect(context, graph_materialization_effect(
             event,
             raw_plan.revision.as_ref(),
             raw_plan.rebuild,
@@ -2202,14 +2214,13 @@ async fn merge_batch_event(
     change: Effect,
     raw_state_cache: &mut RawStateCache,
 ) -> Result<MaterializedCreateEvent, MetadataMaterializationError> {
-    let metadata_handle = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataMaterializationError::MetadataHandleMissing)?;
     // A batch carries quads only, so the event's visibility is applied here the
     // way a crate replacement used to carry it.
-    match metadata_handle
-        .send_effect(Effect::Metadata(MetadataEffect::SetGraphPolicy {
+    match send_graph_effect(context, Effect::Metadata(MetadataEffect::SetGraphPolicy {
             graph_iri: event.record.graph_iri.clone(),
             policy: MetadataGraphPolicy {
                 public: event.record.public,
@@ -2227,7 +2238,7 @@ async fn merge_batch_event(
             )));
         }
     }
-    match metadata_handle.send_effect(change).await {
+    match send_graph_effect(context, change).await {
         Event::Metadata(MetadataEvent::BatchMerged { .. })
         | Event::Metadata(MetadataEvent::SnapshotInstalled { .. }) => {}
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
@@ -2237,8 +2248,7 @@ async fn merge_batch_event(
             )));
         }
     }
-    let render = match metadata_handle
-        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
+    let render = match send_graph_effect(context, Effect::Metadata(MetadataEffect::ExportRoCrate {
             graph_iri: event.record.graph_iri.clone(),
         }))
         .await

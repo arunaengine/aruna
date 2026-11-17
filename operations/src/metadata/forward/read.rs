@@ -127,9 +127,9 @@ pub(super) async fn device_export(
         None,
     )
     .await?;
-    let handle = context
+    context
         .metadata_handle
-        .clone()
+        .as_ref()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     match request.view {
         RoCrateExportView::Full => Ok(ExportMetadataResult::Full {

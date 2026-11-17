@@ -403,7 +403,7 @@ async fn scaffold_display(
     record: &MetadataRegistryRecord,
     snapshot: &GraphReplicaSnapshot,
 ) -> Result<String, SyncRefusal> {
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
@@ -516,7 +516,7 @@ pub(super) async fn run_device_batch(
         })?;
     // An edit whose dependencies never reached this holder would wait in its log forever;
     // the device retries it instead, or learns the dependency was refused.
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;

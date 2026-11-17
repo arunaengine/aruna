@@ -1190,9 +1190,9 @@ pub(crate) async fn dot_applied(
     graph_iri: &str,
     batch: &aruna_core::metadata::MetadataBatch,
 ) -> Result<bool, MetadataProjectionError> {
-    let Some(handle) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         return Ok(true);
-    };
+    }
     match crate::metadata::send_metadata_effect(context, aruna_core::metadata::MetadataEffect::ContainsDot {
             graph_iri: graph_iri.to_string(),
             actor: batch.actor,

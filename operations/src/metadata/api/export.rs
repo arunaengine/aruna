@@ -175,9 +175,9 @@ async fn export_rocrate_jsonld(
     context: &DriverContext,
     graph_iri: &str,
 ) -> Result<String, MetadataApiError> {
-    let handle = context
+    context
         .metadata_handle
-        .clone()
+        .as_ref()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     crate::metadata::export_rocrate_jsonld(context, graph_iri.to_string())
         .await
@@ -192,9 +192,9 @@ pub(super) async fn export_summary_jsonld(
     graph_iri: &str,
     cursor: Ulid,
 ) -> Result<String, MetadataApiError> {
-    let handle = context
+    context
         .metadata_handle
-        .clone()
+        .as_ref()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     // The handle rejects deleted graphs before every export, so a hit has to
     // re-check the authoritative lifecycle record itself.
@@ -223,9 +223,9 @@ async fn export_rocrate_page(
         return Err(MetadataApiError::BadRequest);
     }
     let limit = limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX);
-    let handle = context
+    context
         .metadata_handle
-        .clone()
+        .as_ref()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     crate::metadata::export_rocrate_page(context, graph_iri.to_string(), limit, offset, after)
         .await

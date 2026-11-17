@@ -203,9 +203,9 @@ async fn install_state(
     replica: &mut ReplicaRecord,
     state: GraphState,
 ) -> bool {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         return false;
-    };
+    }
     let graph_iri = state.record.graph_iri.clone();
     let clock = state.snapshot.clock.clone();
     let graph_bytes = postcard::to_allocvec(&state.snapshot).map_or(0, |bytes| bytes.len() as u64);

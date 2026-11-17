@@ -38,9 +38,9 @@ pub async fn count_realm_documents(
     context: &DriverContext,
     realm_id: RealmId,
 ) -> Result<Option<u64>, MetadataApiError> {
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         return Ok(None);
-    };
+    }
     let records = crate::metadata::list_cached_records(context)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
@@ -147,9 +147,9 @@ pub async fn count_group_purpose(
     realm_id: RealmId,
     group_id: GroupId,
 ) -> Result<Option<GroupDocumentCounts>, MetadataApiError> {
-    let Some(metadata_handle) = context.metadata_handle.clone() else {
+    if context.metadata_handle.is_none() {
         return Ok(None);
-    };
+    }
     let records = crate::metadata::list_cached_group(context, group_id)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
@@ -160,7 +160,6 @@ pub async fn count_group_purpose(
         .collect::<Vec<_>>();
 
     let classifications = stream::iter(records.into_iter().map(|record| {
-        let metadata_handle = metadata_handle.clone();
         async move {
             if !record_materialized_read(context, &record)
                 .await

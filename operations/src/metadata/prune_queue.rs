@@ -285,9 +285,9 @@ pub async fn process_graph_tombstones(
         }
         result.enqueued = result.enqueued.saturating_add(1);
 
-        let Some(metadata_handle) = metadata_handle.as_ref() else {
+        if metadata_handle.is_none() {
             continue;
-        };
+        }
         match crate::metadata::prune_if_deleted(context, tombstone.graph_iri.clone())
             .await
         {
@@ -346,7 +346,7 @@ async fn process_prune_job(
         });
     }
 
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         reschedule_prune_job(
             &context.storage_handle,
             &job_keys,
@@ -358,7 +358,7 @@ async fn process_prune_job(
             completed_keys: Vec::new(),
             processed: 1,
         });
-    };
+    }
 
     // A retry after a failed link queueing finds the graph already pruned, so it queues again.
     let pruned = match crate::metadata::prune_if_deleted(context, graph_iri.clone()).await {

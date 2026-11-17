@@ -558,7 +558,7 @@ impl MetadataHandle {
             .remove_registry_record(document_id);
     }
 
-    pub(crate) fn query_cache(&self) -> &MetadataQueryCache {
+    pub(in crate::metadata) fn query_cache(&self) -> &MetadataQueryCache {
         &self.inner.query_cache
     }
 

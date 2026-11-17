@@ -74,7 +74,7 @@ async fn apply_one(
     document: &MetadataRegistryRecord,
     merge: &PendingMerge,
 ) -> Result<(), GitError> {
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(GitError::Unavailable)?;

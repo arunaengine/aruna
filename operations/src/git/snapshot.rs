@@ -102,7 +102,7 @@ pub(super) async fn current(
     }) {
         return Ok(None);
     }
-    let handle = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(GitError::Unavailable)?;
