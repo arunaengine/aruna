@@ -952,3 +952,158 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::tests::notifications::{record, user};
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    const TXN: TxnId = TxnId::from_parts(5, 5);
+
+    fn notice() -> NotificationRecord {
+        record(user(1, 2), NotificationClass::Direct, 1_000)
+    }
+
+    fn inbox_key(record: &NotificationRecord) -> Key {
+        notification_inbox_key(record.recipient, record.created_at_ms, record.notification_id)
+    }
+
+    fn conflict() -> Event {
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        })
+    }
+
+    #[test]
+    fn upsert_success_trace() {
+        let record = notice();
+        let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
+        let writes = inbox_write_entries(&record).unwrap();
+        check_trace(
+            &mut upsert,
+            &[Effect::Storage(StorageEffect::StartTransaction { read: false })],
+            vec![
+                (
+                    Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }),
+                    vec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: vec![(NOTIFICATION_INBOX_KEYSPACE.to_string(), inbox_key(&record))],
+                        txn_id: Some(TXN),
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchReadResult {
+                        values: vec![(inbox_key(&record), None)],
+                    }),
+                    vec![Effect::Storage(StorageEffect::BatchWrite {
+                        writes,
+                        txn_id: Some(TXN),
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchWriteResult {
+                        entries: Vec::new(),
+                    }),
+                    vec![Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })],
+                ),
+                (
+                    Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN }),
+                    vec![],
+                ),
+            ],
+        );
+        let outcome = upsert.finalize().unwrap();
+        assert_eq!(
+            (outcome.written, outcome.recipients, outcome.held),
+            (1, vec![record.recipient], vec![record])
+        );
+    }
+
+    #[test]
+    fn redelivery_aborts() {
+        let record = notice();
+        let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
+        upsert.start();
+        upsert.step(Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        let effects = upsert.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(inbox_key(&record), Some(Value::from(vec![1])))],
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })]
+        );
+        upsert.step(Event::Storage(StorageEvent::TransactionAborted { txn_id: TXN }));
+        let outcome = upsert.finalize().unwrap();
+        assert_eq!((outcome.written, outcome.held.len()), (0, 1));
+    }
+
+    #[test]
+    fn conflict_runs_twice() {
+        let mut upsert = UpsertInboxOperation::new(vec![notice()]);
+        upsert.start();
+        upsert.step(Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        let abort = upsert.step(conflict());
+        assert_eq!(
+            abort.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })]
+        );
+        let again = upsert.step(Event::Storage(StorageEvent::TransactionAborted { txn_id: TXN }));
+        assert_eq!(
+            again.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction { read: false })]
+        );
+        upsert.step(Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        upsert.step(conflict());
+        assert_eq!(upsert.finalize(), Err(InboxError::ConflictedTwice));
+    }
+
+    #[test]
+    fn within_reports_conflict() {
+        let mut upsert = UpsertInboxOperation::within(vec![notice()], TXN);
+        assert!(matches!(
+            upsert.start().as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead { .. })]
+        ));
+        assert!(upsert.step(conflict()).is_empty());
+        assert_eq!(upsert.finalize(), Err(InboxError::Conflict));
+    }
+
+    #[test]
+    fn empty_batch_done() {
+        let mut upsert = UpsertInboxOperation::new(Vec::new());
+        assert!(upsert.start().is_empty());
+        assert_eq!(upsert.finalize(), Ok(InboxWriteOutcome::default()));
+    }
+
+    #[test]
+    fn unexpected_events_fail() {
+        let make = || {
+            let mut upsert = UpsertInboxOperation::new(vec![notice()]);
+            upsert.start();
+            upsert
+        };
+        let started = |event: &Event| {
+            matches!(event, Event::Storage(StorageEvent::TransactionStarted { .. }))
+        };
+        let refusals = rejects_events(make, sample_events, started);
+        assert!(!refusals.is_empty());
+    }
+
+    #[test]
+    fn abort_per_phase() {
+        let mut upsert = UpsertInboxOperation::new(vec![notice()]);
+        upsert.start();
+        check_abort(&mut upsert, &[]);
+        upsert.step(Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        check_abort(
+            &mut upsert,
+            &[Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })],
+        );
+        let mut within = UpsertInboxOperation::within(vec![notice()], TXN);
+        within.start();
+        check_abort(&mut within, &[]);
+        rejects_finalize(within);
+    }
+}

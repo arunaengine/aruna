@@ -263,3 +263,103 @@ impl Operation for DeliverBatchOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::tests::locations::node_id;
+    use crate::tests::notifications::{record, user};
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::execution::notification::NotificationClass;
+
+    fn input() -> DeliverInput {
+        DeliverInput {
+            peer: node_id(2),
+            local: node_id(1),
+            local_realm: user(1, 2).realm_id,
+            now_ms: 1_000,
+        }
+    }
+
+    fn batch() -> Vec<NotificationRecord> {
+        vec![record(user(1, 2), NotificationClass::Direct, 1_000)]
+    }
+
+    fn rejected(operation: DeliverBatchOperation) -> String {
+        match operation.finalize() {
+            Ok(NotificationTransportMessage::Reject(reason)) => reason,
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reads_realm_config() {
+        let mut deliver = DeliverBatchOperation::new(input(), batch());
+        let key = Key::from(input().local_realm.as_bytes().to_vec());
+        check_trace(
+            &mut deliver,
+            &[Effect::Storage(StorageEffect::Read {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: key.clone(),
+                txn_id: None,
+            })],
+            vec![(
+                Event::Storage(StorageEvent::ReadResult { key, value: None }),
+                vec![],
+            )],
+        );
+        assert!(rejected(deliver).contains("config unavailable"));
+    }
+
+    #[test]
+    fn empty_and_foreign_rejected() {
+        let mut empty = DeliverBatchOperation::new(input(), Vec::new());
+        assert!(empty.start().is_empty());
+        assert_eq!(rejected(empty), "empty batch");
+        let foreign = DeliverInput {
+            local_realm: user(9, 2).realm_id,
+            ..input()
+        };
+        let mut deliver = DeliverBatchOperation::new(foreign, batch());
+        assert!(deliver.start().is_empty());
+        assert!(rejected(deliver).contains("foreign realm"));
+    }
+
+    #[test]
+    fn storage_error_rejected() {
+        let mut deliver = DeliverBatchOperation::new(input(), batch());
+        deliver.start();
+        deliver.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert!(!rejected(deliver).is_empty());
+    }
+
+    #[test]
+    fn unexpected_events_fail() {
+        let make = || {
+            let mut deliver = DeliverBatchOperation::new(input(), batch());
+            deliver.start();
+            deliver
+        };
+        let expected = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        let refusals = rejects_events(make, sample_events, expected);
+        assert!(!refusals.is_empty());
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        let mut deliver = DeliverBatchOperation::new(input(), batch());
+        deliver.start();
+        check_abort(&mut deliver, &[]);
+        rejects_finalize(deliver);
+    }
+}

@@ -162,3 +162,118 @@ impl Operation for SendOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::tests::notifications::user;
+    use aruna_core::operation_check::{check_abort, rejects_events, rejects_finalize, sample_events};
+    use aruna_core::structs::execution::notification::{
+        NotificationClass, NotificationKind, NotificationRecord,
+    };
+
+    fn spec() -> WebhookDeliverySpec {
+        let kind = NotificationKind::ShareUpload {
+            share_id: Ulid::from_parts(4, 4),
+            node_id: crate::tests::locations::node_id(3),
+            group_id: Ulid::from_parts(5, 5),
+            bucket: "inbox".to_string(),
+            key: "a.csv".to_string(),
+            size_bytes: 9,
+        };
+        let notification = NotificationRecord::new(user(1, 2), NotificationClass::Direct, kind, 42);
+        WebhookDeliverySpec {
+            subscription_id: Ulid::nil(),
+            notification,
+        }
+    }
+
+    fn posted(result: Result<u16, OutboundError>) -> Event {
+        Event::Outbound(OutboundEvent::Posted { result })
+    }
+
+    fn run(event: Event) -> Result<Option<u16>, SendError> {
+        let mut send = SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
+        send.start();
+        send.step(event);
+        send.finalize()
+    }
+
+    #[test]
+    fn webhook_post_signed() {
+        let mut send = SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
+        let effects = send.start();
+        let [Effect::Outbound(OutboundEffect::Post(post))] = effects.as_slice() else {
+            panic!("one post: {effects:?}");
+        };
+        let body = serde_json::to_vec(&spec().body().unwrap()).unwrap();
+        assert_eq!(post.body.as_ref(), body.as_slice());
+        assert_eq!(post.url, "https://hooks.example.org/a");
+        assert_eq!(post.deadline, DELIVERY_DEADLINE);
+        assert!(post.headers.contains(&(SIGNATURE_HEADER, sign_delivery(&[9; 32], 7, &body))));
+        assert!(send.step(posted(Ok(204))).is_empty());
+        assert_eq!(send.finalize(), Ok(Some(204)));
+    }
+
+    #[test]
+    fn webhook_status_kinds() {
+        assert!(matches!(run(posted(Ok(500))), Err(SendError::Failed(_))));
+        assert!(matches!(run(posted(Ok(429))), Err(SendError::Failed(_))));
+        assert!(matches!(run(posted(Ok(408))), Err(SendError::Failed(_))));
+        assert!(matches!(run(posted(Ok(400))), Err(SendError::Refused(_))));
+        let refused = posted(Err(OutboundError::Permanent("egress screen".into())));
+        assert!(matches!(run(refused), Err(SendError::Refused(_))));
+        let timeout = posted(Err(OutboundError::Retryable("late".into())));
+        assert!(matches!(run(timeout), Err(SendError::Failed(_))));
+    }
+
+    #[test]
+    fn other_notice_refused() {
+        let mut other = spec();
+        other.notification.kind = NotificationKind::AddedToGroup {
+            group_id: Ulid::from_parts(5, 5),
+            actor_user_id: user(1, 3),
+        };
+        let mut send = SendOperation::webhook(&other, "https://hooks.example.org/a", &[9; 32], 7);
+        assert!(send.start().is_empty());
+        assert!(matches!(send.finalize(), Err(SendError::Refused(_))));
+    }
+
+    #[test]
+    fn mail_needs_sender() {
+        let mail = OutgoingMail {
+            to: "ada@example.org".to_string(),
+            subject: String::new(),
+            body: String::new(),
+            id: Ulid::from_parts(1, 1),
+        };
+        let mut send = SendOperation::mail(Ulid::from_parts(2, 2), None, mail);
+        assert!(matches!(
+            send.start().as_slice(),
+            [Effect::Outbound(OutboundEffect::Mail(_))]
+        ));
+        send.step(Event::Outbound(OutboundEvent::MailSent {
+            result: Err(OutboundError::NoSender),
+        }));
+        assert_eq!(send.finalize(), Err(SendError::NoSender));
+    }
+
+    #[test]
+    fn unexpected_events_fail() {
+        let make = || {
+            let mut send = SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
+            send.start();
+            send
+        };
+        let refusals = rejects_events(make, sample_events, |_| false);
+        assert_eq!(refusals.len(), sample_events().len());
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        let mut send = SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
+        send.start();
+        check_abort(&mut send, &[]);
+        rejects_finalize(send);
+    }
+}
