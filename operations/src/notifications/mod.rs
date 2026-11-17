@@ -6,6 +6,7 @@ pub mod client;
 pub mod dispatch;
 pub mod email;
 pub mod emit;
+pub mod enqueue;
 pub mod inbox;
 pub mod incoming;
 pub mod list;
