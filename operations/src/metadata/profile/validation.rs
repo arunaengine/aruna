@@ -31,6 +31,7 @@ use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 use crate::metadata::forward::read::export_profile_routed;
 use crate::metadata::raw_revision::load_raw_revision;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
 use aruna_core::profile_shapes::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
@@ -571,7 +572,10 @@ pub async fn current_validation_status(
     // A built-in Profile carries no id, so no registry row can age it out.
     let pinned = status.profile_id.zip(status.profile_revision.clone());
     if let Some((profile_id, validated_revision)) = pinned {
-        match read_registry(context, profile_id).await {
+        match load_document_record(context, profile_id)
+            .await
+            .map_err(map_registry_error)
+        {
             Ok(Some(profile)) if profile.last_event_id.to_string() == validated_revision => {}
             Ok(Some(_)) => {
                 status.state = ProfileValidationState::Stale;
@@ -738,7 +742,10 @@ async fn resolve_registered_profile(
     let Some(profile_id) = profile_from_iri(requested_iri) else {
         return Err(profile_not_registered(requested_iri));
     };
-    let record = match read_registry(context, profile_id).await {
+    let record = match load_document_record(context, profile_id)
+        .await
+        .map_err(map_registry_error)
+    {
         Ok(Some(record)) => record,
         Ok(None) => return Err(profile_not_registered(requested_iri)),
         Err(_) => {
@@ -834,19 +841,6 @@ fn cache_shapes(context: &DriverContext, profile_id: Ulid, revision: Ulid, shape
             .profile_cache()
             .insert(profile_id, revision, Arc::new(shapes.to_vec()));
     }
-}
-
-async fn read_registry(
-    context: &DriverContext,
-    document_id: Ulid,
-) -> Result<Option<MetadataRegistryRecord>, MetadataError> {
-    parse_registry_read(
-        context
-            .storage_handle
-            .send_effect(read_document_registry(document_id, None))
-            .await,
-    )
-    .map_err(map_registry_error)
 }
 
 fn map_registry_error(error: StorageReadError) -> MetadataError {
