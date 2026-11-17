@@ -43,19 +43,8 @@ pub(in crate::document_sync) async fn apply_create_event(
             target.storage_key(),
             ByteView::from(bytes.clone()),
         )];
-        match replace_batch_in(storage, txn_id, Vec::new(), writes).await {
-            Ok(()) => return Ok(()),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, Vec::new(), writes).await? {
+            return Ok(());
         }
     }
     Err(NetError::Dht(

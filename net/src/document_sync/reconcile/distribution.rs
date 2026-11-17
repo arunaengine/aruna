@@ -177,15 +177,8 @@ pub(in crate::document_sync) async fn install_events(
             Ok(None) => return abort_txn(storage, txn_id).await,
             Err(error) => return Err(abort_error(storage, txn_id, error).await),
         };
-        match replace_batch_in(storage, txn_id, Vec::new(), writes).await {
-            Ok(()) => return Ok(()),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = abort_txn(storage, txn_id).await;
-            }
-            Err(error) => {
-                let _ = abort_txn(storage, txn_id).await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, Vec::new(), writes).await? {
+            return Ok(());
         }
     }
     Err(NetError::Dht(
