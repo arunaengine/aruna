@@ -2,8 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::Status;
 use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_core::structs::{
+    ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState, Status,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -155,7 +157,7 @@ pub struct NetworkServiceStatus {
     pub requests: Option<RequestSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RequestSummary {
     pub total: u64,
     pub failure_rate: f64,
@@ -218,6 +220,43 @@ pub struct InterfaceStatus {
     /// Local listen address. Realm-authenticated callers only.
     pub bind: Option<String>,
     pub url: Option<String>,
+}
+
+impl RequestSummary {
+    pub fn from_state(state: &RequestSummaryState) -> Self {
+        Self::from_counts(state.total, state.failures, state.last_error.clone())
+    }
+
+    fn from_counts(total: u64, failures: u64, last_error: Option<String>) -> Self {
+        Self {
+            total,
+            failure_rate: if total == 0 {
+                0.0
+            } else {
+                failures as f64 / total as f64
+            },
+            last_error,
+        }
+    }
+}
+
+impl From<PeerConnectionStatus> for PeerStatus {
+    fn from(status: PeerConnectionStatus) -> Self {
+        match status {
+            PeerConnectionStatus::Connected => Self::Connected,
+            PeerConnectionStatus::Known => Self::Known,
+            PeerConnectionStatus::Unreachable => Self::Unreachable,
+        }
+    }
+}
+
+impl From<ConnectionAddressStatus> for AddressStatus {
+    fn from(status: ConnectionAddressStatus) -> Self {
+        match status {
+            ConnectionAddressStatus::Active => Self::Active,
+            ConnectionAddressStatus::NotAssigned => Self::NotAssigned,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

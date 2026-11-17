@@ -296,15 +296,6 @@ fn preferences_from_attributes(attributes: &HashMap<String, String>) -> UserPref
     }
 }
 
-impl From<User> for RegisterUserResponse {
-    fn from(value: User) -> Self {
-        RegisterUserResponse {
-            name: value.name,
-            id: value.user_id.to_string(),
-        }
-    }
-}
-
 fn map_consume_error(error: ConsumeSecretError) -> ServerError {
     match error {
         ConsumeSecretError::NotFound

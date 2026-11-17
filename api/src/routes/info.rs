@@ -22,7 +22,6 @@ use aruna_core::structs::placement::record::PlacementScope;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
-use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
 use aruna_operations::driver::{backend_used_bytes, drive};
@@ -2592,47 +2591,6 @@ fn map_peer_connection(
             .collect(),
         last_error: admin.then(|| peer.last_error.clone()).flatten(),
         next_retry_secs: peer.retry_in_secs,
-    }
-}
-
-impl RequestSummary {
-    fn default() -> Self {
-        Self::from_counts(0, 0, None)
-    }
-
-    fn from_state(state: &RequestSummaryState) -> Self {
-        Self::from_counts(state.total, state.failures, state.last_error.clone())
-    }
-
-    fn from_counts(total: u64, failures: u64, last_error: Option<String>) -> Self {
-        Self {
-            total,
-            failure_rate: if total == 0 {
-                0.0
-            } else {
-                failures as f64 / total as f64
-            },
-            last_error,
-        }
-    }
-}
-
-impl From<PeerConnectionStatus> for PeerStatus {
-    fn from(status: PeerConnectionStatus) -> Self {
-        match status {
-            PeerConnectionStatus::Connected => Self::Connected,
-            PeerConnectionStatus::Known => Self::Known,
-            PeerConnectionStatus::Unreachable => Self::Unreachable,
-        }
-    }
-}
-
-impl From<ConnectionAddressStatus> for AddressStatus {
-    fn from(status: ConnectionAddressStatus) -> Self {
-        match status {
-            ConnectionAddressStatus::Active => Self::Active,
-            ConnectionAddressStatus::NotAssigned => Self::NotAssigned,
-        }
     }
 }
 

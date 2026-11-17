@@ -22,7 +22,7 @@ use events::{BudgetVerdict, CellBudget, EventRing};
 
 use aruna_core::compute::session::{
     CellPhase, CellSnapshot, EndReason, EventKind, HelperEvent, HelperRequest, MAX_CELL_BYTES,
-    MAX_ID_LEN, MAX_QUEUED_CELLS, MAX_RING_EVENTS, MAX_SCRATCH_BYTES, MAX_SUBMITS,
+    MAX_ID_LEN, MAX_QUEUED_CELLS, MAX_SCRATCH_BYTES, MAX_SUBMITS,
     MAX_TRACKED_CELLS, PendingInput, SUBMIT_WINDOW, SessionError, SessionEvent, SessionPhase,
     SessionSnapshot, StagedInput, TouchedObject,
 };

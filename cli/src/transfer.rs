@@ -5,7 +5,7 @@
 use crate::client::Api;
 use crate::error::{CliError, s3_error};
 use aruna_wire::info::InfoResponse;
-use aruna_wire::session::{CLIENT_REFRESH_WINDOW, S3SessionRequest, SessionTokenResponse};
+use aruna_wire::session::{CLIENT_REFRESH_WINDOW, SessionTokenResponse};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -57,9 +57,7 @@ async fn request_session(
     group_id: &str,
     fallback: Option<&str>,
 ) -> Result<S3Session, CliError> {
-    let body = S3SessionRequest {
-        group_id: group_id.to_string(),
-    };
+    let body = serde_json::json!({ "group_id": group_id });
     let token: SessionTokenResponse = api.send(Method::POST, "access/s3/sessions", &body).await?;
     let mut session = S3Session {
         token,

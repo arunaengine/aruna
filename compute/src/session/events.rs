@@ -4,7 +4,6 @@
 
 use aruna_core::compute::session::{
     EventKind, MAX_CELL_OUTPUTS, MAX_OUTPUT_BYTES, MAX_RING_BYTES, MAX_RING_EVENTS, SessionEvent,
-    TRUNCATED_NOTICE,
 };
 use serde::Serialize;
 use std::collections::VecDeque;

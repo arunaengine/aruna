@@ -40,7 +40,7 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -50,7 +50,6 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
