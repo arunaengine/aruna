@@ -213,7 +213,11 @@ async fn local_audit_result(
         .map_err(|_| MetadataReadError::Unavailable)
 }
 
-fn audit_member(config: &RealmConfigDocument, realm_id: RealmId, node_id: NodeId) -> bool {
+pub(super) fn audit_member(
+    config: &RealmConfigDocument,
+    realm_id: RealmId,
+    node_id: NodeId,
+) -> bool {
     config.realm_id == realm_id
         && config
             .nodes

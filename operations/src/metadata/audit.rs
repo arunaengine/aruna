@@ -649,11 +649,11 @@ mod tests {
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditPageEntry,
         AuditPageResponse, Effect, Event, ListAuditError, ListAuditOperation, ListAuditRequest,
         LocalPageOperation, MAX_AUDIT_PEERS, NetEffect, NetEvent, Operation, StorageEvent,
-        audit_member, audit_scope, decode_cursor, encode_cursor, select_peers,
+        audit_scope, decode_cursor, encode_cursor, select_peers,
     };
     use crate::driver::DriverContext;
     use crate::driver::drive_until;
-    use crate::metadata::audit_entry::{authorize_admin, list_audit};
+    use crate::metadata::audit_entry::{audit_member, authorize_admin, list_audit};
     use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
     use aruna_core::UserId;
