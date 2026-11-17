@@ -11,10 +11,11 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTask, RemapPlan};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::token_grant;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
-use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::driver::drive;
 use aruna_operations::groups::imports::discovery::bucket_access;
 use aruna_operations::groups::imports::last_run;
 use aruna_operations::s3::bucket::linked::{
@@ -24,8 +25,6 @@ use aruna_operations::s3::bucket::remap::{self, RemapScope};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
@@ -274,12 +273,11 @@ fn page_of(page: &PageRequest) -> ServerResult<(Option<String>, usize)> {
 
 /// Cursors name a key the caller may read; they are encoded so clients pass them back as is.
 fn encode_cursor(key: String) -> String {
-    URL_SAFE_NO_PAD.encode(key)
+    aruna_core::cursor::encode(key)
 }
 
 fn decode_cursor(cursor: &str) -> ServerResult<String> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
+    let bytes = aruna_core::cursor::decode(cursor)
         .map_err(|_| ServerError::BadRequestMessage("`after` is not a cursor".to_string()))?;
     String::from_utf8(bytes)
         .map_err(|_| ServerError::BadRequestMessage("`after` is not a cursor".to_string()))
@@ -318,7 +316,7 @@ async fn start_job(
 ) -> ServerResult<(StatusCode, Json<OrganizeJob>)> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let grant = token_grant(bearer.as_str()).map_err(|_| ServerError::Unauthorized)?;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
     let job = LinkedJob {
         id: Ulid::generate(),
         task,
@@ -726,7 +724,7 @@ pub async fn control_job(
         "abort" => LinkedAction::Abort,
         _ => return Err(ServerError::BadRequestMessage("unknown action".to_string())),
     };
-    let operation = BucketJobOperation::new(rule.bucket.clone(), rule.group_id, action, now_ms());
+    let operation = BucketJobOperation::new(rule.bucket.clone(), rule.group_id, action, unix_timestamp_millis());
     let context = state.get_ctx();
     let job = drive(operation, &context).await.map_err(job_error)?;
     Ok(Json(shown(&context, &rule.bucket, job).await?))

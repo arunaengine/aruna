@@ -13,8 +13,9 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::token_grant;
-use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::driver::drive;
 use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
 use aruna_operations::groups::imports::cron::next_due;
@@ -822,14 +823,12 @@ pub async fn get_renames(
     axum::extract::Query(page): axum::extract::Query<RenamePageQuery>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
     use aruna_operations::blob::migration::misplaced::{DEFAULT_PAGE, MAX_PAGE, rename_page};
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let limit = page.limit.unwrap_or(DEFAULT_PAGE);
     let bad = || ServerError::BadRequestMessage("`after` is not a cursor".to_string());
     let after = match page.after.as_deref() {
-        Some(after) => Some(URL_SAFE_NO_PAD.decode(after).map_err(|_| bad())?),
+        Some(after) => Some(aruna_core::cursor::decode(after).map_err(|_| bad())?),
         None => None,
     };
     if !(1..=MAX_PAGE).contains(&limit) {
@@ -879,7 +878,7 @@ pub async fn get_renames(
         files: files
             .map(|(from, to, writable)| RenameFileResponse { from, to, writable })
             .collect(),
-        next: found.next.map(|key| URL_SAFE_NO_PAD.encode(key)),
+        next: found.next.map(aruna_core::cursor::encode),
         progress: last.map(Into::into),
     }))
 }
@@ -977,7 +976,7 @@ pub async fn start_renames(
     }
     // Files written after the check are authorized one by one when the rename reaches them.
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
-    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
+    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, unix_timestamp_millis())
         .renaming((auth.clone(), state.get_node_id()), grant, checked.files)
         .with_guards(guards);
     let record = drive(operation, &state.get_ctx())

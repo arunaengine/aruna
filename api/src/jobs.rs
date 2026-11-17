@@ -41,8 +41,6 @@ use aruna_core::structs::execution::job::KeyWait;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::FamilyReport;
 use aruna_operations::jobs::service::JobStatusView;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -1066,9 +1064,7 @@ pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {
 pub(crate) fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
     match cursor {
         Some(cursor) => {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)?;
+            let bytes = aruna_core::cursor::decode(cursor).map_err(|_| ServerError::BadRequest)?;
             if bytes.len() != 24 {
                 return Err(ServerError::BadRequest);
             }
@@ -1079,7 +1075,7 @@ pub(crate) fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>
 }
 
 pub(crate) fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
-    cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
+    cursor.map(aruna_core::cursor::encode)
 }
 
 pub(crate) fn forwarded_job_auth(

@@ -58,8 +58,6 @@ use aruna_operations::staging::snapshot::{
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path as FsPath};
 use std::str::FromStr;
@@ -1456,9 +1454,7 @@ fn format_job_time(timestamp_ms: u64) -> String {
 fn decode_reference_cursor(cursor: Option<&str>) -> ServerResult<Option<ListContinuationToken>> {
     cursor
         .map(|cursor| {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)?;
+            let bytes = aruna_core::cursor::decode(cursor).map_err(|_| ServerError::BadRequest)?;
             ListContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
         })
         .transpose()
@@ -1467,7 +1463,7 @@ fn decode_reference_cursor(cursor: Option<&str>) -> ServerResult<Option<ListCont
 fn encode_reference_cursor(token: ListContinuationToken) -> ServerResult<String> {
     token
         .to_bytes()
-        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map(aruna_core::cursor::encode)
         .map_err(|error| ServerError::InternalError(error.into()))
 }
 

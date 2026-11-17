@@ -15,8 +15,6 @@ use aruna_operations::jobs::lifecycle::{
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
@@ -117,7 +115,7 @@ fn parse_paging(query: &AuditQuery) -> ServerResult<AuditPaging> {
     let cursor = query
         .cursor
         .as_deref()
-        .map(|cursor| URL_SAFE_NO_PAD.decode(cursor))
+        .map(aruna_core::cursor::decode)
         .transpose()
         .map_err(|_| ServerError::BadRequest)?;
     AuditPaging::new(cursor, query.limit)
@@ -377,7 +375,7 @@ pub async fn get_job_audit(
             next_cursor: page
                 .next
                 .as_ref()
-                .map(|cursor| URL_SAFE_NO_PAD.encode(cursor.as_slice())),
+                .map(aruna_core::cursor::encode),
             projection_digest: hex32(&report.digest),
             responder_node_id: report.responder.map(|node| node.to_string()),
             partial: report.partial,
@@ -402,11 +400,11 @@ mod tests {
     fn rejects_bad_paging() {
         // A cursor must be a bounded record key and a limit must fit the page.
         assert!(parse_paging(&query(Some("not base64 !"), None)).is_err());
-        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 200])), None)).is_err());
-        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 32])), None)).is_err());
+        assert!(parse_paging(&query(Some(&aruna_core::cursor::encode([1u8; 200])), None)).is_err());
+        assert!(parse_paging(&query(Some(&aruna_core::cursor::encode([1u8; 32])), None)).is_err());
         let mut key = [0u8; aruna_core::structs::execution::job::RECORD_KEY_BYTES];
         key[64] = aruna_core::structs::execution::job::JobRecordKind::Spec.as_byte();
-        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode(key)), None)).is_ok());
+        assert!(parse_paging(&query(Some(&aruna_core::cursor::encode(key)), None)).is_ok());
         assert!(parse_paging(&query(None, Some(0))).is_err());
         assert!(parse_paging(&query(None, Some(MAX_AUDIT_PAGE + 1))).is_err());
         assert!(parse_paging(&query(None, None)).is_ok());

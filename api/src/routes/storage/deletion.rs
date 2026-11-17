@@ -881,16 +881,11 @@ pub async fn delete_preview(
 
 /// A page cursor: the key and version id the next page starts after.
 fn encode_marker(key: &str, version_id: Ulid) -> String {
-    use base64::Engine;
-    let raw = format!("{version_id}{key}");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+    aruna_core::cursor::encode(format!("{version_id}{key}"))
 }
 
 fn decode_marker(cursor: &str) -> ServerResult<(String, Ulid)> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(cursor)
-        .map_err(|_| ServerError::BadRequest)?;
+    let bytes = aruna_core::cursor::decode(cursor).map_err(|_| ServerError::BadRequest)?;
     let raw = String::from_utf8(bytes).map_err(|_| ServerError::BadRequest)?;
     let (id, key) = raw.split_at_checked(26).ok_or(ServerError::BadRequest)?;
     let id = Ulid::from_string(id).map_err(|_| ServerError::BadRequest)?;

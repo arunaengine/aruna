@@ -38,8 +38,6 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -450,10 +448,7 @@ struct ReportCursor {
 fn decode_report_cursor(cursor: Option<&str>) -> ServerResult<Option<ReportCursor>> {
     cursor
         .map(|cursor| {
-            URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)
-                .and_then(|bytes| postcard::from_bytes(&bytes).map_err(|_| ServerError::BadRequest))
+            aruna_core::cursor::decode_value(cursor).map_err(|_| ServerError::BadRequest)
         })
         .transpose()
 }
@@ -465,12 +460,11 @@ fn encode_report_cursor(
 ) -> ServerResult<Option<String>> {
     last_key
         .map(|last_key| {
-            postcard::to_allocvec(&ReportCursor {
+            aruna_core::cursor::encode_value(&ReportCursor {
                 job_id,
                 report_digest,
                 last_key,
             })
-            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
             .map_err(|error| ServerError::InternalError(error.into()))
         })
         .transpose()
