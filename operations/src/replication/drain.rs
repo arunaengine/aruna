@@ -82,10 +82,10 @@ pub(super) struct BlobJobScan {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct ReplicationScanCursor {
-    generation: u64,
-    after: Option<Vec<u8>>,
+    pub(super) generation: u64,
+    pub(super) after: Option<Vec<u8>>,
     #[serde(rename = "next_due_at_ms")]
-    next_due_ms: Option<u64>,
+    pub(super) next_due_ms: Option<u64>,
 }
 
 pub async fn restore_blob_timer(storage: &StorageHandle, task_handle: &TaskHandle) {

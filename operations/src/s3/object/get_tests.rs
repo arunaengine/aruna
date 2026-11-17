@@ -180,11 +180,8 @@ fn failure_causes_preserved() {
     mixed.record(BaoReadError::Refused(BaoReadRefusal::BackendFailure));
     assert_eq!(mixed.into_error(), GetObjectError::HoldersUnavailable);
 
-    let metadata_only = HolderFailures {
-        contacted: true,
-        metadata_only: true,
-        ..HolderFailures::default()
-    };
+    let mut metadata_only = HolderFailures::default();
+    (metadata_only.contacted, metadata_only.metadata_only) = (true, true);
     assert_eq!(
         metadata_only.into_error(),
         GetObjectError::HoldersUnavailable

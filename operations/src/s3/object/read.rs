@@ -475,12 +475,12 @@ pub(super) struct RoutedRead {
 pub(crate) struct HolderFailures {
     /// Whether at least one holder answered at all, so zero holders stay
     /// distinguishable from every holder confirming absence.
-    contacted: bool,
+    pub(super) contacted: bool,
     governed: bool,
     denied: bool,
     integrity: bool,
     unavailable: bool,
-    metadata_only: bool,
+    pub(super) metadata_only: bool,
     /// A holder refused because its copy's bucket is locked there.
     locked: Option<Ulid>,
 }

@@ -1800,7 +1800,8 @@ mod tests {
         fn wakes_parked_job() {
             let mut operation = WakeJobOperation::new(wait(), 7);
             assert_eq!(operation.transaction(), TransactionMode::Write);
-            let mut woken = parked();
+            let parked = parked();
+            let mut woken = parked.clone();
             woken.due_at_ms = 7;
             let read = IoCall::Read(vec![(
                 REPLICATION_JOB_KEYSPACE.to_string(),
@@ -1812,7 +1813,6 @@ mod tests {
                 b"job".to_vec().into(),
                 woken.to_bytes().unwrap().into(),
             )]);
-            let parked = parked();
             assert_eq!(
                 operation.next(job_value(Some(&parked))),
                 Ok(Next::Call(write))
