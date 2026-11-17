@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::{Effects, TxnId};
-use smallvec::smallvec;
+use aruna_core::metadata::MetadataActor;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, done};
+use aruna_core::storage_entries::metadata_actor_entry;
 use thiserror::Error;
 
 use super::publish_queue::{
@@ -20,32 +20,22 @@ pub struct EnqueueDraftInput {
     pub entry: PublishEntry,
 }
 
+/// Counts the queue and writes the entry, its fence row and the advanced actor in one
+/// transaction while the queue holds fewer than [`MAX_PUBLISH_ENTRIES`].
 #[derive(Debug, PartialEq)]
 pub struct EnqueueDraftOperation {
     input: EnqueueDraftInput,
     /// The edit's advanced CRDT actor, stored atomically with the entry.
-    actor: Option<aruna_core::metadata::MetadataActor>,
+    actor: Option<MetadataActor>,
     /// Issue time of the token that authored the entry, stored atomically with it.
     issued_at: u64,
-    state: EnqueueDraftState,
-    output: Option<Result<PublishEntry, EnqueueDraftError>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum EnqueueDraftState {
-    Init,
-    StartTransaction,
-    CountEntries { txn_id: TxnId },
-    WriteEntry { txn_id: TxnId },
-    CommitTransaction,
-    Finish,
-    Error,
+    written: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnqueueDraftError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("a queued draft needs a document path")]
@@ -54,14 +44,6 @@ pub enum EnqueueDraftError {
     MissingPayload,
     #[error("the authoring queue already holds the maximum of {limit} drafts")]
     QueueFull { limit: usize },
-    #[error("queueing the draft did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
 }
 
 impl EnqueueDraftOperation {
@@ -70,12 +52,11 @@ impl EnqueueDraftOperation {
             input,
             actor: None,
             issued_at: 0,
-            state: EnqueueDraftState::Init,
-            output: None,
+            written: false,
         }
     }
 
-    pub fn with_actor(mut self, actor: aruna_core::metadata::MetadataActor) -> Self {
+    pub fn with_actor(mut self, actor: MetadataActor) -> Self {
         self.actor = Some(actor);
         self
     }
@@ -85,158 +66,58 @@ impl EnqueueDraftOperation {
         self
     }
 
-    fn emit_write(&mut self, txn_id: TxnId) -> Effects {
-        self.state = EnqueueDraftState::WriteEntry { txn_id };
-        let entry = match publish_entry(&self.input.entry) {
-            Ok(entry) => entry,
-            Err(error) => return fail(self, EnqueueDraftError::ConversionError(error)),
-        };
+    fn write(&mut self) -> Result<IoCall, EnqueueDraftError> {
         let mut writes = vec![
-            entry,
+            publish_entry(&self.input.entry)?,
             fence_entry(self.input.entry.draft_id, self.issued_at),
         ];
         if let Some(actor) = &self.actor {
-            match aruna_core::storage_entries::metadata_actor_entry(actor) {
-                Ok(entry) => writes.push(entry),
-                Err(error) => return fail(self, EnqueueDraftError::ConversionError(error)),
-            }
+            writes.push(metadata_actor_entry(actor)?);
         }
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+        self.written = true;
+        Ok(IoCall::Write(writes))
     }
 }
 
-impl EffectOperation for EnqueueDraftOperation {
+/// The page that counts the queued entries up to the limit.
+fn count_call() -> IoCall {
+    PrefixPages::new(DEVICE_INTAKE_KEYSPACE, Vec::new(), MAX_PUBLISH_ENTRIES).call()
+}
+
+impl Operation for EnqueueDraftOperation {
     type Output = PublishEntry;
     type Error = EnqueueDraftError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<PublishEntry>, EnqueueDraftError> {
         if self.input.entry.document_path.trim().is_empty() {
-            return fail(self, EnqueueDraftError::MissingPath);
+            return Err(EnqueueDraftError::MissingPath);
         }
         // An edit carries its submission in the kind; only a create authors the
         // crate text this field holds.
         if matches!(self.input.entry.kind, PublishKind::Create)
             && self.input.entry.jsonld.trim().is_empty()
         {
-            return fail(self, EnqueueDraftError::MissingPayload);
+            return Err(EnqueueDraftError::MissingPayload);
         }
-        self.state = EnqueueDraftState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+        Ok(Next::Call(count_call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, EnqueueDraftError::StorageError(error));
-            }
-            other => other,
-        };
-
-        match self.state {
-            EnqueueDraftState::StartTransaction => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return fail(
-                        self,
-                        EnqueueDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction started",
-                            got,
-                        },
-                    );
-                };
-                self.state = EnqueueDraftState::CountEntries { txn_id };
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: DEVICE_INTAKE_KEYSPACE.to_string(),
-                    prefix: None,
-                    start: None,
-                    limit: MAX_PUBLISH_ENTRIES,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            EnqueueDraftState::CountEntries { txn_id } => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-                    return fail(
-                        self,
-                        EnqueueDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "iter result",
-                            got,
-                        },
-                    );
-                };
-                if values.len() >= MAX_PUBLISH_ENTRIES {
-                    return fail(
-                        self,
-                        EnqueueDraftError::QueueFull {
-                            limit: MAX_PUBLISH_ENTRIES,
-                        },
-                    );
-                }
-                self.emit_write(txn_id)
-            }
-            EnqueueDraftState::WriteEntry { txn_id } => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-                    return fail(
-                        self,
-                        EnqueueDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "batch write result",
-                            got,
-                        },
-                    );
-                };
-                self.state = EnqueueDraftState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            EnqueueDraftState::CommitTransaction => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return fail(
-                        self,
-                        EnqueueDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction committed",
-                            got,
-                        },
-                    );
-                };
-                self.state = EnqueueDraftState::Finish;
-                self.output = Some(Ok(self.input.entry.clone()));
-                smallvec![]
-            }
-            EnqueueDraftState::Init | EnqueueDraftState::Finish | EnqueueDraftState::Error => {
-                smallvec![]
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<PublishEntry>, EnqueueDraftError> {
+        if self.written {
+            done(result)?;
+            return Ok(Next::Done(self.input.entry.clone()));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            EnqueueDraftState::Finish | EnqueueDraftState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(EnqueueDraftError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            EnqueueDraftState::CountEntries { txn_id }
-            | EnqueueDraftState::WriteEntry { txn_id } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
+        let (rows, _) = result.page()?;
+        if rows.len() >= MAX_PUBLISH_ENTRIES {
+            return Err(EnqueueDraftError::QueueFull {
+                limit: MAX_PUBLISH_ENTRIES,
+            });
         }
+        Ok(Next::Call(self.write()?))
+    }
+
+    fn transaction(&self) -> bool {
+        true
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -247,13 +128,6 @@ impl EffectOperation for EnqueueDraftOperation {
                 | EnqueueDraftError::QueueFull { .. }
         )
     }
-}
-
-fn fail(operation: &mut EnqueueDraftOperation, error: EnqueueDraftError) -> Effects {
-    let cleanup = operation.abort();
-    operation.state = EnqueueDraftState::Error;
-    operation.output = Some(Err(error));
-    cleanup
 }
 
 #[cfg(test)]
@@ -291,6 +165,32 @@ mod tests {
             context,
         )
         .await
+    }
+
+    // The queue is counted, then the entry and its fence row are written in the transaction.
+    #[test]
+    fn counts_then_writes() {
+        use super::count_call;
+        use crate::device::publish_queue::fence_entry;
+        use aruna_core::calls::{IoCall, IoResult, Next};
+        use aruna_core::operation::Operation;
+        let queued = entry(owner());
+        let mut enqueue = EnqueueDraftOperation::new(EnqueueDraftInput {
+            entry: queued.clone(),
+        })
+        .with_fence(7);
+        assert!(enqueue.transaction());
+        assert_eq!(enqueue.first(), Ok(Next::Call(count_call())));
+        let rows = IoCall::Write(vec![
+            publish_entry(&queued).unwrap(),
+            fence_entry(queued.draft_id, 7),
+        ]);
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(enqueue.next(empty), Ok(Next::Call(rows)));
+        assert_eq!(enqueue.next(IoResult::Done), Ok(Next::Done(queued)));
     }
 
     #[tokio::test]
