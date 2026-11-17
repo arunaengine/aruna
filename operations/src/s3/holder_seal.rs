@@ -182,9 +182,7 @@ impl Operation for SealPublishedOperation {
                 }
                 self.next_bucket()
             }
-            (_, event) => self.fail(StorageError::ReadError(format!(
-                "unexpected event while sealing copies: {event:?}"
-            ))),
+            (_, event) => self.fail(StorageError::ReadError(format!("unexpected event while sealing copies: {}", event.label()))),
         }
     }
 
