@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::attempt_intent::{AttemptCommit, RecordIntentOperation};
 use super::*;
 
 /// Read a job record, retaining malformed rows for offline recovery.
@@ -716,12 +717,6 @@ pub async fn handoff_external_attempt(
 /// Write-ahead attempt intent: record the deterministic external identity BEFORE any
 /// external submit so a lost attempt can be adopted by name. A committed cancellation
 /// wins this gate, so no new attempt is submitted afterward.
-#[derive(Debug)]
-pub struct AttemptCommit {
-    pub record: JobRecord,
-    pub control: AttemptControl,
-}
-
 /// `execution_id` binds the fenced attempt to the physical execution a target
 /// already receipted; `None` mints a fresh one for a purely local attempt.
 pub async fn record_attempt_intent(
@@ -733,106 +728,11 @@ pub async fn record_attempt_intent(
     launch: Option<&LaunchRecord>,
     now_ms: u64,
 ) -> Result<AttemptCommit, JobMutationError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let result = async {
-            let Some(mut record) = read_job_record(context, job_id, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?
-            else {
-                return Err(JobMutationError::NotFound);
-            };
-            guard_token(&record, token)?;
-            if let Some(intent) = &record.attempt_intent {
-                if intent.attempt_no != draft.attempt_no
-                    || intent.external_name != draft.external_name
-                    || intent.executor_kind != draft.executor_kind
-                    || intent.pinned_image != draft.pinned_image
-                {
-                    return Err(JobMutationError::IntentConflict);
-                }
-                let control =
-                    read_attempt_control(context, job_id, intent.attempt_epoch, Some(txn_id))
-                        .await?
-                        .ok_or(JobMutationError::MissingControl)?;
-                return Ok(AttemptCommit { record, control });
-            }
-            if record.cancel_requested {
-                return Err(JobMutationError::IntentConflict);
-            }
-            let epoch = record.next_attempt_epoch;
-            record.next_attempt_epoch = epoch
-                .checked_add(1)
-                .ok_or(JobMutationError::EpochExhausted)?;
-            let intent = AttemptIntent {
-                attempt_epoch: epoch,
-                ..draft.clone()
-            };
-            let control = AttemptControl {
-                attempt_epoch: epoch,
-                execution_id: execution_id.unwrap_or_else(Ulid::generate),
-                controller_generation: 1,
-                bound_token: Some(token),
-                tombstone_ref: None,
-                output_commits: Vec::new(),
-                output_record: None,
-            };
-            let old = record.clone();
-            record.attempt_intent = Some(intent);
-            record.updated_at_ms = now_ms;
-            let (mut writes, deletes) = index_deltas(&old, &record)
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-            writes.push((
-                ATTEMPT_CONTROL_KEYSPACE.to_string(),
-                ByteView::from(attempt_control_key(job_id, epoch)),
-                ByteView::from(
-                    control
-                        .to_bytes()
-                        .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-                ),
-            ));
-            // The launch facts belong to exactly the epoch this guarded commit assigns.
-            if let Some(launch) = launch {
-                writes.push((
-                    LAUNCH_RECORD_KEYSPACE.to_string(),
-                    ByteView::from(attempt_control_key(job_id, epoch)),
-                    ByteView::from(
-                        launch
-                            .to_bytes()
-                            .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-                    ),
-                ));
-            }
-            batch_write(context, writes, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            batch_delete(context, deletes, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            Ok(AttemptCommit { record, control })
-        }
-        .await;
-        match result {
-            Ok(commit) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "attempt commit exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(commit),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
-        }
-    }
-    Err(JobMutationError::Storage(
-        "attempt commit exhausted conflict retries".to_string(),
-    ))
+    let execution_id = execution_id.unwrap_or_else(Ulid::generate);
+    let launch = launch.cloned();
+    let build = || {
+        let ids = (job_id, token);
+        RecordIntentOperation::new(ids, draft.clone(), execution_id, launch.clone(), now_ms)
+    };
+    drive_settled(context, build, "attempt commit exhausted conflict retries").await
 }
