@@ -8,15 +8,24 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::heartbeat::HeldHeartbeat;
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
+use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::compute_config::RealmComputeConfig;
-use aruna_core::structs::storage::node_info::{LOCATION_LABEL_KEY, NodeInfoDocument, NodeUrls};
+use aruna_core::structs::storage::node_info::{
+    LOCATION_LABEL_KEY, NodeInfoDocument, NodeUrls, node_info_key,
+};
+use aruna_core::types::{Effects, Key, Value};
 use rand::seq::SliceRandom;
+use smallvec::smallvec;
+use thiserror::Error;
+use tracing::warn;
 
-use crate::driver::{DriverContext, drive};
-use crate::metadata::api::load_realm_config;
-use crate::node::heartbeat::held_heartbeats;
-use crate::node::read_info::ReadInfoOperation;
+use crate::driver::DriverContext;
 
 /// A heartbeat older than this does not make a holder a candidate.
 pub(crate) const HEARTBEAT_STALE_MS: u64 = 180_000;
@@ -90,50 +99,164 @@ fn link_bandwidth(
         .map_or(config.pessimistic_per_sec, |link| link.bandwidth_per_sec)
 }
 
-/// The candidates among `holders`, at most [`MAX_CANDIDATES`] of them looked at.
-pub async fn candidates(
-    context: &DriverContext,
-    holders: &[NodeId],
-    now_ms: u64,
-) -> Vec<HolderCandidate> {
-    let Some(net) = context.net_handle.as_ref() else {
-        return Vec::new();
-    };
-    let local = net.node_id();
-    let mut wanted: Vec<NodeId> = holders.iter().take(MAX_CANDIDATES).copied().collect();
-    wanted.push(local);
-    let documents: BTreeMap<NodeId, NodeInfoDocument> =
-        drive(ReadInfoOperation::new(wanted), context)
-            .await
-            .unwrap_or_default();
-    let held = held_heartbeats(Some(net));
-    let config = load_realm_config(context, *net.realm_id()).await;
-    let compute = config.as_ref().map(|config| &config.compute);
-    let location = |node_id: &NodeId| {
-        documents
-            .get(node_id)
-            .and_then(|document| document.labels.get(LOCATION_LABEL_KEY))
-            .map(String::as_str)
-    };
-    holders
-        .iter()
-        .take(MAX_CANDIDATES)
-        .filter_map(|node_id| {
-            let document = documents.get(node_id)?;
-            let avoided = net.avoided_holders().avoided(node_id, now_ms);
-            let bandwidth = link_bandwidth(compute, location(node_id), location(&local));
-            candidate(document, held.get(node_id), avoided, bandwidth)
-        })
-        .collect()
+#[derive(Debug, Error, PartialEq)]
+pub enum HolderChoiceError {
+    #[error("unexpected holder choice event {0}")]
+    UnexpectedEvent(&'static str),
+    #[error("the holder choice has not finished")]
+    Unfinished,
 }
 
-/// The holder that should serve, chosen among `holders`; `None` without a fresh candidate.
-pub async fn choose_holder(
-    context: &DriverContext,
-    holders: &[NodeId],
+#[derive(Debug, PartialEq)]
+enum Phase {
+    Idle,
+    Facts,
+    Documents(Box<HolderFacts>),
+    Done(Result<Vec<HolderCandidate>, HolderChoiceError>),
+}
+
+/// The candidates among `holders`, at most [`MAX_CANDIDATES`] of them looked at: this node's
+/// heartbeat state first, then their info documents, this node's and the realm config in one
+/// batch read. Without a network or with unreadable documents there is no candidate.
+#[derive(Debug, PartialEq)]
+pub struct HolderChoiceOperation {
+    holders: Vec<NodeId>,
     now_ms: u64,
-) -> Option<HolderCandidate> {
-    pick(candidates(context, holders, now_ms).await)
+    phase: Phase,
+}
+
+impl HolderChoiceOperation {
+    pub fn new(holders: &[NodeId], now_ms: u64) -> Self {
+        Self {
+            holders: holders.iter().take(MAX_CANDIDATES).copied().collect(),
+            now_ms,
+            phase: Phase::Idle,
+        }
+    }
+
+    fn finish(&mut self, candidates: Vec<HolderCandidate>) -> Effects {
+        self.phase = Phase::Done(Ok(candidates));
+        smallvec![]
+    }
+
+    fn read(&mut self, facts: Box<HolderFacts>) -> Effects {
+        let config = DocumentTarget::RealmConfig {
+            realm_id: facts.realm_id,
+        };
+        let mut reads: Vec<_> = (self.holders.iter())
+            .chain(std::iter::once(&facts.local))
+            .map(|node_id| {
+                let key = Key::from(node_info_key(*node_id));
+                (NODE_INFO_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        reads.push((config.storage_keyspace().to_string(), config.storage_key()));
+        self.phase = Phase::Documents(facts);
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })]
+    }
+
+    fn choose(
+        &self,
+        facts: &HolderFacts,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Vec<HolderCandidate> {
+        let mut values = values;
+        let Some((_, config)) = values.pop() else {
+            return Vec::new();
+        };
+        let config = config.and_then(|bytes| match RealmConfigDocument::from_bytes(&bytes) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                warn!(%error, "realm config unreadable for the holder choice");
+                None
+            }
+        });
+        let nodes = self.holders.iter().chain(std::iter::once(&facts.local));
+        let mut documents = BTreeMap::new();
+        for (node_id, (_, value)) in nodes.zip(values) {
+            let Some(bytes) = value else {
+                continue;
+            };
+            // An unreadable advertisement leaves no candidate, as a failed read did.
+            match postcard::from_bytes::<NodeInfoDocument>(bytes.as_ref()) {
+                Ok(document) => documents.insert(*node_id, document),
+                Err(_) => return Vec::new(),
+            };
+        }
+        let compute = config.as_ref().map(|config| &config.compute);
+        let location = |node_id: &NodeId| {
+            documents
+                .get(node_id)
+                .and_then(|document| document.labels.get(LOCATION_LABEL_KEY))
+                .map(String::as_str)
+        };
+        let held: BTreeMap<NodeId, &HeldHeartbeat> =
+            facts.held.iter().map(|held| (held.node_id, held)).collect();
+        self.holders
+            .iter()
+            .filter_map(|node_id| {
+                let document = documents.get(node_id)?;
+                let avoided = facts.avoided.contains(node_id);
+                let bandwidth = link_bandwidth(compute, location(node_id), location(&facts.local));
+                candidate(document, held.get(node_id).copied(), avoided, bandwidth)
+            })
+            .collect()
+    }
+}
+
+impl Operation for HolderChoiceOperation {
+    type Output = Vec<HolderCandidate>;
+    type Error = HolderChoiceError;
+
+    fn start(&mut self) -> Effects {
+        self.phase = Phase::Facts;
+        smallvec![Effect::Net(NetEffect::Heartbeat(Box::new(
+            HeartbeatEffect::Holders {
+                holders: self.holders.clone(),
+                now_ms: self.now_ms,
+            }
+        )))]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (std::mem::replace(&mut self.phase, Phase::Idle), event) {
+            (Phase::Facts, Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Holders(facts)))) => {
+                self.read(facts)
+            }
+            // Without a network no holder is a candidate.
+            (Phase::Facts, Event::Net(NetEvent::Error(_))) => self.finish(Vec::new()),
+            (Phase::Documents(facts), Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                let candidates = self.choose(&facts, values);
+                self.finish(candidates)
+            }
+            (Phase::Documents(_), Event::Storage(StorageEvent::Error { .. })) => {
+                self.finish(Vec::new())
+            }
+            (_, event) => {
+                let error = HolderChoiceError::UnexpectedEvent(event.label());
+                self.phase = Phase::Done(Err(error));
+                smallvec![]
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.phase, Phase::Done(_))
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match self.phase {
+            Phase::Done(result) => result,
+            _ => Err(HolderChoiceError::Unfinished),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
 }
 
 /// Skips `node_id` for a while after this node saw it fail or refuse a slot.
