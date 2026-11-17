@@ -27,6 +27,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::live_records::LiveRecordsOperation;
+use crate::metadata::record_reads::load_document_record;
 
 use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows, iter_page};
 use super::queue_storage::{
@@ -34,8 +35,7 @@ use super::queue_storage::{
     start_write_transaction,
 };
 use super::repository::{
-    StorageReadError, parse_registry_iter, parse_registry_read, parse_status_read,
-    read_status_effect,
+    StorageReadError, parse_registry_iter, parse_status_read, read_status_effect,
 };
 
 const INDEX_PAGE_SIZE: usize = 128;
@@ -287,13 +287,8 @@ pub(crate) async fn lookup_iri_references(
         };
         let mut records = Vec::with_capacity(page.documents.len());
         for document_id in page.documents.keys() {
-            let read = storage
-                .send_effect(super::repository::read_document_registry(
-                    *document_id,
-                    None,
-                ))
-                .await;
-            if let Some(record) = parse_registry_read(read).map_err(status_error)? {
+            let record = load_document_record(context, *document_id).await;
+            if let Some(record) = record.map_err(status_error)? {
                 records.push(record);
             }
         }
