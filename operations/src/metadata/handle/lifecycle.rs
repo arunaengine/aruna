@@ -17,18 +17,19 @@ use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect, MetadataError, 
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
+use aruna_graph::GraphHandle;
 use aruna_storage::StorageHandle;
-use craqle::{AllowAllAuthorizer, CraqleError, CraqleNode, GraphId};
 use tokio::time::sleep;
 use tracing::{Span, field, warn};
 use ulid::Ulid;
 
-use super::entity_convert::error_from_craqle;
 use super::{
-    GRAPH_SYNC_AFTER, GRAPH_SYNC_ATTEMPTS, LifecycleDeletedEntry, MetadataHandle, MetadataInner,
+    GRAPH_SYNC_AFTER, GRAPH_SYNC_ATTEMPTS, LifecycleDeletedEntry, MetadataInner,
     MetadataVisibilityCache, REGISTRY_CANDIDATE_LIMIT, RegistryCacheEntry, VISIBILITY_CACHE_TTL,
-    VisibilityFillResult, metadata_graph_fence, summary_cache,
+    VisibilityFillResult, handles, metadata_graph_fence,
 };
+use crate::driver::DriverContext;
+use crate::metadata::summary_cache::summary_cache;
 use crate::metadata::repository::{
     StorageReadError, iter_registry_effect, parse_lifecycle_read, parse_registry_iter,
     read_lifecycle_effect,
@@ -413,106 +414,103 @@ impl MetadataVisibilityCache {
     }
 }
 
-impl MetadataHandle {
-    pub async fn reconcile_document_sync(&self) -> Result<usize, MetadataError> {
-        let inner = self.inner.clone();
-        let applied = tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
-            .await
-            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        // Peer sync invalidates summaries because their cursor may precede newly applied content.
-        if !applied.is_empty() {
-            self.inner.query_cache.bump_apply();
-            for graph in &applied {
-                summary_cache().remove(graph.as_str());
-            }
+/// Applies document sync updates from peers; returns how many graphs changed.
+pub async fn reconcile_document_sync(context: &DriverContext) -> Result<usize, MetadataError> {
+    let (metadata, graph) = handles(context)?;
+    let applied = graph.reconcile().await?;
+    // Peer sync invalidates summaries because their cursor may precede newly applied content.
+    if !applied.is_empty() {
+        metadata.inner.query_cache.bump_apply();
+        for graph in &applied {
+            summary_cache().remove(graph);
         }
-        Ok(applied.len())
+    }
+    Ok(applied.len())
+}
+
+/// Removes the local copy of `graph_iri` when its lifecycle record says it is deleted.
+pub async fn prune_if_deleted(
+    context: &DriverContext,
+    graph_iri: String,
+) -> Result<bool, MetadataError> {
+    let (metadata, graph) = handles(context)?;
+    let _graph_fence = metadata_graph_fence(&graph_iri)
+        .acquire()
+        .await
+        .map_err(|error| {
+            MetadataError::Backend(format!("metadata graph fence unavailable: {error}"))
+        })?;
+    if !graph_lifecycle_deleted(context.storage_handle.clone(), &graph_iri).await? {
+        return Ok(false);
+    }
+    metadata.inner.visibility_cache.remove_graph_records(&graph_iri);
+    metadata
+        .inner
+        .visibility_cache
+        .store_lifecycle_deleted(graph_iri.clone(), true);
+    if !graph.contains_graph(graph_iri.clone()).await? {
+        return Ok(true);
+    }
+    graph.delete_graph(graph_iri).await?;
+    Ok(true)
+}
+
+/// Removes the local copy of every deleted graph; returns how many were removed.
+pub async fn prune_deleted_graphs(context: &DriverContext) -> Result<usize, MetadataError> {
+    let (_, graph) = handles(context)?;
+    let mut pruned = 0usize;
+    for graph_iri in graph.graphs().await? {
+        if prune_if_deleted(context, graph_iri).await? {
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
+pub(super) fn sync_best_effort(
+    context: &DriverContext,
+    graph_iri: String,
+    mut peers: Vec<NodeId>,
+) -> MetadataEvent {
+    if let Some(net_handle) = context.net_handle.as_ref() {
+        peers.retain(|peer| *peer != net_handle.node_id());
+    }
+    peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    peers.dedup();
+    if peers.is_empty() {
+        return MetadataEvent::GraphSyncScheduled { graph_iri, peers };
     }
 
-    pub async fn prune_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
-        let _graph_fence = metadata_graph_fence(&graph_iri)
-            .acquire()
-            .await
-            .map_err(|error| {
-                MetadataError::Backend(format!("metadata graph fence unavailable: {error}"))
-            })?;
-        if !graph_lifecycle_deleted(self.lifecycle_storage(), &graph_iri).await? {
-            return Ok(false);
-        }
-        self.inner.visibility_cache.remove_graph_records(&graph_iri);
-        self.inner
-            .visibility_cache
-            .store_lifecycle_deleted(graph_iri.clone(), true);
-        if !contains_local_graph(self.inner.node.clone(), graph_iri.clone()).await? {
-            return Ok(true);
-        }
-        delete_local_graph(self.inner.node.clone(), graph_iri).await?;
-        Ok(true)
-    }
-
-    pub async fn prune_deleted_graphs(&self) -> Result<usize, MetadataError> {
-        let inner = self.inner.clone();
-        let graphs = tokio::task::spawn_blocking(move || inner.node.graphs())
-            .await
-            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        let mut pruned = 0usize;
-        for graph in graphs {
-            if self.prune_if_deleted(graph.as_str().to_string()).await? {
-                pruned += 1;
-            }
-        }
-        Ok(pruned)
-    }
-
-    pub(super) async fn sync_best_effort(
-        &self,
-        graph_iri: String,
-        mut peers: Vec<NodeId>,
-    ) -> MetadataEvent {
-        if let Some(net_handle) = self.inner.net_handle.as_ref() {
-            peers.retain(|peer| *peer != net_handle.node_id());
-        }
-        peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        peers.dedup();
-        if peers.is_empty() {
-            return MetadataEvent::GraphSyncScheduled { graph_iri, peers };
-        }
-
-        let inner = self.inner.clone();
-        let task_graph_iri = graph_iri.clone();
-        let task_peers = peers.clone();
-        tokio::spawn(async move {
-            for attempt in 1..=GRAPH_SYNC_ATTEMPTS {
-                match sync_graph_once(inner.clone(), task_graph_iri.clone(), task_peers.clone())
-                    .await
-                {
-                    Ok(()) => return,
-                    Err(error) => {
-                        warn!(
-                            graph_iri = %task_graph_iri,
-                            attempt,
-                            attempts = GRAPH_SYNC_ATTEMPTS,
-                            error = ?error,
-                            "Metadata graph sync attempt failed"
-                        );
-                        if attempt < GRAPH_SYNC_ATTEMPTS {
-                            sleep(GRAPH_SYNC_AFTER).await;
-                        }
+    let context = context.clone();
+    let task_graph_iri = graph_iri.clone();
+    let task_peers = peers.clone();
+    tokio::spawn(async move {
+        for attempt in 1..=GRAPH_SYNC_ATTEMPTS {
+            match sync_graph_once(&context, task_graph_iri.clone(), task_peers.clone()).await {
+                Ok(()) => return,
+                Err(error) => {
+                    warn!(
+                        graph_iri = %task_graph_iri,
+                        attempt,
+                        attempts = GRAPH_SYNC_ATTEMPTS,
+                        error = ?error,
+                        "Metadata graph sync attempt failed"
+                    );
+                    if attempt < GRAPH_SYNC_ATTEMPTS {
+                        sleep(GRAPH_SYNC_AFTER).await;
                     }
                 }
             }
+        }
 
-            warn!(
-                graph_iri = %task_graph_iri,
-                peer_count = task_peers.len(),
-                "Metadata graph sync retries exhausted"
-            );
-        });
+        warn!(
+            graph_iri = %task_graph_iri,
+            peer_count = task_peers.len(),
+            "Metadata graph sync retries exhausted"
+        );
+    });
 
-        MetadataEvent::GraphSyncScheduled { graph_iri, peers }
-    }
+    MetadataEvent::GraphSyncScheduled { graph_iri, peers }
 }
 
 async fn graph_lifecycle_record(
@@ -529,15 +527,16 @@ async fn graph_lifecycle_record(
 }
 
 pub(super) async fn metadata_graph_deleted(
-    inner: Arc<MetadataInner>,
-    storage_handle: StorageHandle,
+    context: &DriverContext,
     graph_iri: &str,
 ) -> Result<bool, MetadataError> {
+    let (metadata, _) = handles(context)?;
+    let inner = &metadata.inner;
     if let Some((true, _)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
         return Ok(true);
     }
 
-    let deleted = graph_lifecycle_deleted(storage_handle, graph_iri).await?;
+    let deleted = graph_lifecycle_deleted(context.storage_handle.clone(), graph_iri).await?;
     inner
         .visibility_cache
         .store_lifecycle_deleted(graph_iri.to_string(), deleted);
@@ -552,40 +551,6 @@ pub(super) async fn graph_lifecycle_deleted(
         .await?
         .map(|record| record.is_deleted())
         .unwrap_or(false))
-}
-
-async fn delete_local_graph(node: Arc<CraqleNode>, graph_iri: String) -> Result<(), MetadataError> {
-    tokio::task::spawn_blocking(move || {
-        node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
-    })
-    .await
-    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-    .map_err(error_from_craqle)
-}
-
-async fn contains_local_graph(
-    node: Arc<CraqleNode>,
-    graph_iri: String,
-) -> Result<bool, MetadataError> {
-    tokio::task::spawn_blocking(move || node.contains_graph(&GraphId::new(&graph_iri)))
-        .await
-        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-        .map_err(error_from_craqle)
-}
-
-pub(super) fn effect_mutates_graph(effect: &MetadataEffect) -> bool {
-    matches!(
-        effect,
-        MetadataEffect::CreateCrate { .. }
-            | MetadataEffect::ApplyRoCrate { .. }
-            | MetadataEffect::UpsertDataEntity { .. }
-            | MetadataEffect::UpsertContextualEntity { .. }
-            | MetadataEffect::SetGraphPolicy { .. }
-            | MetadataEffect::AddGraphPeer { .. }
-            | MetadataEffect::DeleteGraph { .. }
-            | MetadataEffect::InstallSnapshot { .. }
-            | MetadataEffect::MergeBatch { .. }
-    )
 }
 
 pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
@@ -611,7 +576,7 @@ pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
 #[tracing::instrument(
     name = "metadata.registry.list_local",
     level = "debug",
-    skip(inner),
+    skip(inner, graph),
     fields(
         cache_hit = field::Empty,
         stale = field::Empty,
@@ -621,6 +586,7 @@ pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
 )]
 pub(super) async fn list_local_records(
     inner: Arc<MetadataInner>,
+    graph: &GraphHandle,
 ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
     let started = Instant::now();
     let span = Span::current();
@@ -639,7 +605,7 @@ pub(super) async fn list_local_records(
             span.record("stale", true);
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
-            spawn_visibility_refill(&inner);
+            spawn_visibility_refill(&inner, graph);
             Ok(records)
         }
         None => {
@@ -657,7 +623,7 @@ pub(super) async fn list_local_records(
                 return Ok(records);
             }
             span.record("cache_hit", false);
-            let fill = fill_visibility_caches(&inner).await?;
+            let fill = fill_visibility_caches(&inner, graph).await?;
             let records = fill.records;
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
@@ -669,7 +635,7 @@ pub(super) async fn list_local_records(
 #[tracing::instrument(
     name = "metadata.registry.list_local_group",
     level = "debug",
-    skip(inner),
+    skip(inner, graph),
     fields(
         group_id = %group_id,
         cache_hit = field::Empty,
@@ -680,6 +646,7 @@ pub(super) async fn list_local_records(
 )]
 pub(super) async fn list_local_group(
     inner: Arc<MetadataInner>,
+    graph: &GraphHandle,
     group_id: GroupId,
 ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
     let started = Instant::now();
@@ -699,7 +666,7 @@ pub(super) async fn list_local_group(
             span.record("stale", true);
             span.record("record_count", records.len() as u64);
             record_elapsed_ms(&span, "elapsed_ms", started);
-            spawn_visibility_refill(&inner);
+            spawn_visibility_refill(&inner, graph);
             Ok(records)
         }
         None => {
@@ -717,7 +684,7 @@ pub(super) async fn list_local_group(
                 return Ok(records);
             }
             span.record("cache_hit", false);
-            let fill = fill_visibility_caches(&inner).await?;
+            let fill = fill_visibility_caches(&inner, graph).await?;
             let records = if fill.store_accepted {
                 inner
                     .visibility_cache
@@ -734,9 +701,10 @@ pub(super) async fn list_local_group(
     }
 }
 
-fn spawn_visibility_refill(inner: &Arc<MetadataInner>) {
+fn spawn_visibility_refill(inner: &Arc<MetadataInner>, graph: &GraphHandle) {
     let fill_lock = inner.visibility_cache.registry_fill.clone();
     let inner = inner.clone();
+    let graph = graph.clone();
     tokio::spawn(async move {
         let Ok(_guard) = fill_lock.try_lock_owned() else {
             return;
@@ -744,7 +712,7 @@ fn spawn_visibility_refill(inner: &Arc<MetadataInner>) {
         if let Some((_, true)) = inner.visibility_cache.registry_records_any() {
             return;
         }
-        if let Err(error) = fill_visibility_caches(&inner).await {
+        if let Err(error) = fill_visibility_caches(&inner, &graph).await {
             warn!(error = %error, "Background visibility refill failed");
         }
     });
@@ -763,11 +731,14 @@ pub(super) fn records_for_group(
     )
 }
 
-pub(super) async fn list_group_records(
-    inner: Arc<MetadataInner>,
+/// The live registry records of one group, at most `limit` of them.
+pub async fn list_group_records(
+    context: &DriverContext,
     group_id: GroupId,
     limit: usize,
 ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let (metadata, _) = handles(context)?;
+    let inner = &metadata.inner;
     let limit = limit.min(REGISTRY_CANDIDATE_LIMIT);
     if let Some((records, true)) = inner.visibility_cache.records_group_any(group_id)
         && records.len() <= limit
@@ -797,7 +768,7 @@ pub(super) async fn list_group_records(
         }
     }
 
-    let (deleted_graphs, _) = list_deleted_iris(&inner, REGISTRY_CANDIDATE_LIMIT).await?;
+    let (deleted_graphs, _) = list_deleted_iris(inner, REGISTRY_CANDIDATE_LIMIT).await?;
     Ok(Arc::new(
         records
             .into_iter()
@@ -809,7 +780,7 @@ pub(super) async fn list_group_records(
 #[tracing::instrument(
     name = "metadata.visibility.fill",
     level = "debug",
-    skip(inner),
+    skip(inner, graph),
     fields(
         registry_pages = field::Empty,
         lifecycle_pages = field::Empty,
@@ -821,6 +792,7 @@ pub(super) async fn list_group_records(
 )]
 pub(super) async fn fill_visibility_caches(
     inner: &Arc<MetadataInner>,
+    graph: &GraphHandle,
 ) -> Result<VisibilityFillResult, MetadataError> {
     let started = Instant::now();
     let span = Span::current();
@@ -881,7 +853,7 @@ pub(super) async fn fill_visibility_caches(
         .collect::<Vec<_>>();
     records.retain(|record| !deleted_graphs.contains(&record.graph_iri));
     let records = Arc::new(records);
-    warn_unprojected_graphs(inner.clone(), records.as_ref()).await;
+    warn_unprojected_graphs(graph, records.as_ref()).await;
     let store_accepted = inner.visibility_cache.store_visibility_fill(
         records.clone(),
         lifecycle_entries,
@@ -950,41 +922,23 @@ pub(super) async fn list_deleted_iris(
 
 pub(super) async fn list_read_records(
     inner: Arc<MetadataInner>,
+    graph: &GraphHandle,
     span: &Span,
 ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
     let registry_started = Instant::now();
-    let records = list_local_records(inner).await?;
+    let records = list_local_records(inner, graph).await?;
     record_elapsed_ms(span, "registry_ms", registry_started);
     span.record("registry_records", records.len() as u64);
     Ok(records)
 }
 
-async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataRegistryRecord]) {
+async fn warn_unprojected_graphs(graph: &GraphHandle, records: &[MetadataRegistryRecord]) {
     let projected = records
         .iter()
         .map(|record| record.graph_iri.clone())
         .collect::<BTreeSet<_>>();
-    let node = inner.node.clone();
-    let policies = match tokio::task::spawn_blocking(move || {
-        node.graphs()?
-            .into_iter()
-            .map(|graph| {
-                let policy = node.graph_policy(&graph)?;
-                Ok((graph.as_str().to_string(), policy))
-            })
-            .collect::<Result<BTreeMap<_, _>, CraqleError>>()
-    })
-    .await
-    {
-        Ok(Ok(policies)) => policies,
-        Ok(Err(error)) => {
-            warn!(
-                event = "metadata.authorization.graph_scan_failed",
-                error = %error,
-                "Could not audit metadata graphs against the authorization projection"
-            );
-            return;
-        }
+    let policies = match graph.graph_policies().await {
+        Ok(policies) => policies,
         Err(error) => {
             warn!(
                 event = "metadata.authorization.graph_scan_failed",
@@ -1031,4 +985,36 @@ async fn warn_unprojected_graphs(inner: Arc<MetadataInner>, records: &[MetadataR
             "metadata authorization projection disagrees with Craqle graph policy"
         );
     }
+}
+
+/// Every live registry record of this node, from the visibility cache.
+pub async fn list_cached_records(
+    context: &DriverContext,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let (metadata, graph) = handles(context)?;
+    list_local_records(metadata.inner.clone(), graph).await
+}
+
+/// The live registry records of one group, from the visibility cache.
+pub async fn list_cached_group(
+    context: &DriverContext,
+    group_id: GroupId,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let (metadata, graph) = handles(context)?;
+    list_local_group(metadata.inner.clone(), graph, group_id).await
+}
+
+/// Primes the visibility cache and craqle query indexes so the first
+/// query after boot finds everything warm.
+pub async fn warm_caches(context: &DriverContext) -> Result<(), MetadataError> {
+    let (metadata, graph) = handles(context)?;
+    graph.ensure_query_indexes().await?;
+    let cache = &metadata.inner.visibility_cache;
+    if cache.registry_records_any().is_none() {
+        let _fill = cache.registry_fill.clone().lock_owned().await;
+        if cache.registry_records_any().is_none() {
+            fill_visibility_caches(&metadata.inner, graph).await?;
+        }
+    }
+    Ok(())
 }

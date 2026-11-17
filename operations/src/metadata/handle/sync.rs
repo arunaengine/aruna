@@ -3,24 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Instant;
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::telemetry::record_elapsed_ms;
+use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
-use craqle::{CraqleError, GraphId};
 use tracing::{Span, debug, field};
 
-use super::MetadataInner;
-use super::entity_convert::{error_from_craqle, irokle_peer_id};
+use super::handles;
 use super::lifecycle::graph_lifecycle_deleted;
+use crate::driver::DriverContext;
 
 #[tracing::instrument(
     name = "metadata.graph_sync.once",
     level = "debug",
-    skip(inner),
+    skip(context),
     fields(
         graph_iri = %graph_iri,
         peer_count = peers.len() as u64,
@@ -30,7 +29,7 @@ use super::lifecycle::graph_lifecycle_deleted;
     )
 )]
 pub(super) async fn sync_graph_once(
-    inner: Arc<MetadataInner>,
+    context: &DriverContext,
     graph_iri: String,
     peers: Vec<NodeId>,
 ) -> Result<(), MetadataError> {
@@ -39,33 +38,30 @@ pub(super) async fn sync_graph_once(
     if peers.is_empty() {
         return Ok(());
     }
-    if graph_lifecycle_deleted(inner.storage_handle.clone(), &graph_iri).await? {
+    let (metadata, graph) = handles(context)?;
+    if graph_lifecycle_deleted(metadata.inner.storage_handle.clone(), &graph_iri).await? {
         return Ok(());
     }
-    let net_handle = inner
+    let net_handle = context
         .net_handle
         .clone()
         .ok_or(MetadataError::HandleMissing)?;
 
-    // Deterministic topic id, bound locally only when its genesis is already
-    // present; deriving never mints one, so concurrent holders cannot fork.
     let setup_started = Instant::now();
-    let topic_id = resolve_topic(&inner, &graph_iri).await?;
+    let topic_id = graph.graph_topic(graph_iri.clone()).await?;
     record_elapsed_ms(&span, "local_peer_setup_ms", setup_started);
 
     let sync_started = Instant::now();
-    // Join-before-create: adopt an existing co-holder genesis first (raw sync
-    // bootstraps an unknown topic), and only then consider minting one.
     if !sync_topic_exists(&net_handle, topic_id)? {
         if let Err(error) = net_handle.sync_topic_peers(topic_id, peers.clone()).await {
             debug!(%topic_id, error = %error, "graph topic join attempt failed");
         }
-        bind_graph_topic(&inner, &graph_iri).await?;
+        graph.bind_topic(graph_iri.clone()).await?;
     }
     if !sync_topic_exists(&net_handle, topic_id)? {
-        ensure_topic_genesis(&inner, &net_handle, &graph_iri, topic_id, &peers).await?;
+        ensure_topic_genesis(graph, &net_handle, &graph_iri, topic_id, &peers).await?;
     }
-    add_topic_peers(&inner, &net_handle, &graph_iri, topic_id, &peers).await?;
+    add_topic_peers(graph, &net_handle, &graph_iri, topic_id, &peers).await?;
 
     net_handle
         .sync_topic_peers(topic_id, peers)
@@ -77,7 +73,7 @@ pub(super) async fn sync_graph_once(
 }
 
 async fn add_topic_peers(
-    inner: &Arc<MetadataInner>,
+    graph: &GraphHandle,
     net_handle: &NetHandle,
     graph_iri: &str,
     topic_id: irokle::TopicId,
@@ -89,33 +85,23 @@ async fn add_topic_peers(
     else {
         return Ok(());
     };
-    let node = inner.node.clone();
-    let graph_iri = graph_iri.to_string();
     let peers = peers
         .iter()
         .copied()
-        .filter(|peer| !state.members.contains(&irokle_peer_id(*peer)))
+        .filter(|peer| {
+            !state
+                .members
+                .contains(&irokle::PeerId::from_bytes(*peer.as_bytes()))
+        })
         .collect::<Vec<_>>();
     if peers.is_empty() {
         return Ok(());
     }
-    tokio::task::spawn_blocking(move || {
-        let graph = GraphId::new(&graph_iri);
-        for peer in peers {
-            node.add_irokle_peer(&graph, irokle_peer_id(peer))?;
-        }
-        Ok::<_, CraqleError>(())
-    })
-    .await
-    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-    .map_err(error_from_craqle)
+    graph.add_topic_peers(graph_iri.to_string(), peers).await
 }
 
-/// Creates the graph topic genesis under the single-minter discipline: only
-/// rank-0 mints, after confirming no co-holder holds a genesis, so a rank-0 move
-/// cannot fork a rival. Rank-0 ties only; content materializes on every holder.
 async fn ensure_topic_genesis(
-    inner: &Arc<MetadataInner>,
+    graph: &GraphHandle,
     net_handle: &NetHandle,
     graph_iri: &str,
     topic_id: irokle::TopicId,
@@ -133,7 +119,7 @@ async fn ensure_topic_genesis(
         if let Err(error) = net_handle.sync_topic_peers(topic_id, peers.to_vec()).await {
             debug!(%topic_id, error = %error, "graph topic adopt attempt failed");
         }
-        bind_graph_topic(inner, graph_iri).await?;
+        graph.bind_topic(graph_iri.to_string()).await?;
         return Ok(());
     }
     if !probe.unreachable.is_empty() || probe.unconfirmed.contains(&topic_id) {
@@ -141,9 +127,9 @@ async fn ensure_topic_genesis(
             "withholding graph topic {topic_id} genesis: co-holder unreachable or unconfirmed"
         )));
     }
-    let mut members: BTreeSet<irokle::PeerId> = peers.iter().copied().map(irokle_peer_id).collect();
-    members.insert(irokle_peer_id(local));
-    mint_graph_topic(inner, graph_iri, members).await?;
+    let mut members = peers.iter().copied().collect::<BTreeSet<_>>();
+    members.insert(local);
+    graph.mint_topic(graph_iri.to_string(), members).await?;
     Ok(())
 }
 
@@ -154,42 +140,4 @@ fn sync_topic_exists(
     net_handle
         .sync_topic_exists(topic_id)
         .map_err(|error| MetadataError::Backend(error.to_string()))
-}
-
-async fn resolve_topic(
-    inner: &Arc<MetadataInner>,
-    graph_iri: &str,
-) -> Result<irokle::TopicId, MetadataError> {
-    let node = inner.node.clone();
-    let graph_iri = graph_iri.to_string();
-    tokio::task::spawn_blocking(move || node.bind_or_derive_irokle_topic(&GraphId::new(&graph_iri)))
-        .await
-        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-        .map_err(error_from_craqle)
-}
-
-async fn bind_graph_topic(
-    inner: &Arc<MetadataInner>,
-    graph_iri: &str,
-) -> Result<(), MetadataError> {
-    let node = inner.node.clone();
-    let graph_iri = graph_iri.to_string();
-    tokio::task::spawn_blocking(move || node.bind_irokle_topic(&GraphId::new(&graph_iri)))
-        .await
-        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-        .map_err(error_from_craqle)?;
-    Ok(())
-}
-
-async fn mint_graph_topic(
-    inner: &Arc<MetadataInner>,
-    graph_iri: &str,
-    members: BTreeSet<irokle::PeerId>,
-) -> Result<irokle::TopicId, MetadataError> {
-    let node = inner.node.clone();
-    let graph_iri = graph_iri.to_string();
-    tokio::task::spawn_blocking(move || node.mint_irokle_topic(&GraphId::new(&graph_iri), members))
-        .await
-        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-        .map_err(error_from_craqle)
 }
