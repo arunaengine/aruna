@@ -5,6 +5,7 @@
 
 // The copy becomes an attachment row, or a cache entry that evicts the oldest entries for room.
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -12,14 +13,15 @@ use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE,
     DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::on_use::{
     Attachment, CACHE_TOTALS_KEY, CacheEntry, CacheTotals, FillClaim, KeptKind, attachment_key,
 };
-use aruna_core::types::{Effects, Key, TxnId};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -44,6 +46,12 @@ pub enum KeepError {
     },
 }
 
+impl From<IoError> for KeepError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
 fn unexpected(state: &'static str, event: Event) -> KeepError {
     KeepError::UnexpectedEvent {
         state,
@@ -59,25 +67,13 @@ pub enum Claimed {
     Busy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClaimState {
-    Init,
-    Start,
-    Read,
-    Write,
-    Commit,
-    Abort,
-    Done,
-}
-
-/// Claims one fill: absent or stale claims are taken, a fresh one of another fill is not.
+/// Claims one fill in one transaction: absent or stale claims are taken, a fresh one of another
+/// fill is not.
 #[derive(Debug, PartialEq)]
 pub struct ClaimFillOperation {
     key: Vec<u8>,
     claim: FillClaim,
-    state: ClaimState,
-    txn_id: Option<TxnId>,
-    output: Option<Result<Claimed, KeepError>>,
+    written: bool,
 }
 
 impl ClaimFillOperation {
@@ -85,118 +81,47 @@ impl ClaimFillOperation {
         Self {
             key,
             claim,
-            state: ClaimState::Init,
-            txn_id: None,
-            output: None,
+            written: false,
         }
     }
 
-    fn fail(&mut self, error: KeepError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = ClaimState::Done;
-        abort_effects(&mut self.txn_id)
-    }
-
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            ClaimState::Init => "init",
-            ClaimState::Start => "start",
-            ClaimState::Read => "read",
-            ClaimState::Write => "write",
-            ClaimState::Commit => "commit",
-            ClaimState::Abort => "abort",
-            ClaimState::Done => "done",
+    fn claim_held(&mut self, value: Option<Value>) -> Result<Next<Claimed>, KeepError> {
+        let held = value.as_deref().map(FillClaim::from_bytes).transpose()?;
+        let busy = held.is_some_and(|held| {
+            held.claim_id != self.claim.claim_id && !held.stale(self.claim.claimed_at_ms)
+        });
+        if busy {
+            return Ok(Next::Done(Claimed::Busy));
         }
+        self.written = true;
+        let row = (
+            FILL_CLAIM_KEYSPACE.to_string(),
+            self.key.clone().into(),
+            self.claim.to_bytes()?.into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
-impl EffectOperation for ClaimFillOperation {
+impl Operation for ClaimFillOperation {
     type Output = Claimed;
     type Error = KeepError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ClaimState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<Claimed>, KeepError> {
+        Ok(Next::Call(read_row(FILL_CLAIM_KEYSPACE, self.key.clone())))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
+    fn next(&mut self, result: IoResult) -> Result<Next<Claimed>, KeepError> {
+        if self.written {
+            done(result)?;
+            return Ok(Next::Done(Claimed::Claimed));
         }
-        match (self.state, event) {
-            (ClaimState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = ClaimState::Read;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: FILL_CLAIM_KEYSPACE.to_string(),
-                    key: self.key.clone().into(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (ClaimState::Read, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let held = match value.as_deref().map(FillClaim::from_bytes).transpose() {
-                    Ok(held) => held,
-                    Err(error) => return self.fail(error.into()),
-                };
-                let busy = held.is_some_and(|held| {
-                    held.claim_id != self.claim.claim_id && !held.stale(self.claim.claimed_at_ms)
-                });
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(KeepError::NotFinished);
-                };
-                if busy {
-                    self.output = Some(Ok(Claimed::Busy));
-                    self.state = ClaimState::Abort;
-                    self.txn_id = None;
-                    return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-                }
-                let value = match self.claim.to_bytes() {
-                    Ok(value) => value,
-                    Err(error) => return self.fail(error.into()),
-                };
-                self.state = ClaimState::Write;
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: FILL_CLAIM_KEYSPACE.to_string(),
-                    key: self.key.clone().into(),
-                    value: value.into(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (ClaimState::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id.take() else {
-                    return self.fail(KeepError::NotFinished);
-                };
-                self.state = ClaimState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (ClaimState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.output = Some(Ok(Claimed::Claimed));
-                self.state = ClaimState::Done;
-                smallvec![]
-            }
-            (ClaimState::Abort, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
-                self.state = ClaimState::Done;
-                smallvec![]
-            }
-            (_, event) => {
-                let error = unexpected(self.state_name(), event);
-                self.fail(error)
-            }
-        }
+        let [value] = values::<1>(result)?;
+        self.claim_held(value)
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == ClaimState::Done
-    }
-
-    fn finalize(self) -> Result<Claimed, KeepError> {
-        self.output.unwrap_or(Err(KeepError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.fail(KeepError::NotFinished)
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
