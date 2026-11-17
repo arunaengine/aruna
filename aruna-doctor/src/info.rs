@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use aruna_api::server::state::client_bind_url;
 use aruna_core::structs::storage::backends::BackendsFile;
+use aruna_wire::address::client_bind_url;
 use aruna_wire::info::InfoResponse;
 use reqwest::Client;
 use serde::Serialize;
