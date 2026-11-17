@@ -637,7 +637,7 @@ pub(crate) async fn list_persistent_ids(
     let ctx = state.get_ctx();
     let record = load_document_record(&ctx, document_id)
         .await
-        .map_err(|error| ServerError::InternalError(format!("{error:?}").into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let routed = read_pid_routed(&ctx, state.get_realm_id(), document_id).await;
     match routed {
         Ok(Some(mapping)) => {
