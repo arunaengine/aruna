@@ -5,7 +5,8 @@
 use super::{GitError, records};
 use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms};
 use crate::realm::get_config::GetConfigOperation;
-use crate::replication::bao_read::{BaoReadOutput, managed_read};
+use crate::replication::bao_read::BaoReadOutput;
+use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};

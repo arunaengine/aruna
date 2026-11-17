@@ -46,8 +46,9 @@ use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::source_read::{READ_OPERATION, SourceReadError, authorize_read};
 use crate::jobs::store::reserve_output_commits;
 use crate::realm::get_config::GetConfigOperation;
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::live_queue::complete_put;
+use crate::replication::managed_read::{local_is_user, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::replication::version_replication::{
     ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,

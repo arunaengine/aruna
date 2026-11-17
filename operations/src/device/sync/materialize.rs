@@ -26,7 +26,8 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
+use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 use super::reconcile::Download;
