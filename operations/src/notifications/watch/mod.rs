@@ -6,7 +6,8 @@ pub mod authorization;
 pub mod check;
 pub mod digest;
 pub mod emit;
-pub mod expand;
+#[cfg(test)]
+mod expand;
 pub mod expansion;
 pub mod interest;
 pub mod listing;

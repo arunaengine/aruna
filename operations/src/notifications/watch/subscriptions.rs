@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#[cfg(test)]
 mod tests {
     use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
     use crate::notifications::watch::listing::{

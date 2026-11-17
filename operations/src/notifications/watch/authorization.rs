@@ -1,20 +1,13 @@
-//! Runs the watch checks for async callers and filters watch lists by them.
+//! Runs the watch creation check for async callers; its tests cover every watch check.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
-use aruna_core::structs::execution::notification::NotificationKind;
-use aruna_core::structs::execution::notification_watch::{
-    WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
-};
+use aruna_core::structs::execution::notification_watch::WatchEventMask;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 
 use crate::driver::{DriverContext, drive};
-use crate::notifications::watch::check::{
-    AuthorizedWatchSubscriptions, WatchCheckOperation, WatchFilterOperation,
-};
+use crate::notifications::watch::check::WatchCheckOperation;
 use crate::notifications::watch::paths::WatchAuthorization;
 
 async fn checked(
@@ -24,39 +17,6 @@ async fn checked(
     drive(check, context)
         .await
         .map_err(|error| error.to_string())
-}
-
-/// Canonical authorization result every watch surface shares: the owner must
-/// still hold READ on the watched prefix's permission path. No resource
-/// identity or a non-user owner denies; unevaluable checks are errors, not grants.
-#[cfg(test)]
-pub(crate) async fn is_watch_authorized(
-    context: &DriverContext,
-    realm_id: RealmId,
-    owner: UserId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<bool, String> {
-    let check =
-        WatchCheckOperation::listing(realm_id, owner, path_prefix, event_mask, authorization);
-    Ok(matches!(
-        checked(context, check).await?,
-        WatchAuthorization::Authorized
-    ))
-}
-
-pub(crate) async fn evaluate_watch_delivery(
-    context: &DriverContext,
-    realm_id: RealmId,
-    owner: UserId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<WatchAuthorization, String> {
-    let check =
-        WatchCheckOperation::delivery(realm_id, owner, path_prefix, event_mask, authorization);
-    checked(context, check).await
 }
 
 pub async fn evaluate_watch_creation(
@@ -70,69 +30,6 @@ pub async fn evaluate_watch_creation(
     checked(context, check).await
 }
 
-pub(crate) async fn authorize_forwarded_watch(
-    context: &DriverContext,
-    realm_id: RealmId,
-    owner: UserId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<WatchAuthorization, String> {
-    let check =
-        WatchCheckOperation::forwarded(realm_id, owner, path_prefix, event_mask, authorization);
-    checked(context, check).await
-}
-
-pub(crate) async fn authorize_watch_event(
-    context: &DriverContext,
-    owner: UserId,
-    authorization: &WatchAuthorizationBinding,
-    event: &WatchEvent,
-) -> Result<WatchAuthorization, String> {
-    checked(
-        context,
-        WatchCheckOperation::event(owner, authorization, event),
-    )
-    .await
-}
-
-pub(crate) async fn authorize_notification(
-    context: &DriverContext,
-    recipient: UserId,
-    kind: &NotificationKind,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<WatchAuthorization, String> {
-    let check = WatchCheckOperation::notification(recipient, kind, authorization);
-    checked(context, check).await
-}
-
-/// Holder-side enumeration of one user's watches through the same authorization
-/// result delivery uses. Revoked watches retain only their opaque deletion id;
-/// protected watch details are redacted so the owner can still release quota.
-pub(crate) async fn list_authorized_subscriptions(
-    context: &DriverContext,
-    owner: UserId,
-) -> Result<Vec<WatchSubscription>, String> {
-    let listed = drive(WatchFilterOperation::owner(owner), context).await;
-    listed
-        .map(|listed| listed.subscriptions)
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) async fn filter_authorized_subscriptions(
-    context: &DriverContext,
-    realm_id: RealmId,
-    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    local_node_id: NodeId,
-    subscriptions: Vec<WatchSubscription>,
-) -> Result<AuthorizedWatchSubscriptions, String> {
-    let filter = WatchFilterOperation::realm(realm_id, realm_config, local_node_id, subscriptions)
-        .map_err(|error| error.to_string())?;
-    drive(filter, context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,7 +39,7 @@ mod tests {
     use aruna_core::structs::execution::notification_watch::{
         WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
     };
-    use aruna_core::structs::identity::auth::{Actor, PathRestriction};
+    use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
@@ -151,6 +48,77 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_storage::{FjallStorage, StorageHandle};
     use ulid::Ulid;
+
+    use aruna_core::NodeId;
+    use aruna_core::UserId;
+    use aruna_core::structs::execution::notification_watch::{
+        WatchAuthorizationBinding, WatchSubscription,
+    };
+
+    use crate::notifications::watch::check::{AuthorizedWatchSubscriptions, WatchFilterOperation};
+    use crate::notifications::watch::paths::{
+        WatchAuthorizationDenial, event_permission_path, watch_permission_path,
+    };
+
+    /// Canonical authorization result every watch surface shares: the owner must
+    /// still hold READ on the watched prefix's permission path. No resource
+    /// identity or a non-user owner denies; unevaluable checks are errors, not grants.
+    async fn is_watch_authorized(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<bool, String> {
+        let check =
+            WatchCheckOperation::listing(realm_id, owner, path_prefix, event_mask, authorization);
+        Ok(matches!(
+            checked(context, check).await?,
+            WatchAuthorization::Authorized
+        ))
+    }
+
+    async fn filter_authorized_subscriptions(
+        context: &DriverContext,
+        realm_id: RealmId,
+        realm_config: &RealmConfigDocument,
+        local_node_id: NodeId,
+        subscriptions: Vec<WatchSubscription>,
+    ) -> Result<AuthorizedWatchSubscriptions, String> {
+        let filter =
+            WatchFilterOperation::realm(realm_id, realm_config, local_node_id, subscriptions)
+                .map_err(|error| error.to_string())?;
+        drive(filter, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn evaluate_watch_delivery(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<WatchAuthorization, String> {
+        let check =
+            WatchCheckOperation::delivery(realm_id, owner, path_prefix, event_mask, authorization);
+        checked(context, check).await
+    }
+
+    async fn authorize_forwarded_watch(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<WatchAuthorization, String> {
+        let check =
+            WatchCheckOperation::forwarded(realm_id, owner, path_prefix, event_mask, authorization);
+        checked(context, check).await
+    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

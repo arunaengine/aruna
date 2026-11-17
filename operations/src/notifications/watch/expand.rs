@@ -1,52 +1,18 @@
-//! Expands watch events into inbox records and retries the deliveries that failed.
+//! Tests the watch event expansion and the retry drain through two drive wrappers.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::structs::execution::notification::InboxWriteOutcome;
-use aruna_core::structs::execution::notification_watch::WatchEvent;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-
-use crate::driver::{DriverContext, drive, drive_retry};
-use crate::notifications::watch::expansion::{RetryDrainOperation, WatchExpandOperation};
-
-/// Expands one bounded subscription page into idempotent inbox records.
-/// Later pages are durably retried; placement and authorization are rechecked.
-/// Returns the write outcome and whether stale or unauthorized rows were skipped.
-pub(crate) async fn expand_watch_events(
-    context: &DriverContext,
-    realm_id: RealmId,
-    realm_config: &RealmConfigDocument,
-    local_node_id: NodeId,
-    events: &[WatchEvent],
-) -> Result<(InboxWriteOutcome, bool), String> {
-    let build = || {
-        let events = events.to_vec();
-        WatchExpandOperation::new(realm_id, realm_config.clone(), local_node_id, events, None)
-    };
-    let expanded = drive_retry(build, context, realm_id.as_bytes()).await;
-    expanded
-        .map(|outcome| (outcome.inbox, outcome.dropped))
-        .map_err(|error| error.to_string())
-}
-
-pub(crate) async fn drain_watch_events(
-    context: &DriverContext,
-    realm_id: RealmId,
-    realm_config: &RealmConfigDocument,
-    local_node_id: NodeId,
-) -> Result<(), String> {
-    let drain = RetryDrainOperation::new(realm_id, realm_config.clone(), local_node_id);
-    drive(drain, context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::driver::{DriverContext, drive, drive_retry};
     use crate::notifications::protocol::WATCH_PAGE_LIMIT;
     use crate::notifications::protocol::valid_retry;
+    use crate::notifications::protocol::{
+        EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, add_limit,
+        expansion_budget, page_limit,
+    };
+    use crate::notifications::watch::expansion::{RetryDrainOperation, WatchExpandOperation};
+    use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -54,14 +20,16 @@ mod tests {
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
         WATCH_INTEREST_KEYSPACE,
     };
+    use aruna_core::structs::execution::notification::InboxWriteOutcome;
     use aruna_core::structs::execution::notification_watch::{
-        WatchAuthorizationBinding, WatchEventDetail, WatchEventKind, WatchEventMask,
-        WatchEventRetry, watch_resource_path, watch_retry_prefix,
+        WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
+        WatchEventRetry, watch_resource_path, watch_retry_key, watch_retry_prefix,
+        watch_subscription_key,
     };
     use aruna_core::structs::identity::auth::{Actor, Permission};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{
-        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::structs::storage::blob::object_permission_path;
     use aruna_storage::{FjallStorage, StorageHandle};
@@ -69,6 +37,38 @@ mod tests {
     use ulid::Ulid;
 
     use crate::tests::notifications::{create_holder_watch, create_local_watch};
+
+    /// Expands one bounded subscription page into idempotent inbox records.
+    /// Later pages are durably retried; placement and authorization are rechecked.
+    /// Returns the write outcome and whether stale or unauthorized rows were skipped.
+    async fn expand_watch_events(
+        context: &DriverContext,
+        realm_id: RealmId,
+        realm_config: &RealmConfigDocument,
+        local_node_id: NodeId,
+        events: &[WatchEvent],
+    ) -> Result<(InboxWriteOutcome, bool), String> {
+        let build = || {
+            let events = events.to_vec();
+            WatchExpandOperation::new(realm_id, realm_config.clone(), local_node_id, events, None)
+        };
+        let expanded = drive_retry(build, context, realm_id.as_bytes()).await;
+        expanded
+            .map(|outcome| (outcome.inbox, outcome.dropped))
+            .map_err(|error| error.to_string())
+    }
+
+    async fn drain_watch_events(
+        context: &DriverContext,
+        realm_id: RealmId,
+        realm_config: &RealmConfigDocument,
+        local_node_id: NodeId,
+    ) -> Result<(), String> {
+        let drain = RetryDrainOperation::new(realm_id, realm_config.clone(), local_node_id);
+        drive(drain, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
         let dir = tempdir().expect("temp dir");

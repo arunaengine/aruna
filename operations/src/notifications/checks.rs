@@ -4,7 +4,6 @@
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, parse_watch_path, watch_resource_path,
@@ -500,30 +499,6 @@ pub(crate) fn events_realm(events: &[WatchEvent]) -> Result<RealmId, String> {
         return Err("mixed-realm batch".to_string());
     }
     Ok(realm_id)
-}
-
-pub(crate) fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, String> {
-    match message {
-        NotificationTransportMessage::DeliverBatch { records } => batch_realm(records),
-        NotificationTransportMessage::List { recipient, .. }
-        | NotificationTransportMessage::UnreadCount { recipient }
-        | NotificationTransportMessage::MarkRead { recipient, .. } => Ok(recipient.realm_id),
-        NotificationTransportMessage::CreateWatch { owner, .. }
-        | NotificationTransportMessage::DeleteWatch { owner, .. }
-        | NotificationTransportMessage::ListWatches { owner } => Ok(owner.realm_id),
-        NotificationTransportMessage::DeliverWatchEvents { events } => events_realm(events),
-        NotificationTransportMessage::DeliverAck { .. }
-        | NotificationTransportMessage::ListResult { .. }
-        | NotificationTransportMessage::UnreadCountResult { .. }
-        | NotificationTransportMessage::MarkReadResult { .. }
-        | NotificationTransportMessage::Reject(_)
-        | NotificationTransportMessage::WatchCreated { .. }
-        | NotificationTransportMessage::WatchDeleted
-        | NotificationTransportMessage::WatchList { .. }
-        | NotificationTransportMessage::WatchEventsAck { .. } => {
-            Err("unexpected notification control message".to_string())
-        }
-    }
 }
 
 /// The stored realm config when `peer` may speak for the realm: only sync-eligible
