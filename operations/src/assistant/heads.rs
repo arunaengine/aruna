@@ -10,6 +10,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows;
 use aruna_core::structs::{AssistantChatHead, MAX_ASSISTANT_CHATS};
 
 /// Lists one user's live chat heads, newest change first.
@@ -33,7 +34,7 @@ impl Operation for ListChatOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
-        let (rows, _) = result.page()?;
+        let (rows, _) = rows::page(result)?;
         let mut heads = decode_heads(rows)?;
         heads.retain(AssistantChatHead::is_live);
         heads.sort_by_key(|head| std::cmp::Reverse(head.updated_at));
@@ -139,7 +140,7 @@ impl Operation for WriteChatOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
         match std::mem::replace(&mut self.stage, WriteHeadStage::Head) {
-            WriteHeadStage::Head => match decode_head(result.value()?)? {
+            WriteHeadStage::Head => match decode_head(rows::value(result)?)? {
                 Some(head) => self.rename(head),
                 None => {
                     self.stage = WriteHeadStage::Count;
@@ -147,12 +148,12 @@ impl Operation for WriteChatOperation {
                 }
             },
             WriteHeadStage::Count => {
-                let (rows, _) = result.page()?;
+                let (rows, _) = rows::page(result)?;
                 let live = decode_heads(rows)?.iter().filter(|head| head.is_live()).count();
                 self.create(live)
             }
             WriteHeadStage::Written(head) => {
-                result.done()?;
+                rows::done(result)?;
                 Ok(Next::Done(head))
             }
         }
@@ -218,7 +219,7 @@ impl Operation for DeleteChatOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ChatStoreError> {
         match std::mem::replace(&mut self.stage, DeleteChatStage::Written) {
-            DeleteChatStage::Head => match decode_head(result.value()?)? {
+            DeleteChatStage::Head => match decode_head(rows::value(result)?)? {
                 Some(head) if head.is_live() => {
                     let turns = turns_page(self.user_id, &self.chat_id, head.first_seq, usize::MAX);
                     self.stage = DeleteChatStage::Turns(head);
@@ -227,7 +228,7 @@ impl Operation for DeleteChatOperation {
                 _ => Ok(Next::Done(())),
             },
             DeleteChatStage::Turns(head) => {
-                let (rows, _) = result.page()?;
+                let (rows, _) = rows::page(result)?;
                 if rows.is_empty() {
                     return self.tombstone(head);
                 }
@@ -239,11 +240,11 @@ impl Operation for DeleteChatOperation {
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             DeleteChatStage::Deleted(head) => {
-                result.done()?;
+                rows::done(result)?;
                 self.tombstone(head)
             }
             DeleteChatStage::Written => {
-                result.done()?;
+                rows::done(result)?;
                 Ok(Next::Done(()))
             }
         }

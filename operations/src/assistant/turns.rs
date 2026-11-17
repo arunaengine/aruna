@@ -10,6 +10,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows;
 use aruna_core::structs::{
     AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
 };
@@ -47,14 +48,14 @@ impl Operation for ReadChatOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
         if self.turns {
-            let (rows, _) = result.page()?;
+            let (rows, _) = rows::page(result)?;
             let turns = rows
                 .into_iter()
                 .map(|(_, value)| AssistantChatTurn::from_bytes(value.as_ref()))
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(Next::Done(turns));
         }
-        let head = live_head(result.value()?)?;
+        let head = live_head(rows::value(result)?)?;
         let from = self.after.map_or(head.first_seq, |after| {
             after.saturating_add(1).max(head.first_seq)
         });
@@ -235,17 +236,17 @@ impl Operation for WriteTurnOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
         match std::mem::replace(&mut self.stage, WriteTurnStage::Head) {
             WriteTurnStage::Head => {
-                let head = live_head(result.value()?)?;
+                let head = live_head(rows::value(result)?)?;
                 self.head(head)
             }
-            WriteTurnStage::Turns(head) => self.turns(head, result.page()?.0),
-            WriteTurnStage::Sum(head) => self.sum(head, result.page()?.0),
+            WriteTurnStage::Turns(head) => self.turns(head, rows::page(result)?.0),
+            WriteTurnStage::Sum(head) => self.sum(head, rows::page(result)?.0),
             WriteTurnStage::Trimmed(head) => {
-                result.done()?;
+                rows::done(result)?;
                 self.write_all(head)
             }
             WriteTurnStage::Written(head) => {
-                result.done()?;
+                rows::done(result)?;
                 Ok(Next::Done(head))
             }
         }
