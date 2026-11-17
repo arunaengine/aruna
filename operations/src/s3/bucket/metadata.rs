@@ -349,6 +349,7 @@ impl EffectOperation for PutMetadataOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::s3::bucket::dataset::bucket_metadata;
     use aruna_core::UserId;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;

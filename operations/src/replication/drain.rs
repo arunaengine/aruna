@@ -72,12 +72,12 @@ pub struct BlobDrainResult {
 }
 
 pub(super) struct BlobJobScan {
-    jobs: Vec<(Vec<u8>, BlobJobRecord)>,
+    pub(super) jobs: Vec<(Vec<u8>, BlobJobRecord)>,
     /// The generation the scan started in.
     generation: u64,
-    has_more_due: bool,
+    pub(super) has_more_due: bool,
     next_due_ms: Option<u64>,
-    next_cursor: ReplicationScanCursor,
+    pub(super) next_cursor: ReplicationScanCursor,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

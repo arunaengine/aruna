@@ -400,6 +400,7 @@ mod tests {
     use crate::storage_read::iter_prefix_page;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::handle::Handle;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::operation::{EffectOperation, Runnable};
     use aruna_core::structs::identity::realm::RealmId;

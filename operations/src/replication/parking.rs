@@ -725,7 +725,16 @@ mod tests {
         let park = ParkJobOperation::new(job_key, job.clone(), keys.to_vec(), now_ms);
         drive(park, context).await
     }
+
+    /// Sends one storage effect and keeps only its error.
+    async fn run(storage: &StorageHandle, effect: StorageEffect) -> Result<(), StorageError> {
+        match storage.send_storage_effect(effect).await {
+            Event::Storage(StorageEvent::Error { error }) => Err(error),
+            _ => Ok(()),
+        }
+    }
     use crate::replication::drain::next_blob_timer;
+    use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -992,12 +1001,28 @@ mod tests {
         source(&context, old).await;
         let record = job(Ulid::from_parts(12, 12));
         let row = store(&storage, &record).await;
-        let txn_id = start(&storage).await.unwrap();
-        assert!(
-            wait_current(&storage, &record, &[old], Some(txn_id))
-                .await
-                .unwrap()
-        );
+        let started = StorageEffect::StartTransaction { read: false };
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) =
+            storage.send_storage_effect(started).await
+        else {
+            panic!("the transaction starts")
+        };
+        // The parking reads of the key rows join the transaction, so a rotation conflicts.
+        let reads = vec![
+            (
+                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                record.input.bucket.as_bytes().into(),
+            ),
+            (BUCKET_KEY_KEYSPACE.to_string(), old.key().into()),
+        ];
+        let read = StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        };
+        assert!(matches!(
+            storage.send_storage_effect(read).await,
+            Event::Storage(StorageEvent::BatchReadResult { .. })
+        ));
         source(&context, BucketKeyRef::new(old.bucket_id, 2)).await;
         let mut parked = record;
         parked.due_at_ms = PARKED_DUE;
@@ -1013,8 +1038,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            commit(&storage, txn_id).await,
-            Err(BlobQueueError::Storage(StorageError::TransactionConflict))
+            run(&storage, StorageEffect::CommitTransaction { txn_id }).await,
+            Err(StorageError::TransactionConflict)
         );
         assert_ne!(
             read_job(&storage, &row, None)

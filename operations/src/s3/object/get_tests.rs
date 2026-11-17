@@ -28,7 +28,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
@@ -2992,11 +2992,11 @@ fn resolve_all(
     accesses: Vec<ResolvedSourceAccess>,
     connectors: &[SourceConnector],
 ) {
-    let mut turn = Ok(Next::Done(None));
+    let mut turn: Turn = Err(GetObjectError::GetObjectFailed);
     for access in accesses {
         let result = Ok(access);
         let resolved = SubOperationEvent::VersionAccessResolved { result };
-        turn = step(operation, Event::SubOperation(resolved)).map(|next| next.map(Some));
+        turn = step(operation, Event::SubOperation(resolved));
     }
     if let Ok(Next::Call(IoCall::Read(reads))) = &turn {
         let row = |key: &aruna_core::types::Key| {
@@ -3009,11 +3009,10 @@ fn resolve_all(
             .iter()
             .map(|(_, key)| (key.clone(), row(key)))
             .collect();
-        let read = step(
+        turn = step(
             operation,
             Event::Storage(StorageEvent::BatchReadResult { values }),
         );
-        turn = read.map(|next| next.map(Some));
     }
     assert!(matches!(
         asked(&turn),

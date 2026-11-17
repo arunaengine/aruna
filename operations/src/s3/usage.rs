@@ -5,7 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
@@ -3059,16 +3059,18 @@ mod state_machine_tests {
 
     #[test]
     fn marker_marks_incomplete() {
-        let marker_read = Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: Key::from(USAGE_REBUILD_KEY.to_vec()),
-            txn_id: None,
-        });
+        let marker_read = || {
+            Effect::Storage(StorageEffect::Read {
+                key_space: USAGE_STATS_KEYSPACE.to_string(),
+                key: Key::from(USAGE_REBUILD_KEY.to_vec()),
+                txn_id: None,
+            })
+        };
         for (value, complete) in [(None, true), (Some(Value::from(vec![1])), false)] {
             let mut operation = UsageCompleteOperation::new();
             check_trace(
                 &mut operation,
-                &[marker_read.clone()],
+                &[marker_read()],
                 vec![(read(value), vec![])],
             );
             assert_eq!(operation.finalize(), Ok(complete));

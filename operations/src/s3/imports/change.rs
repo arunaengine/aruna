@@ -335,7 +335,7 @@ mod tests {
     /// The earlier patterns a pattern change stores with the rule.
     fn earlier(turn: &Step) -> Vec<String> {
         let writes = writes(turn);
-        let [_, (space, key, value)] = writes.as_slice() else {
+        let [_, (space, key, value)] = writes else {
             panic!("expected two writes, got {writes:?}")
         };
         assert_eq!(
