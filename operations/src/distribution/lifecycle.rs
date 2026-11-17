@@ -6,6 +6,7 @@
 // A transfer away drains its uploads before its fence is stated; a deletion purges the member
 // bucket once it commits. Every pass is bounded and resumes from durable state.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,7 +42,7 @@ use super::purge::{
     PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
     purge_range, purge_rest, read,
 };
-use super::roots::roots_checked;
+use super::roots::{RootsCheckOperation, RootsOutcome, Sweep};
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{dirty_rows, wake_publish};
@@ -58,6 +59,8 @@ const FENCE_ATTEMPTS: usize = 4;
 const UPLOAD_GRACE_MS: u64 = 5 * 60 * 1000;
 /// The set marker after which the next pass continues; a restart begins at the first set.
 static MARKER_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Where the open source root sweep of each transfer goes on.
+static SWEEPS: Mutex<BTreeMap<Ulid, Sweep>> = Mutex::new(BTreeMap::new());
 
 /// What a range held when its former coordinator fenced it; the new coordinator completes
 /// once its own counters of the range reach it.
@@ -598,7 +601,16 @@ impl SetWork {
         }
         // Every source root of what it applied must be readable here before it takes over.
         let group_id = snapshot.config.owner_group;
-        if !roots_checked(context, self.set_id, group_id, open.transfer_id).await? {
+        let sweep = (SWEEPS.lock().ok()).and_then(|sweeps| sweeps.get(&open.transfer_id).cloned());
+        let check = RootsCheckOperation::new(self.set_id, group_id, sweep);
+        let outcome = drive(check, context).await.map_err(|e| e.to_string())?;
+        if let Ok(mut sweeps) = SWEEPS.lock() {
+            match &outcome {
+                RootsOutcome::Continue(sweep) => sweeps.insert(open.transfer_id, sweep.clone()),
+                RootsOutcome::Done(_) => sweeps.remove(&open.transfer_id),
+            };
+        }
+        if outcome != RootsOutcome::Done(true) {
             return Ok(Left::Waiting);
         }
         // The former coordinator's open imports are fetched now, while it still holds them,
