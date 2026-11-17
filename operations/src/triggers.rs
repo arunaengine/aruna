@@ -24,6 +24,8 @@ use crate::notifications::prune::{
     NOTIFICATION_RETRY_AFTER, PRUNE_PAGE_SIZE, PruneNotificationsOperation,
 };
 use crate::notifications::serve::{InboxRequest, ServeInboxOperation, WatchEventsOperation};
+use crate::notifications::watch::digest::WATCH_PUBLISH_DEBOUNCE;
+use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
 
 /// What the timer shell knows when a timer fires.
@@ -66,6 +68,7 @@ pub trait TimerRun: Operation + Sized {
 pub enum TimerOperation {
     DrainNotificationOutbox(DrainOutboxOperation),
     PruneNotifications(PruneNotificationsOperation),
+    PublishWatchInterest(PublishInterestOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -77,6 +80,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::PruneNotifications => Some(TimerOperation::PruneNotifications(
             PruneNotificationsOperation::new(input.now_ms, PRUNE_PAGE_SIZE),
         )),
+        TaskKey::PublishWatchInterest => Some(TimerOperation::PublishWatchInterest(
+            PublishInterestOperation::new(input.local_node),
+        )),
         _ => None,
     }
 }
@@ -87,6 +93,7 @@ macro_rules! each_timer {
         match $self {
             TimerOperation::DrainNotificationOutbox($operation) => $body,
             TimerOperation::PruneNotifications($operation) => $body,
+            TimerOperation::PublishWatchInterest($operation) => $body,
         }
     };
 }
@@ -172,6 +179,19 @@ impl TimerRun for DrainOutboxOperation {
             retry_after: DELIVERY_RETRY_AFTER,
             reason: error.to_string(),
         })
+    }
+}
+
+impl TimerRun for PublishInterestOperation {
+    /// A published or skipped run waits for the next change; a failed one runs again soon.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+        match result {
+            Ok(_) => Ok(None),
+            Err(error) => Err(TimerFailure {
+                retry_after: WATCH_PUBLISH_DEBOUNCE,
+                reason: error.to_string(),
+            }),
+        }
     }
 }
 
@@ -453,7 +473,7 @@ mod tests {
     #[test]
     fn unconverted_keys_absent() {
         assert!(timer_operation(&TaskKey::DrainJobQueue, &INPUT).is_none());
-        assert!(timer_operation(&TaskKey::PublishWatchInterest, &INPUT).is_none());
+        assert!(timer_operation(&TaskKey::PruneJobs, &INPUT).is_none());
     }
 
     #[test]

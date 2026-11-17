@@ -13,7 +13,7 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::document_sync::{apply_metadata, run_maintenance};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
-use crate::notifications::watch::interest::refresh_target_interest;
+use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::replication::protocol::{
@@ -421,7 +421,10 @@ async fn reconcile_inbound_topics(
     crate::notifications::email::config_applied(context, &targets.targets).await;
     // An installed record may name a member this node bootstraps.
     wake_bootstrap(context).await;
-    refresh_target_interest(context, &targets.targets).await;
+    let refresh = RefreshInterestOperation::new(&targets.targets, *net_handle.realm_id());
+    if let Err(error) = drive(refresh, context).await {
+        warn!(%error, "Watch interest refresh stopped after a document sync");
+    }
     let timings = apply_metadata(context, Some(net_handle.node_id()), targets, true).await;
     info!(
         event = "pipeline.reconcile.summary",
