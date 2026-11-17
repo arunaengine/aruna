@@ -294,16 +294,21 @@ fn unexpected(got: &'static str) -> RecordError {
     })
 }
 
-/// Writes or deletes the record, then wakes the outbox drain; a failed wake only delays the drain.
+/// Writes or deletes the record, then wakes the outbox drain.
 pub(crate) async fn write_entry(
     ctx: &DriverContext,
     config: InstallEntryConfig,
 ) -> Result<Option<PluginInstall>, RecordError> {
     let written = drive(InstallEntryOperation::new(config), ctx).await?;
+    wake_drain(ctx).await;
+    Ok(written)
+}
+
+/// Wakes the outbox drain after a committed config write; a failed wake only delays the drain.
+pub(super) async fn wake_drain(ctx: &DriverContext) {
     if let Err(error) = drive(WakeDrain, ctx).await {
         warn!(%error, "Failed to schedule the outbox drain; the durable outbox stays retryable");
     }
-    Ok(written)
 }
 
 /// Schedules the outbox drain at once.
