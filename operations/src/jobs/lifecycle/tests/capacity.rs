@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::scheduling::PlannedInput;
@@ -16,7 +17,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::reservation::{
-    ExecutionReservation, MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
+    MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
     ReserveExecutionOperation, fits,
 };
 use crate::jobs::lifecycle::held::HeldReservations;
@@ -126,7 +127,7 @@ async fn reserve(
 fn holds_static_ceilings() {
     // An unmeasured ceiling never filters; a measured one is exact and a zero
     // concurrency ceiling admits nothing at all.
-    let held = vec![ExecutionReservation {
+    let held = vec![JobReservationRecord {
         execution_id: Ulid::from_bytes([1u8; 16]),
         job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
         logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
@@ -156,7 +157,7 @@ async fn pages_reservations() {
     let writes = (0..=MAX_RESERVATION_SCAN)
         .map(|index| {
             let execution_id = Ulid::from(index as u128 + 1);
-            let reservation = ExecutionReservation {
+            let reservation = JobReservationRecord {
                 execution_id,
                 job_id: family.job_id,
                 logical_job_id: family.job_id,

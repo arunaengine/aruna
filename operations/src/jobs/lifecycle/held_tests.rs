@@ -16,11 +16,12 @@ use ulid::Ulid;
 
 use super::HeldReservations;
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::lifecycle::reservation::{ExecutionReservation, MAX_RESERVATION_SCAN};
+use crate::jobs::lifecycle::reservation::MAX_RESERVATION_SCAN;
+use aruna_core::compute::quota::JobReservationRecord;
 use crate::jobs::records::rows::to_bytes;
 
-fn row(seed: u8) -> ExecutionReservation {
-    ExecutionReservation {
+fn row(seed: u8) -> JobReservationRecord {
+    JobReservationRecord {
         execution_id: Ulid::from_bytes([seed; 16]),
         job_id: JobId::from_bytes([seed; 16]),
         logical_job_id: JobId::from_bytes([seed + 1; 16]),

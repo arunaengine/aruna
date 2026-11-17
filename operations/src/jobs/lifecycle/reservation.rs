@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -34,9 +35,6 @@ use crate::jobs::store::job_insert_entries;
 /// executions than this without its backend ceiling stopping it first.
 pub const MAX_RESERVATION_SCAN: usize = 512;
 
-/// Capacity held for one physical execution: the shared core contract, written
-/// with the receipt and released at that execution's terminal state.
-pub use aruna_core::compute::quota::JobReservationRecord as ExecutionReservation;
 
 pub fn reservation_key(execution_id: Ulid) -> Key {
     Key::from(execution_id.to_bytes().as_slice())
@@ -45,7 +43,7 @@ pub fn reservation_key(execution_id: Ulid) -> Key {
 /// Whether one more execution fits the backend's static ceilings. An unmeasured
 /// ceiling never filters, and a zero concurrency ceiling admits nothing.
 pub fn fits(
-    held: &[ExecutionReservation],
+    held: &[JobReservationRecord],
     request: &EffectiveResources,
     envelope: &ResourceEnvelope,
 ) -> bool {
@@ -101,7 +99,7 @@ pub struct ReserveExecutionConfig {
 pub struct ReserveExecutionOperation {
     config: ReserveExecutionConfig,
     view: Option<FamilyView>,
-    held: Vec<ExecutionReservation>,
+    held: Vec<JobReservationRecord>,
     cursor: Option<Key>,
     cache: Option<ProjectionCache>,
     state: ReserveState,
@@ -230,7 +228,7 @@ impl ReserveExecutionOperation {
                 JOB_RESERVATION_KEYSPACE.to_string(),
                 reservation_key(self.config.execution_id),
                 Value::from(
-                    to_bytes(&ExecutionReservation {
+                    to_bytes(&JobReservationRecord {
                         execution_id: self.config.execution_id,
                         job_id: self.config.job_id,
                         logical_job_id: self.config.logical_job_id,
@@ -359,7 +357,7 @@ impl Operation for ReserveExecutionOperation {
                     next_start_after,
                 }) => {
                     for (_, value) in values {
-                        match from_bytes::<ExecutionReservation>(&value) {
+                        match from_bytes::<JobReservationRecord>(&value) {
                             Ok(reservation) => self.held.push(reservation),
                             Err(error) => {
                                 self.outcome = Some(Err(error.into()));

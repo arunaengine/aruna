@@ -11,16 +11,17 @@ use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 
 use super::LifecycleError;
-use super::reservation::{ExecutionReservation, MAX_RESERVATION_SCAN};
+use super::reservation::MAX_RESERVATION_SCAN;
+use aruna_core::compute::quota::JobReservationRecord;
 use crate::jobs::records::rows::from_bytes;
 
 /// Reads every held reservation, or only the one of `job_id`, oldest key first.
 #[derive(Debug)]
 pub struct HeldReservations {
     job_id: Option<JobId>,
-    held: Vec<ExecutionReservation>,
+    held: Vec<JobReservationRecord>,
     state: HeldState,
-    outcome: Option<Result<Vec<ExecutionReservation>, LifecycleError>>,
+    outcome: Option<Result<Vec<JobReservationRecord>, LifecycleError>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +63,7 @@ impl HeldReservations {
         })]
     }
 
-    fn finish(&mut self, outcome: Result<Vec<ExecutionReservation>, LifecycleError>) -> Effects {
+    fn finish(&mut self, outcome: Result<Vec<JobReservationRecord>, LifecycleError>) -> Effects {
         self.outcome = Some(outcome);
         self.state = HeldState::Done;
         smallvec![]
@@ -70,7 +71,7 @@ impl HeldReservations {
 }
 
 impl Operation for HeldReservations {
-    type Output = Vec<ExecutionReservation>;
+    type Output = Vec<JobReservationRecord>;
     type Error = LifecycleError;
 
     fn start(&mut self) -> Effects {
@@ -87,7 +88,7 @@ impl Operation for HeldReservations {
                 }),
             ) => {
                 for (_, value) in values {
-                    match from_bytes::<ExecutionReservation>(&value) {
+                    match from_bytes::<JobReservationRecord>(&value) {
                         Ok(row) if self.job_id.is_none_or(|job_id| row.job_id == job_id) => {
                             self.held.push(row);
                         }

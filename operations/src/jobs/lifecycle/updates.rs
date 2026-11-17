@@ -90,7 +90,7 @@ pub async fn chain_of_attempt(
 async fn local_reservation(
     context: &DriverContext,
     job_id: JobId,
-) -> Option<super::reservation::ExecutionReservation> {
+) -> Option<aruna_core::compute::quota::JobReservationRecord> {
     match drive(HeldReservations::of_job(job_id), context).await {
         Ok(held) => held.into_iter().next(),
         Err(error) => {
