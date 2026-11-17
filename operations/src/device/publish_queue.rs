@@ -9,7 +9,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
@@ -354,7 +354,7 @@ impl ClaimStateOperation {
     }
 }
 
-impl Operation for ClaimStateOperation {
+impl EffectOperation for ClaimStateOperation {
     type Output = bool;
     type Error = ClaimError;
 
@@ -456,7 +456,7 @@ impl RequeueFailedOperation {
     }
 }
 
-impl Operation for RequeueFailedOperation {
+impl EffectOperation for RequeueFailedOperation {
     type Output = usize;
     type Error = ScanRowsError;
 
@@ -535,7 +535,7 @@ mod pure_tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
     };

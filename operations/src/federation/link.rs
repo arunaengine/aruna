@@ -16,7 +16,7 @@ use aruna_core::link::{
     LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation, fresh_local,
     link_secret,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
@@ -180,7 +180,7 @@ impl ConfirmLinkOperation {
     }
 }
 
-impl Operation for ConfirmLinkOperation {
+impl EffectOperation for ConfirmLinkOperation {
     type Output = Signed<LinkConfirmation>;
     type Error = LinkLoginError;
 
@@ -304,7 +304,7 @@ impl LinkLoginOperation {
     }
 }
 
-impl Operation for LinkLoginOperation {
+impl EffectOperation for LinkLoginOperation {
     type Output = User;
     type Error = LinkLoginError;
 
@@ -460,7 +460,7 @@ impl UnlinkLoginOperation {
     }
 }
 
-impl Operation for UnlinkLoginOperation {
+impl EffectOperation for UnlinkLoginOperation {
     type Output = User;
     type Error = LinkLoginError;
 
@@ -910,7 +910,7 @@ mod tests {
         held: Option<Event>,
     }
 
-    impl Operation for Racing {
+    impl EffectOperation for Racing {
         type Output = User;
         type Error = LinkLoginError;
 

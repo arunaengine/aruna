@@ -6,7 +6,7 @@
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{
     ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
     JobRecordKind,
@@ -209,12 +209,12 @@ pub(crate) fn receipt_in(
 }
 
 /// Steps a child read: its effects while it runs, `None` once it ended.
-fn advance<O: Operation>(child: &mut O, event: Event) -> Option<Effects> {
+fn advance<O: EffectOperation>(child: &mut O, event: Event) -> Option<Effects> {
     let effects = child.step(event);
     (!child.is_complete()).then_some(effects)
 }
 
-impl Operation for ExecutionChainOperation {
+impl EffectOperation for ExecutionChainOperation {
     type Output = Option<ExecutionChain>;
     type Error = LifecycleError;
 

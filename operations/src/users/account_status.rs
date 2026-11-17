@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
@@ -350,7 +350,7 @@ fn holds_admin_role(realm_auth: Option<&RealmAuthorizationDocument>, target: &Us
     })
 }
 
-impl Operation for AccountStatusOperation {
+impl EffectOperation for AccountStatusOperation {
     type Output = ();
     type Error = AccountStatusError;
 

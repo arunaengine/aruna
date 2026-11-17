@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -82,7 +82,7 @@ impl ReadUserOperation {
     }
 }
 
-impl Operation for ReadUserOperation {
+impl EffectOperation for ReadUserOperation {
     type Output = User;
     type Error = ReadUserError;
 

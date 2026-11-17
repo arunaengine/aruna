@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
@@ -177,7 +177,7 @@ impl RestartNoticeOperation {
     }
 }
 
-impl Operation for RestartNoticeOperation {
+impl EffectOperation for RestartNoticeOperation {
     type Output = ();
     type Error = RestartNoticeError;
 

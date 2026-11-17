@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::replication_queue::{
     BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, ReferenceAdvance,
@@ -204,7 +204,7 @@ impl QueueBlobOperation {
     }
 }
 
-impl Operation for QueueBlobOperation {
+impl EffectOperation for QueueBlobOperation {
     type Output = QueueBlobResult;
     type Error = BlobQueueError;
 
@@ -434,7 +434,7 @@ impl LiveVersionOperation {
     }
 }
 
-impl Operation for LiveVersionOperation {
+impl EffectOperation for LiveVersionOperation {
     type Output = QueueBlobResult;
     type Error = BlobQueueError;
 
@@ -590,7 +590,7 @@ impl JobStatsOperation {
     }
 }
 
-impl Operation for JobStatsOperation {
+impl EffectOperation for JobStatsOperation {
     type Output = (usize, Option<u64>);
     type Error = BlobQueueError;
 

@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
@@ -213,7 +213,7 @@ fn decode_cursor(token: &str) -> Result<Key, ConversionError> {
     Ok(cursor::decode_value::<Vec<u8>>(token)?.into())
 }
 
-impl Operation for ListBucketsOperation {
+impl EffectOperation for ListBucketsOperation {
     type Output = ListBucketsResult;
     type Error = ListBucketsError;
 

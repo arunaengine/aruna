@@ -10,7 +10,7 @@ use crate::effects::{Effect, StorageEffect};
 use crate::errors::StorageError;
 use crate::events::{Event, StorageEvent};
 use crate::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE};
-use crate::operation::Operation;
+use crate::operation::EffectOperation;
 use crate::structs::storage::node_info::{NodeInfoDocument, node_info_key};
 use crate::types::{Effects, Key, Value};
 use smallvec::smallvec;
@@ -72,7 +72,7 @@ impl ReadInfoOperation {
     }
 }
 
-impl Operation for ReadInfoOperation {
+impl EffectOperation for ReadInfoOperation {
     type Output = BTreeMap<NodeId, NodeInfoDocument>;
     type Error = NodeInfoError;
 
@@ -167,7 +167,7 @@ impl InstallInfoOperation {
     }
 }
 
-impl Operation for InstallInfoOperation {
+impl EffectOperation for InstallInfoOperation {
     type Output = ();
     type Error = NodeInfoError;
 
@@ -480,7 +480,7 @@ impl DrainStateOperation {
     }
 }
 
-impl Operation for DrainStateOperation {
+impl EffectOperation for DrainStateOperation {
     type Output = DrainState;
     type Error = DrainStateError;
 

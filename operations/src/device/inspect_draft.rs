@@ -4,7 +4,7 @@
 
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -55,7 +55,7 @@ impl InspectDraftOperation {
     }
 }
 
-impl Operation for InspectDraftOperation {
+impl EffectOperation for InspectDraftOperation {
     type Output = PublishEntry;
     type Error = InspectDraftError;
 

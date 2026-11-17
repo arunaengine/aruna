@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, DISPLAY_NAME_PATH};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -368,7 +368,7 @@ impl UpdateGroupOperation {
     }
 }
 
-impl Operation for UpdateGroupOperation {
+impl EffectOperation for UpdateGroupOperation {
     type Output = Group;
     type Error = UpdateGroupError;
 
@@ -554,7 +554,7 @@ mod pure_tests {
     use aruna_core::keyspaces::{
         DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::reducer_state_key;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};

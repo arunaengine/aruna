@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -246,7 +246,7 @@ impl PrepareOperation {
     }
 }
 
-impl Operation for PrepareOperation {
+impl EffectOperation for PrepareOperation {
     type Output = ();
     type Error = GroupDeletionError;
 

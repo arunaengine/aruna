@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::task::TaskEvent;
@@ -147,7 +147,7 @@ impl EmitNotificationsOperation {
     }
 }
 
-impl Operation for EmitNotificationsOperation {
+impl EffectOperation for EmitNotificationsOperation {
     type Output = ();
     type Error = EmitNotificationsError;
 
@@ -464,7 +464,7 @@ mod tests {
         }
     }
 
-    impl Operation for HostOperation {
+    impl EffectOperation for HostOperation {
         type Output = Event;
         type Error = Infallible;
 

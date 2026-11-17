@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_SESSION_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -174,7 +174,7 @@ impl TouchS3Operation {
     }
 }
 
-impl Operation for TouchS3Operation {
+impl EffectOperation for TouchS3Operation {
     type Output = S3Session;
     type Error = S3SessionError;
 

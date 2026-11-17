@@ -4,7 +4,7 @@
 
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
@@ -124,7 +124,7 @@ impl GetSourceOperation {
     }
 }
 
-impl Operation for GetSourceOperation {
+impl EffectOperation for GetSourceOperation {
     type Output = GetSourceResult;
     type Error = GetSourceError;
 

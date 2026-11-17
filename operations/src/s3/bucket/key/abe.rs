@@ -8,7 +8,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::abe::{AbeEffect, AbeError, AbeEvent, AbeParameters};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
@@ -60,7 +60,7 @@ impl PrepareAbeOperation {
         smallvec![]
     }
 }
-impl Operation for PrepareAbeOperation {
+impl EffectOperation for PrepareAbeOperation {
     type Output = ();
     type Error = BlobError;
     fn start(&mut self) -> Effects {
@@ -151,7 +151,7 @@ impl Operation for PrepareAbeOperation {
 }
 
 #[cfg(test)]
-pub(crate) fn admit_parameters(operation: &mut impl Operation, effects: Effects) -> Effects {
+pub(crate) fn admit_parameters(operation: &mut impl EffectOperation, effects: Effects) -> Effects {
     let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
         panic!("expected parameter derivation");
     };

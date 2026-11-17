@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -194,7 +194,7 @@ impl ListUserOperation {
     }
 }
 
-impl Operation for ListUserOperation {
+impl EffectOperation for ListUserOperation {
     type Output = Vec<UserAccess>;
     type Error = ListUserError;
 

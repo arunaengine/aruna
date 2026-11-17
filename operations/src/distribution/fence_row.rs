@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
 use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
@@ -131,7 +131,7 @@ impl UpdateFenceOperation {
     }
 }
 
-impl Operation for UpdateFenceOperation {
+impl EffectOperation for UpdateFenceOperation {
     type Output = LocalFence;
     type Error = FenceError;
 

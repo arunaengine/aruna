@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{BackendImport, valid_pattern};
 use aruna_core::structs::storage::backends::ImportRoot;
@@ -593,7 +593,7 @@ fn check_folder(storage: &GroupStorage, folder: &str) -> Result<Option<String>, 
     Ok(bucket.map(str::to_string))
 }
 
-impl Operation for CreateImportOperation {
+impl EffectOperation for CreateImportOperation {
     type Output = BackendImport;
     type Error = ImportRuleError;
 

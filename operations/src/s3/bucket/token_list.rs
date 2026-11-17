@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, USER_ACCESS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::abe_access::KeyGrant;
 use aruna_core::structs::storage::blob::UserAccess;
@@ -155,7 +155,7 @@ impl ListTokensOperation {
     }
 }
 
-impl Operation for ListTokensOperation {
+impl EffectOperation for ListTokensOperation {
     type Output = Vec<TokenEntry>;
     type Error = TokenListError;
 

@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::usage::{
     NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, UsageCounterError, UsageCounters,
@@ -328,7 +328,7 @@ impl RealmUsageOperation {
     }
 }
 
-impl Operation for RealmUsageOperation {
+impl EffectOperation for RealmUsageOperation {
     /// One total per scope, in scope order.
     type Output = Vec<RealmUsage>;
     type Error = RealmUsageError;
@@ -381,7 +381,7 @@ mod state_machine_tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
     };

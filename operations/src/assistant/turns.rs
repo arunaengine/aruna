@@ -12,7 +12,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{
     AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
 };
@@ -57,7 +57,7 @@ impl ReadChatOperation {
     }
 }
 
-impl Operation for ReadChatOperation {
+impl EffectOperation for ReadChatOperation {
     type Output = Vec<AssistantChatTurn>;
     type Error = ChatStoreError;
 
@@ -372,7 +372,7 @@ impl WriteTurnOperation {
     }
 }
 
-impl Operation for WriteTurnOperation {
+impl EffectOperation for WriteTurnOperation {
     type Output = AssistantChatHead;
     type Error = ChatStoreError;
 

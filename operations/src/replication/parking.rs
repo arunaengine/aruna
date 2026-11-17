@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     BUCKET_KEY_KEYSPACE, COPY_WAIT_KEYSPACE, PENDING_LOCATION_KEYSPACE, REPLICATION_JOB_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,
@@ -376,7 +376,7 @@ impl ParkJobOperation {
     }
 }
 
-impl Operation for ParkJobOperation {
+impl EffectOperation for ParkJobOperation {
     type Output = Option<u64>;
     type Error = BlobQueueError;
 
@@ -574,7 +574,7 @@ impl WakeJobOperation {
     }
 }
 
-impl Operation for WakeJobOperation {
+impl EffectOperation for WakeJobOperation {
     type Output = bool;
     type Error = BlobQueueError;
 
@@ -738,7 +738,7 @@ impl WakeParkedOperation {
     }
 }
 
-impl Operation for WakeParkedOperation {
+impl EffectOperation for WakeParkedOperation {
     type Output = usize;
     type Error = BlobQueueError;
 
@@ -872,7 +872,7 @@ impl AwaitingJobsOperation {
     }
 }
 
-impl Operation for AwaitingJobsOperation {
+impl EffectOperation for AwaitingJobsOperation {
     type Output = usize;
     type Error = BlobQueueError;
 

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -268,7 +268,7 @@ impl PutPlacementOperation {
     }
 }
 
-impl Operation for PutPlacementOperation {
+impl EffectOperation for PutPlacementOperation {
     type Output = BucketPlacementDefault;
     type Error = PutPlacementError;
 
@@ -412,7 +412,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::{

@@ -6,7 +6,7 @@ use super::S3SessionError;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_SESSION_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -81,7 +81,7 @@ impl GetS3Operation {
     }
 }
 
-impl Operation for GetS3Operation {
+impl EffectOperation for GetS3Operation {
     type Output = Option<S3Session>;
     type Error = S3SessionError;
 

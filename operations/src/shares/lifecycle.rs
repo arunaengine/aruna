@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::SHARE_LINK_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::share::{ShareAction, ShareEvent, ShareLink, ShareToken};
 use aruna_core::types::Effects;
@@ -150,7 +150,7 @@ impl CreateShareOperation {
     }
 }
 
-impl Operation for CreateShareOperation {
+impl EffectOperation for CreateShareOperation {
     type Output = ShareLink;
     type Error = ShareError;
 
@@ -365,7 +365,7 @@ impl OpenShareOperation {
     }
 }
 
-impl Operation for OpenShareOperation {
+impl EffectOperation for OpenShareOperation {
     type Output = OpenedShare;
     type Error = ShareError;
 
@@ -452,7 +452,7 @@ impl RevokeShareOperation {
     }
 }
 
-impl Operation for RevokeShareOperation {
+impl EffectOperation for RevokeShareOperation {
     type Output = ();
     type Error = ShareError;
 

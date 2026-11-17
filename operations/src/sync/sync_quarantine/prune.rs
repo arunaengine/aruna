@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SYNC_QUARANTINE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{SyncQuarantineRecord, SyncQuarantineUsage, quarantine_usage_entry};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -126,7 +126,7 @@ impl PruneQuarantineOperation {
     }
 }
 
-impl Operation for PruneQuarantineOperation {
+impl EffectOperation for PruneQuarantineOperation {
     type Output = QuarantinePruneResult;
     type Error = QuarantineAdminError;
 

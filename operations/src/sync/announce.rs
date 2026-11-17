@@ -13,7 +13,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::repository::RepositoryLink;
 use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::PersistentIdMapping;
@@ -479,7 +479,7 @@ impl AnnounceTopicOperation {
     }
 }
 
-impl Operation for AnnounceTopicOperation {
+impl EffectOperation for AnnounceTopicOperation {
     type Output = ();
     type Error = AnnounceTopicError;
 

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::handle_allocation::HandleAllocationCursor;
 use aruna_core::structs::placement::record::HandleRange;
@@ -106,7 +106,7 @@ impl AllocateHandleOperation {
     }
 }
 
-impl Operation for AllocateHandleOperation {
+impl EffectOperation for AllocateHandleOperation {
     type Output = AllocatedHandle;
     type Error = HandleAllocationError;
 

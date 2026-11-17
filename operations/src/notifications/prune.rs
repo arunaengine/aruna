@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification::{
     DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
     notification_inbox_key, notification_prune_key, parse_prune_key,
@@ -428,7 +428,7 @@ impl PruneNotificationsOperation {
     }
 }
 
-impl Operation for PruneNotificationsOperation {
+impl EffectOperation for PruneNotificationsOperation {
     type Output = NotificationPruneOutcome;
     type Error = PruneError;
 
@@ -597,7 +597,7 @@ impl RestorePruneOperation {
     }
 }
 
-impl Operation for RestorePruneOperation {
+impl EffectOperation for RestorePruneOperation {
     type Output = ();
     type Error = PruneError;
 

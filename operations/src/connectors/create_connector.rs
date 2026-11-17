@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{SOURCE_ID_KEYSPACE, SOURCE_INDEX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
 };
@@ -319,7 +319,7 @@ fn storage_read(error: crate::connectors::repository::StorageReadError) -> Sourc
     }
 }
 
-impl Operation for SourceConnectorOperation {
+impl EffectOperation for SourceConnectorOperation {
     type Output = SourceConnectorResult;
     type Error = SourceConnectorError;
 

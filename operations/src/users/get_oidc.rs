@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::oidc_subject_key;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Effects, TxnId};
@@ -254,7 +254,7 @@ impl GetOidcOperation {
     }
 }
 
-impl Operation for GetOidcOperation {
+impl EffectOperation for GetOidcOperation {
     type Output = User;
     type Error = GetOidcError;
 
@@ -327,7 +327,7 @@ mod tests {
     use super::{GetOidcInput, GetOidcOperation};
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;

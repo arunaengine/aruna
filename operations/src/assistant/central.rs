@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ASSISTANT_USAGE_KEYSPACE, CENTRAL_ASSISTANT_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{
     AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, QuotaReached, charge,
 };
@@ -97,7 +97,7 @@ impl GetCentralOperation {
     }
 }
 
-impl Operation for GetCentralOperation {
+impl EffectOperation for GetCentralOperation {
     type Output = CentralRead;
     type Error = CentralStoreError;
 
@@ -213,7 +213,7 @@ impl SetCentralOperation {
     }
 }
 
-impl Operation for SetCentralOperation {
+impl EffectOperation for SetCentralOperation {
     type Output = ();
     type Error = CentralStoreError;
 
@@ -331,7 +331,7 @@ impl ChargeUsageOperation {
     }
 }
 
-impl Operation for ChargeUsageOperation {
+impl EffectOperation for ChargeUsageOperation {
     type Output = AssistantUsage;
     type Error = CentralStoreError;
 

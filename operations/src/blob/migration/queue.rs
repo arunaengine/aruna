@@ -1224,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn promoted_reencode_retried() {
-        use aruna_core::operation::Operation;
+        use aruna_core::operation::EffectOperation;
         use aruna_core::structs::storage::blob::ArchiveKey;
         use aruna_core::structs::storage::format::StoredLayout;
         for kind in [

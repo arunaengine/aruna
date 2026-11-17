@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, LINKED_JOB_KEYSPACE,
     RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
@@ -262,7 +262,7 @@ impl BucketJobOperation {
     }
 }
 
-impl Operation for BucketJobOperation {
+impl EffectOperation for BucketJobOperation {
     type Output = BucketJob;
     type Error = LinkedError;
 
@@ -352,7 +352,7 @@ impl ShownJobOperation {
     }
 }
 
-impl Operation for ShownJobOperation {
+impl EffectOperation for ShownJobOperation {
     type Output = Option<BucketJob>;
     type Error = LinkedError;
 
@@ -448,7 +448,7 @@ impl RenameTotalOperation {
     }
 }
 
-impl Operation for RenameTotalOperation {
+impl EffectOperation for RenameTotalOperation {
     type Output = Option<u64>;
     type Error = LinkedError;
 

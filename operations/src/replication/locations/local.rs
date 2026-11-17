@@ -22,7 +22,7 @@ use aruna_core::keyspaces::{
 use aruna_core::managed_copy::{
     CopyRequest, read_effect, registration_for, serve_reads, split_reads,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::identity::auth::Permission;
@@ -698,7 +698,7 @@ impl LocationSummaryOperation {
     }
 }
 
-impl Operation for LocationSummaryOperation {
+impl EffectOperation for LocationSummaryOperation {
     type Output = LocalSummary;
     type Error = LocationSummaryError;
 
@@ -792,7 +792,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};

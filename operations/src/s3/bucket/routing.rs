@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::routing::{
     RoutingError, RoutingTarget, StorageRoutingRule, validate_tenant_rules,
@@ -101,7 +101,7 @@ impl PutRoutingOperation {
     }
 }
 
-impl Operation for PutRoutingOperation {
+impl EffectOperation for PutRoutingOperation {
     type Output = Vec<StorageRoutingRule>;
     type Error = PutRoutingError;
 
@@ -310,7 +310,7 @@ impl GetRoutingOperation {
     }
 }
 
-impl Operation for GetRoutingOperation {
+impl EffectOperation for GetRoutingOperation {
     type Output = Vec<StorageRoutingRule>;
     type Error = GetRoutingError;
 
@@ -371,7 +371,7 @@ mod pure_tests {
     use super::{GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::routing::{

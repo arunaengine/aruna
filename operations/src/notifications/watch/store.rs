@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
     WATCH_USER_CAP, WatchSubscription, watch_subscription_prefix,
@@ -227,7 +227,7 @@ impl StoreWatchOperation {
     }
 }
 
-impl Operation for StoreWatchOperation {
+impl EffectOperation for StoreWatchOperation {
     type Output = bool;
     type Error = WatchSubscriptionError;
 

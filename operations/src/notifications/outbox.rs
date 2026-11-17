@@ -10,7 +10,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::structs::execution::notification::{
     NotificationRequest, NotificationTransportMessage,
@@ -450,7 +450,7 @@ fn head_rearm(values: Vec<(Key, Value)>) -> Option<Duration> {
     }
 }
 
-impl Operation for DrainOutboxOperation {
+impl EffectOperation for DrainOutboxOperation {
     type Output = Option<Duration>;
     type Error = DrainError;
 
@@ -620,7 +620,7 @@ impl RestoreOutboxOperation {
     }
 }
 
-impl Operation for RestoreOutboxOperation {
+impl EffectOperation for RestoreOutboxOperation {
     type Output = bool;
     type Error = DrainError;
 

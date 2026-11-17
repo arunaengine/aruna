@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::types::{Effects, Key};
@@ -101,7 +101,7 @@ impl QueuedNodesOperation {
     }
 }
 
-impl Operation for QueuedNodesOperation {
+impl EffectOperation for QueuedNodesOperation {
     type Output = QueuedReplicas;
     type Error = LocationSummaryError;
 
@@ -166,7 +166,7 @@ mod pure_tests {
     use crate::tests::locations::{auth, node_id};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::storage::replication_queue::BlobJobRecord;
     use aruna_core::structs::storage::replication_queue::{
         ReplicateScopeInput, ReplicateScopeTarget,

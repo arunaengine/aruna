@@ -17,7 +17,7 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, DISTRIBUTION_KEYSPACE, INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
     RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SEARCH_INDEX_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::table::search_terms;
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::distribution::DistributionView;
@@ -704,7 +704,7 @@ impl FeedWalk {
     }
 }
 
-impl Operation for FeedWalk {
+impl EffectOperation for FeedWalk {
     type Output = usize;
     type Error = FeedError;
 
@@ -819,7 +819,7 @@ impl OpenWalk {
     }
 }
 
-impl Operation for OpenWalk {
+impl EffectOperation for OpenWalk {
     type Output = usize;
     type Error = FeedError;
 
@@ -1338,7 +1338,7 @@ impl StateWalk {
     }
 }
 
-impl Operation for StateWalk {
+impl EffectOperation for StateWalk {
     type Output = usize;
     type Error = FeedError;
 
@@ -1464,7 +1464,7 @@ impl FeedPassOperation {
     }
 }
 
-impl Operation for FeedPassOperation {
+impl EffectOperation for FeedPassOperation {
     type Output = FeedPass;
     type Error = FeedError;
 

@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -89,7 +89,7 @@ impl PrefixScanOperation {
     }
 }
 
-impl Operation for PrefixScanOperation {
+impl EffectOperation for PrefixScanOperation {
     type Output = ScannedRows;
     type Error = PrefixScanError;
 

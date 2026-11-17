@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
@@ -97,7 +97,7 @@ impl ObjectPlacementOperation {
     }
 }
 
-impl Operation for ObjectPlacementOperation {
+impl EffectOperation for ObjectPlacementOperation {
     type Output = ObjectPlacement;
     type Error = ObjectPlacementError;
 
@@ -175,7 +175,7 @@ mod pure_tests {
     use super::{ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation};
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersionPointer};
     use aruna_core::structs::storage::format::EncodingClass;

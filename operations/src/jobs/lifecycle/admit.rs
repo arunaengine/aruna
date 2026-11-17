@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     ADMISSION_QUOTA_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
     RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key, owner_index_key,
@@ -367,7 +367,7 @@ fn authentic(verdict: RecordVerdict) -> Result<(), LifecycleError> {
     }
 }
 
-impl Operation for AdmitSubmissionOperation {
+impl EffectOperation for AdmitSubmissionOperation {
     type Output = AdmittedSubmission;
     type Error = LifecycleError;
 

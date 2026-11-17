@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -300,7 +300,7 @@ impl RemoveNodeOperation {
     }
 }
 
-impl Operation for RemoveNodeOperation {
+impl EffectOperation for RemoveNodeOperation {
     type Output = RealmConfigDocument;
     type Error = RemoveNodeError;
 

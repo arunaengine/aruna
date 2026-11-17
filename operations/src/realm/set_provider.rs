@@ -10,7 +10,7 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::federation::valid_federation_url;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, config_oidc_path};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -316,7 +316,7 @@ impl SetProviderOperation {
     }
 }
 
-impl Operation for SetProviderOperation {
+impl EffectOperation for SetProviderOperation {
     type Output = RealmConfigDocument;
     type Error = SetProviderError;
 

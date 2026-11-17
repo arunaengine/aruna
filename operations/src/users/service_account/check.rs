@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Effects, GroupId};
@@ -171,7 +171,7 @@ fn user_read(user_id: &UserId) -> (String, ByteView) {
     )
 }
 
-impl Operation for ServiceCheckOperation {
+impl EffectOperation for ServiceCheckOperation {
     type Output = Option<User>;
     type Error = ServiceCheckError;
 

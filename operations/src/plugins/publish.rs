@@ -12,7 +12,7 @@ use aruna_core::events::{
     Event, GroupEvent, GroupResult, NetEvent, StorageEvent, SubOperationEvent,
 };
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::plugins::{ArtifactStore, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
@@ -229,7 +229,7 @@ impl CopyArtifact {
     }
 }
 
-impl Operation for CopyArtifact {
+impl EffectOperation for CopyArtifact {
     type Output = BTreeSet<NodeId>;
     type Error = CopyError;
 
@@ -497,7 +497,7 @@ impl PublishEntryOperation {
     }
 }
 
-impl Operation for PublishEntryOperation {
+impl EffectOperation for PublishEntryOperation {
     type Output = PublishedPlugin;
     type Error = EntryError;
 

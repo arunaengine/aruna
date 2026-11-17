@@ -6,7 +6,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementSubject;
@@ -323,7 +323,7 @@ impl SubjectScanOperation {
     }
 }
 
-impl Operation for SubjectScanOperation {
+impl EffectOperation for SubjectScanOperation {
     type Output = SubjectScanResult;
     type Error = SubjectScanError;
 
@@ -387,7 +387,7 @@ mod pure_tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
     use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};

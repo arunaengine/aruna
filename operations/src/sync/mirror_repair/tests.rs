@@ -16,7 +16,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::Actor;
@@ -247,7 +247,7 @@ async fn outgoing(
 }
 
 /// Runs `operation` against storage until it asks to commit, and returns that commit.
-async fn run_to_commit<O: Operation>(context: &DriverContext, operation: &mut O) -> StorageEffect {
+async fn run_to_commit<O: EffectOperation>(context: &DriverContext, operation: &mut O) -> StorageEffect {
     let mut queue: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = queue.pop_front() {
         let Effect::Storage(effect) = effect else {

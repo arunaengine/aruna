@@ -5,7 +5,7 @@
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 
@@ -45,7 +45,7 @@ impl BlobRequest {
     }
 }
 
-impl Operation for BlobRequest {
+impl EffectOperation for BlobRequest {
     type Output = BlobEvent;
     type Error = BlobError;
 

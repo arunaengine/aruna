@@ -21,7 +21,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE,
     DHT_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::realm::RealmId;
@@ -2321,7 +2321,7 @@ mod sealed {
     use aruna_core::errors::ConversionError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BUCKET_KEY_KEYSPACE, COPY_OWNER_KEYSPACE};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::abe::{

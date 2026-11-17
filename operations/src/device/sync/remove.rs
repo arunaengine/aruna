@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{ActionOutcome, SyncActionRecord, SyncedFolder, WriteGuard};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -63,7 +63,7 @@ impl RemoveEntryOperation {
     }
 }
 
-impl Operation for RemoveEntryOperation {
+impl EffectOperation for RemoveEntryOperation {
     type Output = SyncActionRecord;
     type Error = ActionError;
 

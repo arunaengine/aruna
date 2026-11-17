@@ -12,7 +12,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::realm_vault::{
     FetchScope, RealmSealed, RealmSecretRef, RealmVaultError, RealmVaultRecord,
 };
@@ -149,7 +149,7 @@ impl ReadSecretOperation {
     }
 }
 
-impl Operation for ReadSecretOperation {
+impl EffectOperation for ReadSecretOperation {
     type Output = SecretBytes;
     type Error = RealmSecretError;
 
@@ -386,7 +386,7 @@ impl ServeSecretOperation {
     }
 }
 
-impl Operation for ServeSecretOperation {
+impl EffectOperation for ServeSecretOperation {
     type Output = SecretAnswer;
     type Error = MetadataReadError;
 
@@ -521,7 +521,7 @@ impl PruneCacheOperation {
     }
 }
 
-impl Operation for PruneCacheOperation {
+impl EffectOperation for PruneCacheOperation {
     type Output = usize;
     type Error = RealmSecretError;
 

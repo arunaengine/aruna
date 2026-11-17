@@ -7,7 +7,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicySignEvent, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -319,7 +319,7 @@ impl CreatePolicyOperation {
     }
 }
 
-impl Operation for CreatePolicyOperation {
+impl EffectOperation for CreatePolicyOperation {
     type Output = PlacementPolicyDocument;
     type Error = CreatePolicyError;
 

@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{SyncRelationship, SyncState};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
@@ -177,7 +177,7 @@ impl CreateRelationshipOperation {
     }
 }
 
-impl Operation for CreateRelationshipOperation {
+impl EffectOperation for CreateRelationshipOperation {
     type Output = SyncRelationship;
     type Error = SyncRelationshipError;
 

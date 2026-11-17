@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use aruna_core::UserId;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::harvest::{
     HarvestSelector, HarvestSource, RepositoryConnector, RepositoryConnectorKind,
 };
@@ -261,7 +261,7 @@ impl CreateSourceOperation {
     }
 }
 
-impl Operation for CreateSourceOperation {
+impl EffectOperation for CreateSourceOperation {
     type Output = HarvestSource;
     type Error = CreateSourceError;
 

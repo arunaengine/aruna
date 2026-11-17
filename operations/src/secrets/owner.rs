@@ -12,7 +12,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::realm_vault::{RealmVaultError, seal_named};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::register::{RegisterError, RegisterStamp};
@@ -498,7 +498,7 @@ fn expected(change: &SecretChange) -> Option<&str> {
     }
 }
 
-impl Operation for OwnerSecretOperation {
+impl EffectOperation for OwnerSecretOperation {
     type Output = Option<SecretEntry>;
     type Error = OwnerSecretError;
 
@@ -693,7 +693,7 @@ impl OwnerSecretsOperation {
     }
 }
 
-impl Operation for OwnerSecretsOperation {
+impl EffectOperation for OwnerSecretsOperation {
     /// The entries and whether more names follow.
     type Output = (Vec<SecretEntry>, bool);
     type Error = OwnerSecretError;
@@ -834,7 +834,7 @@ impl ReadbackOperation {
     }
 }
 
-impl Operation for ReadbackOperation {
+impl EffectOperation for ReadbackOperation {
     type Output = SecretEntry;
     type Error = OwnerSecretError;
 

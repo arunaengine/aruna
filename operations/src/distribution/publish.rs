@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     DISTRIBUTION_LIFECYCLE_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
     NODE_STATS_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{reducer_state_entry, reducer_state_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
@@ -456,7 +456,7 @@ impl PublishOperation {
     }
 }
 
-impl Operation for PublishOperation {
+impl EffectOperation for PublishOperation {
     type Output = DistributionRevision;
     type Error = PublishError;
 

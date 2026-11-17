@@ -10,7 +10,7 @@ use aruna_core::federation::Signed;
 use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{
     JobRecord, RoCrateUploadRecord, job_record_key, parse_dedup_value,
 };
@@ -300,7 +300,7 @@ impl RecordOperation {
     }
 }
 
-impl Operation for RecordOperation {
+impl EffectOperation for RecordOperation {
     type Output = RecordOutcome;
     type Error = RecordError;
 

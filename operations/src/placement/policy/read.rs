@@ -9,7 +9,7 @@ use aruna_core::effects::{
 };
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicyFetchEvent, StorageEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -363,7 +363,7 @@ impl ReadPolicyOperation {
     }
 }
 
-impl Operation for ReadPolicyOperation {
+impl EffectOperation for ReadPolicyOperation {
     type Output = (AuthenticPolicy, PolicySource);
     type Error = ReadPolicyError;
 

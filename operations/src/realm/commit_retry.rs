@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::task::{TaskEvent, TaskKey};
@@ -22,7 +22,7 @@ const ELSEWHERE: &str = "changed elsewhere";
 
 /// Lets `operation` read `first` and lose its commit, then read a newer document that another
 /// writer changed; returns the document the retry wrote, which keeps that writer's change.
-pub(super) fn conflict_then_commit<O: Operation>(
+pub(super) fn conflict_then_commit<O: EffectOperation>(
     operation: &mut O,
     actor: &Actor,
     first: &RealmConfigDocument,
@@ -48,7 +48,7 @@ pub(super) fn conflict_then_commit<O: Operation>(
 
 /// Lets `operation` read `first` and lose its commit, then read `newer` in a fresh transaction
 /// and commit; returns the rows the retry wrote. Each read answers the keys in request order.
-pub(super) fn conflict_then_write<O: Operation>(
+pub(super) fn conflict_then_write<O: EffectOperation>(
     operation: &mut O,
     first: Vec<Option<Vec<u8>>>,
     newer: Vec<Option<Vec<u8>>>,
@@ -90,7 +90,7 @@ pub(super) fn conflict_then_write<O: Operation>(
 
 /// Starts attempt `attempt`, answers its read with `values` in request order, and returns what
 /// the operation asks next.
-fn read_in<O: Operation>(
+fn read_in<O: EffectOperation>(
     operation: &mut O,
     effects: Effects,
     attempt: u128,
@@ -126,7 +126,7 @@ fn read_in<O: Operation>(
 }
 
 /// Answers the writes of attempt `attempt` until it asks to commit, and returns those writes.
-fn until_commit<O: Operation>(
+fn until_commit<O: EffectOperation>(
     operation: &mut O,
     mut effects: Effects,
     attempt: u128,

@@ -11,7 +11,7 @@ use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::heartbeat::{
     HeartbeatEffect, HeartbeatEvent, INFO_PUBLISH_INTERVAL, NodeHeartbeat,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Value};
 use smallvec::smallvec;
@@ -94,7 +94,7 @@ impl SendHeartbeatOperation {
     }
 }
 
-impl Operation for SendHeartbeatOperation {
+impl EffectOperation for SendHeartbeatOperation {
     type Output = ();
     type Error = HeartbeatError;
 
@@ -184,7 +184,7 @@ impl ReceiveHeartbeatOperation {
     }
 }
 
-impl Operation for ReceiveHeartbeatOperation {
+impl EffectOperation for ReceiveHeartbeatOperation {
     type Output = ();
     type Error = HeartbeatError;
 

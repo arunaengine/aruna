@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, JOB_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, JobRecordEnvelope, JobState, LogicalJobState, PhysicalExecutionState,
 };

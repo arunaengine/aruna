@@ -4,7 +4,7 @@
 
 use aruna_core::UserId;
 use aruna_core::auth::valid_token_lifetime;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::permission_path::validate_restriction_limits;
 use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionRef, TokenClaims,
@@ -155,7 +155,7 @@ impl CreateTokenOperation {
         Ok(())
     }
 }
-impl Operation for CreateTokenOperation {
+impl EffectOperation for CreateTokenOperation {
     type Output = String;
 
     type Error = CreateTokenError;

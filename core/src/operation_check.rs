@@ -5,14 +5,14 @@
 use crate::effects::Effect;
 use crate::errors::StorageError;
 use crate::events::{Event, StorageEvent, SubOperationEvent};
-use crate::operation::Operation;
+use crate::operation::EffectOperation;
 use crate::task::TaskEvent;
 use crate::types::Effects;
 use ulid::Ulid;
 
 /// Starts `operation` and checks that `start` emits `start_effects`, then feeds each event in
 /// turn and checks the effects of every step, in order.
-pub fn check_trace<O: Operation>(
+pub fn check_trace<O: EffectOperation>(
     operation: &mut O,
     start_effects: &[Effect],
     steps: Vec<(Event, Vec<Effect>)>,
@@ -36,7 +36,7 @@ pub fn check_trace<O: Operation>(
 /// Steps a fresh operation from `make` with each event of `events` that `expected` does not
 /// accept and checks that every one ends the operation with an error. Returns the event text,
 /// the effects and the error of each refusal, so the caller can check cleanup and error kind.
-pub fn rejects_events<O: Operation>(
+pub fn rejects_events<O: EffectOperation>(
     make: impl Fn() -> O,
     events: impl Fn() -> Vec<Event>,
     expected: impl Fn(&Event) -> bool,
@@ -100,12 +100,12 @@ pub fn sample_events() -> Vec<Event> {
 }
 
 /// Checks that `abort` emits exactly `cleanup`.
-pub fn check_abort<O: Operation>(operation: &mut O, cleanup: &[Effect]) {
+pub fn check_abort<O: EffectOperation>(operation: &mut O, cleanup: &[Effect]) {
     assert_eq!(operation.abort().as_slice(), cleanup, "effects of abort");
 }
 
 /// Checks that an operation that has not finished reports no result.
-pub fn rejects_finalize<O: Operation>(operation: O) {
+pub fn rejects_finalize<O: EffectOperation>(operation: O) {
     assert!(!operation.is_complete(), "the operation already finished");
     if let Ok(output) = operation.finalize() {
         panic!("an unfinished operation reported {output:?}");

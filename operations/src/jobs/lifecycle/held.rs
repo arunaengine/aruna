@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -70,7 +70,7 @@ impl HeldReservations {
     }
 }
 
-impl Operation for HeldReservations {
+impl EffectOperation for HeldReservations {
     type Output = Vec<JobReservationRecord>;
     type Error = LifecycleError;
 

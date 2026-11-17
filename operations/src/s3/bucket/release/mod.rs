@@ -13,7 +13,7 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_RELEASE_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_core::structs::identity::realm::RealmId;
@@ -485,7 +485,7 @@ impl ReleaseMembersOperation {
     }
 }
 
-impl Operation for ReleaseMembersOperation {
+impl EffectOperation for ReleaseMembersOperation {
     type Output = MembersOutput;
     type Error = ReleaseError;
 

@@ -16,7 +16,7 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditRecord;
 use aruna_core::types::{Effects, GroupId, Key, Value};
@@ -225,7 +225,7 @@ impl LocalPageOperation {
     }
 }
 
-impl Operation for LocalPageOperation {
+impl EffectOperation for LocalPageOperation {
     type Output = AuditPageResponse;
     type Error = ListAuditError;
 
@@ -459,7 +459,7 @@ impl ListAuditOperation {
     }
 }
 
-impl Operation for ListAuditOperation {
+impl EffectOperation for ListAuditOperation {
     type Output = AuditAggregate;
     type Error = ListAuditError;
 
@@ -646,7 +646,7 @@ mod tests {
         AUDIT_CURSOR_CHARS, AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditPageEntry,
         AuditPageResponse, Effect, Event, ListAuditError, ListAuditOperation, ListAuditRequest,
-        LocalPageOperation, MAX_AUDIT_PEERS, NetEffect, NetEvent, Operation, StorageEvent,
+        LocalPageOperation, MAX_AUDIT_PEERS, NetEffect, NetEvent, EffectOperation, StorageEvent,
         audit_scope, decode_cursor, encode_cursor, select_peers,
     };
     use crate::driver::DriverContext;

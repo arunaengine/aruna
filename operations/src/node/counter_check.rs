@@ -11,7 +11,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::usage::{
     USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY, global_shard_keys, usage_bucket_key,
 };
@@ -88,7 +88,7 @@ impl Default for CounterCheckOperation {
     }
 }
 
-impl Operation for CounterCheckOperation {
+impl EffectOperation for CounterCheckOperation {
     type Output = bool;
     type Error = CounterCheckError;
 

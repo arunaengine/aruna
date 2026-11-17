@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::PLACEMENT_POLICY_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::{
@@ -137,7 +137,7 @@ impl ListPoliciesOperation {
     }
 }
 
-impl Operation for ListPoliciesOperation {
+impl EffectOperation for ListPoliciesOperation {
     type Output = PolicyListPage;
     type Error = ListPoliciesError;
 
@@ -208,7 +208,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::document::placement_policy_key;

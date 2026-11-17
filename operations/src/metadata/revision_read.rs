@@ -12,7 +12,7 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord,
     MetadataLifecycleRecord, MetadataRawRevision, resolve_raw_revision,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{document_lifecycle_key, graph_lifecycle_key, raw_revision_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -178,7 +178,7 @@ impl RawViewOperation {
     }
 }
 
-impl Operation for RawViewOperation {
+impl EffectOperation for RawViewOperation {
     type Output = RawViewOutput;
     type Error = RawReadError;
 
@@ -255,7 +255,7 @@ impl RawStateOperation {
     }
 }
 
-impl Operation for RawStateOperation {
+impl EffectOperation for RawStateOperation {
     type Output = Option<RawRevisionState>;
     type Error = RawReadError;
 

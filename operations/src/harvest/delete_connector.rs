@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, LINK_CONNECTOR_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -57,7 +57,7 @@ impl DeleteRepositoryOperation {
     }
 }
 
-impl Operation for DeleteRepositoryOperation {
+impl EffectOperation for DeleteRepositoryOperation {
     type Output = ();
     type Error = UpdateConnectorError;
 

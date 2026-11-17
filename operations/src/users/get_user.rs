@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
@@ -153,7 +153,7 @@ impl GetUserOperation {
     }
 }
 
-impl Operation for GetUserOperation {
+impl EffectOperation for GetUserOperation {
     type Output = User;
     type Error = GetUserError;
 

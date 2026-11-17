@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::types::{Effects, TxnId};
@@ -226,7 +226,7 @@ fn state_name(state: ApplyState) -> &'static str {
     }
 }
 
-impl Operation for PageApplyOperation {
+impl EffectOperation for PageApplyOperation {
     type Output = PageAnswer;
     type Error = PageError;
 

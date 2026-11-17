@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, DISTRIBUTION_KEYSPACE, GROUP_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
@@ -426,7 +426,7 @@ pub(super) fn candidate_path(
     }
 }
 
-impl Operation for SearchBucketsOperation {
+impl EffectOperation for SearchBucketsOperation {
     type Output = SearchBucketsOutput;
     type Error = SearchBucketsError;
 
@@ -477,7 +477,7 @@ mod tests {
         AUTH_KEYSPACE, BUCKET_METADATA_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};

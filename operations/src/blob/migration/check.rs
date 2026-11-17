@@ -6,7 +6,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{BROKEN_VERSION_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobVersion, BlobVersionState, VersionKey,
 };
@@ -184,7 +184,7 @@ impl CheckVersionOperation {
     }
 }
 
-impl Operation for CheckVersionOperation {
+impl EffectOperation for CheckVersionOperation {
     type Output = CheckOutcome;
     type Error = CheckVersionError;
 

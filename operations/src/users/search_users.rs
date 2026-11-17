@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Effects, Key, Value};
@@ -191,7 +191,7 @@ impl SearchUsersOperation {
     }
 }
 
-impl Operation for SearchUsersOperation {
+impl EffectOperation for SearchUsersOperation {
     type Output = SearchUsersOutput;
     type Error = SearchUsersError;
 
@@ -238,7 +238,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;

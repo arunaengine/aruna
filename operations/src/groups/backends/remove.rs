@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     BACKEND_INDEX_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
 use aruna_core::structs::storage::group_backend::{
     BUCKET_DELETING, GroupStorage, GroupStorageSecret,
@@ -33,7 +33,7 @@ pub(crate) struct DisabledScanOperation {
     output: Option<Result<Vec<GroupStorage>, String>>,
 }
 
-impl Operation for DisabledScanOperation {
+impl EffectOperation for DisabledScanOperation {
     type Output = Vec<GroupStorage>;
     type Error = String;
 
@@ -127,7 +127,7 @@ impl HoldingScanOperation {
     }
 }
 
-impl Operation for HoldingScanOperation {
+impl EffectOperation for HoldingScanOperation {
     type Output = BTreeSet<BackendRef>;
     type Error = String;
 
@@ -386,7 +386,7 @@ impl RemoveBackendOperation {
     }
 }
 
-impl Operation for RemoveBackendOperation {
+impl EffectOperation for RemoveBackendOperation {
     type Output = ();
     type Error = RemoveBackendError;
 

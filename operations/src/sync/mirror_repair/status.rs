@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
@@ -171,7 +171,7 @@ impl StoreStatusOperation {
     }
 }
 
-impl Operation for StoreStatusOperation {
+impl EffectOperation for StoreStatusOperation {
     type Output = bool;
     type Error = SyncMirrorError;
 

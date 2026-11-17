@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, TASK_TIMER_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::storage::key_audit::BucketAuditRecord;
 use aruna_core::task::{PersistedTaskTimer, TaskEffect, TaskKey};
 use aruna_core::types::{Effects, Key, TxnId};
@@ -138,7 +138,7 @@ impl StoreAuditOperation {
     }
 }
 
-impl Operation for StoreAuditOperation {
+impl EffectOperation for StoreAuditOperation {
     type Output = ();
     type Error = AuditError;
 
@@ -283,7 +283,7 @@ impl ResumeAuditOperation {
     }
 }
 
-impl Operation for ResumeAuditOperation {
+impl EffectOperation for ResumeAuditOperation {
     type Output = usize;
     type Error = AuditError;
 

@@ -11,7 +11,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailPreference};
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
@@ -154,7 +154,7 @@ impl SetEmailOperation {
     }
 }
 
-impl Operation for SetEmailOperation {
+impl EffectOperation for SetEmailOperation {
     type Output = EmailPreference;
     type Error = EmailError;
 

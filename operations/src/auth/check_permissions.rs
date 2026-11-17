@@ -4,7 +4,7 @@
 
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::types::{Effects, TxnId};
 
@@ -59,7 +59,7 @@ impl CheckPermissionsOperation {
     }
 }
 
-impl Operation for CheckPermissionsOperation {
+impl EffectOperation for CheckPermissionsOperation {
     type Output = bool;
 
     type Error = AuthorizationError;

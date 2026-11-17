@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::API_STATE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Value};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -82,7 +82,7 @@ impl<T> LoadStateOperation<T> {
     }
 }
 
-impl<T: DeserializeOwned + std::fmt::Debug + Send> Operation for LoadStateOperation<T> {
+impl<T: DeserializeOwned + std::fmt::Debug + Send> EffectOperation for LoadStateOperation<T> {
     type Output = Option<T>;
     type Error = StateError;
 
@@ -143,7 +143,7 @@ impl SaveStateOperation {
     }
 }
 
-impl Operation for SaveStateOperation {
+impl EffectOperation for SaveStateOperation {
     type Output = ();
     type Error = StateError;
 

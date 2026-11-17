@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::CONNECTOR_SECRET_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::harvest::RepositoryConnector;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
@@ -70,7 +70,7 @@ impl GetRepositoryOperation {
     }
 }
 
-impl Operation for GetRepositoryOperation {
+impl EffectOperation for GetRepositoryOperation {
     type Output = ConnectorView;
     type Error = ReadConnectorError;
 
@@ -182,7 +182,7 @@ impl ListRepositoryOperation {
     }
 }
 
-impl Operation for ListRepositoryOperation {
+impl EffectOperation for ListRepositoryOperation {
     type Output = Vec<ConnectorView>;
     type Error = ReadConnectorError;
 

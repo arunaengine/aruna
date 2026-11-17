@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
 use aruna_core::types::{Effects, TxnId};
@@ -161,7 +161,7 @@ impl AddIdentifiersOperation {
     }
 }
 
-impl Operation for AddIdentifiersOperation {
+impl EffectOperation for AddIdentifiersOperation {
     type Output = (PersistentIdMapping, bool);
     type Error = PersistentIdError;
 

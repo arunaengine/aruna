@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, EncryptionMode};
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
@@ -156,7 +156,7 @@ impl UnlockLimitOperation {
     }
 }
 
-impl Operation for UnlockLimitOperation {
+impl EffectOperation for UnlockLimitOperation {
     type Output = BucketEncryption;
     type Error = UnlockLimitError;
 

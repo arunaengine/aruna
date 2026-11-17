@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::UnlockStatus;
@@ -20,7 +20,7 @@ pub async fn activate_and_wake<O>(
     limits: &RoCrateLimits,
 ) -> Result<UnlockStatus, O::Error>
 where
-    O: Operation<Output = UnlockStatus>,
+    O: EffectOperation<Output = UnlockStatus>,
 {
     let status = drive(operation, context).await?;
     let now_ms = aruna_core::time::unix_timestamp_millis();

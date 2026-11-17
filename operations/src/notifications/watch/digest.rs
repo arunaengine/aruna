@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification_watch::{
     INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, WATCH_DIRTY_PREFIX, WatchEventKind, WatchEventMask,
     WatchInterestDigest, WatchInterestEntry, interest_dirty_key, interest_node_key,
@@ -160,7 +160,7 @@ impl InterestOperation {
     }
 }
 
-impl Operation for InterestOperation {
+impl EffectOperation for InterestOperation {
     type Output = bool;
     type Error = InterestError;
 

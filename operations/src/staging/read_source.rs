@@ -6,7 +6,7 @@ use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
@@ -150,7 +150,7 @@ impl ReadSourceOperation {
     }
 }
 
-impl Operation for ReadSourceOperation {
+impl EffectOperation for ReadSourceOperation {
     type Output = ReadSourceResult;
     type Error = ReadSourceError;
 

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredLayout;
@@ -705,7 +705,7 @@ impl UsageCompleteOperation {
     }
 }
 
-impl Operation for UsageCompleteOperation {
+impl EffectOperation for UsageCompleteOperation {
     type Output = bool;
     type Error = StorageError;
 
@@ -827,7 +827,7 @@ impl LoadCountersOperation {
     }
 }
 
-impl Operation for LoadCountersOperation {
+impl EffectOperation for LoadCountersOperation {
     type Output = UsageCounters;
     type Error = LoadCountersError;
 
@@ -973,7 +973,7 @@ impl MarkDirtyOperation {
     }
 }
 
-impl Operation for MarkDirtyOperation {
+impl EffectOperation for MarkDirtyOperation {
     type Output = ();
     type Error = MarkDirtyError;
 

@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::inbox_update_entry;
 use aruna_core::structs::execution::notification::{
     NotificationRecord, invert_timestamp_ms, notification_inbox_prefix, parse_inbox_key,
@@ -224,7 +224,7 @@ impl MarkReadOperation {
     }
 }
 
-impl Operation for MarkReadOperation {
+impl EffectOperation for MarkReadOperation {
     type Output = MarkReadOutput;
     type Error = MarkReadError;
 

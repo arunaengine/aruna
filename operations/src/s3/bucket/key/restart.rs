@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
     KEY_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
@@ -469,7 +469,7 @@ fn iter(key_space: &str, prefix: Option<Vec<u8>>, start: Option<Key>, limit: usi
     })]
 }
 
-impl Operation for RestartScanOperation {
+impl EffectOperation for RestartScanOperation {
     type Output = Vec<RestartedBucket>;
     type Error = RestartScanError;
 

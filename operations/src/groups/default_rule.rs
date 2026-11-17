@@ -11,7 +11,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::group_backend::{
@@ -369,7 +369,7 @@ fn linked_error(bucket: &str, rule: &BackendImport) -> PutGroupError {
     ))
 }
 
-impl Operation for PutDefaultOperation {
+impl EffectOperation for PutDefaultOperation {
     type Output = GroupStorageRouting;
     type Error = PutGroupError;
 

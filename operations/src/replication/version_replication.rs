@@ -34,7 +34,7 @@ use aruna_core::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use aruna_core::native_reference::NATIVE_RELATIONSHIP_ID;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::checksum::unmatched_checksum;
 use aruna_core::structs::execution::source_access::{
     ObservationMatch, ResolvedSourceAccess, SourceMetadata,
@@ -317,7 +317,7 @@ pub struct ReplicateScopeOperation {
     plaintext: bool,
 }
 
-impl Operation for ReplicateScopeOperation {
+impl EffectOperation for ReplicateScopeOperation {
     type Output = ReplicateScopeResult;
     type Error = ReplicateScopeError;
 
@@ -2253,7 +2253,7 @@ impl ReplicateObjectOperation {
 // Phase: manifest preparation
 // Reading the stored version, resolving and materializing reference sources,
 // multipart metadata and the current-version lookup that builds the manifest.
-impl Operation for ReplicateObjectOperation {
+impl EffectOperation for ReplicateObjectOperation {
     type Output = ReplicationSuboperationResult;
     type Error = ReplicateObjectError;
 
@@ -3151,7 +3151,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::ReferenceHandling;
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};

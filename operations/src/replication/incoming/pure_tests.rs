@@ -25,7 +25,7 @@ use aruna_core::keyspaces::{
     OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;

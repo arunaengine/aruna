@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
@@ -199,7 +199,7 @@ impl ListUsersOperation {
     }
 }
 
-impl Operation for ListUsersOperation {
+impl EffectOperation for ListUsersOperation {
     type Output = ListUsersOutput;
     type Error = ListUsersError;
 
@@ -250,7 +250,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;

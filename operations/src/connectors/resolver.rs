@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::OFFERED_DIRECTORY_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::repository::invenio::REFERENCE_GROUP;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::offered_directory::{
@@ -366,7 +366,7 @@ impl ResolveBindingOperation {
     }
 }
 
-impl Operation for ResolveConnectorOperation {
+impl EffectOperation for ResolveConnectorOperation {
     type Output = ResolvedSourceConnector;
     type Error = SourceResolutionError;
 
@@ -407,7 +407,7 @@ impl Operation for ResolveConnectorOperation {
     }
 }
 
-impl Operation for ResolveBindingOperation {
+impl EffectOperation for ResolveBindingOperation {
     type Output = ResolvedSourceAccess;
     type Error = SourceResolutionError;
 

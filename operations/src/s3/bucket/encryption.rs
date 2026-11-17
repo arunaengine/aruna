@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
@@ -522,7 +522,7 @@ impl EnableEncryptionOperation {
     }
 }
 
-impl Operation for EnableEncryptionOperation {
+impl EffectOperation for EnableEncryptionOperation {
     type Output = EnableResult;
     type Error = EnableError;
 

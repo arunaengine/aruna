@@ -11,7 +11,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -310,7 +310,7 @@ impl ClaimInitialOperation {
     }
 }
 
-impl Operation for ClaimInitialOperation {
+impl EffectOperation for ClaimInitialOperation {
     type Output = ClaimInitialResult;
     type Error = ClaimInitialError;
 
@@ -585,7 +585,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};

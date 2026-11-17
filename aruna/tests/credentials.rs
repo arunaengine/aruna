@@ -1051,7 +1051,7 @@ async fn token_requests(
 
 #[tokio::test]
 async fn token_needs_credential() -> TestResult<()> {
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::abe::AbeError;
     use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyIssuer};

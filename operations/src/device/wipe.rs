@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -60,7 +60,7 @@ impl WipeDeviceOperation {
     }
 }
 
-impl Operation for WipeDeviceOperation {
+impl EffectOperation for WipeDeviceOperation {
     type Output = NodeId;
     type Error = WipeDeviceError;
 
@@ -133,7 +133,7 @@ mod pure_tests {
     use super::{WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation, WipeDeviceState};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
 
     fn node() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[8u8; 32]).public()

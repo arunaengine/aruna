@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -165,7 +165,7 @@ impl ListSessionOperation {
     }
 }
 
-impl Operation for ListSessionOperation {
+impl EffectOperation for ListSessionOperation {
     type Output = Vec<UserSession>;
     type Error = ListSessionError;
 

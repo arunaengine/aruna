@@ -13,7 +13,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -752,7 +752,7 @@ impl UpdateUserOperation {
     }
 }
 
-impl Operation for UpdateUserOperation {
+impl EffectOperation for UpdateUserOperation {
     type Output = User;
     type Error = UpdateUserError;
 
@@ -1086,7 +1086,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key, sync_revision_key};

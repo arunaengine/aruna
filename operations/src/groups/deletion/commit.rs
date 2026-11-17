@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     BACKEND_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE,
     NODE_VAULT_KEYSPACE, REALM_CONFIG_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, group_deletion_entries, reducer_state_key, stale_conflict_deletes,
@@ -332,7 +332,7 @@ fn trail_drop(group_id: ulid::Ulid) -> Result<(String, Key, Value), GroupDeletio
     Ok((space, row.to_bytes().to_vec().into(), value.into()))
 }
 
-impl Operation for CommitOperation {
+impl EffectOperation for CommitOperation {
     type Output = AdminDocumentEvent;
     type Error = GroupDeletionError;
 

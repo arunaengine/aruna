@@ -8,7 +8,7 @@ use aruna_core::errors::{
 };
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
 use aruna_core::types::Effects;
@@ -140,7 +140,7 @@ impl ObserveSourceOperation {
     }
 }
 
-impl Operation for ObserveSourceOperation {
+impl EffectOperation for ObserveSourceOperation {
     type Output = SourceMetadata;
     type Error = ObserveError;
 

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, INVENTORY_KEYSPACE, REPLICATION_JOB_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::KeyRange;
@@ -292,7 +292,7 @@ impl BootstrapPage {
     }
 }
 
-impl Operation for BootstrapPage {
+impl EffectOperation for BootstrapPage {
     type Output = PageProgress;
     type Error = BootstrapError;
 
@@ -377,7 +377,7 @@ impl ReadCursorOperation {
     }
 }
 
-impl Operation for ReadCursorOperation {
+impl EffectOperation for ReadCursorOperation {
     type Output = Option<BootstrapCursor>;
     type Error = BootstrapError;
 
@@ -482,7 +482,7 @@ impl ClearCursorsOperation {
     }
 }
 
-impl Operation for ClearCursorsOperation {
+impl EffectOperation for ClearCursorsOperation {
     type Output = bool;
     type Error = BootstrapError;
 

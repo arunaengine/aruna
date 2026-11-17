@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, JobRecordEffect, JobRecordFrame, NetEffect};
 use aruna_core::events::{Event, JobRecordEvent, NetEvent};
 use aruna_core::id::NodeId;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use tracing::debug;
@@ -33,7 +33,7 @@ impl FetchFamilyOperation {
     }
 }
 
-impl Operation for FetchFamilyOperation {
+impl EffectOperation for FetchFamilyOperation {
     type Output = FetchedFamily;
     type Error = LifecycleError;
 
@@ -95,7 +95,7 @@ mod state_machine_tests {
 
     use aruna_core::effects::{HolderList, JobRecordEffect, PageLimit};
     use aruna_core::events::{Event, JobRecordEvent, NetEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
 
     use super::FetchFamilyOperation;
     use crate::jobs::lifecycle::LifecycleError;

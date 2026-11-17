@@ -4,7 +4,7 @@
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect, abort_effects};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 
@@ -222,7 +222,7 @@ impl<P: Plan> RowsOperation<P> {
     }
 }
 
-impl<P: Plan> Operation for RowsOperation<P> {
+impl<P: Plan> EffectOperation for RowsOperation<P> {
     type Output = P::Output;
     type Error = P::Error;
 

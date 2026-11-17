@@ -6,7 +6,7 @@ use aruna_core::events::Event;
 use aruna_core::metadata::{
     MaterializationState, MetadataDocumentView, MetadataEffect, MetadataError, MetadataEvent,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
@@ -85,7 +85,7 @@ impl GetDocumentOperation {
     }
 }
 
-impl Operation for GetDocumentOperation {
+impl EffectOperation for GetDocumentOperation {
     type Output = MetadataDocumentView;
     type Error = GetDocumentError;
 
@@ -283,7 +283,7 @@ mod tests {
     fn rejects_terminal_event() {
         use super::{GetDocumentError, GetDocumentOperation};
         use aruna_core::events::{Event, StorageEvent};
-        use aruna_core::operation::Operation;
+        use aruna_core::operation::EffectOperation;
 
         let late = || {
             Event::Storage(StorageEvent::ReadResult {

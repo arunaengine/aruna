@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
     UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
@@ -843,7 +843,7 @@ impl DeleteBucketOperation {
     }
 }
 
-impl Operation for DeleteBucketOperation {
+impl EffectOperation for DeleteBucketOperation {
     type Output = ();
     type Error = DeleteBucketError;
 

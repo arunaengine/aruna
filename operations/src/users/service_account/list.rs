@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Effects, GroupId, Key};
@@ -137,7 +137,7 @@ impl ListServiceOperation {
     }
 }
 
-impl Operation for ListServiceOperation {
+impl EffectOperation for ListServiceOperation {
     type Output = Vec<User>;
     type Error = ListServiceError;
 

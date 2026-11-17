@@ -40,7 +40,7 @@ use aruna_core::keyspaces::{
     PENDING_LOCATION_KEYSPACE, SYNC_RECEIPT_KEYSPACE,
 };
 use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::table::searchable;
@@ -542,7 +542,7 @@ impl IncomingVersionOperation {
     }
 }
 
-impl Operation for IncomingVersionOperation {
+impl EffectOperation for IncomingVersionOperation {
     type Output = IncomingVersionResult;
     type Error = IncomingVersionError;
 

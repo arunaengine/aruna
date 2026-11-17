@@ -15,7 +15,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE};
 use aruna_core::managed_copy::{ManagedCopyError, serve_reads};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
@@ -509,7 +509,7 @@ impl GetAttributesOperation {
     }
 }
 
-impl Operation for GetAttributesOperation {
+impl EffectOperation for GetAttributesOperation {
     type Output = GetAttributesResult;
     type Error = GetAttributesError;
 

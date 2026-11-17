@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ProviderCleanup, RemovalMark, WriteIntent, import_key, object_prefix,
 };
@@ -303,7 +303,7 @@ impl RemoveImportOperation {
     }
 }
 
-impl Operation for RemoveImportOperation {
+impl EffectOperation for RemoveImportOperation {
     type Output = ();
     type Error = ImportRuleError;
 

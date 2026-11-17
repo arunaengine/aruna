@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, HolderOrigin, KeyState, SealedCopy,
@@ -255,7 +255,7 @@ impl RemoveHolderOperation {
     }
 }
 
-impl Operation for RemoveHolderOperation {
+impl EffectOperation for RemoveHolderOperation {
     type Output = RemovalResult;
     type Error = RemovalError;
 

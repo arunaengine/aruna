@@ -5,7 +5,7 @@
 
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
@@ -190,7 +190,7 @@ impl PolicyMutationOperation {
     }
 }
 
-impl Operation for PolicyMutationOperation {
+impl EffectOperation for PolicyMutationOperation {
     type Output = SuccessorOutcome;
     type Error = PolicyMutationError;
 
@@ -313,7 +313,7 @@ mod pure_tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::{

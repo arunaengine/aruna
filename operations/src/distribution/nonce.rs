@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DELEGATION_NONCE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 
@@ -102,7 +102,7 @@ fn spend_error(error: StorageError) -> NonceError {
     }
 }
 
-impl Operation for SpendNonceOperation {
+impl EffectOperation for SpendNonceOperation {
     type Output = ();
     type Error = NonceError;
 

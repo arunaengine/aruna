@@ -15,7 +15,7 @@ use aruna_core::effects::{
 use aruna_core::events::{Event, JobRecordEvent, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_OUTBOX_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::JobRecordKey;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -190,7 +190,7 @@ impl PublishRecordOperation {
     }
 }
 
-impl Operation for PublishRecordOperation {
+impl EffectOperation for PublishRecordOperation {
     type Output = bool;
     type Error = LifecycleError;
 

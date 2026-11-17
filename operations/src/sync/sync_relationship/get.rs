@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -44,7 +44,7 @@ impl GetRelationshipOperation {
     }
 }
 
-impl Operation for GetRelationshipOperation {
+impl EffectOperation for GetRelationshipOperation {
     type Output = SyncRelationship;
     type Error = SyncRelationshipError;
 

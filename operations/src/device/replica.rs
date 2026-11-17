@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use byteview::ByteView;
@@ -268,7 +268,7 @@ impl DeselectDocumentOperation {
     }
 }
 
-impl Operation for DeselectDocumentOperation {
+impl EffectOperation for DeselectDocumentOperation {
     type Output = ReplicaRecord;
     type Error = SelectionError;
 
@@ -345,7 +345,7 @@ impl TrackCreatedOperation {
     }
 }
 
-impl Operation for TrackCreatedOperation {
+impl EffectOperation for TrackCreatedOperation {
     type Output = ();
     type Error = SelectionError;
 
@@ -443,7 +443,7 @@ impl ListReplicasOperation {
     }
 }
 
-impl Operation for ListReplicasOperation {
+impl EffectOperation for ListReplicasOperation {
     type Output = Vec<ReplicaRecord>;
     type Error = ReplicaScanError;
 
@@ -511,7 +511,7 @@ impl CacheUsageOperation {
     }
 }
 
-impl Operation for CacheUsageOperation {
+impl EffectOperation for CacheUsageOperation {
     type Output = u64;
     type Error = ReplicaScanError;
 

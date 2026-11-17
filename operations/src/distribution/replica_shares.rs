@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::accounting::{
     CounterOverflow, RangeAccount, RangeCounters,
@@ -177,7 +177,7 @@ impl BindingShareOperation {
     }
 }
 
-impl Operation for BindingShareOperation {
+impl EffectOperation for BindingShareOperation {
     type Output = BindingShare;
     type Error = UsageError;
 
@@ -311,7 +311,7 @@ impl ReplicaSharesOperation {
     }
 }
 
-impl Operation for ReplicaSharesOperation {
+impl EffectOperation for ReplicaSharesOperation {
     type Output = BTreeMap<GroupId, GroupShare>;
     type Error = UsageError;
 

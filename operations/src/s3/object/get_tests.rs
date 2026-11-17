@@ -25,7 +25,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     CONNECTOR_REFERENCE_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
@@ -2363,7 +2363,7 @@ mod sealed {
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::errors::{BlobError, ConversionError};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::identity::realm::RealmId;

@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
 };
@@ -152,7 +152,7 @@ pub(super) fn unexpected(event: &Event) -> UsageError {
     StorageError::ReadError(format!("unexpected answer {}", event.label())).into()
 }
 
-impl Operation for ChargedRangesOperation {
+impl EffectOperation for ChargedRangesOperation {
     type Output = ChargedRanges;
     type Error = UsageError;
 

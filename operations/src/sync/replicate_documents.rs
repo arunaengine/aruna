@@ -7,7 +7,7 @@ use aruna_core::document::{DocumentTarget, PendingShardPlacement};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementRef};
 use aruna_core::task::TaskEvent;
@@ -304,7 +304,7 @@ impl ReplicateDocumentsOperation {
     }
 }
 
-impl Operation for ReplicateDocumentsOperation {
+impl EffectOperation for ReplicateDocumentsOperation {
     type Output = ();
     type Error = ReplicateDocumentsError;
 

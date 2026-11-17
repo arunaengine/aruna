@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BUCKET_AUDIT_KEYSPACE,
     BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE, TRANSITION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
@@ -243,7 +243,7 @@ impl KeyStatusOperation {
     }
 }
 
-impl Operation for KeyStatusOperation {
+impl EffectOperation for KeyStatusOperation {
     type Output = KeySnapshot;
     type Error = KeyStatusError;
 
@@ -362,7 +362,7 @@ impl AuditPageOperation {
 
 type AuditPage = (Vec<BucketAuditRecord>, Option<Ulid>);
 
-impl Operation for AuditPageOperation {
+impl EffectOperation for AuditPageOperation {
     type Output = AuditPage;
     type Error = KeyStatusError;
 

@@ -7,7 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::OnboardingSecretRecord;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -74,7 +74,7 @@ impl DeleteSecretOperation {
     }
 }
 
-impl Operation for DeleteSecretOperation {
+impl EffectOperation for DeleteSecretOperation {
     type Output = OnboardingSecretRecord;
     type Error = DeleteSecretError;
 

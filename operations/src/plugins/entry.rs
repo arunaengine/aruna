@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::secret_registers::{SecretEntry, SecretOwner};
 use aruna_core::secrets::SecretName;
 use aruna_core::structs::identity::realm::RealmId;
@@ -28,7 +28,7 @@ impl ReadEntry {
     }
 }
 
-impl Operation for ReadEntry {
+impl EffectOperation for ReadEntry {
     type Output = Option<SecretEntry>;
     type Error = OwnerSecretError;
 

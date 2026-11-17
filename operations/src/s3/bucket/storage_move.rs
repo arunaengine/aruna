@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     LINKED_JOB_KEYSPACE, RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
     TRANSITION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal, TokenGrant};
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -270,7 +270,7 @@ impl StartMoveOperation {
     }
 }
 
-impl Operation for StartMoveOperation {
+impl EffectOperation for StartMoveOperation {
     type Output = CompressionMigration;
     type Error = StartMoveError;
 

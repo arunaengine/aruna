@@ -13,7 +13,7 @@ use crate::events::{Event, NetError, NetEvent, StorageEvent};
 use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HolderFacts};
 use crate::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use crate::keyspaces::NODE_INFO_KEYSPACE;
-use crate::operation::Operation;
+use crate::operation::EffectOperation;
 use crate::operation_check::{
     check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
 };

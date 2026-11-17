@@ -5,7 +5,7 @@
 use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentReconcileResult};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -49,7 +49,7 @@ impl ReconcileTopicsOperation {
     }
 }
 
-impl Operation for ReconcileTopicsOperation {
+impl EffectOperation for ReconcileTopicsOperation {
     type Output = DocumentReconcileResult;
     type Error = ReconcileError;
 

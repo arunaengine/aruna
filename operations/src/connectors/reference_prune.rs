@@ -12,7 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -88,7 +88,7 @@ impl Default for RestorePruneOperation {
     }
 }
 
-impl Operation for RestorePruneOperation {
+impl EffectOperation for RestorePruneOperation {
     type Output = ();
     type Error = PruneError;
 
@@ -200,7 +200,7 @@ impl Default for PruneReferencesOperation {
     }
 }
 
-impl Operation for PruneReferencesOperation {
+impl EffectOperation for PruneReferencesOperation {
     type Output = bool;
     type Error = PruneError;
 
@@ -460,7 +460,7 @@ impl PrunePageOperation {
     }
 }
 
-impl Operation for PrunePageOperation {
+impl EffectOperation for PrunePageOperation {
     type Output = bool;
     type Error = PruneError;
 

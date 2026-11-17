@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{stale_subject_deletes, subject_index_writes};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::user::User;
@@ -355,7 +355,7 @@ impl ResolveConflictsOperation {
     }
 }
 
-impl Operation for ResolveConflictsOperation {
+impl EffectOperation for ResolveConflictsOperation {
     type Output = ();
     type Error = ResolveConflictsError;
 
@@ -437,7 +437,7 @@ mod pure_tests {
     use super::{ResolveConflictsInput, ResolveConflictsOperation};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;

@@ -16,7 +16,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, DistributionView, KeyRange, Publication,
@@ -147,7 +147,7 @@ impl ReadRecordOperation {
     }
 }
 
-impl Operation for ReadRecordOperation {
+impl EffectOperation for ReadRecordOperation {
     type Output = Option<DistributionView>;
     type Error = RecordError;
 
@@ -233,7 +233,7 @@ impl BoundRecordOperation {
     }
 }
 
-impl Operation for BoundRecordOperation {
+impl EffectOperation for BoundRecordOperation {
     type Output = Option<BoundRecord>;
     type Error = RecordError;
 
@@ -428,7 +428,7 @@ impl OwesFanoutOperation {
     }
 }
 
-impl Operation for OwesFanoutOperation {
+impl EffectOperation for OwesFanoutOperation {
     type Output = bool;
     type Error = RecordError;
 
@@ -564,7 +564,7 @@ impl CopyLagOperation {
     }
 }
 
-impl Operation for CopyLagOperation {
+impl EffectOperation for CopyLagOperation {
     type Output = (LagMap, bool);
     type Error = RecordError;
 

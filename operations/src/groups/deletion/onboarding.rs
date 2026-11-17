@@ -6,7 +6,7 @@ use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{group_deletion_entries, reducer_state_key};
 use aruna_core::structs::identity::group_delete::{
@@ -101,7 +101,7 @@ impl InstallOperation {
     }
 }
 
-impl Operation for InstallOperation {
+impl EffectOperation for InstallOperation {
     type Output = ();
     type Error = GroupDeletionError;
 

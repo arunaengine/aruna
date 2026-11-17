@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
 use aruna_core::structs::storage::blob::{ArchiveKey, BlobVersion, VersionKey};
 use aruna_core::types::{Effects, TxnId};
@@ -53,7 +53,7 @@ impl EnvelopeOperation {
         self.abort()
     }
 }
-impl Operation for EnvelopeOperation {
+impl EffectOperation for EnvelopeOperation {
     type Output = (ObjectEnvelope, EnvelopeArchive);
     type Error = AbeError;
     fn start(&mut self) -> Effects {

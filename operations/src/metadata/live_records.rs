@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPAC
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataLifecycleRecord, REGISTRY_CANDIDATE_LIMIT,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{document_lifecycle_key, graph_lifecycle_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -110,7 +110,7 @@ impl LiveRecordsOperation {
     }
 }
 
-impl Operation for LiveRecordsOperation {
+impl EffectOperation for LiveRecordsOperation {
     type Output = Vec<MetadataRegistryRecord>;
     type Error = LiveRecordsError;
 

@@ -7,7 +7,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
     JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
@@ -355,7 +355,7 @@ impl CreateRoCrateOperation {
     }
 }
 
-impl Operation for CreateRoCrateOperation {
+impl EffectOperation for CreateRoCrateOperation {
     type Output = RoCrateUploadRecord;
     type Error = CreateRoCrateError;
 

@@ -38,7 +38,7 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::checksum::{Hasher, combine_crcs};
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -2562,7 +2562,7 @@ impl CompleteUploadOperation {
     }
 }
 
-impl Operation for CompleteUploadOperation {
+impl EffectOperation for CompleteUploadOperation {
     type Output = CompleteUploadResult;
     type Error = CompleteUploadError;
 

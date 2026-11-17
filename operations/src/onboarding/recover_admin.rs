@@ -7,7 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -121,7 +121,7 @@ impl RecoverInitialOperation {
     }
 }
 
-impl Operation for RecoverInitialOperation {
+impl EffectOperation for RecoverInitialOperation {
     type Output = OnboardingSecretRecord;
     type Error = RecoverInitialError;
 

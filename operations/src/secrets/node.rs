@@ -10,7 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, NODE_SECRETS_KEYSPACE};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::secrets::{SecretName, SecretRecord, SecretScope};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskEvent;
@@ -210,7 +210,7 @@ impl From<aruna_core::secrets::SecretError> for NodeSecretError {
     }
 }
 
-impl Operation for NodeSecretOperation {
+impl EffectOperation for NodeSecretOperation {
     type Output = Option<SecretRecord>;
     type Error = NodeSecretError;
 
@@ -352,7 +352,7 @@ impl NodeSecretsOperation {
     }
 }
 
-impl Operation for NodeSecretsOperation {
+impl EffectOperation for NodeSecretsOperation {
     /// The records and whether more follow.
     type Output = (Vec<SecretRecord>, bool);
     type Error = NodeSecretError;

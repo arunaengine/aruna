@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::FAMILY_ALIAS_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{JobFamilyId, JobId};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -39,7 +39,7 @@ impl AliasFamilyOperation {
     }
 }
 
-impl Operation for AliasFamilyOperation {
+impl EffectOperation for AliasFamilyOperation {
     type Output = Option<JobFamilyId>;
     type Error = JobRouteError;
 
@@ -94,7 +94,7 @@ mod state_machine_tests {
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::FAMILY_ALIAS_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
     };

@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::policy::PlacementPolicyError;
 use aruna_core::structs::storage::blob::{
@@ -320,7 +320,7 @@ impl MintSuccessorOperation {
     }
 }
 
-impl Operation for MintSuccessorOperation {
+impl EffectOperation for MintSuccessorOperation {
     type Output = bool;
     type Error = MintError;
 

@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE,
     HARVEST_SOURCE_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::harvest::HarvestSource;
 use aruna_core::structs::execution::job::{
     ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
@@ -698,7 +698,7 @@ fn workspace_plan_digest(
     *hasher.finalize().as_bytes()
 }
 
-impl Operation for SubmitJobOperation {
+impl EffectOperation for SubmitJobOperation {
     type Output = SubmitJobResult;
     type Error = SubmitJobError;
 

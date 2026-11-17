@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -186,7 +186,7 @@ impl SetDisabledOperation {
     }
 }
 
-impl Operation for SetDisabledOperation {
+impl EffectOperation for SetDisabledOperation {
     type Output = GroupStorage;
     type Error = SetDisabledError;
 
@@ -244,7 +244,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use aruna_core::types::{Effects, TxnId};

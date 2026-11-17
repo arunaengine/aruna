@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::AUTH_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::permission_path::{
     compile_permission_matcher, restrictions_cover_subtree, validate_restriction_limits,
 };
@@ -651,7 +651,7 @@ impl PermissionRulesOperation {
     }
 }
 
-impl Operation for PermissionRulesOperation {
+impl EffectOperation for PermissionRulesOperation {
     type Output = PermissionRules;
 
     type Error = AuthorizationError;
@@ -721,7 +721,7 @@ mod pure_tests {
     use aruna_core::errors::AuthorizationError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};

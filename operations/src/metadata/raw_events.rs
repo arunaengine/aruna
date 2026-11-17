@@ -9,7 +9,7 @@ use aruna_core::keyspaces::EVENT_LOG_KEYSPACE;
 use aruna_core::metadata::{
     EVENT_LIMIT, MetadataError, MetadataEventRecord, MetadataRawRevision, RAW_BYTES_LIMIT,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{event_log_key, event_log_prefix, pending_projection_target};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use serde::{Deserialize, Serialize};
@@ -229,7 +229,7 @@ impl RawEventsOperation {
     }
 }
 
-impl Operation for RawEventsOperation {
+impl EffectOperation for RawEventsOperation {
     type Output = Vec<MetadataEventRecord>;
     type Error = RawReadError;
 

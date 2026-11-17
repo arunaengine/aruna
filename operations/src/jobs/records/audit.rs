@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, FetchCursor, IterStart, PageLimit, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_CONFLICT_KEYSPACE, FAMILY_RECORD_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, SubmissionId,
 };
@@ -119,7 +119,7 @@ impl FamilyAuditOperation {
     }
 }
 
-impl Operation for FamilyAuditOperation {
+impl EffectOperation for FamilyAuditOperation {
     type Output = AuditPage;
     type Error = RecordStoreError;
 
@@ -195,7 +195,7 @@ impl Operation for FamilyAuditOperation {
 mod tests {
     use aruna_core::effects::PageLimit;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::execution::job::SubmissionId;
 
     use super::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};

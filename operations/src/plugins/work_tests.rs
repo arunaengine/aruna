@@ -15,7 +15,7 @@ use crate::plugins::jobs::{retire_work, settle_work};
 use crate::plugins::rows::{read_rows, write_rows};
 use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::installed;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";

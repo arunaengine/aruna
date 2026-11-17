@@ -204,7 +204,7 @@ pub async fn envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
 
     #[test]
     fn storage_unavailable_maps() {

@@ -6,7 +6,7 @@
 use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     ActionOutcome, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord, SyncBase,
@@ -242,7 +242,7 @@ impl MaterializeEntryOperation {
     }
 }
 
-impl Operation for MaterializeEntryOperation {
+impl EffectOperation for MaterializeEntryOperation {
     type Output = MaterializeOutcome;
     type Error = MaterializeError;
 

@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
@@ -69,7 +69,7 @@ fn answer(effect: &Effect, rows: &Rows) -> Event {
 }
 
 /// Runs `operation` to its end against `rows`.
-fn run<O: Operation>(mut operation: O, rows: &Rows) -> Result<O::Output, O::Error> {
+fn run<O: EffectOperation>(mut operation: O, rows: &Rows) -> Result<O::Output, O::Error> {
     let mut effects = operation.start().into_vec();
     while !operation.is_complete() {
         let effect = effects

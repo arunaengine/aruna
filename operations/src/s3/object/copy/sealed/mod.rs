@@ -31,7 +31,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -894,7 +894,7 @@ fn abe(error: AbeError) -> SealedCopyError {
     SealedCopyError::Blob(error.into())
 }
 
-impl Operation for SealedCopyOperation {
+impl EffectOperation for SealedCopyOperation {
     type Output = SealedCopyResult;
     type Error = SealedCopyError;
 

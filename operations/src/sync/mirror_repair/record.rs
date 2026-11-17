@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -199,7 +199,7 @@ impl MirrorRecordOperation {
     }
 }
 
-impl Operation for MirrorRecordOperation {
+impl EffectOperation for MirrorRecordOperation {
     type Output = ();
     type Error = SyncMirrorError;
 

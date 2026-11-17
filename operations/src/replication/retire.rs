@@ -7,7 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     EVENT_JOURNAL_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
@@ -204,7 +204,7 @@ impl RetireJobOperation {
     }
 }
 
-impl Operation for RetireJobOperation {
+impl EffectOperation for RetireJobOperation {
     type Output = ();
     type Error = BlobQueueError;
 

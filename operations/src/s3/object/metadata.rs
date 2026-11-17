@@ -9,7 +9,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{REFRESH_DUE_KEYSPACE, REFRESH_JOB_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -241,7 +241,7 @@ impl QueueRefreshOperation {
     }
 }
 
-impl Operation for QueueRefreshOperation {
+impl EffectOperation for QueueRefreshOperation {
     type Output = QueueRefreshResult;
     type Error = ReferenceRefreshError;
 

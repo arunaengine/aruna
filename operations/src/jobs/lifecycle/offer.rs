@@ -4,7 +4,7 @@
 
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchOfferEffect, NetEffect};
 use aruna_core::events::{Event, LaunchDecline, LaunchOfferEvent, NetEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use tracing::debug;
@@ -38,7 +38,7 @@ impl OfferLaunchOperation {
     }
 }
 
-impl Operation for OfferLaunchOperation {
+impl EffectOperation for OfferLaunchOperation {
     type Output = OfferOutcome;
     type Error = LifecycleError;
 

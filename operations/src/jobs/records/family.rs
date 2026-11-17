@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind,
 };
@@ -99,7 +99,7 @@ impl LoadFamilyOperation {
     }
 }
 
-impl Operation for LoadFamilyOperation {
+impl EffectOperation for LoadFamilyOperation {
     type Output = Vec<JobRecordEnvelope>;
     type Error = FamilyReadError;
 

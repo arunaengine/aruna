@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::realm_vault::{RealmSecretRef, RealmVaultError, RealmVaultKey, RealmVaultRecord};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::secrets::{SecretRecord, SecretScope, UseRule};
@@ -300,7 +300,7 @@ impl RealmSecretOperation {
     }
 }
 
-impl Operation for RealmSecretOperation {
+impl EffectOperation for RealmSecretOperation {
     type Output = Option<SecretRecord>;
     type Error = RealmSecretError;
 

@@ -8,7 +8,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{
@@ -211,7 +211,7 @@ impl CreateBackendOperation {
     }
 }
 
-impl Operation for CreateBackendOperation {
+impl EffectOperation for CreateBackendOperation {
     type Output = GroupStorage;
     type Error = CreateBackendError;
 
@@ -251,7 +251,7 @@ mod pure_tests {
     use aruna_core::errors::BlobError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::group_backend::{
         GroupBackendKind, GroupStorage, GroupStorageSecret,

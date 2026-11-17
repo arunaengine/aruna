@@ -6,7 +6,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
@@ -172,7 +172,7 @@ impl ResolveQuarantineOperation {
     }
 }
 
-impl Operation for ResolveQuarantineOperation {
+impl EffectOperation for ResolveQuarantineOperation {
     type Output = QuarantineResolution;
     type Error = QuarantineError;
 

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::federation::Signed;
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, JOB_STATE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{ExportSelection, JobId};
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
@@ -121,7 +121,7 @@ impl IssueGrantOperation {
     }
 }
 
-impl Operation for IssueGrantOperation {
+impl EffectOperation for IssueGrantOperation {
     /// Whether the record was stored before, and the record.
     type Output = (bool, GrantRecord);
     type Error = GrantError;

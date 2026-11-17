@@ -13,7 +13,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
 };
@@ -622,7 +622,7 @@ impl RevokeTokenOperation {
     }
 }
 
-impl Operation for RevokeTokenOperation {
+impl EffectOperation for RevokeTokenOperation {
     type Output = RealmConfigDocument;
     type Error = RevokeTokenError;
 

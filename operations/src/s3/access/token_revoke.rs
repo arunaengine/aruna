@@ -9,7 +9,7 @@ use aruna_core::keyspaces::{
     ACCESS_OWNER_KEYSPACE, S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE,
     USER_KEYSPACE, USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::s3_session::S3Session;
@@ -360,7 +360,7 @@ impl RevokeTokensOperation {
     }
 }
 
-impl Operation for RevokeTokensOperation {
+impl EffectOperation for RevokeTokensOperation {
     type Output = Revocation;
     type Error = GroupTokensError;
 

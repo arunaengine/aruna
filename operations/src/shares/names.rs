@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARE_NAME_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
 
@@ -65,7 +65,7 @@ impl ClaimNameOperation {
     }
 }
 
-impl Operation for ClaimNameOperation {
+impl EffectOperation for ClaimNameOperation {
     type Output = bool;
     type Error = ShareError;
 
@@ -173,7 +173,7 @@ impl ReleaseNameOperation {
     }
 }
 
-impl Operation for ReleaseNameOperation {
+impl EffectOperation for ReleaseNameOperation {
     type Output = ();
     type Error = ShareError;
 

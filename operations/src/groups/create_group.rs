@@ -15,7 +15,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{conflict_write_entries, reducer_state_entry};
 use aruna_core::structs::identity::auth::{Actor, Role};
@@ -615,7 +615,7 @@ pub enum CreateGroupError {
     },
 }
 
-impl Operation for CreateGroupOperation {
+impl EffectOperation for CreateGroupOperation {
     type Output = (Group, GroupAuthorizationDocument);
 
     type Error = CreateGroupError;
@@ -691,7 +691,7 @@ mod test {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};

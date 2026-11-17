@@ -5,7 +5,7 @@
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -79,7 +79,7 @@ impl ReadAuthorizationOperation {
     }
 }
 
-impl Operation for ReadAuthorizationOperation {
+impl EffectOperation for ReadAuthorizationOperation {
     type Output = Option<RealmAuthorizationDocument>;
     type Error = ReadAuthorizationError;
 

@@ -12,7 +12,7 @@ use aruna_core::document::{
 };
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::realm_vault::seal_setting;
 use aruna_core::register::{RegisterError, RegisterStamp};
 use aruna_core::storage_entries::sync_revision_entry;
@@ -111,7 +111,7 @@ impl ReadSettingOperation {
     }
 }
 
-impl Operation for ReadSettingOperation {
+impl EffectOperation for ReadSettingOperation {
     type Output = Option<Vec<u8>>;
     type Error = SettingError;
 
@@ -341,7 +341,7 @@ impl WriteSettingOperation {
     }
 }
 
-impl Operation for WriteSettingOperation {
+impl EffectOperation for WriteSettingOperation {
     type Output = Vec<u8>;
     type Error = SettingError;
 

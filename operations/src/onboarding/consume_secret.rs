@@ -7,7 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -91,7 +91,7 @@ impl ConsumeSecretOperation {
     }
 }
 
-impl Operation for ConsumeSecretOperation {
+impl EffectOperation for ConsumeSecretOperation {
     type Output = ConsumeSecretOutput;
     type Error = ConsumeSecretError;
 

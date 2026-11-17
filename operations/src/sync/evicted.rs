@@ -8,7 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::document::DocumentEvictedDocument;
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -107,7 +107,7 @@ impl ReemitEvictedOperation {
     }
 }
 
-impl Operation for ReemitEvictedOperation {
+impl EffectOperation for ReemitEvictedOperation {
     type Output = ReemitOutcome;
     type Error = ReemitError;
 

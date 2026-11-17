@@ -12,7 +12,7 @@ use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::keys::realm_presence_key;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -113,7 +113,7 @@ impl GetNodesOperation {
     }
 }
 
-impl Operation for GetNodesOperation {
+impl EffectOperation for GetNodesOperation {
     type Output = RealmPresence;
     type Error = GetNodesError;
 

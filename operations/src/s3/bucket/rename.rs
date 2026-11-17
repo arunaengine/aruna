@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
     PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
     RELATIONSHIP_OUT_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::job_record_key;
 use aruna_core::structs::identity::realm::RealmId;
@@ -1054,7 +1054,7 @@ fn describe(
     Ok(())
 }
 
-impl Operation for RenameKeysOperation {
+impl EffectOperation for RenameKeysOperation {
     type Output = RenamePlan;
     type Error = RenameError;
 

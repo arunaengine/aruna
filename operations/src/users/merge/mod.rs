@@ -21,7 +21,7 @@ use aruna_core::keyspaces::{
     SYNC_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{reducer_state_key, subject_index_key, sync_revision_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Role};
@@ -764,7 +764,7 @@ fn parse_users(values: &[(ByteView, Option<Value>)]) -> Result<[User; 2], MergeE
     Ok([parse(survivor)?, parse(merged)?])
 }
 
-impl Operation for MergeUsersOperation {
+impl EffectOperation for MergeUsersOperation {
     type Output = MergeOutcome;
     type Error = MergeError;
 

@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::structs::identity::auth::Actor;
@@ -492,7 +492,7 @@ pub enum CreateRealmError {
     },
 }
 
-impl Operation for CreateRealmOperation {
+impl EffectOperation for CreateRealmOperation {
     type Output = (RealmConfigDocument, RealmAuthorizationDocument);
 
     type Error = CreateRealmError;
@@ -609,7 +609,7 @@ mod test {
     use aruna_core::keyspaces::{
         DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{

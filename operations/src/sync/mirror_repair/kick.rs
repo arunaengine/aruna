@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -40,7 +40,7 @@ impl Default for KickRepairOperation {
     }
 }
 
-impl Operation for KickRepairOperation {
+impl EffectOperation for KickRepairOperation {
     type Output = ();
     type Error = SyncMirrorError;
 

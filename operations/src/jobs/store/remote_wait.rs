@@ -9,7 +9,7 @@ use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use tracing::warn;
@@ -105,7 +105,7 @@ impl WaitRowOperation {
     }
 }
 
-impl Operation for WaitRowOperation {
+impl EffectOperation for WaitRowOperation {
     type Output = ();
     type Error = JobMutationError;
 
@@ -246,7 +246,7 @@ impl QueueWakesOperation {
     }
 }
 
-impl Operation for QueueWakesOperation {
+impl EffectOperation for QueueWakesOperation {
     type Output = bool;
     type Error = JobMutationError;
 
@@ -364,7 +364,7 @@ impl OwedWakesOperation {
     }
 }
 
-impl Operation for OwedWakesOperation {
+impl EffectOperation for OwedWakesOperation {
     type Output = OwedPage;
     type Error = JobMutationError;
 

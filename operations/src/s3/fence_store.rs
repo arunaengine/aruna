@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PURGE_FENCE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
 use aruna_core::types::{Effects, Key, TxnId, Value};
@@ -33,7 +33,7 @@ impl FenceCheckOperation {
     }
 }
 
-impl Operation for FenceCheckOperation {
+impl EffectOperation for FenceCheckOperation {
     type Output = ();
     type Error = PurgeFenceError;
 
@@ -161,7 +161,7 @@ impl AcquireFenceOperation {
     }
 }
 
-impl Operation for AcquireFenceOperation {
+impl EffectOperation for AcquireFenceOperation {
     type Output = ();
     type Error = PurgeFenceError;
 

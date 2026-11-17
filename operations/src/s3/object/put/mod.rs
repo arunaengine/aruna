@@ -37,7 +37,7 @@ use aruna_core::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
     split_serve_reads, validate_registration,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -2170,7 +2170,7 @@ impl PutObjectOperation {
     }
 }
 
-impl Operation for PutObjectOperation {
+impl EffectOperation for PutObjectOperation {
     type Output = PutObjectResult;
     type Error = PutObjectError;
 
@@ -2297,7 +2297,7 @@ mod pure_tests {
     use crate::groups::backends::BackendFenceError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::auth::PathRestriction;
     use aruna_core::structs::identity::realm::RealmId;
@@ -2619,7 +2619,7 @@ mod decision_tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::{

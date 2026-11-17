@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     FAMILY_OUTBOX_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, RUN_LINK_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, LaunchIntent, RecordVerdict,
     RunLink, run_crate_key,
@@ -318,7 +318,7 @@ impl ReserveExecutionOperation {
     }
 }
 
-impl Operation for ReserveExecutionOperation {
+impl EffectOperation for ReserveExecutionOperation {
     type Output = Ulid;
     type Error = LifecycleError;
 
@@ -497,7 +497,7 @@ impl ReleaseExecutionOperation {
     }
 }
 
-impl Operation for ReleaseExecutionOperation {
+impl EffectOperation for ReleaseExecutionOperation {
     type Output = bool;
     type Error = LifecycleError;
 

@@ -4,7 +4,7 @@
 
 use super::*;
 use aruna_core::events::StorageEvent;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
     AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_TURN_BYTES,
@@ -589,7 +589,7 @@ fn skips_missing_chat() {
     assert!(is_write(&operation.step(turns_iter(&[]))));
 }
 
-fn expect_unexpected<O: Operation<Error = ChatStoreError>>(
+fn expect_unexpected<O: EffectOperation<Error = ChatStoreError>>(
     mut operation: O,
     events: Vec<Event>,
     wrong: Event,

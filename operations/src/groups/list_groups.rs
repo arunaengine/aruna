@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::types::Effects;
 use aruna_core::types::{Key, Value};
@@ -194,7 +194,7 @@ pub enum ListGroupError {
     },
 }
 
-impl Operation for ListGroupOperation {
+impl EffectOperation for ListGroupOperation {
     type Output = Vec<Group>;
 
     type Error = ListGroupError;

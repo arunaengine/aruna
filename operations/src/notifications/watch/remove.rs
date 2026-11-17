@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key};
@@ -87,7 +87,7 @@ impl RemoveWatchOperation {
     }
 }
 
-impl Operation for RemoveWatchOperation {
+impl EffectOperation for RemoveWatchOperation {
     type Output = NotificationTransportMessage;
     type Error = DeliverError;
 

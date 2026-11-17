@@ -8,7 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification_watch::{
     WatchInterestDigest, WatchInterestTable, interest_node_id, interest_node_prefix,
     interest_realm_id,
@@ -123,7 +123,7 @@ fn eligible_nodes(realm_id: RealmId, value: Option<&[u8]>) -> Result<HashSet<Nod
         .map_err(|error| error.to_string())
 }
 
-impl Operation for RebuildTableOperation {
+impl EffectOperation for RebuildTableOperation {
     type Output = WatchInterestTable;
     type Error = InterestError;
 

@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
     prefix_upper_bound,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -782,7 +782,7 @@ fn marker_progress(value: Option<Value>) -> Result<RebuildProgress, RebuildStats
     Ok(RebuildProgress::from_bytes(value.as_ref())?)
 }
 
-impl Operation for RebuildStatsOperation {
+impl EffectOperation for RebuildStatsOperation {
     type Output = UsageCounters;
     type Error = RebuildStatsError;
 

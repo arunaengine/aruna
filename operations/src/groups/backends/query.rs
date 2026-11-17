@@ -7,7 +7,7 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Effects, GroupId, Key};
@@ -58,7 +58,7 @@ impl GetBackendOperation {
     }
 }
 
-impl Operation for GetBackendOperation {
+impl EffectOperation for GetBackendOperation {
     type Output = Option<GroupStorage>;
     type Error = GroupQueryError;
 
@@ -141,7 +141,7 @@ impl ListBackendsOperation {
     }
 }
 
-impl Operation for ListBackendsOperation {
+impl EffectOperation for ListBackendsOperation {
     type Output = Vec<GroupStorage>;
     type Error = GroupQueryError;
 
@@ -211,7 +211,7 @@ impl BucketCheckOperation {
     }
 }
 
-impl Operation for BucketCheckOperation {
+impl EffectOperation for BucketCheckOperation {
     type Output = (bool, Option<bool>);
     type Error = BlobError;
 
@@ -268,7 +268,7 @@ mod pure_tests {
     use aruna_core::errors::BlobError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::BACKEND_INDEX_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{
         check_trace, rejects_events, rejects_finalize, sample_events,
     };

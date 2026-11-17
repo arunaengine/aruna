@@ -13,7 +13,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRecord, BucketKeyRef, HolderOrigin, KeyState, KeyTicket,
@@ -303,7 +303,7 @@ impl UnlockBucketOperation {
     }
 }
 
-impl Operation for UnlockBucketOperation {
+impl EffectOperation for UnlockBucketOperation {
     type Output = UnlockStatus;
     type Error = UnlockError;
 

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{OFFERED_DIRECTORY_KEYSPACE, SYNCED_FOLDER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::offered_directory::OfferedDirectory;
 use aruna_core::structs::{FolderState, SyncedFolder};
 use aruna_core::types::Effects;
@@ -77,7 +77,7 @@ impl BucketGuardOperation {
     }
 }
 
-impl Operation for BucketGuardOperation {
+impl EffectOperation for BucketGuardOperation {
     type Output = ();
     type Error = BucketGuardError;
 

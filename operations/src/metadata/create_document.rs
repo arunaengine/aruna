@@ -15,7 +15,7 @@ use aruna_core::metadata::{
     MetadataEventRecord, MetadataGraphPolicy, MetadataRequestDurability, ProfileValidationStatus,
     RAW_BYTES_LIMIT, raw_quotas,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{
     commit_message_entry, create_acceptance_entry, create_acceptance_key, profile_validation_entry,
     raw_budget_entry,
@@ -895,7 +895,7 @@ fn id_generator() -> &'static Mutex<StructuredIdGenerator> {
     GENERATOR.get_or_init(|| Mutex::new(StructuredIdGenerator::new()))
 }
 
-impl Operation for CreateDocumentOperation {
+impl EffectOperation for CreateDocumentOperation {
     fn is_conflict(error: &CreateDocumentError) -> bool {
         matches!(
             error,
@@ -1110,7 +1110,7 @@ mod tests {
         MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
         MetadataRequestDurability, RawOriginBudget,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::storage_entries::{
         create_acceptance_key, event_log_prefix, pending_projection_key,
     };

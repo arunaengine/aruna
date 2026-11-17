@@ -18,7 +18,7 @@ use aruna_core::join_request::{
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::reducer::{AdminDocumentError, decode_reducer_state};
 use aruna_core::storage_entries::{
@@ -445,7 +445,7 @@ fn normalized(value: &Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-impl Operation for GroupJoinOperation {
+impl EffectOperation for GroupJoinOperation {
     type Output = JoinRequestState;
     type Error = GroupJoinError;
 

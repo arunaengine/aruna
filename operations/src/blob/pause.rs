@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PURGE_FILES_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -42,7 +42,7 @@ impl PausePurgeOperation {
     }
 }
 
-impl Operation for PausePurgeOperation {
+impl EffectOperation for PausePurgeOperation {
     type Output = ();
     type Error = PauseError;
 
@@ -107,7 +107,7 @@ impl PausedOperation {
     }
 }
 
-impl Operation for PausedOperation {
+impl EffectOperation for PausedOperation {
     type Output = bool;
     type Error = PauseError;
 

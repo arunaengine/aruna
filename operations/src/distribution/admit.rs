@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, CAPACITY_RESERVATION_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
     S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::distribution::accounting::account_key;
@@ -388,7 +388,7 @@ impl AdmitOperation {
     }
 }
 
-impl Operation for AdmitOperation {
+impl EffectOperation for AdmitOperation {
     type Output = SignedStatement;
     type Error = AdmitError;
 

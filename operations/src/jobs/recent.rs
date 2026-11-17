@@ -7,7 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::jobs::RunningJobView;
 use aruna_core::keyspaces::JOB_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
@@ -64,7 +64,7 @@ impl RecentJobsOperation {
     }
 }
 
-impl Operation for RecentJobsOperation {
+impl EffectOperation for RecentJobsOperation {
     type Output = HashMap<GroupId, u64>;
     type Error = RecentJobsError;
 

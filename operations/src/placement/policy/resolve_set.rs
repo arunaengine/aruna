@@ -5,7 +5,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, PolicyResolution};
 use aruna_core::types::Effects;

@@ -6,7 +6,7 @@
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -141,7 +141,7 @@ impl ReleaseViewOperation {
     }
 }
 
-impl Operation for ReleaseViewOperation {
+impl EffectOperation for ReleaseViewOperation {
     type Output = ReleaseView;
     type Error = ViewError;
 

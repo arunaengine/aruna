@@ -13,7 +13,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, NODE_STATE_KEYSPACE, PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobLocationKey, BucketInfo, HashIndex};
@@ -231,7 +231,7 @@ impl RefreshHoldersOperation {
     }
 }
 
-impl Operation for RefreshHoldersOperation {
+impl EffectOperation for RefreshHoldersOperation {
     type Output = usize;
     type Error = RefreshHoldersError;
 
@@ -413,7 +413,7 @@ impl GetHoldersOperation {
     }
 }
 
-impl Operation for GetHoldersOperation {
+impl EffectOperation for GetHoldersOperation {
     type Output = Vec<NodeId>;
     type Error = GetHoldersError;
 
@@ -480,7 +480,7 @@ pub(crate) fn dht_registration_effect(
 #[cfg(test)]
 mod pure_tests {
     use aruna_core::events::DhtEntry;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::format::EncodingClass;
 

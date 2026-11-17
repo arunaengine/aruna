@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
@@ -292,7 +292,7 @@ impl StoreUploadOperation {
     }
 }
 
-impl Operation for StoreUploadOperation {
+impl EffectOperation for StoreUploadOperation {
     type Output = bool;
     type Error = StoreUploadError;
 
@@ -404,7 +404,7 @@ impl RequeueUploadsOperation {
     }
 }
 
-impl Operation for RequeueUploadsOperation {
+impl EffectOperation for RequeueUploadsOperation {
     type Output = usize;
     type Error = ScanRowsError;
 
@@ -481,7 +481,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::SYNC_UPLOAD_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
     };

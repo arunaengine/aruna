@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::{
@@ -162,7 +162,7 @@ impl SnapshotOperation {
     }
 }
 
-impl Operation for SnapshotOperation {
+impl EffectOperation for SnapshotOperation {
     type Output = RoutingSnapshot;
     type Error = RoutingInputsError;
 
@@ -237,7 +237,7 @@ impl QuotaOperation {
     }
 }
 
-impl Operation for QuotaOperation {
+impl EffectOperation for QuotaOperation {
     type Output = NodeRouting;
     type Error = RoutingInputsError;
 
@@ -295,7 +295,7 @@ impl UsageOperation {
     }
 }
 
-impl Operation for UsageOperation {
+impl EffectOperation for UsageOperation {
     type Output = u64;
     type Error = RecordReadError;
 

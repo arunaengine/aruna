@@ -5,7 +5,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::delegation::{
     Delegation, DelegationError, MAX_VALID_SECS, SignedDelegation,
@@ -87,7 +87,7 @@ impl AcceptDelegationOperation {
     }
 }
 
-impl Operation for AcceptDelegationOperation {
+impl EffectOperation for AcceptDelegationOperation {
     type Output = Delegation;
     type Error = DelegateError;
 

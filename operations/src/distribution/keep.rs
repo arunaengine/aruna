@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE,
     DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
@@ -110,7 +110,7 @@ impl ClaimFillOperation {
     }
 }
 
-impl Operation for ClaimFillOperation {
+impl EffectOperation for ClaimFillOperation {
     type Output = Claimed;
     type Error = KeepError;
 
@@ -454,7 +454,7 @@ impl PublishKeptOperation {
     }
 }
 
-impl Operation for PublishKeptOperation {
+impl EffectOperation for PublishKeptOperation {
     type Output = Published;
     type Error = KeepError;
 

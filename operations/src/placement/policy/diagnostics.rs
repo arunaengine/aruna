@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
@@ -222,7 +222,7 @@ impl PolicyDiagnosticsOperation {
     }
 }
 
-impl Operation for PolicyDiagnosticsOperation {
+impl EffectOperation for PolicyDiagnosticsOperation {
     type Output = DiagnosticsReport;
     type Error = DiagnosticsError;
 
@@ -303,7 +303,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;

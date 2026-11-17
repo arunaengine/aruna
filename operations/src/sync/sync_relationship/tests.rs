@@ -6,7 +6,7 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::sync::mirror_repair::{MirrorRecordOperation, SyncMirrorIntent};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::operation_check::{rejects_events, sample_events};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;

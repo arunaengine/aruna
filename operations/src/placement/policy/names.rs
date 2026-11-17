@@ -7,7 +7,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
@@ -78,7 +78,7 @@ impl PolicyNamesOperation {
     }
 }
 
-impl Operation for PolicyNamesOperation {
+impl EffectOperation for PolicyNamesOperation {
     type Output = BTreeMap<Ulid, PolicyName>;
     type Error = PolicyNamesError;
 
@@ -154,7 +154,7 @@ impl Operation for PolicyNamesOperation {
 mod pure_tests {
     use super::{PolicyName, PolicyNamesOperation};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
     use ulid::Ulid;

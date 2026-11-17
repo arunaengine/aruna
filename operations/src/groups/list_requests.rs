@@ -9,7 +9,7 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -160,7 +160,7 @@ impl ListJoinOperation {
     }
 }
 
-impl Operation for ListJoinOperation {
+impl EffectOperation for ListJoinOperation {
     type Output = JoinRequestsPage;
     type Error = ListJoinError;
     fn start(&mut self) -> Effects {

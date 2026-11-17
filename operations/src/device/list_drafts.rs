@@ -4,7 +4,7 @@
 
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -58,7 +58,7 @@ impl ListDraftsOperation {
     }
 }
 
-impl Operation for ListDraftsOperation {
+impl EffectOperation for ListDraftsOperation {
     type Output = Vec<PublishEntry>;
     type Error = ListDraftsError;
 

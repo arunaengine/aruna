@@ -8,7 +8,7 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SYNC_STATE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Key};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -137,7 +137,7 @@ impl NoteSyncOperation {
     }
 }
 
-impl Operation for NoteSyncOperation {
+impl EffectOperation for NoteSyncOperation {
     type Output = ();
     type Error = NoteError;
 

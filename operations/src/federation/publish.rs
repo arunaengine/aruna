@@ -13,7 +13,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::federation::{PUBLISH_SOON, RealmDescriptor, RegistrationMode, Signed};
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Effects;
@@ -243,7 +243,7 @@ impl PublishOperation {
     }
 }
 
-impl Operation for PublishOperation {
+impl EffectOperation for PublishOperation {
     type Output = Publication;
     type Error = PublishError;
 
@@ -388,7 +388,7 @@ impl PublishSoonOperation {
     }
 }
 
-impl Operation for PublishSoonOperation {
+impl EffectOperation for PublishSoonOperation {
     type Output = bool;
     type Error = PublishError;
 

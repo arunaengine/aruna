@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{SyncRelationship, SyncState};
 use aruna_core::types::Effects;
 
@@ -46,7 +46,7 @@ impl RemoveOutgoingOperation {
     }
 }
 
-impl Operation for RemoveOutgoingOperation {
+impl EffectOperation for RemoveOutgoingOperation {
     type Output = ();
     type Error = SyncRelationshipError;
 

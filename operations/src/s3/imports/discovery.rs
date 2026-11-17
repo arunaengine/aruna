@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, PathIdentity, WriteIntent, import_key, object_key, object_prefix,
@@ -153,7 +153,7 @@ impl SetDiscoveryOperation {
     }
 }
 
-impl Operation for SetDiscoveryOperation {
+impl EffectOperation for SetDiscoveryOperation {
     type Output = Vec<DiscoveryRule>;
     type Error = ImportRuleError;
 

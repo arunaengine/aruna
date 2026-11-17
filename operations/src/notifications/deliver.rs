@@ -6,7 +6,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -180,7 +180,7 @@ impl DeliverBatchOperation {
     }
 }
 
-impl Operation for DeliverBatchOperation {
+impl EffectOperation for DeliverBatchOperation {
     type Output = NotificationTransportMessage;
     type Error = DeliverError;
 

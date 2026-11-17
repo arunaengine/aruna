@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -510,7 +510,7 @@ impl RealmRoleOperation {
     }
 }
 
-impl Operation for RealmRoleOperation {
+impl EffectOperation for RealmRoleOperation {
     type Output = RealmAuthorizationDocument;
 
     type Error = RealmRoleError;
@@ -705,7 +705,7 @@ pub mod test {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};

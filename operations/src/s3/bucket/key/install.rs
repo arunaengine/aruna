@@ -10,7 +10,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, UnlockStatus, deadline_after,
 };
@@ -246,7 +246,7 @@ impl InstallKeyOperation {
     }
 }
 
-impl Operation for InstallKeyOperation {
+impl EffectOperation for InstallKeyOperation {
     type Output = UnlockStatus;
     type Error = InstallError;
 

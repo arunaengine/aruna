@@ -10,7 +10,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{EVENT_SIZE_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE};
 use aruna_core::metadata::{EVENT_LIMIT, EventSize};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::event_log_prefix;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
@@ -110,7 +110,7 @@ fn busiest_origin(values: &[(Key, Value)]) -> Result<(u64, u64), CheckpointWindo
     }))
 }
 
-impl Operation for CheckpointWindowOperation {
+impl EffectOperation for CheckpointWindowOperation {
     type Output = (u64, u64);
     type Error = CheckpointWindowError;
 

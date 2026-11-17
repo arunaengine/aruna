@@ -7,7 +7,7 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::plugins::broker::call_intent;
 use crate::plugins::worker::prune_runs;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};

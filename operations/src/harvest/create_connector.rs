@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use aruna_core::UserId;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::harvest::{
     RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
 };
@@ -271,7 +271,7 @@ pub const INVENIO_COMMUNITY: &str = "community";
 /// Secret config key of the optional read token an Invenio connector keeps.
 pub const INVENIO_TOKEN: &str = "token";
 
-impl Operation for CreateConnectorOperation {
+impl EffectOperation for CreateConnectorOperation {
     type Output = CreateConnectorResult;
     type Error = CreateConnectorError;
 

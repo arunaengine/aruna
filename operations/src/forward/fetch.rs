@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect,
 use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -171,7 +171,7 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
     }
 }
 
-impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> Operation for HolderFetchOperation<T> {
+impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> EffectOperation for HolderFetchOperation<T> {
     type Output = Fetched<T>;
     type Error = FetchError;
 
@@ -274,7 +274,7 @@ fn read_answer(
     }
 }
 
-impl Operation for FanoutOperation {
+impl EffectOperation for FanoutOperation {
     type Output = Vec<PeerAnswer>;
     type Error = FetchError;
 

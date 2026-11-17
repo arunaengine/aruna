@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::effects::Effect;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -117,7 +117,7 @@ impl RevokeAllOperation {
     }
 }
 
-impl Operation for RevokeAllOperation {
+impl EffectOperation for RevokeAllOperation {
     type Output = ();
     type Error = RevokeAllError;
 

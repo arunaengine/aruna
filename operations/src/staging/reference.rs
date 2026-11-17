@@ -33,7 +33,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -223,7 +223,7 @@ impl MaterializeReferenceOperation {
     }
 }
 
-impl Operation for MaterializeReferenceOperation {
+impl EffectOperation for MaterializeReferenceOperation {
     type Output = MaterializeReferenceResult;
     type Error = MaterializeReferenceError;
 
@@ -783,7 +783,7 @@ fn guard_record(
     }
 }
 
-impl Operation for WriteReferenceOperation {
+impl EffectOperation for WriteReferenceOperation {
     type Output = (Ulid, bool);
     type Error = MaterializeReferenceError;
 

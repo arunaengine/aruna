@@ -14,7 +14,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::{
@@ -360,7 +360,7 @@ fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
     view
 }
 
-impl Operation for InfoWriteOperation {
+impl EffectOperation for InfoWriteOperation {
     type Output = bool;
     type Error = InfoWriteError;
 

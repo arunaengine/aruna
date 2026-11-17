@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -321,7 +321,7 @@ impl DeleteSourceOperation {
     }
 }
 
-impl Operation for DeleteSourceOperation {
+impl EffectOperation for DeleteSourceOperation {
     type Output = DeleteSourceResult;
     type Error = DeleteSourceError;
 

@@ -16,7 +16,7 @@ use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQue
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::*;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRecords};
 use aruna_core::structs::storage::abe::{AbeEffect, AbeError, AbeEvent, AbeParameters};
@@ -423,7 +423,7 @@ impl KeyOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 }
-impl Operation for KeyOperation {
+impl EffectOperation for KeyOperation {
     type Output = KeyResult;
     type Error = KeyError;
     fn start(&mut self) -> Effects {

@@ -5,7 +5,7 @@
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -58,7 +58,7 @@ impl ScanRowsOperation {
     }
 }
 
-impl Operation for ScanRowsOperation {
+impl EffectOperation for ScanRowsOperation {
     type Output = Vec<Value>;
     type Error = ScanRowsError;
 

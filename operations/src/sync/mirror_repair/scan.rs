@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use tracing::warn;
@@ -109,7 +109,7 @@ impl ScanRepairsOperation {
     }
 }
 
-impl Operation for ScanRepairsOperation {
+impl EffectOperation for ScanRepairsOperation {
     type Output = RepairScan;
     type Error = SyncMirrorError;
 

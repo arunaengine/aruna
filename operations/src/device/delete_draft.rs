@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -65,7 +65,7 @@ impl DeleteDraftOperation {
     }
 }
 
-impl Operation for DeleteDraftOperation {
+impl EffectOperation for DeleteDraftOperation {
     type Output = PublishEntry;
     type Error = DeleteDraftError;
 

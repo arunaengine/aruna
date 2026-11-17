@@ -9,7 +9,7 @@ use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_seal::{SealedSecret, open_sealed, seal_to};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::abe::{
     AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,

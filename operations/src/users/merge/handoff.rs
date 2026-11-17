@@ -12,7 +12,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
@@ -227,7 +227,7 @@ impl HandoffOperation {
     }
 }
 
-impl Operation for HandoffOperation {
+impl EffectOperation for HandoffOperation {
     type Output = ();
     type Error = MergeError;
 

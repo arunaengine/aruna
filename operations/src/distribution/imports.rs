@@ -666,7 +666,7 @@ mod tests {
         use crate::jobs::submit::{SubmitJobError, SubmitJobOperation, SubmitJobSpec};
         use aruna_core::effects::Effect;
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-        use aruna_core::operation::Operation;
+        use aruna_core::operation::EffectOperation;
         use aruna_core::structs::execution::job::WorkspaceMode;
         use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
         use aruna_core::structs::storage::distribution::{SignedSnapshot, TransferRole};

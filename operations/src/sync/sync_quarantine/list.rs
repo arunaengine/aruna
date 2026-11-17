@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::SyncQuarantineRecord;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -43,7 +43,7 @@ impl ListQuarantineOperation {
     }
 }
 
-impl Operation for ListQuarantineOperation {
+impl EffectOperation for ListQuarantineOperation {
     type Output = QuarantinePage;
     type Error = QuarantineAdminError;
 

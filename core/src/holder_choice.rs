@@ -13,7 +13,7 @@ use crate::effects::{Effect, NetEffect, StorageEffect};
 use crate::events::{Event, NetEvent, StorageEvent};
 use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
 use crate::keyspaces::NODE_INFO_KEYSPACE;
-use crate::operation::Operation;
+use crate::operation::EffectOperation;
 use crate::structs::identity::realm::RealmConfigDocument;
 use crate::structs::placement::compute_config::RealmComputeConfig;
 use crate::structs::storage::node_info::{
@@ -210,7 +210,7 @@ impl HolderChoiceOperation {
     }
 }
 
-impl Operation for HolderChoiceOperation {
+impl EffectOperation for HolderChoiceOperation {
     type Output = Vec<HolderCandidate>;
     type Error = HolderChoiceError;
 

@@ -8,7 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
@@ -148,7 +148,7 @@ pub(crate) fn pending_devices(
         .count() as u32
 }
 
-impl Operation for CreateSecretOperation {
+impl EffectOperation for CreateSecretOperation {
     type Output = OnboardingSecretRecord;
     type Error = CreateSecretError;
 
@@ -377,7 +377,7 @@ mod tests {
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };

@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     NODE_SUBJECT_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
@@ -756,7 +756,7 @@ impl ListBucketOperation {
     }
 }
 
-impl Operation for ListBucketOperation {
+impl EffectOperation for ListBucketOperation {
     type Output = ListBucketResult;
     type Error = ListBucketError;
 

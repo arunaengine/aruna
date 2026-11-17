@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -316,7 +316,7 @@ impl ListUploadsOperation {
     }
 }
 
-impl Operation for ListUploadsOperation {
+impl EffectOperation for ListUploadsOperation {
     type Output = ListUploadsResult;
     type Error = ListUploadsError;
 

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -224,7 +224,7 @@ impl PublishInfoOperation {
     }
 }
 
-impl Operation for PublishInfoOperation {
+impl EffectOperation for PublishInfoOperation {
     type Output = ();
     type Error = PublishInfoError;
 

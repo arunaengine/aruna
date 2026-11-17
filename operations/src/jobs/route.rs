@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
 use aruna_core::events::{Event, JobControlEvent, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::{JobOwnerError, RealmConfigDocument, RealmId};
 use aruna_core::types::Effects;
@@ -107,7 +107,7 @@ impl JobRouteOperation {
     }
 }
 
-impl Operation for JobRouteOperation {
+impl EffectOperation for JobRouteOperation {
     type Output = JobRouteOutcome;
     type Error = JobRouteError;
 

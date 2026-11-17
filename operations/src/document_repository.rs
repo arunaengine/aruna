@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -199,7 +199,7 @@ impl GetConfigOperation {
     }
 }
 
-impl Operation for GetConfigOperation {
+impl EffectOperation for GetConfigOperation {
     type Output = RealmConfigDocument;
     type Error = GetConfigError;
 
@@ -483,7 +483,7 @@ pub enum GetGroupError {
     },
 }
 
-impl Operation for GetGroupOperation {
+impl EffectOperation for GetGroupOperation {
     type Output = (Group, GroupAuthorizationDocument);
 
     type Error = GetGroupError;

@@ -11,7 +11,7 @@ use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect}
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::SOURCE_ROOT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, checked_key, decode_key};
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
@@ -254,7 +254,7 @@ impl RootsCheckOperation {
     }
 }
 
-impl Operation for RootsCheckOperation {
+impl EffectOperation for RootsCheckOperation {
     type Output = RootsOutcome;
     type Error = RootsError;
 

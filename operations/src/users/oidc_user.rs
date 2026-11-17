@@ -13,7 +13,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};
@@ -497,7 +497,7 @@ impl ResolveOidcOperation {
     }
 }
 
-impl Operation for ResolveOidcOperation {
+impl EffectOperation for ResolveOidcOperation {
     type Output = User;
     type Error = ResolveOidcError;
 
@@ -657,7 +657,7 @@ mod tests {
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::{reducer_state_key, sync_revision_key};
     use aruna_core::structs::identity::auth::{Actor, oidc_subject_key};

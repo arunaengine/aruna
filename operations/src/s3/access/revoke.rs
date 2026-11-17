@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
@@ -266,7 +266,7 @@ impl RevokeUserOperation {
     }
 }
 
-impl Operation for RevokeUserOperation {
+impl EffectOperation for RevokeUserOperation {
     type Output = UserAccess;
     type Error = RevokeUserError;
 

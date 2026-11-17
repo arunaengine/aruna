@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
 use aruna_core::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
@@ -169,7 +169,7 @@ impl SubjectCheckOperation {
     }
 }
 
-impl Operation for SubjectCheckOperation {
+impl EffectOperation for SubjectCheckOperation {
     type Output = ();
     type Error = SubjectCheckError;
 

@@ -14,7 +14,7 @@ use aruna_core::metadata::{
     MetadataLifecycleRecord, MetadataMaterializationRecord, ProfileValidationStatus,
     RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::storage_entries::{
     commit_message_entry, create_acceptance_key, document_lifecycle_entry, event_log_key,
@@ -1270,7 +1270,7 @@ fn validate_entity_jsonld(jsonld: &str) -> Result<(), MetadataError> {
     Ok(())
 }
 
-impl Operation for UpdateDocumentOperation {
+impl EffectOperation for UpdateDocumentOperation {
     type Output = MetadataRegistryRecord;
     type Error = UpdateDocumentError;
 

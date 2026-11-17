@@ -130,7 +130,7 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
 }
 
 /// Runs storage effects on `storage` and answers copy envelopes as an unlocked or locked node.
-async fn run<O: Operation>(
+async fn run<O: EffectOperation>(
     mut operation: O,
     storage: &StorageHandle,
     unlocked: Option<&Sealed>,

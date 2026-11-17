@@ -23,7 +23,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, DELETE_CLAIM_KEYSPACE, IMPORT_INTENT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE, MANAGED_COPY_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, PlainPath, WriteIntent, claim_key, import_key, intent_key,
@@ -1454,7 +1454,7 @@ impl MigrateVersionOperation {
     }
 }
 
-impl Operation for MigrateVersionOperation {
+impl EffectOperation for MigrateVersionOperation {
     type Output = MigrateOutcome;
     type Error = MigrateVersionError;
 

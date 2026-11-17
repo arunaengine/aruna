@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
     TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
@@ -458,7 +458,7 @@ impl ChangeEncryptionOperation {
     }
 }
 
-impl Operation for ChangeEncryptionOperation {
+impl EffectOperation for ChangeEncryptionOperation {
     type Output = ChangeResult;
     type Error = ChangeError;
 

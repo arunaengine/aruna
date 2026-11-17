@@ -9,7 +9,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRef, CopyTarget, GrantState, HolderOrigin, SealedCopy,
@@ -240,7 +240,7 @@ impl GrantHolderOperation {
     }
 }
 
-impl Operation for GrantHolderOperation {
+impl EffectOperation for GrantHolderOperation {
     type Output = GrantResult;
     type Error = GrantError;
 

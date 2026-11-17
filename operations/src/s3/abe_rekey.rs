@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::blob::{BucketInfo, VersionKey};
@@ -377,7 +377,7 @@ impl RekeyOperation {
     }
 }
 
-impl Operation for RekeyOperation {
+impl EffectOperation for RekeyOperation {
     type Output = (RekeyProgress, bool);
     type Error = KeyError;
     fn start(&mut self) -> Effects {

@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::delete_audit::bucket_prefix;
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
@@ -101,7 +101,7 @@ impl DropTrailOperation {
     }
 }
 
-impl Operation for DropTrailOperation {
+impl EffectOperation for DropTrailOperation {
     type Output = ();
     type Error = TrailError;
 

@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, Cursor, RangeAccount, RangeCounters, SAMPLE_SIZE, SampleEntry, account_key, refill_key,
     sample_count_key, sample_prefix,
@@ -429,7 +429,7 @@ impl RefillOperation {
     }
 }
 
-impl Operation for RefillOperation {
+impl EffectOperation for RefillOperation {
     type Output = RefillOutcome;
     type Error = RefillError;
 

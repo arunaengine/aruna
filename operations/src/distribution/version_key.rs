@@ -6,7 +6,7 @@
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -94,7 +94,7 @@ impl VersionKeyOperation {
     }
 }
 
-impl Operation for VersionKeyOperation {
+impl EffectOperation for VersionKeyOperation {
     type Output = MemberAnswer;
     type Error = VersionKeyError;
 

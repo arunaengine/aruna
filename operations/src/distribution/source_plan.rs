@@ -9,7 +9,7 @@ use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
@@ -212,7 +212,7 @@ fn plan(
     })
 }
 
-impl Operation for KeepPlanOperation {
+impl EffectOperation for KeepPlanOperation {
     type Output = Option<Plan>;
     type Error = PlanError;
 
@@ -383,7 +383,7 @@ impl SpoolSourceOperation {
 
 const MISMATCH: &str = "the source bytes do not match the record";
 
-impl Operation for SpoolSourceOperation {
+impl EffectOperation for SpoolSourceOperation {
     type Output = SpooledCopy;
     type Error = SpoolError;
 

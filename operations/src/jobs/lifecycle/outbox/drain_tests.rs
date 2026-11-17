@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, IterStart, JobRecordEffect, NetEffect, Storage
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, JobRecordEvent, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::operation_check::{
     check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
 };

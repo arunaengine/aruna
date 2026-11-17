@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
     TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::managed_copy::{ManagedCopyError, check_serveable, read_effect};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{
@@ -467,7 +467,7 @@ impl RewriteVersionOperation {
     }
 }
 
-impl Operation for RewriteVersionOperation {
+impl EffectOperation for RewriteVersionOperation {
     type Output = RewriteOutcome;
     type Error = RewriteError;
 

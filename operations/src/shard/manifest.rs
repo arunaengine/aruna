@@ -6,7 +6,7 @@ use aruna_core::document::ShardManifestEntry;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_MANIFEST_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{shard_manifest_prefix, sync_revision_key};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Effects, Key};
@@ -51,7 +51,7 @@ impl ManifestScanOperation {
     }
 }
 
-impl Operation for ManifestScanOperation {
+impl EffectOperation for ManifestScanOperation {
     type Output = Vec<ShardManifestEntry>;
     type Error = String;
 

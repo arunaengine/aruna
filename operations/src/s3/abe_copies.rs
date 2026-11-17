@@ -17,7 +17,7 @@ use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::{
@@ -269,7 +269,7 @@ impl CopyEnvelopeOperation {
     }
 }
 
-impl Operation for CopyEnvelopeOperation {
+impl EffectOperation for CopyEnvelopeOperation {
     type Output = CopyOutcome;
     type Error = AbeError;
 

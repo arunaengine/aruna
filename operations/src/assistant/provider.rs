@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ASSISTANT_PROVIDER_KEYSPACE, PROVIDER_OWNER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderSecret, AssistantSecretError,
 };
@@ -230,7 +230,7 @@ impl CreateProviderOperation {
     }
 }
 
-impl Operation for CreateProviderOperation {
+impl EffectOperation for CreateProviderOperation {
     type Output = AssistantProvider;
     type Error = ProviderStoreError;
 
@@ -313,7 +313,7 @@ impl GetProviderOperation {
     }
 }
 
-impl Operation for GetProviderOperation {
+impl EffectOperation for GetProviderOperation {
     type Output = Option<AssistantProvider>;
     type Error = ProviderStoreError;
 
@@ -434,7 +434,7 @@ impl ListProviderOperation {
     }
 }
 
-impl Operation for ListProviderOperation {
+impl EffectOperation for ListProviderOperation {
     type Output = Vec<AssistantProvider>;
     type Error = ProviderStoreError;
 
@@ -601,7 +601,7 @@ impl UpdateProviderOperation {
     }
 }
 
-impl Operation for UpdateProviderOperation {
+impl EffectOperation for UpdateProviderOperation {
     type Output = AssistantProvider;
     type Error = ProviderStoreError;
 
@@ -809,7 +809,7 @@ impl DeleteProviderOperation {
     }
 }
 
-impl Operation for DeleteProviderOperation {
+impl EffectOperation for DeleteProviderOperation {
     type Output = ();
     type Error = ProviderStoreError;
 

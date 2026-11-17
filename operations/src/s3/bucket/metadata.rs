@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::group_admin_path;
@@ -228,7 +228,7 @@ impl PutMetadataOperation {
     }
 }
 
-impl Operation for PutMetadataOperation {
+impl EffectOperation for PutMetadataOperation {
     type Output = ();
     type Error = PutMetadataError;
 

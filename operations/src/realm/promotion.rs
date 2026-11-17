@@ -8,7 +8,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::{Effects, Value};
 use byteview::ByteView;
@@ -111,7 +111,7 @@ impl ServePromotionOperation {
     }
 }
 
-impl Operation for ServePromotionOperation {
+impl EffectOperation for ServePromotionOperation {
     type Output = PromotionAnswer;
     type Error = MetadataReadError;
 

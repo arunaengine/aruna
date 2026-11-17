@@ -15,7 +15,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ACCESS_OWNER_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::PathRestriction;
@@ -635,7 +635,7 @@ impl CreateUserOperation {
     }
 }
 
-impl Operation for CreateUserOperation {
+impl EffectOperation for CreateUserOperation {
     type Output = (String, Secret, UserAccess);
     type Error = CreateUserError;
 

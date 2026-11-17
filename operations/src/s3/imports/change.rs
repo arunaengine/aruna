@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE, JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::job_record_key;
 use aruna_core::structs::storage::backend_import::{
@@ -264,7 +264,7 @@ impl ChangeImportOperation {
     }
 }
 
-impl Operation for ChangeImportOperation {
+impl EffectOperation for ChangeImportOperation {
     type Output = BackendImport;
     type Error = ImportRuleError;
 

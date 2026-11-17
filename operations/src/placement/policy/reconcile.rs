@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::{
     NODE_SUBJECT_KEY, NodeSubjectRecord, storage_subject,
@@ -139,7 +139,7 @@ impl SubjectSyncOperation {
     }
 }
 
-impl Operation for SubjectSyncOperation {
+impl EffectOperation for SubjectSyncOperation {
     type Output = SubjectSync;
     type Error = SubjectScanError;
 
@@ -202,7 +202,7 @@ impl LocalSubjectOperation {
     }
 }
 
-impl Operation for LocalSubjectOperation {
+impl EffectOperation for LocalSubjectOperation {
     type Output = Option<NodeSubjectRecord>;
     type Error = SubjectScanError;
 

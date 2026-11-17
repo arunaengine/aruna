@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, INVENTORY_KEYSPACE, PENDING_LOCATION_KEYSPACE,
     VERSION_INDEX_KEYSPACE, prefix_upper_bound,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey,
 };
@@ -436,7 +436,7 @@ impl InventoryVersionsOperation {
     }
 }
 
-impl Operation for InventoryVersionsOperation {
+impl EffectOperation for InventoryVersionsOperation {
     type Output = ListVersionsResult;
     type Error = InventoryVersionsError;
 

@@ -12,7 +12,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionKind, SessionRef,
@@ -412,7 +412,7 @@ impl CreateSessionOperation {
     }
 }
 
-impl Operation for CreateSessionOperation {
+impl EffectOperation for CreateSessionOperation {
     type Output = CreatedSession;
     type Error = CreateSessionError;
 

@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -87,7 +87,7 @@ impl GetBucketOperation {
     }
 }
 
-impl Operation for GetBucketOperation {
+impl EffectOperation for GetBucketOperation {
     type Output = BucketInfo;
     type Error = GetBucketError;
 
@@ -133,7 +133,7 @@ mod state_machine_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;

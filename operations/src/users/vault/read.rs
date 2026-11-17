@@ -12,7 +12,7 @@ use aruna_core::effects::{
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StorageEvent, VaultFetchEvent};
 use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, VaultRevision,
@@ -193,7 +193,7 @@ impl ReadVaultOperation {
     }
 }
 
-impl Operation for ReadVaultOperation {
+impl EffectOperation for ReadVaultOperation {
     type Output = VaultRecords;
     type Error = ReadVaultError;
 
@@ -290,7 +290,7 @@ impl LocalRecordsOperation {
     }
 }
 
-impl Operation for LocalRecordsOperation {
+impl EffectOperation for LocalRecordsOperation {
     type Output = VaultRecords;
     type Error = MetadataReadError;
 

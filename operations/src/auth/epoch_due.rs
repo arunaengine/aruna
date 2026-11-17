@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::storage::abe_access::{due_rows, indexed_buckets};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -57,7 +57,7 @@ impl EpochDueOperation {
         smallvec![]
     }
 }
-impl Operation for EpochDueOperation {
+impl EffectOperation for EpochDueOperation {
     type Output = Vec<String>;
     type Error = EpochDueError;
     fn start(&mut self) -> Effects {

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::effects::{Effect, VaultQuery};
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::structs::storage::holders::KeyLookup;
@@ -84,7 +84,7 @@ impl LookupKeysOperation {
     }
 }
 
-impl Operation for LookupKeysOperation {
+impl EffectOperation for LookupKeysOperation {
     type Output = BTreeMap<UserId, KeyLookup>;
     type Error = LookupError;
 

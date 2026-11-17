@@ -13,7 +13,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{BlobCleanupWork, BucketInfo};
 use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
@@ -567,7 +567,7 @@ impl AbortUploadOperation {
     }
 }
 
-impl Operation for AbortUploadOperation {
+impl EffectOperation for AbortUploadOperation {
     type Output = ();
     type Error = AbortUploadError;
 

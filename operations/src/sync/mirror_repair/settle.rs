@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use byteview::ByteView;
@@ -110,7 +110,7 @@ impl SettleReconcileOperation {
     }
 }
 
-impl Operation for SettleReconcileOperation {
+impl EffectOperation for SettleReconcileOperation {
     type Output = RollbackClaim;
     type Error = SyncMirrorError;
 

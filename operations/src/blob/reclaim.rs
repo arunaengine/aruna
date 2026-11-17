@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::backend_import::version_key;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
@@ -520,7 +520,7 @@ impl ReclaimBlobOperation {
     }
 }
 
-impl Operation for ReclaimBlobOperation {
+impl EffectOperation for ReclaimBlobOperation {
     type Output = ReclaimVerdict;
     type Error = ReclaimBlobError;
 

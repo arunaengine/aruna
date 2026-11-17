@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{UPLOAD_INVENTORY_KEYSPACE, UPLOAD_KEYSPACE, prefix_upper_bound};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, bound_position, head_position, prefix_interval, upload_position,
 };
@@ -278,7 +278,7 @@ impl InventoryUploadsOperation {
     }
 }
 
-impl Operation for InventoryUploadsOperation {
+impl EffectOperation for InventoryUploadsOperation {
     type Output = ListUploadsResult;
     type Error = InventoryUploadsError;
 

@@ -9,7 +9,7 @@ use crate::storage_read::StorageReadError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -317,7 +317,7 @@ impl ReplaceBackendOperation {
     }
 }
 
-impl Operation for ReplaceBackendOperation {
+impl EffectOperation for ReplaceBackendOperation {
     type Output = GroupStorage;
     type Error = CreateBackendError;
 
@@ -376,7 +376,7 @@ mod pure_tests {
     use crate::groups::backends::validation::GroupBackendError;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};

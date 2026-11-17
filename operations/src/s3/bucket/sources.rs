@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::{SyncMode, SyncRelationship, sync_relationship_prefix};
 use aruna_core::types::{Effects, GroupId, Key, Value};
@@ -125,7 +125,7 @@ impl BucketSourcesOperation {
     }
 }
 
-impl Operation for BucketSourcesOperation {
+impl EffectOperation for BucketSourcesOperation {
     type Output = (Vec<FileSource>, bool);
     type Error = SourcesError;
 

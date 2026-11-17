@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
@@ -180,7 +180,7 @@ impl SearchGroupsOperation {
     }
 }
 
-impl Operation for SearchGroupsOperation {
+impl EffectOperation for SearchGroupsOperation {
     type Output = SearchGroupsOutput;
     type Error = SearchGroupsError;
 
@@ -227,7 +227,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::Group;
     use aruna_core::structs::identity::realm::RealmId;

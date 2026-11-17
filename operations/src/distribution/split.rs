@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     CAPACITY_RESERVATION_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
     RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, RangeAccount, RangeCounters, RangeSlot, Rebuild, SAMPLE_SIZE, SampleEntry, account_key,
     generation_key, pending_key, sample_count_key, sample_prefix, slot_key,
@@ -343,7 +343,7 @@ impl SplitOperation {
     }
 }
 
-impl Operation for SplitOperation {
+impl EffectOperation for SplitOperation {
     type Output = ();
     type Error = SplitError;
 

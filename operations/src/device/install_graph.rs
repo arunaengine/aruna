@@ -9,7 +9,7 @@ use aruna_core::keyspaces::DEVICE_GRAPH_KEYSPACE;
 use aruna_core::metadata::{
     MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -110,7 +110,7 @@ impl InstallGraphOperation {
     }
 }
 
-impl Operation for InstallGraphOperation {
+impl EffectOperation for InstallGraphOperation {
     type Output = bool;
     type Error = InstallError;
 

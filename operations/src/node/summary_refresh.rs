@@ -9,7 +9,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::usage::{SUMMARY_GLOBAL_KEY, SUMMARY_GROUP_PREFIX};
@@ -291,7 +291,7 @@ impl RefreshUsageOperation {
     }
 }
 
-impl Operation for RefreshUsageOperation {
+impl EffectOperation for RefreshUsageOperation {
     type Output = ();
     type Error = RefreshUsageError;
 

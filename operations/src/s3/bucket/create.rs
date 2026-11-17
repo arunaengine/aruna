@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_CREATION_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
@@ -430,7 +430,7 @@ impl CreateBucketOperation {
     }
 }
 
-impl Operation for CreateBucketOperation {
+impl EffectOperation for CreateBucketOperation {
     type Output = BucketInfo;
     type Error = CreateBucketError;
 

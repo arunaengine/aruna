@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, UPDATED_INDEX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{metadata_document_key, parse_updated_key, updated_index_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, Key, Value};
@@ -269,7 +269,7 @@ impl TimestampSweepOperation {
     }
 }
 
-impl Operation for TimestampSweepOperation {
+impl EffectOperation for TimestampSweepOperation {
     type Output = SweepPass;
     type Error = SweepError;
 

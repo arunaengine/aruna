@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
     PLAINTEXT_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
@@ -91,7 +91,7 @@ impl ConsentStoreOperation {
     }
 }
 
-impl Operation for ConsentStoreOperation {
+impl EffectOperation for ConsentStoreOperation {
     type Output = ();
     type Error = PlaintextError;
 
@@ -237,7 +237,7 @@ impl HolderCheckOperation {
     }
 }
 
-impl Operation for HolderCheckOperation {
+impl EffectOperation for HolderCheckOperation {
     type Output = bool;
     type Error = PlaintextError;
 
@@ -305,7 +305,7 @@ impl ConsentReadOperation {
     }
 }
 
-impl Operation for ConsentReadOperation {
+impl EffectOperation for ConsentReadOperation {
     type Output = Option<UserId>;
     type Error = PlaintextError;
 
@@ -418,7 +418,7 @@ impl EncryptionCheckOperation {
     }
 }
 
-impl Operation for EncryptionCheckOperation {
+impl EffectOperation for EncryptionCheckOperation {
     type Output = bool;
     type Error = PlaintextError;
 

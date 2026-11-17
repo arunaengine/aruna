@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
@@ -178,7 +178,7 @@ impl BaoReadOperation {
     }
 }
 
-impl Operation for BaoReadOperation {
+impl EffectOperation for BaoReadOperation {
     type Output = BaoReadOutput;
     type Error = BaoReadError;
 
@@ -1512,7 +1512,7 @@ impl IncomingBaoOperation {
     }
 }
 
-impl Operation for IncomingBaoOperation {
+impl EffectOperation for IncomingBaoOperation {
     type Output = IncomingBaoResult;
     type Error = BaoReadError;
 
@@ -1712,7 +1712,7 @@ mod pure_tests {
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};

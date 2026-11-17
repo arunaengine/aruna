@@ -13,7 +13,7 @@ use aruna_core::federation::{FederationError, RealmDescriptor, Signed};
 use aruna_core::handoff::{FEDERATED_SESSION_SECS, HandoffError, LoginHandoff, check_handoff};
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
 use aruna_core::link::{alias_claims_key, alias_owner};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, SessionKind};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
@@ -97,7 +97,7 @@ impl IssueHandoffOperation {
     }
 }
 
-impl Operation for IssueHandoffOperation {
+impl EffectOperation for IssueHandoffOperation {
     type Output = Signed<LoginHandoff>;
     type Error = IssueHandoffError;
 
@@ -138,7 +138,7 @@ impl Operation for IssueHandoffOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.read.as_mut().map(Operation::abort).unwrap_or_default()
+        self.read.as_mut().map(EffectOperation::abort).unwrap_or_default()
     }
 }
 
@@ -328,7 +328,7 @@ impl FederatedLoginOperation {
     }
 }
 
-impl Operation for FederatedLoginOperation {
+impl EffectOperation for FederatedLoginOperation {
     type Output = CreatedSession;
     type Error = FederatedLoginError;
 

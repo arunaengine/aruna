@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::{
@@ -224,7 +224,7 @@ impl GateOperation {
     }
 }
 
-impl Operation for GateOperation {
+impl EffectOperation for GateOperation {
     type Output = Option<GateContext>;
     type Error = GateContextError;
 
@@ -457,7 +457,7 @@ pub fn union_refs(
     Ok(PlacementPolicyRef::canonical_set(&refs)?)
 }
 
-impl Operation for PolicyGateOperation {
+impl EffectOperation for PolicyGateOperation {
     type Output = PolicyGateOutcome;
     type Error = ReadPolicyError;
 

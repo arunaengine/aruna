@@ -7,7 +7,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StorageEvent, VaultSignEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_PREDECESSORS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecordError,
@@ -627,7 +627,7 @@ impl AppendVaultOperation {
     }
 }
 
-impl Operation for AppendVaultOperation {
+impl EffectOperation for AppendVaultOperation {
     type Output = VaultAppended;
     type Error = AppendVaultError;
 

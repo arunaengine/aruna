@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -139,7 +139,7 @@ impl SnapshotReuseOperation {
     }
 }
 
-impl Operation for SnapshotReuseOperation {
+impl EffectOperation for SnapshotReuseOperation {
     type Output = Option<(BackendLocation, Ulid)>;
     type Error = SnapshotReuseError;
 

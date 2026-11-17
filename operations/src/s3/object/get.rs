@@ -35,7 +35,7 @@ use aruna_core::keyspaces::{
     SOURCE_INDEX_KEYSPACE,
 };
 use aruna_core::managed_copy::ManagedCopyError;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ExpectedChecksum, HASH_MD5, unmatched_checksum};
 use aruna_core::structs::execution::source_access::{
@@ -2271,7 +2271,7 @@ pub(super) fn locked(error: BucketKeyError) -> GetObjectError {
     GetObjectError::ConversionError(ConversionError::BucketKey(error))
 }
 
-impl Operation for GetObjectOperation {
+impl EffectOperation for GetObjectOperation {
     type Output = GetObjectResult;
     type Error = GetObjectError;
 

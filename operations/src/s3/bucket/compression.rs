@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan, UnlockStatus,
@@ -357,7 +357,7 @@ impl PutCompressionOperation {
     }
 }
 
-impl Operation for PutCompressionOperation {
+impl EffectOperation for PutCompressionOperation {
     type Output = Option<CompressionMigration>;
     type Error = PutCompressionError;
 
@@ -489,7 +489,7 @@ impl MigrationStatusOperation {
     }
 }
 
-impl Operation for MigrationStatusOperation {
+impl EffectOperation for MigrationStatusOperation {
     type Output = Option<CompressionMigration>;
     type Error = PutCompressionError;
 

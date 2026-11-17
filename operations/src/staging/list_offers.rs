@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::OFFERED_DIRECTORY_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::offered_directory::OfferedDirectory;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -56,7 +56,7 @@ impl ListOffersOperation {
     }
 }
 
-impl Operation for ListOffersOperation {
+impl EffectOperation for ListOffersOperation {
     type Output = Vec<OfferedDirectory>;
     type Error = ListOffersError;
 

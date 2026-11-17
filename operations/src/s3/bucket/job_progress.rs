@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::LINKED_JOB_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -158,7 +158,7 @@ impl StoreProgressOperation {
     }
 }
 
-impl Operation for StoreProgressOperation {
+impl EffectOperation for StoreProgressOperation {
     type Output = ();
     type Error = StoreProgressError;
 

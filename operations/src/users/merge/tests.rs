@@ -8,7 +8,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTa
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::storage_entries::subject_index_value;

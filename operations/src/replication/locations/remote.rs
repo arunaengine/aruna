@@ -9,7 +9,7 @@ use crate::replication::protocol::{
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use ulid::Ulid;
@@ -64,7 +64,7 @@ impl RemoteLocationOperation {
     }
 }
 
-impl Operation for RemoteLocationOperation {
+impl EffectOperation for RemoteLocationOperation {
     type Output = LocationSummary;
     type Error = LocationSummaryError;
 
@@ -167,7 +167,7 @@ mod pure_tests {
     use crate::tests::locations::{node_id, request};
     use aruna_core::effects::Effect;
     use aruna_core::events::Event;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use ulid::Ulid;
 
     #[test]

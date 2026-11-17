@@ -12,7 +12,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{AssistantChatHead, MAX_ASSISTANT_CHATS};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -49,7 +49,7 @@ impl ListChatOperation {
     }
 }
 
-impl Operation for ListChatOperation {
+impl EffectOperation for ListChatOperation {
     type Output = Vec<AssistantChatHead>;
     type Error = ChatStoreError;
 
@@ -258,7 +258,7 @@ impl WriteChatOperation {
     }
 }
 
-impl Operation for WriteChatOperation {
+impl EffectOperation for WriteChatOperation {
     type Output = AssistantChatHead;
     type Error = ChatStoreError;
 
@@ -449,7 +449,7 @@ impl DeleteChatOperation {
     }
 }
 
-impl Operation for DeleteChatOperation {
+impl EffectOperation for DeleteChatOperation {
     type Output = ();
     type Error = ChatStoreError;
 

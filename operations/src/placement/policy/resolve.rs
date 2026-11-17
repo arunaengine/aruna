@@ -8,7 +8,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::POLICY_CACHE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -258,7 +258,7 @@ impl ResolvePolicyOperation {
     }
 }
 
-impl Operation for ResolvePolicyOperation {
+impl EffectOperation for ResolvePolicyOperation {
     type Output = ResolvedPolicy;
     type Error = ReadPolicyError;
 

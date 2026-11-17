@@ -15,7 +15,7 @@ use aruna_core::errors::{
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::managed_copy::{ManagedCopyError, serve_reads};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
@@ -591,7 +591,7 @@ impl HeadObjectOperation {
     }
 }
 
-impl Operation for HeadObjectOperation {
+impl EffectOperation for HeadObjectOperation {
     type Output = HeadObjectResult;
     type Error = HeadObjectError;
 

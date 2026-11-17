@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 
 use aruna_core::NodeId;
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailDeliverySpec};
 use aruna_core::structs::execution::job::{JobId, JobPayload, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
@@ -147,7 +147,7 @@ fn mint(
     mint_configured_job(config.ok_or_else(unavailable)?, owner_node, dedup_key)
 }
 
-impl Operation for EnqueueDeliveriesOperation {
+impl EffectOperation for EnqueueDeliveriesOperation {
     type Output = ();
     type Error = EnqueueError;
 

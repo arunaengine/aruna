@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
 use aruna_core::types::{Effects, GroupId, TxnId};
 use smallvec::smallvec;
@@ -54,7 +54,7 @@ impl CheckOperation {
     }
 }
 
-impl Operation for CheckOperation {
+impl EffectOperation for CheckOperation {
     type Output = ();
     type Error = GroupDeletionError;
 

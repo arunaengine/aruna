@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, NODE_STATS_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, Cursor, RangeAccount, RangeCounters, Rebuild, account_key,
     generation_key,
@@ -514,7 +514,7 @@ impl RebuildOperation {
     }
 }
 
-impl Operation for RebuildOperation {
+impl EffectOperation for RebuildOperation {
     type Output = RebuildOutcome;
     type Error = RebuildError;
 
@@ -646,7 +646,7 @@ impl BeginRebuildsOperation {
     }
 }
 
-impl Operation for BeginRebuildsOperation {
+impl EffectOperation for BeginRebuildsOperation {
     type Output = usize;
     type Error = BeginRebuildsError;
 

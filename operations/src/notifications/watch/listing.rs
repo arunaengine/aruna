@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification_watch::{
     WatchSubscription, watch_subscription_prefix,
 };
@@ -148,7 +148,7 @@ impl ListWatchesOperation {
     }
 }
 
-impl Operation for ListWatchesOperation {
+impl EffectOperation for ListWatchesOperation {
     type Output = WatchPage;
     type Error = WatchSubscriptionError;
 

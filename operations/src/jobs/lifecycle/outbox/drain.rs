@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::job::{JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key};
@@ -204,7 +204,7 @@ fn stored_frame(value: Option<&[u8]>) -> Option<JobRecordFrame> {
     JobRecordFrame::new(envelope).ok()
 }
 
-impl Operation for DrainOutboxOperation {
+impl EffectOperation for DrainOutboxOperation {
     type Output = bool;
     type Error = LifecycleError;
 

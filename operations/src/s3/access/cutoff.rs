@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{Effects, Key};
@@ -184,7 +184,7 @@ fn revoked(result: Result<UserAccess, RevokeUserError>) -> Event {
     Event::SubOperation(SubOperationEvent::TokenRevoked { result })
 }
 
-impl Operation for CutoffSweepOperation {
+impl EffectOperation for CutoffSweepOperation {
     type Output = usize;
     type Error = CutoffSweepError;
 

@@ -5,7 +5,7 @@
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataError};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -78,7 +78,7 @@ impl GraphDeletedOperation {
     }
 }
 
-impl Operation for GraphDeletedOperation {
+impl EffectOperation for GraphDeletedOperation {
     type Output = bool;
     type Error = GraphDeletedError;
 

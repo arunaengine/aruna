@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, PENDING_LOCATION_KEYSPACE, PENDING_RECLAIM_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, BlobCleanupWork};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
@@ -185,7 +185,7 @@ impl ReclaimPendingOperation {
     }
 }
 
-impl Operation for ReclaimPendingOperation {
+impl EffectOperation for ReclaimPendingOperation {
     type Output = ReclaimVerdict;
     type Error = ReclaimBlobError;
 

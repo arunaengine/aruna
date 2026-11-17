@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, BUCKET_RECOVERY_KEYSPACE, KEY_COPY_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -227,7 +227,7 @@ fn decode<T>(
         .collect()
 }
 
-impl Operation for RecoveryNoticeOperation {
+impl EffectOperation for RecoveryNoticeOperation {
     type Output = Vec<UserId>;
     type Error = RecoveryNoticeError;
 

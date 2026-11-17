@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::distribution::{
     DistributionSnapshot, DistributionView, MemberState,
 };
@@ -138,7 +138,7 @@ impl SetCountsOperation {
     }
 }
 
-impl Operation for SetCountsOperation {
+impl EffectOperation for SetCountsOperation {
     type Output = SetCounts;
     type Error = CountsError;
 

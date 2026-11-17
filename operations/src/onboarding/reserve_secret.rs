@@ -8,7 +8,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Effects, TxnId, Value};
 use byteview::ByteView;
@@ -220,7 +220,7 @@ impl ReserveSecretOperation {
     }
 }
 
-impl Operation for ReserveSecretOperation {
+impl EffectOperation for ReserveSecretOperation {
     type Output = OnboardingSecretRecord;
     type Error = ReserveSecretError;
 

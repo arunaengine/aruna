@@ -6,7 +6,7 @@ use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::{ListCursor, ListRequest, SourceEntry};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId};
@@ -82,7 +82,7 @@ impl ListStagingOperation {
     }
 }
 
-impl Operation for ListStagingOperation {
+impl EffectOperation for ListStagingOperation {
     type Output = ListStagingResult;
     type Error = ListStagingError;
 

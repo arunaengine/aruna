@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::events::Event;
 use aruna_core::federation::{FederationError, Signed};
 use aruna_core::handoff::descriptor_digest;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::transfer::{
@@ -54,7 +54,7 @@ impl<T> ConfigStep<T> {
     }
 
     fn start(&mut self) -> Effects {
-        self.read.as_mut().map(Operation::start).unwrap_or_default()
+        self.read.as_mut().map(EffectOperation::start).unwrap_or_default()
     }
 
     fn step(
@@ -76,7 +76,7 @@ impl<T> ConfigStep<T> {
     }
 
     fn abort(&mut self) -> Effects {
-        self.read.as_mut().map(Operation::abort).unwrap_or_default()
+        self.read.as_mut().map(EffectOperation::abort).unwrap_or_default()
     }
 }
 
@@ -108,7 +108,7 @@ impl IssueIntentOperation {
     }
 }
 
-impl Operation for IssueIntentOperation {
+impl EffectOperation for IssueIntentOperation {
     type Output = Signed<ImportIntent>;
     type Error = TransferAdmitError;
 
@@ -175,7 +175,7 @@ impl AdmitTransferOperation {
     }
 }
 
-impl Operation for AdmitTransferOperation {
+impl EffectOperation for AdmitTransferOperation {
     type Output = String;
     type Error = TransferAdmitError;
 

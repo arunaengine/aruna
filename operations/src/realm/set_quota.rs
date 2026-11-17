@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
 };
@@ -270,7 +270,7 @@ impl SetQuotaOperation {
     }
 }
 
-impl Operation for SetQuotaOperation {
+impl EffectOperation for SetQuotaOperation {
     type Output = RealmConfigDocument;
     type Error = SetQuotaError;
 

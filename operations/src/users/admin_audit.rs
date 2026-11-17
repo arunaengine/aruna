@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditRecord, AuditIndex, audit_key, audit_prefix,
 };
@@ -78,7 +78,7 @@ impl AuditPageOperation {
     }
 }
 
-impl Operation for AuditPageOperation {
+impl EffectOperation for AuditPageOperation {
     type Output = AuditPage;
     type Error = AuditPageError;
 

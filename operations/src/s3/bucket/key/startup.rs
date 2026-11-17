@@ -10,7 +10,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, EncryptionMode, KeyState,
 };
@@ -233,7 +233,7 @@ impl OpenManagedOperation {
     }
 }
 
-impl Operation for OpenManagedOperation {
+impl EffectOperation for OpenManagedOperation {
     type Output = ManagedKeys;
     type Error = StartupError;
 

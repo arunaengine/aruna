@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
 };
@@ -418,7 +418,7 @@ fn secret_config_changed(
     current.map(|secret| &secret.secret_config) != replacement.map(|secret| &secret.secret_config)
 }
 
-impl Operation for ReplaceSourceOperation {
+impl EffectOperation for ReplaceSourceOperation {
     type Output = ReplaceSourceResult;
     type Error = ReplaceSourceError;
 

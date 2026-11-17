@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::repository::{
     LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkReview, LinkStatus, PullCheck,
     PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
@@ -385,7 +385,7 @@ impl ChangeLinkOperation {
     }
 }
 
-impl Operation for ChangeLinkOperation {
+impl EffectOperation for ChangeLinkOperation {
     type Output = Option<RepositoryLink>;
     type Error = LinkError;
 

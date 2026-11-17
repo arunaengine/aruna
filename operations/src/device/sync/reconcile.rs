@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::offered_directory::fingerprint_complete;
 use aruna_core::structs::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
@@ -511,7 +511,7 @@ fn upload_entry_state(deleted: bool, had_base: bool) -> EntryState {
     }
 }
 
-impl Operation for ReconcileFolderOperation {
+impl EffectOperation for ReconcileFolderOperation {
     type Output = ReconcilePlan;
     type Error = ReconcileError;
 

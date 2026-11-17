@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group_delete::{
     GroupDeletePhase, GroupDeletionError, GroupWriteError, MembershipFence,
 };

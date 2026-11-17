@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketInfo};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -87,7 +87,7 @@ impl PutCorsOperation {
     }
 }
 
-impl Operation for PutCorsOperation {
+impl EffectOperation for PutCorsOperation {
     type Output = BucketCorsConfiguration;
     type Error = PutCorsError;
 
@@ -256,7 +256,7 @@ impl GetCorsOperation {
     }
 }
 
-impl Operation for GetCorsOperation {
+impl EffectOperation for GetCorsOperation {
     type Output = BucketCorsConfiguration;
     type Error = GetCorsError;
 
@@ -384,7 +384,7 @@ impl DeleteCorsOperation {
     }
 }
 
-impl Operation for DeleteCorsOperation {
+impl EffectOperation for DeleteCorsOperation {
     type Output = ();
     type Error = DeleteCorsError;
 

@@ -273,7 +273,7 @@ impl KeyOperation {
         smallvec![Effect::SubOperation(sub)]
     }
 }
-impl Operation for ReissueOperation {
+impl EffectOperation for ReissueOperation {
     type Output = bool;
     type Error = KeyError;
     fn start(&mut self) -> Effects {

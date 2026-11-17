@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     NODE_SUBJECT_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
@@ -777,7 +777,7 @@ impl ListVersionsOperation {
     }
 }
 
-impl Operation for ListVersionsOperation {
+impl EffectOperation for ListVersionsOperation {
     type Output = ListVersionsResult;
     type Error = ListVersionsError;
 

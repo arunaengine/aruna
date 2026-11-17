@@ -12,7 +12,7 @@ use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_MAX_TTL};
 use aruna_core::types::{Effects, GroupId};
@@ -326,7 +326,7 @@ impl CreateS3Operation {
     }
 }
 
-impl Operation for CreateS3Operation {
+impl EffectOperation for CreateS3Operation {
     type Output = S3SessionCredentials;
     type Error = S3SessionError;
 

@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{SourceMapping, SourceMirror, VersionSourceBinding};
@@ -419,7 +419,7 @@ fn removed(
     Removal::Removed
 }
 
-impl Operation for SourceEditOperation {
+impl EffectOperation for SourceEditOperation {
     type Output = SourceEditResult;
     type Error = SourceEditError;
 

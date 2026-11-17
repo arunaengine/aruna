@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
@@ -388,7 +388,7 @@ impl PidTransitionOperation {
     }
 }
 
-impl Operation for PidTransitionOperation {
+impl EffectOperation for PidTransitionOperation {
     type Output = PidOutcome;
     type Error = PersistentIdError;
 

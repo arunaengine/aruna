@@ -13,7 +13,7 @@ use aruna_core::federation::{
     RegistrationMode, Signed,
 };
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_FEDERATION_PATH,
 };
@@ -386,7 +386,7 @@ impl SetFederationOperation {
     }
 }
 
-impl Operation for SetFederationOperation {
+impl EffectOperation for SetFederationOperation {
     type Output = RealmConfigDocument;
     type Error = SetFederationError;
 

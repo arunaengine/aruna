@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventRecord;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, overlay_placement};
 use aruna_core::storage_entries::{
     conflict_write_entries, pending_projection_target, reducer_state_entry, reducer_state_key,
@@ -1087,7 +1087,7 @@ impl MutatePlacementOperation {
     }
 }
 
-impl Operation for MutatePlacementOperation {
+impl EffectOperation for MutatePlacementOperation {
     type Output = RealmConfigDocument;
     type Error = MutatePlacementError;
 

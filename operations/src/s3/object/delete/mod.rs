@@ -27,7 +27,7 @@ use aruna_core::keyspaces::{
     DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
@@ -1345,7 +1345,7 @@ impl DeleteObjectOperation {
     }
 }
 
-impl Operation for DeleteObjectOperation {
+impl EffectOperation for DeleteObjectOperation {
     type Output = DeleteObjectResult;
     type Error = DeleteObjectError;
 

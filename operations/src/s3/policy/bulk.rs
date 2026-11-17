@@ -15,7 +15,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
@@ -843,7 +843,7 @@ fn covered(version: &BlobVersion, target: &[PlacementPolicyRef]) -> bool {
         .all(|policy| version.placement_policies.contains(policy))
 }
 
-impl Operation for PolicyBulkOperation {
+impl EffectOperation for PolicyBulkOperation {
     type Output = BulkReport;
     type Error = BulkError;
 
@@ -1056,7 +1056,7 @@ mod tests {
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, POLICY_CACHE_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;

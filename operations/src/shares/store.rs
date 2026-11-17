@@ -9,7 +9,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     SHARE_EVENT_KEYSPACE, SHARE_LINK_KEYSPACE, SHARE_OWNER_KEYSPACE, SHARE_USE_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::share::{ShareEvent, ShareLink, ShareUses, event_key, owner_key};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -83,7 +83,7 @@ impl GetShareOperation {
     }
 }
 
-impl Operation for GetShareOperation {
+impl EffectOperation for GetShareOperation {
     type Output = Option<ShareLink>;
     type Error = ShareStoreError;
 
@@ -199,7 +199,7 @@ impl ListSharesOperation {
     }
 }
 
-impl Operation for ListSharesOperation {
+impl EffectOperation for ListSharesOperation {
     type Output = Vec<ShareLink>;
     type Error = ShareStoreError;
 
@@ -318,7 +318,7 @@ impl LogShareOperation {
     }
 }
 
-impl Operation for LogShareOperation {
+impl EffectOperation for LogShareOperation {
     type Output = ();
     type Error = ShareStoreError;
 
@@ -404,7 +404,7 @@ impl ReadUsesOperation {
     }
 }
 
-impl Operation for ReadUsesOperation {
+impl EffectOperation for ReadUsesOperation {
     type Output = Vec<ShareUses>;
     type Error = ShareStoreError;
 
@@ -502,7 +502,7 @@ impl ShareEventsOperation {
     }
 }
 
-impl Operation for ShareEventsOperation {
+impl EffectOperation for ShareEventsOperation {
     type Output = EventPage;
     type Error = ShareStoreError;
 

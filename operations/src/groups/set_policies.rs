@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, GROUP_POLICIES_PATH};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
@@ -319,7 +319,7 @@ impl SetGroupOperation {
     }
 }
 
-impl Operation for SetGroupOperation {
+impl EffectOperation for SetGroupOperation {
     type Output = GroupAuthorizationDocument;
     type Error = SetGroupError;
 
@@ -527,7 +527,7 @@ mod tests {
     use aruna_core::errors::{AuthorizationError, StorageError};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::request_policy::RequestPolicy;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;

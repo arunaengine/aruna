@@ -7,7 +7,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -73,7 +73,7 @@ impl InspectSecretOperation {
     }
 }
 
-impl Operation for InspectSecretOperation {
+impl EffectOperation for InspectSecretOperation {
     type Output = OnboardingSecretRecord;
     type Error = InspectSecretError;
 

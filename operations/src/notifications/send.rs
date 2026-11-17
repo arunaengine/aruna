@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::outbound::{
     HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail, SmtpSettings,
 };
@@ -122,7 +122,7 @@ fn posted(status: u16) -> Result<Option<u16>, SendError> {
     }
 }
 
-impl Operation for SendOperation {
+impl EffectOperation for SendOperation {
     type Output = Option<u16>;
     type Error = SendError;
 

@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, StagingSourceEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -56,7 +56,7 @@ impl CheckSourceOperation {
     }
 }
 
-impl Operation for CheckSourceOperation {
+impl EffectOperation for CheckSourceOperation {
     type Output = ();
     type Error = CheckSourceError;
 

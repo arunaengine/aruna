@@ -10,7 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key};
@@ -154,7 +154,7 @@ impl IssueSyncOperation {
     }
 }
 
-impl Operation for IssueSyncOperation {
+impl EffectOperation for IssueSyncOperation {
     type Output = OnboardingTicket;
     type Error = IssueSyncError;
 
@@ -261,7 +261,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USER_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_storage::storage;
     use byteview::ByteView;

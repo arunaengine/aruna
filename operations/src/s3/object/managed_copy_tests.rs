@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, NODE_
 use aruna_core::managed_copy::{
     CopyRegistration, ManagedCopyError, register_effect, scan_effect, version_scope,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};

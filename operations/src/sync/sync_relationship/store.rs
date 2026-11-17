@@ -4,7 +4,7 @@
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -44,7 +44,7 @@ impl StoreRelationshipOperation {
     }
 }
 
-impl Operation for StoreRelationshipOperation {
+impl EffectOperation for StoreRelationshipOperation {
     type Output = SyncRelationship;
     type Error = SyncRelationshipError;
 

@@ -18,7 +18,7 @@ use crate::plugins::store::Txn;
 use crate::plugins::worker::decide_batch;
 use crate::plugins::worker::prune_runs;
 use crate::plugins::worker::tests::{created, installed, scoped, worker};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 
 /// A created dataset journaled now, and its forward row for `install`.
 fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, ForwardRow) {

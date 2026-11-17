@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::harvest::{
     RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
 };
@@ -220,7 +220,7 @@ impl UpdateRepositoryOperation {
     }
 }
 
-impl Operation for UpdateRepositoryOperation {
+impl EffectOperation for UpdateRepositoryOperation {
     type Output = ConnectorView;
     type Error = UpdateConnectorError;
 

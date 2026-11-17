@@ -7,7 +7,7 @@ use std::mem;
 use aruna_core::compute::session::{SessionAnswer, SessionEffect, SessionRequest};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -42,7 +42,7 @@ impl SessionOperation {
     }
 }
 
-impl Operation for SessionOperation {
+impl EffectOperation for SessionOperation {
     type Output = SessionAnswer;
     type Error = SessionCallError;
 

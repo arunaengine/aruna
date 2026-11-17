@@ -6,7 +6,7 @@ use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_target,
@@ -85,7 +85,7 @@ impl ServePolicyOperation {
     }
 }
 
-impl Operation for ServePolicyOperation {
+impl EffectOperation for ServePolicyOperation {
     type Output = PolicyAnswer;
     type Error = MetadataReadError;
 

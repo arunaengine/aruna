@@ -15,7 +15,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
 use aruna_core::structs::sync_relationship_prefix;
@@ -390,7 +390,7 @@ fn expected_event(state: PageImportState) -> &'static str {
     }
 }
 
-impl Operation for PageImportOperation {
+impl EffectOperation for PageImportOperation {
     type Output = PageImportResult;
     type Error = PageImportError;
 
@@ -447,7 +447,7 @@ impl PreparePageOperation {
     }
 }
 
-impl Operation for PreparePageOperation {
+impl EffectOperation for PreparePageOperation {
     type Output = PreparedRows;
     type Error = PageImportError;
 

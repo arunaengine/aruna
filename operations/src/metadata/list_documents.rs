@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::GraphLifecycleRecord;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
@@ -93,7 +93,7 @@ impl ListDocumentsOperation {
     }
 }
 
-impl Operation for ListDocumentsOperation {
+impl EffectOperation for ListDocumentsOperation {
     type Output = Vec<MetadataRegistryRecord>;
     type Error = ListDocumentsError;
 

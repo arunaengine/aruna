@@ -4,7 +4,7 @@
 
 use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{SyncQuarantineRecord, quarantine_row_entry, quarantine_usage_entry};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -86,7 +86,7 @@ impl AcknowledgeQuarantineOperation {
     }
 }
 
-impl Operation for AcknowledgeQuarantineOperation {
+impl EffectOperation for AcknowledgeQuarantineOperation {
     type Output = Option<SyncQuarantineRecord>;
     type Error = QuarantineAdminError;
 

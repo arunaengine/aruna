@@ -4,7 +4,7 @@
 
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
@@ -93,7 +93,7 @@ pub(crate) fn admin_check(auth_context: &AuthContext, group_id: GroupId) -> Effe
     ))]
 }
 
-impl Operation for ListTokensOperation {
+impl EffectOperation for ListTokensOperation {
     type Output = TokenPage;
     type Error = GroupTokensError;
 

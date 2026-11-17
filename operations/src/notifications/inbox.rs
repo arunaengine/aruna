@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{inbox_delete_entries, inbox_write_entries};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
@@ -528,7 +528,7 @@ impl UpsertInboxOperation {
     }
 }
 
-impl Operation for UpsertInboxOperation {
+impl EffectOperation for UpsertInboxOperation {
     type Output = InboxWriteOutcome;
     type Error = InboxError;
 

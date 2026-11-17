@@ -5,7 +5,7 @@
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::types::Effects;
 use aruna_storage::storage::{FjallStorage, StorageHandle};
@@ -30,7 +30,7 @@ pub(crate) async fn seed_upload(storage: &StorageHandle, record: &MultipartUploa
 }
 
 /// Answers the rows and the commit of a fenced write.
-pub(crate) fn fence_done(operation: &mut impl Operation) -> Effects {
+pub(crate) fn fence_done(operation: &mut impl EffectOperation) -> Effects {
     operation.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
     }));

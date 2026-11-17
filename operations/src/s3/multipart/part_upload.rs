@@ -14,7 +14,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     ABE_PENDING_KEYSPACE, NODE_SUBJECT_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
@@ -810,7 +810,7 @@ impl UploadPartOperation {
     }
 }
 
-impl Operation for UploadPartOperation {
+impl EffectOperation for UploadPartOperation {
     type Output = UploadPartResult;
     type Error = UploadPartError;
 

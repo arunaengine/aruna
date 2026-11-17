@@ -8,7 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_prefix};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -105,7 +105,7 @@ impl RelationshipNodesOperation {
     }
 }
 
-impl Operation for RelationshipNodesOperation {
+impl EffectOperation for RelationshipNodesOperation {
     type Output = BTreeSet<ReplicaTarget>;
     type Error = LocationSummaryError;
 
@@ -173,7 +173,7 @@ mod pure_tests {
     use super::{RelationshipNodesOperation, ReplicaTarget};
     use crate::tests::locations::{node_id, realm_id};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{
         ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,

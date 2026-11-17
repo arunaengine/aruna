@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
@@ -263,7 +263,7 @@ pub(crate) fn reference_manifest(
     })
 }
 
-impl Operation for PageBuildOperation {
+impl EffectOperation for PageBuildOperation {
     type Output = Vec<Built>;
     type Error = BuildError;
 

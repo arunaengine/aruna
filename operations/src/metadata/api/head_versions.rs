@@ -5,7 +5,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
 };
@@ -134,7 +134,7 @@ fn version_key((key, value): &(Key, Value)) -> Result<(VersionKey, Vec<u8>), Hea
     Ok((version_key, row))
 }
 
-impl Operation for HeadVersionsOperation {
+impl EffectOperation for HeadVersionsOperation {
     type Output = HeadVersions;
     type Error = HeadVersionsError;
 

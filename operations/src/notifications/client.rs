@@ -5,7 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification::{
     NotificationRecord, NotificationRequest, NotificationTransportMessage,
 };
@@ -40,7 +40,7 @@ impl HolderRequestOperation {
     }
 }
 
-impl Operation for HolderRequestOperation {
+impl EffectOperation for HolderRequestOperation {
     type Output = NotificationTransportMessage;
     type Error = RemoteError;
 

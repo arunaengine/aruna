@@ -12,7 +12,7 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEffect, MetadataError,
     MetadataEvent, MetadataLifecycleRecord,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::storage_entries::{
     graph_revision_change, lifecycle_revision_change, updated_index_delete,
 };
@@ -981,7 +981,7 @@ fn delete_updated_index(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -
     })
 }
 
-impl Operation for DeleteDocumentOperation {
+impl EffectOperation for DeleteDocumentOperation {
     fn is_conflict(error: &DeleteDocumentError) -> bool {
         matches!(
             error,

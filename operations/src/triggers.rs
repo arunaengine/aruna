@@ -8,7 +8,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
@@ -39,7 +39,7 @@ pub struct TimerFailure {
 }
 
 /// A timer operation decides when its timer runs again.
-pub trait TimerRun: Operation + Sized {
+pub trait TimerRun: EffectOperation + Sized {
     /// The delay before the next run, or `None` when the timer stays off until work arrives.
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure>;
 }
@@ -65,7 +65,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
     }
 }
 
-impl Operation for TimerOperation {
+impl EffectOperation for TimerOperation {
     type Output = Option<Duration>;
     type Error = TimerFailure;
 
@@ -148,7 +148,7 @@ pub struct PeerInput<'a> {
 pub struct PeerFailure(pub String);
 
 /// A peer operation produces the answer frame body the shell writes back.
-pub trait PeerRun: Operation + Sized {
+pub trait PeerRun: EffectOperation + Sized {
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure>;
 }
 
@@ -209,7 +209,7 @@ impl PeerRun for RemoveWatchOperation {
     }
 }
 
-impl Operation for PeerOperation {
+impl EffectOperation for PeerOperation {
     type Output = Vec<u8>;
     type Error = PeerFailure;
 

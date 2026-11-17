@@ -4,7 +4,7 @@
 
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
@@ -107,7 +107,7 @@ impl ListSourceOperation {
     }
 }
 
-impl Operation for ListSourceOperation {
+impl EffectOperation for ListSourceOperation {
     type Output = ListSourceResult;
     type Error = ListSourceError;
 

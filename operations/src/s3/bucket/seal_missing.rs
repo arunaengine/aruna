@@ -10,7 +10,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRef, GrantState, SealedCopy,
@@ -207,7 +207,7 @@ impl SealMissingOperation {
     }
 }
 
-impl Operation for SealMissingOperation {
+impl EffectOperation for SealMissingOperation {
     type Output = Vec<UserId>;
     type Error = SealMissingError;
 

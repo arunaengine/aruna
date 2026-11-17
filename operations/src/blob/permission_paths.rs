@@ -6,7 +6,7 @@ use crate::blob::records::iter_hash_page;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -192,7 +192,7 @@ impl ResolvePathsOperation {
     }
 }
 
-impl Operation for ResolvePathsOperation {
+impl EffectOperation for ResolvePathsOperation {
     type Output = Vec<HashIndex>;
     type Error = ResolvePathsError;
 
@@ -247,7 +247,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
     use aruna_storage::storage;

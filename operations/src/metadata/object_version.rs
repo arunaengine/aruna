@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
 };
@@ -129,7 +129,7 @@ impl ObjectVersionOperation {
     }
 }
 
-impl Operation for ObjectVersionOperation {
+impl EffectOperation for ObjectVersionOperation {
     type Output = ObjectVersion;
     type Error = ObjectVersionError;
 

@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
     STORAGE_ROUTING_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::discovery::DiscoveryRules;
@@ -131,7 +131,7 @@ impl GroupInputsOperation {
     }
 }
 
-impl Operation for GroupInputsOperation {
+impl EffectOperation for GroupInputsOperation {
     type Output = GroupRoutingInputs;
     type Error = GroupInputsError;
 
@@ -370,7 +370,7 @@ impl PutGroupOperation {
     }
 }
 
-impl Operation for PutGroupOperation {
+impl EffectOperation for PutGroupOperation {
     type Output = GroupStorageRouting;
     type Error = PutGroupError;
 
@@ -492,7 +492,7 @@ impl GroupRoutingOperation {
     }
 }
 
-impl Operation for GroupRoutingOperation {
+impl EffectOperation for GroupRoutingOperation {
     type Output = Option<GroupStorageRouting>;
     type Error = GroupRoutingError;
 
@@ -566,7 +566,7 @@ mod pure_tests {
         BACKEND_IMPORT_KEYSPACE, BACKEND_INDEX_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
         STORAGE_ROUTING_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::backend_import::BackendImport;
     use aruna_core::structs::storage::blob::BackendRef;

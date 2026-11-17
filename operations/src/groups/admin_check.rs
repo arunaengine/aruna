@@ -5,7 +5,7 @@
 use aruna_core::effects::Effect;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
@@ -57,7 +57,7 @@ impl AdminCheckOperation {
     }
 }
 
-impl Operation for AdminCheckOperation {
+impl EffectOperation for AdminCheckOperation {
     type Output = bool;
     type Error = AuthorizationError;
 

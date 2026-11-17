@@ -26,7 +26,7 @@ use aruna_core::managed_copy::{
     COPY_PAGE_LIMIT, CopyRegistration, CopyRequest, ManagedCopyError, ManagedCopyPage,
     register_entry, scan_effect, validate_registration, version_scope,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::attachment::{
@@ -962,7 +962,7 @@ impl MintSuccessorOperation {
     }
 }
 
-impl Operation for MintSuccessorOperation {
+impl EffectOperation for MintSuccessorOperation {
     type Output = SuccessorOutcome;
     type Error = SuccessorError;
 
@@ -1074,7 +1074,7 @@ mod pure_tests {
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     };
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};

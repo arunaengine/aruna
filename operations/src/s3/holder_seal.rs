@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -150,7 +150,7 @@ impl SealPublishedOperation {
     }
 }
 
-impl Operation for SealPublishedOperation {
+impl EffectOperation for SealPublishedOperation {
     type Output = Vec<String>;
     type Error = StorageError;
 

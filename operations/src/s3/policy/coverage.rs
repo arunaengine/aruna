@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
@@ -566,7 +566,7 @@ impl PolicyCoverageOperation {
     }
 }
 
-impl Operation for PolicyCoverageOperation {
+impl EffectOperation for PolicyCoverageOperation {
     type Output = CoverageReport;
     type Error = CoverageError;
 
@@ -696,7 +696,7 @@ mod pure_tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
