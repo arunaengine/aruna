@@ -13,7 +13,7 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::plugins::{ArtifactStore, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
@@ -454,8 +454,8 @@ impl Operation for PublishEntryOperation {
     type Output = PublishedPlugin;
     type Error = EntryError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, EntryError> {

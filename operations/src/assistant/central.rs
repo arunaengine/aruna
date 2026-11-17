@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ASSISTANT_USAGE_KEYSPACE, CENTRAL_ASSISTANT_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::structs::{
     AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, QuotaReached, charge,
@@ -140,8 +140,8 @@ impl Operation for SetCentralOperation {
         Ok(Next::Call(call))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -180,15 +180,16 @@ impl Operation for ChargeUsageOperation {
             return Ok(Next::Done(charged));
         }
         let usage = decode_usage(rows::value(result)?.as_ref())?;
-        let next = charge(usage, self.today, self.limit).map_err(CentralStoreError::QuotaReached)?;
+        let next =
+            charge(usage, self.today, self.limit).map_err(CentralStoreError::QuotaReached)?;
         let (space, key) = usage_row(self.user_id);
         let call = IoCall::Write(vec![(space, key, next.to_bytes()?.into())]);
         self.charged = Some(next);
         Ok(Next::Call(call))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

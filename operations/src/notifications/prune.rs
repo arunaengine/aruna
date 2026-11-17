@@ -11,7 +11,7 @@ use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification::{
     DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
     notification_inbox_key, notification_prune_key, parse_prune_key,
@@ -404,8 +404,8 @@ impl Operation for CutoffPruneOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -1154,7 +1154,10 @@ mod call_tests {
             now_ms: NOW_MS,
             deleting: false,
         };
-        assert!(cutoff.transaction());
+        assert_eq!(
+            cutoff.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert!(matches!(cutoff.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 2));
         let renewed = Value::from(NOW_MS.to_be_bytes().to_vec());
         assert_eq!(

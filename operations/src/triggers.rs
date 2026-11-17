@@ -9,7 +9,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::calls::{IoError, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
@@ -118,7 +118,7 @@ impl Operation for TimerOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
+    fn transaction(&self) -> TransactionMode {
         match self {
             TimerOperation::DrainNotificationOutbox(operation) => operation.transaction(),
             TimerOperation::PruneNotifications(operation) => operation.transaction(),
@@ -279,7 +279,7 @@ impl Operation for PeerOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
+    fn transaction(&self) -> TransactionMode {
         match self {
             PeerOperation::DeliverNotifications(operation) => operation.transaction(),
             PeerOperation::RemoveWatch(operation) => operation.transaction(),
@@ -321,7 +321,10 @@ mod tests {
             operation.first(),
             timer_turn::<PruneNotificationsOperation>(inner.first())
         );
-        assert!(!operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::None
+        );
         let drain = timer_operation(&TaskKey::DrainNotificationOutbox, &INPUT);
         assert_eq!(
             drain.unwrap().first(),

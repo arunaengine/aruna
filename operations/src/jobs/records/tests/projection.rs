@@ -274,7 +274,10 @@ fn reads_cache_outside() {
         now_ms: 3_100,
         rebuild: false,
     });
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     assert!(matches!(
         operation.first(),
         Ok(Next::Call(IoCall::Effect(effect)))

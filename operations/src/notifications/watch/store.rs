@@ -5,7 +5,7 @@
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
     WATCH_USER_CAP, WatchSubscription, watch_subscription_prefix,
@@ -149,8 +149,8 @@ impl Operation for WatchRowsOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -258,7 +258,10 @@ mod call_tests {
         let owner = user(1, 2);
         let watch_id = Ulid::from_parts(9, 9);
         let mut rows = rows(Change::Delete { owner, watch_id });
-        assert!(rows.transaction());
+        assert_eq!(
+            rows.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let (space, key) = watch_delete_entry(owner, watch_id);
         assert_eq!(
             rows.first(),

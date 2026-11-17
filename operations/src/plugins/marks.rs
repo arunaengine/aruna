@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::JobId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -90,8 +90,11 @@ impl Operation for MarkEnded {
     type Error = StoreError;
 
     /// With the mark's key the delete runs in one transaction with the lookup.
-    fn transaction(&self) -> bool {
-        self.key.is_some()
+    fn transaction(&self) -> TransactionMode {
+        match self.key.is_some() {
+            true => TransactionMode::Write,
+            false => TransactionMode::None,
+        }
     }
 
     fn first(&mut self) -> Result<Next<bool>, StoreError> {

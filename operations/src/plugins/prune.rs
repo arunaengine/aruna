@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{ADMIN_AUDIT_KEYSPACE, PLUGIN_HOOKS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{HOOK_RETENTION_MS, HOOK_ROW, HOOK_TIME_ROW};
 use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, AuditIndex, audit_prefix};
@@ -53,8 +53,8 @@ impl Operation for PruneUses {
     type Output = (usize, bool);
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {

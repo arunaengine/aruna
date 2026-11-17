@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, done, read_row, values};
 use aruna_core::structs::{SyncRelationship, SyncState};
 use aruna_core::types::Value;
@@ -135,8 +135,8 @@ impl Operation for CreateRelationshipOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn conflict_retries() -> u32 {
@@ -203,7 +203,10 @@ mod tests {
     fn creates_relationship() {
         let other = row(&relationship(2, "source-a", "target-b"));
         let mut operation = CreateRelationshipOperation::new(subject());
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert_eq!(operation.first(), Ok(scan(None)));
         assert_eq!(
             operation.next(page(vec![other.clone()], Some(other.0.clone()))),

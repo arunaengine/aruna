@@ -6,7 +6,7 @@ use super::{S3SessionError, decode_index};
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::Key;
 
@@ -95,8 +95,8 @@ impl Operation for ListSessionsOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -137,7 +137,10 @@ mod tests {
             next: None,
         };
         assert_eq!(operation.next(end), Ok(Next::Done(Vec::new())));
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
     }
 
     #[test]

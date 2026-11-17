@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
     EVENT_JOURNAL_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -191,8 +191,8 @@ impl Operation for RetireJobOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
