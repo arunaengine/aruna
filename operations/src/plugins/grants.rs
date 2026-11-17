@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::structs::identity::auth::Permission as Access;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::types::GroupId;
@@ -340,6 +340,30 @@ pub(crate) fn install_scope(install: &PluginInstall) -> InstallScope {
         realm_id: install.account.realm_id,
         group_id: install.group_id,
         install_id: install.install_id,
+    }
+}
+
+/// The install's account restricted to `patterns`, at the access `permission` needs.
+pub(crate) fn restricted_account(
+    (install, realm_id): (&PluginInstall, RealmId),
+    patterns: &BTreeSet<String>,
+    permission: Permission,
+) -> AuthContext {
+    let access = match accesses(permission).contains(&Access::WRITE) {
+        true => Access::WRITE,
+        false => Access::READ,
+    };
+    let restrictions = (patterns.iter())
+        .map(|pattern| PathRestriction {
+            pattern: pattern.clone(),
+            permission: access.clone(),
+        })
+        .collect();
+    AuthContext {
+        user_id: install.account,
+        realm_id,
+        path_restrictions: Some(restrictions),
+        session: None,
     }
 }
 

@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,9 +17,7 @@ use aruna_core::plugin_runs::{
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
 use aruna_core::structs::execution::job::UploadForm;
-use aruna_core::structs::identity::auth::{
-    Actor, AuthContext, PathRestriction, Permission as Access,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::data::identity::DataIdentity;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -48,7 +45,7 @@ use super::dataset::{
     content_urls, dataset_change, dataset_crate, dataset_of, file_entities, file_entity,
     parse_document, same_revision,
 };
-use super::grants::{accesses, install_scope, object_path, parse_grants, patterns_for};
+use super::grants::{install_scope, object_path, parse_grants, patterns_for, restricted_account};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row, written};
@@ -176,7 +173,7 @@ impl RunBroker {
         let patterns = matching(&install, permission, target)?;
         Ok((
             install.clone(),
-            self.account(&install, &patterns, permission),
+            restricted_account((&install, self.scope.realm_id), &patterns, permission),
         ))
     }
 
@@ -190,33 +187,8 @@ impl RunBroker {
         let patterns = patterns_for(&grants, permission);
         Ok((
             install.clone(),
-            self.account(&install, &patterns, permission),
+            restricted_account((&install, self.scope.realm_id), &patterns, permission),
         ))
-    }
-
-    /// The account restricted to `patterns`, at the access `permission` needs.
-    fn account(
-        &self,
-        install: &PluginInstall,
-        patterns: &BTreeSet<String>,
-        permission: Permission,
-    ) -> AuthContext {
-        let access = match accesses(permission).contains(&Access::WRITE) {
-            true => Access::WRITE,
-            false => Access::READ,
-        };
-        let restrictions = (patterns.iter())
-            .map(|pattern| PathRestriction {
-                pattern: pattern.clone(),
-                permission: access.clone(),
-            })
-            .collect();
-        AuthContext {
-            user_id: install.account,
-            realm_id: self.scope.realm_id,
-            path_restrictions: Some(restrictions),
-            session: None,
-        }
     }
 
     /// The registry record and JSON-LD of a document the account may read.
