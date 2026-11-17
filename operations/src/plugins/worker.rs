@@ -88,7 +88,6 @@ const RECHECK_MS: u64 = 10 * 1000;
 const PRUNE_MS: u64 = 3600 * 1000;
 /// How often the worker keeps the summaries of finished plugin work.
 const SETTLE_MS: u64 = 30 * 1000;
-/// Longest wait before a run that failed in the host starts again.
 
 /// The node service that owns the plugin runtime and the runs it executes.
 pub struct Worker {
