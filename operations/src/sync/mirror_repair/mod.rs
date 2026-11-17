@@ -20,6 +20,7 @@ pub use status::StoreStatusOperation;
 
 use std::time::Duration;
 
+use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -169,6 +170,49 @@ fn decode_record(
     value
         .map(|value| SyncMirrorRecord::from_bytes(key, &value))
         .transpose()
+}
+
+/// Where a mirror change runs, seen from the local node.
+#[derive(Debug, PartialEq)]
+enum MirrorPeer {
+    Local,
+    Remote(NodeId),
+}
+
+/// A mirror is created from its source node, locally when the target is local too.
+fn create_peer(
+    relationship: &SyncRelationship,
+    local_node: NodeId,
+) -> Result<MirrorPeer, SyncMirrorError> {
+    if relationship.source.node_id != local_node {
+        return Err(SyncMirrorError::Mirror(
+            "sync mirror creation must run on the source node".to_string(),
+        ));
+    }
+    if relationship.target.node_id == local_node {
+        return Ok(MirrorPeer::Local);
+    }
+    Ok(MirrorPeer::Remote(relationship.target.node_id))
+}
+
+/// A mirror is deleted from either endpoint; a rollback runs only on the source.
+fn delete_peer(
+    relationship: &SyncRelationship,
+    local_node: NodeId,
+    rollback: bool,
+) -> Result<MirrorPeer, SyncMirrorError> {
+    let (source, target) = (relationship.source.node_id, relationship.target.node_id);
+    if source == local_node && target == local_node {
+        Ok(MirrorPeer::Local)
+    } else if source == local_node {
+        Ok(MirrorPeer::Remote(target))
+    } else if target == local_node && !rollback {
+        Ok(MirrorPeer::Remote(source))
+    } else {
+        Err(SyncMirrorError::Mirror(
+            "sync mirror deletion must run on an endpoint node".to_string(),
+        ))
+    }
 }
 
 pub(crate) fn same_relationship(left: &SyncRelationship, right: &SyncRelationship) -> bool {

@@ -805,3 +805,29 @@ async fn policy_retry_survives() {
         Some("access_denied".to_string())
     );
 }
+
+#[test]
+fn routes_mirror_changes() {
+    let relationship = relationship();
+    let (source, target) = (relationship.source.node_id, relationship.target.node_id);
+    assert_eq!(
+        create_peer(&relationship, source),
+        Ok(MirrorPeer::Remote(target))
+    );
+    assert!(create_peer(&relationship, target).is_err());
+    assert_eq!(
+        delete_peer(&relationship, source, true),
+        Ok(MirrorPeer::Remote(target))
+    );
+    assert_eq!(
+        delete_peer(&relationship, target, false),
+        Ok(MirrorPeer::Remote(source))
+    );
+    assert!(delete_peer(&relationship, target, true).is_err());
+    assert!(delete_peer(&relationship, node(9), false).is_err());
+
+    let mut local = relationship.clone();
+    local.target.node_id = source;
+    assert_eq!(create_peer(&local, source), Ok(MirrorPeer::Local));
+    assert_eq!(delete_peer(&local, source, true), Ok(MirrorPeer::Local));
+}

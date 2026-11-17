@@ -22,7 +22,10 @@ use ulid::Ulid;
 use super::record::MirrorRecordOperation;
 use super::scan::ScanRepairsOperation;
 use super::settle::{RollbackClaim, SettleReconcileOperation};
-use super::{SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, SyncMirrorResult};
+use super::{
+    MirrorPeer, SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, SyncMirrorResult, create_peer,
+    delete_peer,
+};
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -181,11 +184,7 @@ async fn ensure_sync_mirror(
     relationship: &SyncRelationship,
 ) -> Result<(), SyncMirrorError> {
     relationship.validate()?;
-    if relationship.source.node_id != local_node {
-        return Err(SyncMirrorError::Mirror(
-            "sync mirror creation must run on the source node".to_string(),
-        ));
-    }
+    let peer = create_peer(relationship, local_node)?;
     let source_bucket = relationship
         .source
         .bucket()
@@ -205,14 +204,14 @@ async fn ensure_sync_mirror(
         "s3.GetObject",
     )
     .await?;
-    if relationship.target.node_id == local_node {
+    let MirrorPeer::Remote(target) = peer else {
         ensure_target_write(context, relationship).await?;
         let store = StoreRelationshipOperation::new(
             relationship.clone(),
             SyncRelationshipDirection::Incoming,
         );
         return drive(store, context).await.map(|_| ()).map_err(Into::into);
-    }
+    };
 
     let metadata_handle = context
         .metadata_handle
@@ -220,7 +219,7 @@ async fn ensure_sync_mirror(
         .ok_or_else(|| SyncMirrorError::Mirror("target unreachable".to_string()))?;
     metadata_handle
         .request_sync_create(
-            relationship.target.node_id,
+            target,
             Some(creator_token(relationship)),
             source_group_id,
             relationship.clone(),
@@ -239,7 +238,7 @@ async fn send_mirror_delete(
     rollback: bool,
 ) -> Result<(), SyncMirrorError> {
     relationship.validate()?;
-    if relationship.source.node_id == local_node && relationship.target.node_id == local_node {
+    let MirrorPeer::Remote(remote_node) = delete_peer(relationship, local_node, rollback)? else {
         if rollback {
             let delete = DeleteRelationshipOperation::new(
                 relationship.clone(),
@@ -250,16 +249,6 @@ async fn send_mirror_delete(
             delete_local_relationships(context, local_node, relationship).await?;
         }
         return Ok(());
-    }
-
-    let remote_node = if relationship.source.node_id == local_node {
-        relationship.target.node_id
-    } else if relationship.target.node_id == local_node && !rollback {
-        relationship.source.node_id
-    } else {
-        return Err(SyncMirrorError::Mirror(
-            "sync mirror deletion must run on an endpoint node".to_string(),
-        ));
     };
     let metadata_handle = context
         .metadata_handle
