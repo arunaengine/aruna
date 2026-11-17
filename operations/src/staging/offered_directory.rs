@@ -8,6 +8,7 @@ use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::staging::bucket_guard::BucketGuardError;
+use crate::staging::list_offers::{ListOffersError, ListOffersOperation};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
@@ -138,6 +139,16 @@ pub enum OfferedDirectoryError {
     Usage(#[from] UsageUpdateError),
 }
 
+impl From<ListOffersError> for OfferedDirectoryError {
+    fn from(error: ListOffersError) -> Self {
+        match error {
+            ListOffersError::Storage(error) => OfferedDirectoryError::Storage(error),
+            ListOffersError::Conversion(error) => OfferedDirectoryError::Conversion(error),
+            other => StorageError::ReadError(other.to_string()).into(),
+        }
+    }
+}
+
 impl From<BucketGuardError> for OfferedDirectoryError {
     fn from(error: BucketGuardError) -> Self {
         match error {
@@ -192,35 +203,9 @@ pub async fn offer_directory(
 pub async fn list_offers(
     context: &DriverContext,
 ) -> Result<Vec<OfferedDirectory>, OfferedDirectoryError> {
-    let mut offers = Vec::new();
-    let mut start: Option<Key> = None;
-    loop {
-        let (values, next) = match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: OFFERED_DIRECTORY_KEYSPACE.to_string(),
-                prefix: None,
-                start: start.map(IterStart::After),
-                limit: LIST_PAGE,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            _ => return Err(StorageError::ReadError("unexpected event".to_string()).into()),
-        };
-        for (_, value) in values {
-            offers.push(OfferedDirectory::from_bytes(&value)?);
-        }
-        match next {
-            Some(next) => start = Some(next),
-            None => return Ok(offers),
-        }
-    }
+    drive(ListOffersOperation::new(), context)
+        .await
+        .map_err(Into::into)
 }
 
 /// Withdraws one offer: registration first, then observations become delete

@@ -5,6 +5,7 @@
 pub mod bucket_guard;
 pub mod check_source;
 pub mod head_source;
+pub mod list_offers;
 pub mod list_source;
 pub mod native_source;
 pub mod offered_directory;
