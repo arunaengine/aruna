@@ -654,10 +654,7 @@ impl OperationsTaskHandler {
         let Some(net) = self.context.net_handle.as_ref() else {
             return;
         };
-        let drain = DrainOutboxOperation::new(DrainOutboxConfig {
-            realm_id: *net.realm_id(),
-            local: net.node_id(),
-        });
+        let drain = DrainOutboxOperation::new(*net.realm_id(), net.node_id());
         let remaining = drive(drain, self.context.as_ref()).await.unwrap_or_else(|error| {
             warn!(error = %error, "Job family outbox drain failed");
             true

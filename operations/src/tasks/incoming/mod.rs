@@ -68,7 +68,7 @@ use crate::driver::{DriverContext, drive};
 use crate::groups::backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
-use crate::jobs::lifecycle::outbox_drain::{DrainOutboxConfig, DrainOutboxOperation};
+use crate::jobs::lifecycle::outbox_drain::DrainOutboxOperation;
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, settle_terminals};
 use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
 use crate::jobs::prune::{prune_job_batch, restore_prune_timer};

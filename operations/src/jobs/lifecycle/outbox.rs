@@ -10,6 +10,7 @@ use aruna_core::effects::{
     StorageEffect,
 };
 use aruna_core::events::{Event, JobRecordEvent, NetEvent, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_OUTBOX_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -47,7 +48,6 @@ pub fn schedule_outbox_drain(after: Duration) -> Effect {
 /// Asks the drain to run now, after a record was queued for replication.
 pub async fn kick(context: &DriverContext) {
     if let Some(task) = context.task_handle.as_ref() {
-        use aruna_core::handle::Handle;
         let _ = task
             .send_effect(schedule_outbox_drain(Duration::ZERO))
             .await;
@@ -316,6 +316,33 @@ impl Operation for PublishRecordOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+/// Re-arms the replication and witness queues after a restart. Both queues are
+/// durable rows, so the timers only have to be brought back, never the work.
+pub async fn restore_lifecycle_timers(storage: &aruna_storage::StorageHandle, task_handle: &aruna_tasks::TaskHandle) {
+    let pending = crate::jobs::store::iter_prefix_page(
+        storage,
+        aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
+        None,
+        None,
+        1,
+        None,
+    )
+    .await
+    .map(|(rows, _)| !rows.is_empty())
+    .unwrap_or(false);
+    let mut timers = vec![schedule_outbox_drain(OUTBOX_RETRY_AFTER)];
+    if pending {
+        timers.push(super::witness::schedule_witness_drain(Duration::from_secs(1)));
+    }
+    for timer in timers {
+        if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
+            task_handle.send_effect(timer).await
+        {
+            warn!(message = %message, "Failed to restore a job lifecycle timer");
+        }
     }
 }
 

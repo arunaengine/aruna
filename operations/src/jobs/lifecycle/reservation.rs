@@ -25,7 +25,7 @@ use smallvec::smallvec;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::{LifecycleError, family_view};
+use super::{LifecycleError, stored_view};
 use crate::jobs::records::keys::{family_prefix, record_key};
 use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
 use crate::jobs::records::verify::{Evidence, FamilyView};
@@ -334,7 +334,7 @@ impl Operation for ReserveExecutionOperation {
         match self.state {
             ReserveState::ReadConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    match family_view(value, self.config.realm_id, self.family()) {
+                    match stored_view(value, self.config.realm_id, self.family()) {
                         Ok(view) => self.view = view,
                         Err(error) => return self.fail(error),
                     }

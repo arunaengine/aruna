@@ -14,7 +14,7 @@ use aruna_core::structs::execution::job::JobFamilyRecord;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::{Effects, Key, Value};
 
-use super::{DrainOutboxConfig, DrainOutboxOperation};
+use super::DrainOutboxOperation;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::outbox::OUTBOX_DRAIN_BATCH;
 use crate::jobs::records::keys::record_key;
@@ -112,10 +112,7 @@ fn failed() -> Event {
 }
 
 fn drain(local: u8) -> DrainOutboxOperation {
-    DrainOutboxOperation::new(DrainOutboxConfig {
-        realm_id: REALM,
-        local: node(local),
-    })
+    DrainOutboxOperation::new(REALM, node(local))
 }
 
 /// One signed spec record of `family`, its outbox key and its stored row.

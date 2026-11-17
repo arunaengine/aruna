@@ -24,17 +24,12 @@ use crate::realm::get_config::GetConfigOperation;
 
 const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DrainOutboxConfig {
-    pub realm_id: RealmId,
-    pub local: NodeId,
-}
-
 /// One drain pass. Every local failure ends the pass with "entries remain", so
 /// the timer retries later; only an event that fits no phase is an error.
 #[derive(Debug)]
 pub struct DrainOutboxOperation {
-    config: DrainOutboxConfig,
+    realm_id: RealmId,
+    local: NodeId,
     realm: Option<Box<RealmConfigDocument>>,
     entries: VecDeque<Key>,
     next_cursor: Option<Key>,
@@ -57,9 +52,11 @@ enum Phase {
 }
 
 impl DrainOutboxOperation {
-    pub fn new(config: DrainOutboxConfig) -> Self {
+    /// One pass of `local`, a node of realm `realm_id`.
+    pub fn new(realm_id: RealmId, local: NodeId) -> Self {
         Self {
-            config,
+            realm_id,
+            local,
             realm: None,
             entries: VecDeque::new(),
             next_cursor: None,
@@ -149,7 +146,7 @@ impl DrainOutboxOperation {
                 return self.next_entry();
             }
         };
-        let local = self.config.local;
+        let local = self.local;
         let holders: Vec<NodeId> = resolve_shard_holders(realm, &placement)
             .into_iter()
             .filter(|holder| *holder != local)
@@ -163,7 +160,7 @@ impl DrainOutboxOperation {
             })];
         }
         let mut publish = PublishRecordOperation::new(PublishRecordConfig {
-            realm_id: self.config.realm_id,
+            realm_id: self.realm_id,
             placement,
             holders,
             record: Box::new(frame),
@@ -212,7 +209,7 @@ impl Operation for DrainOutboxOperation {
     type Error = LifecycleError;
 
     fn start(&mut self) -> Effects {
-        let mut config = GetConfigOperation::new(self.config.realm_id);
+        let mut config = GetConfigOperation::new(self.realm_id);
         let effects = config.start();
         self.phase = Phase::Config(config);
         effects

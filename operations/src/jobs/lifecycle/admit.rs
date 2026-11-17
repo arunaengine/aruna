@@ -23,7 +23,7 @@ use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::{debug, warn};
 
-use super::{LifecycleError, family_view};
+use super::{LifecycleError, stored_view};
 use super::ids::workspace_of;
 use crate::jobs::records::keys::{alias_key, family_prefix, record_key, submission_prefix};
 use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
@@ -380,7 +380,7 @@ impl Operation for AdmitSubmissionOperation {
         match self.state {
             AdmitState::ReadConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    match family_view(value, self.config.realm_id, self.family()) {
+                    match stored_view(value, self.config.realm_id, self.family()) {
                         Ok(view) => self.view = view,
                         Err(error) => return self.fail(error),
                     }
