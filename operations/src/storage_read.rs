@@ -95,7 +95,7 @@ pub(crate) fn scan_pages<'a>(
                     next_start_after,
                 }) => Ok(Some((values, next_start_after.map(Some)))),
                 Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-                other => Err(format!("unexpected iter event: {other:?}")),
+                _ => Err("unexpected iter event".to_string()),
             }
         }
     })

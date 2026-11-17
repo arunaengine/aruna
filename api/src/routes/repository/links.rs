@@ -17,9 +17,8 @@ use aruna_operations::harvest::read_connector::{
 };
 use aruna_operations::jobs::repository::check::{RequirementCheck, check_requirements};
 use aruna_operations::jobs::repository::link_queue::owner_holds;
-use aruna_operations::jobs::repository::links::{
-    LinkChange, LinkError, change_link, list_links, read_link,
-};
+use aruna_operations::jobs::repository::link_store::{change_link, list_links, read_link};
+use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token, supports};
 use axum::Json;
 use axum::extract::{Path, State};

@@ -646,7 +646,9 @@ impl CreateDocumentOperation {
             );
             job.workspace_mode = WorkspaceMode::None;
             job.retention_ms = RETENTION_MS;
-            writes.extend(crate::jobs::store::job_insert_entries(&job)?);
+            writes.extend(aruna_core::structs::execution::job::job_insert_entries(
+                &job,
+            )?);
 
             let route = mapping_route_for(
                 realm_config,

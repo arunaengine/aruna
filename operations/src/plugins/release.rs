@@ -4,54 +4,39 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::compute::SecretBytes;
-use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall, SecretBinding};
+use aruna_core::plugins::{Refusal, ReleaseError, ReleaseRequest, Released};
+use aruna_core::realm_vault::{RealmSealKey, RealmVaultKey};
 use aruna_core::request_policy::PolicyRequest;
 use aruna_core::secrets::{
-    Delivery, ResponseExposure, SecretConsumer, SecretKind, SecretName, SecretScope,
-    SecretSettings, UseRequest, check_use,
+    Delivery, SecretConsumer, SecretName, SecretScope, UseRequest, check_use,
 };
 use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, SecretAudit, SecretUse};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 use url::Url;
 
 use super::account::{owned, read_user};
-pub use super::bound::{Refusal, ReleaseError, ReleaseKeys};
+use super::bound::ReleaseKeys;
 use super::bound::{Selected, open, select, slot_kind};
 use super::grants::InstallScope;
-use super::store::Txn;
+use super::rows::write_rows;
 use crate::auth::request_policy::PolicyEvaluator;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
-/// What a run asks of the secret bound to one slot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReleaseRequest {
-    pub install_id: Ulid,
-    pub slot: String,
-    pub delivery: Delivery,
-    /// The method and URL of the outgoing request, for `inject`.
-    pub target: Option<(String, String)>,
-    /// The value write id the receiver holds already; its fields are not sent again.
-    pub held: Option<Ulid>,
-    pub run_id: Option<Ulid>,
+/// The realm keys this node releases group and realm secrets with, if it holds them.
+pub(crate) fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
+    (ctx.metadata_handle.as_ref())
+        .map(|handle| ReleaseKeys {
+            seal: handle.realm_seal_key(),
+            vault: handle.realm_vault_key(),
+        })
+        .unwrap_or_default()
 }
 
-/// A released secret; `fields` is absent when the receiver holds this value already.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Released {
-    pub kind: SecretKind,
-    pub settings: SecretSettings,
-    pub exposure: ResponseExposure,
-    pub value_id: Ulid,
-    pub fields: Option<SecretBytes>,
-}
-
-pub fn delivery_name(delivery: Delivery) -> &'static str {
+pub(crate) fn delivery_name(delivery: Delivery) -> &'static str {
     match delivery {
         Delivery::Inject => "inject",
         Delivery::Verify => "verify",
@@ -60,7 +45,7 @@ pub fn delivery_name(delivery: Delivery) -> &'static str {
 }
 
 /// The permission path a `secret.use` policy decides on.
-pub fn secret_path(
+pub(crate) fn secret_path(
     realm_id: RealmId,
     scope: SecretScope,
     name: &SecretName,
@@ -219,15 +204,10 @@ impl Audit<'_> {
         };
         let record = AdminAuditRecord::for_use(self.install, secret, used);
         let unavailable = |error: String| ReleaseError::Unavailable(error);
-        let rows = (record
+        let rows = record
             .entries()
-            .map_err(|error| unavailable(error.to_string()))?)
-        .into_iter()
-        .map(|(_, key, value)| (key.to_vec(), value.to_vec()))
-        .collect();
-        let written = Txn::direct(self.ctx)
-            .write(ADMIN_AUDIT_KEYSPACE, rows)
-            .await;
+            .map_err(|error| unavailable(error.to_string()))?;
+        let written = drive(write_rows(rows), self.ctx).await;
         written.map_err(|error| unavailable(error.to_string()))
     }
 
@@ -240,16 +220,18 @@ impl Audit<'_> {
     }
 }
 
-/// The management side of a release request from an infrastructure peer.
+/// The management side of a release request from an infrastructure peer, with the realm keys a
+/// management node opens group and realm secrets with.
 pub(crate) async fn serve_release(
     ctx: &DriverContext,
-    keys: ReleaseKeys,
+    (seal, vault): (Option<Arc<RealmSealKey>>, Option<Arc<RealmVaultKey>>),
     peer: NodeId,
     request: ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
     let local = super::artifacts::local_config(ctx).await;
     let local = local.map_err(|error| ReleaseError::Unavailable(format!("{error:?}")))?;
     let (config, local) = local;
+    let keys = ReleaseKeys { seal, vault };
     release(ctx, &keys, (&config, local, peer), &request).await
 }
 

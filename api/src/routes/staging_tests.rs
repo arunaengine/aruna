@@ -5,9 +5,7 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::openapi::ApiDoc;
-use crate::tests::routes::{
-    seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
-};
+use crate::tests::routes::{seed_realm_auth, seed_realm_config, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -32,6 +30,7 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
+use aruna_operations::testing::test_context;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -396,7 +395,7 @@ async fn batch_rejects_cap() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: None,
@@ -422,7 +421,7 @@ async fn batch_rejects_node() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: Some(other_node.to_string()),
@@ -510,7 +509,7 @@ async fn batch_sync_unimplemented() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: None,
@@ -1208,7 +1207,7 @@ mod distributed {
         blocking.table = table("{url|basename}");
         let refused = stage_batch(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Json(blocking),
         )
         .await;
@@ -1221,7 +1220,7 @@ mod distributed {
         let run = |request: StageBatchRequest| {
             stage_batch(
                 State(node.state.clone()),
-                Extension(Some(node.owner.clone())),
+                RealmAuth(node.owner.clone()),
                 Json(request),
             )
         };

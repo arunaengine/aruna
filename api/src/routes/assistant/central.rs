@@ -8,7 +8,6 @@ use super::{
     parse_json, parse_provider_kind, provider_base_url, provider_summary,
 };
 use crate::auth::UnrestrictedAuth;
-use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::routes::info::is_realm_admin;
@@ -28,11 +27,11 @@ use aruna_operations::assistant::central::{
     CentralRead, CentralStoreError, ChargeUsageOperation, GetCentralOperation, SetCentralOperation,
 };
 use aruna_operations::driver::drive;
+use axum::Json;
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
@@ -267,10 +266,9 @@ refused.
 )]
 pub async fn get_central(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<CentralResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (central, usage) = load_central(&state, auth.user_id).await?;
     let central = central.ok_or(ServerError::NotFound)?;
     let admin = is_realm_admin(&state, &auth).await?;

@@ -222,7 +222,7 @@ pub fn describe_pack(pack: &Bytes) -> Result<GitPack, GitError> {
             MAX_PACK_BYTES >> 20
         )));
     }
-    let hashes = aruna_blob::hash::Hasher::new_with_bytes(pack).to_map();
+    let hashes = aruna_core::structs::checksum::Hasher::new_with_bytes(pack).to_map();
     let sha256 = hashes
         .get("sha256")
         .map(hex::encode)
@@ -338,7 +338,7 @@ pub async fn mark_imported(
     (document_id, actor): (ulid::Ulid, aruna_core::UserId),
     pack: &GitPack,
 ) {
-    let Some(store) = context.blob_handle.as_ref().and_then(|handle| handle.git()) else {
+    let Ok(store) = super::store(context) else {
         return;
     };
     let effect = aruna_core::git::GitEffect::MarkImported {

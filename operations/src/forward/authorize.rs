@@ -26,29 +26,19 @@ use tracing::warn;
 use ulid::Ulid;
 
 pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
-    configured_kind(config, node_id).is_some_and(RealmNodeKind::is_sync_eligible)
+    config
+        .node_kind(&node_id)
+        .is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
 /// A User peer is owner-bound: it may forward only for the owner its realm
 /// config names, whatever token it managed to present. Other kinds are not
 /// owner-bound, so any authenticated caller may travel through them.
 pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
-    match configured_kind(config, peer).and_then(RealmNodeKind::owner) {
+    match config.node_kind(&peer).and_then(RealmNodeKind::owner) {
         Some(owner) => owner == user_id,
         None => true,
     }
-}
-
-pub(super) fn configured_kind(
-    config: &RealmConfigDocument,
-    node_id: NodeId,
-) -> Option<&RealmNodeKind> {
-    let node_id = node_id.to_string();
-    config
-        .nodes
-        .iter()
-        .find(|node| node.node_id == node_id)
-        .map(|node| &node.kind)
 }
 
 pub(crate) async fn authorize_forwarded_pid(

@@ -19,9 +19,9 @@ use tracing::debug;
 
 use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
-use crate::jobs::records::keys::submission_prefix;
 use crate::metadata::api::load_realm_config;
 use crate::placement::resolve_shard_holders;
+use aruna_core::structs::execution::job::record_keys::submission_prefix;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PageReadError {
@@ -62,12 +62,12 @@ pub async fn store_pages(
     };
     match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(PageReadError::Storage(format!("{other:?}"))),
+        other => Err(PageReadError::Storage(other.label().to_string())),
     }
 }
 
 /// The page this node keeps under `digest`, checked against that digest.
-pub async fn local_page(
+async fn local_page(
     context: &DriverContext,
     submission: &SubmissionId,
     digest: &[u8; 32],
@@ -79,7 +79,7 @@ pub async fn local_page(
     };
     let bytes = match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => return Err(PageReadError::Storage(format!("{other:?}"))),
+        other => return Err(PageReadError::Storage(other.label().to_string())),
     };
     let Some(bytes) = bytes else {
         return Ok(None);
@@ -297,7 +297,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::testing::test_context;
+    use crate::tests::s3::test_storage;
 
     fn submission() -> SubmissionId {
         SubmissionId([3; 32])

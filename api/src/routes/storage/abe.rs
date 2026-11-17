@@ -4,9 +4,10 @@
 
 mod content;
 mod records;
+use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::lookup::{copy_miss, read_holders, relay_read};
+use crate::routes::storage::relay::{copy_miss, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
@@ -119,7 +120,7 @@ fn version_path(route: &str, query: &VersionQuery) -> String {
         ("key", &query.key),
         ("version_id", &query.version_id),
     ];
-    crate::lookup::query_path(route, &pairs)
+    crate::routes::storage::relay::query_path(route, &pairs)
 }
 async fn read_envelope(
     state: &ServerState,
@@ -149,12 +150,11 @@ async fn read_envelope(
         (status = 503, body = ErrorResponse, description = "Storage unavailable, or no holder of the key's range answered")), security(("bearer_auth" = [])))]
 pub async fn envelope(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Query(query): Query<VersionQuery>,
 ) -> ServerResult<Json<EnvelopeView>> {
-    let auth = crate::auth::require_realm_auth(&state, auth)?;
     let (version, info) = authorize_version(&state, &auth, &query).await?;
     let path = version_path("/data/blobs/envelope", &query);
     if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {

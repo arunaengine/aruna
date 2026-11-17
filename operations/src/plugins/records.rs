@@ -76,7 +76,7 @@ pub enum RecordError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -249,7 +249,7 @@ impl InstallEntryOperation {
         cleanup
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(RecordError::UnexpectedEvent {
             state,
@@ -260,7 +260,7 @@ impl InstallEntryOperation {
 
     fn handle_auth(&mut self, event: Event) -> Effects {
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected("authorization result", format!("{event:?}"));
+            return self.unexpected("authorization result", event.label());
         };
         match allowed {
             Ok(true) => {
@@ -294,7 +294,7 @@ impl InstallEntryOperation {
                 })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected("storage batch write result", format!("{other:?}")),
+            other => self.unexpected("storage batch write result", other.label()),
         }
     }
 }
@@ -327,13 +327,15 @@ impl Operation for InstallEntryOperation {
                     self.emit_read(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start result", format!("{other:?}")),
+                other => self.unexpected("transaction start result", other.label()),
             },
             RecordState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document), (_, state)] = values.as_slice() else {
-                        return self
-                            .unexpected("realm config and reducer state", format!("{values:?}"));
+                        return self.unexpected(
+                            "realm config and reducer state",
+                            "StorageEvent::BatchReadResult",
+                        );
                     };
                     match self.emit_write(document.clone(), state.clone()) {
                         Ok(effects) => effects,
@@ -341,13 +343,13 @@ impl Operation for InstallEntryOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch read result", format!("{other:?}")),
+                other => self.unexpected("storage batch read result", other.label()),
             },
             RecordState::WriteState { stale } => self.handle_written(event, stale),
             RecordState::DeleteConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch delete result", format!("{other:?}")),
+                other => self.unexpected("storage batch delete result", other.label()),
             },
             RecordState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -359,7 +361,7 @@ impl Operation for InstallEntryOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected("transaction commit result", format!("{other:?}")),
+                other => self.unexpected("transaction commit result", other.label()),
             },
             RecordState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -371,7 +373,7 @@ impl Operation for InstallEntryOperation {
                     self.state = RecordState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected("outbox drain timer schedule", format!("{other:?}")),
+                other => self.unexpected("outbox drain timer schedule", other.label()),
             },
             RecordState::Finish | RecordState::Error | RecordState::Init => smallvec![],
         }

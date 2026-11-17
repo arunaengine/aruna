@@ -12,52 +12,21 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_SECRETS_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
+use aruna_core::plugins::{NodeCheckError, Refusal, ReleaseError};
 use aruna_core::realm_vault::{RealmSealKey, RealmSecretRef, RealmVaultKey, RealmVaultRecord};
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings, UseRule};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_plugins::trigger::TriggerKind;
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::entry::ReadEntry;
 use super::install::{pick_version, read_manifest};
-use super::store::Txn;
-use crate::driver::DriverContext;
+use super::rows::read_rows;
+use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
 use crate::secrets::node::{record_key, value_entry};
-use crate::secrets::owner::{EntryReader, open_value};
-
-/// The step of the use check that refused a release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Refusal {
-    Peer,
-    Binding,
-    Entry,
-    Rule,
-    Authority,
-    Policy,
-}
-
-impl Refusal {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Peer => "peer",
-            Self::Binding => "binding",
-            Self::Entry => "entry",
-            Self::Rule => "rule",
-            Self::Authority => "authority",
-            Self::Policy => "policy",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-pub enum ReleaseError {
-    #[error("the use of the secret was refused at the {} check", .0.as_str())]
-    Refused(Refusal),
-    #[error("the secret cannot be released now: {0}")]
-    Unavailable(String),
-}
+use crate::secrets::owner::open_value;
 
 /// The realm keys a management node opens group and realm secrets with.
 #[derive(Clone, Default)]
@@ -84,7 +53,7 @@ pub enum Sealed {
 }
 
 /// The kind the install's manifest declares for `slot`.
-pub fn slot_kind(
+pub(crate) fn slot_kind(
     config: &RealmConfigDocument,
     install: &PluginInstall,
     slot: &str,
@@ -111,8 +80,9 @@ pub async fn select(
 ) -> Result<Option<Selected>, ReleaseError> {
     if binding.scope == BoundScope::Node {
         let key = record_key(&binding.name);
-        let row = Txn::direct(ctx).read(NODE_SECRETS_KEYSPACE, &key).await;
+        let row = drive(read_rows(vec![(NODE_SECRETS_KEYSPACE, key)]), ctx).await;
         let row = row.map_err(|error| ReleaseError::Unavailable(error.to_string()))?;
+        let row = row.into_iter().next().flatten();
         let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
         return Ok(record.map(|record| Selected {
             kind: record.kind,
@@ -169,22 +139,8 @@ pub(crate) async fn read_entry(
     owner: &SecretOwner,
     name: &SecretName,
 ) -> Result<Option<SecretEntry>, ReleaseError> {
-    let unavailable = |error: String| ReleaseError::Unavailable(error);
-    let mut reader = EntryReader::new(realm_id, owner, name);
-    let mut effect = reader.start(None);
-    loop {
-        let aruna_core::effects::Effect::Storage(storage) = effect else {
-            return Err(unavailable(
-                "the reader asked for a non-storage effect".into(),
-            ));
-        };
-        let event = ctx.storage_handle.send_storage_effect(storage).await;
-        match reader.step(event, None) {
-            Ok(Some(next)) => effect = next,
-            Ok(None) => return Ok(reader.entry().filter(SecretEntry::complete)),
-            Err(error) => return Err(unavailable(error.to_string())),
-        }
-    }
+    let read = drive(ReadEntry::new(realm_id, owner, name), ctx).await;
+    read.map_err(|error| ReleaseError::Unavailable(error.to_string()))
 }
 
 pub async fn open(
@@ -216,7 +172,7 @@ pub async fn open(
                     secret: Some(secret),
                     ..
                 }) => Ok(secret),
-                other => Err(failed(format!("the node vault answered {other:?}"))),
+                other => Err(failed(format!("the node vault answered {}", other.label()))),
             }
         }
     }
@@ -239,7 +195,7 @@ pub struct BindPlace {
 /// The bindings of every slot the manifest declares, from `requested` (slot to `scope:name`)
 /// or the same name in the group, each checked where it lives; and the warnings for slots whose
 /// use rule a realm admin must add.
-pub async fn bind_slots(
+pub(crate) async fn bind_slots(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     place: BindPlace,
@@ -323,7 +279,7 @@ pub async fn bind_slots(
 
 /// Whether the webhook that `slot` verifies reads its delivery id from the header the secret
 /// checks, so the id would carry the credential. Install and receiver both refuse it.
-pub fn delivery_clash(
+pub(crate) fn delivery_clash(
     manifest: &aruna_plugins::manifest::Manifest,
     slot: &str,
     settings: &SecretSettings,
@@ -343,30 +299,17 @@ pub enum BindError {
     Unavailable(String),
 }
 
-/// Why a node binding does not fit its slot on the install's receiver.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-pub enum NodeCheckError {
-    #[error("the receiver has no node secret of this name")]
-    Missing,
-    #[error("the node secret has another kind than the slot")]
-    OtherKind,
-    #[error("only a server node of the realm may ask")]
-    Forbidden,
-    #[error("the receiver did not answer")]
-    Unavailable,
-}
-
 /// Whether this node holds the node secret `name` with `kind`; answers the header its `header`
 /// setting names, in lowercase. Never the value.
-pub async fn node_secret_fits(
+pub(crate) async fn node_secret_fits(
     ctx: &DriverContext,
     name: &SecretName,
     kind: &SecretKind,
 ) -> Result<Option<String>, NodeCheckError> {
-    let row = Txn::direct(ctx)
-        .read(NODE_SECRETS_KEYSPACE, &record_key(name))
-        .await;
+    let read = vec![(NODE_SECRETS_KEYSPACE, record_key(name))];
+    let row = drive(read_rows(read), ctx).await;
     let row = row.map_err(|_| NodeCheckError::Unavailable)?;
+    let row = row.into_iter().next().flatten();
     let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
     match record {
         None => Err(NodeCheckError::Missing),
@@ -380,7 +323,7 @@ pub async fn node_secret_fits(
 
 /// Checks a node binding where it lives: on `receiver`, here or over the metadata transport;
 /// answers the secret's checked header as [`node_secret_fits`] does.
-pub async fn check_node_binding(
+pub(crate) async fn check_node_binding(
     ctx: &DriverContext,
     (local, receiver): (NodeId, NodeId),
     name: &SecretName,

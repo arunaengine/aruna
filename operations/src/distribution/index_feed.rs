@@ -11,10 +11,10 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_index::{IndexEffect, IndexEvent};
 use aruna_core::keyspaces::SEARCH_INDEX_KEYSPACE;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_core::types::Key;
 use aruna_storage::key_index::RangeIndexes;
+use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 use ulid::Ulid;
 

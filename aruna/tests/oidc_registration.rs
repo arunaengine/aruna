@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_api::auth::OidcValidator;
-use aruna_api::routes::users::RegisterUserResponse;
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_core::UserId;
@@ -26,6 +25,7 @@ use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_wire::users::RegisterUserResponse;
 use axum::Json;
 use axum::extract::State;
 use axum::routing::get;
@@ -205,7 +205,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         compute_handle: None,
     });
     initialize_incoming_fixture(context.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
+    let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
         task_handle,

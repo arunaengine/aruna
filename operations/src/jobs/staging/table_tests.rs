@@ -240,7 +240,7 @@ impl Fixture {
             lease_expires_ms: u64::MAX,
         });
         let storage = &self.driver.storage_handle;
-        crate::jobs::store::insert_job(storage, &record)
+        crate::jobs::store::query::insert_job(storage, &record)
             .await
             .unwrap();
         JobContext {

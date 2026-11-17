@@ -86,14 +86,17 @@ pub fn enforced_limit(
     }
 }
 
-/// Wall-clock milliseconds every backend stamps its attempt evidence with.
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
+/// What a backend offers whose attempts run on the controller host with an open channel.
+#[cfg(any(all(feature = "apptainer", unix), feature = "docker"))]
+pub(crate) fn host_capabilities(limits: ResourceEnvelope) -> BackendCaps {
+    BackendCaps {
+        file_staging: true,
+        direct_s3: true,
+        local_site: true,
+        session: true,
+        limits,
+        ..BackendCaps::default()
+    }
 }
 
 #[cfg(any(feature = "apptainer", feature = "docker", feature = "kubernetes"))]

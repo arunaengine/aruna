@@ -44,7 +44,7 @@ use crate::driver::{
 };
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::source_read::{SourceReadError, authorize_read};
-use crate::jobs::store::reserve_output_commits;
+use crate::jobs::store::attempt::reserve_output_commits;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
@@ -1530,7 +1530,7 @@ fn source_input_error(error: GetObjectError) -> JobError {
         &error,
         GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(_)))
     ) {
-        return JobError::retryable(format!("{LOCKED_INPUT}: {error}"));
+        return JobError::locked(format!("{LOCKED_INPUT}: {error}"));
     }
     let message = format!("input read failed: {error}");
     if get_input_retryable(&error) {
@@ -1955,7 +1955,7 @@ mod tests {
         ));
         let error = source_input_error(locked);
         assert_eq!(error.kind, JobErrorKind::Retryable);
-        assert!(error.message.starts_with(LOCKED_INPUT));
+        assert!(error.locked);
     }
 
     // Transient fjall faults now carry their source; classification must key on
@@ -2510,7 +2510,7 @@ mod tests {
             lease_expires_ms: u64::MAX,
         });
         let storage = &context.storage_handle;
-        crate::jobs::store::insert_job(storage, &record)
+        crate::jobs::store::query::insert_job(storage, &record)
             .await
             .unwrap();
         let pin = SourcePin {
@@ -2519,7 +2519,8 @@ mod tests {
             source_version: None,
         };
         let stored = || async {
-            let read = crate::jobs::store::read_job_record(storage, record.job_id, None).await;
+            let read =
+                crate::jobs::store::state::read_job_record(storage, record.job_id, None).await;
             read.unwrap().unwrap().captured_inputs[0].served_by.clone()
         };
         let served = BTreeMap::from([("inputs/in.txt".to_string(), pin.clone())]);

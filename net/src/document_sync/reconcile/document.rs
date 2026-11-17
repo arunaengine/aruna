@@ -5,8 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ::irokle::{Event as _, Storage as _};
-use aruna_core::document::{DocumentEvent, DocumentReconcileResult, DocumentTarget};
-use aruna_core::effects::StorageEffect;
+use aruna_core::document::{
+    BatchEvent, DocumentEvent, DocumentReconcileResult, DocumentTarget, ReconcileBatch,
+};
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE};
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::{
@@ -14,13 +15,14 @@ use aruna_core::storage_entries::{
     create_projection_entries, shard_manifest_entry, sync_revision_entry,
 };
 use aruna_core::structs::SyncQuarantineIdentity;
+use aruna_core::sync_checks::{EventScreen, screen_event};
 use aruna_core::types::Value;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_sync::storage::{
-    replace_batch_in, start_storage_transaction, transaction_read,
+    abort_txn, replace_batch_in, start_storage_transaction, transaction_read,
 };
 use crate::document_sync::{
     DeferredRegistrationOutcome, DocumentSyncDependency, DocumentSyncService, FRAME_LEN_LIMIT,
@@ -33,22 +35,10 @@ use super::cursor::{
     applied_cursor_clock, applied_cursor_value, deferred_topics_key, topic_cursor_key,
 };
 use super::registry::{
-    create_fence_txn, event_is_create, lifecycle_stale_txn, registry_identity_matches,
-    same_create_event, transaction_placement_fence, validate_metadata_event,
+    create_fence_txn, lifecycle_stale_txn, same_create_event, transaction_placement_fence,
+    validate_metadata_event,
 };
 use super::{dependency_available, register_deferred_topic, remove_deferred_topic};
-
-/// One bounded causal batch with the topic identity and cursor it was read
-/// under. The cursor is already advanced past the batch.
-struct ReconcileBatch {
-    genesis: ::irokle::OpId,
-    /// The cursor the batch starts from, where an overflow replay resumes.
-    start: ::irokle::ActorClock,
-    cursor_key: ByteView,
-    cursor: ::irokle::ActorClock,
-    rejections: Vec<SyncRejection>,
-    events: Vec<(DocumentEvent, ::irokle::ActorId, u64)>,
-}
 
 /// Topics still to reconcile plus the persisted dependency registry that gates
 /// them. Already-satisfied dependencies are resolved once per pass, so a
@@ -85,8 +75,8 @@ impl DocumentSyncService {
                 continue;
             };
             let genesis = batch.genesis;
-            let cursor = batch.cursor.clone();
             let cursor_key = batch.cursor_key.clone();
+            let value = batch.cursor_value.clone();
             let start = batch.start.clone();
             let mut outcome = self.apply_reconcile_batch(topic_id, batch).await?;
             if outcome.overflowed {
@@ -113,7 +103,6 @@ impl DocumentSyncService {
                 // unresolved topic is safe to mark as applied.
                 continue;
             }
-            let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
             if outcome.deferred_creates {
                 deferred_rejections.append(&mut outcome.rejections);
                 deferred_cursor_writes.push((
@@ -255,13 +244,26 @@ impl DocumentSyncService {
         if batch.cursor == cursor {
             return Ok(None);
         }
+        let cursor_value =
+            applied_cursor_value(self.node.storage(), topic_id, genesis, &batch.cursor)?;
+        let policies = self.shard_publishers.read();
+        let policy = policies.get(&topic_id);
+        let events = (batch.events.into_iter())
+            .map(|(event, actor, actor_seq)| BatchEvent {
+                publisher_allowed: policy.is_none_or(|policy| policy.allows(&actor, actor_seq)),
+                event,
+                actor,
+                actor_seq,
+            })
+            .collect();
+        drop(policies);
         Ok(Some(ReconcileBatch {
             genesis,
             start: cursor,
             cursor_key,
-            cursor: batch.cursor,
+            cursor_value,
             rejections: batch.rejections,
-            events: batch.events,
+            events,
         }))
     }
 
@@ -271,7 +273,13 @@ impl DocumentSyncService {
         batch: ReconcileBatch,
     ) -> Result<BatchOutcome> {
         let mut state = BatchState::new(batch.rejections);
-        for (event, actor_id, actor_seq) in batch.events {
+        for BatchEvent {
+            event,
+            actor: actor_id,
+            actor_seq,
+            publisher_allowed,
+        } in batch.events
+        {
             let identity = SyncQuarantineIdentity {
                 topic: topic_id,
                 actor: actor_id,
@@ -282,43 +290,17 @@ impl DocumentSyncService {
             if !is_config_candidate(&event) {
                 state.flush_config(&self.storage).await?;
             }
-            if self
-                .shard_publishers
-                .read()
-                .get(&topic_id)
-                .is_some_and(|policy| !policy.allows(&actor_id, actor_seq))
-            {
-                warn!(
-                    %topic_id,
-                    %actor_id,
-                    "Rejecting shard event from a publisher outside the current holder set"
-                );
-                state.add_rejection(SyncRejection::new(
-                    identity,
-                    event,
-                    "shard publisher is outside the current holder set",
-                ));
-                continue;
-            }
             let target_topic_id = event
                 .target()
                 .sync_topic_id(self.realm_id, &event.placement());
-            if target_topic_id != topic_id {
-                // Heartbeats left on the retired node info topic are republished, so drop them.
-                if matches!(event.target(), DocumentTarget::NodeInfo { .. }) {
+            match screen_event(topic_id, target_topic_id, event.target(), publisher_allowed) {
+                EventScreen::Apply => {}
+                EventScreen::Drop => continue,
+                EventScreen::Reject(reason) => {
+                    warn!(%topic_id, %actor_id, %target_topic_id, reason, "Rejecting a document sync event");
+                    state.add_rejection(SyncRejection::new(identity, event, reason));
                     continue;
                 }
-                warn!(
-                    %topic_id,
-                    %target_topic_id,
-                    "Skipping document sync event whose target does not match its topic"
-                );
-                state.add_rejection(SyncRejection::new(
-                    identity,
-                    event,
-                    "event target does not match its topic",
-                ));
-                continue;
             }
             apply_batch_event(self, topic_id, actor_id, identity, event, &mut state).await?;
         }
@@ -380,7 +362,7 @@ impl DocumentSyncService {
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
                 );
             }
-            if event_is_create(&apply.record) {
+            if apply.record.is_create() {
                 entries.push(
                     create_acceptance_entry(&apply.record)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -399,10 +381,7 @@ impl DocumentSyncService {
             let fenced = match create_fence_txn(&self.storage, &apply.record, txn_id).await {
                 Ok(fenced) => fenced,
                 Err(error) => {
-                    let _ = self
-                        .storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(&self.storage, txn_id).await;
                     return Err(error);
                 }
             };
@@ -415,10 +394,7 @@ impl DocumentSyncService {
                     {
                         Ok(stale) => stale,
                         Err(error) => {
-                            let _ = self
-                                .storage
-                                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                                .await;
+                            let _ = abort_txn(&self.storage, txn_id).await;
                             return Err(error);
                         }
                     };
@@ -439,10 +415,7 @@ impl DocumentSyncService {
                 {
                     Ok(logged) => logged.is_some(),
                     Err(error) => {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(error);
                     }
                 } {
@@ -488,10 +461,7 @@ impl DocumentSyncService {
                     continue;
                 }
                 Err(error) => {
-                    let _ = self
-                        .storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(&self.storage, txn_id).await;
                     return Err(error);
                 }
             };
@@ -509,10 +479,7 @@ impl DocumentSyncService {
                 {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(error);
                     }
                 };
@@ -523,35 +490,26 @@ impl DocumentSyncService {
                 {
                     Ok(event) => event,
                     Err(error) => {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(NetError::Bootstrap(error.to_string()));
                     }
                 };
                 if let Some(event) = &event {
-                    if !event_is_create(event) {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                    if !event.is_create() {
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(NetError::Bootstrap(
                             "metadata create acceptance contains a non-create event".to_string(),
                         ));
                     }
                     if let Err(error) = validate_metadata_event(event) {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(error);
                     }
                     create_acceptances.insert(document_id, event.clone());
                 }
                 event
             };
-            if event_is_create(&apply.record) {
+            if apply.record.is_create() {
                 if accepted_create
                     .as_ref()
                     .is_some_and(|accepted| !same_create_event(accepted, &apply.record))
@@ -579,9 +537,10 @@ impl DocumentSyncService {
                 );
                 deferred_cursor_topics.insert(apply.identity.topic);
                 continue;
-            } else if accepted_create.as_ref().is_some_and(|accepted| {
-                !registry_identity_matches(&accepted.record, &apply.record.record)
-            }) {
+            } else if accepted_create
+                .as_ref()
+                .is_some_and(|accepted| !accepted.record.same_identity(&apply.record.record))
+            {
                 warn!(
                     topic_id = %apply.identity.topic,
                     %document_id,
@@ -607,7 +566,7 @@ impl DocumentSyncService {
                 deferred_cursor_topics.extend(rejections.iter().map(|reject| reject.topic_id()));
             }
             Err(error) => {
-                self.abort_transaction(txn_id).await;
+                let _ = abort_txn(&self.storage, txn_id).await;
                 return Err(error);
             }
         }
@@ -615,10 +574,7 @@ impl DocumentSyncService {
             (!deferred_cursor_topics.contains(&topic_id)).then_some(write)
         }));
         if let Err(error) = replace_batch_in(&self.storage, txn_id, Vec::new(), writes).await {
-            let _ = self
-                .storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(&self.storage, txn_id).await;
             return Err(error);
         }
         for apply in accepted {

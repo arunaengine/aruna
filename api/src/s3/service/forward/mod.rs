@@ -375,7 +375,7 @@ fn coordinator_error(forward: &Forward, status: http::StatusCode, body: &str) ->
 
 /// The body of a node's answer; a broken or oversized body is an error, never an empty answer.
 pub(super) async fn answer_text(response: reqwest::Response) -> S3Result<String> {
-    match crate::lookup::capped_body(response).await {
+    match crate::routes::storage::relay::capped_body(response).await {
         Ok(body) => String::from_utf8(body)
             .map_err(|_| s3_error!(ServiceUnavailable, "A member answered with invalid text")),
         Err(error) => Err(s3_error!(

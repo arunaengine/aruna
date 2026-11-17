@@ -19,12 +19,12 @@ use super::walk::{PageFailure, directory_list_path, first_key, target_of, walk_p
 use super::{checkpoint_key, persist_rows};
 use crate::driver::DriverContext;
 use crate::jobs::executor::JobContext;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 
 /// Lanes one job walks at the same time. Each lane holds at most one listed page ahead, so a
 /// job holds a bounded number of pages whatever the source holds.
-pub(super) const LANE_LIMIT: usize = 4;
+const LANE_LIMIT: usize = 4;
 /// Slots per spec prefix: lane `slot` walks part `slot % PARTS` of prefix `slot / PARTS`.
 const PARTS: u64 = LANE_LIMIT as u64;
 /// One-key listings that split one prefix, whatever its key space looks like.
@@ -896,7 +896,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::insert_job(&ctx.driver.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&ctx.driver.storage_handle, &record)
             .await
             .unwrap();
         JobContext {
@@ -1038,7 +1038,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::insert_job(&driver.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&driver.storage_handle, &record)
             .await
             .unwrap();
         let ctx = JobContext {

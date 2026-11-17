@@ -17,13 +17,15 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::{ExecutorBackend, now_ms};
-use events::{BudgetVerdict, CellBudget, EventRing, SessionEvent};
+use crate::executor::ExecutorBackend;
+use aruna_core::time::unix_timestamp_millis;
+use events::{BudgetVerdict, CellBudget, EventRing};
 
-pub use aruna_core::compute::session::{
-    CellPhase, EndReason, EventKind, HelperEvent, HelperRequest, MAX_CELL_BYTES, MAX_ID_LEN,
-    MAX_QUEUED_CELLS, MAX_RING_EVENTS, MAX_SCRATCH_BYTES, MAX_SUBMITS, MAX_TRACKED_CELLS,
-    SUBMIT_WINDOW, SessionError, SessionPhase,
+use aruna_core::compute::session::{
+    CellPhase, CellSnapshot, EndReason, EventKind, HelperEvent, HelperRequest, MAX_CELL_BYTES,
+    MAX_ID_LEN, MAX_QUEUED_CELLS, MAX_SCRATCH_BYTES, MAX_SUBMITS, MAX_TRACKED_CELLS, PendingInput,
+    SUBMIT_WINDOW, SessionError, SessionEvent, SessionPhase, SessionSnapshot, StagedInput,
+    TouchedObject,
 };
 
 /// Bytes one helper line may carry before the session is torn down.
@@ -71,65 +73,6 @@ struct SessionFrame<'a> {
 #[derive(Serialize)]
 struct EndedFrame {
     reason: &'static str,
-}
-
-/// One object staged into the workspace bucket after the session started.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct StagedInput {
-    pub dest_key: String,
-    pub bytes: u64,
-    pub blake3: String,
-    pub source_node_id: String,
-    pub version_id: String,
-}
-
-/// One object a background copy job is still bringing into the workspace
-/// bucket. The report resolves it against the job once the session ends.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct PendingInput {
-    pub dest_key: String,
-    pub job_id: String,
-    pub source_node_id: String,
-}
-
-/// One object the session's own credential read or wrote, as the S3 plane
-/// attributed it to this job.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct TouchedObject {
-    pub bucket: String,
-    pub key: String,
-    /// `read` or `write`.
-    pub operation: String,
-}
-
-/// One cell as the client sees it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct CellSnapshot {
-    pub cell_id: String,
-    pub state: CellPhase,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at_ms: Option<u64>,
-}
-
-/// The whole session as the client sees it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionSnapshot {
-    pub job_id: String,
-    pub state: SessionPhase,
-    pub runtime: String,
-    pub workspace_bucket: String,
-    pub executor_node_id: String,
-    pub started_at_ms: u64,
-    pub idle_after_ms: u64,
-    pub idle_deadline_ms: u64,
-    pub credential_expires_ms: u64,
-    pub last_event_id: u64,
-    pub cells: Vec<CellSnapshot>,
-    pub ended: Option<EndReason>,
 }
 
 /// What one session is opened with.
@@ -393,7 +336,7 @@ impl Session {
             inner.submits.push_back(now);
             inner.queue.push_back(cell_id.to_string());
             inner.track(cell_id);
-            inner.set_cell(cell_id, CellPhase::Queued, None, now_ms());
+            inner.set_cell(cell_id, CellPhase::Queued, None, unix_timestamp_millis());
             let event = inner.ring.push(
                 EventKind::Cell,
                 &CellFrame {
@@ -443,7 +386,12 @@ impl Session {
                 })
                 .collect();
             for cell_id in dropped {
-                inner.set_cell(&cell_id, CellPhase::Interrupted, None, now_ms());
+                inner.set_cell(
+                    &cell_id,
+                    CellPhase::Interrupted,
+                    None,
+                    unix_timestamp_millis(),
+                );
                 let event = inner.ring.push(
                     EventKind::Cell,
                     &CellFrame {
@@ -592,7 +540,7 @@ impl Session {
                     return;
                 };
                 inner.track(&cell_id);
-                inner.set_cell(&cell_id, phase, execution_count, now_ms());
+                inner.set_cell(&cell_id, phase, execution_count, unix_timestamp_millis());
                 if !phase.is_open() {
                     inner.queue.retain(|queued| queued != &cell_id);
                 }
@@ -799,7 +747,7 @@ fn build_session(config: SessionConfig) -> (Arc<Session>, mpsc::Receiver<HelperR
     let credential_expires_ms = config.credential_expires_ms;
     let session = Arc::new(Session {
         config,
-        started_at_ms: now_ms(),
+        started_at_ms: unix_timestamp_millis(),
         inner: Mutex::new(Inner {
             phase: SessionPhase::Starting,
             ended: None,
@@ -1029,7 +977,7 @@ fn session_frame<'a>(
 fn deadline_ms(deadline: Instant) -> u64 {
     let now = Instant::now();
     let left = deadline.saturating_duration_since(now);
-    now_ms().saturating_add(left.as_millis().try_into().unwrap_or(u64::MAX))
+    unix_timestamp_millis().saturating_add(left.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

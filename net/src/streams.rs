@@ -26,7 +26,9 @@ use crate::connection_pool::{ConnectionLease, ConnectionPool};
 use crate::device_limits::{DeviceLimiter, DeviceLimits, DevicePermit, DeviceRefusal};
 use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
-use crate::telemetry::{duration_ms, record_duration_ms, warn_iroh_phase, warn_iroh_request};
+use crate::telemetry::{
+    duration_ms, record_duration_ms, record_selected_path, warn_iroh_phase, warn_iroh_request,
+};
 
 /// Reason a node closes an open connection once its realm configuration stops admitting the peer.
 pub const MEMBERSHIP_CLOSE: &str = "realm membership";
@@ -730,19 +732,6 @@ impl StreamsService {
         .instrument(span)
         .await
     }
-}
-
-fn record_selected_path(span: &Span, conn: &Connection) {
-    let paths = conn.paths();
-    let Some(path) = paths.iter().find(|path| path.is_selected()) else {
-        return;
-    };
-
-    span.record(
-        "iroh.selected_address",
-        field::display(format!("{:?}", path.remote_addr())),
-    );
-    span.record("iroh.rtt_ms", duration_ms(path.rtt()));
 }
 
 impl std::fmt::Debug for StreamsService {

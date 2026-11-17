@@ -10,9 +10,10 @@ use aruna_core::NodeId;
 use aruna_core::plugin_runs::HookRequest;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::node::node_info::node_urls;
-use aruna_operations::plugins::hooks::{HookError, admit_hook, checks_authorization};
+use aruna_operations::plugins::bound::ReleaseKeys;
+use aruna_operations::plugins::dispatch::{admit_hook, checks_authorization};
+use aruna_operations::plugins::hooks::HookError;
 use aruna_operations::plugins::install::read_config;
-use aruna_operations::plugins::release::ReleaseKeys;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -23,8 +24,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError};
-use crate::lookup::{capped_body, relay_url};
 use crate::routes::management_relay::{RELAY_HOP_HEADER, passed_hops};
+use crate::routes::storage::relay::{capped_body, relay_url};
 use crate::server::state::ServerState;
 
 /// Bounds of a webhook request, checked before its body is read or relayed.

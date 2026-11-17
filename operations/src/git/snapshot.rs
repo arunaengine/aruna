@@ -409,20 +409,20 @@ pub(super) async fn linked(
         .iter()
         .filter(|linked| linked.path.is_none())
         .map(|linked| {
-            Some(crate::jobs::export::StorageKey {
+            Some(aruna_core::archive_path::StorageKey {
                 bucket: linked.object.bucket.clone(),
                 key: linked.object.key.clone(),
             })
         })
         .collect();
-    let layout = crate::jobs::export::KeyLayout::new(&sources);
+    let layout = aruna_core::archive_path::KeyLayout::new(&sources);
     for linked in linked.iter_mut().filter(|linked| linked.path.is_none()) {
-        let source = crate::jobs::export::StorageKey {
+        let source = aruna_core::archive_path::StorageKey {
             bucket: linked.object.bucket.clone(),
             key: linked.object.key.clone(),
         };
         linked.path = Some(layout.path(&source).unwrap_or_else(|| {
-            crate::jobs::export::synthesized_path(linked.object.blake3, &linked.entity)
+            aruna_core::archive_path::synthesized_path(linked.object.blake3, &linked.entity)
         }));
     }
     linked
@@ -733,7 +733,7 @@ fn background(context: &DriverContext, document: &MetadataRegistryRecord) {
     let context = context.clone();
     let document = document.clone();
     tokio::spawn(async move {
-        if let Some(store) = context.blob_handle.as_ref().and_then(|handle| handle.git()) {
+        if let Ok(store) = super::store(&context) {
             let refreshing = timed(id, async {
                 let _guard = store.lock(id).await;
                 refresh(&context, store, &document).await
@@ -834,7 +834,7 @@ pub async fn capture(
     record: &MetadataRegistryRecord,
     revision: Option<&MetadataRawRevision>,
 ) -> Result<(), GitError> {
-    let Some(store) = context.blob_handle.as_ref().and_then(|handle| handle.git()) else {
+    let Ok(store) = super::store(context) else {
         return Ok(());
     };
     timed(record.document_id, async {
@@ -865,7 +865,6 @@ async fn timed<T>(document_id: Ulid, work: impl std::future::Future<Output = T>)
 /// whether a newer snapshot is still being made.
 pub async fn status(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<
@@ -878,6 +877,7 @@ pub async fn status(
     ),
     GitError,
 > {
+    let store = super::store(context)?;
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
     // Status never waits for a first snapshot either; it reports an empty pending state.
     let (projection, pending) = match store.try_lock(id) {
@@ -918,11 +918,11 @@ pub async fn status(
 
 pub async fn export(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     revision: String,
 ) -> Result<Bytes, GitError> {
+    let store = super::store(context)?;
     let document = document(context, auth, id, Permission::READ).await?;
     read_view(context, store, &document).await?;
     let known = GitEffect::Resolve {

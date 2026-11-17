@@ -126,8 +126,9 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
+    use crate::testing::test_context;
     use crate::tests::access::seed_open_access;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::tests::s3::test_storage;
 
     const BUCKET: &str = "refseq";
 

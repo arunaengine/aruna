@@ -6,14 +6,18 @@
 use std::sync::{Arc, Mutex};
 
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::matcher::match_pending;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
+use crate::plugins::store::Txn;
+use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{created, installed};
+use crate::plugins::worker::{send_bounded, send_outbox, unreadable};
+use aruna_core::operation::Operation;
+use aruna_core::plugin_runs::EVENTS_QUEUED;
 
 /// The batches a fake receiver got; it answers each event with `decide` and acknowledges gaps
 /// when `ack` is set.
@@ -60,7 +64,7 @@ async fn queued(fixture: &Fixture, install: &PluginInstall, names: &[&str], at_m
     }
     let local = fixture.actor.node_id;
     let config = config(fixture).await;
-    match_pending(&fixture.ctx, &config, local, at_ms)
+    match_journal(&fixture.ctx, &config, local, (at_ms, EVENTS_QUEUED))
         .await
         .unwrap();
 }
@@ -147,7 +151,7 @@ async fn creation(fixture: &Fixture, install: &PluginInstall, now: u64) -> (Ulid
     };
     journal(fixture, &event).await;
     let (local, config) = (fixture.actor.node_id, config(fixture).await);
-    match_pending(&fixture.ctx, &config, local, now)
+    match_journal(&fixture.ctx, &config, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     (document, event_id)
@@ -300,7 +304,7 @@ async fn update_waits() {
         event,
         queued_ms: 1,
     };
-    let waits = async || unreadable(&fixture.ctx, &Txn::direct(&fixture.ctx), &row).await;
+    let waits = async || unreadable(&fixture.ctx, &row).await;
     let newer = (document, Ulid::from_parts(20, 1));
     materialization(&fixture, newer, State::Materialized).await;
     assert_eq!(waits().await, Ok(true));
@@ -353,4 +357,126 @@ async fn update_waits() {
         .await
         .unwrap();
     assert_eq!(waits().await, Ok(false));
+}
+
+#[test]
+fn apply_decisions() {
+    let install = Ulid::from_parts(1, 1);
+    let keys = BTreeMap::from([
+        ((install, "s1".to_string()), b"k1".to_vec()),
+        ((install, "s2".to_string()), b"k2".to_vec()),
+    ]);
+    let decisions = Decisions {
+        events: vec![
+            (install, "s1".into(), Outcome::Queued),
+            (install, "s2".into(), Outcome::Busy),
+        ],
+        gaps: vec![(install, SourceKind::DatasetCreated, GapReason::Full, 4)],
+    };
+    let mut plan = Apply {
+        count: 1,
+        busy: true,
+        decided: Some(vec![(PLUGIN_OUTBOX_KEYSPACE, b"k1".to_vec())]),
+        acked: vec![(
+            gap_key(install, SourceKind::DatasetCreated, GapReason::Full),
+            4,
+        )],
+        phase: ApplyPhase::Deleting,
+    };
+    assert_eq!(apply(&keys, decisions).start().len(), 1);
+    // A busy event keeps its row; the acknowledged sequence stops at the counted one.
+    let decided = vec![(PLUGIN_OUTBOX_KEYSPACE, b"k1".to_vec())];
+    assert_eq!(plan.first().unwrap(), Turn::Ask(Ask::Delete(decided)));
+    assert!(matches!(
+        plan.next(Answer::Done).unwrap(),
+        Turn::Ask(Ask::Read(_))
+    ));
+    let mut row = GapRow::new(SourceKind::DatasetCreated, GapReason::Full);
+    row.sequence = 3;
+    let read = Answer::Values(vec![Some(encode(&row).unwrap())]);
+    let Turn::Ask(Ask::Write(rows)) = plan.next(read).unwrap() else {
+        panic!("the acknowledgement is written");
+    };
+    let written: GapRow = decode(&rows[0].2).unwrap();
+    assert_eq!(written.acked, 3);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish((1, true)));
+}
+
+#[test]
+fn expired_rows_counted() {
+    let install = Ulid::from_parts(1, 1);
+    let row = |queued_ms| ForwardRow {
+        install_id: install,
+        revision: 1,
+        event: SourceEvent {
+            kind: SourceKind::DatasetCreated,
+            group_id: Ulid::from_parts(1, 9),
+            path: "/r/g/x/meta/a@d".into(),
+            resource: "d".into(),
+            revision: "e".into(),
+            source: format!("s{queued_ms}"),
+            actor: None,
+            anchor_ms: queued_ms,
+            journaled_ms: queued_ms,
+        },
+        queued_ms,
+    };
+    let now = SEND_EXPIRY_MS + 10;
+    let mut plan = ExpireRows {
+        install_id: install,
+        now_ms: now,
+        phase: ExpirePhase::Reading,
+    };
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    let (old, kept) = (encode(&row(1)).unwrap(), encode(&row(now)).unwrap());
+    let page = vec![(b"o".to_vec(), old), (b"k".to_vec(), kept.clone())];
+    let Turn::Ask(Ask::Read(reads)) = plan.next(Answer::Page(page, None)).unwrap() else {
+        panic!("the expired row's gap is read");
+    };
+    assert_eq!(reads.len(), 1);
+    let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Values(vec![None])).unwrap() else {
+        panic!("the gap is written");
+    };
+    assert_eq!(rows.len(), 1);
+    let deleted = Ask::Delete(vec![(PLUGIN_OUTBOX_KEYSPACE, b"o".to_vec())]);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Ask(deleted));
+    let rest = vec![(b"k".to_vec(), kept)];
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(rest));
+}
+
+#[test]
+fn next_after_install() {
+    let id = Ulid::from_parts(3, 3);
+    let start = [&id.to_bytes()[..], &[0xff; 24]].concat();
+    let mut plan = NextInstall(Some(start.clone()));
+    let Turn::Ask(Ask::Page { after, limit, .. }) = plan.first().unwrap() else {
+        panic!("the next install reads one row");
+    };
+    assert_eq!((after, limit), (Some(start), 1));
+    let key = [&id.to_bytes()[..], &[0; 24]].concat();
+    let found = plan.next(Answer::Page(vec![(key, Vec::new())], None));
+    assert_eq!(found.unwrap(), Turn::Finish(Some(id)));
+    let mut empty = NextInstall(None);
+    let none = empty.next(Answer::Page(Vec::new(), None)).unwrap();
+    assert_eq!(none, Turn::Finish(None));
+    assert!(empty.next(Answer::Done).is_err());
+}
+
+#[test]
+fn drops_every_page() {
+    let space = PLUGIN_OUTBOX_KEYSPACE;
+    let mut plan = DropRows {
+        space,
+        prefix: b"p".to_vec(),
+        deleting: false,
+    };
+    let first = plan.first().unwrap();
+    assert!(matches!(first, Turn::Ask(Ask::Page { limit: 1_000, .. })));
+    let rows = vec![(b"p1".to_vec(), b"x".to_vec())];
+    let asked = plan.next(Answer::Page(rows, None)).unwrap();
+    assert_eq!(asked, Turn::Ask(Ask::Delete(vec![(space, b"p1".to_vec())])));
+    let again = plan.next(Answer::Done).unwrap();
+    assert!(matches!(again, Turn::Ask(Ask::Page { .. })));
+    let last = plan.next(Answer::Page(Vec::new(), None)).unwrap();
+    assert_eq!(last, Turn::Finish(()));
 }

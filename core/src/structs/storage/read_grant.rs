@@ -17,6 +17,7 @@ use crate::structs::storage::replication::VersionedObjectArn;
 
 /// The longest a granted request may be valid.
 pub const MAX_REQUEST_SECS: u64 = 30;
+
 /// The policy operation of a byte read, the same name the S3 surface uses.
 pub const READ_OPERATION: &str = "s3.GetObject";
 /// The policy operation of a metadata read or of one listed entry.

@@ -4,10 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::drive;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::{list_runs, read_run};
 use crate::plugins::worker::tests::installed;
 use aruna_core::plugin_runs::RUNS_QUEUED;
+use aruna_core::plugin_runs::SourceKind;
 
 const HOUR: u64 = 3600 * 1000;
 
@@ -31,7 +33,9 @@ async fn manual_runs() {
         );
     }
     let run = start("{}").await.unwrap();
-    let stored = read_run(ctx, install.install_id, run.run_id).await.unwrap();
+    let stored = drive(read_run(install.install_id, run.run_id), ctx)
+        .await
+        .unwrap();
     assert_eq!(stored, run);
     assert_eq!(
         (run.handler.as_str(), run.revision),
@@ -79,7 +83,9 @@ async fn timer_occurrences() {
             .unwrap(),
         0
     );
-    let (runs, _) = list_runs(ctx, install.install_id, None, 10).await.unwrap();
+    let (runs, _) = drive(list_runs(install.install_id, None, 10), ctx)
+        .await
+        .unwrap();
     let occurrence_ms = active + 3 * HOUR;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].trigger, RunTrigger::Timer { occurrence_ms });
@@ -106,7 +112,10 @@ async fn timer_occurrences() {
             .unwrap(),
         0
     );
-    let row = read_timer(ctx, install.install_id).await.unwrap().unwrap();
+    let row = drive(read_timer(install.install_id), ctx)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         row,
         TimerRow {
@@ -130,4 +139,48 @@ fn trigger_indexes_kept() {
     ] {
         assert_eq!(event_trigger(kind).as_str(), kind.name());
     }
+}
+
+#[test]
+fn timer_occurrences() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let plan = |now_ms| EnqueueTimer {
+        install: Box::new(install.clone()),
+        handler: "every".into(),
+        interval_ms: 10,
+        now_ms,
+        key: timer_key(install.install_id),
+        phase: TimerPhase::Reading,
+    };
+    // Before the first interval since activation nothing is due.
+    let mut early = plan(14);
+    assert!(matches!(early.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    assert_eq!(
+        early.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Finish(false)
+    );
+    // Missed occurrences collapse into the latest; a full queue skips it.
+    let mut due = plan(37);
+    due.first().unwrap();
+    assert!(matches!(
+        due.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let full = (0..RUNS_QUEUED)
+        .map(|seq| (vec![seq as u8], Vec::new()))
+        .collect();
+    let Turn::Ask(Ask::Write(rows)) = due.next(Answer::Page(full, None)).unwrap() else {
+        panic!("the timer row is written");
+    };
+    let row: TimerRow = decode(&rows[0].2).unwrap();
+    assert_eq!((row.last_due_ms, row.skipped), (35, 1));
+    assert_eq!(due.next(Answer::Done).unwrap(), Turn::Finish(false));
+    let mut queued = plan(37);
+    queued.first().unwrap();
+    queued.next(Answer::Values(vec![None])).unwrap();
+    let Turn::Ask(Ask::Write(rows)) = queued.next(Answer::Page(Vec::new(), None)).unwrap() else {
+        panic!("the run and the timer row are written");
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(queued.next(Answer::Done).unwrap(), Turn::Finish(true));
 }

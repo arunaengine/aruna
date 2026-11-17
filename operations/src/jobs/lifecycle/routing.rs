@@ -6,31 +6,23 @@
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobKind, JobStatusView};
-use aruna_core::keyspaces::FAMILY_ALIAS_KEYSPACE;
 use aruna_core::structs::execution::job::{
-    ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobProgress,
-    JobProjection, JobRecord, JobResultPayload, JobState, LogicalJobSpec, LogicalJobState,
-    PhysicalExecutionState, ResultMessage, WorkspaceMode,
+    ExecutionRole, JobError, JobFamilyRecord, JobId, JobPayload, JobProgress, JobProjection,
+    JobRecord, JobResultPayload, JobState, LogicalJobSpec, LogicalJobState, PhysicalExecutionState,
+    ResultMessage, WorkspaceMode,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
 
-use std::time::Duration;
-
 use super::ids::{session_of, workspace_of};
-use crate::driver::{DriverContext, drive};
-use crate::jobs::records::keys::{alias_family, alias_prefix};
-use crate::jobs::records::{
-    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
-    load_family_complete,
+use crate::driver::{DriverContext, drive, drive_retry};
+use crate::jobs::records::RecordStoreError;
+use crate::jobs::records::family::LoadFamilyOperation;
+use crate::jobs::records::project::{
+    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
+use crate::jobs::route::JobRouteError;
 use crate::jobs::service::{RoutedJobStatus, read_owned_job};
-use crate::jobs::store::iter_prefix_page;
-use crate::jobs::{JobRouteError, MUTATE_MAX_ATTEMPTS};
-
-/// Families one alias may resolve to. Two families claiming one id is an
-/// anomaly that stays visible instead of rebinding the first one.
-const MAX_ALIAS_FAMILIES: usize = 8;
 
 /// Why a partial projection answers nothing: it reduced only part of its
 /// family, so its state, executions, and outputs are unknown, never absent.
@@ -49,51 +41,25 @@ pub(crate) fn decidable(projected: &ProjectedFamily) -> Result<(), JobRouteError
     }
 }
 
-/// The request family one accepted alias belongs to. Ordered by key, so two
-/// families claiming one alias resolve identically on every replica.
-pub async fn family_of_alias(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<JobFamilyId>, JobRouteError> {
-    let (rows, _) = iter_prefix_page(
-        &context.storage_handle,
-        FAMILY_ALIAS_KEYSPACE,
-        Some(alias_prefix(job_id)),
-        None,
-        MAX_ALIAS_FAMILIES,
-        None,
-    )
-    .await
-    .map_err(JobRouteError::Unavailable)?;
-    Ok(rows.iter().filter_map(|(key, _)| alias_family(key)).min())
-}
-
-/// Drives one projection, retrying a lost optimistic transaction with the same
-/// bounded backoff a job mutation uses. `None` names no family here.
+/// Drives one projection, retrying a lost optimistic transaction with the
+/// runner's conflict rule. `None` names no family here.
 async fn project_alias(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<ProjectedFamily>, JobRouteError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        match drive(
-            ProjectFamilyOperation::new(ProjectFamilyConfig {
-                family: FamilyRef::Alias(job_id),
-                now_ms: unix_timestamp_millis(),
-                rebuild: false,
-            }),
-            context,
-        )
-        .await
-        {
-            Ok(projected) => return Ok(Some(projected)),
-            Err(RecordStoreError::UnknownAlias) => return Ok(None),
-            Err(error) if error.is_conflict() => {
-                tokio::time::sleep(Duration::from_millis(1 << attempt.min(6))).await;
-            }
-            Err(error) => return Err(JobRouteError::Unavailable(error.to_string())),
-        }
+    let build = || {
+        ProjectFamilyOperation::new(ProjectFamilyConfig {
+            family: FamilyRef::Alias(job_id),
+            now_ms: unix_timestamp_millis(),
+            rebuild: false,
+        })
+    };
+    match drive_retry(build, context, &job_id.to_bytes()).await {
+        Ok(projected) => Ok(Some(projected)),
+        Err(RecordStoreError::UnknownAlias) => Ok(None),
+        Err(error) if error.is_conflict() => Err(JobRouteError::Unavailable(BUSY.to_string())),
+        Err(error) => Err(JobRouteError::Unavailable(error.to_string())),
     }
-    Err(JobRouteError::Unavailable(BUSY.to_string()))
 }
 
 /// The reduced family of one alias plus the stored spec of its canonical claim.
@@ -109,7 +75,7 @@ pub async fn family_projection(
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("job family has no projection".to_string()))?
         .canonical_job_id;
-    let records = load_family_complete(context, projected.family)
+    let records = drive(LoadFamilyOperation::family(projected.family), context)
         .await
         .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
     let spec = records.iter().find_map(|envelope| match &envelope.record {
@@ -206,7 +172,7 @@ pub async fn session_job(
     record.finished_at_ms = status.finished_at_ms;
     let physical = match execution {
         Some(execution) => {
-            let records = load_family_complete(context, projected.family)
+            let records = drive(LoadFamilyOperation::family(projected.family), context)
                 .await
                 .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
             Some(
@@ -372,7 +338,7 @@ fn local_state(state: LogicalJobState) -> JobState {
 
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::structs::execution::job::SubmissionId;
+    use aruna_core::structs::execution::job::{JobFamilyId, SubmissionId};
 
     use super::*;
 

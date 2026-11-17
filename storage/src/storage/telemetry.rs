@@ -207,6 +207,7 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Stream() => "stream",
         Effect::Index(_) => "index",
         Effect::Group(_) => "group",
+        Effect::Session(_) => "session",
     }
 }
 

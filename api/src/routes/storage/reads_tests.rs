@@ -96,7 +96,7 @@ async fn reads_ask_holder() {
     assert_eq!(locations.version_id, VERSION);
     let Json(view) = envelope(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         HeaderMap::new(),
         Query(VersionQuery {
@@ -185,7 +185,7 @@ async fn local_miss_relays() {
     assert_eq!(view.generation, 7);
     let Json(view) = envelope(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         HeaderMap::new(),
         Query(VersionQuery {

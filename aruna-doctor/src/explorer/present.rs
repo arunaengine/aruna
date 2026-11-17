@@ -3,12 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna::identity::PersistedNodeState;
 use aruna_core::compute::quota::{ComputeDepartureReport, JobReservationRecord};
 use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::structs::execution::job::record_rows::OutboxEntry;
 use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
 use aruna_core::structs::placement::policy::attachment::{
@@ -25,7 +26,6 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::WitnessDeadline;
-use aruna_operations::jobs::records::rows::OutboxEntry;
 use aruna_operations::placement::policy::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -689,7 +689,7 @@ impl Serialize for JsonStoredEntry {
 #[cfg(test)]
 mod tests {
     use super::{DecodedField, DecodedValue, EntryOutput, JsonPersistedState};
-    use aruna::identity::PersistedNodeState;
+    use aruna_core::structs::identity::node_state::PersistedNodeState;
 
     // The JSON record shape is a CLI contract: the tagged key field and the
     // tagged value field with their fixed fixture values.
@@ -718,15 +718,16 @@ mod tests {
     #[test]
     fn network_secret_persisted() {
         let state = PersistedNodeState {
-            boot_origin: aruna::identity::BootOrigin::InitializedRealm,
-            status: aruna::identity::PersistedNodeStatus::Complete,
+            boot_origin: aruna_core::structs::identity::node_state::BootOrigin::InitializedRealm,
+            status: aruna_core::structs::identity::node_state::PersistedNodeStatus::Complete,
             realm_id: aruna_core::structs::identity::realm::RealmId([3u8; 32]),
             net_secret_key: [7u8; 32],
             onboarding_phase: None,
             onboarding_sync_ticket: None,
-            identity: aruna::identity::PersistedNodeIdentity::Management {
-                realm_private_pem: "synthetic-pem".to_string(),
-            },
+            identity:
+                aruna_core::structs::identity::node_state::PersistedNodeIdentity::Management {
+                    realm_private_pem: "synthetic-pem".to_string(),
+                },
         };
         let json = serde_json::to_value(JsonPersistedState(state)).unwrap();
         assert_eq!(

@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
-use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite, SecretBinding};
+use aruna_core::plugin_installs::{
+    BoundScope, InstallState, PluginInstall, Prerequisite, SecretBinding,
+};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -16,7 +18,7 @@ use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_plugins::artifact::ArtifactDigest;
 use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Permission;
+use aruna_plugins::permission::{Grant, Permission};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -27,10 +29,11 @@ use super::account::{
     Identity, account_name, check_ready, ensure_account, ensure_role, guard_of, read_auth,
     read_user, teardown,
 };
-use super::bound::{BindError, BindPlace, bind_slots};
+use super::bound::{BindError, BindPlace, bind_slots, vault_kind};
+use super::check::covers;
 use super::grants::{
     GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
-    parse_grants, patterns_for, role_paths, stored_grants,
+    parse_grants, patterns_for, role_paths, stored_grants, writes,
 };
 use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
@@ -360,7 +363,7 @@ async fn make_ready(
 
 /// Repairs the account and role of every settled install from its current record on a
 /// management node, as the approving admin, then sweeps accounts no record names any more.
-pub async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallError> {
+pub(crate) async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallError> {
     let Some(net) = ctx.net_handle.as_ref() else {
         return Ok(0);
     };
@@ -599,6 +602,182 @@ pub(crate) async fn write_record(
     });
     drive(write, ctx).await?;
     Ok(install)
+}
+
+/// One grant line: `read`, or `write` when the plugin writes, and its granted patterns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionLine {
+    pub permission: String,
+    pub required: bool,
+    pub granted: Vec<String>,
+}
+
+/// One declared service, its methods and whether the install may call it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionLine {
+    pub name: String,
+    pub url: String,
+    pub methods: Vec<String>,
+    pub required: bool,
+    pub granted: bool,
+    /// The plugin downloads, and the node adds a secret to requests of this service.
+    pub stored: bool,
+}
+
+/// One secret slot: its kind, the secret it uses and whether the code reads the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretLine {
+    pub slot: String,
+    pub kind: String,
+    pub secret: String,
+    pub value: bool,
+}
+
+/// What an admin approves: the version, the permissions and connections, and the triggers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    pub id: String,
+    pub plugin: String,
+    pub title: Option<String>,
+    pub version: String,
+    pub digest: String,
+    pub group: String,
+    pub permissions: Vec<PermissionLine>,
+    pub connections: Vec<ConnectionLine>,
+    pub triggers: Vec<String>,
+    pub secrets: Vec<SecretLine>,
+    pub warnings: Vec<String>,
+}
+
+/// The summary of a checked install request, before anything is written.
+pub fn prepared_summary(prepared: &Prepared) -> Summary {
+    let grants = stored_grants(&prepared.grants);
+    let granted = (&grants, &prepared.secrets);
+    summary_of(
+        &prepared.manifest,
+        &prepared.plugin.digest,
+        &prepared.scope,
+        granted,
+    )
+}
+
+/// The summary of a stored install, from the record alone while the pinned manifest is missing.
+pub fn installed_summary(config: &RealmConfigDocument, install: &PluginInstall) -> Summary {
+    let manifest = pick_version(config, &install.plugin, Some(&install.digest))
+        .ok()
+        .and_then(|plugin| read_manifest(&plugin).ok());
+    let scope = InstallScope {
+        realm_id: config.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    };
+    match manifest {
+        Some(manifest) => {
+            let granted = (&install.grants, &install.secrets);
+            summary_of(&manifest, &install.digest, &scope, granted)
+        }
+        None => bare_summary(install),
+    }
+}
+
+/// The summary of `grants` against the manifest's requests.
+fn summary_of(
+    manifest: &Manifest,
+    digest: &str,
+    scope: &InstallScope,
+    (grants, bound): (
+        &BTreeMap<String, Vec<String>>,
+        &BTreeMap<String, SecretBinding>,
+    ),
+) -> Summary {
+    let granted = parse_grants(grants);
+    let requested = [Grant::Read]
+        .into_iter()
+        .chain(writes(manifest).then_some(Grant::Write));
+    let permissions = requested
+        .map(|grant| PermissionLine {
+            permission: grant.to_string(),
+            required: true,
+            granted: (granted.get(&grant).into_iter().flatten())
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    let sends = granted.get(&Grant::Services);
+    let values = granted.get(&Grant::Secrets);
+    let readable = |slot: &str| {
+        let path = scope.secret(slot);
+        values.is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &path)))
+    };
+    let downloads = (manifest.requested()).contains(&Permission::TransfersDownload);
+    let connections = (manifest.connections.iter())
+        .map(|(name, connection)| ConnectionLine {
+            name: name.clone(),
+            url: connection.url.clone(),
+            methods: (connection.methods.iter())
+                .map(|method| method.as_str().to_string())
+                .collect(),
+            required: !connection.optional,
+            granted: sends.is_some_and(|paths| paths.contains(&scope.connection(name))),
+            stored: downloads && connection.auth.is_some(),
+        })
+        .collect();
+    Summary {
+        id: scope.install_id.to_string(),
+        plugin: manifest.name.clone(),
+        title: manifest.title.clone(),
+        version: manifest.version.clone(),
+        digest: digest.to_string(),
+        group: scope.group_id.to_string(),
+        permissions,
+        connections,
+        triggers: manifest
+            .triggers
+            .keys()
+            .map(|kind| kind.as_str().to_string())
+            .collect(),
+        secrets: (bound.iter())
+            .map(|(slot, binding)| SecretLine {
+                slot: slot.clone(),
+                kind: (manifest.secrets.get(slot))
+                    .and_then(|declared| vault_kind(declared.kind))
+                    .map_or_else(String::new, |kind| kind.as_str().to_string()),
+                secret: binding.to_string(),
+                value: readable(slot),
+            })
+            .collect(),
+        warnings: (bound.iter())
+            .filter_map(|(slot, binding)| {
+                let shared = matches!(binding.scope, BoundScope::Realm | BoundScope::Node);
+                shared
+                    .then(|| format!("a realm admin adds the use rule of `{binding}` for `{slot}`"))
+            })
+            .collect(),
+    }
+}
+
+/// A summary from the record alone.
+fn bare_summary(install: &PluginInstall) -> Summary {
+    let permissions = (install.grants.iter())
+        .map(|(permission, granted)| PermissionLine {
+            permission: permission.clone(),
+            required: false,
+            granted: granted.clone(),
+        })
+        .collect();
+    Summary {
+        id: install.install_id.to_string(),
+        plugin: install.plugin.clone(),
+        title: None,
+        version: install.version.clone(),
+        digest: install.digest.clone(),
+        group: install.group_id.to_string(),
+        permissions,
+        connections: Vec::new(),
+        triggers: Vec::new(),
+        secrets: Vec::new(),
+        warnings: Vec::new(),
+    }
 }
 
 #[cfg(test)]

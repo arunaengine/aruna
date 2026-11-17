@@ -5,17 +5,16 @@
 use crate::auth::RealmAuth;
 use crate::auth::{
     ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id,
-    require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::{decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor};
 use crate::lookup::bucket_info;
-use crate::lookup::{RestForward, relay_json, rest_target};
 use crate::routes::execution::jobs::map_submit_error;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::connectors::{
     ApiConnectorKind, CreateConnectorRequest, SourceConnectorResponse,
 };
+use crate::routes::storage::relay::{RestForward, relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
@@ -58,8 +57,6 @@ use aruna_operations::staging::snapshot::{
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path as FsPath};
 use std::str::FromStr;
@@ -463,12 +460,11 @@ route, and sending `prefixes` additionally requires READ on the group's data pat
 )]
 pub async fn stage_batch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<StageBatchRequest>,
 ) -> ServerResult<(StatusCode, Json<StageBatchResponse>)> {
     const BATCH_LIMIT: usize = 1000;
 
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
     if request.strategy == ApiStagingStrategy::Sync {
@@ -901,7 +897,7 @@ pub async fn submit_staging(
         ensure_prefix_permission(&state, &auth, group_id, mirror_id, prefix).await?;
     }
 
-    crate::lookup::relayed_set(&bucket_info, &headers)?;
+    crate::routes::storage::relay::relayed_set(&bucket_info, &headers)?;
     let source = local_connector(&state, group_id, connector_id).await?;
     // A distributed bucket imports by range: every coordinator runs a job for its own keys.
     let fan_out =
@@ -1456,9 +1452,7 @@ fn format_job_time(timestamp_ms: u64) -> String {
 fn decode_reference_cursor(cursor: Option<&str>) -> ServerResult<Option<ListContinuationToken>> {
     cursor
         .map(|cursor| {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)?;
+            let bytes = aruna_core::cursor::decode(cursor).map_err(|_| ServerError::BadRequest)?;
             ListContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
         })
         .transpose()
@@ -1467,7 +1461,7 @@ fn decode_reference_cursor(cursor: Option<&str>) -> ServerResult<Option<ListCont
 fn encode_reference_cursor(token: ListContinuationToken) -> ServerResult<String> {
     token
         .to_bytes()
-        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map(aruna_core::cursor::encode)
         .map_err(|error| ServerError::InternalError(error.into()))
 }
 
@@ -1926,7 +1920,7 @@ fn map_read_error(error: ReadSourceError) -> ServerError {
     }
 }
 
-fn map_resolution_error(error: SourceResolutionError) -> ServerError {
+pub(crate) fn map_resolution_error(error: SourceResolutionError) -> ServerError {
     match error {
         SourceResolutionError::NotFound => ServerError::NotFound,
         SourceResolutionError::InvalidSourcePath

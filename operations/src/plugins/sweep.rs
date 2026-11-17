@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::pin::pin;
 use std::sync::{LazyLock, Mutex};
 
 use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_KEYSPACE};
@@ -14,39 +13,35 @@ use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConf
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::{NodeId, UserId};
-use futures_util::TryStreamExt;
 use tracing::{info, warn};
 
+use ulid::Ulid;
+
 use super::account::read_row;
+use super::rows::{Answer, Ask, Plan, RowsOperation, StoreError, Turn, unexpected};
 use crate::driver::{DriverContext, drive};
-use crate::storage_read::scan_pages;
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
 
 /// How long an account stays unnamed before it is deactivated, so a record still on its way
 /// to this node does not cut its account off. Measured in this node's clock.
 pub const ORPHAN_GRACE_MS: u64 = 60 * 60 * 1000;
+/// Users one sweep page reads.
+const PAGE: usize = 1_000;
 
 /// When this node first saw each unnamed account; a restart starts the grace again.
 static SEEN: LazyLock<Mutex<HashMap<UserId, u64>>> = LazyLock::new(Default::default);
 
 /// Deactivates the active plugin accounts the canonical records have not named for the grace
 /// period, as a realm administrator. Returns how many it deactivated.
-pub async fn sweep_orphans(
+pub(crate) async fn sweep_orphans(
     ctx: &DriverContext,
     node_id: NodeId,
     config: &RealmConfigDocument,
     now_ms: u64,
 ) -> Result<usize, String> {
-    let mut pages = pin!(scan_pages(&ctx.storage_handle, USER_KEYSPACE, None));
-    let mut accounts = Vec::new();
-    while let Some(page) = pages.try_next().await? {
-        let users = (page.iter()).filter_map(|(_, value)| User::from_bytes(value).ok());
-        accounts.extend(
-            users
-                .filter_map(|user| Some((user.install()?, user)))
-                .filter(|(_, user)| !user.is_deactivated()),
-        );
-    }
+    let accounts = drive(plugin_accounts(), ctx)
+        .await
+        .map_err(|error| error.0)?;
     let mut due = Vec::new();
     {
         let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -103,6 +98,59 @@ pub async fn sweep_orphans(
         }
     }
     Ok(swept)
+}
+
+/// The active plugin accounts with their install, read a page at a time.
+fn plugin_accounts() -> RowsOperation<PluginAccounts> {
+    RowsOperation::direct(PluginAccounts {
+        after: None,
+        accounts: Vec::new(),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PluginAccounts {
+    after: Option<Vec<u8>>,
+    accounts: Vec<(Ulid, User)>,
+}
+
+impl PluginAccounts {
+    fn page(&self) -> Ask {
+        Ask::Page {
+            space: USER_KEYSPACE,
+            prefix: Vec::new(),
+            after: self.after.clone(),
+            limit: PAGE,
+        }
+    }
+}
+
+impl Plan for PluginAccounts {
+    type Output = Vec<(Ulid, User)>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(self.page()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        let Answer::Page(rows, next) = answer else {
+            return Err(unexpected(answer));
+        };
+        let users = (rows.iter()).filter_map(|(_, value)| User::from_bytes(value).ok());
+        self.accounts.extend(
+            users
+                .filter_map(|user| Some((user.install()?, user)))
+                .filter(|(_, user)| !user.is_deactivated()),
+        );
+        Ok(match next {
+            Some(key) => {
+                self.after = Some(key);
+                Turn::Ask(self.page())
+            }
+            None => Turn::Finish(std::mem::take(&mut self.accounts)),
+        })
+    }
 }
 
 /// The realm administrator with the smallest id, so every node acts as the same one.
@@ -170,5 +218,29 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn accounts_page_through() {
+        let mut plan = PluginAccounts {
+            after: None,
+            accounts: Vec::new(),
+        };
+        assert!(matches!(
+            plan.first().unwrap(),
+            Turn::Ask(Ask::Page { after: None, .. })
+        ));
+        let rows = vec![(b"u1".to_vec(), Vec::new())];
+        let Turn::Ask(Ask::Page { after, .. }) =
+            plan.next(Answer::Page(rows, Some(b"u1".to_vec()))).unwrap()
+        else {
+            panic!("a next key reads the next page");
+        };
+        assert_eq!(after, Some(b"u1".to_vec()));
+        let Turn::Finish(accounts) = plan.next(Answer::Page(Vec::new(), None)).unwrap() else {
+            panic!("the last page ends the listing");
+        };
+        assert!(accounts.is_empty());
+        assert!(plan.next(Answer::Done).is_err());
     }
 }

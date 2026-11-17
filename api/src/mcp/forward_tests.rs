@@ -234,7 +234,7 @@ fn auth_parts(auth: &AuthContext, directed: Option<NodeId>) -> http::request::Pa
     parts.extensions.insert(Some(token));
     if let Some(node_id) = directed {
         let value = http::HeaderValue::try_from(node_id.to_string()).unwrap();
-        let header = crate::lookup::RELAY_NODE_HEADER;
+        let header = crate::routes::storage::relay::RELAY_NODE_HEADER;
         parts.headers.insert(header, value);
     }
     parts

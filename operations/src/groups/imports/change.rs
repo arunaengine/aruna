@@ -6,7 +6,7 @@ use super::ImportRuleError;
 use super::cron::{is_running, parse_schedule};
 use crate::groups::backends::backend_key;
 use crate::groups::fence::{parse_group_record, read_group_record};
-use crate::jobs::store::decode_job_record;
+
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -15,6 +15,7 @@ use aruna_core::keyspaces::{
     STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::job_record_key;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, import_key, object_prefix, read_patterns, retire_pattern, valid_pattern,
@@ -206,7 +207,7 @@ impl ChangeImportOperation {
             Ok(_) => {}
             Err(error) => return self.fail(error.into()),
         }
-        match run.as_deref().map(decode_job_record).transpose() {
+        match run.as_deref().map(JobRecord::from_bytes).transpose() {
             Ok(Some(last)) if is_running(last.state) => {
                 return self.fail(ImportRuleError::Conflict(
                     "the last run of this import has not finished".to_string(),

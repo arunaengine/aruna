@@ -315,6 +315,30 @@ pub enum DocumentSyncPublish {
     },
 }
 
+/// One bounded causal batch of a document sync topic, read under its stored cursor. The new
+/// cursor is written, as `cursor_value` under `cursor_key`, only once the batch applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileBatch {
+    pub genesis: irokle::OpId,
+    /// The cursor the batch starts from, where an overflow replay resumes.
+    pub start: irokle::ActorClock,
+    pub cursor_key: ByteView,
+    pub cursor_value: ByteView,
+    /// Ops whose payload never decoded into an event.
+    pub rejections: Vec<crate::structs::SyncRejection>,
+    pub events: Vec<BatchEvent>,
+}
+
+/// One event of a [`ReconcileBatch`] with its publishing actor and that actor's sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchEvent {
+    pub event: DocumentEvent,
+    pub actor: irokle::ActorId,
+    pub actor_seq: u64,
+    /// Whether the topic's shard publisher policy admits this actor at this sequence.
+    pub publisher_allowed: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocumentReconcileResult {
     pub targets: Vec<DocumentTarget>,
@@ -716,6 +740,9 @@ pub enum DocumentEffect {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,
     },
+    /// Applies the stored events of these topics to local state; the runner
+    /// carries it out through the net handle, which also reloads realm peers.
+    ReconcileTopics { topics: Vec<irokle::TopicId> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

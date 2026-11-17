@@ -11,7 +11,7 @@ pub async fn read_job_record(
     txn_id: Option<TxnId>,
 ) -> Result<Option<JobRecord>, String> {
     match read_raw(storage, JOB_KEYSPACE, job_record_key(job_id), txn_id).await? {
-        Some(value) => match decode_job_record(&value) {
+        Some(value) => match JobRecord::from_bytes(&value) {
             Ok(record) => Ok(Some(record)),
             Err(error) => {
                 warn!(job_id = %job_id, error = %error, "Malformed job record retained");
@@ -287,7 +287,7 @@ pub async fn complete_cancelled(
 /// The storage-level success invariant: `Succeeded` commits in the transaction
 /// that reads the attempt control, and only when every output binds the active
 /// ExecutionId, names a reserved version, and the exact output record is durable.
-pub(super) async fn commit_success<G>(
+async fn commit_success<G>(
     storage: &StorageHandle,
     job_id: JobId,
     token: Ulid,

@@ -195,6 +195,27 @@ pub(super) async fn replace_batch_in(
     }
 }
 
+/// Applies one batch and commits. A conflict aborts and reports `false`, so the caller tries
+/// again; any other failure aborts and is returned.
+pub(super) async fn commit_batch(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    deletes: Vec<(String, ByteView)>,
+    writes: Vec<(String, ByteView, Value)>,
+) -> Result<bool> {
+    match replace_batch_in(storage, txn_id, deletes, writes).await {
+        Ok(()) => Ok(true),
+        Err(NetError::Storage(StorageError::TransactionConflict)) => {
+            let _ = abort_txn(storage, txn_id).await;
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = abort_txn(storage, txn_id).await;
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 pub(super) async fn batch_delete_to(
     storage: &StorageHandle,

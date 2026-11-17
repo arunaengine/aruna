@@ -41,10 +41,11 @@ use crate::s3::object::get::{
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
 use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
+use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 struct PreparedReference {
     metadata: SourceMetadata,
@@ -654,8 +655,8 @@ async fn mark_access_denied(context: &DriverContext, mut relationship: SyncRelat
         .counters
         .consecutive_failures
         .saturating_add(1);
-    match store_sync_status(context, &relationship).await {
-        Ok(true) => kick_mirror_repair(context).await,
+    match drive(StoreStatusOperation::new(relationship.clone()), context).await {
+        Ok(true) => _ = drive(KickRepairOperation::new(), context).await,
         Ok(false) => {}
         Err(error) => warn!(%error, "Failed to persist native reference denial"),
     }
@@ -748,11 +749,9 @@ mod tests {
 
         mark_access_denied(&context, relationship.clone()).await;
 
-        let txn = crate::plugins::store::Txn::direct(&context);
         let pending = aruna_core::plugin_runs::PENDING_ROW;
-        let (rows, _) = crate::plugins::journal::journal_page(&txn, pending, None, 10)
-            .await
-            .unwrap();
+        let page = crate::plugins::journal::journal_page(pending, None, 10);
+        let (rows, _) = crate::driver::drive(page, &context).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.resource, relationship.id.to_string());
         let transition = format!("sync_failed/{source}/{}/", relationship.id);

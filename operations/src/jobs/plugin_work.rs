@@ -24,10 +24,10 @@ use super::key_wake::version_wait;
 use crate::driver::drive;
 use crate::plugins::account::read_user;
 use crate::plugins::broker::local_object;
+use crate::plugins::broker::unmarked;
 use crate::plugins::check::{check_identity, copy_grants};
 use crate::plugins::install::read_config;
-use crate::plugins::marks::unmarked;
-use crate::plugins::outgoing::node_keys;
+use crate::plugins::release::node_keys;
 use crate::plugins::work::{WorkRow, read_work};
 
 use super::transfers::{Download, Upload, download_work, upload_work};
@@ -91,7 +91,7 @@ async fn admit_work(
     let deferred = |message: String| JobRunOutcome::Deferred(JobError::retryable(message));
     let config = read_config(&ctx.driver, spec.realm_id).await;
     let config = config.map_err(|error| deferred(error.to_string()))?;
-    let row = read_work(&ctx.driver, spec.install_id, spec.work_id).await;
+    let row = drive(read_work(spec.install_id, spec.work_id), &ctx.driver).await;
     let row = row.map_err(|error| deferred(error.to_string()))?;
     let Some(row) = row else {
         return Err(permanent("the plugin work is no longer recorded"));

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::structs::storage::data::identity::{LOCAL_PATH_IRI, ensure_local_term};
-use craqle::{CrateViolation, RoCrateError, UpdateError};
+use craqle::{RoCrateError, UpdateError};
 use oxrdf::{NamedOrBlankNode, Term};
 use oxttl::NQuadsParser;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -349,7 +349,12 @@ fn ensure_local_context(value: &mut Value) -> Result<(), CrateValidationError> {
 fn map_validation_error(error: RoCrateError) -> CrateValidationError {
     match error {
         RoCrateError::Update(UpdateError::ValidationFailed(violations)) => {
-            CrateValidationError::Violations(violations.into_iter().map(validation_issue).collect())
+            CrateValidationError::Violations(
+                violations
+                    .into_iter()
+                    .map(MetadataValidationViolation::from)
+                    .collect(),
+            )
         }
         // craqle reports version problems as errors; keep the structured code
         // the import and export contracts expose.
@@ -362,15 +367,6 @@ fn map_validation_error(error: RoCrateError) -> CrateValidationError {
             }])
         }
         other => CrateValidationError::Invalid(other.to_string()),
-    }
-}
-
-fn validation_issue(violation: CrateViolation) -> MetadataValidationViolation {
-    MetadataValidationViolation {
-        code: violation.code.to_string(),
-        message: violation.message,
-        pointer: violation.pointer,
-        entity_id: violation.entity_id,
     }
 }
 

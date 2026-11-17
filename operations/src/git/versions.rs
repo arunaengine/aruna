@@ -345,11 +345,11 @@ pub(super) fn version(commit: CommitInfo, state: &GitState, tags: &[Named]) -> V
 /// from, so later pages stay stable while the branch moves.
 pub async fn list(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     query: VersionQuery<'_>,
 ) -> Result<(Vec<Version>, Option<String>), GitError> {
+    let store = super::store(context)?;
     let projection = read(context, store, auth, id).await?;
     let (head, skip) = match query.cursor {
         Some(cursor) => {
@@ -390,11 +390,11 @@ pub async fn list(
 /// One version and the files it changed against its first parent.
 pub async fn show(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     revision: &str,
 ) -> Result<(Version, Vec<FileChange>), GitError> {
+    let store = super::store(context)?;
     let projection = read(context, store, auth, id).await?;
     let commit = resolve(store, auth, id, revision).await?;
     let info = log(store, auth, id, (&commit, None), 0, 1)
@@ -415,12 +415,12 @@ pub async fn show(
 
 pub async fn compare(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     from: Option<&str>,
     to: &str,
 ) -> Result<Comparison, GitError> {
+    let store = super::store(context)?;
     read(context, store, auth, id).await?;
     let from = match from {
         Some(from) => Some(resolve(store, auth, id, from).await?),
@@ -447,10 +447,10 @@ pub async fn compare(
 /// Every branch with its head version.
 pub async fn branches(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<(String, Version)>, GitError> {
+    let store = super::store(context)?;
     let projection = read(context, store, auth, id).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
     let heads: Vec<_> = projection
@@ -473,10 +473,10 @@ pub async fn branches(
 /// Every tag with the commit it names.
 pub async fn tags(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<Named>, GitError> {
+    let store = super::store(context)?;
     let projection = read(context, store, auth, id).await?;
     peeled_tags(store, auth, id, &projection).await
 }
@@ -488,13 +488,13 @@ pub fn protected(branch: &str) -> bool {
 /// Creates (`target` set) or deletes a branch or tag. Creating refuses an existing name.
 pub async fn change_ref(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     name: String,
     target: Option<&str>,
     expected: Option<&str>,
 ) -> Result<Named, GitError> {
+    let store = super::store(context)?;
     let discard = name.starts_with("refs/conflicts/") && target.is_none();
     if !(valid_ref(&name, false) || discard) {
         return Err(GitError::Invalid);
@@ -572,10 +572,10 @@ pub(super) fn parse_conflict(name: &str, target: &str) -> Option<Conflict> {
 /// Branch and tag updates that lost a race between holders, with the version each kept.
 pub async fn conflicts(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Vec<(Conflict, Version)>, GitError> {
+    let store = super::store(context)?;
     let projection = read(context, store, auth, id).await?;
     let tags = peeled_tags(store, auth, id, &projection).await?;
     let kept: Vec<_> = projection
@@ -602,11 +602,11 @@ pub async fn conflicts(
 /// The full ref name of a kept conflict, for discarding it.
 pub async fn conflict_ref(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     conflict: Ulid,
 ) -> Result<String, GitError> {
+    let store = super::store(context)?;
     let projection = read(context, store, auth, id).await?;
     projection
         .state

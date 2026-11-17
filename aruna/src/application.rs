@@ -1188,7 +1188,7 @@ mod tests {
     /// The same minimal owner set as the shutdown-module helper, so the
     /// mapping test runs a real `NodeShutdown` sequence.
     fn node_shutdown(
-        shutdown: aruna_core::shutdown::Shutdown,
+        shutdown: aruna_tasks::shutdown::Shutdown,
         storage_handle: aruna_storage::StorageHandle,
         grace: std::time::Duration,
     ) -> NodeShutdown {
@@ -1223,7 +1223,7 @@ mod tests {
                 .expect("storage opens");
 
         let complete = node_shutdown(
-            aruna_core::shutdown::Shutdown::new(),
+            aruna_tasks::shutdown::Shutdown::new(),
             storage_handle.clone(),
             crate::shutdown::MIN_SHUTDOWN_GRACE,
         )
@@ -1235,7 +1235,7 @@ mod tests {
             ProcessOutcome::StartupCancelled
         );
 
-        let shutdown = aruna_core::shutdown::Shutdown::new();
+        let shutdown = aruna_tasks::shutdown::Shutdown::new();
         shutdown.spawn(std::future::pending());
         let incomplete = node_shutdown(
             shutdown,

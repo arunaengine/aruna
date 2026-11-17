@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod join_registry;
+pub mod shutdown;
 pub mod wipe;
 
 use aruna_core::effects::Effect;
