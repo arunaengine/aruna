@@ -3,12 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::IoError;
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::document::DocumentOutboxEvent;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -21,8 +22,10 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::metadata::call_results::read_value;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry};
+use aruna_core::placement::fence::{admits, fence_read};
 use aruna_core::placement::resolve_shard_holders;
 
 #[derive(Debug, Error, PartialEq)]
@@ -77,6 +80,42 @@ pub(crate) fn parse_mapping_read(
         _ => Err(PersistentIdError::Storage(StorageError::ReadError(
             "unexpected event".to_string(),
         ))),
+    }
+}
+
+/// The call that reads a document's mapping row.
+pub(crate) fn mapping_call(document_id: Ulid) -> IoCall {
+    read_row(ID_MAPPING_KEYSPACE, persistent_id_key(document_id))
+}
+
+/// The mapping a [`mapping_call`] read, when the row exists.
+pub(crate) fn mapping_answer(
+    result: IoResult,
+) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
+    read_value(result)?
+        .map(|value| PersistentIdMapping::from_bytes(value.as_ref()))
+        .transpose()
+        .map_err(PersistentIdError::Conversion)
+}
+
+/// The read of the mapping bucket's write fence, when the route resolved at a fenced generation.
+pub(crate) fn fence_call(route: &Option<MappingRoute>) -> Option<IoCall> {
+    let route = route.as_ref().filter(|route| route.generation > 0)?;
+    Some(IoCall::Read(vec![fence_read(
+        &route.realm_id,
+        &route.placement,
+    )]))
+}
+
+/// Checks a [`fence_call`] answer: a bucket closed past the route's generation refuses writes.
+pub(crate) fn fence_answer(
+    route: &Option<MappingRoute>,
+    result: IoResult,
+) -> Result<(), PersistentIdError> {
+    let generation = route.as_ref().map_or(0, |route| route.generation);
+    match admits(read_value(result)?.as_ref(), generation) {
+        true => Ok(()),
+        false => Err(PersistentIdError::PlacementFenced),
     }
 }
 

@@ -3,29 +3,24 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, METADATA_AUDIT_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::{decode, done, encoded_row, read_row};
+use aruna_core::storage_entries::metadata_document_key;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
 use aruna_core::structs::{PersistentIdFailure, PersistentIdMapping, secondary_index_deletes};
-use aruna_core::types::{Effects, TxnId, Value};
-use byteview::ByteView;
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace};
 use ulid::Ulid;
 
+use crate::metadata::call_results::read_value;
 use crate::metadata::id_mapping::{
-    MappingRoute, PersistentIdError, TransitionEntry, mapping_revision, parse_mapping_read,
-    read_mapping_effect, transition_actor, transition_entries,
+    MappingRoute, PersistentIdError, TransitionEntry, fence_answer, fence_call, mapping_answer,
+    mapping_call, mapping_revision, transition_actor, transition_entries,
 };
-use crate::metadata::repository::{metadata_audit_key, read_document_registry};
-
-/// Storage conflicts are optimistic and short-lived; a caller that exhausts these
-/// gets a retryable error rather than a lost transition.
-const TRANSITION_ATTEMPTS: usize = 4;
+use crate::metadata::repository::metadata_audit_key;
 
 /// The change one transition makes to the mapping.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,37 +51,28 @@ pub struct PidOutcome {
 }
 
 #[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    Start,
+enum Step {
     Mapping,
     Registry,
     Fence,
     Write,
     Delete,
-    Commit,
-    /// Aborts a no-op transaction before reading the stored mapping outside it.
-    Release,
-    Existing,
-    Aborting,
-    Finish,
 }
 
-/// Runs one transition behind the mapping bucket's write fence, retrying a commit
-/// conflict with a fresh transaction. A no-op answers with the stored mapping.
+type PidTurn = Result<Next<PidOutcome>, PersistentIdError>;
+
+/// Runs one transition in one transaction behind the mapping bucket's write fence; the runner
+/// reruns it after a commit conflict. A no-op answers with the stored mapping and writes nothing.
 #[derive(Debug, PartialEq)]
 pub struct PidTransitionOperation {
     route: Option<MappingRoute>,
     document_id: Ulid,
     transition: PidTransition,
-    state: State,
-    attempts: usize,
-    txn_id: Option<TxnId>,
+    step: Step,
     mapping: Option<PersistentIdMapping>,
     registry: Option<MetadataRegistryRecord>,
     applied: bool,
-    deletes: Vec<(String, ByteView)>,
-    output: Option<Result<PidOutcome, PersistentIdError>>,
+    deletes: Vec<(KeySpace, Key)>,
 }
 
 impl PidTransitionOperation {
@@ -95,75 +81,37 @@ impl PidTransitionOperation {
             route,
             document_id,
             transition,
-            state: State::Init,
-            attempts: 0,
-            txn_id: None,
+            step: Step::Mapping,
             mapping: None,
             registry: None,
             applied: false,
             deletes: Vec::new(),
-            output: None,
         }
     }
 
-    fn begin(&mut self) -> Effects {
-        self.attempts += 1;
-        self.mapping = None;
-        self.registry = None;
-        self.deletes = Vec::new();
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn read_mapping(&mut self) -> PidTurn {
+        self.step = Step::Mapping;
+        Ok(Next::Call(mapping_call(self.document_id)))
     }
 
-    fn fail(&mut self, error: PersistentIdError) -> Effects {
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    fn unexpected(&mut self, event: &Event) -> Effects {
-        let message = format!(
-            "unexpected persistent id event {} in state {:?}",
-            event.label(),
-            self.state
-        );
-        self.fail(PersistentIdError::Unavailable(message))
-    }
-
-    fn read(&mut self, state: State, effect: Effect) -> Effects {
-        self.state = state;
-        smallvec![effect]
-    }
-
-    fn read_mapping(&mut self) -> Effects {
-        let effect = read_mapping_effect(self.document_id, self.txn_id);
-        self.read(State::Mapping, effect)
-    }
-
-    fn read_registry(&mut self) -> Effects {
-        let effect = read_document_registry(self.document_id, self.txn_id);
-        self.read(State::Registry, effect)
+    fn read_registry(&mut self) -> PidTurn {
+        self.step = Step::Registry;
+        let key = metadata_document_key(self.document_id);
+        Ok(Next::Call(read_row(DOCUMENT_INDEX_KEYSPACE, key)))
     }
 
     /// Reads the fence, or goes on when the route has no fenced generation.
-    fn check_fence(&mut self) -> Effects {
-        let Some(route) = self.route.as_ref().filter(|route| route.generation > 0) else {
+    fn check_fence(&mut self) -> PidTurn {
+        let Some(fence) = fence_call(&self.route) else {
             return self.fenced();
         };
-        let (key_space, key) =
-            aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
-        let effect = Effect::Storage(StorageEffect::Read {
-            key_space,
-            key,
-            txn_id: self.txn_id,
-        });
-        self.read(State::Fence, effect)
+        self.step = Step::Fence;
+        Ok(Next::Call(fence))
     }
 
     /// The step after an admitting fence: mint reads the registry, withdraw the
     /// mapping, and a failure applies right away.
-    fn fenced(&mut self) -> Effects {
+    fn fenced(&mut self) -> PidTurn {
         match self.transition {
             PidTransition::Mint { .. } => self.read_registry(),
             PidTransition::Fail { .. } => self.apply(),
@@ -171,33 +119,26 @@ impl PidTransitionOperation {
         }
     }
 
-    fn mapping_read(&mut self, event: Event) -> Effects {
-        let mapping = match parse_mapping_read(event) {
-            Ok(Some(mapping)) => mapping,
-            Ok(None) => return self.fail(PersistentIdError::IntentMissing),
-            Err(error) => return self.fail(error),
-        };
+    fn mapping_read(&mut self, result: IoResult) -> PidTurn {
+        let mapping = mapping_answer(result)?.ok_or(PersistentIdError::IntentMissing)?;
         let skip_mint = mapping.is_active() || mapping.is_retired();
+        if matches!(self.transition, PidTransition::Mint { .. }) && skip_mint {
+            return Ok(Next::Done(unchanged(mapping)));
+        }
         self.mapping = Some(mapping);
         match self.transition {
-            PidTransition::Mint { .. } if skip_mint => self.release(),
             PidTransition::Withdraw { .. } => self.apply(),
             _ => self.check_fence(),
         }
     }
 
-    fn registry_read(&mut self, value: Option<Value>) -> Effects {
+    fn registry_read(&mut self, result: IoResult) -> PidTurn {
+        let value = read_value(result)?;
         if let PidTransition::Withdraw { .. } = self.transition {
-            let Some(bytes) = value else {
-                return self.fail(PersistentIdError::DocumentMissing);
-            };
-            match postcard::from_bytes(bytes.as_ref()) {
-                Ok(record) => self.registry = Some(record),
-                Err(error) => return self.fail(PersistentIdError::Conversion(error.into())),
-            }
+            let value = value.ok_or(PersistentIdError::DocumentMissing)?;
+            self.registry = Some(decode(&value)?);
             return self.check_fence();
         }
-        self.registry = None;
         if value.is_none() {
             // Projection has not produced the row yet: record Processing, retryable.
             return self.mint_processing();
@@ -205,9 +146,9 @@ impl PidTransitionOperation {
         self.apply()
     }
 
-    fn mint_processing(&mut self) -> Effects {
+    fn mint_processing(&mut self) -> PidTurn {
         let PidTransition::Mint { minted_at_ms, .. } = self.transition else {
-            return self.fail(PersistentIdError::Unavailable("not a mint".into()));
+            return Err(PersistentIdError::Unavailable("not a mint".into()));
         };
         let failure = PersistentIdFailure {
             message: "metadata projection is not readable yet".to_string(),
@@ -215,19 +156,22 @@ impl PidTransitionOperation {
             recorded_at_ms: minted_at_ms,
         };
         let revision = mapping_revision(&self.route, minted_at_ms);
-        let Some(mapping) = self.mapping.as_mut() else {
-            return self.fail(PersistentIdError::IntentMissing);
-        };
+        let mapping = self
+            .mapping
+            .as_mut()
+            .ok_or(PersistentIdError::IntentMissing)?;
         mapping.processing(revision, Some(failure));
         self.applied = false;
         self.write(Vec::new())
     }
 
-    /// Applies the transition to the read mapping and writes it, or releases a no-op.
-    fn apply(&mut self) -> Effects {
-        let Some(mapping) = self.mapping.as_mut() else {
-            return self.fail(PersistentIdError::IntentMissing);
-        };
+    /// Applies the transition to the read mapping and writes it; a no-op answers unchanged.
+    fn apply(&mut self) -> PidTurn {
+        let stored = self
+            .mapping
+            .take()
+            .ok_or(PersistentIdError::IntentMissing)?;
+        let mut mapping = stored.clone();
         let changed = match &self.transition {
             PidTransition::Mint {
                 minted_by,
@@ -248,13 +192,11 @@ impl PidTransitionOperation {
             ),
         };
         if !changed {
-            return self.release();
+            return Ok(Next::Done(unchanged(stored)));
         }
         self.applied = true;
-        let audit = match self.withdraw_audit() {
-            Ok(audit) => audit,
-            Err(error) => return self.fail(error),
-        };
+        self.mapping = Some(mapping);
+        let audit = self.withdraw_audit()?;
         self.write(audit)
     }
 
@@ -282,204 +224,100 @@ impl PidTransitionOperation {
             occurred_at_ms: *withdrawn_at_ms,
             details: Some(format!("provider=w3id; reason={reason}")),
         };
-        let value = postcard::to_allocvec(&audit)
-            .map_err(|error| PersistentIdError::Conversion(error.into()))?;
-        Ok(vec![(
-            METADATA_AUDIT_KEYSPACE.to_string(),
-            metadata_audit_key(record.group_id, self.document_id, mapping.revision.event_id),
-            ByteView::from(value),
-        )])
+        let key = metadata_audit_key(record.group_id, self.document_id, mapping.revision.event_id);
+        Ok(vec![encoded_row(METADATA_AUDIT_KEYSPACE, key, &audit)?])
     }
 
-    fn write(&mut self, extra: Vec<TransitionEntry>) -> Effects {
-        let Some(mapping) = self.mapping.as_ref() else {
-            return self.fail(PersistentIdError::IntentMissing);
-        };
-        let mut writes = match transition_entries(&self.route, mapping) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error),
-        };
+    fn write(&mut self, extra: Vec<TransitionEntry>) -> PidTurn {
+        let mapping = self
+            .mapping
+            .as_ref()
+            .ok_or(PersistentIdError::IntentMissing)?;
+        let mut writes = transition_entries(&self.route, mapping)?;
         writes.extend(extra);
         if let PidTransition::Withdraw { .. } = self.transition {
             self.deletes = secondary_index_deletes(mapping);
         }
-        self.state = State::Write;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
+        self.step = Step::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn written(&mut self) -> Effects {
-        if self.deletes.is_empty() {
-            return self.commit();
-        }
-        self.state = State::Delete;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(PersistentIdError::Unavailable("transaction missing".into()));
-        };
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn committed(&mut self) -> Effects {
-        self.txn_id = None;
-        self.state = State::Finish;
-        self.output = self.mapping.take().map(|mapping| {
-            Ok(PidOutcome {
-                mapping,
-                applied: self.applied,
-                committed: true,
-            })
-        });
-        smallvec![]
-    }
-
-    /// Commit errors other than a conflict leave no transaction to abort.
-    fn commit_failed(&mut self, error: StorageError) -> Effects {
-        self.txn_id = None;
-        match error {
-            StorageError::TransactionConflict if self.attempts < TRANSITION_ATTEMPTS => {
-                self.begin()
-            }
-            StorageError::TransactionConflict => self.fail(PersistentIdError::Storage(error)),
-            error => self.fail(PersistentIdError::Unavailable(error.to_string())),
-        }
-    }
-
-    fn release(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id.take() else {
-            return self.read_existing();
-        };
-        self.state = State::Release;
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn read_existing(&mut self) -> Effects {
-        let effect = read_mapping_effect(self.document_id, None);
-        self.read(State::Existing, effect)
-    }
-
-    fn existing_read(&mut self, event: Event) -> Effects {
-        let missing = match self.transition {
-            PidTransition::Mint { .. } => PersistentIdError::DocumentMissing,
-            PidTransition::Fail { .. } => PersistentIdError::IntentMissing,
-            PidTransition::Withdraw { .. } => PersistentIdError::Storage(StorageError::ReadError(
-                "persistent id mapping missing".to_string(),
-            )),
-        };
-        self.state = State::Finish;
-        self.output = Some(parse_mapping_read(event).and_then(|mapping| {
-            let mapping = mapping.ok_or(missing)?;
-            Ok(PidOutcome {
-                mapping,
-                applied: false,
-                committed: false,
-            })
-        }));
-        smallvec![]
+    fn committed(&mut self) -> PidTurn {
+        let mapping = self
+            .mapping
+            .take()
+            .ok_or(PersistentIdError::IntentMissing)?;
+        Ok(Next::Done(PidOutcome {
+            mapping,
+            applied: self.applied,
+            committed: true,
+        }))
     }
 }
 
-impl EffectOperation for PidTransitionOperation {
+/// The outcome of a transition that changed nothing.
+fn unchanged(mapping: PersistentIdMapping) -> PidOutcome {
+    PidOutcome {
+        mapping,
+        applied: false,
+        committed: false,
+    }
+}
+
+impl Operation for PidTransitionOperation {
     type Output = PidOutcome;
     type Error = PersistentIdError;
 
-    fn start(&mut self) -> Effects {
-        self.begin()
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (State::Aborting, _) => {
-                self.state = State::Finish;
-                smallvec![]
-            }
-            // A failed abort leaves nothing to undo here; the stored row still answers.
-            (State::Release, _) => self.read_existing(),
-            (State::Existing, event) => self.existing_read(event),
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                match self.transition {
-                    PidTransition::Withdraw { .. } => self.read_registry(),
-                    _ => self.read_mapping(),
-                }
-            }
-            (State::Mapping, event) => self.mapping_read(event),
-            (State::Registry, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.registry_read(value)
-            }
-            (State::Fence, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let generation = self.route.as_ref().map_or(0, |route| route.generation);
-                if !aruna_core::placement::fence::admits(value.as_ref(), generation) {
-                    return self.fail(PersistentIdError::PlacementFenced);
-                }
-                self.fenced()
-            }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => self.written(),
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.commit()
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.committed()
-            }
-            (State::Commit, Event::Storage(StorageEvent::Error { error })) => {
-                self.commit_failed(error)
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => {
-                self.fail(PersistentIdError::Storage(error))
-            }
-            (_, event) => self.unexpected(&event),
+    fn first(&mut self) -> PidTurn {
+        match self.transition {
+            PidTransition::Withdraw { .. } => self.read_registry(),
+            _ => self.read_mapping(),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PersistentIdError::Unavailable(
-            "persistent id transition did not finish".into(),
-        )))
-    }
-
-    // An open transaction is aborted and its answer awaited; without one the run ends.
-    fn abort(&mut self) -> Effects {
-        let txn_id = self.txn_id.take();
-        self.state = if txn_id.is_some() {
-            State::Aborting
-        } else {
-            State::Finish
-        };
-        let abort = |txn_id| Effect::Storage(StorageEffect::AbortTransaction { txn_id });
-        txn_id.map(abort).into_iter().collect()
+    fn next(&mut self, result: IoResult) -> PidTurn {
+        match self.step {
+            Step::Mapping => self.mapping_read(result),
+            Step::Registry => self.registry_read(result),
+            Step::Fence => {
+                fence_answer(&self.route, result)?;
+                self.fenced()
+            }
+            Step::Write => {
+                done(result)?;
+                if self.deletes.is_empty() {
+                    return self.committed();
+                }
+                self.step = Step::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Step::Delete => {
+                done(result)?;
+                self.committed()
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
-    use crate::metadata::secondary_ids::tests::{mapping, read_event};
+    use crate::metadata::secondary_ids::tests::mapping;
     use crate::metadata::timestamp_sweep::state_machine_tests::record_bytes;
-    use aruna_core::operation_check::{
-        check_abort, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::calls::IoError;
+    use aruna_core::errors::StorageError;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::types::Value;
 
     fn document() -> Ulid {
         Ulid::from_bytes([3; 16])
-    }
-
-    fn txn() -> TxnId {
-        Ulid::from_bytes([9; 16])
     }
 
     fn user() -> UserId {
@@ -503,86 +341,47 @@ mod state_machine_tests {
         }
     }
 
-    fn started(transition: PidTransition, route: Option<MappingRoute>) -> PidTransitionOperation {
-        let mut operation = PidTransitionOperation::new(route, document(), transition);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: txn(),
-        }));
-        operation
+    fn withdraw() -> PidTransition {
+        PidTransition::Withdraw {
+            withdrawn_by: user(),
+            reason: "court order".to_string(),
+            withdrawn_at_ms: 90,
+        }
     }
 
-    fn registry(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: value.map(ByteView::from),
-        })
+    fn row(value: Option<Value>) -> IoResult {
+        IoResult::Values(vec![value])
     }
 
-    fn written() -> Event {
-        Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        })
+    fn stored(mapping: &PersistentIdMapping) -> IoResult {
+        row(Some(mapping.to_bytes().unwrap().into()))
     }
 
-    fn committed() -> Event {
-        Event::Storage(StorageEvent::TransactionCommitted { txn_id: txn() })
+    fn registry_call() -> PidTurn {
+        let key = metadata_document_key(document());
+        Ok(Next::Call(read_row(DOCUMENT_INDEX_KEYSPACE, key)))
     }
 
-    fn aborted() -> Event {
-        Event::Storage(StorageEvent::TransactionAborted { txn_id: txn() })
-    }
-
-    fn storage_error(error: StorageError) -> Event {
-        Event::Storage(StorageEvent::Error { error })
-    }
-
-    fn is_commit(effects: &Effects) -> bool {
-        effects.as_slice()
-            == [Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id: txn(),
-            })]
-    }
-
-    fn is_abort(effects: &Effects) -> bool {
-        effects.as_slice()
-            == [Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: txn(),
-            })]
+    fn writes(turn: PidTurn) -> Vec<TransitionEntry> {
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("expected one write");
+        };
+        writes
     }
 
     #[test]
     fn mint_activates_mapping() {
         let mut operation = PidTransitionOperation::new(None, document(), mint());
+        assert!(operation.transaction());
+        assert_eq!(operation.first(), Ok(Next::Call(mapping_call(document()))));
         assert_eq!(
-            operation.start().as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
+            operation.next(stored(&mapping(document()))),
+            registry_call()
         );
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: txn(),
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [read_mapping_effect(document(), Some(txn()))]
-        );
-        let effects = operation.step(read_event(Some(&mapping(document()))));
-        assert_eq!(
-            effects.as_slice(),
-            [read_document_registry(document(), Some(txn()))]
-        );
-        let effects = operation.step(registry(Some(vec![1])));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchWrite {
-                txn_id: Some(_),
-                ..
-            })]
-        ));
-        assert!(is_commit(&operation.step(written())));
-        assert!(operation.step(committed()).is_empty());
-        let outcome = operation.finalize().unwrap();
+        writes(operation.next(row(Some(vec![1].into()))));
+        let Ok(Next::Done(outcome)) = operation.next(IoResult::Done) else {
+            panic!("expected the outcome");
+        };
         assert!(outcome.mapping.is_active());
         assert!(outcome.applied && outcome.committed);
     }
@@ -590,74 +389,72 @@ mod state_machine_tests {
     #[test]
     fn unprojected_mint_processing() {
         // Without a registry row the mint commits Processing and reports no activation.
-        let mut operation = started(mint(), None);
-        operation.step(read_event(Some(&mapping(document()))));
-        operation.step(registry(None));
-        operation.step(written());
-        operation.step(committed());
-        let outcome = operation.finalize().unwrap();
+        let mut operation = PidTransitionOperation::new(None, document(), mint());
+        operation.first().unwrap();
+        operation.next(stored(&mapping(document()))).unwrap();
+        writes(operation.next(row(None)));
+        let Ok(Next::Done(outcome)) = operation.next(IoResult::Done) else {
+            panic!("expected the outcome");
+        };
         assert!(!outcome.mapping.is_active());
         assert!(!outcome.applied && outcome.committed);
     }
 
     #[test]
-    fn noop_reads_existing() {
-        // An active mapping is not minted again; the stored row answers outside the transaction.
+    fn noop_answers_stored() {
+        // An active mapping is not minted again; the stored row answers and nothing is written.
         let mut active = mapping(document());
         active.activate(user(), active.revision);
-        let mut operation = started(mint(), None);
-        assert!(is_abort(&operation.step(read_event(Some(&active)))));
+        let mut operation = PidTransitionOperation::new(None, document(), mint());
+        operation.first().unwrap();
         assert_eq!(
-            operation.step(aborted()).as_slice(),
-            [read_mapping_effect(document(), None)]
+            operation.next(stored(&active)),
+            Ok(Next::Done(unchanged(active)))
         );
-        assert!(operation.step(read_event(Some(&active))).is_empty());
-        let outcome = operation.finalize().unwrap();
-        assert_eq!(outcome.mapping, active);
-        assert!(!outcome.applied && !outcome.committed);
 
-        let mut gone = started(mint(), None);
-        gone.step(read_event(Some(&active)));
-        gone.step(aborted());
-        gone.step(read_event(None));
-        assert_eq!(gone.finalize(), Err(PersistentIdError::DocumentMissing));
+        let mut missing = PidTransitionOperation::new(None, document(), failure());
+        missing.first().unwrap();
+        assert_eq!(
+            missing.next(row(None)),
+            Err(PersistentIdError::IntentMissing)
+        );
     }
 
     #[test]
     fn withdraw_writes_audit() {
-        let transition = PidTransition::Withdraw {
-            withdrawn_by: user(),
-            reason: "court order".to_string(),
-            withdrawn_at_ms: 90,
-        };
-        let mut operation = started(transition.clone(), None);
-        let effects = operation.step(registry(Some(record_bytes(document(), 10).to_vec())));
+        let mut operation = PidTransitionOperation::new(None, document(), withdraw());
+        assert_eq!(operation.first(), registry_call());
+        let registry = Some(record_bytes(document(), 10));
         assert_eq!(
-            effects.as_slice(),
-            [read_mapping_effect(document(), Some(txn()))]
+            operation.next(row(registry)),
+            Ok(Next::Call(mapping_call(document())))
         );
-        let effects = operation.step(read_event(Some(&mapping(document()))));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}");
-        };
+        let written = writes(operation.next(stored(&mapping(document()))));
         assert!(
-            writes
+            written
                 .iter()
                 .any(|(key_space, _, _)| key_space == METADATA_AUDIT_KEYSPACE)
         );
-        assert!(is_commit(&operation.step(written())));
-        operation.step(committed());
-        assert!(operation.finalize().unwrap().mapping.is_retired());
+        let retired = loop {
+            match operation.next(IoResult::Done) {
+                Ok(Next::Call(IoCall::Delete(_))) => continue,
+                Ok(Next::Done(outcome)) => break outcome,
+                other => panic!("unexpected turn {other:?}"),
+            }
+        };
+        assert!(retired.mapping.is_retired());
 
-        let mut missing = started(transition, None);
-        assert!(is_abort(&missing.step(registry(None))));
-        missing.step(aborted());
-        assert_eq!(missing.finalize(), Err(PersistentIdError::DocumentMissing));
+        let mut missing = PidTransitionOperation::new(None, document(), withdraw());
+        missing.first().unwrap();
+        assert_eq!(
+            missing.next(row(None)),
+            Err(PersistentIdError::DocumentMissing)
+        );
     }
 
     #[test]
     fn fence_rejects_failure() {
-        let route = MappingRoute {
+        let route = Some(MappingRoute {
             realm_id: RealmId([5; 32]),
             placement: PlacementRef {
                 strategy_id: Ulid::from_bytes([6; 16]),
@@ -666,129 +463,34 @@ mod state_machine_tests {
             peers: Vec::new(),
             actor: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             generation: 3,
-        };
-        let mut operation = started(failure(), Some(route));
-        let effects = operation.step(read_event(Some(&mapping(document()))));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read {
-                txn_id: Some(_),
-                ..
-            })]
-        ));
-        // A bucket closed at generation 5 no longer admits a transition resolved at 3.
-        let fence = registry(Some(5u64.to_be_bytes().to_vec()));
-        assert!(is_abort(&operation.step(fence)));
-        operation.step(aborted());
+        });
+        let mut operation = PidTransitionOperation::new(route.clone(), document(), failure());
+        operation.first().unwrap();
         assert_eq!(
-            operation.finalize(),
+            operation.next(stored(&mapping(document()))),
+            Ok(Next::Call(fence_call(&route).unwrap()))
+        );
+        // A bucket closed at generation 5 no longer admits a transition resolved at 3.
+        let closed = row(Some(5u64.to_be_bytes().to_vec().into()));
+        assert_eq!(
+            operation.next(closed),
             Err(PersistentIdError::PlacementFenced)
         );
     }
 
     #[test]
-    fn conflict_exhausts_retries() {
-        let mut operation = started(failure(), None);
-        for attempt in 1..=TRANSITION_ATTEMPTS {
-            if attempt > 1 {
-                operation.step(Event::Storage(StorageEvent::TransactionStarted {
-                    txn_id: txn(),
-                }));
-            }
-            operation.step(read_event(Some(&mapping(document()))));
-            operation.step(written());
-            let effects = operation.step(storage_error(StorageError::TransactionConflict));
-            let restarted = effects.as_slice()
-                == [Effect::Storage(StorageEffect::StartTransaction {
-                    read: false,
-                })];
-            assert_eq!(restarted, attempt < TRANSITION_ATTEMPTS);
-        }
-        assert!(operation.is_complete());
+    fn conflict_reruns() {
+        let conflict = PersistentIdError::from(IoError::Conflict);
+        assert!(PidTransitionOperation::is_conflict(&conflict));
         assert_eq!(
-            operation.finalize(),
-            Err(PersistentIdError::Storage(
-                StorageError::TransactionConflict
-            ))
+            PersistentIdError::from(IoError::Storage(StorageError::Timeout)),
+            PersistentIdError::Storage(StorageError::Timeout)
         );
-    }
-
-    #[test]
-    fn storage_errors_fail() {
-        // Before a transaction nothing is aborted; inside one the abort runs first.
-        let mut unstarted = PidTransitionOperation::new(None, document(), failure());
-        unstarted.start();
-        assert!(
-            unstarted
-                .step(storage_error(StorageError::Timeout))
-                .is_empty()
-        );
-        assert_eq!(
-            unstarted.finalize(),
-            Err(PersistentIdError::Storage(StorageError::Timeout))
-        );
-
-        let mut reading = started(failure(), None);
-        assert!(is_abort(
-            &reading.step(storage_error(StorageError::Timeout))
-        ));
-        reading.step(aborted());
-        assert_eq!(
-            reading.finalize(),
-            Err(PersistentIdError::Storage(StorageError::Timeout))
-        );
-
-        let mut committing = started(failure(), None);
-        committing.step(read_event(Some(&mapping(document()))));
-        committing.step(written());
-        assert!(
-            committing
-                .step(storage_error(StorageError::Timeout))
-                .is_empty()
-        );
+        let mut operation = PidTransitionOperation::new(None, document(), failure());
+        operation.first().unwrap();
         assert!(matches!(
-            committing.finalize(),
+            operation.next(IoResult::Done),
             Err(PersistentIdError::Unavailable(_))
         ));
-    }
-
-    #[test]
-    fn rejects_other_events() {
-        let starting = || {
-            let mut operation = PidTransitionOperation::new(None, document(), failure());
-            operation.start();
-            operation
-        };
-        let accepted = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(
-                    StorageEvent::TransactionStarted { .. } | StorageEvent::Error { .. }
-                )
-            )
-        };
-        for (_, effects, error) in rejects_events(starting, sample_events, accepted) {
-            assert!(effects.is_empty());
-            assert!(matches!(error, PersistentIdError::Unavailable(_)));
-        }
-    }
-
-    #[test]
-    fn abort_releases_transaction() {
-        let mut idle = PidTransitionOperation::new(None, document(), failure());
-        check_abort(&mut idle, &[]);
-        let mut open = started(failure(), None);
-        check_abort(
-            &mut open,
-            &[Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: txn(),
-            })],
-        );
-    }
-
-    #[test]
-    fn finalize_needs_result() {
-        rejects_finalize(PidTransitionOperation::new(None, document(), failure()));
-        rejects_finalize(started(failure(), None));
     }
 }

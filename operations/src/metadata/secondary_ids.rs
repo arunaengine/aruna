@@ -3,18 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::placement::fence::{admits, fence_read};
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::done;
+use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
-use aruna_core::structs::{PersistentIdMapping, persistent_id_key};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::metadata::call_results::read_value;
 use crate::metadata::id_mapping::{
-    MappingRoute, PersistentIdError, mapping_revision, transition_entries,
+    MappingRoute, PersistentIdError, fence_answer, fence_call, mapping_answer, mapping_call,
+    mapping_revision, transition_entries,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,11 +51,7 @@ impl AddIdentifiersOperation {
     }
 
     fn mapping_read(&mut self, result: IoResult) -> AddTurn {
-        let mapping = read_value(result)?
-            .map(|value| PersistentIdMapping::from_bytes(value.as_ref()))
-            .transpose()
-            .map_err(PersistentIdError::Conversion)?
-            .ok_or(PersistentIdError::IntentMissing)?;
+        let mapping = mapping_answer(result)?.ok_or(PersistentIdError::IntentMissing)?;
         if mapping.is_retired() {
             return Ok(Next::Done((mapping, false)));
         }
@@ -71,36 +65,17 @@ impl AddIdentifiersOperation {
             .occurred_at_ms
             .max(mapping.revision.occurred_at_ms.saturating_add(1));
         merged.revision = mapping_revision(&self.input.route, occurred_at_ms);
-        let fenced = self
-            .input
-            .route
-            .as_ref()
-            .filter(|route| route.generation > 0);
-        let Some(route) = fenced else {
+        let Some(fence) = fence_call(&self.input.route) else {
             return self.write(merged);
         };
         self.step = Step::Fence;
         self.merged = Some(merged);
-        Ok(Next::Call(IoCall::Read(vec![fence_read(
-            &route.realm_id,
-            &route.placement,
-        )])))
+        Ok(Next::Call(fence))
     }
 
-    fn fence_answer(&mut self, result: IoResult) -> AddTurn {
-        let generation = self
-            .input
-            .route
-            .as_ref()
-            .map_or(0, |route| route.generation);
-        if !admits(read_value(result)?.as_ref(), generation) {
-            return Err(PersistentIdError::PlacementFenced);
-        }
-        let merged = self
-            .merged
-            .take()
-            .ok_or_else(|| PersistentIdError::Unavailable("merged row missing".into()))?;
-        self.write(merged)
+    fn take_merged(&mut self) -> Result<PersistentIdMapping, PersistentIdError> {
+        let missing = || PersistentIdError::Unavailable("merged row missing".into());
+        self.merged.take().ok_or_else(missing)
     }
 
     fn write(&mut self, merged: PersistentIdMapping) -> AddTurn {
@@ -120,21 +95,20 @@ impl Operation for AddIdentifiersOperation {
     }
 
     fn first(&mut self) -> AddTurn {
-        let key = persistent_id_key(self.input.document_id);
-        Ok(Next::Call(read_row(ID_MAPPING_KEYSPACE, key)))
+        Ok(Next::Call(mapping_call(self.input.document_id)))
     }
 
     fn next(&mut self, result: IoResult) -> AddTurn {
         match self.step {
             Step::Read => self.mapping_read(result),
-            Step::Fence => self.fence_answer(result),
+            Step::Fence => {
+                fence_answer(&self.input.route, result)?;
+                let merged = self.take_merged()?;
+                self.write(merged)
+            }
             Step::Write => {
                 done(result)?;
-                let merged = self
-                    .merged
-                    .take()
-                    .ok_or_else(|| PersistentIdError::Unavailable("merged row missing".into()))?;
-                Ok(Next::Done((merged, true)))
+                Ok(Next::Done((self.take_merged()?, true)))
             }
         }
     }
@@ -177,8 +151,7 @@ pub(crate) mod tests {
     use super::*;
     use aruna_core::calls::IoError;
     use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::SECONDARY_ID_KEYSPACE;
+    use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE};
     use aruna_core::structs::PersistentIdRevision;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::realm::RealmId;
@@ -219,13 +192,6 @@ pub(crate) mod tests {
         })
     }
 
-    pub(crate) fn read_event(value: Option<&PersistentIdMapping>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: value.map(|mapping| mapping.to_bytes().unwrap().into()),
-        })
-    }
-
     fn stored(mapping: &PersistentIdMapping) -> IoResult {
         IoResult::Values(vec![Some(mapping.to_bytes().unwrap().into())])
     }
@@ -235,13 +201,7 @@ pub(crate) mod tests {
         let document_id = Ulid::from_bytes([3; 16]);
         let mut op = operation(document_id);
         assert!(op.transaction());
-        assert_eq!(
-            op.first(),
-            Ok(Next::Call(read_row(
-                ID_MAPPING_KEYSPACE,
-                persistent_id_key(document_id)
-            )))
-        );
+        assert_eq!(op.first(), Ok(Next::Call(mapping_call(document_id))));
         let Ok(Next::Call(IoCall::Write(writes))) = op.next(stored(&mapping(document_id))) else {
             panic!("expected one write");
         };
@@ -317,10 +277,7 @@ pub(crate) mod tests {
         op.first().unwrap();
         assert_eq!(
             op.next(stored(&mapping(document_id))),
-            Ok(Next::Call(IoCall::Read(vec![fence_read(
-                &route.realm_id,
-                &route.placement
-            )])))
+            Ok(Next::Call(fence_call(&Some(route)).unwrap()))
         );
         // A bucket closed at generation 5 no longer admits a write resolved at 3.
         let closed = IoResult::Values(vec![Some(5u64.to_be_bytes().to_vec().into())]);
