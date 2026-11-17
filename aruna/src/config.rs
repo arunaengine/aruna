@@ -26,7 +26,7 @@ use crate::identity::{
     refresh_onboarding_bootstrap,
 };
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
-use aruna_operations::metadata::MetadataSearchStorage;
+use aruna_graph::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
 use byteview::ByteView;
 use iroh::EndpointAddr;

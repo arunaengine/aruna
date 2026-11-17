@@ -82,6 +82,7 @@ hyper-util = { workspace = true }
 s3s = { workspace = true }
 
 [dev-dependencies]
+aruna-graph = { workspace = true }
 aruna-net = { workspace = true }
 tracing-subscriber = { workspace = true }
 aruna-storage = { workspace = true }

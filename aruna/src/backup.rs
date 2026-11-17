@@ -161,7 +161,7 @@ fn node_sources(storage_path: &Path, ctx: &DriverContext) -> Option<BackupSource
             .document_sync_database()
             .inner()
             .clone(),
-        metadata: ctx.metadata_handle.as_ref()?.store_database(),
+        metadata: ctx.graph_handle.as_ref()?.store_database(),
         git_root: storage_path.join("git"),
     })
 }

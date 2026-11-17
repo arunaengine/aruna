@@ -1074,18 +1074,19 @@ mod authorization_tests {
             user_id,
             realm_id,
         };
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            node_id,
-            storage_handle.clone(),
-            None,
-            None,
-            None,
-        )
+        let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
         .unwrap();
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
         let mut context = test_context(storage_handle);
         context.net_handle = Some(net);
         context.metadata_handle = Some(metadata_handle);
+        context.graph_handle = Some(graph_handle);
         context.task_handle = Some(TaskHandle::new());
         let driver_ctx = Arc::new(context);
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -1167,8 +1168,8 @@ mod authorization_tests {
         .await
         .unwrap();
         // A text search sees only committed index updates.
-        let handle = ctx.metadata_handle.as_ref().unwrap();
-        handle.flush_search_updates().await.unwrap();
+        let graph = ctx.graph_handle.as_ref().unwrap();
+        graph.flush_search_updates().await.unwrap();
     }
 
     fn draft_crate(name: &str) -> Value {

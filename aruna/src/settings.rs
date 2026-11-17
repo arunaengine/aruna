@@ -20,7 +20,7 @@ use aruna_core::structs::storage::node_info::{
     CLASS_LABEL_PREFIX, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
 };
 use aruna_net::IrohRuntimeConfig;
-use aruna_operations::metadata::MetadataSearchStorage;
+use aruna_graph::MetadataSearchStorage;
 use aruna_storage::{CACHE_BYTES, FjallPersistPolicy};
 
 use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
