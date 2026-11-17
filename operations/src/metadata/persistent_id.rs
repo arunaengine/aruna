@@ -7,32 +7,18 @@
 pub mod forward;
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::metadata_registry::{
-    MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
-};
-use aruna_core::structs::{PersistentIdFailure, PersistentIdMapping, secondary_index_deletes};
-use aruna_core::types::TxnId;
-use byteview::ByteView;
+use aruna_core::structs::{PersistentIdFailure, PersistentIdMapping};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::id_mapping::{
-    MappingRoute, PersistentIdError, TransitionEntry, mapping_revision, mapping_route_for,
-    parse_mapping_read, read_mapping_effect, transition_entries,
+    MappingRoute, PersistentIdError, mapping_route_for, parse_mapping_read, read_mapping_effect,
 };
-use crate::metadata::repository::{metadata_audit_key, read_document_registry};
+use crate::metadata::pid_transition::{PidTransition, PidTransitionOperation};
 use crate::realm::load_config::load_realm_config;
 use crate::sync::outbox_record::schedule_drain_effect;
-
-/// Storage conflicts are optimistic and short-lived; a caller that exhausts these
-/// gets a retryable error rather than a lost transition.
-const TRANSITION_ATTEMPTS: usize = 4;
 
 pub async fn read_mapping(
     ctx: &DriverContext,
@@ -56,39 +42,11 @@ pub async fn mint_persistent_id(
     minted_at_ms: u64,
 ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
     let route = mapping_route(ctx, realm_id, document_id).await?;
-    for attempt in 0..TRANSITION_ATTEMPTS {
-        let txn_id = start_transaction(ctx).await?;
-        let outcome = mint_in_txn(ctx, &route, document_id, minted_by, minted_at_ms, txn_id).await;
-        let Some((mapping, activated)) = (match outcome {
-            Ok(mapping) => mapping,
-            Err(error) => {
-                abort_transaction(ctx, txn_id).await;
-                return Err(error);
-            }
-        }) else {
-            abort_transaction(ctx, txn_id).await;
-            let existing = read_mapping(ctx, document_id)
-                .await?
-                .ok_or(PersistentIdError::DocumentMissing)?;
-            return Ok((existing, false));
-        };
-        match commit_transaction(ctx, txn_id).await {
-            TransitionCommit::Committed => {
-                schedule_drain(ctx).await;
-                return Ok((mapping, activated));
-            }
-            TransitionCommit::Conflict if attempt + 1 < TRANSITION_ATTEMPTS => continue,
-            TransitionCommit::Conflict => {
-                return Err(PersistentIdError::Storage(
-                    StorageError::TransactionConflict,
-                ));
-            }
-            TransitionCommit::Failed(error) => return Err(PersistentIdError::Unavailable(error)),
-        }
-    }
-    Err(PersistentIdError::Storage(
-        StorageError::TransactionConflict,
-    ))
+    let transition = PidTransition::Mint {
+        minted_by,
+        minted_at_ms,
+    };
+    run_transition(ctx, route, document_id, transition).await
 }
 
 /// Adds external identifiers on this node's row; callers route to the PID authority first.
@@ -128,55 +86,7 @@ pub(crate) async fn fail_persistent_id(
     failure: PersistentIdFailure,
 ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
     let route = mapping_route(ctx, realm_id, document_id).await?;
-    for attempt in 0..TRANSITION_ATTEMPTS {
-        let txn_id = start_transaction(ctx).await?;
-        let outcome = async {
-            let Some(mut mapping) = mapping_in_txn(ctx, document_id, txn_id).await? else {
-                return Err(PersistentIdError::IntentMissing);
-            };
-            if !fence_admits(ctx, &route, txn_id).await? {
-                return Err(PersistentIdError::PlacementFenced);
-            }
-            if !mapping.fail(
-                failure.clone(),
-                mapping_revision(&route, failure.recorded_at_ms),
-            ) {
-                return Ok(None);
-            }
-            write_transition(ctx, &route, &mapping, txn_id).await?;
-            Ok(Some(mapping))
-        }
-        .await;
-        let Some(mapping) = (match outcome {
-            Ok(mapping) => mapping,
-            Err(error) => {
-                abort_transaction(ctx, txn_id).await;
-                return Err(error);
-            }
-        }) else {
-            abort_transaction(ctx, txn_id).await;
-            let existing = read_mapping(ctx, document_id)
-                .await?
-                .ok_or(PersistentIdError::IntentMissing)?;
-            return Ok((existing, false));
-        };
-        match commit_transaction(ctx, txn_id).await {
-            TransitionCommit::Committed => {
-                schedule_drain(ctx).await;
-                return Ok((mapping, true));
-            }
-            TransitionCommit::Conflict if attempt + 1 < TRANSITION_ATTEMPTS => continue,
-            TransitionCommit::Conflict => {
-                return Err(PersistentIdError::Storage(
-                    StorageError::TransactionConflict,
-                ));
-            }
-            TransitionCommit::Failed(error) => return Err(PersistentIdError::Unavailable(error)),
-        }
-    }
-    Err(PersistentIdError::Storage(
-        StorageError::TransactionConflict,
-    ))
+    run_transition(ctx, route, document_id, PidTransition::Fail { failure }).await
 }
 
 /// Exceptional administrator-only withdrawal. Authorization is enforced at
@@ -191,51 +101,27 @@ pub(crate) async fn admin_withdraw_pid(
     withdrawn_at_ms: u64,
 ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
     let route = mapping_route(ctx, realm_id, document_id).await?;
-    for attempt in 0..TRANSITION_ATTEMPTS {
-        let txn_id = start_transaction(ctx).await?;
-        let outcome = admin_withdraw_txn(
-            ctx,
-            &route,
-            document_id,
-            withdrawn_by,
-            &reason,
-            withdrawn_at_ms,
-            txn_id,
-        )
-        .await;
-        let mapping = match outcome {
-            Ok(Some(mapping)) => mapping,
-            Ok(None) => {
-                abort_transaction(ctx, txn_id).await;
-                let existing = read_mapping(ctx, document_id).await?.ok_or_else(|| {
-                    PersistentIdError::Storage(StorageError::ReadError(
-                        "persistent id mapping missing".to_string(),
-                    ))
-                })?;
-                return Ok((existing, false));
-            }
-            Err(error) => {
-                abort_transaction(ctx, txn_id).await;
-                return Err(error);
-            }
-        };
-        match commit_transaction(ctx, txn_id).await {
-            TransitionCommit::Committed => {
-                schedule_drain(ctx).await;
-                return Ok((mapping, true));
-            }
-            TransitionCommit::Conflict if attempt + 1 < TRANSITION_ATTEMPTS => continue,
-            TransitionCommit::Conflict => {
-                return Err(PersistentIdError::Storage(
-                    StorageError::TransactionConflict,
-                ));
-            }
-            TransitionCommit::Failed(error) => return Err(PersistentIdError::Unavailable(error)),
-        }
+    let transition = PidTransition::Withdraw {
+        withdrawn_by,
+        reason,
+        withdrawn_at_ms,
+    };
+    run_transition(ctx, route, document_id, transition).await
+}
+
+/// Drives one transition and schedules the outbox drain after its commit.
+async fn run_transition(
+    ctx: &DriverContext,
+    route: Option<MappingRoute>,
+    document_id: Ulid,
+    transition: PidTransition,
+) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
+    let operation = PidTransitionOperation::new(route, document_id, transition);
+    let outcome = drive(operation, ctx).await?;
+    if outcome.committed {
+        schedule_drain(ctx).await;
     }
-    Err(PersistentIdError::Storage(
-        StorageError::TransactionConflict,
-    ))
+    Ok((outcome.mapping, outcome.applied))
 }
 
 pub(crate) async fn mapping_route(
@@ -256,283 +142,6 @@ pub(crate) async fn mapping_route(
         .map(Some)
 }
 
-/// `Ok(None)` means the transition is a no-op and the caller must abort.
-async fn mint_in_txn(
-    ctx: &DriverContext,
-    route: &Option<MappingRoute>,
-    document_id: Ulid,
-    minted_by: aruna_core::UserId,
-    minted_at_ms: u64,
-    txn_id: TxnId,
-) -> Result<Option<(PersistentIdMapping, bool)>, PersistentIdError> {
-    let Some(mut mapping) = mapping_in_txn(ctx, document_id, txn_id).await? else {
-        return Err(PersistentIdError::IntentMissing);
-    };
-    if mapping.is_active() || mapping.is_retired() {
-        return Ok(None);
-    }
-    if !fence_admits(ctx, route, txn_id).await? {
-        return Err(PersistentIdError::PlacementFenced);
-    }
-    if registry_missing_txn(ctx, document_id, txn_id).await? {
-        let failure = PersistentIdFailure {
-            message: "metadata projection is not readable yet".to_string(),
-            retryable: true,
-            recorded_at_ms: minted_at_ms,
-        };
-        mapping.processing(mapping_revision(route, minted_at_ms), Some(failure));
-        write_transition(ctx, route, &mapping, txn_id).await?;
-        return Ok(Some((mapping, false)));
-    }
-    mapping.activate(minted_by, mapping_revision(route, minted_at_ms));
-    write_transition(ctx, route, &mapping, txn_id).await?;
-    Ok(Some((mapping, true)))
-}
-
-/// `Ok(None)` means the mapping is already terminal and the caller must abort.
-async fn admin_withdraw_txn(
-    ctx: &DriverContext,
-    route: &Option<MappingRoute>,
-    document_id: Ulid,
-    withdrawn_by: UserId,
-    reason: &str,
-    withdrawn_at_ms: u64,
-    txn_id: TxnId,
-) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
-    let record = registry_in_txn(ctx, document_id, txn_id)
-        .await?
-        .ok_or(PersistentIdError::DocumentMissing)?;
-    if !fence_admits(ctx, route, txn_id).await? {
-        return Err(PersistentIdError::PlacementFenced);
-    }
-    let Some(mut mapping) = mapping_in_txn(ctx, document_id, txn_id).await? else {
-        return Err(PersistentIdError::IntentMissing);
-    };
-    let revision = mapping_revision(route, withdrawn_at_ms);
-    if !mapping.admin_withdraw(withdrawn_by, reason.to_string(), revision) {
-        return Ok(None);
-    }
-    let mut writes = transition_entries(route, &mapping)?;
-    let audit = MetadataAuditRecord {
-        realm_id: record.realm_id,
-        group_id: record.group_id,
-        document_id,
-        graph_iri: record.graph_iri,
-        user_id: withdrawn_by,
-        node_id: transition_actor(route),
-        operation: MetadataAuditOperation::WithdrawPersistentId,
-        occurred_at_ms: withdrawn_at_ms,
-        details: Some(format!("provider=w3id; reason={reason}")),
-    };
-    writes.push((
-        METADATA_AUDIT_KEYSPACE.to_string(),
-        metadata_audit_key(record.group_id, document_id, revision.event_id),
-        ByteView::from(
-            postcard::to_allocvec(&audit)
-                .map_err(|error| PersistentIdError::Conversion(error.into()))?,
-        ),
-    ));
-    write_entries(ctx, writes, txn_id).await?;
-    delete_entries(ctx, secondary_index_deletes(&mapping), txn_id).await?;
-    Ok(Some(mapping))
-}
-
-async fn write_transition(
-    ctx: &DriverContext,
-    route: &Option<MappingRoute>,
-    mapping: &PersistentIdMapping,
-    txn_id: TxnId,
-) -> Result<(), PersistentIdError> {
-    write_entries(ctx, transition_entries(route, mapping)?, txn_id).await
-}
-
-async fn write_entries(
-    ctx: &DriverContext,
-    writes: Vec<TransitionEntry>,
-    txn_id: TxnId,
-) -> Result<(), PersistentIdError> {
-    match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
-        other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected persistent id write event: {}",
-            other.label()
-        ))),
-    }
-}
-
-async fn delete_entries(
-    ctx: &DriverContext,
-    deletes: Vec<(String, ByteView)>,
-    txn_id: TxnId,
-) -> Result<(), PersistentIdError> {
-    if deletes.is_empty() {
-        return Ok(());
-    }
-    match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id),
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
-        other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected persistent id delete event: {}",
-            other.label()
-        ))),
-    }
-}
-
-/// Whether the document's registry row is absent inside `txn_id`.
-async fn registry_missing_txn(
-    ctx: &DriverContext,
-    document_id: Ulid,
-    txn_id: TxnId,
-) -> Result<bool, PersistentIdError> {
-    match ctx
-        .storage_handle
-        .send_effect(read_document_registry(document_id, Some(txn_id)))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_none()),
-        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
-        other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected registry fence event: {}",
-            other.label()
-        ))),
-    }
-}
-
-async fn registry_in_txn(
-    ctx: &DriverContext,
-    document_id: Ulid,
-    txn_id: TxnId,
-) -> Result<Option<MetadataRegistryRecord>, PersistentIdError> {
-    match ctx
-        .storage_handle
-        .send_effect(read_document_registry(document_id, Some(txn_id)))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes(bytes.as_ref())
-                    .map_err(|error| PersistentIdError::Conversion(error.into()))
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
-        other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected registry read event: {}",
-            other.label()
-        ))),
-    }
-}
-
-/// Reads the mapping bucket's write fence inside the transaction, so a
-/// departing holder's close either rejects this transition or conflicts it.
-async fn fence_admits(
-    ctx: &DriverContext,
-    route: &Option<MappingRoute>,
-    txn_id: TxnId,
-) -> Result<bool, PersistentIdError> {
-    let Some(route) = route.as_ref().filter(|route| route.generation > 0) else {
-        return Ok(true);
-    };
-    let (key_space, key) = crate::placement::fence::fence_read(&route.realm_id, &route.placement);
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space,
-            key,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(
-            crate::placement::fence::admits(value.as_ref(), route.generation),
-        ),
-        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
-        other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected mapping fence event: {}",
-            other.label()
-        ))),
-    }
-}
-
-async fn mapping_in_txn(
-    ctx: &DriverContext,
-    document_id: Ulid,
-    txn_id: TxnId,
-) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
-    let event = ctx
-        .storage_handle
-        .send_effect(read_mapping_effect(document_id, Some(txn_id)))
-        .await;
-    parse_mapping_read(event)
-}
-
-enum TransitionCommit {
-    Committed,
-    Conflict,
-    Failed(String),
-}
-
-async fn start_transaction(ctx: &DriverContext) -> Result<TxnId, PersistentIdError> {
-    match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
-        other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected persistent id transaction event: {}",
-            other.label()
-        ))),
-    }
-}
-
-async fn commit_transaction(ctx: &DriverContext, txn_id: TxnId) -> TransitionCommit {
-    match ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => TransitionCommit::Committed,
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => TransitionCommit::Conflict,
-        Event::Storage(StorageEvent::Error { error }) => {
-            TransitionCommit::Failed(error.to_string())
-        }
-        other => TransitionCommit::Failed(format!(
-            "unexpected persistent id commit event: {}",
-            other.label()
-        )),
-    }
-}
-
-async fn abort_transaction(ctx: &DriverContext, txn_id: TxnId) {
-    if let Event::Storage(StorageEvent::Error { error }) = ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
-        .await
-    {
-        tracing::warn!(%error, "failed to abort a persistent id transaction");
-    }
-}
-
 async fn schedule_drain(ctx: &DriverContext) {
     if let Some(task_handle) = ctx.task_handle.as_ref() {
         task_handle.send_effect(schedule_drain_effect()).await;
@@ -542,6 +151,11 @@ async fn schedule_drain(ctx: &DriverContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::id_mapping::{TransitionEntry, mapping_revision, transition_entries};
+    use crate::metadata::repository::metadata_audit_key;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
     use aruna_core::storage_entries::registry_write_entries;
     use aruna_core::structs::PersistentIdStatus;
     use aruna_core::structs::execution::job::JobId;
@@ -549,7 +163,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::{
-        MetadataAuditRecord, MetadataRegistryRecord,
+        MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
     };
     use aruna_storage::storage;
     use tempfile::tempdir;
