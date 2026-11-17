@@ -72,7 +72,7 @@ pub enum CreateSecretError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -169,7 +169,7 @@ impl Operation for CreateSecretOperation {
 
         match self.state.clone() {
             CreateSecretState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return fail(
                         self,
@@ -194,7 +194,7 @@ impl Operation for CreateSecretOperation {
                 })]
             }
             CreateSecretState::ReadRealmConfig { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
                         self,
@@ -240,7 +240,7 @@ impl Operation for CreateSecretOperation {
                 enrolled,
                 pending,
             } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -280,7 +280,7 @@ impl Operation for CreateSecretOperation {
                 }
             }
             CreateSecretState::WriteRecord { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
                         self,
@@ -295,7 +295,7 @@ impl Operation for CreateSecretOperation {
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             CreateSecretState::CommitTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
                         self,
