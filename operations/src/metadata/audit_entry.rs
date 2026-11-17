@@ -13,7 +13,6 @@ use crate::realm::load_config::load_realm_config;
 use aruna_core::audit::AuditPageRequest;
 use aruna_core::audit::AuditPageResponse;
 use aruna_core::audit::validate_request;
-use aruna_core::effects::AuditPageEffect;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::AuthContext;

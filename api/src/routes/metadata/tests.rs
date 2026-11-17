@@ -1008,7 +1008,7 @@ async fn tombstone_hides_listing() {
     let processed = process_graph_tombstones(ctx.as_ref(), vec![tombstone]).await;
 
     assert_eq!(processed.enqueued, 1);
-    assert!(prune_jobs_exist(&ctx.storage_handle).await.unwrap());
+    assert!(prune_jobs_exist(ctx.as_ref()).await.unwrap());
     let (_, Json(listed)) = list_metadata_documents(
         State(test.state.clone()),
         Extension(None),

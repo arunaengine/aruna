@@ -52,7 +52,7 @@ use crate::metadata::repository::{
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
 use crate::tasks::task_persistence::persist_task_effect;
-use aruna_core::placement::{registry_placement, resolve_shard_holders};
+use aruna_core::placement::resolve_shard_holders;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
 const PROJECTION_PAGE_SIZE: usize = 256;
@@ -1222,6 +1222,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
+    use aruna_core::placement::registry_placement;
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
