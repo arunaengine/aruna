@@ -4,25 +4,25 @@
 
 use std::time::{Duration, SystemTime};
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentChange, DocumentOutboxEvent};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::repository::{
     LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkReview, LinkStatus, PullCheck,
     PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
     RepositoryRecord, connector_link_key, link_key,
 };
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use ulid::Ulid;
 
 use crate::metadata::id_mapping::MappingRoute;
@@ -102,21 +102,28 @@ pub enum LinkError {
     Lineage,
 }
 
+impl From<IoError> for LinkError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Unexpected(other.to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
-    Init,
-    Start,
     Read,
     Fence,
     Write,
     Delete,
-    Commit,
-    Schedule,
-    Aborting,
-    Done,
 }
 
-/// Applies one change to a link and its rows in a single transaction.
+type Step = Result<Next<Option<RepositoryLink>>, LinkError>;
+
+/// Applies one change to a link and its rows in a single transaction, then wakes the link
+/// drain and the sync outbox drain when the change queued work for them.
 #[derive(Debug, PartialEq)]
 pub struct ChangeLinkOperation {
     document_id: Ulid,
@@ -124,14 +131,13 @@ pub struct ChangeLinkOperation {
     change: LinkChange,
     now: SystemTime,
     state: State,
-    txn_id: Option<TxnId>,
     deletes: Vec<(String, Key)>,
     schedule: bool,
     route: Option<MappingRoute>,
     stored: Option<RepositoryLink>,
     queued: Option<LinkQueueEntry>,
-    pending: usize,
-    output: Option<Result<Option<RepositoryLink>, LinkError>>,
+    /// The link as the change leaves it, `None` once deleted.
+    changed: Option<Option<RepositoryLink>>,
 }
 
 impl ChangeLinkOperation {
@@ -141,15 +147,13 @@ impl ChangeLinkOperation {
             link_id,
             change,
             now,
-            state: State::Init,
-            txn_id: None,
+            state: State::Read,
             deletes: Vec::new(),
             schedule: false,
             route: None,
             stored: None,
             queued: None,
-            pending: 0,
-            output: None,
+            changed: None,
         }
     }
 
@@ -159,12 +163,52 @@ impl ChangeLinkOperation {
         self
     }
 
-    fn fail(&mut self, error: LinkError) -> Effects {
-        self.output = Some(Err(error));
-        self.abort()
+    /// Keeps the stored link and queue row, then reads the placement fence when the change
+    /// replicates under a generation.
+    fn keep_rows(&mut self, result: IoResult) -> Step {
+        let [link, queued] = values::<2>(result)?;
+        let stored = link
+            .map(|bytes| RepositoryLink::from_bytes(&bytes))
+            .transpose()?;
+        // An unreadable queue row is replaced like a missing one.
+        self.queued = queued.and_then(|bytes| postcard::from_bytes(&bytes).ok());
+        // A departing holder's close either rejects this write or conflicts with it.
+        match self.route.as_ref().filter(|route| route.generation > 0) {
+            Some(route) => {
+                let row = fence::fence_read(&route.realm_id, &route.placement);
+                self.stored = stored;
+                self.state = State::Fence;
+                Ok(Next::Call(IoCall::Read(vec![row])))
+            }
+            None => self.plan(stored),
+        }
     }
 
-    fn plan(&mut self, stored: Option<RepositoryLink>) -> Result<Effects, LinkError> {
+    /// The drains this change woke, run once it committed.
+    fn finish(&mut self) -> Step {
+        let changed = self.changed.take().flatten();
+        let mut calls = Vec::new();
+        if self.schedule {
+            calls.push(IoCall::Effect(Box::new(schedule_drain(Duration::ZERO))));
+        }
+        if self
+            .route
+            .as_ref()
+            .is_some_and(|route| !route.peers.is_empty())
+        {
+            calls.push(IoCall::Effect(Box::new(schedule_drain_effect())));
+        }
+        // Queue and outbox rows are durable, so the periodic rearm covers a lost timer.
+        Ok(match calls.is_empty() {
+            true => Next::Done(changed),
+            false => Next::Then {
+                output: changed,
+                calls,
+            },
+        })
+    }
+
+    fn plan(&mut self, stored: Option<RepositoryLink>) -> Step {
         let link_row = (
             REPOSITORY_LINK_KEYSPACE.to_string(),
             ByteView::from(link_key(self.document_id, self.link_id)),
@@ -351,186 +395,50 @@ impl ChangeLinkOperation {
             writes.push((queue_row.0, queue_row.1, ByteView::from(value)));
             self.schedule = true;
         }
-        self.output = Some(Ok(result));
-        Ok(if writes.is_empty() {
-            self.delete_rows()
-        } else {
-            self.state = State::Write;
-            smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: self.txn_id,
-            })]
-        })
-    }
-
-    fn delete_rows(&mut self) -> Effects {
-        if self.deletes.is_empty() {
-            return self.commit();
-        }
-        self.state = State::Delete;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        match self.txn_id {
-            Some(txn_id) => {
-                self.state = State::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            None => self.fail(LinkError::Unexpected("missing transaction".into())),
-        }
+        self.changed = Some(result);
+        self.state = State::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
-impl EffectOperation for ChangeLinkOperation {
+impl Operation for ChangeLinkOperation {
     type Output = Option<RepositoryLink>;
     type Error = LinkError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Aborting {
-            return match event {
-                Event::Storage(
-                    StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. },
-                ) => {
-                    self.state = State::Done;
-                    smallvec![]
-                }
-                other => {
-                    self.state = State::Done;
-                    self.output = Some(Err(LinkError::Unexpected(other.label().to_string())));
-                    smallvec![]
-                }
-            };
-        }
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (self.state, event) {
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::Read;
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            REPOSITORY_LINK_KEYSPACE.to_string(),
-                            ByteView::from(link_key(self.document_id, self.link_id)),
-                        ),
-                        (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id)),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (State::Read, Event::Storage(StorageEvent::BatchReadResult { mut values }))
-                if values.len() == 2 =>
-            {
-                let queued = values.pop().and_then(|(_, value)| value);
-                let link = values.pop().and_then(|(_, value)| value);
-                let stored = match link
-                    .map(|bytes| RepositoryLink::from_bytes(&bytes))
-                    .transpose()
-                {
-                    Ok(stored) => stored,
-                    Err(error) => return self.fail(error.into()),
-                };
-                // An unreadable queue row is replaced like a missing one.
-                self.queued = queued.and_then(|bytes| postcard::from_bytes(&bytes).ok());
-                // A departing holder's close either rejects this write or conflicts with it.
-                match self.route.as_ref().filter(|route| route.generation > 0) {
-                    Some(route) => {
-                        let (key_space, key) = fence::fence_read(&route.realm_id, &route.placement);
-                        self.stored = stored;
-                        self.state = State::Fence;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space,
-                            key,
-                            txn_id: self.txn_id,
-                        })]
-                    }
-                    None => self.plan(stored).unwrap_or_else(|error| self.fail(error)),
-                }
-            }
-            (State::Fence, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+    fn first(&mut self) -> Step {
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                REPOSITORY_LINK_KEYSPACE.to_string(),
+                ByteView::from(link_key(self.document_id, self.link_id)),
+            ),
+            (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id)),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Step {
+        match (self.state, result) {
+            (State::Read, result) => self.keep_rows(result),
+            (State::Fence, result) => {
+                let [value] = values::<1>(result)?;
                 let generation = self.route.as_ref().map_or(0, |route| route.generation);
                 if !fence::admits(value.as_ref(), generation) {
-                    return self.fail(LinkError::Fenced);
+                    return Err(LinkError::Fenced);
                 }
                 let stored = self.stored.take();
-                self.plan(stored).unwrap_or_else(|error| self.fail(error))
+                self.plan(stored)
             }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.delete_rows()
+            (State::Write, IoResult::Done) => {
+                self.state = State::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
             }
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.commit()
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                let mut effects = Effects::new();
-                if self.schedule {
-                    effects.push(schedule_drain(Duration::ZERO));
-                }
-                if self
-                    .route
-                    .as_ref()
-                    .is_some_and(|route| !route.peers.is_empty())
-                {
-                    effects.push(schedule_drain_effect());
-                }
-                self.pending = effects.len();
-                self.state = if effects.is_empty() {
-                    State::Done
-                } else {
-                    State::Schedule
-                };
-                effects
-            }
-            // Queue and outbox rows are durable, so the periodic rearm covers a lost timer.
-            (State::Schedule, Event::Task(_)) => {
-                self.pending = self.pending.saturating_sub(1);
-                if self.pending == 0 {
-                    self.state = State::Done;
-                }
-                smallvec![]
-            }
-            (_, other) => self.fail(LinkError::Unexpected(other.label().to_string())),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match (self.state, self.output) {
-            (State::Done, Some(output)) => output,
-            (_, Some(Err(error))) => Err(error),
-            _ => Err(LinkError::Unexpected("link change did not finish".into())),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        if matches!(self.output, Some(Ok(_))) && self.state != State::Commit {
-            self.output = Some(Err(LinkError::Unexpected("link change aborted".into())));
-        }
-        match self.txn_id.take() {
-            Some(txn_id) if self.state != State::Commit => {
-                self.state = State::Aborting;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => {
-                self.state = State::Done;
-                smallvec![]
-            }
+            (State::Delete, IoResult::Done) => self.finish(),
+            (_, other) => Err(LinkError::Unexpected(other.label().to_string())),
         }
     }
 }
