@@ -2,7 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
+
+use super::mutation::{MutateJobCalls, NoGuard, forward, settle_attempt};
 use super::*;
+use crate::driver::drive;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use std::collections::BTreeMap;
 
@@ -289,8 +295,7 @@ pub async fn record_attempt_started(
 }
 
 /// `mutate_job`, then in the same transaction marks the launch record of the current attempt
-/// as executed: its guard passed, so the backend accepted this epoch, even when a cancellation
-/// keeps the job from running.
+/// as executed; see [`MarkStartOperation`].
 async fn mutate_marking_start<F>(
     context: &DriverContext,
     job_id: JobId,
@@ -298,79 +303,144 @@ async fn mutate_marking_start<F>(
     mut mutate: F,
 ) -> Result<JobRecord, JobMutationError>
 where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
 {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let result = async {
-            let record =
-                Box::pin(mutate_in_txn(context, txn_id, job_id, &mut mutate, None)).await?;
-            mark_launch_started(context, txn_id, &record, started_at_ms).await?;
-            Ok(record)
-        }
+    let mut attempt = 0;
+    loop {
+        let result = drive(
+            MarkStartOperation::new(job_id, &mut mutate, started_at_ms),
+            context,
+        )
         .await;
-        match result {
-            Ok(record) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "job mutation exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(record),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
+        match settle_attempt(result, attempt, "job mutation exhausted conflict retries").await {
+            Some(result) => return result,
+            None => attempt += 1,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum StartStep {
+    Mutate,
+    ReadLaunch,
+    WriteLaunch,
+}
+
+/// A job mutation that also marks the launch record of the current attempt as executed: its
+/// guard passed, so the backend accepted this epoch, even when a cancellation keeps the job
+/// from running. Both commit in one write transaction.
+pub(crate) struct MarkStartOperation<F> {
+    calls: MutateJobCalls<F, NoGuard>,
+    started_at_ms: u64,
+    record: Option<JobRecord>,
+    step: StartStep,
+}
+
+impl<F> std::fmt::Debug for MarkStartOperation<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkStartOperation")
+            .field("calls", &self.calls)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> PartialEq for MarkStartOperation<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.calls == other.calls
+            && self.started_at_ms == other.started_at_ms
+            && self.record == other.record
+            && self.step == other.step
+    }
+}
+
+impl<F> MarkStartOperation<F>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
+{
+    pub(crate) fn new(job_id: JobId, mutate: F, started_at_ms: u64) -> Self {
+        Self {
+            calls: MutateJobCalls::new(job_id, mutate, None),
+            started_at_ms,
+            record: None,
+            step: StartStep::Mutate,
+        }
+    }
+
+    fn launch_key(&self) -> Option<Key> {
+        let record = self.record.as_ref()?;
+        let intent = record.attempt_intent.as_ref()?;
+        Some(ByteView::from(attempt_control_key(
+            record.job_id,
+            intent.attempt_epoch,
+        )))
+    }
+
+    fn finish(&mut self) -> Result<Next<JobRecord>, JobMutationError> {
+        self.record
+            .take()
+            .map(Next::Done)
+            .ok_or_else(|| JobMutationError::Storage("launch mark lost its record".into()))
+    }
+}
+
+impl<F> Operation for MarkStartOperation<F>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
+{
+    type Output = JobRecord;
+    type Error = JobMutationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<JobRecord>, JobMutationError> {
+        forward(self.calls.first()?)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<JobRecord>, JobMutationError> {
+        match self.step {
+            StartStep::Mutate => {
+                let record = match self.calls.next(result)? {
+                    Next::Done(record) => record,
+                    other => return forward(other),
+                };
+                self.record = Some(record);
+                let Some(key) = self.launch_key() else {
+                    return self.finish();
+                };
+                self.step = StartStep::ReadLaunch;
+                let row = (LAUNCH_RECORD_KEYSPACE.to_string(), key);
+                Ok(Next::Call(IoCall::Read(vec![row])))
+            }
+            StartStep::ReadLaunch => {
+                let [value] = values::<1>(result)?;
+                let (Some(value), Some(key)) = (value, self.launch_key()) else {
+                    return self.finish();
+                };
+                let mut launch = LaunchRecord::from_bytes(value.as_ref())
+                    .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+                if launch.started_at_ms.is_some() {
+                    return self.finish();
+                }
+                launch.started_at_ms = Some(self.started_at_ms);
+                let value = launch
+                    .to_bytes()
+                    .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+                self.step = StartStep::WriteLaunch;
+                let row = (
+                    LAUNCH_RECORD_KEYSPACE.to_string(),
+                    key,
+                    ByteView::from(value),
+                );
+                Ok(Next::Call(IoCall::Write(vec![row])))
+            }
+            StartStep::WriteLaunch => {
+                done(result)?;
+                self.finish()
             }
         }
     }
-    Err(JobMutationError::Storage(
-        "job mutation exhausted conflict retries".to_string(),
-    ))
-}
-
-async fn mark_launch_started(
-    context: &DriverContext,
-    txn_id: TxnId,
-    record: &JobRecord,
-    started_at_ms: u64,
-) -> Result<(), JobMutationError> {
-    let Some(intent) = &record.attempt_intent else {
-        return Ok(());
-    };
-    let key = ByteView::from(attempt_control_key(record.job_id, intent.attempt_epoch));
-    let storage_error = |error: String| JobMutationError::Storage(error);
-    let Some(value) = read_raw(context, LAUNCH_RECORD_KEYSPACE, key.clone(), Some(txn_id))
-        .await
-        .map_err(storage_error)?
-    else {
-        return Ok(());
-    };
-    let mut launch = LaunchRecord::from_bytes(value.as_ref())
-        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    if launch.started_at_ms.is_some() {
-        return Ok(());
-    }
-    launch.started_at_ms = Some(started_at_ms);
-    let value = launch
-        .to_bytes()
-        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    batch_write(
-        context,
-        vec![(
-            LAUNCH_RECORD_KEYSPACE.to_string(),
-            key,
-            ByteView::from(value),
-        )],
-        Some(txn_id),
-    )
-    .await
-    .map_err(storage_error)
 }
 
 /// The executed launch record of the record's final attempt, if any.
