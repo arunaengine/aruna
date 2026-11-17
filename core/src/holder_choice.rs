@@ -8,19 +8,19 @@
 use std::collections::BTreeMap;
 
 use crate::NodeId;
+use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::document::DocumentTarget;
-use crate::effects::{Effect, NetEffect, StorageEffect};
-use crate::events::{Event, NetEvent, StorageEvent};
+use crate::effects::{Effect, NetEffect};
+use crate::events::{Event, NetEvent};
 use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
 use crate::keyspaces::NODE_INFO_KEYSPACE;
-use crate::operation::EffectOperation;
+use crate::operation::Operation;
 use crate::structs::identity::realm::RealmConfigDocument;
 use crate::structs::placement::compute_config::RealmComputeConfig;
 use crate::structs::storage::node_info::{
     LOCATION_LABEL_KEY, NodeInfoDocument, NodeUrls, node_info_key,
 };
-use crate::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use crate::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 
@@ -104,18 +104,8 @@ fn link_bandwidth(
 
 #[derive(Debug, Error, PartialEq)]
 pub enum HolderChoiceError {
-    #[error("unexpected holder choice event {0}")]
-    UnexpectedEvent(&'static str),
-    #[error("the holder choice has not finished")]
-    Unfinished,
-}
-
-#[derive(Debug, PartialEq)]
-enum Phase {
-    Idle,
-    Facts,
-    Documents(Box<HolderFacts>),
-    Done(Result<Vec<HolderCandidate>, HolderChoiceError>),
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 /// The candidates among `holders`, at most [`MAX_CANDIDATES`] of them looked at: this node's
@@ -125,7 +115,7 @@ enum Phase {
 pub struct HolderChoiceOperation {
     holders: Vec<NodeId>,
     now_ms: u64,
-    phase: Phase,
+    facts: Option<Box<HolderFacts>>,
 }
 
 impl HolderChoiceOperation {
@@ -133,16 +123,12 @@ impl HolderChoiceOperation {
         Self {
             holders: holders.iter().take(MAX_CANDIDATES).copied().collect(),
             now_ms,
-            phase: Phase::Idle,
+            facts: None,
         }
     }
 
-    fn finish(&mut self, candidates: Vec<HolderCandidate>) -> Effects {
-        self.phase = Phase::Done(Ok(candidates));
-        smallvec![]
-    }
-
-    fn read(&mut self, facts: Box<HolderFacts>) -> Effects {
+    /// The info documents of the holders and this node, then the realm config.
+    fn reads(&self, facts: &HolderFacts) -> IoCall {
         let config = DocumentTarget::RealmConfig {
             realm_id: facts.realm_id,
         };
@@ -154,20 +140,11 @@ impl HolderChoiceOperation {
             })
             .collect();
         reads.push((config.storage_keyspace().to_string(), config.storage_key()));
-        self.phase = Phase::Documents(facts);
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        IoCall::Read(reads)
     }
 
-    fn choose(
-        &self,
-        facts: &HolderFacts,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Vec<HolderCandidate> {
-        let mut values = values;
-        let Some((_, config)) = values.pop() else {
+    fn choose(&self, facts: &HolderFacts, mut values: Vec<Option<Value>>) -> Vec<HolderCandidate> {
+        let Some(config) = values.pop() else {
             return Vec::new();
         };
         let config = config.and_then(|bytes| match RealmConfigDocument::from_bytes(&bytes) {
@@ -179,7 +156,7 @@ impl HolderChoiceOperation {
         });
         let nodes = self.holders.iter().chain(std::iter::once(&facts.local));
         let mut documents = BTreeMap::new();
-        for (node_id, (_, value)) in nodes.zip(values) {
+        for (node_id, value) in nodes.zip(values) {
             let Some(bytes) = value else {
                 continue;
             };
@@ -210,55 +187,43 @@ impl HolderChoiceOperation {
     }
 }
 
-impl EffectOperation for HolderChoiceOperation {
+impl Operation for HolderChoiceOperation {
     type Output = Vec<HolderCandidate>;
     type Error = HolderChoiceError;
 
-    fn start(&mut self) -> Effects {
-        self.phase = Phase::Facts;
-        smallvec![Effect::Net(NetEffect::Heartbeat(Box::new(
-            HeartbeatEffect::Holders {
-                holders: self.holders.clone(),
-                now_ms: self.now_ms,
-            }
-        )))]
+    fn first(&mut self) -> Result<Next<Self::Output>, HolderChoiceError> {
+        let holders = HeartbeatEffect::Holders {
+            holders: self.holders.clone(),
+            now_ms: self.now_ms,
+        };
+        let effect = Effect::Net(NetEffect::Heartbeat(Box::new(holders)));
+        Ok(Next::Call(IoCall::Effect(effect)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::replace(&mut self.phase, Phase::Idle), event) {
-            (Phase::Facts, Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Holders(facts)))) => {
-                self.read(facts)
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, HolderChoiceError> {
+        match (self.facts.take(), result) {
+            (
+                None,
+                IoResult::Event(Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Holders(facts)))),
+            ) => {
+                let reads = self.reads(&facts);
+                self.facts = Some(facts);
+                Ok(Next::Call(reads))
             }
             // Without a network no holder is a candidate.
-            (Phase::Facts, Event::Net(NetEvent::Error(_))) => self.finish(Vec::new()),
-            (Phase::Documents(facts), Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let candidates = self.choose(&facts, values);
-                self.finish(candidates)
+            (None, IoResult::Event(Event::Net(NetEvent::Error(_)))) => Ok(Next::Done(Vec::new())),
+            (Some(facts), IoResult::Values(values)) => Ok(Next::Done(self.choose(&facts, values))),
+            (None, IoResult::Event(event)) => Err(IoError::Unexpected {
+                expected: "HeartbeatEvent::Holders",
+                got: event.label(),
             }
-            (Phase::Documents(_), Event::Storage(StorageEvent::Error { .. })) => {
-                self.finish(Vec::new())
+            .into()),
+            _ => Err(IoError::Unexpected {
+                expected: "the holder facts or the documents",
+                got: "another result",
             }
-            (_, event) => {
-                let error = HolderChoiceError::UnexpectedEvent(event.label());
-                self.phase = Phase::Done(Err(error));
-                smallvec![]
-            }
+            .into()),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.phase, Phase::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.phase {
-            Phase::Done(result) => result,
-            _ => Err(HolderChoiceError::Unfinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
