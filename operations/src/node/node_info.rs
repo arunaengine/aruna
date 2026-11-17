@@ -48,6 +48,7 @@ use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
+use crate::node::drain_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
 use crate::placement::{build_view, held_buckets};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
@@ -85,7 +86,7 @@ pub async fn seed_info_document(
     // The published drain is the operator's durable flag or a departure, never
     // a value carried forward from the previous document.
     let leaving = stored.as_ref().is_some_and(|old| old.leaving);
-    let compute_draining = leaving || read_operator_drain(ctx).await?;
+    let compute_draining = leaving || operator_drain(ctx, None).await?;
     let document = NodeInfoDocument {
         node_id,
         executors: advertised_executors(ctx, &config, node_id, &reservation.reserved, now).await?,
@@ -677,11 +678,6 @@ fn merge_view(
     (totals, truncated || missing)
 }
 
-/// The single durable departure-report row of this node.
-const DEPARTURE_KEY: &[u8] = b"departure";
-/// The operator's own compute drain, kept apart from an observed departure so
-/// returning to placement can never silently undrain a node an operator drained.
-const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
 /// The newest advertisement revision not yet handed to replication. It is written in the same
 /// transaction as that revision, so a failure after the commit only delays the publish.
 const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
@@ -700,7 +696,7 @@ pub async fn set_departure_state(
     };
     // An operator drain outlives a placement observation: returning to the
     // placement map must not undrain a node somebody drained deliberately.
-    let draining = departing || read_operator_drain(ctx).await?;
+    let draining = departing || operator_drain(ctx, None).await?;
     if document.leaving == departing && document.compute_draining == draining {
         return Ok(false);
     }
@@ -740,7 +736,7 @@ pub async fn set_operator_drain(
     realm_id: RealmId,
     draining: bool,
 ) -> Result<bool, String> {
-    if read_operator_drain(ctx).await? == draining {
+    if operator_drain(ctx, None).await? == draining {
         return Ok(false);
     }
     write_operator_drain(ctx, draining).await?;
@@ -773,11 +769,6 @@ pub async fn set_operator_drain(
         replicate_node_info(ctx, node_id, realm_id).await?;
     }
     Ok(true)
-}
-
-/// Whether an operator currently drains this node's compute plane.
-pub async fn read_operator_drain(ctx: &DriverContext) -> Result<bool, String> {
-    operator_drain(ctx, None).await
 }
 
 async fn operator_drain(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<bool, String> {
@@ -857,36 +848,6 @@ async fn write_departure_report(
     }
 }
 
-/// The durable departure report of this node, read through its context.
-pub async fn departure_report(
-    ctx: &DriverContext,
-) -> Result<Option<ComputeDepartureReport>, String> {
-    read_departure_report(&ctx.storage_handle).await
-}
-
-/// The durable departure report, if this node ever departed.
-pub async fn read_departure_report(
-    storage: &StorageHandle,
-) -> Result<Option<ComputeDepartureReport>, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key: Key::from(DEPARTURE_KEY.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes::<ComputeDepartureReport>(bytes.as_ref())
-                    .map_err(|error| error.to_string())
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("departure report read failed: {other:?}")),
-    }
-}
-
 async fn load_realm_config(
     ctx: &DriverContext,
     realm_id: RealmId,
@@ -933,7 +894,7 @@ fn node_labels(
 
 async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
     Ok(
-        crate::node::usage_stats::read_local_global(&ctx.storage_handle, None)
+        crate::node::usage_publish::read_local_global(&ctx.storage_handle, None)
             .await?
             .stored_bytes,
     )
@@ -1232,6 +1193,7 @@ pub async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::drain_state::DrainStateOperation;
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::storage_entries::metadata_registry_key;
@@ -2104,9 +2066,10 @@ mod tests {
         assert!(after.supersedes(&before));
         assert_eq!(after.reservation.reserved.count, 1);
 
-        let report = read_departure_report(&ctx.storage_handle)
+        let report = drive(DrainStateOperation::new(), &ctx)
             .await
             .unwrap()
+            .departure
             .expect("departure report");
         assert_eq!(report.unresolved, vec![execution_id]);
         assert!(!report.truncated);

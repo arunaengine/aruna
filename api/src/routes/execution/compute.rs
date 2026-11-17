@@ -13,9 +13,8 @@ use aruna_core::structs::placement::compute_config::{
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::node::heartbeat::held_heartbeats;
-use aruna_operations::node::node_info::{
-    departure_report, group_demand, read_info_documents, read_operator_drain, set_operator_drain,
-};
+use aruna_operations::node::drain_state::DrainStateOperation;
+use aruna_operations::node::node_info::{group_demand, read_info_documents, set_operator_drain};
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,
@@ -658,10 +657,10 @@ pub async fn get_compute_snapshots(
         }
         None => None,
     };
-    let departure = departure_report(&context)
+    let drain = drive(DrainStateOperation::new(), context.as_ref())
         .await
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .map(|report| DepartureBody {
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    let departure = drain.departure.map(|report| DepartureBody {
             departed_at_ms: report.departed_at_ms,
             membership_generation: report.membership_generation,
             unresolved: report
@@ -672,9 +671,7 @@ pub async fn get_compute_snapshots(
             truncated: report.truncated,
         });
     Ok(Json(ComputeSnapshotsResponse {
-        operator_draining: read_operator_drain(&context)
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?,
+        operator_draining: drain.operator_draining,
         nodes,
         group,
         departure,

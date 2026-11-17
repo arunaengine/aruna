@@ -53,7 +53,8 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
-use crate::node::node_info::{read_info_document, read_operator_drain};
+use crate::node::drain_state::DrainStateOperation;
+use crate::node::node_info::read_info_document;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::placement::resolve_shard_holders;
 
@@ -597,7 +598,9 @@ pub(crate) async fn local_capability(
     // must never re-enable offers this node was drained out of.
     if document.leaving
         || document.compute_draining
-        || read_operator_drain(context).await.unwrap_or(true)
+        || drive(DrainStateOperation::new(), context)
+            .await
+            .map_or(true, |drain| drain.operator_draining)
         || config
             .placement_entry(local)
             .is_some_and(|entry| entry.draining)

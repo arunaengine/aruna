@@ -16,7 +16,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{list_owned_jobs, submit_execution_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::api::load_realm_config;
-use crate::node::node_info::read_operator_drain;
+use crate::node::drain_state::DrainStateOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
@@ -80,9 +80,10 @@ pub async fn submit_local_execution(
     if owner != config.owner {
         return Err(LocalExecutionError::NotOwner);
     }
-    if read_operator_drain(context)
+    if drive(DrainStateOperation::new(), context)
         .await
-        .map_err(LocalExecutionError::Unavailable)?
+        .map_err(|error| LocalExecutionError::Unavailable(error.to_string()))?
+        .operator_draining
     {
         return Err(LocalExecutionError::Paused);
     }
@@ -141,9 +142,10 @@ pub async fn compute_status(
         .as_ref()
         .and_then(|registry| registry.select(None).cloned());
     let runs = count_runs(context, owner).await?;
-    let paused = read_operator_drain(context)
+    let paused = drive(DrainStateOperation::new(), context)
         .await
-        .map_err(LocalExecutionError::Unavailable)?;
+        .map_err(|error| LocalExecutionError::Unavailable(error.to_string()))?
+        .operator_draining;
     let (kind, limits, failure) = match &backend {
         Some(backend) => (
             Some(backend.kind().as_wire()),
