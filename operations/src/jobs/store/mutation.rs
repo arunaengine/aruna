@@ -88,8 +88,7 @@ where
 
     pub(crate) fn first(&mut self) -> Mutated {
         self.step = Step::Read;
-        let row = (JOB_KEYSPACE.to_string(), job_record_key(self.job_id));
-        Ok(Next::Call(IoCall::Read(vec![row])))
+        Ok(Next::Call(record_read(self.job_id)))
     }
 
     pub(crate) fn next(&mut self, result: IoResult) -> Mutated {
@@ -165,14 +164,7 @@ where
 
     fn mutate_row(&mut self, result: IoResult) -> Mutated {
         let [value] = values::<1>(result)?;
-        let record = value.and_then(|bytes| match JobRecord::from_bytes(&bytes) {
-            Ok(record) => Some(record),
-            Err(error) => {
-                warn!(job_id = %self.job_id, error = %error, "Malformed job record retained");
-                None
-            }
-        });
-        let Some(mut record) = record else {
+        let Some(mut record) = read_record(self.job_id, value) else {
             return Err(JobMutationError::NotFound);
         };
         let old = record.clone();
@@ -463,6 +455,22 @@ fn cleanup_obligation(record: &JobRecord) -> Result<JobWrites, JobMutationError>
     );
     child.retention_ms = record.retention_ms;
     job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))
+}
+
+/// The read of one job row.
+pub(super) fn record_read(job_id: JobId) -> IoCall {
+    IoCall::Read(vec![(JOB_KEYSPACE.to_string(), job_record_key(job_id))])
+}
+
+/// The job record of a row read; a malformed row reads as missing and is kept.
+pub(super) fn read_record(job_id: JobId, value: Option<Value>) -> Option<JobRecord> {
+    value.and_then(|bytes| match JobRecord::from_bytes(&bytes) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            warn!(job_id = %job_id, error = %error, "Malformed job record retained");
+            None
+        }
+    })
 }
 
 fn missing() -> JobMutationError {

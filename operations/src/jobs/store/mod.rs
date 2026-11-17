@@ -52,13 +52,16 @@ pub mod mutation;
 pub mod park_wake;
 pub mod query;
 pub mod remote_wait;
+pub mod run_delete;
 pub mod state;
 
 use crate::driver::drive;
+use aruna_core::operation::Runnable;
 use attempt::*;
 use key_wait::*;
 use mutation::{MutateJobOperation, NoGuard};
 use query::*;
+use run_delete::DeleteRunOperation;
 use state::*;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -165,6 +168,24 @@ pub(crate) async fn settle_attempt<T>(
     }
 }
 
+/// Drives a fresh `build()` per attempt while attempts lose a conflict; see [`settle_attempt`].
+pub(super) async fn drive_settled<O, K>(
+    context: &DriverContext,
+    mut build: impl FnMut() -> O,
+    exhausted: &str,
+) -> Result<O::Output, JobMutationError>
+where
+    O: Runnable<K, Error = JobMutationError>,
+{
+    let mut attempt = 0;
+    loop {
+        match settle_attempt(drive(build(), context).await, attempt, exhausted).await {
+            Some(result) => return result,
+            None => attempt += 1,
+        }
+    }
+}
+
 /// What deleting a run from this node's lists found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunDelete {
@@ -188,121 +209,8 @@ pub async fn delete_finished_run(
     job_id: JobId,
     recorded: bool,
 ) -> Result<RunDelete, JobMutationError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        match Box::pin(run_delete_txn(context, txn_id, (user_id, job_id), recorded)).await {
-            Ok(RunDelete::Deleted) => match commit_txn(context, txn_id).await {
-                CommitResult::Committed => return Ok(RunDelete::Deleted),
-                CommitResult::Conflict if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
-                }
-                CommitResult::Conflict => break,
-                CommitResult::Failed(error) => return Err(JobMutationError::Storage(error)),
-            },
-            outcome => {
-                abort_txn(context, txn_id).await;
-                return outcome;
-            }
-        }
-    }
-    Err(JobMutationError::Storage(
-        "run delete exhausted conflict retries".to_string(),
-    ))
-}
-
-async fn run_delete_txn(
-    context: &DriverContext,
-    txn_id: TxnId,
-    (user_id, job_id): (UserId, JobId),
-    recorded: bool,
-) -> Result<RunDelete, JobMutationError> {
-    let Some(record) = read_job_record(context, job_id, Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)?
-    else {
-        return Ok(RunDelete::NotFound);
-    };
-    if record.created_by != user_id || record.payload.is_internal() {
-        return Ok(RunDelete::NotFound);
-    }
-    if !matches!(record.payload, JobPayload::Execution(_)) {
-        return hide_settled(context, txn_id, record).await;
-    }
-    if !record.state.is_terminal() {
-        return Ok(RunDelete::Unfinished(record.state));
-    }
-    // A queued cleanup still needs this row to fence and remove the container.
-    if read_job_record(context, cleanup_job_id(job_id), Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)?
-        .is_some_and(|cleanup| !cleanup.state.is_terminal())
-    {
-        return Ok(RunDelete::CleanupPending);
-    }
-    // A run became deletable after its eligibility was read, so no deletion was recorded yet.
-    if !recorded {
-        return Ok(RunDelete::Unrecorded(
-            "the run settled while it was deleted; retry".to_string(),
-        ));
-    }
-    let mut deletes = prune_delete_entries(&record);
-    let mut start_after = None;
-    loop {
-        let (values, next) = iter_prefix_page(
-            &context.storage_handle,
-            JOB_ENTRY_KEYSPACE,
-            Some(job_entry_prefix(job_id)),
-            start_after.take(),
-            JOB_PRUNE_PAGE,
-            Some(txn_id),
-        )
-        .await
-        .map_err(JobMutationError::Storage)?;
-        deletes.extend(
-            values
-                .into_iter()
-                .map(|(key, _)| (JOB_ENTRY_KEYSPACE.to_string(), key)),
-        );
-        match next {
-            Some(next) => start_after = Some(next),
-            None => break,
-        }
-    }
-    batch_delete(context, deletes, Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)?;
-    Ok(RunDelete::Deleted)
-}
-
-/// Takes a settled job other than a run off this node's list and makes it due for pruning,
-/// which removes its rows page by page, as staging rows can be too many for one transaction.
-async fn hide_settled(
-    context: &DriverContext,
-    txn_id: TxnId,
-    record: JobRecord,
-) -> Result<RunDelete, JobMutationError> {
-    if !record.is_settled() {
-        return Ok(RunDelete::Unfinished(record.state));
-    }
-    let listed = owner_index_key(record.created_by, record.created_at_ms, record.job_id);
-    let row = read_raw(context, JOB_INDEX_KEYSPACE, listed.clone(), Some(txn_id)).await;
-    if row.map_err(JobMutationError::Storage)?.is_none() {
-        return Ok(RunDelete::NotFound);
-    }
-    let mut hidden = record.clone();
-    hidden.retention_ms = 0;
-    let (writes, mut deletes) = index_deltas(&record, &hidden)
-        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    deletes.push((JOB_INDEX_KEYSPACE.to_string(), listed));
-    batch_write(context, writes, Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)?;
-    batch_delete(context, deletes, Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)?;
-    Ok(RunDelete::Deleted)
+    let build = || DeleteRunOperation::new(user_id, job_id, recorded);
+    drive_settled(context, build, "run delete exhausted conflict retries").await
 }
 
 /// Same transaction as [`mutate_job`], with `guard` re-checking the mutated
