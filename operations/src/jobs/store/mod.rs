@@ -45,6 +45,7 @@ use crate::storage_read::iter_prefix_page;
 use crate::tasks::queue_backoff::retry_delay_ms;
 
 pub mod attempt;
+pub mod job_rows;
 pub mod key_wait;
 pub mod list_jobs;
 pub mod mark_start;
@@ -58,6 +59,7 @@ pub mod state;
 use crate::driver::drive;
 use aruna_core::operation::Runnable;
 use attempt::*;
+use job_rows::{PutEntryOperation, PutRowsOperation};
 use key_wait::*;
 use mutation::{MutateJobOperation, NoGuard};
 use query::*;
@@ -342,51 +344,13 @@ pub(crate) async fn put_job_rows(
     writes: Vec<(KeySpace, Key, Value)>,
     deletes: Vec<(KeySpace, Key)>,
 ) -> Result<(), JobMutationError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let result = async {
-            // The claim row, not the record a progress flush rewrites, fences the write.
-            let key = job_record_key(job_id);
-            let claim = read_raw(context, JOB_CLAIM_KEYSPACE, key, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?
-                .map(|value| ClaimGuard::from_bytes(value.as_ref()))
-                .transpose()
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-            if claim.is_none_or(|claim| claim.claim_token != token) {
-                return Err(JobMutationError::TokenMismatch);
-            }
-            batch_write(context, writes.clone(), Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            batch_delete(context, deletes.clone(), Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)
-        }
-        .await;
-        match result {
-            Ok(()) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "checkpoint write exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(()),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
-        }
-    }
-    Err(JobMutationError::Storage(
-        "checkpoint write exhausted conflict retries".to_string(),
-    ))
+    let build = || PutRowsOperation::new(job_id, token, writes.clone(), deletes.clone());
+    drive_settled(
+        context,
+        build,
+        "checkpoint write exhausted conflict retries",
+    )
+    .await
 }
 
 pub async fn put_job_entry<T: Serialize>(
@@ -399,53 +363,8 @@ pub async fn put_job_entry<T: Serialize>(
     let value = postcard::to_allocvec(row)
         .map(ByteView::from)
         .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let result = async {
-            let record = read_job_record(context, job_id, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?
-                .ok_or(JobMutationError::NotFound)?;
-            if record.is_settled() {
-                return Err(JobMutationError::ReportFrozen);
-            }
-            guard_token(&record, token)?;
-            batch_write(
-                context,
-                vec![(
-                    JOB_ENTRY_KEYSPACE.to_string(),
-                    job_entry_key(job_id, entry_key),
-                    value.clone(),
-                )],
-                Some(txn_id),
-            )
-            .await
-            .map_err(JobMutationError::Storage)
-        }
-        .await;
-        match result {
-            Ok(()) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "job entry write exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(()),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
-        }
-    }
-    Err(JobMutationError::Storage(
-        "job entry write exhausted conflict retries".to_string(),
-    ))
+    let build = || PutEntryOperation::new(job_id, token, entry_key, value.clone());
+    drive_settled(context, build, "job entry write exhausted conflict retries").await
 }
 
 fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
