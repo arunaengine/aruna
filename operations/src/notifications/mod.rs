@@ -10,6 +10,7 @@ pub mod email;
 pub(crate) mod email_job;
 pub mod emit;
 pub mod enqueue;
+pub mod holder;
 pub mod inbox;
 pub mod incoming;
 pub mod list;
@@ -22,6 +23,7 @@ pub mod protocol;
 pub mod prune;
 pub mod routing;
 pub mod send;
+pub mod serve;
 pub mod setting_rows;
 pub mod settings;
 #[cfg(test)]
