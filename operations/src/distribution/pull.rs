@@ -46,12 +46,12 @@ use super::keep::{
 };
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::driver::{DriverContext, drive, now_ms};
-use crate::node::holder_choice::{HolderChoiceOperation, avoid_holder, pick};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{
     GetObjectError, GetObjectResult, HolderFailures, ObjectInfo, ObjectRangeRequest,
 };
+use aruna_core::holder_choice::{HolderChoiceOperation, pick};
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
 
@@ -436,7 +436,7 @@ async fn from_holders(
             result,
             Err(BaoReadError::Blob(_) | BaoReadError::Refused(BaoReadRefusal::BackendFailure))
         ) {
-            avoid_holder(context, *holder, now_ms());
+            context.avoid_holder(*holder, now_ms());
         }
         if let Some(BaoReadOutput::Stream { blob, .. }) = failures.consider(result) {
             return Ok(blob);

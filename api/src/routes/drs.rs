@@ -9,6 +9,7 @@ use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
+use aruna_core::holder_choice::{HolderChoiceOperation, pick};
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -26,7 +27,6 @@ use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, issue_ticket, redeem_ticket,
 };
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::node::holder_choice::{HolderChoiceOperation, avoid_holder, pick};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
@@ -1320,7 +1320,7 @@ async fn resolve_global(
             ResolveOutcome::Denied => outcome = ResolveOutcome::Denied,
             // A holder that could not answer is skipped by the next choices for a while.
             ResolveOutcome::Unavailable => {
-                avoid_holder(&context, holder.node_id, unix_timestamp_millis())
+                context.avoid_holder(holder.node_id, unix_timestamp_millis())
             }
             ResolveOutcome::NotFound => {}
         }

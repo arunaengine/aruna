@@ -109,6 +109,13 @@ impl DriverContext {
         held
     }
 
+    /// Skips holder `node_id` in holder choices for a while after it failed or refused a slot.
+    pub fn avoid_holder(&self, node_id: NodeId, now_ms: u64) {
+        if let Some(net_handle) = self.net_handle.as_ref() {
+            net_handle.avoided_holders().avoid(node_id, now_ms);
+        }
+    }
+
     /// Tells dashboard subscribers that something they show changed.
     pub fn notify_dashboard_change(&self) {
         if let Some(net_handle) = self.net_handle.as_ref() {

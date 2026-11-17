@@ -6,24 +6,24 @@ use super::{
     HEARTBEAT_STALE_MS, HolderCandidate, HolderChoiceError, HolderChoiceOperation, candidate,
     link_bandwidth, pick,
 };
-use aruna_core::document::DocumentTarget;
-use aruna_core::download_slots::DownloadSlots;
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetError, NetEvent, StorageEvent};
-use aruna_core::heartbeat::{HeartbeatEffect, HeartbeatEvent, HolderFacts};
-use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
-use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
-use aruna_core::operation::Operation;
-use aruna_core::operation_check::{
+use crate::document::DocumentTarget;
+use crate::download_slots::DownloadSlots;
+use crate::effects::{Effect, NetEffect, StorageEffect};
+use crate::events::{Event, NetError, NetEvent, StorageEvent};
+use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HolderFacts};
+use crate::heartbeat::{HeldHeartbeat, NodeHeartbeat};
+use crate::keyspaces::NODE_INFO_KEYSPACE;
+use crate::operation::Operation;
+use crate::operation_check::{
     check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
 };
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
-use aruna_core::structs::storage::node_info::node_info_key;
-use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
-use aruna_core::types::{Key, Value};
+use crate::structs::identity::realm::RealmId;
+use crate::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
+use crate::structs::storage::node_info::node_info_key;
+use crate::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
+use crate::types::{Key, Value};
 
-fn node(seed: u8) -> aruna_core::NodeId {
+fn node(seed: u8) -> crate::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
@@ -154,7 +154,7 @@ fn links_rank_bandwidth() {
 
 const REALM: RealmId = RealmId([1; 32]);
 
-fn facts(held: Vec<HeldHeartbeat>, avoided: Vec<aruna_core::NodeId>) -> Event {
+fn facts(held: Vec<HeldHeartbeat>, avoided: Vec<crate::NodeId>) -> Event {
     Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Holders(Box::new(
         HolderFacts {
             local: node(9),
@@ -258,7 +258,7 @@ fn failures_leave_none() {
     failed.start();
     failed.step(facts(Vec::new(), Vec::new()));
     failed.step(Event::Storage(StorageEvent::Error {
-        error: aruna_core::errors::StorageError::Timeout,
+        error: crate::errors::StorageError::Timeout,
     }));
     assert_eq!(failed.finalize(), Ok(Vec::new()));
 }

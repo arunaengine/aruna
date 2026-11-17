@@ -7,25 +7,23 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
-use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
-use aruna_core::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
-use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
-use aruna_core::operation::Operation;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::compute_config::RealmComputeConfig;
-use aruna_core::structs::storage::node_info::{
+use crate::NodeId;
+use crate::document::DocumentTarget;
+use crate::effects::{Effect, NetEffect, StorageEffect};
+use crate::events::{Event, NetEvent, StorageEvent};
+use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
+use crate::keyspaces::NODE_INFO_KEYSPACE;
+use crate::operation::Operation;
+use crate::structs::identity::realm::RealmConfigDocument;
+use crate::structs::placement::compute_config::RealmComputeConfig;
+use crate::structs::storage::node_info::{
     LOCATION_LABEL_KEY, NodeInfoDocument, NodeUrls, node_info_key,
 };
-use aruna_core::types::{Effects, Key, Value};
-use rand::seq::SliceRandom;
+use crate::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
-
-use crate::driver::DriverContext;
+use ulid::Ulid;
 
 /// A heartbeat older than this does not make a holder a candidate.
 pub(crate) const HEARTBEAT_STALE_MS: u64 = 180_000;
@@ -64,19 +62,23 @@ pub fn candidate(
     })
 }
 
-/// Power of two choices over shuffled candidates: more free slots wins, then more bandwidth.
+/// Power of two choices over two random candidates: more free slots wins, then more bandwidth.
 pub fn pick(mut candidates: Vec<HolderCandidate>) -> Option<HolderCandidate> {
-    candidates.shuffle(&mut rand::rng());
-    let mut first_two = candidates.into_iter().take(2);
-    let first = first_two.next()?;
-    Some(match first_two.next() {
-        Some(second)
-            if (second.free_slots, second.bandwidth) > (first.free_slots, first.bandwidth) =>
-        {
-            second
-        }
-        _ => first,
-    })
+    let random = |len: usize| (Ulid::generate().random() % len as u128) as usize;
+    if candidates.is_empty() {
+        return None;
+    }
+    let first = candidates.swap_remove(random(candidates.len()));
+    if candidates.is_empty() {
+        return Some(first);
+    }
+    let second = candidates.swap_remove(random(candidates.len()));
+    Some(
+        match (second.free_slots, second.bandwidth) > (first.free_slots, first.bandwidth) {
+            true => second,
+            false => first,
+        },
+    )
 }
 
 /// The bandwidth from `from` to `to`: unlimited within one location, the configured link
@@ -256,13 +258,6 @@ impl Operation for HolderChoiceOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
-    }
-}
-
-/// Skips `node_id` for a while after this node saw it fail or refuse a slot.
-pub fn avoid_holder(context: &DriverContext, node_id: NodeId, now_ms: u64) {
-    if let Some(net) = context.net_handle.as_ref() {
-        net.avoided_holders().avoid(node_id, now_ms);
     }
 }
 

@@ -23,6 +23,7 @@ pub mod git;
 pub mod handle;
 pub mod handoff;
 pub mod heartbeat;
+pub mod holder_choice;
 pub mod id;
 pub mod injection;
 pub mod jobs;

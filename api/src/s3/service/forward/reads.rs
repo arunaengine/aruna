@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::NodeId;
+use aruna_core::holder_choice::{HolderChoiceOperation, pick};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
 use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute};
@@ -18,7 +19,6 @@ use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
 use aruna_operations::driver::drive;
-use aruna_operations::node::holder_choice::{HolderChoiceOperation, avoid_holder, pick};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method};
 use s3s::dto::{
@@ -428,11 +428,8 @@ impl ArunaS3Service {
                 .status_code()
                 .is_none_or(|status| status.is_server_error())
         {
-            avoid_holder(
-                self.state.as_ref(),
-                forward.node_id,
-                unix_timestamp_millis(),
-            );
+            let context: &aruna_operations::driver::DriverContext = self.state.as_ref();
+            context.avoid_holder(forward.node_id, unix_timestamp_millis());
         }
         result
     }

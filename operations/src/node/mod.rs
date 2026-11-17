@@ -1,9 +1,8 @@
-//! Groups node startup, the node info document, node usage publication and holder choice.
+//! Groups node startup, heartbeats, the node info document and node usage publication.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod heartbeat;
-pub mod holder_choice;
 mod info_publish;
 mod info_write;
 pub mod node_info;
