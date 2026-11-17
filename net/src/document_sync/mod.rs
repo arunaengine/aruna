@@ -23,9 +23,9 @@ use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_checks::{
-    AdminOperationFamily, family_matches_targets, foreign_actor_allowed, has_write_permission,
-    origin_may_publish, revocation_origin_full, revocation_origin_known, service_owner,
-    validate_event_scope, validate_shape,
+    AdminOperationFamily, coalescible_config_op, config_mutation_allowed, family_matches_targets,
+    foreign_actor_allowed, has_write_permission, origin_may_publish, revocation_origin_full,
+    revocation_origin_known, service_owner, validate_event_scope, validate_shape,
 };
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
