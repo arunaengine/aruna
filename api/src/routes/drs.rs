@@ -26,7 +26,7 @@ use aruna_operations::distribution::ticket::{
 };
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
-use aruna_operations::node::node_info::read_info_documents;
+use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
@@ -1423,9 +1423,9 @@ async fn owner_origin(
     state: &ServerState,
     node_id: aruna_core::NodeId,
 ) -> Result<Option<String>, DrsError> {
-    let documents = read_info_documents(&state.get_ctx(), &[node_id])
+    let documents = drive(ReadInfoOperation::new(vec![node_id]), state.get_ctx().as_ref())
         .await
-        .map_err(DrsError::internal)?;
+        .map_err(|error| DrsError::internal(error.to_string()))?;
     let Some(published) = documents.get(&node_id).and_then(|doc| doc.urls.api.clone()) else {
         return Ok(None);
     };

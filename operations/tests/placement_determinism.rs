@@ -22,7 +22,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::node::node_info::{read_info_document, seed_info_document};
+use aruna_operations::node::node_info::seed_info_document;
+use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::mutate_placement::{
@@ -173,17 +174,18 @@ async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
         "node info document did not propagate over the shared topic",
         || async {
             Ok(usize::from(
-                read_info_document(&peer.context.storage_handle, publisher_id)
+                drive(ReadInfoOperation::new(vec![publisher_id]), peer.context.as_ref())
                     .await
                     .map_err(std::io::Error::other)?
-                    .is_none(),
+                    .is_empty(),
             ))
         },
     )
     .await?;
-    let received = read_info_document(&peer.context.storage_handle, publisher_id)
+    let received = drive(ReadInfoOperation::new(vec![publisher_id]), peer.context.as_ref())
         .await
         .map_err(std::io::Error::other)?
+        .remove(&publisher_id)
         .expect("node info document present after convergence");
 
     assert_eq!(received.node_id, publisher_id);

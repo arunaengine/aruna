@@ -23,7 +23,8 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::node::read_info::ReadInfoOperation;
 use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;
 
@@ -234,7 +235,7 @@ pub async fn prune_nonces(context: &DriverContext, now: u64) {
 
 /// The published endpoints of a node, from its info document.
 pub async fn node_urls(context: &DriverContext, node_id: NodeId) -> Option<NodeUrls> {
-    crate::node::node_info::read_info_documents(context, &[node_id])
+    drive(ReadInfoOperation::new(vec![node_id]), context)
         .await
         .ok()?
         .remove(&node_id)

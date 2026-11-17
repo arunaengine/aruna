@@ -21,7 +21,8 @@ use aruna_operations::auth::revoke_token::{
 use aruna_operations::device::realm_documents::{fetch_realm_documents, realm_removed};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::node::node_info::{read_info_documents, seed_info_document};
+use aruna_operations::node::node_info::seed_info_document;
+use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -226,7 +227,8 @@ async fn device_fetches_nodes() -> TestResult<()> {
         || async {
             let mut missing = 0;
             for node in &realm.nodes {
-                let documents = read_info_documents(node.context.as_ref(), &node_ids)
+                let read = ReadInfoOperation::new(node_ids.clone());
+                let documents = drive(read, node.context.as_ref())
                     .await
                     .map_err(std::io::Error::other)?;
                 missing += node_ids.len().saturating_sub(documents.len());
@@ -241,7 +243,7 @@ async fn device_fetches_nodes() -> TestResult<()> {
         fetch_realm_documents(&device.context, FETCH_BUDGET).await,
         "the device beat must fetch the realm documents"
     );
-    let documents = read_info_documents(device.context.as_ref(), &node_ids)
+    let documents = drive(ReadInfoOperation::new(node_ids.clone()), device.context.as_ref())
         .await
         .map_err(std::io::Error::other)?;
     assert_eq!(documents.len(), node_ids.len());

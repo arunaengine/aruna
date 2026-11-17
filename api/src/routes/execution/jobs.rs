@@ -28,7 +28,8 @@ use aruna_operations::jobs::service::{
     read_report_routed, resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
-use aruna_operations::node::node_info::read_info_documents;
+use aruna_operations::driver::drive;
+use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -1091,7 +1092,7 @@ async fn node_url(state: &ServerState, node_id: NodeId, job_id: JobId) -> Option
             .ok()
             .map(|urls| urls.owner_node_url);
     }
-    let documents = read_info_documents(&state.get_ctx(), &[node_id])
+    let documents = drive(ReadInfoOperation::new(vec![node_id]), state.get_ctx().as_ref())
         .await
         .ok()?;
     let published = documents.get(&node_id)?.urls.api.clone()?;

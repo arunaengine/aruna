@@ -14,7 +14,7 @@ use aruna_core::onboarding::{OnboardingMode, OnboardingPhase};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::user::User;
 use aruna_operations::driver::drive;
-use aruna_operations::node::node_info::read_info_document;
+use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::placement::build_view;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
@@ -84,11 +84,13 @@ async fn joiner_bootstraps_documents() -> TestResult<()> {
             .expect("joiner user should be bootstrapped"),
         expected_user
     );
-    let issuer_info = read_info_document(&joiner.context.storage_handle, seed.net.node_id())
+    let issuer_info = drive(ReadInfoOperation::new(vec![seed.net.node_id()]), joiner.context.as_ref())
         .await?
+        .remove(&seed.net.node_id())
         .expect("issuer node info should be fetched from the onboarding ticket");
-    let seed_info = read_info_document(&seed.context.storage_handle, seed.net.node_id())
+    let seed_info = drive(ReadInfoOperation::new(vec![seed.net.node_id()]), seed.context.as_ref())
         .await?
+        .remove(&seed.net.node_id())
         .expect("seed fixture should publish issuer node info");
     assert_eq!(issuer_info.node_id, seed_info.node_id);
     assert_eq!(issuer_info.labels, seed_info.labels);
@@ -109,8 +111,9 @@ async fn joiner_bootstraps_documents() -> TestResult<()> {
         .find(|node| node.node_id == joiner.config.node_id)
         .expect("joiner should be in the placement view")
         .labels;
-    let joiner_info = read_info_document(&joiner.context.storage_handle, joiner.config.node_id)
+    let joiner_info = drive(ReadInfoOperation::new(vec![joiner.config.node_id]), joiner.context.as_ref())
         .await?
+        .remove(&joiner.config.node_id)
         .expect("joiner startup should seed its node info after fetching realm config");
     assert_eq!(joiner_info.node_id, joiner.config.node_id);
     assert_eq!(joiner_info.labels, selector_labels);

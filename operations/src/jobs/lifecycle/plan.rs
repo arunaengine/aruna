@@ -36,7 +36,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::node::heartbeat::{fresh_heartbeats, live_telemetry};
-use crate::node::node_info::read_info_document;
+use crate::node::read_info::ReadInfoOperation;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 
 /// Tag that pins the container network mode, shared with the executor path.
@@ -136,7 +136,8 @@ pub(super) async fn advertisements(
     };
     let mut unread = false;
     for node_id in members {
-        match read_info_document(&context.storage_handle, node_id).await {
+        let read = drive(ReadInfoOperation::new(vec![node_id]), context).await;
+        match read.map(|mut documents| documents.remove(&node_id)) {
             Ok(Some(document)) => {
                 documents.insert(node_id, document);
             }

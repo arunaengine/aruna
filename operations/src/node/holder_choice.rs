@@ -13,10 +13,10 @@ use aruna_core::structs::placement::compute_config::RealmComputeConfig;
 use aruna_core::structs::storage::node_info::{LOCATION_LABEL_KEY, NodeInfoDocument, NodeUrls};
 use rand::seq::SliceRandom;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
 use crate::node::heartbeat::held_heartbeats;
-use crate::node::node_info::read_info_documents;
+use crate::node::read_info::ReadInfoOperation;
 
 /// A heartbeat older than this does not make a holder a candidate.
 pub const HEARTBEAT_STALE_MS: u64 = 180_000;
@@ -102,9 +102,10 @@ pub async fn candidates(
     let local = net.node_id();
     let mut wanted: Vec<NodeId> = holders.iter().take(MAX_CANDIDATES).copied().collect();
     wanted.push(local);
-    let documents: BTreeMap<NodeId, NodeInfoDocument> = read_info_documents(context, &wanted)
-        .await
-        .unwrap_or_default();
+    let documents: BTreeMap<NodeId, NodeInfoDocument> =
+        drive(ReadInfoOperation::new(wanted), context)
+            .await
+            .unwrap_or_default();
     let held = held_heartbeats(Some(net));
     let config = load_realm_config(context, *net.realm_id()).await;
     let compute = config.as_ref().map(|config| &config.compute);

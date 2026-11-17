@@ -54,7 +54,7 @@ use crate::jobs::records::{
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
 use crate::node::drain_state::DrainStateOperation;
-use crate::node::node_info::read_info_document;
+use crate::node::read_info::ReadInfoOperation;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::placement::resolve_shard_holders;
 
@@ -246,10 +246,10 @@ async fn store_receipt(
         round.local,
         now,
     )?;
-    let membership_generation = read_info_document(&context.storage_handle, round.local)
+    let membership_generation = drive(ReadInfoOperation::new(vec![round.local]), context)
         .await
         .ok()
-        .flatten()
+        .and_then(|mut documents| documents.remove(&round.local))
         .map(|document| document.epoch.membership_generation)
         .unwrap_or_default();
     let launch_digest =
@@ -575,9 +575,10 @@ pub(crate) async fn local_capability(
     intent: &LaunchIntent,
     spec: &LogicalJobSpec,
 ) -> Result<ExecutorCapability, LaunchDecline> {
-    let document = read_info_document(&context.storage_handle, local)
+    let document = drive(ReadInfoOperation::new(vec![local]), context)
         .await
         .map_err(|_| LaunchDecline::Draining)?
+        .remove(&local)
         .ok_or(LaunchDecline::Draining)?;
     if !config
         .sync_eligible_nodes()

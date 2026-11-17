@@ -22,6 +22,7 @@ use tracing::debug;
 use super::routing::{family_projection, status_view};
 use super::witness::{WitnessExplain, has_deadline};
 use crate::driver::{DriverContext, drive};
+use crate::node::read_info::ReadInfoOperation;
 use crate::jobs::JobRouteError;
 use crate::jobs::records::keys::submission_prefix;
 use crate::jobs::records::rows::from_bytes;
@@ -139,9 +140,9 @@ pub async fn family_report(
         if output_endpoints.contains_key(&output.node_id) {
             continue;
         }
-        if let Ok(Some(document)) =
-            crate::node::node_info::read_info_document(&context.storage_handle, output.node_id)
-                .await
+        let read = drive(ReadInfoOperation::new(vec![output.node_id]), context).await;
+        if let Ok(mut documents) = read
+            && let Some(document) = documents.remove(&output.node_id)
             && let Some(endpoint) = document.urls.s3
         {
             output_endpoints.insert(output.node_id, endpoint);
@@ -460,9 +461,9 @@ pub async fn audit_endpoints(
             if endpoints.contains_key(&object.node_id) {
                 continue;
             }
-            if let Ok(Some(document)) =
-                crate::node::node_info::read_info_document(&context.storage_handle, object.node_id)
-                    .await
+            let read = drive(ReadInfoOperation::new(vec![object.node_id]), context).await;
+            if let Ok(mut documents) = read
+                && let Some(document) = documents.remove(&object.node_id)
                 && let Some(endpoint) = document.urls.s3
             {
                 endpoints.insert(object.node_id, endpoint);

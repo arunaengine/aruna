@@ -31,6 +31,7 @@ use aruna_operations::federation::totals::data_totals;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
+use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::node::realm_usage::RealmUsageOperation;
 use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
@@ -1547,8 +1548,7 @@ pub(crate) async fn load_node_documents(
         .iter()
         .filter_map(|node| node.node_id.parse().ok())
         .collect();
-    match aruna_operations::node::node_info::read_info_documents(&state.get_ctx(), &node_ids).await
-    {
+    match drive(ReadInfoOperation::new(node_ids), state.get_ctx().as_ref()).await {
         Ok(documents) => documents,
         Err(error) => {
             warn!(error = %error, "Failed to load node info documents for realm info");

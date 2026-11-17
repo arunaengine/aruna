@@ -34,6 +34,7 @@ use super::{
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::node::read_info::ReadInfoOperation;
 use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::publish::{PublishError, holder_answer};
@@ -407,14 +408,13 @@ impl MetadataHandle {
                     let result = match self.authorize_read_peer(peer, auth_token, false).await {
                         Ok(auth) => match context.net_handle.as_ref() {
                             Some(net) => {
-                                let endpoint = crate::node::node_info::read_info_document(
-                                    &context.storage_handle,
-                                    net.node_id(),
-                                )
-                                .await
-                                .ok()
-                                .flatten()
-                                .and_then(|document| document.urls.s3);
+                                let local = net.node_id();
+                                let read = ReadInfoOperation::new(vec![local]);
+                                let endpoint = drive(read, context.as_ref())
+                                    .await
+                                    .ok()
+                                    .and_then(|mut documents| documents.remove(&local))
+                                    .and_then(|document| document.urls.s3);
                                 super::super::api::references_preflight_local(
                                     context.as_ref(),
                                     *net.realm_id(),

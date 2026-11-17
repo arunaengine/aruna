@@ -32,12 +32,13 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
-use crate::node::node_info::{read_info_document, write_info_document};
+use crate::node::node_info::write_info_document;
+use crate::node::read_info::ReadInfoOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
 
@@ -683,7 +684,9 @@ pub async fn install_group_docs(
 
 async fn install_node_infos(context: &Arc<DriverContext>, documents: &[NodeInfoDocument]) -> bool {
     for document in documents {
-        match read_info_document(&context.storage_handle, document.node_id).await {
+        let node_id = document.node_id;
+        let read = drive(ReadInfoOperation::new(vec![node_id]), context.as_ref()).await;
+        match read.map(|mut documents| documents.remove(&node_id)) {
             Ok(Some(stored)) if stored == *document => continue,
             Ok(_) => {}
             Err(error) => {

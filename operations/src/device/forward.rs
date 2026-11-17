@@ -24,7 +24,7 @@ use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_document::update_metadata_document;
-use crate::node::node_info::read_info_documents;
+use crate::node::read_info::ReadInfoOperation;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::node_name::ReadNamesOperation;
 use aruna_core::NodeId;
@@ -132,7 +132,7 @@ pub(super) async fn read_realm_documents(
     let node_ids = config
         .sync_eligible_nodes()
         .map_err(|_| SyncRefusal::Unavailable)?;
-    let node_infos = read_info_documents(context, &node_ids)
+    let node_infos = drive(ReadInfoOperation::new(node_ids), context)
         .await
         .map_err(|error| {
             warn!(%error, "Failed to read the node info documents for a device");
@@ -172,7 +172,7 @@ pub(super) async fn management_urls(
         .filter(|node| matches!(node.kind, RealmNodeKind::Management))
         .filter_map(|node| NodeId::from_str(&node.node_id).ok())
         .collect();
-    let documents = match read_info_documents(context, &node_ids).await {
+    let documents = match drive(ReadInfoOperation::new(node_ids), context).await {
         Ok(documents) => documents,
         Err(error) => {
             warn!(%error, "Failed to read the management urls for a device");

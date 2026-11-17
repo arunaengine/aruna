@@ -14,7 +14,8 @@ use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::node::heartbeat::held_heartbeats;
 use aruna_operations::node::drain_state::DrainStateOperation;
-use aruna_operations::node::node_info::{group_demand, read_info_documents, set_operator_drain};
+use aruna_operations::node::node_info::{group_demand, set_operator_drain};
+use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,
@@ -600,9 +601,9 @@ pub async fn get_compute_snapshots(
     let members = config
         .node_ids()
         .map_err(|error| ServerError::InternalError(error.into()))?;
-    let documents = read_info_documents(&context, &members)
+    let documents = drive(ReadInfoOperation::new(members), context.as_ref())
         .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
 
     let heartbeats = held_heartbeats(context.net_handle.as_ref());
     let nodes = documents
