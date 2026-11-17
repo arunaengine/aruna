@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::rows::done;
+use aruna_core::rows::{done, read_row};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -240,10 +240,7 @@ impl From<IoError> for SelectionError {
 }
 
 fn read_call(document_id: Ulid) -> IoCall {
-    IoCall::Read(vec![(
-        DEVICE_REPLICA_KEYSPACE.to_string(),
-        replica_key(document_id),
-    )])
+    read_row(DEVICE_REPLICA_KEYSPACE, replica_key(document_id))
 }
 
 /// The replica a read holds; an absent or undecodable row is none.
