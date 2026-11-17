@@ -88,15 +88,11 @@ pub enum SourceConnectorError {
     /// The id is in use on this node with another definition, credentials or group.
     #[error("connector id is already in use on this node")]
     IdTaken,
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for SourceConnectorError {
     fn from(error: IoError) -> Self {
-        error
-            .into_storage()
-            .map_or_else(Self::Io, Self::StorageError)
+        Self::StorageError(error.into())
     }
 }
 

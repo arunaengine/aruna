@@ -25,13 +25,11 @@ pub enum CentralStoreError {
     Stale,
     #[error("daily assistant limit reached")]
     QuotaReached(QuotaReached),
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for CentralStoreError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 

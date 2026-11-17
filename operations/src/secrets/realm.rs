@@ -54,13 +54,11 @@ pub enum RealmSecretError {
     ConfigMissing,
     #[error("this node is not a realm management node")]
     NotManagementNode,
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for RealmSecretError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 

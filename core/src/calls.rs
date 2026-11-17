@@ -262,18 +262,6 @@ pub enum IoError {
     Codec(String),
 }
 
-impl IoError {
-    /// The storage failure this error is, a lost conflict as `TransactionConflict`; any other
-    /// error as it is.
-    pub fn into_storage(self) -> Result<StorageError, IoError> {
-        match self {
-            Self::Conflict => Ok(StorageError::TransactionConflict),
-            Self::Storage(error) => Ok(error),
-            other => Err(other),
-        }
-    }
-}
-
 impl From<IoError> for StorageError {
     /// A storage failure as itself, a conflict as the transaction conflict, any other as a read
     /// error naming it.

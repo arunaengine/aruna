@@ -67,13 +67,11 @@ pub enum CreateSourceError {
     SourceConflict(Ulid),
     #[error("CreateHarvestSource failed")]
     Failed,
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for CreateSourceError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 

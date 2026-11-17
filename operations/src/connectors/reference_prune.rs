@@ -237,13 +237,11 @@ pub enum PruneError {
     NotFinished,
     #[error("connector reference pruning was not scheduled: {0}")]
     Schedule(String),
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for PruneError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 

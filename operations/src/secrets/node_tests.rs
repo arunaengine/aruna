@@ -173,7 +173,7 @@ fn wrong_event_fails() {
     let error = operation.next(storage(StorageEvent::SyncAllFinished));
     assert!(matches!(
         error,
-        Err(NodeSecretError::Io(IoError::Unexpected { .. }))
+        Err(NodeSecretError::Storage(StorageError::ReadError(_)))
     ));
 }
 

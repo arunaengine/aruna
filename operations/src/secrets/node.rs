@@ -43,13 +43,11 @@ pub enum NodeSecretError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for NodeSecretError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 

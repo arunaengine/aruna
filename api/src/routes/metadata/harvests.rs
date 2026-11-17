@@ -183,8 +183,7 @@ fn source_error(error: CreateSourceError) -> ServerError {
         CreateSourceError::GroupWrite(_)
         | CreateSourceError::Storage(_)
         | CreateSourceError::Conversion(_)
-        | CreateSourceError::Failed
-        | CreateSourceError::Io(_) => ServerError::InternalError(error.into()),
+        | CreateSourceError::Failed => ServerError::InternalError(error.into()),
     }
 }
 

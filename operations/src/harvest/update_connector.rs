@@ -78,7 +78,7 @@ pub enum UpdateConnectorError {
 
 impl From<IoError> for UpdateConnectorError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or(Self::Unexpected, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 

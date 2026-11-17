@@ -467,7 +467,7 @@ fn rejects_wrong_results() {
     let unexpected = |turn: Result<Next<AssistantChatHead>, ChatStoreError>| {
         assert!(matches!(
             turn,
-            Err(ChatStoreError::Io(IoError::Unexpected { .. }))
+            Err(ChatStoreError::Storage(StorageError::ReadError(_)))
         ));
     };
     let mut operation = head_op(None);
