@@ -27,9 +27,12 @@ use super::check::{RunScope, check_call};
 use super::dispatch::{event_run, event_trigger};
 use super::forward::{Decisions, EventBatch, Outcome};
 use super::replay::{COVERAGE_ROW, CoverageRow, row_key};
-use super::runs::{ADMISSIONS, RunError, admit_in};
-use super::store::{StoreError, Txn, decode, encode, transact};
-use crate::driver::DriverContext;
+use super::rows::{
+    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row as row_of, unexpected, values,
+};
+use super::runs::{ADMISSIONS, Admission, RunError};
+use super::store::{Rows, StoreError, decode, encode};
+use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::mutate_placement::node_kind;
 
@@ -49,6 +52,7 @@ pub struct WaitingRow {
 }
 
 /// Whether an event can be decided now, and how.
+#[derive(Debug, PartialEq)]
 pub(crate) enum Verdict {
     /// The install record or a prerequisite write is not here yet.
     Unready,
@@ -96,7 +100,7 @@ pub async fn decide_batch(
             .events
             .push((row.install_id, row.event.source, outcome));
     }
-    decisions.gaps = keep_reports(ctx, sender, batch.gaps).await?;
+    decisions.gaps = drive(keep_reports(sender, batch.gaps), ctx).await?;
     Ok(decisions)
 }
 
@@ -108,96 +112,277 @@ async fn decide(
     row: &ForwardRow,
     now_ms: u64,
 ) -> Result<Outcome, StoreError> {
-    let seen = seen_key(row.install_id, row.event.kind, &row.event.source);
-    if let Some(bytes) = Txn::direct(ctx).read(PLUGIN_SEEN_KEYSPACE, &seen).await? {
-        return Ok(decode::<SeenRow>(&bytes)?.outcome);
+    if let Some(outcome) = drive(seen_outcome(row), ctx).await? {
+        return Ok(outcome);
     }
     // Its dedup record would be gone, so a run now could repeat one already made.
     if now_ms > row.event.anchor_ms.saturating_add(DEDUP_RETENTION_MS) {
-        let late = async |txn: &Txn<'_>| local_gap(txn, local, row, GapReason::Late).await;
-        transact(ctx, late).await?;
+        let late = GapCount::new(local, row, GapReason::Late);
+        drive(RowsOperation::transaction(LateEvent(late)), ctx).await?;
         return Ok(Outcome::Expired);
     }
     let verdict = judge(ctx, config, local, row, now_ms).await?;
-    transact(ctx, async |txn: &Txn<'_>| {
-        let outcome = match &verdict {
-            Verdict::Unavailable => return Ok(Outcome::Busy),
-            Verdict::Run(run) => match admit_in(txn, run).await {
-                Err(RunError::Full(_)) => return Ok(Outcome::Busy),
-                Err(RunError::Store(error)) => return Err(error),
-                Ok(())
-                | Err(
-                    RunError::NotFound
-                    | RunError::NotWaiting(_)
-                    | RunError::NotRetried(_)
-                    | RunError::NotHeld,
-                ) => Outcome::Queued,
-            },
-            Verdict::Unready if !hold(txn, row, now_ms).await? => return Ok(Outcome::Busy),
-            Verdict::Unready => Outcome::Waiting,
-            Verdict::Denied(reason) => Outcome::Denied(reason.clone()),
-        };
-        record(txn, row, &outcome, now_ms).await?;
-        Ok(outcome)
-    })
-    .await
+    drive(decide_event(verdict, row, now_ms)?, ctx).await
 }
 
-/// Counts an event this receiver did not run in its own gap row of `reason`.
-pub(crate) async fn local_gap(
-    txn: &Txn<'_>,
-    local: NodeId,
-    row: &ForwardRow,
-    reason: GapReason,
-) -> Result<(), StoreError> {
-    let (install_id, kind) = (row.install_id, row.event.kind);
-    let key = reported_key(local, install_id, kind, reason);
-    let mut gap = match txn.read(PLUGIN_GAPS_KEYSPACE, &key).await? {
-        Some(bytes) => decode(&bytes)?,
-        None => GapRow::new(kind, reason),
-    };
-    gap.add(row.event.anchor_ms);
-    txn.write(PLUGIN_GAPS_KEYSPACE, vec![(key, encode(&gap)?)])
-        .await
+/// The outcome an earlier decision recorded for the event.
+fn seen_outcome(row: &ForwardRow) -> RowsOperation<SeenOutcome> {
+    let seen = seen_key(row.install_id, row.event.kind, &row.event.source);
+    RowsOperation::direct(SeenOutcome(seen))
 }
 
-/// Deletes the dedup records past their retention; returns how many.
-pub async fn prune_seen(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
-    let txn = Txn::direct(ctx);
-    let (mut after, mut pruned) = (None, 0);
-    loop {
-        let (rows, next) = txn.page(PLUGIN_SEEN_KEYSPACE, &[], after, 1_000).await?;
-        let old: Vec<Vec<u8>> = (rows.into_iter())
-            .filter(|(_, value)| {
-                decode::<SeenRow>(value)
-                    .is_ok_and(|seen| now_ms > seen.anchor_ms.saturating_add(DEDUP_RETENTION_MS))
-            })
-            .map(|(key, _)| key)
-            .collect();
-        pruned += old.len();
-        txn.delete(PLUGIN_SEEN_KEYSPACE, old).await?;
-        match next {
-            Some(key) => after = Some(key),
-            None => return Ok(pruned),
+#[derive(Debug, PartialEq)]
+pub struct SeenOutcome(Vec<u8>);
+
+impl Plan for SeenOutcome {
+    type Output = Option<Outcome>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_SEEN_KEYSPACE, self.0.clone())])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        let [found] = values::<1>(answer)?;
+        let seen = found.map(|bytes| decode::<SeenRow>(&bytes)).transpose()?;
+        Ok(Turn::Finish(seen.map(|seen| seen.outcome)))
+    }
+}
+
+/// Counts an event that came too late in its own gap row.
+#[derive(Debug, PartialEq)]
+pub struct LateEvent(GapCount);
+
+impl Plan for LateEvent {
+    type Output = ();
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<()>, StoreError> {
+        Ok(Turn::Ask(self.0.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+        match self.0.take(answer)? {
+            Some(row) => Ok(Turn::Ask(Ask::Write(vec![row]))),
+            None => Ok(Turn::Finish(())),
         }
     }
 }
 
-/// Writes the event's dedup record with its outcome.
-pub(crate) async fn record(
-    txn: &Txn<'_>,
+/// Records the event's outcome under `verdict` in one transaction: a queued run, a held queue
+/// slot, or a denial. A full queue and an unavailable check are busy and write nothing.
+pub(crate) fn decide_event(
+    verdict: Verdict,
     row: &ForwardRow,
-    outcome: &Outcome,
     now_ms: u64,
-) -> Result<(), StoreError> {
+) -> Result<RowsOperation<DecideEvent>, StoreError> {
+    let phase = match verdict {
+        Verdict::Unavailable => DecidePhase::Busy,
+        Verdict::Run(run) => DecidePhase::Admitting(Admission::new(*run)),
+        Verdict::Unready => DecidePhase::Holding(Hold::new(row, now_ms)?),
+        Verdict::Denied(reason) => DecidePhase::Denying(reason),
+    };
+    Ok(RowsOperation::transaction(DecideEvent {
+        row: Box::new(row.clone()),
+        now_ms,
+        phase,
+    }))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DecideEvent {
+    row: Box<ForwardRow>,
+    now_ms: u64,
+    phase: DecidePhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum DecidePhase {
+    Busy,
+    Admitting(Admission),
+    Holding(Hold),
+    Denying(String),
+    /// The rows of this outcome are being written.
+    Writing(Outcome),
+}
+
+impl DecideEvent {
+    fn decided(&mut self, outcome: Outcome, mut rows: Vec<Row>) -> Result<Turn<Outcome>, StoreError> {
+        rows.push(seen_row(&self.row, &outcome, self.now_ms)?);
+        self.phase = DecidePhase::Writing(outcome);
+        Ok(Turn::Ask(Ask::Write(rows)))
+    }
+}
+
+impl Plan for DecideEvent {
+    type Output = Outcome;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Outcome>, StoreError> {
+        match std::mem::replace(&mut self.phase, DecidePhase::Busy) {
+            DecidePhase::Busy => Ok(Turn::Finish(Outcome::Busy)),
+            DecidePhase::Admitting(admission) => {
+                let ask = admission.ask();
+                self.phase = DecidePhase::Admitting(admission);
+                Ok(Turn::Ask(ask))
+            }
+            DecidePhase::Holding(hold) => {
+                let ask = hold.ask();
+                self.phase = DecidePhase::Holding(hold);
+                Ok(Turn::Ask(ask))
+            }
+            DecidePhase::Denying(reason) => self.decided(Outcome::Denied(reason), Vec::new()),
+            DecidePhase::Writing(_) => Err(StoreError("decided twice".into())),
+        }
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Outcome>, StoreError> {
+        match std::mem::replace(&mut self.phase, DecidePhase::Busy) {
+            DecidePhase::Admitting(mut admission) => match admission.take(answer) {
+                Ok(None) => {
+                    let ask = admission.ask();
+                    self.phase = DecidePhase::Admitting(admission);
+                    Ok(Turn::Ask(ask))
+                }
+                Ok(Some(rows)) => self.decided(Outcome::Queued, rows),
+                Err(RunError::Full(_)) => Ok(Turn::Finish(Outcome::Busy)),
+                Err(RunError::Store(error)) => Err(error),
+                Err(error) => Err(StoreError(error.to_string())),
+            },
+            DecidePhase::Holding(mut hold) => match hold.take(answer)? {
+                Slot::More(ask) => {
+                    self.phase = DecidePhase::Holding(hold);
+                    Ok(Turn::Ask(ask))
+                }
+                Slot::Full => Ok(Turn::Finish(Outcome::Busy)),
+                Slot::Taken(rows) => self.decided(Outcome::Waiting, rows),
+            },
+            DecidePhase::Writing(outcome) => {
+                done(answer)?;
+                Ok(Turn::Finish(outcome))
+            }
+            DecidePhase::Busy | DecidePhase::Denying(_) => Err(unexpected(answer)),
+        }
+    }
+}
+
+/// A sub-plan that counts an event this receiver did not run in its own gap row of `reason`.
+#[derive(Debug, PartialEq)]
+pub struct GapCount {
+    key: Vec<u8>,
+    kind: SourceKind,
+    reason: GapReason,
+    anchor_ms: u64,
+    counted: bool,
+}
+
+impl GapCount {
+    pub fn new(local: NodeId, row: &ForwardRow, reason: GapReason) -> Self {
+        let (install_id, kind) = (row.install_id, row.event.kind);
+        Self {
+            key: reported_key(local, install_id, kind, reason),
+            kind,
+            reason,
+            anchor_ms: row.event.anchor_ms,
+            counted: false,
+        }
+    }
+
+    pub fn ask(&self) -> Ask {
+        Ask::Read(vec![(PLUGIN_GAPS_KEYSPACE, self.key.clone())])
+    }
+
+    /// The counted gap row after its read, or `None` once its write was answered.
+    pub fn take(&mut self, answer: Answer) -> Result<Option<Row>, StoreError> {
+        if self.counted {
+            return done(answer).map(|()| None);
+        }
+        let [found] = values::<1>(answer)?;
+        let mut gap = match found {
+            Some(bytes) => decode(&bytes)?,
+            None => GapRow::new(self.kind, self.reason),
+        };
+        gap.add(self.anchor_ms);
+        self.counted = true;
+        Ok(Some(row_of(PLUGIN_GAPS_KEYSPACE, self.key.clone(), encode(&gap)?)))
+    }
+}
+
+/// Deletes the dedup records past their retention; returns how many.
+pub fn prune_seen(now_ms: u64) -> RowsOperation<PruneSeen> {
+    RowsOperation::direct(PruneSeen {
+        now_ms,
+        after: None,
+        deleting: None,
+        pruned: 0,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PruneSeen {
+    now_ms: u64,
+    after: Option<Vec<u8>>,
+    /// The key to continue after once the deletes of a page are answered; `Some(None)` ends.
+    deleting: Option<Option<Vec<u8>>>,
+    pruned: usize,
+}
+
+impl PruneSeen {
+    fn page(&self) -> Ask {
+        Ask::Page {
+            space: PLUGIN_SEEN_KEYSPACE,
+            prefix: Vec::new(),
+            after: self.after.clone(),
+            limit: 1_000,
+        }
+    }
+}
+
+impl Plan for PruneSeen {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
+        Ok(Turn::Ask(self.page()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+        if let Some(next) = self.deleting.take() {
+            done(answer)?;
+            return Ok(match next {
+                Some(key) => {
+                    self.after = Some(key);
+                    Turn::Ask(self.page())
+                }
+                None => Turn::Finish(self.pruned),
+            });
+        }
+        let Answer::Page(rows, next) = answer else {
+            return Err(unexpected(answer));
+        };
+        let old: Vec<_> = (rows.into_iter())
+            .filter(|(_, value)| {
+                decode::<SeenRow>(value).is_ok_and(|seen| {
+                    self.now_ms > seen.anchor_ms.saturating_add(DEDUP_RETENTION_MS)
+                })
+            })
+            .map(|(key, _)| (PLUGIN_SEEN_KEYSPACE, key))
+            .collect();
+        self.pruned += old.len();
+        self.deleting = Some(next);
+        Ok(Turn::Ask(Ask::Delete(old)))
+    }
+}
+
+/// The event's dedup record with its outcome.
+pub(crate) fn seen_row(row: &ForwardRow, outcome: &Outcome, now_ms: u64) -> Result<Row, StoreError> {
     let key = seen_key(row.install_id, row.event.kind, &row.event.source);
     let record = SeenRow {
         outcome: outcome.clone(),
         anchor_ms: row.event.anchor_ms,
         decided_ms: now_ms,
     };
-    txn.write(PLUGIN_SEEN_KEYSPACE, vec![(key, encode(&record)?)])
-        .await
+    Ok(row_of(PLUGIN_SEEN_KEYSPACE, key, encode(&record)?))
 }
 
 /// Whether the local install record and its prerequisite writes are here, then the check.
@@ -246,51 +431,106 @@ async fn trigger_check(
     Ok(scope.run)
 }
 
-/// Takes a queue slot for a waiting event; `false` when the install's queue is full.
-async fn hold(txn: &Txn<'_>, row: &ForwardRow, now_ms: u64) -> Result<bool, StoreError> {
-    let prefix = row.install_id.to_bytes();
-    if txn.scan(PLUGIN_QUEUE_KEYSPACE, &prefix).await?.len() >= RUNS_QUEUED {
-        return Ok(false);
+/// A sub-plan that takes a queue slot for a waiting event, unless the install's queue is full.
+#[derive(Debug, PartialEq)]
+pub struct Hold {
+    key: Vec<u8>,
+    waiting: Vec<u8>,
+    queued: Scan,
+}
+
+/// What a hold needs next, or whether it took the slot.
+#[derive(Debug, PartialEq)]
+pub enum Slot {
+    More(Ask),
+    Full,
+    /// The rows of the slot and its waiting event.
+    Taken(Vec<Row>),
+}
+
+impl Hold {
+    pub fn new(row: &ForwardRow, now_ms: u64) -> Result<Self, StoreError> {
+        let waiting = WaitingRow {
+            row: row.clone(),
+            received_ms: now_ms,
+        };
+        Ok(Self {
+            key: queue_key(row.install_id, Ulid::generate()),
+            waiting: encode(&waiting)?,
+            queued: Scan::new(PLUGIN_QUEUE_KEYSPACE, row.install_id.to_bytes().to_vec()),
+        })
     }
-    let key = queue_key(row.install_id, Ulid::generate());
-    let waiting = WaitingRow {
-        row: row.clone(),
-        received_ms: now_ms,
-    };
-    let slot = vec![(key.clone(), WAITING_ROW.to_vec())];
-    txn.write(PLUGIN_QUEUE_KEYSPACE, slot).await?;
-    txn.write(PLUGIN_WAITING_KEYSPACE, vec![(key, encode(&waiting)?)])
-        .await?;
-    Ok(true)
+
+    pub fn ask(&self) -> Ask {
+        self.queued.ask()
+    }
+
+    pub fn take(&mut self, answer: Answer) -> Result<Slot, StoreError> {
+        let Some(queued) = self.queued.take(answer)? else {
+            return Ok(Slot::More(self.queued.ask()));
+        };
+        if queued.len() >= RUNS_QUEUED {
+            return Ok(Slot::Full);
+        }
+        Ok(Slot::Taken(vec![
+            row_of(PLUGIN_QUEUE_KEYSPACE, self.key.clone(), WAITING_ROW.to_vec()),
+            row_of(PLUGIN_WAITING_KEYSPACE, self.key.clone(), std::mem::take(&mut self.waiting)),
+        ]))
+    }
 }
 
 /// Keeps each report from `sender` that is newer than the one kept; answers the sequence kept.
-async fn keep_reports(
-    ctx: &DriverContext,
+fn keep_reports(sender: NodeId, reports: Vec<(Ulid, GapRow)>) -> RowsOperation<KeepReports> {
+    RowsOperation::transaction(KeepReports {
+        sender,
+        reports,
+        acked: None,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct KeepReports {
     sender: NodeId,
     reports: Vec<(Ulid, GapRow)>,
-) -> Result<Vec<(Ulid, SourceKind, GapReason, u64)>, StoreError> {
-    transact(ctx, async |txn: &Txn<'_>| {
-        let mut acked = Vec::new();
-        for (install_id, report) in reports {
-            let key = reported_key(sender, install_id, report.kind, report.reason);
-            let kept = txn.read(PLUGIN_GAPS_KEYSPACE, &key).await?;
+    acked: Option<Vec<(Ulid, SourceKind, GapReason, u64)>>,
+}
+
+impl Plan for KeepReports {
+    type Output = Vec<(Ulid, SourceKind, GapReason, u64)>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        let reads = (self.reports.iter())
+            .map(|(install_id, report)| {
+                let key = reported_key(self.sender, *install_id, report.kind, report.reason);
+                (PLUGIN_GAPS_KEYSPACE, key)
+            })
+            .collect();
+        Ok(Turn::Ask(Ask::Read(reads)))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        if let Some(acked) = self.acked.take() {
+            done(answer)?;
+            return Ok(Turn::Finish(acked));
+        }
+        let Answer::Values(kept) = answer else {
+            return Err(unexpected(answer));
+        };
+        let (mut acked, mut writes) = (Vec::new(), Vec::new());
+        for ((install_id, report), kept) in std::mem::take(&mut self.reports).into_iter().zip(kept) {
             let kept = kept.map(|bytes| decode::<GapRow>(&bytes)).transpose()?;
             let sequence = kept.as_ref().map_or(0, |kept| kept.sequence);
-            acked.push((
-                install_id,
-                report.kind,
-                report.reason,
-                sequence.max(report.sequence),
-            ));
+            let (kind, reason) = (report.kind, report.reason);
+            acked.push((install_id, kind, reason, sequence.max(report.sequence)));
             if report.sequence > sequence {
-                txn.write(PLUGIN_GAPS_KEYSPACE, vec![(key, encode(&report)?)])
-                    .await?;
+                let key = reported_key(self.sender, install_id, kind, reason);
+                writes.push(row_of(PLUGIN_GAPS_KEYSPACE, key, encode(&report)?));
             }
         }
-        Ok(acked)
-    })
-    .await
+        self.acked = Some(acked);
+        Ok(Turn::Ask(Ask::Write(writes)))
+    }
 }
 
 /// What the receiver holds about an install's event delivery.
@@ -305,15 +545,84 @@ pub struct Delivery {
 }
 
 /// The install's waiting events, gap totals and replay note on this receiver.
-pub async fn event_delivery(ctx: &DriverContext, install_id: Ulid) -> Result<Delivery, StoreError> {
-    let txn = Txn::direct(ctx);
+pub fn event_delivery(install_id: Ulid) -> RowsOperation<EventDelivery> {
+    let prefix = install_id.to_bytes().to_vec();
+    RowsOperation::direct(EventDelivery {
+        install_id,
+        phase: DeliveryPhase::Waiting(Scan::new(PLUGIN_WAITING_KEYSPACE, prefix)),
+        delivery: Delivery::default(),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct EventDelivery {
+    install_id: Ulid,
+    phase: DeliveryPhase,
+    delivery: Delivery,
+}
+
+#[derive(Debug, PartialEq)]
+enum DeliveryPhase {
+    Waiting(Scan),
+    Gaps(Scan),
+    Coverage,
+}
+
+impl Plan for EventDelivery {
+    type Output = Delivery;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Delivery>, StoreError> {
+        match &self.phase {
+            DeliveryPhase::Waiting(scan) => Ok(Turn::Ask(scan.ask())),
+            _ => Err(StoreError("read twice".into())),
+        }
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Delivery>, StoreError> {
+        match std::mem::replace(&mut self.phase, DeliveryPhase::Coverage) {
+            DeliveryPhase::Waiting(mut scan) => {
+                let Some(waiting) = scan.take(answer)? else {
+                    let ask = scan.ask();
+                    self.phase = DeliveryPhase::Waiting(scan);
+                    return Ok(Turn::Ask(ask));
+                };
+                let received = (waiting.iter())
+                    .filter_map(|(_, value)| decode::<WaitingRow>(value).ok())
+                    .map(|waiting| waiting.received_ms);
+                self.delivery.oldest_ms = received.min();
+                self.delivery.waiting = waiting.len();
+                let scan = Scan::new(PLUGIN_GAPS_KEYSPACE, vec![RECEIVER_GAP]);
+                let ask = scan.ask();
+                self.phase = DeliveryPhase::Gaps(scan);
+                Ok(Turn::Ask(ask))
+            }
+            DeliveryPhase::Gaps(mut scan) => {
+                let Some(gaps) = scan.take(answer)? else {
+                    let ask = scan.ask();
+                    self.phase = DeliveryPhase::Gaps(scan);
+                    return Ok(Turn::Ask(ask));
+                };
+                self.delivery.gaps = gap_totals(self.install_id, gaps)?;
+                let coverage = row_key(COVERAGE_ROW, self.install_id);
+                Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_REPLAYS_KEYSPACE, coverage)])))
+            }
+            DeliveryPhase::Coverage => {
+                let [coverage] = values::<1>(answer)?;
+                let coverage = coverage.and_then(|bytes| decode::<CoverageRow>(&bytes).ok());
+                self.delivery.note = coverage.and_then(|row| row.note);
+                Ok(Turn::Finish(std::mem::take(&mut self.delivery)))
+            }
+        }
+    }
+}
+
+/// The undelivered events of an install among the receiver's gap `rows`, summed by kind and
+/// reason over the nodes that counted them.
+fn gap_totals(install_id: Ulid, rows: Rows) -> Result<Vec<GapRow>, StoreError> {
     let prefix = install_id.to_bytes();
-    let waiting = txn.scan(PLUGIN_WAITING_KEYSPACE, &prefix).await?;
-    let received = (waiting.iter())
-        .filter_map(|(_, value)| decode::<WaitingRow>(value).ok())
-        .map(|waiting| waiting.received_ms);
     let mut totals: BTreeMap<(SourceKind, GapReason), GapRow> = BTreeMap::new();
-    for (key, value) in txn.scan(PLUGIN_GAPS_KEYSPACE, &[RECEIVER_GAP]).await? {
+    for (key, value) in rows {
         if key.get(33..49) != Some(&prefix[..]) {
             continue;
         }
@@ -325,15 +634,7 @@ pub async fn event_delivery(ctx: &DriverContext, install_id: Ulid) -> Result<Del
         total.earliest_ms = total.earliest_ms.min(row.earliest_ms);
         total.latest_ms = total.latest_ms.max(row.latest_ms);
     }
-    let coverage = row_key(COVERAGE_ROW, install_id);
-    let coverage = txn.read(PLUGIN_REPLAYS_KEYSPACE, &coverage).await?;
-    let coverage = coverage.and_then(|bytes| decode::<CoverageRow>(&bytes).ok());
-    Ok(Delivery {
-        waiting: waiting.len(),
-        oldest_ms: received.min(),
-        gaps: totals.into_values().collect(),
-        note: coverage.and_then(|row| row.note),
-    })
+    Ok(totals.into_values().collect())
 }
 
 #[cfg(test)]
