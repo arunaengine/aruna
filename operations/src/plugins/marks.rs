@@ -5,24 +5,14 @@
 
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::structs::execution::job::JobId;
-use aruna_plugins::broker::{ErrorKind, HostError};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::check::unavailable;
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Turn, done, page_rows, row, values,
-};
-use super::store::{StoreError, decode, encode};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row, values, StoreError, decode, encode};
 use super::work::{Found, WorkKind, WorkLookup, WorkState};
-use crate::driver::{DriverContext, drive};
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Row kind of the marks in the work keyspace, apart from the rows an install's removal deletes.
 pub const MARK_ROW: u8 = b'm';
-
-/// Marks one sweep pass reads at a time.
-const PAGE: usize = 100;
 
 /// What every refusal of a marked version says.
 pub const MARKED: &str = "this object was written by a job with a secret; plugins cannot read it";
@@ -69,67 +59,6 @@ impl Plan for IsMarked {
     fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
         let [row] = values::<1>(answer)?;
         Ok(Turn::Finish(row.is_some()))
-    }
-}
-
-/// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
-/// when it is marked; `None` when there is no such object, so nothing is read either.
-pub async fn unmarked(
-    ctx: &DriverContext,
-    (bucket, key): (&str, &str),
-    version: Option<Ulid>,
-) -> Result<Option<Ulid>, HostError> {
-    let head = HeadObjectInput {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        version_id: version,
-    };
-    let resolved = match drive(HeadObjectOperation::new(head), ctx).await {
-        Ok(head) => head.resolved_version_id.or(version),
-        Err(error) if absent(&error) => return Ok(None),
-        Err(error) => return Err(unavailable(error.to_string())),
-    };
-    let Some(resolved) = resolved else {
-        return Ok(None);
-    };
-    let marked = is_marked((bucket, key, resolved)).map_err(|error| unavailable(error.0))?;
-    match drive(marked, ctx).await {
-        Ok(false) => Ok(Some(resolved)),
-        Ok(true) => Err(HostError::new(ErrorKind::Denied, MARKED)),
-        Err(error) => Err(unavailable(error.0)),
-    }
-}
-
-/// Drops the marks nothing can need any more, a page at a time: the work that minted the
-/// version can write no more, as its row is settled or gone, and only then the version is
-/// absent. The delete reads the row again, so it conflicts with a settlement or reservation.
-pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
-    let (mut dropped, mut after) = (0, None);
-    loop {
-        let page = page_rows(PLUGIN_WORK_KEYSPACE, vec![MARK_ROW], after, PAGE);
-        let (rows, next) = drive(page, ctx).await?;
-        for (key, value) in rows {
-            let mark: Mark = decode(&value)?;
-            let (bucket, object, version_id) = decode::<(String, String, Ulid)>(&key[1..])?;
-            if !drive(MarkEnded::check(&mark, None), ctx).await? {
-                continue;
-            }
-            let head = HeadObjectInput {
-                bucket,
-                key: object,
-                version_id: Some(version_id),
-            };
-            match drive(HeadObjectOperation::new(head), ctx).await {
-                Err(error) if absent(&error) => {}
-                // Present, or not known now: the mark stays.
-                _ => continue,
-            }
-            dropped += usize::from(drive(MarkEnded::check(&mark, Some(key)), ctx).await?);
-        }
-        match next {
-            Some(key) => after = Some(key),
-            None => return Ok(dropped),
-        }
     }
 }
 
@@ -183,13 +112,6 @@ impl Plan for MarkEnded {
             (ended, _) => Ok(Turn::Finish(ended)),
         }
     }
-}
-
-fn absent(error: &HeadObjectError) -> bool {
-    matches!(
-        error,
-        HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion | HeadObjectError::DeleteMarker
-    )
 }
 
 #[cfg(test)]

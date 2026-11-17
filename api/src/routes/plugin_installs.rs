@@ -14,7 +14,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
 use aruna_operations::plugins::bound::vault_kind;
-use aruna_operations::plugins::check::covers;
+use aruna_operations::plugins::grants::covers;
 use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants, writes};
 use aruna_operations::plugins::install::{
     InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,

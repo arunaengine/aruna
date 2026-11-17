@@ -14,11 +14,8 @@ use ulid::Ulid;
 
 use super::dispatch::event_run;
 use super::intents::{intent_scan, undone_keys};
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, scan_rows, values,
-};
-use super::runs::{ADMISSIONS, Admission, RunError, read_run};
-use super::store::{Rows, StoreError, decode, encode};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, scan_rows, values, Rows, StoreError, decode, encode};
+use super::runs::{ADMISSIONS, Admission, RunError, audit_rows, read_run};
 use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_scan, work_state};
 use crate::driver::{DriverContext, drive};
 
@@ -298,10 +295,6 @@ impl Plan for DropCompletion {
     }
 }
 
-/// The rows of an admin audit record.
-pub fn audit_rows(audit: &AdminAuditRecord) -> Result<Vec<Row>, StoreError> {
-    audit.entries().map_err(|error| StoreError(error.to_string()))
-}
 
 /// The event a `job_finished` run gets: the job's id, the object path it wrote or read, and
 /// how it ended.
@@ -324,18 +317,6 @@ fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> Source
     }
 }
 
-/// The runs a completion still waits on among the work `rows`: those of works not notified yet,
-/// which keep their record until the completion is delivered or dropped.
-pub fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
-    let mut runs = Vec::new();
-    for (_, value) in rows {
-        let row: WorkRow = decode(&value)?;
-        if !row.notified {
-            runs.push(row.run_id);
-        }
-    }
-    Ok(runs)
-}
 
 #[cfg(test)]
 #[path = "finished_tests.rs"]

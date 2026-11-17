@@ -12,14 +12,9 @@ use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use super::finished::{audit_rows, held_runs};
 use super::intents::{first_open, intent_keys, intent_scan, resolved_rows};
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, Writes, done, row, unexpected, values,
-    writes,
-};
-use super::store::{StoreError, decode, encode};
-use super::work::work_scan;
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, Writes, done, row, unexpected, values, writes, StoreError, decode, encode};
+use super::work::{WorkRow, work_scan};
 
 /// Serializes admissions on this node, so no install passes its queue bound.
 pub static ADMISSIONS: Mutex<()> = Mutex::const_new(());
@@ -440,6 +435,24 @@ impl Plan for PruneRuns {
             }
         }
     }
+}
+
+/// The runs a completion still waits on among the work `rows`: those of works not notified yet,
+/// which keep their record until the completion is delivered or dropped.
+pub fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
+    let mut runs = Vec::new();
+    for (_, value) in rows {
+        let row: WorkRow = decode(&value)?;
+        if !row.notified {
+            runs.push(row.run_id);
+        }
+    }
+    Ok(runs)
+}
+
+/// The rows of an admin audit record.
+pub fn audit_rows(audit: &AdminAuditRecord) -> Result<Vec<Row>, StoreError> {
+    audit.entries().map_err(|error| StoreError(error.to_string()))
 }
 
 #[cfg(test)]

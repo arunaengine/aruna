@@ -47,7 +47,7 @@ use super::intents::{
     Begun, begin, intent_row_key, settled_row, unknown_row, written,
 };
 use super::jobs::{cancel_job, job_outputs, job_row, job_status};
-use super::marks::{is_marked, unmarked};
+use super::marks::{MARKED, is_marked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::outgoing::{node_keys, outgoing, request_context};
 use super::rate::take_call;
@@ -75,7 +75,7 @@ use crate::metadata::handle::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
 
 /// Entries of one metadata or object listing page.
@@ -1335,6 +1335,41 @@ impl Broker for RunBroker {
         let reason = "the call did not finish in time";
         self.mark_unknown(intent, reason).await;
     }
+}
+
+/// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
+/// when it is marked; `None` when there is no such object, so nothing is read either.
+pub async fn unmarked(
+    ctx: &DriverContext,
+    (bucket, key): (&str, &str),
+    version: Option<Ulid>,
+) -> Result<Option<Ulid>, HostError> {
+    let head = HeadObjectInput {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: version,
+    };
+    let resolved = match drive(HeadObjectOperation::new(head), ctx).await {
+        Ok(head) => head.resolved_version_id.or(version),
+        Err(error) if absent(&error) => return Ok(None),
+        Err(error) => return Err(unavailable(error.to_string())),
+    };
+    let Some(resolved) = resolved else {
+        return Ok(None);
+    };
+    let marked = is_marked((bucket, key, resolved)).map_err(|error| unavailable(error.0))?;
+    match drive(marked, ctx).await {
+        Ok(false) => Ok(Some(resolved)),
+        Ok(true) => Err(HostError::new(ErrorKind::Denied, MARKED)),
+        Err(error) => Err(unavailable(error.0)),
+    }
+}
+
+pub(crate) fn absent(error: &HeadObjectError) -> bool {
+    matches!(
+        error,
+        HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion | HeadObjectError::DeleteMarker
+    )
 }
 
 /// The type a JSON literal comes back with from the stored graph.

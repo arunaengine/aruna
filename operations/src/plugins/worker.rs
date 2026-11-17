@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::plugin_runs::{
     EVENTS_QUEUED, MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
 };
@@ -28,33 +29,35 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::artifacts::fetch_artifact;
-use super::broker::{RunBroker, short_path};
+use super::broker::{RunBroker, absent, short_path};
 use super::check::{RunScope, check_call};
 use super::cleanup::sweep_events;
 use super::clock::probe_clock;
 use super::decide::{decide_batch, prune_seen};
-use super::dispatch::{enqueue_timers, event_trigger};
+use super::dispatch::enqueue_timers;
+use super::matcher::event_trigger;
 use super::finished::notify_work;
 use super::forward::{Backoff, Decisions, EventBatch, send_outbox};
 use super::grants::{parse_grants, patterns_for};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
-use super::marks::sweep_marks;
+use super::marks::{MARK_ROW, Mark, MarkEnded};
 use super::journal::JOURNAL_PAGE;
-use super::matcher::{match_page, match_targets};
+use super::lifecycle::match_targets;
+use super::matcher::match_page;
 use super::outbound::Outbound;
 use super::prune::{self, prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
 use super::release::ReleaseKeys;
 use super::replay::{plan_replays, replay_page, replay_scan};
-use super::rows::scan_rows;
+use super::rows::{StoreError, decode, page_rows, scan_rows};
 use super::runs::{RunError, prune_runs, read_run, save_run, unfinished};
-use super::store::StoreError;
 use super::waiting::recheck_waiting;
 use super::jobs::{retire_work, settle_work};
 use super::work::prune_work;
 use crate::driver::{DriverContext, drive};
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 
 /// How often the worker looks for due runs.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -601,6 +604,42 @@ pub(crate) async fn prune_audit(ctx: &DriverContext, now_ms: u64) -> Result<usiz
         pruned += count;
         if !more {
             return Ok(pruned);
+        }
+    }
+}
+
+/// Marks one sweep pass reads at a time.
+const MARK_PAGE: usize = 100;
+
+/// Drops the marks nothing can need any more, a page at a time: the work that minted the
+/// version can write no more, as its row is settled or gone, and only then the version is
+/// absent. The delete reads the row again, so it conflicts with a settlement or reservation.
+pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
+    let (mut dropped, mut after) = (0, None);
+    loop {
+        let page = page_rows(PLUGIN_WORK_KEYSPACE, vec![MARK_ROW], after, MARK_PAGE);
+        let (rows, next) = drive(page, ctx).await?;
+        for (key, value) in rows {
+            let mark: Mark = decode(&value)?;
+            let (bucket, object, version_id) = decode::<(String, String, Ulid)>(&key[1..])?;
+            if !drive(MarkEnded::check(&mark, None), ctx).await? {
+                continue;
+            }
+            let head = HeadObjectInput {
+                bucket,
+                key: object,
+                version_id: Some(version_id),
+            };
+            match drive(HeadObjectOperation::new(head), ctx).await {
+                Err(error) if absent(&error) => {}
+                // Present, or not known now: the mark stays.
+                _ => continue,
+            }
+            dropped += usize::from(drive(MarkEnded::check(&mark, Some(key)), ctx).await?);
+        }
+        match next {
+            Some(key) => after = Some(key),
+            None => return Ok(dropped),
         }
     }
 }

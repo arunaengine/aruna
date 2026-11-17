@@ -16,7 +16,7 @@ use aruna_plugins::permission::Permission;
 use ulid::Ulid;
 
 use super::account::read_user;
-use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
+use super::grants::{covers, InstallScope, accesses, parse_grants, patterns_for};
 use super::install::read_config;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -105,19 +105,6 @@ pub fn matching(
             format!("{permission} is not granted on {target}"),
         )),
         false => Ok(patterns),
-    }
-}
-
-/// Whether a granted pattern, an exact path or a `<base>/**` subtree, covers `target`.
-pub fn covers(pattern: &str, target: &str) -> bool {
-    match pattern.strip_suffix("/**") {
-        Some(base) => {
-            target == base
-                || target
-                    .strip_prefix(base)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        }
-        None => pattern == target,
     }
 }
 

@@ -169,6 +169,19 @@ pub fn patterns_for(grants: &Grants, permission: Permission) -> BTreeSet<String>
         .collect()
 }
 
+/// Whether a granted pattern, an exact path or a `<base>/**` subtree, covers `target`.
+pub fn covers(pattern: &str, target: &str) -> bool {
+    match pattern.strip_suffix("/**") {
+        Some(base) => {
+            target == base
+                || target
+                    .strip_prefix(base)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+        None => pattern == target,
+    }
+}
+
 /// Whether `pattern` names `root/**` or a path or subtree below `root`: clean segments, and
 /// `**` only as the last one.
 pub fn within(pattern: &str, root: &str) -> bool {

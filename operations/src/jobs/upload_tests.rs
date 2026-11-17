@@ -213,14 +213,14 @@ async fn put_sent_again() {
 #[tokio::test]
 async fn marked_source_kept() {
     // A version a job with a secret wrote never leaves the node.
-    use crate::plugins::marks::{Mark, mark_in};
-    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::marks::{Mark, mark_row};
+    use crate::plugins::rows::write_rows;
     let fixture = Fixture::new().await;
     let install = uploader(&fixture).await;
     let (_root, blob) = ready(&fixture, &install).await;
     let (base, seen) = server(201).await;
     let (_, spec) = recorded(&fixture, &install, (&base, "PUT")).await;
-    let version = crate::plugins::marks::unmarked(&blob, ("in", "a.txt"), None).await;
+    let version = crate::plugins::broker::unmarked(&blob, ("in", "a.txt"), None).await;
     let version = version.unwrap().unwrap();
     let mark = Mark {
         install_id: Ulid::from_parts(8, 8),

@@ -10,7 +10,10 @@ use super::*;
 use crate::jobs::plugin_work::tests::ready_copy;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::{retire_work, update_work};
+use crate::plugins::jobs::retire_work;
+use crate::plugins::rows::write_rows;
+use crate::plugins::work::tests::edit_work;
+use crate::plugins::worker::sweep_marks;
 
 /// The current version of the copy's source object `in/a.txt`.
 async fn source_version(ctx: &DriverContext) -> Ulid {

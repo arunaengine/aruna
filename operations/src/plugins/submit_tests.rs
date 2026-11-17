@@ -335,8 +335,8 @@ async fn marks_once() {
 async fn retired_unmarked() {
     // A download that was never submitted, retired with its install, loses its mark at the next
     // sweep: its row is gone and the version it would have written never existed.
-    use crate::plugins::marks::sweep_marks;
-    use crate::plugins::work::retire_work;
+    use crate::plugins::jobs::retire_work;
+    use crate::plugins::worker::sweep_marks;
     use aruna_core::plugin_installs::InstallState;
     let fixture = Fixture::keyed().await;
     let install = fetcher(&fixture).await;
@@ -506,8 +506,9 @@ fn send(fixture: &Fixture, install: &PluginInstall, version: Option<Ulid>) -> Up
 #[tokio::test]
 async fn upload_started() {
     // An upload needs a readable, unmarked source; the same call finds the same work.
-    use crate::plugins::marks::{Mark, mark_in, unmarked};
-    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::broker::unmarked;
+    use crate::plugins::marks::{Mark, mark_row};
+    use crate::plugins::rows::write_rows;
     let fixture = Fixture::keyed().await;
     let install = fetcher(&fixture).await;
     let (_root, blob) = stored_object(&fixture, &install).await;

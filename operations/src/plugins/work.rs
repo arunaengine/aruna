@@ -14,10 +14,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::marks::{Mark, mark_row};
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, unexpected, values,
-};
-use super::store::{Rows, StoreError, decode, encode};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, unexpected, values, Rows, StoreError, decode, encode};
 
 /// The row of a work under its key.
 fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {

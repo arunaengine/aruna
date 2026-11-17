@@ -6,26 +6,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
-use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
     EVENTS_QUEUED, ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW,
     SourceEvent, SourceKind, gap_key, outbox_key, source_key,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::UserId;
 use aruna_plugins::trigger::TriggerKind;
 use ulid::Ulid;
 
-use super::check::covers;
-use super::dispatch::event_trigger;
-use super::grants::parse_grants;
-use super::install::{pick_version, read_manifest};
+use super::grants::covers;
 use super::journal::JOURNAL_PAGE;
-use super::lifecycle::coverage;
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row as row_of, unexpected};
-use super::store::{Rows, StoreError, decode, encode};
-use crate::realm::mutate_placement::node_kind;
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row as row_of, unexpected, Rows, StoreError, decode, encode};
 
 /// An active install with event triggers, as the matcher sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,35 +45,19 @@ impl Target {
     }
 }
 
-/// The active installs whose manifest declares event triggers, with their coverage.
-pub fn targets(config: &RealmConfigDocument) -> Vec<Target> {
-    (config.installs.iter())
-        .filter(|install| install.state == InstallState::Active)
-        .filter_map(|install| {
-            let plugin = pick_version(config, &install.plugin, Some(&install.digest)).ok()?;
-            let manifest = read_manifest(&plugin).ok()?;
-            let coverage = coverage(&manifest, &parse_grants(&install.grants));
-            (!coverage.is_empty()).then_some(Target {
-                install_id: install.install_id,
-                group_id: install.group_id,
-                revision: install.revision,
-                coverage,
-                account: install.account,
-            })
-        })
-        .collect()
+/// The manifest trigger a journaled event kind starts.
+pub fn event_trigger(kind: SourceKind) -> TriggerKind {
+    match kind {
+        SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
+        SourceKind::DataUploaded => TriggerKind::DataUploaded,
+        SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
+        SourceKind::SyncCompleted => TriggerKind::SyncCompleted,
+        SourceKind::SyncFailed => TriggerKind::SyncFailed,
+        SourceKind::JobFinished => TriggerKind::JobFinished,
+    }
 }
 
-/// The installs this node matches pending rows to, and whether it keeps its journal: a user
-/// node keeps none, so its rows are deleted unmatched.
-pub fn match_targets(config: &RealmConfigDocument, local: NodeId) -> (Vec<Target>, bool) {
-    let keep = !matches!(node_kind(config, local), Some(RealmNodeKind::User { .. }));
-    let targets = match keep {
-        true => targets(config),
-        false => Vec::new(),
-    };
-    (targets, keep)
-}
+
 
 /// One page of pending rows in one transaction, matched with at most `bound` forward rows per
 /// install: the forward rows and gaps of the targets each row matches, and the pending rows

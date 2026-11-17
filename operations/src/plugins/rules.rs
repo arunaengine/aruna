@@ -17,7 +17,7 @@ use aruna_plugins::trigger::TriggerKind;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::check::covers;
+use super::grants::covers;
 use super::grants::{InstallScope, parse_grants};
 use super::install::read_config;
 use crate::driver::{DriverContext, drive};

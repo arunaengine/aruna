@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use aruna_core::plugin_installs::{InstallState, PluginInstall, SecretBinding, Widening};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::NodeId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::manifest::Manifest;
 use aruna_plugins::trigger::TriggerKind;
@@ -18,18 +19,20 @@ use ulid::Ulid;
 
 use super::account::{Identity, guard_of, teardown};
 use super::bound::{BindError, BindPlace, bind_slots};
-use super::check::covers;
 use super::grants::{
+    covers,
     Grants, carry_grants, check_supported, narrow_grants, parse_grants, patterns_for, stored_grants,
 };
 use super::install::{
     InstallError, check_admin, check_holder, lock_install, pick_version, read_config,
     read_manifest, scope_of, settle, write_record,
 };
+use super::matcher::Target;
 use super::records::{InstallEntryConfig, InstallEntryOperation};
 use super::rules::retire_rules;
 use super::settings::check_settings;
 use crate::driver::{DriverContext, drive};
+use crate::realm::mutate_placement::node_kind;
 
 /// Replaces the grants: a permission left out gets all of the group, an empty list removes an
 /// optional one. The caller must hold every grant. It also retries a failed earlier change.
@@ -336,6 +339,36 @@ async fn commit(
 ) -> Result<PluginInstall, InstallError> {
     let audit = AdminAuditRecord::for_install(action, actor.user_id, &next);
     write_record(ctx, actor, auth, Some(current.revision), next, Some(audit)).await
+}
+
+/// The active installs whose manifest declares event triggers, with their coverage.
+pub fn targets(config: &RealmConfigDocument) -> Vec<Target> {
+    (config.installs.iter())
+        .filter(|install| install.state == InstallState::Active)
+        .filter_map(|install| {
+            let plugin = pick_version(config, &install.plugin, Some(&install.digest)).ok()?;
+            let manifest = read_manifest(&plugin).ok()?;
+            let coverage = coverage(&manifest, &parse_grants(&install.grants));
+            (!coverage.is_empty()).then_some(Target {
+                install_id: install.install_id,
+                group_id: install.group_id,
+                revision: install.revision,
+                coverage,
+                account: install.account,
+            })
+        })
+        .collect()
+}
+
+/// The installs this node matches pending rows to, and whether it keeps its journal: a user
+/// node keeps none, so its rows are deleted unmatched.
+pub fn match_targets(config: &RealmConfigDocument, local: NodeId) -> (Vec<Target>, bool) {
+    let keep = !matches!(node_kind(config, local), Some(RealmNodeKind::User { .. }));
+    let targets = match keep {
+        true => targets(config),
+        false => Vec::new(),
+    };
+    (targets, keep)
 }
 
 #[cfg(test)]

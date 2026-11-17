@@ -20,12 +20,9 @@ use ulid::Ulid;
 
 use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
 use super::lifecycle::held_covers;
-use super::matcher::{Counting, Outbox, Target, targets};
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row as row_of, unexpected, values,
-    write_rows,
-};
-use super::store::{Rows, StoreError, decode, encode};
+use super::lifecycle::targets;
+use super::matcher::{Counting, Outbox, Target};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row as row_of, unexpected, values, write_rows, Rows, StoreError, decode, encode};
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
 
@@ -198,7 +195,7 @@ impl StartReplay {
                 SourceKind::SyncCompleted,
                 SourceKind::SyncFailed,
             ] {
-                let trigger = super::dispatch::event_trigger(kind);
+                let trigger = super::matcher::event_trigger(kind);
                 if target.coverage.contains_key(&trigger)
                     && old.get(&trigger) != target.coverage.get(&trigger)
                 {

@@ -16,11 +16,13 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::install::{InstallError, check_admin, pick_version, read_config, read_manifest};
+use super::matcher::event_trigger;
 use super::receiver::lost_reason;
-use super::rows::{Answer, Ask, Plan, RowsOperation, Turn, done, row as row_of, values};
+use super::rows::{
+    Answer, Ask, Plan, RowsOperation, StoreError, Turn, decode, done, encode, row as row_of, values,
+};
 use super::runs::{ADMISSIONS, Admission, RunError, admit};
 use super::settings::{SettingError, check_fields};
-use super::store::{StoreError, decode, encode};
 use crate::driver::{DriverContext, drive};
 
 #[derive(Debug, thiserror::Error)]
@@ -158,18 +160,6 @@ pub fn event_run(
     let handler = handler(config, install, event_trigger(event.kind))?;
     let trigger = RunTrigger::Event(event.clone());
     Some(new_run(install, handler, trigger, now_ms))
-}
-
-/// The manifest trigger a journaled event kind starts.
-pub fn event_trigger(kind: SourceKind) -> TriggerKind {
-    match kind {
-        SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
-        SourceKind::DataUploaded => TriggerKind::DataUploaded,
-        SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
-        SourceKind::SyncCompleted => TriggerKind::SyncCompleted,
-        SourceKind::SyncFailed => TriggerKind::SyncFailed,
-        SourceKind::JobFinished => TriggerKind::JobFinished,
-    }
 }
 
 /// Queues the due `every` occurrence of each active install this node receives. Missed

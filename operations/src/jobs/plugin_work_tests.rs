@@ -274,8 +274,8 @@ async fn marked_source_refused() {
 
     use crate::driver::drive;
     use crate::plugins::broker::RunBroker;
-    use crate::plugins::marks::{MARKED, Mark, mark_in};
-    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::marks::{MARKED, Mark, mark_row};
+    use crate::plugins::rows::write_rows;
     use crate::plugins::submit::start_copy;
     use crate::plugins::submit::tests::{request, scope};
     use crate::plugins::work::WorkKind;
@@ -296,8 +296,8 @@ async fn marked_source_refused() {
         kind: WorkKind::Download,
         at_ms: 1,
     };
-    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
-    transact(&blob, marked).await.unwrap();
+    let marked = mark_row(("in", "a.txt", version), &mark).unwrap();
+    drive(write_rows(vec![marked]), &blob).await.unwrap();
     let (kind, message) = failure(run_plugin_work(&job_context(&blob, &fixture), &spec).await);
     assert_eq!((kind, message.as_str()), (JobErrorKind::Permanent, MARKED));
     let run = scope(&fixture, &install);
@@ -325,8 +325,8 @@ async fn small_reads_unmarked() {
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
 
     use crate::plugins::broker::RunBroker;
-    use crate::plugins::marks::{MARKED, Mark, mark_in};
-    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::marks::{MARKED, Mark, mark_row};
+    use crate::plugins::rows::write_rows;
     use crate::plugins::submit::tests::scope;
     use crate::plugins::work::WorkKind;
     let fixture = Fixture::new().await;
@@ -367,8 +367,8 @@ async fn small_reads_unmarked() {
         kind: WorkKind::Download,
         at_ms: 1,
     };
-    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
-    transact(&blob, marked).await.unwrap();
+    let marked = mark_row(("in", "a.txt", version), &mark).unwrap();
+    drive(write_rows(vec![marked]), &blob).await.unwrap();
     let pinned = Some(version.to_string());
     let refused = broker.objects_read(&cx(1 << 20), "in/a.txt", pinned).await;
     assert_eq!(
@@ -385,8 +385,8 @@ async fn versioned_info() {
 
     use crate::driver::drive;
     use crate::plugins::broker::RunBroker;
-    use crate::plugins::marks::{Mark, mark_in};
-    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::marks::{Mark, mark_row};
+    use crate::plugins::rows::write_rows;
     use crate::plugins::submit::tests::scope;
     use crate::plugins::work::WorkKind;
     use crate::s3::object::copy::test::put_config;
@@ -417,8 +417,8 @@ async fn versioned_info() {
         at_ms: 1,
     };
     let version = Ulid::from_string(&first.version).unwrap();
-    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
-    transact(&blob, marked).await.unwrap();
+    let marked = mark_row(("in", "a.txt", version), &mark).unwrap();
+    drive(write_rows(vec![marked]), &blob).await.unwrap();
     assert!(
         broker
             .objects_info(&cx, "in/a.txt", pinned)
