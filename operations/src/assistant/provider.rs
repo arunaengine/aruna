@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ASSISTANT_PROVIDER_KEYSPACE, PROVIDER_OWNER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderSecret, AssistantSecretError,
@@ -167,8 +167,8 @@ impl Operation for CreateProviderOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -270,8 +270,8 @@ impl Operation for ListProviderOperation {
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -337,8 +337,8 @@ impl Operation for UpdateProviderOperation {
         )])))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -453,7 +453,7 @@ impl Operation for DeleteProviderOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }

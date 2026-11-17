@@ -7,7 +7,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::encoded_row;
 
 use super::*;
@@ -192,8 +192,8 @@ impl Operation for QueueWakesOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn is_conflict(error: &Self::Error) -> bool {

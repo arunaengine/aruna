@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, LocalFileEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::{ActionOutcome, SyncActionRecord, SyncedFolder, WriteGuard};
 
@@ -120,8 +120,8 @@ impl Operation for RemoveEntryOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -169,7 +169,10 @@ mod tests {
     #[test]
     fn moves_then_drops_base() {
         let mut remove = remove();
-        assert!(remove.transaction());
+        assert_eq!(
+            remove.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert!(matches!(remove.first(), Ok(Next::Call(IoCall::Effect(_)))));
         let moved = answer(LocalFileEvent::Moved {
             to: ".trash/a.txt".to_string(),

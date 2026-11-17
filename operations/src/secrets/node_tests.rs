@@ -46,7 +46,10 @@ fn read_with(
     stored: Option<&SecretRecord>,
     auth: Option<Vec<u8>>,
 ) -> Result<Next<Option<SecretRecord>>, NodeSecretError> {
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     let first = operation.first().unwrap();
     assert!(matches!(
         &first,

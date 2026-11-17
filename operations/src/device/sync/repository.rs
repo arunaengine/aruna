@@ -8,7 +8,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
     SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::{SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, TxnId, Value};
@@ -290,8 +290,8 @@ impl Operation for StoreUploadOperation {
         })
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -343,7 +343,10 @@ mod pure_tests {
     fn stores_unchanged_row() {
         let row = upload(failed());
         let mut store = StoreUploadOperation::new(row.clone(), due(), true);
-        assert!(store.transaction());
+        assert_eq!(
+            store.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let read = (
             SYNC_UPLOAD_KEYSPACE.to_string(),
             base_key(row.folder_id, &row.relative),

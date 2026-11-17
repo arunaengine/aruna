@@ -118,7 +118,10 @@ fn claim_calls() {
         claimed_at_ms,
     };
     let mut operation = ClaimFillOperation::new(b"fill".to_vec(), claim(1, 1_000));
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     let read = read_row(FILL_CLAIM_KEYSPACE, b"fill".to_vec());
     assert_eq!(operation.first(), Ok(Next::Call(read)));
     let row = (

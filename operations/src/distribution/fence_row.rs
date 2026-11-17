@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
 use aruna_core::types::Key;
@@ -112,8 +112,8 @@ impl Operation for UpdateFenceOperation {
         Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -137,7 +137,10 @@ mod tests {
             ..LocalFence::default()
         };
         let mut update = UpdateFenceOperation::new(set(), FenceChange::Close);
-        assert!(update.transaction());
+        assert_eq!(
+            update.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let key: Key = LocalFence::key(set()).into();
         let row = (DISTRIBUTION_FENCE_KEYSPACE.to_string(), key.clone());
         assert_eq!(update.first(), Ok(Next::Call(IoCall::Read(vec![row]))));

@@ -6,7 +6,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ASSISTANT_USAGE_KEYSPACE, CENTRAL_ASSISTANT_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::structs::{
     AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, QuotaReached, charge,
@@ -140,8 +140,8 @@ impl Operation for SetCentralOperation {
         Ok(Next::Call(call))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -188,8 +188,8 @@ impl Operation for ChargeUsageOperation {
         Ok(Next::Call(call))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

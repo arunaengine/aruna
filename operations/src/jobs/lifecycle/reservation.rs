@@ -14,7 +14,7 @@ use aruna_core::keyspaces::{
     FAMILY_OUTBOX_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, RUN_LINK_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, LaunchIntent, RecordVerdict,
@@ -250,8 +250,8 @@ impl Operation for ReserveExecutionOperation {
     type Output = Ulid;
     type Error = LifecycleError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -347,8 +347,8 @@ impl Operation for ReleaseExecutionOperation {
     type Output = bool;
     type Error = LifecycleError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Step<bool> {
@@ -382,7 +382,10 @@ mod pure_tests {
     #[test]
     fn release_deletes_held() {
         let mut operation = ReleaseExecutionOperation::new(Ulid::from_parts(1, 1));
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert!(matches!(
             operation.first(),
             Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 1

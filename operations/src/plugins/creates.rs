@@ -6,7 +6,7 @@
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_CREATES_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_plugins::broker::{Created, HostError};
 use serde::{Deserialize, Serialize};
@@ -100,8 +100,8 @@ impl Operation for ClaimKey {
     type Output = (PinnedCreate, Claim);
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
@@ -168,8 +168,8 @@ impl Operation for SettleKey {
     type Output = ();
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<()>, StoreError> {

@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE,
     DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::distribution::DistributionView;
@@ -105,8 +105,8 @@ impl Operation for ClaimFillOperation {
         self.claim_held(value)
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -389,8 +389,8 @@ impl Operation for PublishKeptOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

@@ -209,7 +209,10 @@ fn refuses_missing_chat() {
 #[test]
 fn creates_a_head() {
     let mut operation = head_op(None);
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     assert_eq!(call(operation.first()), read_head(user(), CHAT));
     assert!(is_heads_page(&call(operation.next(head_value(None)))));
     let write = call(operation.next(heads_rows(&[head("other", 1, 1)])));
@@ -289,7 +292,10 @@ fn refuses_stale_head() {
 #[test]
 fn appends_a_turn() {
     let mut operation = turn_op(4, "abcd");
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     operation.first().unwrap();
     let sum = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
     assert!(is_heads_page(&sum));
@@ -424,7 +430,10 @@ fn refuses_over_budget() {
 #[test]
 fn deletes_once() {
     let mut operation = delete_op();
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     operation.first().unwrap();
     let page = call(operation.next(head_value(Some(&head(CHAT, 2, 8)))));
     assert_eq!(turns_from(&page), (0, usize::MAX));

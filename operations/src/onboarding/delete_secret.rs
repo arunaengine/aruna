@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::OnboardingSecretRecord;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, read_row, values};
 use thiserror::Error;
 use ulid::Ulid;
@@ -74,8 +74,8 @@ impl Operation for DeleteSecretOperation {
     type Output = OnboardingSecretRecord;
     type Error = DeleteSecretError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<OnboardingSecretRecord>, DeleteSecretError> {
@@ -118,7 +118,10 @@ mod tests {
         // The read runs in the delete's transaction; a missing record deletes nothing.
         let enrollment_id = Ulid::from_bytes([1; 16]);
         let mut operation = DeleteSecretOperation::new(DeleteSecretInput { enrollment_id });
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let read = read_row(ONBOARDING_KEYSPACE, secret_record_key(enrollment_id));
         assert_eq!(operation.first(), Ok(Next::Call(read)));
         let missing = operation.next(IoResult::Values(vec![None]));

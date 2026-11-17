@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::{Key, Value};
@@ -188,8 +188,8 @@ impl Operation for MirrorRecordOperation {
         self.decide(value)
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn stamp(&mut self, now_ms: u64) {
@@ -245,7 +245,10 @@ mod tests {
             relationship(),
             SyncMirrorIntent::Delete,
         ));
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let staged = SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Delete, NOW);
         assert_eq!(operation.next(values(None)), Ok(write(&staged)));
         assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
