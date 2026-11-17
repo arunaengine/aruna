@@ -5,6 +5,7 @@
 use super::*;
 use crate::test_support::test_endpoint;
 use ::irokle::sync::SyncData;
+use aruna_core::admin_checks::revocation_origin_known;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -38,9 +39,9 @@ use aruna_core::structs::identity::realm::{
     UserCapOverride,
 };
 use aruna_core::structs::placement::record::{
-    BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HandleRange,
-    METADATA_HANDLE, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
-    PlacementStrategy, StrategyBinding, band_start,
+    BandPool, BindingScope, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE,
+    HandleRange, METADATA_HANDLE, NodePlacementEntry, PlacementBinding, PlacementOverride,
+    PlacementRef, PlacementStrategy, StrategyBinding, band_start,
 };
 use aruna_core::structs::storage::usage::NodeUsageSnapshot;
 use aruna_core::structs::{QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord};
