@@ -439,20 +439,7 @@ pub(in crate::document_sync) async fn store_watch_change(
     change: DocumentChange,
 ) -> Result<bool> {
     for _ in 0..2 {
-        let txn_id = match storage
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(error.into());
-            }
-            other => {
-                return Err(NetError::Dht(format!(
-                    "unexpected transaction start while applying watch subscription: {other:?}"
-                )));
-            }
-        };
+        let txn_id = start_storage_transaction(storage).await?;
 
         let current = match storage
             .send_storage_effect(StorageEffect::Read {
