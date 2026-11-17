@@ -549,10 +549,10 @@ async fn complete(
         return Ok(());
     };
     let storage = &fixture.context.storage_handle;
-    let record = aruna_operations::jobs::store::read_job_record(storage, ctx.job_id, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, ctx.job_id, None)
         .await?
         .ok_or("job missing")?;
-    aruna_operations::jobs::store::complete_job(
+    aruna_operations::jobs::store::state::complete_job(
         storage,
         ctx.job_id,
         ctx.claim_token,
@@ -838,7 +838,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         }
     })
     .await??;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, job, None)
         .await?
         .ok_or("pull job missing")?;
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {

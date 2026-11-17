@@ -23,7 +23,7 @@ use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::transport::serve_job_record;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::tests::records::{Family, REALM, user};
 
@@ -379,7 +379,8 @@ async fn unrecorded_deletion_kept() {
     // A node that cannot record the deletion in the run's family keeps the run, so a retried
     // delete records it again; a holder records it before the run goes.
     use crate::jobs::service::delete_owned_run;
-    use crate::jobs::store::{RunDelete, insert_job};
+    use crate::jobs::store::RunDelete;
+    use crate::jobs::store::query::insert_job;
     use crate::tests::records::secret;
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, JobPayload, JobRecord,

@@ -18,7 +18,9 @@ use super::work::{
     work_state,
 };
 use crate::driver::DriverContext;
-use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::attempt::set_cancel_requested;
+use crate::jobs::store::state::read_job_record;
 
 /// Outputs of one page.
 const PAGE: usize = 100;

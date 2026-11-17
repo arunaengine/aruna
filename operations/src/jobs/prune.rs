@@ -21,10 +21,10 @@ use byteview::ByteView;
 use tracing::warn;
 
 use super::JOB_PRUNE_PAGE;
-use super::store::{
-    artifact_tombstone_key, batch_delete, first_schedule_entry, iter_prefix_page,
-    job_entry_deletes, preserve_artifact_tombstone, read_job_record, staging_row_deletes,
+use super::store::query::{
+    batch_delete, first_schedule_entry, iter_prefix_page, job_entry_deletes, staging_row_deletes,
 };
+use super::store::state::{artifact_tombstone_key, preserve_artifact_tombstone, read_job_record};
 use crate::driver::DriverContext;
 use crate::plugins::work::holds_job;
 use aruna_core::structs::execution::job::prune_delete_entries;
@@ -224,9 +224,9 @@ pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHand
 mod tests {
     use super::*;
     use crate::jobs::JOB_RETENTION_MS;
-    use crate::jobs::store::{
-        ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
-    };
+    use crate::jobs::store::put_job_entry;
+    use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::{ClaimOutcome, claim_job, complete_job, transition_to_running};
     use aruna_core::UserId;
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{

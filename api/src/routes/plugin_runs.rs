@@ -12,7 +12,7 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRec
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
-use aruna_operations::jobs::store::read_job_record;
+use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, start_run};
 use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for};
@@ -1295,7 +1295,7 @@ mod tests {
         };
         use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
         use aruna_core::structured_id::{BucketId, PlacementHandle};
-        use aruna_operations::jobs::store::insert_job;
+        use aruna_operations::jobs::store::query::insert_job;
         use aruna_operations::plugins::work::{Identity, WorkRow, dispatched, reserve};
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([1u8; 32]);

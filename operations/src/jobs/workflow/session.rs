@@ -14,7 +14,8 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::placement::compute_config::IDLE_AFTER_MS;
 use tracing::warn;
 
-use super::super::store::{put_job_entry, read_job_record};
+use super::super::store::put_job_entry;
+use super::super::store::state::read_job_record;
 use super::workspace::mint_workspace_credential;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;

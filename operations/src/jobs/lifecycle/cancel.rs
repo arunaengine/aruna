@@ -28,7 +28,8 @@ use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::route::JobRouteError;
 use crate::jobs::service::kick_drain;
-use crate::jobs::store::{CancelRequestOutcome, JobMutationError, set_cancel_requested};
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::attempt::{CancelRequestOutcome, set_cancel_requested};
 use crate::metadata::AuthToken;
 use crate::metadata::api::load_realm_config;
 

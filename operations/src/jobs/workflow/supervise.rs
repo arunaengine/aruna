@@ -14,7 +14,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::super::JOB_HEARTBEAT_MS;
-use super::super::store::{JobMutationError, read_job_record, record_attempt_started, renew_lease};
+use super::super::store::JobMutationError;
+use super::super::store::attempt::record_attempt_started;
+use super::super::store::state::{read_job_record, renew_lease};
 use super::DEFAULT_WALLTIME;
 use super::finalize::{finalize_attempt, finalize_session, finalize_walltime};
 use super::session::{start_session, write_session_report};

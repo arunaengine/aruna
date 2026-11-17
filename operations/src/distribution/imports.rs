@@ -541,7 +541,7 @@ mod tests {
             1,
             None,
         );
-        crate::jobs::store::insert_job(&context.storage_handle, &job)
+        crate::jobs::store::query::insert_job(&context.storage_handle, &job)
             .await
             .unwrap();
         let (snapshot, bytes) = record(true);
@@ -764,7 +764,7 @@ mod tests {
             let mut record =
                 JobRecord::new(job_id, payload, Default::default(), node_id, 1, 1, None);
             record.state = state;
-            crate::jobs::store::insert_job(&storage, &record)
+            crate::jobs::store::query::insert_job(&storage, &record)
                 .await
                 .unwrap();
         }
@@ -792,7 +792,7 @@ mod tests {
         let job_id = JobId::from_bytes([1; 16]);
         let payload = JobPayload::Staging(spec("spire"));
         let mut record = JobRecord::new(job_id, payload, Default::default(), node_id, 1, 1, None);
-        crate::jobs::store::insert_job(&storage, &record)
+        crate::jobs::store::query::insert_job(&storage, &record)
             .await
             .unwrap();
         let context = DriverContext {
@@ -806,7 +806,7 @@ mod tests {
         let transfer_id = Ulid::from_bytes([8; 16]);
         keep_resume(&context, "spire", transfer_id).await.unwrap();
         record.state = JobState::Succeeded;
-        crate::jobs::store::insert_job(&context.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&context.storage_handle, &record)
             .await
             .unwrap();
 

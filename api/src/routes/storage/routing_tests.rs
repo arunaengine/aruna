@@ -423,7 +423,7 @@ async fn lists_unrouted_import() {
     let (user, node) = (test.auth.user_id, test.state.get_node_id());
     let record = JobRecord::new(job_id, payload, user, node, 1, 1, None);
     let storage = &context.storage_handle;
-    aruna_operations::jobs::store::insert_job(storage, &record)
+    aruna_operations::jobs::store::query::insert_job(storage, &record)
         .await
         .unwrap();
     let query = BucketPageQuery {

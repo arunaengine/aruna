@@ -558,7 +558,7 @@ async fn start_update(
     .ok_or("link missing")?;
     assert_eq!(link.pull_reason(), Some("update_available"));
     let pull = Box::pin(start_pull(&fixture.context, &link)).await?;
-    let record = aruna_operations::jobs::store::read_job_record(storage, pull, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, pull, None)
         .await?
         .ok_or("pull job missing")?;
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {

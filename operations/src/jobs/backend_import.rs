@@ -1439,7 +1439,7 @@ async fn candidates(
     let mut rows = Vec::new();
     let mut after = None;
     loop {
-        let page = super::store::iter_prefix_page(
+        let page = super::store::query::iter_prefix_page(
             &context.storage_handle,
             BLOB_VERSIONS_KEYSPACE,
             Some(prefix.clone().into()),
@@ -2038,7 +2038,7 @@ async fn sharing_now(
     let mut found = std::collections::BTreeSet::new();
     let mut after = None;
     loop {
-        let page = super::store::iter_prefix_page(
+        let page = super::store::query::iter_prefix_page(
             &context.storage_handle,
             BACKEND_IMPORT_KEYSPACE,
             Some(rule.group_id.to_bytes().to_vec().into()),

@@ -23,7 +23,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use crate::node::dashboard::notify_dashboard_change;
 
 /// Spacing between retries of a terminal publication that stayed pending.

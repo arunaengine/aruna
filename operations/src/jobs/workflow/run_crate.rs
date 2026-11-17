@@ -38,10 +38,11 @@ const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket"
 const LINK_PROPERTY: &str = "https://w3id.org/aruna/terms/link";
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{
-    put_crate_outcome, put_crate_status, put_local_crate, read_crate_status, read_job_record,
-    read_launch_record, read_run_link,
+use super::super::store::attempt::{
+    put_crate_outcome, put_crate_status, put_local_crate, read_crate_status, read_launch_record,
+    read_run_link,
 };
+use super::super::store::state::read_job_record;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;

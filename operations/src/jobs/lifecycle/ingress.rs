@@ -1285,7 +1285,7 @@ async fn cached_projection(
     context: &DriverContext,
     family: &JobFamilyId,
 ) -> Result<Option<ProjectionCache>, String> {
-    let (page, _) = crate::jobs::store::iter_prefix_page(
+    let (page, _) = crate::jobs::store::query::iter_prefix_page(
         &context.storage_handle,
         FAMILY_PROJECTION_KEYSPACE,
         Some(family_prefix(family)),
@@ -1360,7 +1360,7 @@ async fn admit_with_quota(
 /// Whether this node already holds a claim for `family`, which makes the
 /// admission a replay that settles inside its own transaction.
 async fn has_claim(context: &DriverContext, family: &JobFamilyId) -> Result<bool, SubmitJobError> {
-    let (page, _) = crate::jobs::store::iter_prefix_page(
+    let (page, _) = crate::jobs::store::query::iter_prefix_page(
         &context.storage_handle,
         FAMILY_RECORD_KEYSPACE,
         Some(kind_prefix(family, JobRecordKind::Claim)),

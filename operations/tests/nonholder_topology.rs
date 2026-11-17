@@ -28,7 +28,7 @@ use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, read_record_routed,
     submit_execution_job, submit_rocrate_import,
 };
-use aruna_operations::jobs::store::find_dedup_job;
+use aruna_operations::jobs::store::query::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
 use aruna_operations::metadata::AuthToken;
 use aruna_operations::metadata::api::{

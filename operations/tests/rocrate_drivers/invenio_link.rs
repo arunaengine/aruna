@@ -15,7 +15,7 @@ use aruna_operations::jobs::repository::link_queue::drain_links;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange, list_links};
 use aruna_operations::jobs::repository::seal_link_token;
 use aruna_operations::jobs::service::submit_export_job;
-use aruna_operations::jobs::store::{complete_job, fail_job};
+use aruna_operations::jobs::store::state::{complete_job, fail_job};
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
@@ -200,7 +200,7 @@ pub(super) async fn run_push(
         .0
         .active_job
         .ok_or("no running push")?;
-    let record = aruna_operations::jobs::store::read_job_record(
+    let record = aruna_operations::jobs::store::state::read_job_record(
         &fixture.context.storage_handle,
         job_id,
         None,
@@ -303,11 +303,15 @@ pub(super) async fn run_registration(
 ) -> Result<AuthContext, Box<dyn std::error::Error>> {
     let storage = &fixture.context.storage_handle;
     let key = format!("identifiers/{for_job}");
-    let (job_id, _) =
-        aruna_operations::jobs::store::find_dedup_plan(storage, created_by, key.as_bytes(), None)
-            .await?
-            .ok_or("no registration queued")?;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let (job_id, _) = aruna_operations::jobs::store::query::find_dedup_plan(
+        storage,
+        created_by,
+        key.as_bytes(),
+        None,
+    )
+    .await?
+    .ok_or("no registration queued")?;
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
         .await?
         .ok_or("registration job missing")?;
     let JobPayload::RegisterIdentifiers(spec) = record.payload.clone() else {
@@ -416,7 +420,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
         .0
         .active_job
         .ok_or("no push")?;
-    let pusher = aruna_operations::jobs::store::read_job_record(
+    let pusher = aruna_operations::jobs::store::state::read_job_record(
         &fixture.context.storage_handle,
         push_job,
         None,
@@ -968,7 +972,7 @@ async fn has_row(fixture: &Fixture, key_space: &str, link: &RepositoryLink) -> b
 async fn cancelled_queue_settles() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
     use aruna_operations::jobs::repository::links::change_link;
-    use aruna_operations::jobs::store::{CancelRequestOutcome, set_cancel_requested};
+    use aruna_operations::jobs::store::attempt::{CancelRequestOutcome, set_cancel_requested};
     for paused in [false, true] {
         let fixture = build_fixture(false).await?;
         let server = remote(LINK_TOKEN).await;

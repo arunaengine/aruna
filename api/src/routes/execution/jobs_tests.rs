@@ -34,8 +34,10 @@ use aruna_operations::jobs::command::{
 };
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::{
-    ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
+use aruna_operations::jobs::store::put_job_entry;
+use aruna_operations::jobs::store::query::insert_job;
+use aruna_operations::jobs::store::state::{
+    ClaimOutcome, claim_job, complete_job, transition_to_running,
 };
 use aruna_storage::FjallStorage;
 use std::collections::HashMap;

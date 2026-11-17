@@ -23,10 +23,10 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::reconcile::ExternalReconciler;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::{
-    ClaimOutcome, JobMutation, claim_job, insert_job, mutate_job, read_crate_status,
-    read_job_record,
-};
+use aruna_operations::jobs::store::attempt::read_crate_status;
+use aruna_operations::jobs::store::query::insert_job;
+use aruna_operations::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
+use aruna_operations::jobs::store::{JobMutation, mutate_job};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
 use aruna_operations::jobs::workflow::run_execution_job;
@@ -588,7 +588,7 @@ async fn execution_cancel_terminalizes() -> TestResult<()> {
         Duration::from_secs(90),
     )
     .await;
-    aruna_operations::jobs::store::set_cancel_requested(
+    aruna_operations::jobs::store::attempt::set_cancel_requested(
         &fixture.compute_ctx.storage_handle,
         job_id,
         now_ms(),

@@ -23,10 +23,9 @@ use byteview::ByteView;
 use tracing::warn;
 
 use super::reconcile::ExternalReconciler;
-use super::store::{
-    ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
-    iter_prefix_page, read_job_record, requeue_job,
-};
+use super::store::JobMutationError;
+use super::store::query::{batch_delete, first_schedule_entry, iter_prefix_page};
+use super::store::state::{ClaimOutcome, RequeueOutcome, claim_job, read_job_record, requeue_job};
 use super::{DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 
 /// Per-class claim budget. Both classes share one due index, so a saturated class
@@ -414,7 +413,7 @@ async fn scan_ready(
 mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
-    use crate::jobs::store::insert_job;
+    use crate::jobs::store::query::insert_job;
     use aruna_core::UserId;
     use aruna_core::structs::execution::job::{
         AttemptIntent, JobClaim, JobPayload, JobState, due_index_key,

@@ -524,7 +524,7 @@ mod tests {
     use aruna_core::types::GroupId;
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord};
     use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_operations::jobs::store::list_user_jobs;
+    use aruna_operations::jobs::store::query::list_user_jobs;
     use aruna_storage::FjallStorage;
     use serde::Serialize;
     use std::collections::BTreeMap;

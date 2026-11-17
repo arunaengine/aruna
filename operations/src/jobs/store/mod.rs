@@ -42,17 +42,17 @@ use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_PRUNE_PAGE, MUTATE_MAX_ATTEMPTS};
 use crate::tasks::queue_backoff::retry_delay_ms;
 
-mod attempt;
-mod key_wait;
-mod query;
-mod remote_wait;
-mod state;
+pub mod attempt;
+pub mod key_wait;
+pub mod query;
+pub mod remote_wait;
+pub mod state;
 
-pub use attempt::*;
-pub use key_wait::*;
-pub use query::*;
-pub use remote_wait::*;
-pub use state::*;
+use attempt::*;
+use key_wait::*;
+use query::*;
+use remote_wait::*;
+use state::*;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactTombstone {

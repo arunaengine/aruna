@@ -19,7 +19,9 @@ use super::marks::{Mark, mark_in};
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
 use crate::jobs::service::find_dedup_job;
-use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::attempt::set_cancel_requested;
+use crate::jobs::store::state::read_job_record;
 
 /// Row kinds of the work keyspace: the work by install and identity, and its identity by work id.
 pub const WORK_ROW: u8 = b'w';

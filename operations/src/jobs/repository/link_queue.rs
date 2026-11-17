@@ -32,7 +32,7 @@ use super::links::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;

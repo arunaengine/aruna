@@ -5,7 +5,7 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::key_wake::read_row;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::bucket::key::rows::{authority_read, parse_authority};
 use aruna_core::UserId;

@@ -186,7 +186,7 @@ async fn decrypting_source(state: &ServerState, user: UserId) {
 #[tokio::test]
 async fn decrypting_copy_consent() {
     use crate::routes::storage::blobs::{ReplicateBlobRequest, replicate_blob};
-    use aruna_operations::jobs::store::iter_prefix_page;
+    use aruna_operations::jobs::store::query::iter_prefix_page;
     use aruna_operations::replication::plaintext::{job_consent, read_consent};
     let (_dir, state, auth, _) = test_state().await;
     decrypting_source(&state, auth.user_id).await;

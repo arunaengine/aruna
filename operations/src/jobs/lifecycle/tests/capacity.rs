@@ -25,7 +25,7 @@ use crate::jobs::lifecycle::reservation::{
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::replication::protocol::BaoReadTarget;
 use crate::tests::records::{Family, REALM, context, node};
 
@@ -234,7 +234,7 @@ async fn persists_receipt_first() {
         .expect("reservation is durable");
     assert_eq!(reservation.execution_id, execution_id);
     assert!(
-        crate::jobs::store::read_job_record(&ctx.storage_handle, spec.job_id, None)
+        crate::jobs::store::state::read_job_record(&ctx.storage_handle, spec.job_id, None)
             .await
             .expect("physical row read")
             .is_some()

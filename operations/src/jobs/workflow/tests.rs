@@ -9,10 +9,11 @@ use super::supervise::{supervise_and_finalize, walltime_anchor};
 use super::*;
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use crate::jobs::store::{
-    ClaimOutcome, claim_job, handoff_external_attempt, insert_job, put_crate_status,
-    read_attempt_control, record_attempt_started, set_cancel_requested,
+use crate::jobs::store::attempt::{
+    put_crate_status, read_attempt_control, record_attempt_started, set_cancel_requested,
 };
+use crate::jobs::store::query::insert_job;
+use crate::jobs::store::state::{ClaimOutcome, claim_job, handoff_external_attempt};
 use crate::jobs::workflow::workspace::mint_workspace_credential;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};

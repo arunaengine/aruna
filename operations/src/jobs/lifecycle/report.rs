@@ -27,7 +27,7 @@ use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::keys::submission_prefix;
 use crate::jobs::records::rows::from_bytes;
 use crate::jobs::route::JobRouteError;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 
 /// Sibling families of one submission a conflict count may scan.
 const MAX_SIBLING_SCAN: usize = 256;

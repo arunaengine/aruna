@@ -43,9 +43,10 @@ use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::store::{
-    ClaimOutcome, claim_job, complete_job, fail_job, insert_job, put_purge_checkpoint,
-    transition_to_running,
+use aruna_operations::jobs::store::put_purge_checkpoint;
+use aruna_operations::jobs::store::query::insert_job;
+use aruna_operations::jobs::store::state::{
+    ClaimOutcome, claim_job, complete_job, fail_job, transition_to_running,
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -1109,7 +1110,7 @@ async fn cancelled_queue_releases() {
     cancel_owned_job(&context.driver, &runtime, context.user_id, job_id)
         .await
         .unwrap();
-    let stored = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let stored = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1263,7 +1264,7 @@ async fn purge_releases_copies() {
     let mut released = releases(storage).await;
     released.sort_by_key(|file| file.backend_path.clone());
     assert_eq!(released, [location, copy]);
-    let (left, _) = aruna_operations::jobs::store::iter_prefix_page(
+    let (left, _) = aruna_operations::jobs::store::query::iter_prefix_page(
         storage,
         aruna_core::keyspaces::RENAMED_ROW_KEYSPACE,
         None,

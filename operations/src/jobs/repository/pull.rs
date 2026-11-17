@@ -23,7 +23,7 @@ use super::{TransferError, latest_version};
 use crate::driver::DriverContext;
 use crate::jobs::executor::JobContext;
 use crate::jobs::service::submit_rocrate_import;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::get_document::load_document_record;
 

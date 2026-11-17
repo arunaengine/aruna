@@ -41,11 +41,11 @@ use super::protocol::send_job_request;
 use super::route::JobRouteError;
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
-use super::store::{
-    CancelRequestOutcome, JobMutationError, RunDelete, delete_finished_run, find_dedup_plan,
-    list_job_entries, list_user_jobs, read_artifact_tombstone, read_crate_status, read_job_record,
-    read_key_waits, set_cancel_requested,
-};
+use super::store::attempt::{CancelRequestOutcome, read_crate_status, set_cancel_requested};
+use super::store::key_wait::read_key_waits;
+use super::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
+use super::store::state::{read_artifact_tombstone, read_job_record};
+use super::store::{JobMutationError, RunDelete, delete_finished_run};
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
     schedule_drain_effect,
@@ -1656,7 +1656,8 @@ pub(crate) async fn kick_drain(context: &DriverContext) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::{insert_job, preserve_artifact_tombstone, read_job_record};
+    use super::super::store::query::insert_job;
+    use super::super::store::state::{preserve_artifact_tombstone, read_job_record};
     use super::*;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,

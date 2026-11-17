@@ -16,7 +16,8 @@ use ulid::Ulid;
 
 use super::{OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::{JobMutationError, WAKE_PAGE};
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::key_wait::WAKE_PAGE;
 
 fn waiter() -> NodeId {
     iroh::SecretKey::from_bytes(&[2; 32]).public()

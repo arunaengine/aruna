@@ -144,7 +144,7 @@ async fn keeps_attempt_state() {
     let mut physical = logical.clone();
     physical.job_id = physical_id;
     physical.state = JobState::Running;
-    crate::jobs::store::insert_job(&context.storage_handle, &physical)
+    crate::jobs::store::query::insert_job(&context.storage_handle, &physical)
         .await
         .expect("physical row inserted");
 
@@ -156,15 +156,17 @@ async fn keeps_attempt_state() {
         LogicalJobState::Succeeded
     );
 
-    let stored = crate::jobs::store::read_job_record(&context.storage_handle, family.job_id, None)
-        .await
-        .expect("job row read")
-        .expect("job row exists");
+    let stored =
+        crate::jobs::store::state::read_job_record(&context.storage_handle, family.job_id, None)
+            .await
+            .expect("job row read")
+            .expect("job row exists");
     assert_eq!(stored.state, JobState::Succeeded);
-    let physical = crate::jobs::store::read_job_record(&context.storage_handle, physical_id, None)
-        .await
-        .expect("physical row read")
-        .expect("physical row exists");
+    let physical =
+        crate::jobs::store::state::read_job_record(&context.storage_handle, physical_id, None)
+            .await
+            .expect("physical row read")
+            .expect("physical row exists");
     assert_eq!(physical.state, JobState::Running);
 }
 

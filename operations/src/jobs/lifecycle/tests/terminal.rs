@@ -22,7 +22,9 @@ use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::store::{iter_prefix_page, record_attempt_intent, reserve_output_commits};
+use crate::jobs::store::attempt::reserve_output_commits;
+use crate::jobs::store::query::iter_prefix_page;
+use crate::jobs::store::state::record_attempt_intent;
 use crate::tests::records::{Family, REALM, context};
 
 const TOKEN: Ulid = Ulid(0x7E12);

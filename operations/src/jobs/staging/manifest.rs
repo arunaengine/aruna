@@ -398,7 +398,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::insert_job(&storage_handle, &record)
+        crate::jobs::store::query::insert_job(&storage_handle, &record)
             .await
             .unwrap();
         let driver = DriverContext {

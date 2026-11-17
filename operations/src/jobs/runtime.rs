@@ -32,11 +32,13 @@ use super::executor::{
     JobContext, JobRunOutcome, ProgressReporter, RangeTurns, dispatch_payload, run_cleanup,
 };
 use super::reconcile::ExternalReconciler;
-use super::store::{
-    AwaitOutcome, JobMutationError, ReleaseOutcome, RequeueOutcome, cancel_running_job,
-    complete_job, defer_job, exhaust_job, fail_job, flush_progress, handoff_external_attempt,
-    iter_prefix_page, park_job, read_job_record, release_job, renew_lease, requeue_job,
-    requeue_progressed, satisfy_key_wait, transition_to_running,
+use super::store::JobMutationError;
+use super::store::key_wait::{AwaitOutcome, park_job, satisfy_key_wait};
+use super::store::query::iter_prefix_page;
+use super::store::state::{
+    ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, defer_job, exhaust_job,
+    fail_job, flush_progress, handoff_external_attempt, read_job_record, release_job, renew_lease,
+    requeue_job, requeue_progressed, transition_to_running,
 };
 use super::submit::schedule_drain_effect;
 use super::{
@@ -1051,10 +1053,10 @@ async fn heartbeat_loop(
 mod tests {
     use super::*;
     use crate::jobs::JOB_MAX_ATTEMPTS;
-    use crate::jobs::store::{
-        AdoptOutcome, ClaimOutcome, JobMutation, adopt_external_attempt, claim_job, complete_job,
-        insert_job, list_job_entries, mutate_job, record_attempt_intent, set_cancel_requested,
-    };
+    use crate::jobs::store::attempt::{AdoptOutcome, adopt_external_attempt, set_cancel_requested};
+    use crate::jobs::store::query::{insert_job, list_job_entries};
+    use crate::jobs::store::state::{ClaimOutcome, claim_job, complete_job, record_attempt_intent};
+    use crate::jobs::store::{JobMutation, mutate_job};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::id::NodeId;

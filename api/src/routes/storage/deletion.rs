@@ -937,11 +937,14 @@ pub async fn control_purge(
     let auth = require_realm_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
-    let record =
-        aruna_operations::jobs::store::read_job_record(&context.storage_handle, job_id, None)
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?
-            .ok_or(ServerError::NotFound)?;
+    let record = aruna_operations::jobs::store::state::read_job_record(
+        &context.storage_handle,
+        job_id,
+        None,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
     };
@@ -1001,11 +1004,14 @@ async fn purge_job(
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let context = state.get_ctx();
-    let record =
-        aruna_operations::jobs::store::read_job_record(&context.storage_handle, job_id, None)
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?
-            .ok_or(ServerError::NotFound)?;
+    let record = aruna_operations::jobs::store::state::read_job_record(
+        &context.storage_handle,
+        job_id,
+        None,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .ok_or(ServerError::NotFound)?;
     let paused = aruna_operations::blob::purge::is_paused(&context, job_id.as_ulid())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
@@ -1048,7 +1054,7 @@ pub async fn get_purge(
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let storage = &state.get_ctx().storage_handle;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
@@ -1067,7 +1073,7 @@ async fn purge_ended(
     job_id: aruna_core::structs::execution::job::JobId,
 ) -> ServerResult<bool> {
     let storage = &state.get_ctx().storage_handle;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(record.is_some_and(|record| record.state.is_terminal()))

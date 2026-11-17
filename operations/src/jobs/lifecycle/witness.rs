@@ -39,7 +39,7 @@ use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::store::{batch_delete, iter_prefix_page};
+use crate::jobs::store::query::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
 
 /// Domain of the stable witness order.

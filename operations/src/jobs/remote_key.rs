@@ -29,10 +29,11 @@ use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::key_wake::{alias_page, alias_wait, find_alias, read_row, version_wait};
 use crate::jobs::route::{JobRouteOperation, JobRouteOutcome};
 use crate::jobs::runtime::key_unlocked;
-use crate::jobs::store::{
-    OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation, read_job_record,
-    read_key_waits, satisfy_key_wait,
+use crate::jobs::store::key_wait::{read_key_waits, satisfy_key_wait};
+use crate::jobs::store::remote_wait::{
+    OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
 };
+use crate::jobs::store::state::read_job_record;
 use crate::tasks::task_persistence::persist_task_effect;
 
 /// Targets one registration may name; more is refused rather than scanned.
@@ -391,8 +392,10 @@ pub(crate) async fn arm_delivery(context: &DriverContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::store::iter_prefix_page;
-    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, park_job};
+    use crate::jobs::store::key_wait::park_job;
+    use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::query::iter_prefix_page;
+    use crate::jobs::store::state::{ClaimOutcome, claim_job};
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
@@ -783,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn paging_reaches_later() {
-        use crate::jobs::store::WAKE_PAGE;
+        use crate::jobs::store::key_wait::WAKE_PAGE;
 
         let dir = tempfile::tempdir().unwrap();
         let context = empty_context(&dir);

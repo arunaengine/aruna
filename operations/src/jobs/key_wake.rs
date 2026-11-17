@@ -12,9 +12,9 @@ use crate::blob::migration::queue::resume_transitions;
 use crate::blob::promote::{PromoteError, promote_unlocked};
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
-use crate::jobs::store::{
-    AwaitOutcome, JobMutationError, iter_prefix_page, park_job, satisfy_key_wait, wake_key_waits,
-};
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::key_wait::{AwaitOutcome, park_job, satisfy_key_wait, wake_key_waits};
+use crate::jobs::store::query::iter_prefix_page;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -297,7 +297,9 @@ pub(crate) async fn park_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, park_job, read_job_record};
+    use crate::jobs::store::key_wait::park_job;
+    use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
     use aruna_core::UserId;
     use aruna_core::structs::execution::job::{JobId, JobPayload, JobState};
     use byteview::ByteView;
@@ -305,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn corrupt_archive_wakes() {
         use crate::driver::drive;
-        use crate::jobs::store::{OwedWakesOperation, WaitRowOperation};
+        use crate::jobs::store::remote_wait::{OwedWakesOperation, WaitRowOperation};
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
         use aruna_core::structs::identity::auth::AuthContext;
@@ -599,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
-        use crate::jobs::store::read_key_waits;
+        use crate::jobs::store::key_wait::read_key_waits;
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
         use crate::replication::protocol::BaoReadRefusal;

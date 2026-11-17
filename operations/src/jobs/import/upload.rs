@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::jobs::MUTATE_MAX_ATTEMPTS;
-use crate::jobs::store::{CommitStep, commit_write};
+use crate::jobs::store::query::{CommitStep, commit_write};
 
 #[derive(Debug, PartialEq)]
 pub struct CreateRoCrateConfig {

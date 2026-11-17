@@ -44,7 +44,7 @@ use crate::driver::{
 };
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::source_read::{SourceReadError, authorize_read};
-use crate::jobs::store::reserve_output_commits;
+use crate::jobs::store::attempt::reserve_output_commits;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
@@ -2509,7 +2509,7 @@ mod tests {
             lease_expires_ms: u64::MAX,
         });
         let storage = &context.storage_handle;
-        crate::jobs::store::insert_job(storage, &record)
+        crate::jobs::store::query::insert_job(storage, &record)
             .await
             .unwrap();
         let pin = SourcePin {
@@ -2518,7 +2518,8 @@ mod tests {
             source_version: None,
         };
         let stored = || async {
-            let read = crate::jobs::store::read_job_record(storage, record.job_id, None).await;
+            let read =
+                crate::jobs::store::state::read_job_record(storage, record.job_id, None).await;
             read.unwrap().unwrap().captured_inputs[0].served_by.clone()
         };
         let served = BTreeMap::from([("inputs/in.txt".to_string(), pin.clone())]);

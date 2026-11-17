@@ -22,7 +22,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::insert_job;
+use aruna_operations::jobs::store::query::insert_job;
 use aruna_storage::FjallStorage;
 use tempfile::TempDir;
 

@@ -23,7 +23,8 @@ use aruna_core::structs::storage::storage_purge::{
 use aruna_core::time::unix_timestamp_millis;
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{flush_progress, put_purge_checkpoint, read_purge_checkpoint};
+use super::super::store::state::flush_progress;
+use super::super::store::{put_purge_checkpoint, read_purge_checkpoint};
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::drive;
