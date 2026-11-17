@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
+use crate::blob::holders::dht_registration_effect;
 use crate::blob::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
     split_serve_reads, validate_registration,
@@ -22,7 +23,6 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
-use crate::replication::dht_registration::dht_registration_effect;
 use crate::replication::records::build_live_obligation;
 use crate::s3::purge_fence::{
     PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,

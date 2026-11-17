@@ -22,8 +22,6 @@ use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::replication::dht_registration::dht_registration_effect;
-
 const REFRESH_PAGE_SIZE: usize = 256;
 /// Owner rows of one hash read to tell whether only distributed buckets hold it.
 const OWNER_PROBE: usize = 8;
@@ -462,6 +460,21 @@ impl Operation for GetHoldersOperation {
         self.output.get_or_insert(Err(GetHoldersError::Aborted));
         smallvec![]
     }
+}
+
+/// The DHT put that announces this node as a holder of the blob with hash `blake3`.
+pub(crate) fn dht_registration_effect(
+    blake3: &[u8],
+    local_realm_id: RealmId,
+    limits: &RoCrateLimits,
+) -> Result<Effect, ConversionError> {
+    let key = DhtKeyId::from_bytes(blake3.try_into()?);
+    Ok(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+        key,
+        realm_id: local_realm_id,
+        value: Vec::new(),
+        ttl: Duration::from_millis(limits.holder_ttl_ms),
+    })))
 }
 
 #[cfg(test)]

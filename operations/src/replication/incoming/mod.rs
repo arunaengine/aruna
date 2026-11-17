@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::abe::copies::copy_row;
+use crate::blob::holders::dht_registration_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
@@ -19,7 +20,6 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
-use crate::replication::dht_registration::dht_registration_effect;
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
     ReferenceAdvance, VersionReplicationManifest, VersionReplicationMessage,

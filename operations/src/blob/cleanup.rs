@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use crate::replication::dht_registration::dht_registration_effect;
+use crate::blob::holders::dht_registration_effect;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
