@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::IoCall;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
@@ -19,7 +20,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::holders::{HolderReport, HolderState, KeyLookup, admin_users};
 use aruna_core::structs::storage::multipart::MultipartUpload;
-use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -72,22 +73,36 @@ pub fn authority_read(
     group_id: GroupId,
     txn_id: Option<TxnId>,
 ) -> Effect {
+    let reads = authority_keys(bucket, realm_id, group_id);
+    Effect::Storage(StorageEffect::BatchRead { reads, txn_id })
+}
+
+/// The rows of an `authority_read`, in the order `parse_authority` expects.
+pub(crate) fn authority_keys(
+    bucket: &str,
+    realm_id: RealmId,
+    group_id: GroupId,
+) -> Vec<(KeySpace, Key)> {
     let key: Key = bucket.as_bytes().to_vec().into();
-    Effect::Storage(StorageEffect::BatchRead {
-        reads: vec![
-            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
-            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
-            (
-                AUTH_KEYSPACE.to_string(),
-                realm_id.as_bytes().to_vec().into(),
-            ),
-            (
-                AUTH_KEYSPACE.to_string(),
-                group_id.to_bytes().to_vec().into(),
-            ),
-        ],
-        txn_id,
-    })
+    vec![
+        (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+        (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
+        (
+            AUTH_KEYSPACE.to_string(),
+            realm_id.as_bytes().to_vec().into(),
+        ),
+        (
+            AUTH_KEYSPACE.to_string(),
+            group_id.to_bytes().to_vec().into(),
+        ),
+    ]
+}
+
+/// The values of an `IoCall::Read` as the keyed rows `parse_authority` and `parse_settings` take.
+pub(crate) fn keyless(values: Vec<Option<Value>>) -> Vec<(Key, Option<Value>)> {
+    (values.into_iter())
+        .map(|value| (Key::from(Vec::new()), value))
+        .collect()
 }
 
 /// The state an `authority_read` returned; admins hold WRITE on the group admin path now.
@@ -188,6 +203,16 @@ pub fn parse_settings(
 }
 
 /// Reads every row of `key_space` under `prefix` in one page, inside `txn_id`.
+/// Every row below `prefix` in one page, as a call.
+pub(crate) fn scan_call(key_space: &str, prefix: Key) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix,
+        after: None,
+        limit: u64::MAX as usize,
+    }
+}
+
 pub(crate) fn full_scan(key_space: &str, prefix: Option<Key>, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Iter {
         key_space: key_space.to_string(),
