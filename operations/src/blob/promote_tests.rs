@@ -4,15 +4,100 @@
 
 use super::*;
 use crate::blob::unlocked::{drop_mismatch, promote_unlocked, read_value};
+use aruna_core::calls::ChildOutcome;
+use aruna_core::events::StorageEvent;
+use aruna_core::operation::{EffectOperation, Runnable, SubOperation, boxed_suboperation};
 use aruna_core::structs::storage::abe::envelope_charge;
 use aruna_core::structs::storage::blob::{BackendRef, VersionKey};
 use aruna_core::structs::storage::encryption::ReadLease;
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+use aruna_core::types::Effects;
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
 
 const BLAKE3: [u8; 32] = [9; 32];
+
+/// The transaction id the page transactions of these tests get.
+const TXN: Ulid = Ulid::from_bytes([7; 16]);
+
+/// Runs a promotion and the page children it starts on the events a test feeds it.
+struct Stepper {
+    machine: Box<dyn SubOperation>,
+    child: Option<Box<dyn SubOperation>>,
+}
+
+impl Stepper {
+    fn new(operation: PromotePendingOperation) -> (Self, Effects) {
+        let mut machine =
+            boxed_suboperation(operation, |result| Event::Child(ChildOutcome::new(result)));
+        let effects = machine.start();
+        let mut stepper = Self {
+            machine,
+            child: None,
+        };
+        let effects = stepper.enter(effects);
+        (stepper, effects)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let Some(child) = self.child.as_mut() else {
+            let effects = self.machine.step(event);
+            return self.enter(effects);
+        };
+        let mut effects = child.step(event);
+        if !child.is_complete() {
+            return effects;
+        }
+        if let Some(child) = self.child.take() {
+            let next = self.machine.step(child.finalize());
+            effects.extend(self.enter(next));
+        }
+        effects
+    }
+
+    /// Starts a child the promotion asked for and returns the child's first effects.
+    fn enter(&mut self, mut effects: Effects) -> Effects {
+        loop {
+            match effects.pop() {
+                Some(Effect::SubOperation(mut child)) if effects.is_empty() => {
+                    let started = child.start();
+                    if !child.is_complete() {
+                        self.child = Some(child);
+                        return started;
+                    }
+                    effects = self.machine.step(child.finalize());
+                }
+                Some(effect) => {
+                    effects.push(effect);
+                    return effects;
+                }
+                None => return effects,
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.child.is_none() && self.machine.is_complete()
+    }
+
+    fn finish(self) -> Result<Promotion, PromoteError> {
+        let Event::Child(outcome) = self.machine.finalize() else {
+            panic!("the promotion ended without its outcome")
+        };
+        outcome.take().expect("the promotion outcome")
+    }
+}
+
+fn committed() -> Event {
+    Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+}
+
+fn written() -> Event {
+    Event::Storage(StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    })
+}
 
 fn sealed() -> BackendLocation {
     let layout = PithosLayout {
@@ -37,16 +122,17 @@ fn sealed() -> BackendLocation {
     }
 }
 
-fn operation() -> PromotePendingOperation {
+fn operation() -> Stepper {
     let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
     let archive = ArchiveKey::of(&sealed());
-    PromotePendingOperation::new(archive, RealmId([1; 32]), node, RoCrateLimits::default())
+    let operation =
+        PromotePendingOperation::new(archive, RealmId([1; 32]), node, RoCrateLimits::default());
+    Stepper::new(operation).0
 }
 
 fn read(value: Option<Vec<u8>>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(Vec::new()),
-        value: value.map(Value::from),
+    Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(Key::from(Vec::new()), value.map(Value::from))],
     })
 }
 
@@ -70,7 +156,7 @@ fn key_rows(record: &BucketKeyRecord, claim: Option<[u8; 32]>) -> Event {
     })
 }
 
-fn reread_with(operation: &mut PromotePendingOperation, claim: Option<[u8; 32]>) -> Effects {
+fn reread_with(operation: &mut Stepper, claim: Option<[u8; 32]>) -> Effects {
     let effects = operation.step(location_read());
     let [
         Effect::Storage(StorageEffect::BatchRead {
@@ -88,7 +174,7 @@ fn reread_with(operation: &mut PromotePendingOperation, claim: Option<[u8; 32]>)
     operation.step(key_rows(&record, claim))
 }
 
-fn reread(operation: &mut PromotePendingOperation) -> Effects {
+fn reread(operation: &mut Stepper) -> Effects {
     reread_with(operation, None)
 }
 
@@ -104,9 +190,13 @@ fn hashed(size: u64) -> Event {
 }
 
 /// Steps through admission and hashing into the first transaction.
-fn hashed_operation() -> PromotePendingOperation {
+fn hashed_operation() -> Stepper {
+    hashed_in(TXN)
+}
+
+/// Like `hashed_operation`, the page transaction being `txn_id`.
+fn hashed_in(txn_id: Ulid) -> Stepper {
     let mut operation = operation();
-    operation.start();
     operation.step(location_read());
     operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease() }));
     let effects = operation.step(hashed(100));
@@ -114,7 +204,6 @@ fn hashed_operation() -> PromotePendingOperation {
         effects.as_slice(),
         [Effect::Storage(StorageEffect::StartTransaction { .. })]
     ));
-    let txn_id = Ulid::from_bytes([7; 16]);
     operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
     operation
 }
@@ -122,7 +211,6 @@ fn hashed_operation() -> PromotePendingOperation {
 #[test]
 fn locked_key_waits() {
     let mut operation = operation();
-    operation.start();
     let effects = operation.step(location_read());
     assert!(matches!(
         effects.as_slice(),
@@ -132,17 +220,16 @@ fn locked_key_waits() {
     let locked = BlobError::BucketKey(BucketKeyError::Locked(key.bucket_id));
     operation.step(Event::Blob(BlobEvent::Error(locked)));
     assert!(operation.is_complete());
-    assert_eq!(operation.finalize(), Ok(Promotion::AwaitingKey(key)));
+    assert_eq!(operation.finish(), Ok(Promotion::AwaitingKey(key)));
 }
 
 #[test]
 fn wrong_size_fails() {
     let mut operation = operation();
-    operation.start();
     operation.step(location_read());
     operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease() }));
     operation.step(hashed(99));
-    assert_eq!(operation.finalize(), Err(PromoteError::BadHashes));
+    assert_eq!(operation.finish(), Err(PromoteError::BadHashes));
 }
 
 #[test]
@@ -150,15 +237,14 @@ fn changed_archive_aborts() {
     let mut operation = hashed_operation();
     let mut changed = sealed();
     changed.blob_size = 7;
+    // The page ends without a write, so its commit changes nothing.
     let effects = operation.step(read(Some(changed.to_bytes().unwrap())));
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
     ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: Ulid::nil(),
-    }));
-    assert_eq!(operation.finalize(), Ok(Promotion::Gone));
+    operation.step(committed());
+    assert_eq!(operation.finish(), Ok(Promotion::Gone));
 }
 
 #[tokio::test]
@@ -182,8 +268,7 @@ async fn retirement_fences_promotion() {
     else {
         panic!("transaction missing")
     };
-    let mut operation = hashed_operation();
-    operation.txn_id = Some(txn_id);
+    let mut operation = hashed_in(txn_id);
     let mut effects = operation.step(location_read());
     let Some(Effect::Storage(read)) = effects.pop() else {
         panic!("key fence missing")
@@ -225,26 +310,24 @@ fn retired_key_refused() {
         effects.as_slice(),
         [Effect::Storage(StorageEffect::AbortTransaction { .. })]
     ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: Ulid::nil(),
-    }));
-    assert_eq!(operation.finalize(), Err(PromoteError::NoKey));
+    assert_eq!(operation.finish(), Err(PromoteError::NoKey));
 }
 
 #[test]
 fn promotes_pending_alias() {
     let mut operation = hashed_operation();
     let effects = reread(&mut operation);
-    let [Effect::Storage(StorageEffect::Write { key, value, .. })] = effects.as_slice() else {
+    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
         panic!("the known location row comes first")
+    };
+    let [(_, key, value)] = writes.as_slice() else {
+        panic!("only the known location row is written")
     };
     let location_key = BlobLocationKey::from_bytes(key).unwrap();
     assert_eq!(location_key.blake3_hash, BLAKE3);
     let known = BackendLocation::from_bytes(value).unwrap();
     assert_eq!(known.hashes.get(HASH_BLAKE3), Some(&BLAKE3.to_vec()));
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: key.clone(),
-    }));
+    operation.step(written());
 
     let version_key = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
     let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version_key.clone());
@@ -312,12 +395,14 @@ fn promotes_pending_alias() {
     };
     assert_eq!(deletes[0].0, PENDING_LOCATION_KEYSPACE);
     assert_eq!(deletes[1].0, PENDING_CLAIM_KEYSPACE);
-    operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+    let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
         entries: Vec::new(),
     }));
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::nil(),
-    }));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+    ));
+    let effects = operation.step(committed());
     assert!(matches!(effects.as_slice(), [Effect::Net(_)]));
     let Effect::Net(aruna_core::effects::NetEffect::Dht(aruna_core::effects::DhtEffect::Put {
         key,
@@ -334,7 +419,7 @@ fn promotes_pending_alias() {
         },
     )));
     assert_eq!(
-        operation.finalize(),
+        operation.finish(),
         Ok(Promotion::Promoted {
             blake3: BLAKE3,
             versions: 1
@@ -372,7 +457,7 @@ fn bucket_rows() -> Vec<(Key, Option<Value>)> {
 }
 
 /// Promotes one owner page, `version_id` being the only owner, up to its batch write.
-fn promote_one(operation: &mut PromotePendingOperation, version_id: [u8; 16]) -> Key {
+fn promote_one(operation: &mut Stepper, version_id: [u8; 16]) -> Key {
     let version_key = VersionKey::new("bucket", "key", Ulid::from_bytes(version_id));
     let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version_key.clone());
     operation.step(Event::Storage(StorageEvent::IterResult {
@@ -404,9 +489,7 @@ fn promote_one(operation: &mut PromotePendingOperation, version_id: [u8; 16]) ->
 fn alias_behind_cursor() {
     let mut operation = hashed_operation();
     reread(&mut operation);
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
+    operation.step(written());
     let first = promote_one(&mut operation, [6; 16]);
     let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
@@ -481,9 +564,7 @@ fn alias_behind_cursor() {
 fn conflict_restarts_scan() {
     let mut operation = hashed_operation();
     reread(&mut operation);
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
+    operation.step(written());
     let first = promote_one(&mut operation, [6; 16]);
     operation.step(Event::Storage(StorageEvent::BatchWriteResult {
         entries: Vec::new(),
@@ -493,7 +574,7 @@ fn conflict_restarts_scan() {
         next_start_after: None,
     }));
     operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: Vec::new(),
+        values: vec![(Key::from(Vec::new()), None)],
     }));
     operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
         entries: Vec::new(),
@@ -521,9 +602,7 @@ fn envelope_mapping_rebound() {
     // A promoted version's envelope mapping names the location key; completion charged its size.
     let mut operation = hashed_operation();
     reread(&mut operation);
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
+    operation.step(written());
     let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
     let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version.clone());
     operation.step(Event::Storage(StorageEvent::IterResult {
@@ -588,9 +667,7 @@ fn governed_alias_registration() {
 
     let mut operation = hashed_operation();
     reread(&mut operation);
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
+    operation.step(written());
     let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
     let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version.clone());
     operation.step(Event::Storage(StorageEvent::IterResult {
@@ -659,13 +736,11 @@ fn claim_mismatch_unregistered() {
     let effects = reread_with(&mut operation, Some([8; 32]));
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
+        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
     ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: Ulid::nil(),
-    }));
+    operation.step(committed());
     assert_eq!(
-        operation.finalize(),
+        operation.finish(),
         Ok(Promotion::Mismatch { claimed: [8; 32] })
     );
 
@@ -674,8 +749,8 @@ fn claim_mismatch_unregistered() {
     let effects = reread_with(&mut operation, Some(BLAKE3));
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Write { key_space, .. })]
-            if key_space == BLOB_LOCATIONS_KEYSPACE
+        [Effect::Storage(StorageEffect::BatchWrite { writes, .. })]
+            if writes[0].0 == BLOB_LOCATIONS_KEYSPACE
     ));
 }
 
@@ -915,7 +990,7 @@ pub(crate) mod received {
 
     async fn storage_step(
         context: &DriverContext,
-        operation: &mut RejectOwnersOperation,
+        operation: &mut impl EffectOperation,
         effects: Effects,
     ) -> Effects {
         assert_eq!(effects.len(), 1);
@@ -941,10 +1016,11 @@ pub(crate) mod received {
         let archive = ArchiveKey::of(&location);
         let record =
             BlobQuarantineRecord::new([0; 32], archive.backend.clone(), "mismatch".into(), 0);
-        let mut fence = RejectOwnersOperation::new(archive.clone(), &record).unwrap();
-        let effects = fence.start();
-        let effects = storage_step(&context, &mut fence, effects).await;
-        let effects = storage_step(&context, &mut fence, effects).await;
+        let fence = RejectOwnersOperation::new(archive.clone(), &record).unwrap();
+        let mut first = fence.clone().into_machine();
+        let effects = first.start();
+        let effects = storage_step(&context, &mut first, effects).await;
+        let effects = storage_step(&context, &mut first, effects).await;
         let alias = SealedCopyOperation::new(SealedCopyInput {
             bucket: "bucket".into(),
             source_key: version.key,
@@ -962,17 +1038,14 @@ pub(crate) mod received {
             job_id: None,
         });
         drive(alias, &context).await.unwrap();
-        let effects = storage_step(&context, &mut fence, effects).await;
-        let effects = storage_step(&context, &mut fence, effects).await;
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
-        let mut effects = effects;
-        while !fence.is_complete() {
-            effects = storage_step(&context, &mut fence, effects).await;
-        }
-        assert_eq!(fence.finalize().unwrap().len(), 2);
+        let effects = storage_step(&context, &mut first, effects).await;
+        let effects = storage_step(&context, &mut first, effects).await;
+        // The alias joined the scanned range, so the fence conflicts and runs again.
+        assert!(effects.is_empty() && first.is_complete());
+        let conflict = PromoteError::Storage(StorageError::TransactionConflict);
+        assert_eq!(first.finalize(), Err(conflict));
+        let owners = crate::driver::drive_retry(|| fence.clone(), &context, b"fence").await;
+        assert_eq!(owners.unwrap().len(), 2);
         assert_eq!(
             drop_mismatch(&context, &archive, [0; 32], origin(&context))
                 .await
@@ -1190,9 +1263,7 @@ fn distributed_learns_identity() {
     // and the inventory, where holders find it by content.
     let mut operation = hashed_operation();
     reread(&mut operation);
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
+    operation.step(written());
     let version = VersionKey::new("bucket", "key", Ulid::from_bytes([6; 16]));
     let owner = CopyOwner::new(ArchiveKey::of(&sealed()), version.clone());
     operation.step(Event::Storage(StorageEvent::IterResult {
