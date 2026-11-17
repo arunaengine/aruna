@@ -20,6 +20,7 @@ pub mod protocol;
 pub mod prune;
 pub mod routing;
 pub mod send;
+pub mod setting_rows;
 pub mod settings;
 #[cfg(test)]
 mod tests;
