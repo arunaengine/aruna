@@ -13,6 +13,7 @@ pub mod inbox;
 pub mod incoming;
 pub mod list;
 pub mod mark_read;
+pub mod opt_in;
 pub mod outbox;
 pub mod outbox_record;
 pub mod placement;
