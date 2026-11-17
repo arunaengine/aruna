@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -9,13 +10,14 @@ use aruna_core::keyspaces::EVENT_LOG_KEYSPACE;
 use aruna_core::metadata::{
     EVENT_LIMIT, MetadataError, MetadataEventRecord, MetadataRawRevision, RAW_BYTES_LIMIT,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{event_log_key, event_log_prefix, pending_projection_target};
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, TxnId, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::metadata::call_results::page_rows;
 
 pub(crate) const RAW_PAGE_SIZE: usize = 1;
 pub(crate) const RAW_EVENT_LIMIT: usize = EVENT_LIMIT as usize;
@@ -37,6 +39,16 @@ pub enum RawReadError {
     /// help. Kept apart from [`Self::UnexpectedEvent`], which is adapter noise.
     #[error("inconsistent metadata raw event log: {0}")]
     InconsistentLog(String),
+}
+
+impl From<IoError> for RawReadError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::UnexpectedEvent(other.to_string()),
+        }
+    }
 }
 
 /// Bounds one raw replay by event count and encoded bytes.
@@ -121,13 +133,6 @@ pub(crate) struct RawRevisionState {
     pub(crate) merged: bool,
 }
 
-#[derive(Debug, PartialEq)]
-enum EventsState {
-    Init,
-    Page,
-    Done,
-}
-
 /// Reads a document's event log in pages after `start_after`, stopping before the first
 /// event past `event_cursor`. Every event is validated and counted against `budget`.
 #[derive(Debug, PartialEq)]
@@ -139,8 +144,6 @@ pub struct RawEventsOperation {
     budget: RawLoadBudget,
     page_limit: usize,
     events: Vec<MetadataEventRecord>,
-    state: EventsState,
-    output: Option<Result<Vec<MetadataEventRecord>, RawReadError>>,
 }
 
 impl RawEventsOperation {
@@ -159,31 +162,33 @@ impl RawEventsOperation {
             budget,
             page_limit: 0,
             events: Vec::new(),
-            state: EventsState::Init,
-            output: None,
         }
     }
 
-    fn finish(&mut self, output: Result<Vec<MetadataEventRecord>, RawReadError>) -> Effects {
-        self.state = EventsState::Done;
-        self.output = Some(output);
-        smallvec![]
-    }
-
-    fn read_page(&mut self) -> Effects {
+    fn read_page(&mut self) -> Result<Next<Vec<MetadataEventRecord>>, RawReadError> {
         let remaining = RAW_EVENT_LIMIT.saturating_sub(self.budget.events);
         if remaining == 0 {
-            return self.finish(Err(budget_error("event count limit exceeded")));
+            return Err(budget_error("event count limit exceeded"));
         }
         self.page_limit = remaining.min(RAW_PAGE_SIZE);
-        self.state = EventsState::Page;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: EVENT_LOG_KEYSPACE.to_string(),
-            prefix: Some(event_log_prefix(self.document_id)),
-            start: self.start.take().map(IterStart::After),
-            limit: self.page_limit,
-            txn_id: self.txn_id,
-        })]
+        let prefix = event_log_prefix(self.document_id);
+        let after = self.start.take();
+        Ok(Next::Call(match self.txn_id {
+            // The caller's transaction is not the runner's, so the page goes out as an effect.
+            Some(txn_id) => IoCall::Effect(Effect::Storage(StorageEffect::Iter {
+                key_space: EVENT_LOG_KEYSPACE.to_string(),
+                prefix: Some(prefix),
+                start: after.map(IterStart::After),
+                limit: self.page_limit,
+                txn_id: Some(txn_id),
+            })),
+            None => IoCall::Page {
+                space: EVENT_LOG_KEYSPACE.to_string(),
+                prefix,
+                after,
+                limit: self.page_limit,
+            },
+        }))
     }
 
     /// Takes one page; `Ok(true)` once the cursor is passed and the read ends.
@@ -204,79 +209,51 @@ impl RawEventsOperation {
         }
         Ok(false)
     }
+}
 
-    fn page_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+/// The rows of an event page read alone or inside the caller's transaction.
+fn page_answer(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), RawReadError> {
+    match result {
+        IoResult::Event(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        })) => Ok((values, next_start_after)),
+        IoResult::Event(Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+        other => Ok(page_rows(other)?),
+    }
+}
+
+impl Operation for RawEventsOperation {
+    type Output = Vec<MetadataEventRecord>;
+    type Error = RawReadError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, RawReadError> {
+        self.read_page()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RawReadError> {
+        let (values, next) = page_answer(result)?;
         if values.len() > self.page_limit {
-            return self.finish(Err(budget_error("page size limit exceeded")));
+            return Err(budget_error("page size limit exceeded"));
         }
         if values.is_empty() && next.is_some() {
-            return self.finish(Err(budget_error("empty page has continuation")));
+            return Err(budget_error("empty page has continuation"));
         }
-        let passed = match self.take_page(values) {
-            Ok(passed) => passed,
-            Err(error) => return self.finish(Err(error)),
-        };
+        let passed = self.take_page(values)?;
         match next {
             Some(next) if !passed => {
                 self.start = Some(next);
                 self.read_page()
             }
-            _ => {
-                let events = std::mem::take(&mut self.events);
-                self.finish(Ok(events))
-            }
+            _ => Ok(Next::Done(std::mem::take(&mut self.events))),
         }
-    }
-}
-
-impl EffectOperation for RawEventsOperation {
-    type Output = Vec<MetadataEventRecord>;
-    type Error = RawReadError;
-
-    fn start(&mut self) -> Effects {
-        self.read_page()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let reading = self.state == EventsState::Page;
-        match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) if reading => self.page_read(values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) if reading => {
-                self.finish(Err(error.into()))
-            }
-            other => {
-                let error = RawReadError::UnexpectedEvent(other.label().to_string());
-                self.finish(Err(error))
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == EventsState::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RawReadError::UnexpectedEvent(
-            "the raw event read did not finish".to_string(),
-        )))
-    }
-
-    // Pages are read without writing, and a caller's transaction stays the caller's.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
 #[cfg(test)]
-pub(crate) mod state_machine_tests {
+pub(crate) mod call_tests {
     use super::*;
     use crate::metadata::raw_revision::tests::test_event;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
 
     pub(crate) fn event(seed: u64) -> MetadataEventRecord {
         test_event(Ulid::from_parts(1, seed), seed)
@@ -294,21 +271,17 @@ pub(crate) mod state_machine_tests {
         (key(event), postcard::to_allocvec(event).unwrap().into())
     }
 
-    pub(crate) fn page_effect(start: Option<Key>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: EVENT_LOG_KEYSPACE.to_string(),
-            prefix: Some(event_log_prefix(document())),
-            start: start.map(IterStart::After),
+    pub(crate) fn page_call<T>(after: Option<Key>) -> Next<T> {
+        Next::Call(IoCall::Page {
+            space: EVENT_LOG_KEYSPACE.to_string(),
+            prefix: event_log_prefix(document()),
+            after,
             limit: RAW_PAGE_SIZE,
-            txn_id: None,
         })
     }
 
-    pub(crate) fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: rows,
-            next_start_after: next,
-        })
+    pub(crate) fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Page { rows, next }
     }
 
     fn whole_log() -> RawEventsOperation {
@@ -317,7 +290,7 @@ pub(crate) mod state_machine_tests {
 
     fn reading() -> RawEventsOperation {
         let mut operation = whole_log();
-        operation.start();
+        operation.first().unwrap();
         operation
     }
 
@@ -325,18 +298,15 @@ pub(crate) mod state_machine_tests {
     fn reads_to_end() {
         let first = event(10);
         let mut operation = whole_log();
-        check_trace(
-            &mut operation,
-            &[page_effect(None)],
-            vec![
-                (
-                    page(vec![row(&first)], Some(key(&first))),
-                    vec![page_effect(Some(key(&first)))],
-                ),
-                (page(Vec::new(), None), vec![]),
-            ],
+        assert_eq!(operation.first(), Ok(page_call(None)));
+        assert_eq!(
+            operation.next(page(vec![row(&first)], Some(key(&first)))),
+            Ok(page_call(Some(key(&first))))
         );
-        assert_eq!(operation.finalize(), Ok(vec![first]));
+        assert_eq!(
+            operation.next(page(Vec::new(), None)),
+            Ok(Next::Done(vec![first]))
+        );
     }
 
     #[test]
@@ -350,30 +320,46 @@ pub(crate) mod state_machine_tests {
             None,
             RawLoadBudget::default(),
         );
-        check_trace(
-            &mut operation,
-            &[page_effect(Some(key(&start)))],
-            vec![
-                (
-                    page(vec![row(&next)], Some(key(&next))),
-                    vec![page_effect(Some(key(&next)))],
-                ),
-                (page(vec![row(&late)], Some(key(&late))), vec![]),
-            ],
+        assert_eq!(operation.first(), Ok(page_call(Some(key(&start)))));
+        assert_eq!(
+            operation.next(page(vec![row(&next)], Some(key(&next)))),
+            Ok(page_call(Some(key(&next))))
         );
-        assert_eq!(operation.finalize(), Ok(vec![next]));
+        assert_eq!(
+            operation.next(page(vec![row(&late)], Some(key(&late)))),
+            Ok(Next::Done(vec![next]))
+        );
     }
 
     #[test]
-    fn storage_errors_fail() {
-        let mut operation = reading();
-        let error = Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        });
-        assert!(operation.step(error).is_empty());
+    fn pages_in_transaction() {
+        let txn_id = Ulid::from_bytes([5; 16]);
+        let first = event(10);
+        let mut operation = RawEventsOperation::new(
+            document(),
+            None,
+            None,
+            Some(txn_id),
+            RawLoadBudget::default(),
+        );
+        let iter = StorageEffect::Iter {
+            key_space: EVENT_LOG_KEYSPACE.to_string(),
+            prefix: Some(event_log_prefix(document())),
+            start: None,
+            limit: RAW_PAGE_SIZE,
+            txn_id: Some(txn_id),
+        };
         assert_eq!(
-            operation.finalize(),
-            Err(RawReadError::Storage(StorageError::Timeout))
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(Effect::Storage(iter))))
+        );
+        let answer = StorageEvent::IterResult {
+            values: vec![row(&first)],
+            next_start_after: None,
+        };
+        assert_eq!(
+            operation.next(IoResult::Event(Event::Storage(answer))),
+            Ok(Next::Done(vec![first]))
         );
     }
 
@@ -388,10 +374,8 @@ pub(crate) mod state_machine_tests {
             (page(vec![row(&first), row(&event(11))], None), "limit"),
             (page(Vec::new(), Some(key(&first))), "limit"),
         ];
-        for (event, kind) in cases {
-            let mut operation = reading();
-            assert!(operation.step(event).is_empty());
-            let error = operation.finalize().unwrap_err();
+        for (answer, kind) in cases {
+            let error = reading().next(answer).unwrap_err();
             let matched = match kind {
                 "conversion" => matches!(error, RawReadError::Conversion(_)),
                 "log" => matches!(error, RawReadError::InconsistentLog(_)),
@@ -408,44 +392,21 @@ pub(crate) mod state_machine_tests {
             encoded_bytes: 0,
         };
         let mut operation = RawEventsOperation::new(document(), None, None, None, spent);
-        assert!(operation.start().is_empty());
         assert!(matches!(
-            operation.finalize(),
+            operation.first(),
             Err(RawReadError::LimitExceeded(_))
         ));
     }
 
     #[test]
-    fn rejects_other_events() {
-        let accepted = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
-            assert!(effects.is_empty());
-            assert!(matches!(error, RawReadError::UnexpectedEvent(_)));
-        }
-        let mut idle = whole_log();
-        idle.step(page(Vec::new(), None));
+    fn wrong_result_fails() {
         assert!(matches!(
-            idle.finalize(),
+            reading().next(IoResult::Done),
             Err(RawReadError::UnexpectedEvent(_))
         ));
-    }
-
-    #[test]
-    fn abort_cleans_nothing() {
-        let mut operation = whole_log();
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-    }
-
-    #[test]
-    fn finalize_needs_result() {
-        rejects_finalize(whole_log());
-        rejects_finalize(reading());
+        assert_eq!(
+            RawReadError::from(IoError::Storage(StorageError::Timeout)),
+            RawReadError::Storage(StorageError::Timeout)
+        );
     }
 }
