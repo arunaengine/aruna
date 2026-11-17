@@ -28,7 +28,7 @@ fn query_fans_out() {
     let strategy = config
         .strategy(&config.default_strategy_id.expect("default strategy"))
         .expect("default strategy resolves");
-    let placement = crate::placement::choose_origin_bucket(
+    let placement = aruna_core::placement::choose_origin_bucket(
         &config,
         strategy,
         local_node_id,

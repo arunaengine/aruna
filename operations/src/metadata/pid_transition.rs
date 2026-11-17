@@ -152,7 +152,7 @@ impl PidTransitionOperation {
             return self.fenced();
         };
         let (key_space, key) =
-            crate::placement::fence::fence_read(&route.realm_id, &route.placement);
+            aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
         let effect = Effect::Storage(StorageEffect::Read {
             key_space,
             key,
@@ -418,7 +418,7 @@ impl Operation for PidTransitionOperation {
             }
             (State::Fence, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                 let generation = self.route.as_ref().map_or(0, |route| route.generation);
-                if !crate::placement::fence::admits(value.as_ref(), generation) {
+                if !aruna_core::placement::fence::admits(value.as_ref(), generation) {
                     return self.fail(PersistentIdError::PlacementFenced);
                 }
                 self.fenced()

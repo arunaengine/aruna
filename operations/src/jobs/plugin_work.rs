@@ -62,9 +62,8 @@ pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunO
                 checksums,
                 max_bytes: *max_bytes,
             };
-            let keys = node_keys(&ctx.driver);
             let admitted = (&install, &config, &row);
-            download_work(ctx, spec, admitted, (download, &keys)).await
+            download_work(ctx, spec, admitted, download).await
         }
         PluginWorkAction::Upload {
             source,
@@ -76,9 +75,8 @@ pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunO
                 version: *version,
                 form: form.as_ref(),
             };
-            let keys = node_keys(&ctx.driver);
             let admitted = (&install, &config, &row);
-            upload_work(ctx, spec, admitted, (upload, &keys)).await
+            upload_work(ctx, spec, admitted, upload).await
         }
     }
 }

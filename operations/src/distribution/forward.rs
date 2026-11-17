@@ -25,13 +25,14 @@ use ulid::Ulid;
 
 use super::admit::{AdmitConfig, AdmitError, AdmitOperation};
 use super::publish::{PublishConfig, PublishError, PublishOperation};
-use crate::driver::{DriverContext, drive, drive_retry};
-use crate::effect_adapters::routing::node_routing;
-use crate::forward::authorize::is_sync_eligible;
+use crate::driver::drive_retry;
+use crate::driver::node_routing;
+use crate::driver::{DriverContext, drive};
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::dataset::{DescriptionError, dataset_description};

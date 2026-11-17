@@ -366,6 +366,15 @@ async fn fill(
         .open_vault(aruna_core::node_vault::NodeVaultKey::derive(
             &config.node_state.net_secret_key,
         ));
+    // Only holders of the realm signing key derive the realm keys; storage opens with them.
+    if let aruna_core::structs::identity::auth::NodeCapabilities::Management {
+        realm_signing_key,
+        ..
+    } = &config.node_capabilities
+    {
+        let keys = aruna_core::realm_vault::RealmKeys::derive(realm_signing_key);
+        acquired.storage_handle.open_realm(keys);
+    }
     if matches!(
         config.startup_mode,
         crate::config::StartupMode::JoinRealm {
@@ -426,17 +435,7 @@ async fn fill(
     checkpoint(StartupStage::Net)?;
     stopped(stop)?;
 
-    let mut metadata_options = MetadataHandleOptions::default();
-    // Only holders of the realm signing key derive the realm vault and seal keys.
-    if let aruna_core::structs::identity::auth::NodeCapabilities::Management {
-        realm_signing_key,
-        ..
-    } = &config.node_capabilities
-    {
-        let key = aruna_core::realm_vault::RealmVaultKey::derive(realm_signing_key);
-        let seal_key = aruna_core::realm_vault::RealmSealKey::derive(realm_signing_key);
-        metadata_options = metadata_options.with_vault_key(key).with_seal_key(seal_key);
-    }
+    let metadata_options = MetadataHandleOptions::default();
     let graph_handle = GraphHandle::open(
         &config.metadata_storage_path,
         config.node_id,

@@ -27,11 +27,11 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use super::check::{ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation};
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::oidc_user::initial_sync_change;
+use aruna_core::placement::target_placement_ref;
 
 const MAX_NAME_LEN: usize = 256;
 
@@ -70,7 +70,7 @@ pub enum CreateServiceError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -91,7 +91,7 @@ enum CreateServiceState {
 #[derive(Debug, PartialEq)]
 pub struct CreateServiceOperation {
     config: CreateServiceConfig,
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: CreateServiceState,
     output: Option<Result<User, CreateServiceError>>,
     guard: Option<aruna_core::plugin_installs::InstallGuard>,
@@ -125,7 +125,7 @@ impl CreateServiceOperation {
         self.fail(CreateServiceError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 
@@ -343,18 +343,31 @@ impl Operation for CreateServiceOperation {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return self.fail(error.into());
         }
-        match self.state.clone() {
+        match &self.state {
             CreateServiceState::Authorize => self.handle_authorized(event),
             CreateServiceState::StartTransaction => self.handle_started(event),
-            CreateServiceState::ReadConfig { txn_id } => self.handle_config(event, txn_id),
+            CreateServiceState::ReadConfig { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_config(event, txn_id)
+            }
             CreateServiceState::WriteUser { txn_id, user } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
                 self.handle_written(event, txn_id, user)
             }
             CreateServiceState::ReadFence { txn_id, user } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
                 self.handle_fence(event, txn_id, user)
             }
-            CreateServiceState::Commit { user } => self.handle_committed(event, user),
-            CreateServiceState::ScheduleDrain { user } => self.handle_drain(event, user),
+            CreateServiceState::Commit { user } => {
+                let user = user.clone();
+                self.handle_committed(event, user)
+            }
+            CreateServiceState::ScheduleDrain { user } => {
+                let user = user.clone();
+                self.handle_drain(event, user)
+            }
             CreateServiceState::Init => self.unexpected("no event before start", event),
             CreateServiceState::Finish | CreateServiceState::Error => smallvec![],
         }

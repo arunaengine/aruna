@@ -11,7 +11,9 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::{EffectOperation, HoldScope, Runnable, SubOperation};
+use aruna_core::operation::{EffectOperation, HoldScope, Runnable};
+use aruna_core::operation::{Operation, SubOperation};
+use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, TxnId};
@@ -35,14 +37,19 @@ use crate::effect_adapters;
 use crate::metadata::MetadataHandle;
 use crate::recorder;
 
-pub use effect_adapters::routing::{
-    GateContextError, RoutingInputsError, backend_used_bytes, bucket_snapshot, gate_context,
-    node_routing, now_ms, quota_marked_routing, routing_snapshot,
-};
+/// Node-local routing inputs for a caller assembling an operation config.
+/// Pure in-memory state: operations never fetch this from inside a step.
+pub fn node_routing(context: &DriverContext) -> NodeRouting {
+    context
+        .blob_handle
+        .as_ref()
+        .map(|handle| handle.routing())
+        .unwrap_or_default()
+}
 
 /// Handles and capabilities one operation run may use. Only `storage_handle` is
 /// required; an absent plane keeps its adapter's explicit outcome, and governed
-/// writes fail closed through [`gate_context`] without an advertised subject.
+/// writes fail closed through the gate operation without an advertised subject.
 #[derive(Clone)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
@@ -638,7 +645,7 @@ fn refused_member(effect: &Effect) -> bool {
             | StorageEffect::VaultWrite { txn_id, .. }
             | StorageEffect::VaultRead { txn_id, .. }
             | StorageEffect::VaultDelete { txn_id, .. } => txn_id.is_some(),
-            StorageEffect::SyncAll => false,
+            StorageEffect::SyncAll | StorageEffect::RealmOpen(_) => false,
         },
         _ => false,
     }

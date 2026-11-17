@@ -5,6 +5,7 @@
 use std::time::SystemTime;
 
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
 use aruna_core::metadata::MetadataEventRecord;

@@ -24,13 +24,13 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::device::sync::pull::forward_pull;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::store::attempt::{read_crate_status, read_local_crate};
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::workflow::run_crate::record_crate;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::get_config::GetConfigOperation;
 
 /// One publish at a time, so a repeated request cannot mint a second crate.
 static PUBLISHING: Mutex<()> = Mutex::const_new(());

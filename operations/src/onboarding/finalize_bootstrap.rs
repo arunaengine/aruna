@@ -19,6 +19,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
@@ -35,7 +36,6 @@ use crate::onboarding::reserve_secret::{
 use crate::placement::expand_placement::{ensure_activated_map, expand_realm_placement};
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 use crate::realm::mutate_placement::{MutatePlacementError, RealmPlacementMutation};
 use crate::realm::read_authorization::ReadAuthorizationOperation;
 
@@ -344,14 +344,14 @@ async fn onboarding_sync_topics(
                 continue;
             }
             let placement =
-                crate::placement::target_placement_ref(&config, document, Default::default());
+                aruna_core::placement::target_placement_ref(&config, document, Default::default());
             if placement == PlacementRef::NIL {
                 let DocumentTarget::User { user_id } = document else {
                     unreachable!("shard onboarding documents are restricted to users");
                 };
                 return Err(BootstrapFinalizeError::UserPlacementUnavailable(*user_id));
             }
-            if crate::placement::holds_placement(&config, &placement, joiner_node_id) {
+            if aruna_core::placement::holds_placement(&config, &placement, joiner_node_id) {
                 topics
                     .shard
                     .push(document.sync_topic_id(realm_id, &placement));
@@ -371,12 +371,12 @@ mod tests {
         BootstrapFinalizeError, BootstrapFinalizeInput, bootstrap_onboarding_finalize,
         emit_onboarded_notification, onboarding_node_kind, onboarding_sync_topics,
     };
+    use crate::document_repository::{GetConfigError, GetConfigOperation};
     use crate::driver::{DriverContext, drive};
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
     use crate::onboarding::reserve_secret::ReserveSecretError;
     use crate::onboarding::secret_state::secret_state_key;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_config::{GetConfigError, GetConfigOperation};
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
@@ -956,8 +956,8 @@ mod tests {
                 user_id: UserId::local(Ulid::from_bytes(bytes), fixture.realm_id),
             };
             let placement =
-                crate::placement::target_placement_ref(&config, &target, Default::default());
-            if crate::placement::holds_placement(&config, &placement, fixture.joiner_node_id) {
+                aruna_core::placement::target_placement_ref(&config, &target, Default::default());
+            if aruna_core::placement::holds_placement(&config, &placement, fixture.joiner_node_id) {
                 held.get_or_insert(target);
             } else {
                 nonholder.get_or_insert(target);
@@ -969,7 +969,7 @@ mod tests {
         let held = held.expect("joiner holds a capped user shard");
         let nonholder = nonholder.expect("joiner does not hold every capped user shard");
         let held_placement =
-            crate::placement::target_placement_ref(&config, &held, Default::default());
+            aruna_core::placement::target_placement_ref(&config, &held, Default::default());
         let ticket = OnboardingTicket::issue(
             &fixture.realm_signing_key,
             &fixture.realm_id,

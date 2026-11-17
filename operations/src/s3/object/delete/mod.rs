@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use crate::blob::records::{
     HeadAliasContext, blob_location_read, build_transition_effects, delete_index_effect,
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,
@@ -27,6 +26,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_CREATION_KEYSPACE,
     DELETE_AUDIT_KEYSPACE, DELETE_TRAIL_KEYSPACE, OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;

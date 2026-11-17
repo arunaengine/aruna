@@ -12,10 +12,10 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
+use crate::auth::check_permissions::authorization_event;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::revoke_token::RevokeTokenOperation;
-use crate::groups::admin_check::authorization_event;
-use crate::session::revoke::owner_cutoff;
+use crate::auth::revoke_token::owner_cutoff;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RevokeAllConfig {
@@ -39,7 +39,7 @@ pub enum RevokeAllError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -82,7 +82,7 @@ impl RevokeAllOperation {
         self.done(Err(RevokeAllError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         }))
     }
 

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::AuthorizationError;
@@ -10,8 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::{
-    compile_permission_matcher, readable_roots, restrictions_cover_subtree,
-    validate_restriction_limits,
+    compile_permission_matcher, restrictions_cover_subtree, validate_restriction_limits,
 };
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, Role};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -21,8 +20,6 @@ use aruna_core::types::{Effects, GroupId, TxnId};
 use globset::GlobMatcher;
 use smallvec::smallvec;
 use ulid::Ulid;
-
-use crate::driver::{DriverContext, drive};
 
 /// A role that applies to the caller: `direct` when the caller is assigned to
 /// it, `public` when the realm's Everyone principal is.
@@ -283,37 +280,6 @@ fn base_matches(base: &str, path: &str) -> bool {
     compile_permission_matcher(base).is_ok_and(|matcher| matcher.is_match(&path[..=at]))
 }
 
-/// The subtrees at or below `root` the caller reaches, decided from the realm
-/// and group roles together so a realm deny also applies, and narrowed by the
-/// credential's own restrictions. `root` selects the authorization documents.
-pub async fn reachable_roots(
-    context: &DriverContext,
-    auth_context: &AuthContext,
-    root: &str,
-) -> Result<Vec<String>, AuthorizationError> {
-    let rules = permission_rules(context, auth_context, root).await?;
-    Ok(readable_roots(
-        &rules.direct_patterns(),
-        auth_context.path_restrictions.as_deref(),
-        root,
-    ))
-}
-
-pub async fn permission_rules(
-    context: &DriverContext,
-    auth_context: &AuthContext,
-    root: &str,
-) -> Result<PermissionRules, AuthorizationError> {
-    drive(
-        PermissionRulesOperation::new(PermissionRulesConfig {
-            auth_context: auth_context.clone(),
-            path: root.to_string(),
-        }),
-        context,
-    )
-    .await
-}
-
 /// The caller's rules for a set of groups, collected once per request: every
 /// candidate path is then decided in memory instead of driving one permission
 /// check per path.
@@ -324,39 +290,6 @@ pub struct GroupPermissionRules {
 }
 
 impl GroupPermissionRules {
-    /// One rules drive per distinct group. Anonymous callers hold no rules, and
-    /// a group whose collection fails keeps none, so its records stay hidden.
-    pub async fn collect(
-        context: &DriverContext,
-        auth_context: Option<&AuthContext>,
-        group_ids: impl IntoIterator<Item = GroupId>,
-    ) -> Self {
-        let Some(auth_context) = auth_context else {
-            return Self::default();
-        };
-
-        let mut groups = HashMap::new();
-        for group_id in group_ids.into_iter().collect::<BTreeSet<_>>() {
-            let Ok(rules) = drive(
-                PermissionRulesOperation::new(PermissionRulesConfig {
-                    auth_context: auth_context.clone(),
-                    path: format!("/{}/g/{group_id}", auth_context.realm_id),
-                }),
-                context,
-            )
-            .await
-            else {
-                continue;
-            };
-            groups.insert(group_id, rules);
-        }
-
-        Self {
-            realm_id: Some(auth_context.realm_id),
-            groups,
-        }
-    }
-
     pub fn from_groups(
         realm_id: Option<RealmId>,
         groups: HashMap<GroupId, PermissionRules>,

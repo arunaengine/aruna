@@ -40,7 +40,7 @@ use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperati
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::node::node_info::seed_info_document;
-use aruna_operations::placement::policy::{SubjectScanMode, sync_subject};
+use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -848,15 +848,16 @@ async fn spawn_seed_at(
     // Advertised executors need this node's placement subject, which main.rs
     // reconciles before it seeds the document.
     if compute_enabled {
-        sync_subject(
-            context.as_ref(),
+        let mode = SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin);
+        let sync = SubjectSyncOperation::new(
             realm_id,
             net.node_id(),
-            SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin),
+            SubjectTrigger::Reconcile(mode),
             aruna_core::time::unix_timestamp_millis(),
-        )
-        .await
-        .map_err(std::io::Error::other)?;
+        );
+        drive(sync, context.as_ref())
+            .await
+            .map_err(std::io::Error::other)?;
     }
     seed_info_document(
         context.as_ref(),

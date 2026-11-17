@@ -4,14 +4,12 @@
 
 use super::transport::{MetadataWriteError, RetryDisposition, retry_disposition};
 use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
-use crate::placement::holds_placement;
-use crate::placement::resolve_shard_holders;
 use aruna_core::NodeId;
+use aruna_core::placement::holds_placement;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -50,47 +48,27 @@ pub fn write_route(
     MetadataWriteRoute::Forward(resolve_shard_holders(config, placement))
 }
 
-/// Whether the local node is a device. Devices cache the realm's documents, so
-/// their local checks are real, but they hold no metadata bucket: an effectful
-/// write goes to an ingress, which stays the authority for what it applies.
-pub async fn is_user_origin(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-) -> Result<bool, MetadataApiError> {
-    let config = drive(
-        crate::realm::get_config::GetConfigOperation::new(realm_id),
-        context.as_ref(),
-    )
-    .await
-    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let node = config
-        .nodes
-        .into_iter()
-        .find(|node| node.node_id == local_node_id.to_string())
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    Ok(!node.kind.is_sync_eligible())
+/// Whether the local node is a device; `None` when the config does not list it. Devices hold no
+/// metadata bucket, so an effectful write goes to an ingress, which stays its authority.
+pub fn is_user_origin(config: &RealmConfigDocument, local_node_id: NodeId) -> Option<bool> {
+    let local = local_node_id.to_string();
+    let node = config.nodes.iter().find(|node| node.node_id == local)?;
+    Some(!node.kind.is_sync_eligible())
 }
 
 /// Whether the origin currently holds a structured metadata document's bucket.
-pub async fn origin_holds_document(
-    context: &Arc<DriverContext>,
+/// `None` when the config does not list the local node or the id has no placement.
+pub fn origin_holds_document(
+    config: &RealmConfigDocument,
     realm_id: RealmId,
     local_node_id: NodeId,
     document_id: Ulid,
-) -> Result<bool, MetadataApiError> {
-    let config = drive(
-        crate::realm::get_config::GetConfigOperation::new(realm_id),
-        context.as_ref(),
-    )
-    .await
-    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+) -> Option<bool> {
     if !config.has_node(local_node_id) {
-        return Err(MetadataApiError::ServiceUnavailable);
+        return None;
     }
-    let placement = resolve_metadata_id(&config, realm_id, None, document_id)
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    Ok(holds_placement(&config, &placement, local_node_id))
+    let placement = resolve_metadata_id(config, realm_id, None, document_id).ok()?;
+    Some(holds_placement(config, &placement, local_node_id))
 }
 
 pub(crate) fn holds_metadata_id(

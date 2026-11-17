@@ -3,10 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::revoke_token::{
-    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
+    RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation, owner_cutoff,
 };
 use aruna_core::UserId;
-use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -25,18 +24,6 @@ use ulid::Ulid;
 pub(crate) fn cutoff_revocation(actor: Actor, issued_at: u64, now: u64) -> RevokeTokenConfig {
     let owner = actor.user_id;
     owner_cutoff(actor, owner, issued_at, now)
-}
-
-/// Moves `owner`'s token cutoff past `issued_at` on behalf of `actor`.
-pub fn owner_cutoff(actor: Actor, owner: UserId, issued_at: u64, now: u64) -> RevokeTokenConfig {
-    RevokeTokenConfig {
-        token_hash: user_cutoff_hash(&owner),
-        expires_at: user_cutoff_expiry(issued_at.saturating_add(1)),
-        token_owner: owner,
-        admission: RevokeTokenAdmission::Privileged,
-        actor,
-        now,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,7 +56,7 @@ pub enum RevokeSessionError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -116,7 +103,7 @@ impl RevokeSessionOperation {
         self.emit_error(RevokeSessionError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 
@@ -336,6 +323,7 @@ impl Operation for RevokeSessionOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
     use aruna_core::structs::identity::auth::SessionKind;
     use aruna_core::structs::identity::realm::RealmId;
 

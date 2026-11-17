@@ -21,6 +21,7 @@ use aruna_storage::StorageHandle;
 use futures_util::TryStreamExt;
 use tracing::warn;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::notifications::protocol::DIRTY_REALM_CAP;
 use crate::notifications::watch::authorization::filter_authorized_subscriptions;
@@ -28,7 +29,6 @@ use crate::notifications::watch::digest::{InterestOperation, catchall_digest, di
 use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
-use crate::realm::get_config::GetConfigOperation;
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 

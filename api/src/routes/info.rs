@@ -16,6 +16,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
 use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::placement::transition::transition_health;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
@@ -26,21 +27,22 @@ use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
-use aruna_operations::driver::{backend_used_bytes, drive};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::driver::drive;
 use aruna_operations::federation::totals::data_totals;
+use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
+use aruna_operations::node::heartbeat::held_heartbeats;
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
-use aruna_operations::placement::allocate_handle::{
-    HandleAllocationError, provision_metadata_binding,
-};
-use aruna_operations::placement::transition::transition_health;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::placement::allocate_handle::HandleAllocationError;
+use aruna_operations::placement::mutation::drive_placement_mutation;
+use aruna_operations::placement::provision::provision_metadata_binding;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
 use aruna_operations::realm::mutate_placement::{
-    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation,
 };
 use aruna_operations::realm::node_name::{NodeDisplays, ReadNamesOperation};
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
@@ -1074,7 +1076,7 @@ pub(crate) async fn run_realm_info(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+        aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.into()),
@@ -1521,7 +1523,7 @@ pub async fn get_realm_placement(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+        aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.into()),
@@ -1695,7 +1697,7 @@ pub async fn mutate_realm_placement(
             drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {
-                    aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+                    aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
                         ServerError::NotFound
                     }
                     other => ServerError::InternalError(other.into()),
@@ -1718,7 +1720,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         }
         HandleAllocationError::Append(error) => map_placement_error(error),
         HandleAllocationError::ReadConfig(
-            aruna_operations::realm::get_config::GetConfigError::DocumentNotFound,
+            aruna_operations::document_repository::GetConfigError::DocumentNotFound,
         ) => ServerError::NotFound,
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
@@ -2319,12 +2321,15 @@ async fn backend_statuses(
     let context = state.get_ctx();
     let mut statuses = Vec::with_capacity(backends.len());
     for backend in backends {
-        let used_bytes = backend_used_bytes(&context, &BackendRef::Node(backend.name.clone()))
-            .await
-            .inspect_err(
-                |error| warn!(backend = %backend.name, error = %error, "Backend usage unavailable"),
-            )
-            .ok();
+        let used_bytes = drive(
+            UsageOperation::new(BackendRef::Node(backend.name.clone())),
+            &context,
+        )
+        .await
+        .inspect_err(
+            |error| warn!(backend = %backend.name, error = %error, "Backend usage unavailable"),
+        )
+        .ok();
         statuses.push(BackendStatus {
             name: backend.name,
             backend: backend.backend_type.to_string(),

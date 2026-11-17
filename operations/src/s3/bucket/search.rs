@@ -29,7 +29,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::driver::DriverContext;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {

@@ -33,6 +33,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId};
 use aruna_core::{NodeId, StructuredId, UserId};
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
@@ -40,7 +41,6 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::projector::project_logged_events;
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};

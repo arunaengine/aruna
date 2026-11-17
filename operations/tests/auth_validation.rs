@@ -8,9 +8,8 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, validate_bearer_token,
-};
+use aruna_operations::auth::bearer_token::{ArunaValidationState, validate_bearer_token};
+use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::testing::sign_token;
 use async_trait::async_trait;
 use base64::Engine;

@@ -4,8 +4,8 @@
 
 use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, Permission, Role};
@@ -15,13 +15,36 @@ use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, PolicyPublicationClaim,
 };
 use aruna_core::structs::placement::policy::{PlacementSubject, VerifiedPolicy};
-use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
+use crate::metadata::protocol::{MetadataTransportMessage, decode_message};
 use crate::placement::policy::cache::{PolicyCacheEntry, cache_key};
 use crate::placement::policy::tests::{node, realm_authorization};
+
+/// The holders a holder fetch sub-operation asks, in order, and the request it sends them. Every
+/// holder is answered with a failure, so the walk visits all of them.
+pub(crate) fn fetch_requests(effects: Effects) -> (Vec<NodeId>, MetadataTransportMessage) {
+    let Some(Effect::SubOperation(mut fetch)) = effects.into_iter().next() else {
+        panic!("expected a holder fetch");
+    };
+    let (mut holders, mut asked) = (Vec::new(), None);
+    let mut next = fetch.start();
+    while let Some(Effect::Net(NetEffect::MetadataRequest(request))) = next.into_iter().next() {
+        asked.get_or_insert_with(|| decode_message(&request.frame).expect("request decodes"));
+        holders.push(request.peer);
+        next = fetch.step(Event::Net(NetEvent::MetadataAnswer(Box::new(
+            MetadataAnswer {
+                peer: request.peer,
+                elapsed: std::time::Duration::ZERO,
+                result: Err(PeerRequestError::Failed("test".to_string())),
+            },
+        ))));
+    }
+    (holders, asked.expect("the fetch asked a holder"))
+}
 
 /// The authorizing user every policy fixture publishes under.
 pub(crate) fn admin_user(realm_id: RealmId) -> UserId {

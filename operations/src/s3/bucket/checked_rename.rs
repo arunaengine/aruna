@@ -5,7 +5,8 @@
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 
 use super::rename::{RenameError, RenameInput, RenameKeysOperation, RenamePlan, renamed_key};
-use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
 
 /// Plans or applies a rename only with WRITE, by role and policy, on every old and new key.

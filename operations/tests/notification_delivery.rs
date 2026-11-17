@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
-use aruna_core::realm_vault::RealmSealKey;
+use aruna_core::realm_vault::RealmKeys;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
     NotificationTransportMessage,
@@ -22,6 +22,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::notifications::client::{
@@ -37,7 +38,6 @@ use aruna_operations::notifications::settings::{Delivery, MetadataPeers, deliver
 use aruna_operations::notifications::webhook::{
     WebhookOutcome, read_webhook, remove_webhook, set_webhook,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{drain_notification_outbox, start_task_queues};
 use aruna_storage::{FjallStorage, StorageHandle};
@@ -666,11 +666,13 @@ impl SettingRealm {
 
     async fn start(&self, index: usize) -> TestResult<TestNode> {
         let secret = [self.seed.wrapping_mul(4).wrapping_add(index as u8 + 1); 32];
-        let mut options = MetadataHandleOptions::default();
+        let options = MetadataHandleOptions::default();
+        let node = build_node(self.realm_id, Some(secret), None, Some(options)).await?;
         if index < 3 {
-            options = options.with_seal_key(RealmSealKey::derive(&self.realm_key));
+            let keys = RealmKeys::derive(&self.realm_key);
+            node.context.storage_handle.open_realm(keys);
         }
-        build_node(self.realm_id, Some(secret), None, Some(options)).await
+        Ok(node)
     }
 
     fn id(&self, index: usize) -> NodeId {

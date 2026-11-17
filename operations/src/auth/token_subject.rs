@@ -46,7 +46,7 @@ pub enum SubjectCheckError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("canonical user token subject check did not finish")]
     NotFinished,
@@ -79,7 +79,7 @@ impl SubjectCheckOperation {
         self.fail(SubjectCheckError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{got:?}"),
+            got: got.label(),
         })
     }
 

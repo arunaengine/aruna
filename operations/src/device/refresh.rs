@@ -18,11 +18,11 @@ use tracing::debug;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::realm::load_config::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
-use crate::placement::read_holder_sets;
+use crate::realm::load_config::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::placement::read_holder_sets;
 
 use super::install_graph::InstallGraphOperation;
 use super::replica::{ReplicaRecord, ReplicaState};

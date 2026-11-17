@@ -5,7 +5,9 @@
 pub mod bearer_token;
 pub mod check_permissions;
 pub mod create_token;
-pub mod forward;
+pub mod enforcement;
+pub mod epoch_due;
+pub mod error;
 pub mod permission_rules;
 pub mod request_authorization;
 pub mod request_policy;

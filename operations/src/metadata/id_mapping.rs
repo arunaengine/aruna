@@ -21,8 +21,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::placement::resolve_shard_holders;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry};
+use aruna_core::placement::resolve_shard_holders;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PersistentIdError {
@@ -95,7 +95,7 @@ pub(crate) fn mapping_route_for(
         placement,
         peers: resolve_shard_holders(config, &placement),
         actor,
-        generation: crate::placement::fence::write_generation(config, &placement).unwrap_or(0),
+        generation: aruna_core::placement::fence::write_generation(config, &placement).unwrap_or(0),
     })
 }
 

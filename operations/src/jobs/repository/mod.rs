@@ -21,8 +21,10 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use serde_json::Value;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::harvest::create_connector::INVENIO_TOKEN as CONNECTOR_TOKEN;
 use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, ReadConnectorError};

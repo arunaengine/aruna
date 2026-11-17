@@ -13,17 +13,17 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::auth::bearer_token::token_grant;
+use aruna_operations::auth::error::token_grant;
 use aruna_operations::driver::drive;
-use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
-use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_operations::groups::imports::cron::next_due;
-use aruna_operations::groups::imports::discovery::{authorized_renames, rename_guards};
-use aruna_operations::groups::imports::remove::RemoveImportOperation;
-use aruna_operations::groups::imports::schedule::{start_run, wake_schedule};
-use aruna_operations::groups::imports::{ImportRuleError, last_run, list_imports, read_import};
 use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
 use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
+use aruna_operations::s3::imports::change::{ChangeImportOperation, ImportChange};
+use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
+use aruna_operations::s3::imports::cron::next_due;
+use aruna_operations::s3::imports::discovery::{authorized_renames, rename_guards};
+use aruna_operations::s3::imports::remove::RemoveImportOperation;
+use aruna_operations::s3::imports::schedule::{start_run, wake_schedule};
+use aruna_operations::s3::imports::{ImportRuleError, last_run, list_imports, read_import};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -836,7 +836,7 @@ pub async fn get_renames(
         )));
     }
     let context = state.get_ctx();
-    let access = aruna_operations::groups::imports::discovery::bucket_access(
+    let access = aruna_operations::s3::imports::discovery::bucket_access(
         &context,
         &auth,
         state.get_node_id(),

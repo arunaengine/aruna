@@ -5,8 +5,8 @@
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::warn;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::realm::get_config::GetConfigOperation;
 
 /// The realm config of `realm_id`, or `None` with a warning when it cannot be read.
 pub async fn load_realm_config(

@@ -17,6 +17,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use ulid::Ulid;
 
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
 use crate::notifications::client::{
     HolderRequestOperation, listed, marked_read, unread_counted, watch_created, watch_deleted,
@@ -38,7 +39,6 @@ use crate::notifications::watch::records::{
     WatchSubscriptionError,
 };
 use crate::notifications::watch::subscriptions::{create_holder_watch, delete_holder_watch};
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
 /// Keeps holder resolution and net orchestration out of the REST layer so the

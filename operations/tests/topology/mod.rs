@@ -24,6 +24,11 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
+use aruna_core::placement::transition::{TransitionRequest, plan_transition};
+use aruna_core::placement::{
+    PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
+    resolve_shard_holders, strategy_for_target,
+};
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
@@ -42,6 +47,7 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
@@ -54,19 +60,12 @@ use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::projector::{project_logged_events, replay_event_log};
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::placement::expand_placement::expand_realm_placement;
-use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
-use aruna_operations::placement::{
-    PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
-    resolve_shard_holders, strategy_for_target,
-};
+use aruna_operations::placement::mutation::drive_placement_mutation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::get_nodes::GetNodesOperation;
-use aruna_operations::realm::mutate_placement::{
-    MutatePlacementConfig, RealmPlacementMutation, drive_placement_mutation,
-};
+use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
 use aruna_operations::sync::incoming::{initialize_incoming_fixture, initialize_net_holder};
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
@@ -1243,7 +1242,7 @@ async fn seed_config_topic(
         .ok_or("topology has no nodes")?;
     let target = DocumentTarget::RealmConfig { realm_id };
     let placement =
-        aruna_operations::placement::target_placement_ref(config, &target, Default::default());
+        aruna_core::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: seeder.node_id(),

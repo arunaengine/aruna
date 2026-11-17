@@ -35,9 +35,10 @@ use super::materialization_queue::metadata_graph_fence;
 use super::profile::cache::ProfileCache;
 use super::query_cache::MetadataQueryCache;
 use crate::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
-    realm_token_revoked, realm_user_cutoff,
+    ArunaValidationState, IssuerKeyCache, realm_linked_owner, realm_token_revoked,
+    realm_user_cutoff,
 };
+use crate::auth::error::ArunaBearerError;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
@@ -210,24 +211,7 @@ impl std::fmt::Display for MetadataRequestError {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct MetadataHandleOptions {
-    /// Present on management nodes only: opens realm vault records and serves fetches.
-    pub realm_vault_key: Option<Arc<aruna_core::realm_vault::RealmVaultKey>>,
-    /// Present on management nodes only: opens the secrets of notification settings.
-    pub realm_seal_key: Option<Arc<aruna_core::realm_vault::RealmSealKey>>,
-}
-
-impl MetadataHandleOptions {
-    pub fn with_vault_key(mut self, key: aruna_core::realm_vault::RealmVaultKey) -> Self {
-        self.realm_vault_key = Some(Arc::new(key));
-        self
-    }
-
-    pub fn with_seal_key(mut self, key: aruna_core::realm_vault::RealmSealKey) -> Self {
-        self.realm_seal_key = Some(Arc::new(key));
-        self
-    }
-}
+pub struct MetadataHandleOptions {}
 
 struct MetadataInner {
     storage_handle: StorageHandle,
@@ -237,8 +221,6 @@ struct MetadataInner {
     query_cache: MetadataQueryCache,
     profile_cache: ProfileCache,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
-    realm_vault_key: Option<Arc<aruna_core::realm_vault::RealmVaultKey>>,
-    realm_seal_key: Option<Arc<aruna_core::realm_vault::RealmSealKey>>,
     peer_contacts: PeerContacts,
     sync_pulls: crate::metadata::device_pull::PullRegistry,
     #[cfg(feature = "test-hooks")]
@@ -437,10 +419,11 @@ impl MetadataHandle {
         path: impl AsRef<Path>,
         storage_handle: StorageHandle,
         net_handle: Option<NetHandle>,
-        options: MetadataHandleOptions,
+        _options: MetadataHandleOptions,
     ) -> Self {
         // Range indexes sit beside the metadata store, so only a node with metadata keeps them.
-        storage_handle.install_range_indexes(RangeIndexes::new(path.as_ref().join(RANGE_INDEX_DIR)));
+        storage_handle
+            .install_range_indexes(RangeIndexes::new(path.as_ref().join(RANGE_INDEX_DIR)));
         Self {
             inner: Arc::new(MetadataInner {
                 auth_validation: AuthValidationState::new(
@@ -455,8 +438,6 @@ impl MetadataHandle {
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
                     super::protocol::INBOUND_FRAME_BYTES,
                 )),
-                realm_vault_key: options.realm_vault_key,
-                realm_seal_key: options.realm_seal_key,
                 peer_contacts: PeerContacts::default(),
                 sync_pulls: Default::default(),
                 #[cfg(feature = "test-hooks")]
@@ -547,16 +528,6 @@ impl MetadataHandle {
 
     pub(crate) fn visibility_generation(&self) -> u64 {
         self.inner.visibility_cache.current_generation()
-    }
-
-    /// The realm vault key; only management nodes hold one.
-    pub fn realm_vault_key(&self) -> Option<Arc<aruna_core::realm_vault::RealmVaultKey>> {
-        self.inner.realm_vault_key.clone()
-    }
-
-    /// The realm seal key; only management nodes hold one.
-    pub fn realm_seal_key(&self) -> Option<Arc<aruna_core::realm_vault::RealmSealKey>> {
-        self.inner.realm_seal_key.clone()
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next

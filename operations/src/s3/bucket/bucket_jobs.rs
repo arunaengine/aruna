@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::pause::PausedOperation;
-use crate::driver::{DriverContext, drive};
-use crate::groups::imports::cron::is_running;
-use crate::groups::imports::last_run;
+use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::jobs::store::state::read_job_record;
+use crate::s3::imports::cron::is_running;
+use crate::s3::imports::last_run;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};

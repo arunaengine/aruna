@@ -38,7 +38,7 @@ pub enum ReadAuthorizationError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("read realm authorization did not finish")]
     NotFinished,
@@ -73,7 +73,7 @@ impl ReadAuthorizationOperation {
             other => self.fail(ReadAuthorizationError::UnexpectedEvent {
                 state: format!("{:?}", self.state),
                 expected: "storage read result",
-                got: format!("{other:?}"),
+                got: other.label(),
             }),
         }
     }

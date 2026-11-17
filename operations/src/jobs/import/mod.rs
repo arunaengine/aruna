@@ -61,8 +61,10 @@ use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
 use super::store::{put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{drive, node_routing};
 use crate::forward::transport::MetadataWriteError;
+use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::store::query::list_job_entries;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
@@ -70,7 +72,7 @@ use crate::metadata::create_document::{
 use crate::metadata::forward::write::{route_metadata_create, route_metadata_update};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::emit::emit_metadata_created;
-use crate::realm::get_config::GetConfigOperation;
+use crate::placement::policy::{GateContextError, GateOperation};
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::BucketScope;
@@ -82,6 +84,7 @@ use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, Pu
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::storage::release::MembershipQuery;
+use aruna_core::time::unix_timestamp_millis;
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
 /// Longest wait for the source realm to confirm a grant.
@@ -922,17 +925,27 @@ async fn write_next(
     .map_err(|error| ImportFailure::Retryable(error.to_string()))?
     .quota
     .effective_group_ceiling(&bucket_info.group_id);
-    let routing = bucket_snapshot(&ctx.driver, &bucket_info)
-        .await
-        .map_err(|error| match error.storage() {
-            Some(_) => ImportFailure::Retryable(error.to_string()),
-            None => ImportFailure::Permanent(error.to_string()),
-        })?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&ctx.driver),
+            bucket_info.group_id,
+            BucketRules::of(&bucket_info),
+        ),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| match error.storage() {
+        Some(_) => ImportFailure::Retryable(error.to_string()),
+        None => ImportFailure::Permanent(error.to_string()),
+    })?;
     // The archive entry is external, so it carries no refs of its own: only
     // the destination default governs the imported object.
-    let gate = gate_context(&ctx.driver, spec.auth_context.realm_id, now_ms())
-        .await
-        .map_err(classify_gate)?;
+    let gate = drive(
+        GateOperation::new(spec.auth_context.realm_id, unix_timestamp_millis()),
+        &ctx.driver,
+    )
+    .await
+    .map_err(classify_gate)?;
     // A node that stopped admitting governed data imports nothing until the
     // transition it is in ends; the import resumes from its checkpoint.
     if gate.as_ref().is_some_and(|gate| !gate.admitting) {

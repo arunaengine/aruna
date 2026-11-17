@@ -27,12 +27,12 @@ use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::realm::assign_role::should_seed_role;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 /// The default realm role that carries WRITE on the whole realm admin tree.
 const ADMIN_ROLE: &str = "realm_admin";
@@ -101,7 +101,7 @@ pub enum SetAdminError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -252,7 +252,7 @@ impl SetAdminOperation {
         };
         self.state = SetAdminState::CommitTransaction;
         if self.narrowed {
-            return smallvec![crate::abe::mark_due(None, txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(None, txn_id)];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -278,7 +278,7 @@ impl SetAdminOperation {
         self.fail(SetAdminError::UnexpectedEvent {
             state,
             expected,
-            got: format!("{got:?}"),
+            got: got.label(),
         })
     }
 }
@@ -320,7 +320,7 @@ impl Operation for SetAdminOperation {
         }
         if self.state == SetAdminState::CommitTransaction
             && let Some(txn_id) = self.txn_id
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }

@@ -28,6 +28,7 @@ use aruna_core::structs::{
     PersistentIdStatus,
 };
 use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
@@ -37,7 +38,6 @@ use aruna_operations::metadata::persistent_id::forward::{
 };
 use aruna_operations::metadata::record_reads::load_document_record;
 use aruna_operations::metadata::secondary_ids::IdentifierMatch;
-use aruna_operations::realm::get_config::GetConfigOperation;
 
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};

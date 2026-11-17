@@ -6,12 +6,13 @@
 use std::sync::Arc;
 
 use aruna_core::MetaResourceId;
-use aruna_core::structured_id::StructuredId;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
@@ -20,7 +21,6 @@ use crate::metadata::create_document::{
 use crate::metadata::profile::rules::not_profiled_status;
 use crate::metadata::profile::validation::validate_submission;
 use crate::metadata::projector::schedule_projection_drain;
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 
 pub async fn create_metadata_document(
     mut template: CreateDocumentOperation,

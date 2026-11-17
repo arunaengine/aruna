@@ -69,7 +69,7 @@ pub async fn wake_unlocked(
     // Copies waiting for this source key run after promotion, so pending sources are hashed.
     let wake = crate::replication::parking::WakeParkedOperation::new(key, now_ms);
     let copies = drive(wake, context).await;
-    let envelopes = crate::abe::copies::complete_copies(context, key, origin).await;
+    let envelopes = crate::s3::abe_copies::complete_copies(context, key, origin).await;
     queued.map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
     resumed.map_err(KeyWakeError::Transition)?;
     copies.map_err(|error| KeyWakeError::Copies(error.to_string()))?;

@@ -25,9 +25,12 @@ use aruna_core::time::unix_timestamp_millis;
 use super::super::executor::{JobContext, JobRunOutcome};
 use super::super::store::state::flush_progress;
 use super::super::store::{put_purge_checkpoint, read_purge_checkpoint};
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::driver::{drive, drive_retry};
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::driver::drive;
+use crate::driver::drive_retry;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::BucketScope;
@@ -350,7 +353,7 @@ async fn abort_uploads(
                     bucket: upload.bucket,
                     key: upload.key,
                     upload_id: upload.upload_id,
-                    now_ms: crate::driver::now_ms(),
+                    now_ms: aruna_core::time::unix_timestamp_millis(),
                 })
                 .including_in_progress(),
                 &ctx.driver,

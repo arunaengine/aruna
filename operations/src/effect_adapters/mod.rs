@@ -6,15 +6,14 @@ mod audit;
 mod blob;
 mod metadata;
 mod net;
-pub mod routing;
 mod session;
 mod storage;
 mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
-use aruna_core::outbound::{OutboundEffect, OutboundError, OutboundEvent};
 use aruna_core::key_index::{IndexError, IndexEvent};
+use aruna_core::outbound::{OutboundEffect, OutboundError, OutboundEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -76,21 +75,6 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::AuditPage(audit)) => {
             Box::pin(audit::dispatch_audit_page(*audit, context, deadline)).await
         }
-        // Policy fetch resolves its holders in the operation and runs only the
-        // holder round-trips here.
-        Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
-            Box::pin(crate::placement::policy::fetch_policy(context, *fetch)).await,
-        )),
-        // Publication signing needs this node's key, which only the handle holds.
-        Effect::Net(NetEffect::PolicySign(claim)) => Event::Net(NetEvent::PolicySign(
-            crate::placement::policy::sign_publication(context, *claim),
-        )),
-        Effect::Net(NetEffect::VaultFetch(fetch)) => Event::Net(NetEvent::VaultFetch(
-            Box::pin(crate::users::vault_route::fetch_vault(context, *fetch)).await,
-        )),
-        Effect::Net(NetEffect::VaultSign(records)) => Event::Net(NetEvent::VaultSign(
-            crate::users::vault_route::sign_records(context, *records),
-        )),
         Effect::Net(NetEffect::Heartbeat(effect)) => {
             Box::pin(net::dispatch_heartbeat(*effect, context)).await
         }
@@ -125,6 +109,10 @@ async fn dispatch_unboxed(
                 None => Err("no metadata transport on this node".to_string()),
             };
             Event::Net(NetEvent::ArtifactStored(stored))
+        }
+        // The metadata transport lives in the metadata handle the runner holds.
+        Effect::Net(NetEffect::MetadataRequest(request)) => {
+            Box::pin(metadata::dispatch_request(*request, context)).await
         }
         // Notification frames and inbox wakes need the net handle the runner holds.
         Effect::Net(NetEffect::Notification(request)) => {

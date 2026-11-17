@@ -19,9 +19,10 @@ use thiserror::Error;
 
 use crate::auth::bearer_token::grant_valid;
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
-use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::is_sync_eligible;
+use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 
 /// Seconds a spent nonce outlives its ticket, for clocks that run behind the issuer's.
 const SPENT_MARGIN_SECS: u64 = 60;

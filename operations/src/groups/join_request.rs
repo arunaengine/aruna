@@ -4,7 +4,6 @@
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -20,6 +19,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::placement::target_placement_ref;
 use aruna_core::reducer::{AdminDocumentError, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -109,7 +109,7 @@ pub struct GroupJoinOperation {
     input: GroupJoinInput,
     state: State,
     txn_id: Option<TxnId>,
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     deletes: Vec<(KeySpace, Key)>,
     changed: bool,
     notifications: bool,
@@ -429,7 +429,10 @@ impl GroupJoinOperation {
         };
         self.state = State::Commit;
         if self.deny {
-            return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(
+                Some(self.input.group_id),
+                txn_id
+            )];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -524,7 +527,10 @@ impl Operation for GroupJoinOperation {
                 event @ Event::SubOperation(SubOperationEvent::EpochsMarked { .. }),
             ) if self.deny => {
                 self.deny = false;
-                match self.txn_id.and_then(|id| crate::abe::marked(&event, id)) {
+                match self
+                    .txn_id
+                    .and_then(|id| crate::auth::epoch_due::marked(&event, id))
+                {
                     Some(Ok(effects)) => effects,
                     Some(Err(error)) => self.fail(error.into()),
                     None => self.fail(GroupJoinError::UnexpectedEvent),

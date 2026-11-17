@@ -11,10 +11,11 @@ use aruna_core::structs::identity::group_delete::{
     GroupDeleteAction, GroupDeletePhase, GroupDeleteProof, GroupDeletionError,
 };
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::{ForwardAuthError, authorize_forwarded_caller, is_sync_eligible};
+use crate::forward::authorize::{ForwardAuthError, authorize_forwarded_caller};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
@@ -66,8 +67,9 @@ pub(super) async fn apply_control(
         .net_handle
         .as_ref()
         .ok_or_else(|| GroupDeletionError::Unavailable("network handle is missing".into()))?;
-    let config = load_realm_config(context, *net.realm_id())
+    let config = drive(GetConfigOperation::new(*net.realm_id()), context)
         .await
+        .ok()
         .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
     if !is_sync_eligible(&config, peer) {
         return Err(GroupDeletionError::Unauthorized);
@@ -140,7 +142,8 @@ pub(super) async fn apply_control(
             if caller.realm_id != *net.realm_id() {
                 return Err(GroupDeletionError::Unauthorized);
             }
-            super::check::check_node(context, &config, &caller, group_id, net.node_id()).await?;
+            super::coordinator::check_node(context, &config, &caller, group_id, net.node_id())
+                .await?;
             Ok(None)
         }
         GroupDeleteAction::Start { .. } => Err(GroupDeletionError::Invalid(

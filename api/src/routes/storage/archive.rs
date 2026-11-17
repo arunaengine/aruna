@@ -12,7 +12,8 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_operations::auth::bearer_token::{grant_valid, token_grant};
+use aruna_operations::auth::bearer_token::grant_valid;
+use aruna_operations::auth::error::token_grant;
 use aruna_operations::s3::object::archive::{
     EntryStatus, MemberCall, MemberRead, MemberReader, SelectionEntry, validate_selection,
     write_selection,

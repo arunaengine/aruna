@@ -130,8 +130,7 @@ impl ResolvePolicyOperation {
             [config, auth] => ([config, auth], None),
             [config, auth, (_, group)] => ([config, auth], Some(group)),
             other => {
-                return self
-                    .unexpected_event("realm config and authorization", format!("{other:?}"));
+                return self.unexpected_event("realm config and authorization", other.label());
             }
         };
         let Some(config_value) = config_value else {
@@ -159,7 +158,7 @@ impl ResolvePolicyOperation {
             Err(error) => return self.fail(error.into()),
         };
         let Some(authentic) = self.cached.take() else {
-            return self.unexpected_event("cached policy", String::new());
+            return self.unexpected_event("cached policy", "nothing");
         };
         if let Err(error) =
             verify_policy_authority(&authentic.document, &config, &auth, group_auth.as_ref())
@@ -249,7 +248,7 @@ impl ResolvePolicyOperation {
         self.finish()
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(ReadPolicyError::UnexpectedEvent {
             state,
@@ -306,25 +305,25 @@ impl Operation for ResolvePolicyOperation {
                     self.stats.misses = 1;
                     self.start_read()
                 }
-                other => self.unexpected_event("policy cache read", format!("{other:?}")),
+                other => self.unexpected_event("policy cache read", other.label()),
             },
             ResolveState::Revalidate => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     self.accept_cached(values)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("realm authority read", format!("{other:?}")),
+                other => self.unexpected_event("realm authority read", other.label()),
             },
             ResolveState::Resolve => {
                 let Some(reader) = self.reader.as_mut() else {
-                    return self.unexpected_event("active policy read", format!("{event:?}"));
+                    return self.unexpected_event("active policy read", event.label());
                 };
                 let effects = reader.step(event);
                 if !reader.is_complete() {
                     return effects;
                 }
                 let Some(reader) = self.reader.take() else {
-                    return self.unexpected_event("active policy read", String::new());
+                    return self.unexpected_event("active policy read", "nothing");
                 };
                 self.after_read(reader.finalize())
             }
@@ -356,7 +355,7 @@ impl Operation for ResolvePolicyOperation {
                     warn!(error = %error, "Policy cache scan failed");
                     self.finish()
                 }
-                other => self.unexpected_event("policy cache scan", format!("{other:?}")),
+                other => self.unexpected_event("policy cache scan", other.label()),
             },
             ResolveState::Evict => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_store(),
@@ -364,7 +363,7 @@ impl Operation for ResolvePolicyOperation {
                     warn!(error = %error, "Policy cache eviction failed");
                     self.finish()
                 }
-                other => self.unexpected_event("policy cache eviction", format!("{other:?}")),
+                other => self.unexpected_event("policy cache eviction", other.label()),
             },
             ResolveState::Store => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => self.finish(),
@@ -372,7 +371,7 @@ impl Operation for ResolvePolicyOperation {
                     warn!(error = %error, "Policy cache write failed");
                     self.finish()
                 }
-                other => self.unexpected_event("policy cache write", format!("{other:?}")),
+                other => self.unexpected_event("policy cache write", other.label()),
             },
             ResolveState::Init | ResolveState::Finish | ResolveState::Error => smallvec![],
         }
@@ -410,7 +409,6 @@ impl Operation for ResolvePolicyOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::effects::NetEffect;
     use aruna_core::events::{NetEvent, PolicyFetchEvent};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
@@ -501,10 +499,8 @@ mod pure_tests {
         operation.start();
         operation.step(read_result(None));
         let effects = operation.step(opened(None));
-        let Some(Effect::Net(NetEffect::PolicyFetch(fetch))) = effects.first() else {
-            panic!("a cache miss must resolve holders and fetch, got {effects:?}");
-        };
-        let holder = fetch.holders.as_slice()[0];
+        let (holders, _) = crate::tests::policy::fetch_requests(effects);
+        let holder = holders[0];
         operation.step(Event::Net(NetEvent::PolicyFetch(
             PolicyFetchEvent::Fetched {
                 publisher: holder,

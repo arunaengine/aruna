@@ -15,7 +15,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use ulid::Ulid;
 
-use crate::placement::transition::activation_holders;
+use aruna_core::placement::transition::activation_holders;
 use aruna_core::structs::execution::job::record_keys::{budget_key, id_key};
 
 /// The authenticated local view records of one family are judged against.

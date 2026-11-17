@@ -76,7 +76,7 @@ async fn check_page(
         None,
     )
     .await?;
-    let now_ms = crate::effect_adapters::routing::now_ms();
+    let now_ms = aruna_core::time::unix_timestamp_millis();
     for (key, value) in &heads {
         record.cursor = Some(key.to_vec());
         let head = BlobHeadKey::from_bytes(key.as_ref()).map_err(|error| error.to_string())?;
@@ -274,7 +274,8 @@ async fn clean_one(
     row: BrokenVersion,
     cleaned: &mut Cleaned,
 ) -> Result<bool, String> {
-    use crate::auth::request_authorization::{AuthorizeError, authorize};
+    use crate::auth::error::AuthorizeError;
+    use crate::auth::request_authorization::authorize;
     use crate::auth::request_policy::PolicyRequestExtras;
     use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
     use aruna_core::structs::identity::auth::Permission;

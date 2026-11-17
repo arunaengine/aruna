@@ -35,7 +35,7 @@ use ulid::Ulid;
 
 use super::CONFLICT_RETRIES;
 use crate::groups::update_group::{MAX_NAME_LEN, normalize_group_name};
-use crate::placement::target_placement_ref;
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -55,7 +55,7 @@ pub struct CreateGroupOperation {
     realm_config: Option<RealmConfigDocument>,
     /// Bucket the group's authorization rows publish onto, read inside the
     /// write transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: CreateGroupState,
     txn_id: Option<Ulid>,
     conflicts: u8,

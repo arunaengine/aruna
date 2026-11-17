@@ -4,10 +4,10 @@
 
 use super::GitError;
 use crate::driver::DriverContext;
-use crate::placement::fence::WriteFence;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::placement::fence::WriteFence;
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Writes one rebuildable row without a disk sync: a sync on the shared storage worker

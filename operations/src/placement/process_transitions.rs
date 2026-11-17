@@ -22,16 +22,17 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
-use crate::placement::fence::{fence_read, stored_generation};
-use crate::placement::transition::{
-    TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
-};
+use crate::placement::mutation::drive_placement_mutation;
 use crate::realm::mutate_placement::{
     CONFLICT_ATTEMPTS, MutatePlacementConfig, MutatePlacementError, MutatePlacementOperation,
-    RealmPlacementMutation, drive_placement_mutation, is_management,
+    RealmPlacementMutation, is_management,
 };
 use crate::shard::verify::converge_with_barrier;
 use crate::shard::{assemble_shard_manifest, frontier_root};
+use aruna_core::placement::fence::{fence_read, stored_generation};
+use aruna_core::placement::transition::{
+    TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
+};
 
 /// Runs every transition step the local node owns. Returns whether a step is
 /// still outstanding, so the caller re-arms the placement retry.
@@ -756,7 +757,12 @@ pub async fn close(
         {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected fence transaction result: {other:?}")),
+            other => {
+                return Err(format!(
+                    "unexpected fence transaction result: {}",
+                    other.label()
+                ));
+            }
         };
         let current = match storage
             .send_storage_effect(StorageEffect::Read {
@@ -779,7 +785,7 @@ pub async fn close(
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                return Err(format!("unexpected fence read result: {other:?}"));
+                return Err(format!("unexpected fence read result: {}", other.label()));
             }
         };
         if current.is_some_and(|current| current >= generation) {
@@ -813,7 +819,7 @@ pub async fn close(
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                return Err(format!("unexpected fence write result: {other:?}"));
+                return Err(format!("unexpected fence write result: {}", other.label()));
             }
         }
         match storage
@@ -829,7 +835,7 @@ pub async fn close(
                 error: StorageError::TransactionConflict,
             }) => continue,
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected fence commit result: {other:?}")),
+            other => return Err(format!("unexpected fence commit result: {}", other.label())),
         }
     }
     Err(StorageError::TransactionConflict.to_string())
@@ -837,10 +843,10 @@ pub async fn close(
 
 #[cfg(test)]
 mod tests {
-    use crate::placement::fence;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
+    use aruna_core::placement::fence;
     use aruna_core::reducer::{AdminDocumentState, overlay_placement};
     use std::path::Path;
 
@@ -1371,7 +1377,7 @@ mod tests {
 
         assert!(!document.placement_transitions[0].released(u64::MAX));
         assert!(
-            crate::placement::retained_departing_holder(&document, &_placement, node(1)),
+            aruna_core::placement::retained_departing_holder(&document, &_placement, node(1)),
             "a removed holder is still a retained publisher until it reports"
         );
     }

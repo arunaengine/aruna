@@ -25,12 +25,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::placement::target_placement_ref;
 use crate::realm::ensure_config::overlay_reducer_state;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 /// Which devices the caller may reach. The admin path is authorized on the
 /// realm's onboarding admin path before the operation runs, so here it only
@@ -451,8 +451,8 @@ impl Operation for RemoveNodeOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document_repository::GetConfigOperation;
     use crate::driver::{DriverContext, drive};
-    use crate::realm::get_config::GetConfigOperation;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;

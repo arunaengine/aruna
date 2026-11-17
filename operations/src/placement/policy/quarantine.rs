@@ -18,7 +18,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
+use aruna_core::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 
 use super::subject::{SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation};
 

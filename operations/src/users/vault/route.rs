@@ -7,41 +7,26 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::effects::{VaultFetchEffect, VaultQuery};
-use aruna_core::events::{VaultFetchEvent, VaultSignEvent};
-use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
+use aruna_core::effects::VaultQuery;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::identity::user::vault::{
-    MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, VaultRevision,
-    retain_newest_keys, user_record_prefix,
-};
-use serde::{Deserialize, Serialize};
+use aruna_core::structs::identity::user::vault::VaultRecords;
 use thiserror::Error;
-use tokio::time::timeout_at;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended};
-use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
+use super::read::LocalRecordsOperation;
+use super::write::{
+    AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended, VaultRefusal,
+};
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;
-use crate::placement::process_placements::load_realm_config;
-use crate::placement::{holds_placement, target_placement_ref};
-use crate::storage_read::iter_prefix_page;
-
-/// Saves one holder attempt makes when its transaction loses to a concurrent save.
-const CONFLICT_ATTEMPTS: usize = 3;
-
-/// Why a holder refused a forwarded vault change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VaultRefusal {
-    Invalid,
-    TooManyKeys,
-}
+use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
+use aruna_core::placement::{holds_placement, target_placement_ref};
 
 #[derive(Debug, Error)]
 pub enum VaultRouteError {
@@ -87,17 +72,9 @@ async fn append_local(
     context: &Arc<DriverContext>,
     config: AppendVaultConfig,
 ) -> Result<VaultAppended, AppendVaultError> {
-    let mut attempt = 1;
-    loop {
-        match drive(AppendVaultOperation::new(config.clone()), context.as_ref()).await {
-            Err(AppendVaultError::Storage(
-                aruna_core::errors::StorageError::TransactionConflict,
-            )) if attempt < CONFLICT_ATTEMPTS => {
-                attempt += 1;
-            }
-            result => return result,
-        }
-    }
+    let seed = config.record_id.to_bytes();
+    let build = || AppendVaultOperation::new(config.clone());
+    drive_retry(build, context.as_ref(), &seed).await
 }
 
 /// Runs one forwarded vault change for the user the forwarded token names.
@@ -177,8 +154,9 @@ async fn vault_caller(
             WritePeerError::Unavailable(_) => MetadataReadError::Unavailable,
         })?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
+    let config = drive(GetConfigOperation::new(realm_id), context)
         .await
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
     if auth.realm_id != realm_id
         || auth.path_restrictions.is_some()
@@ -187,102 +165,6 @@ async fn vault_caller(
         return Err(MetadataReadError::Forbidden);
     }
     Ok(auth.user_id)
-}
-
-/// Signs records this node publishes. A record naming another node stays unsigned and fails
-/// the whole batch, so no operation can sign for another origin.
-pub(crate) fn sign_records(context: &DriverContext, mut records: VaultRecords) -> VaultSignEvent {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return VaultSignEvent::Unavailable("net transport unavailable".to_string());
-    };
-    let node_id = net_handle.node_id();
-    let signed = match &mut records {
-        VaultRecords::Heads(heads) => heads.iter_mut().try_for_each(|head| {
-            (head.node_id == node_id).then_some(())?;
-            head.signature = Some(net_handle.sign(&head.signing_bytes().ok()?));
-            Some(())
-        }),
-        VaultRecords::Keys(keys) => keys.iter_mut().try_for_each(|key| {
-            (key.node_id == node_id).then_some(())?;
-            key.signature = Some(net_handle.sign(&key.signing_bytes().ok()?));
-            Some(())
-        }),
-    };
-    match signed {
-        Some(()) => VaultSignEvent::Signed(Box::new(records)),
-        None => VaultSignEvent::Unavailable("record names another publisher".to_string()),
-    }
-}
-
-/// Asks each holder in turn. A holder answering without records is a miss;
-/// only a complete absence of answers is unavailable.
-pub(crate) async fn fetch_vault(
-    context: &DriverContext,
-    effect: VaultFetchEffect,
-) -> VaultFetchEvent {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return VaultFetchEvent::Unavailable("metadata transport unavailable".to_string());
-    };
-    fetch_records(effect, |holder, request| {
-        metadata.request_forwarded_write(holder, request)
-    })
-    .await
-}
-
-async fn fetch_records<F, R, E>(effect: VaultFetchEffect, mut request: F) -> VaultFetchEvent
-where
-    F: FnMut(NodeId, MetadataTransportMessage) -> R,
-    R: std::future::Future<Output = Result<MetadataTransportMessage, E>>,
-    E: std::fmt::Display,
-{
-    let deadline = tokio::time::Instant::now() + effect.deadline;
-    let mut answered = false;
-    for (index, holder) in effect.holders.as_slice().iter().enumerate() {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let remaining = (effect.holders.as_slice().len() - index) as u32;
-        let attempt_deadline = now + deadline.duration_since(now) / remaining;
-        let message = MetadataTransportMessage::FetchVaultRecords {
-            user_id: effect.user_id,
-            query: effect.query.clone(),
-        };
-        let reply = match timeout_at(attempt_deadline, request(*holder, message)).await {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(error)) => {
-                warn!(peer = %holder, error = %error, "Vault fetch failed");
-                continue;
-            }
-            Err(_) => continue,
-        };
-        match reply {
-            MetadataTransportMessage::FetchedVaultRecords {
-                result: Ok(records),
-            } if records.is_empty() => answered = true,
-            MetadataTransportMessage::FetchedVaultRecords {
-                result: Ok(records),
-            } => {
-                return VaultFetchEvent::Fetched {
-                    holder: *holder,
-                    records,
-                };
-            }
-            MetadataTransportMessage::FetchedVaultRecords {
-                result: Err(MetadataReadError::Unauthorized | MetadataReadError::Forbidden),
-            } => return VaultFetchEvent::Denied,
-            MetadataTransportMessage::FetchedVaultRecords { result: Err(_) } => {}
-            other => warn!(
-                peer = %holder,
-                reply = transport_message_kind(&other),
-                "Unexpected vault fetch reply"
-            ),
-        }
-    }
-    if answered {
-        return VaultFetchEvent::NotFound;
-    }
-    VaultFetchEvent::Unavailable("no vault holder answered".to_string())
 }
 
 /// Serves this holder's records of one user to a peer.
@@ -307,10 +189,11 @@ async fn local_records(
         .net_handle
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
-    let config = load_realm_config(context, *net_handle.realm_id())
+    let config = drive(GetConfigOperation::new(*net_handle.realm_id()), context)
         .await
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
-    let (target, key_space, limit) = match query {
+    let (target, heads) = match query {
         VaultQuery::Heads { auth_token } => {
             if vault_caller(context, peer, auth_token).await? != user_id {
                 return Err(MetadataReadError::Forbidden);
@@ -320,7 +203,7 @@ async fn local_records(
                 user_id,
                 revision_id: Ulid::nil(),
             };
-            (target, VAULT_REVISION_KEYSPACE, MAX_VAULT_HEADS)
+            (target, true)
         }
         VaultQuery::Keys => {
             if !is_sync_eligible(&config, peer) {
@@ -331,7 +214,7 @@ async fn local_records(
                 user_id,
                 record_id: Ulid::nil(),
             };
-            (target, USER_KEY_KEYSPACE, MAX_KEY_RECORDS)
+            (target, false)
         }
     };
     let placement = target_placement_ref(&config, &target, Default::default());
@@ -339,225 +222,5 @@ async fn local_records(
     if !holds_placement(&config, &placement, net_handle.node_id()) {
         return Err(MetadataReadError::Unavailable);
     }
-    read_records(context, user_id, key_space, limit).await
-}
-
-async fn read_records(
-    context: &DriverContext,
-    user_id: UserId,
-    key_space: &str,
-    limit: usize,
-) -> Result<VaultRecords, MetadataReadError> {
-    let mut start = None;
-    let mut keys = Vec::new();
-    loop {
-        let (rows, next) = iter_prefix_page(
-            &context.storage_handle,
-            key_space,
-            Some(user_record_prefix(user_id)),
-            start,
-            limit,
-            None,
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?;
-        let values = rows.iter().map(|(_, value)| value.as_ref());
-        if key_space == VAULT_REVISION_KEYSPACE {
-            return Ok(VaultRecords::Heads(
-                values
-                    .map(VaultRevision::from_bytes)
-                    .collect::<Result<_, _>>()
-                    .map_err(|_| MetadataReadError::Unavailable)?,
-            ));
-        }
-        keys.extend(
-            values
-                .map(UserKeyRecord::from_bytes)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| MetadataReadError::Unavailable)?,
-        );
-        retain_newest_keys(&mut keys);
-        if next.is_none() {
-            return Ok(VaultRecords::Keys(keys));
-        }
-        start = next;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aruna_core::effects::HolderList;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::PlacementRef;
-    use std::time::Duration;
-
-    fn node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn fetch_effect() -> VaultFetchEffect {
-        VaultFetchEffect {
-            holders: HolderList::new(vec![node(1), node(2)]).unwrap(),
-            user_id: UserId::local(Ulid::from_bytes([7; 16]), RealmId::from_bytes([3; 32])),
-            query: VaultQuery::Keys,
-            deadline: Duration::from_secs(10),
-        }
-    }
-
-    #[tokio::test]
-    async fn serves_newest_keys() {
-        use aruna_core::effects::StorageEffect;
-        use aruna_core::events::{Event, StorageEvent};
-        use aruna_storage::storage::FjallStorage;
-
-        let dir = tempfile::tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-        let user_id = fetch_effect().user_id;
-        let writes = (1..=65)
-            .map(|id| {
-                let record = UserKeyRecord {
-                    realm_id: user_id.realm_id,
-                    user_id,
-                    record_id: Ulid::from_bytes([id; 16]),
-                    key_id: format!("key-{id}"),
-                    public_key: [1; 32],
-                    fingerprint: aruna_core::vault_format::key_fingerprint(&[1; 32]),
-                    has_recovery: false,
-                    node_id: node(1),
-                    placement: PlacementRef::NIL,
-                    created_at_ms: if id == 1 || id == 65 { 2 } else { 1 },
-                    signature: None,
-                };
-                (
-                    USER_KEY_KEYSPACE.to_string(),
-                    record.target().storage_key(),
-                    record.to_bytes().unwrap().into(),
-                )
-            })
-            .collect();
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::BatchWriteResult { .. })
-        ));
-        let VaultRecords::Keys(keys) =
-            read_records(&context, user_id, USER_KEY_KEYSPACE, MAX_KEY_RECORDS)
-                .await
-                .unwrap()
-        else {
-            panic!("expected keys");
-        };
-        assert_eq!(keys.len(), MAX_KEY_RECORDS);
-        assert_eq!(keys[0].record_id, Ulid::from_bytes([65; 16]));
-        assert_eq!(keys[1].record_id, Ulid::from_bytes([1; 16]));
-        assert!(
-            !keys
-                .iter()
-                .any(|key| key.record_id == Ulid::from_bytes([2; 16]))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn tries_later_holder() {
-        let effect = fetch_effect();
-        let record = UserKeyRecord {
-            realm_id: effect.user_id.realm_id,
-            user_id: effect.user_id,
-            record_id: Ulid::from_bytes([1; 16]),
-            key_id: "key-1".to_string(),
-            public_key: [1; 32],
-            fingerprint: aruna_core::vault_format::key_fingerprint(&[1; 32]),
-            has_recovery: false,
-            node_id: node(2),
-            placement: PlacementRef::NIL,
-            created_at_ms: 1,
-            signature: None,
-        };
-        let expected = VaultRecords::Keys(vec![record]);
-        let mut attempts = Vec::new();
-        let started = tokio::time::Instant::now();
-        let event = fetch_records(effect, |holder, _| {
-            attempts.push(holder);
-            let records = expected.clone();
-            async move {
-                if holder == node(1) {
-                    std::future::pending::<()>().await;
-                }
-                Ok::<_, &'static str>(MetadataTransportMessage::FetchedVaultRecords {
-                    result: Ok(records),
-                })
-            }
-        })
-        .await;
-        assert_eq!(attempts, [node(1), node(2)]);
-        assert_eq!(
-            tokio::time::Instant::now() - started,
-            Duration::from_secs(5)
-        );
-        assert!(
-            matches!(event, VaultFetchEvent::Fetched { holder, records } if holder == node(2) && records == expected)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn preserves_fetch_results() {
-        for case in 0..4 {
-            let mut attempts = Vec::new();
-            let started = tokio::time::Instant::now();
-            let event = fetch_records(fetch_effect(), |holder, _| {
-                attempts.push(holder);
-                async move {
-                    if case == 1 && holder == node(1) {
-                        return Ok::<_, &'static str>(
-                            MetadataTransportMessage::FetchedVaultRecords {
-                                result: Ok(VaultRecords::Keys(Vec::new())),
-                            },
-                        );
-                    }
-                    if (case == 2 && holder == node(2)) || case == 3 {
-                        return Ok(MetadataTransportMessage::FetchedVaultRecords {
-                            result: Err(MetadataReadError::Forbidden),
-                        });
-                    }
-                    std::future::pending::<Result<MetadataTransportMessage, &'static str>>().await
-                }
-            })
-            .await;
-            match case {
-                0 => {
-                    assert!(matches!(event, VaultFetchEvent::Unavailable(_)));
-                    assert_eq!(
-                        tokio::time::Instant::now() - started,
-                        Duration::from_secs(10)
-                    );
-                }
-                1 => assert!(matches!(event, VaultFetchEvent::NotFound)),
-                _ => assert!(matches!(event, VaultFetchEvent::Denied)),
-            }
-            assert_eq!(
-                attempts,
-                if case == 3 {
-                    vec![node(1)]
-                } else {
-                    vec![node(1), node(2)]
-                }
-            );
-        }
-    }
+    drive(LocalRecordsOperation::new(user_id, heads), context).await
 }

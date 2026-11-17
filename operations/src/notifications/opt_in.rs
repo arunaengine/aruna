@@ -20,10 +20,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::notifications::setting_rows::{
     SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
-use crate::realm::get_config::GetConfigOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EmailError {

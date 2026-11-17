@@ -43,19 +43,18 @@ use ulid::Ulid;
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::managed_copy::{
-    CopyRequest, serve_reads, split_serve_reads, validate_registration,
-};
 use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::held::{HeldElsewhere, kept_location, kept_reads};
-use crate::driver::now_ms;
 use crate::placement::policy::{
     GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::ensure_realm_peer;
 use crate::s3::object::get::reference_archive;
+use aruna_core::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+};
 
 #[derive(Debug, PartialEq)]
 pub enum BaoReadOutput {
@@ -87,7 +86,7 @@ pub enum BaoReadError {
     #[error("bao read did not finish")]
     NotFinished,
     #[error(transparent)]
-    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    ManagedCopy(#[from] aruna_core::managed_copy::ManagedCopyError),
     /// The requester must resolve these rules and ask again.
     #[error("the destination has not resolved every required placement policy")]
     PolicyRequired { refs: Vec<PlacementPolicyRef> },

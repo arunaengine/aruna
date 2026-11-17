@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::device::replica::ReplicaRecord;
-use crate::forward::authorize::peer_acts_for;
 use crate::forward::replay::create_record_matches;
 use crate::forward::replay::routed_record_matches;
 use crate::forward::routing::MetadataWriteRoute;
@@ -17,13 +16,14 @@ use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::handle::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
-use crate::placement::resolve_shard_holders;
+use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::metadata::MetadataMergedRevision;
 use aruna_core::metadata::ProfileValidationStatus;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;

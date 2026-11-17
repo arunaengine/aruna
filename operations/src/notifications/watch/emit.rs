@@ -12,6 +12,7 @@ use aruna_core::types::GroupId;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::notifications::client::{HolderRequestOperation, events_delivered};
 use crate::notifications::placement::filter_local_subscriptions;
@@ -19,7 +20,6 @@ use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
-use crate::realm::get_config::GetConfigOperation;
 
 /// Post-commit, best-effort emission of an origin watch event. Matches the
 /// in-memory interest table plus local durable subscriptions, then expands for

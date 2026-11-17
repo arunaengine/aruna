@@ -11,9 +11,8 @@ use aruna_core::audit::AuditPageBatch;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
-    DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, NetEvent,
-    PolicyFetchEvent, PolicySignEvent, SnapshotSignEvent, StatementSignEvent, StreamEvent,
-    VaultFetchEvent, VaultSignEvent,
+    DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, MetadataAnswer,
+    NetEvent, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::identity::realm::RealmId;
@@ -50,6 +49,8 @@ pub struct NetEffectContext {
     pub presence: RealmPresenceCache,
     pub tasks: TaskTracker,
     pub shutdown: CancellationToken,
+    /// This node's key, for the sign effects only the key holder may carry out.
+    pub secret_key: iroh::SecretKey,
     #[cfg(test)]
     pub(crate) refresh_probe: Option<Arc<RefreshProbe>>,
 }
@@ -228,24 +229,18 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         }
         // Policy, job-record, and launch protocols live in the operations
         // runner too; reaching this handler is a wiring bug, never a success.
-        NetEffect::PolicyFetch(_) => NetEvent::PolicyFetch(PolicyFetchEvent::Unavailable(
-            "policy fetch must be dispatched by the operations runner".to_string(),
-        )),
         NetEffect::JobRecord(_) => NetEvent::JobRecord(JobRecordEvent::Unavailable(
             "job-record replication must be dispatched by the operations runner".to_string(),
         )),
         NetEffect::LaunchOffer(_) => NetEvent::LaunchOffer(LaunchOfferEvent::Unavailable(
             "launch offer must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::PolicySign(_) => NetEvent::PolicySign(PolicySignEvent::Unavailable(
-            "policy publication signing must be dispatched by the operations runner".to_string(),
-        )),
-        NetEffect::VaultFetch(_) => NetEvent::VaultFetch(VaultFetchEvent::Unavailable(
-            "vault fetch must be dispatched by the operations runner".to_string(),
-        )),
-        NetEffect::VaultSign(_) => NetEvent::VaultSign(VaultSignEvent::Unavailable(
-            "vault signing must be dispatched by the operations runner".to_string(),
-        )),
+        NetEffect::PolicySign(claim) => {
+            NetEvent::PolicySign(crate::signing::sign_publication(&ctx.secret_key, *claim))
+        }
+        NetEffect::VaultSign(records) => {
+            NetEvent::VaultSign(crate::signing::sign_records(&ctx.secret_key, *records))
+        }
         NetEffect::SnapshotSign(claim) => {
             NetEvent::SnapshotSign(sign_snapshot(&ctx.secret_key, *claim))
         }
@@ -256,6 +251,14 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
         )),
+        // Metadata requests ride the metadata transport the runner holds.
+        NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
+            peer: request.peer,
+            elapsed: Duration::ZERO,
+            result: Err(PeerRequestError::Failed(
+                "metadata request must be dispatched by the operations runner".to_string(),
+            )),
+        })),
         // Notification requests and inbox wakes need the net handle, which the runner holds.
         NetEffect::Notification(_) => NetEvent::Notification(Err(
             "notification requests must be dispatched by the operations runner".to_string(),
@@ -564,16 +567,15 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Stream(_) => "stream",
         NetEffect::JobControl(_) => "job_control",
         NetEffect::AuditPage(_) => "audit_page",
-        NetEffect::PolicyFetch(_) => "policy_fetch",
         NetEffect::JobRecord(_) => "job_record",
         NetEffect::LaunchOffer(_) => "launch_offer",
         NetEffect::PolicySign(_) => "policy_sign",
-        NetEffect::VaultFetch(_) => "vault_fetch",
         NetEffect::VaultSign(_) => "vault_sign",
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
         NetEffect::Release(_) => "release",
         NetEffect::ArtifactStore(_) => "artifact_store",
+        NetEffect::MetadataRequest(_) => "metadata_request",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",
@@ -631,6 +633,7 @@ mod tests {
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
             shutdown: CancellationToken::new(),
+            secret_key: iroh::SecretKey::from_bytes(&[seed; 32]),
             refresh_probe: None,
         };
         (handle, context, directory, realm_id)
@@ -699,6 +702,7 @@ mod tests {
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
             shutdown: CancellationToken::new(),
+            secret_key: iroh::SecretKey::from_bytes(&[seed; 32]),
             refresh_probe: None,
         };
         (

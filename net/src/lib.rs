@@ -20,6 +20,7 @@ mod eviction;
 mod heartbeat;
 pub mod job_control;
 pub mod notification;
+mod signing;
 pub mod streams;
 mod tasks;
 mod telemetry;
@@ -1103,16 +1104,15 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
         Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
-        Effect::Net(NetEffect::PolicyFetch(_)) => "policy_fetch",
         Effect::Net(NetEffect::JobRecord(_)) => "job_record",
         Effect::Net(NetEffect::LaunchOffer(_)) => "launch_offer",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
-        Effect::Net(NetEffect::VaultFetch(_)) => "vault_fetch",
         Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
         Effect::Net(NetEffect::Release(_)) => "release",
         Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
+        Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
         Effect::Net(NetEffect::Notification(_)) => "notification",
         Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",

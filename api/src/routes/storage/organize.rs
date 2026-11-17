@@ -12,17 +12,17 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTask, RemapPlan};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::auth::bearer_token::token_grant;
+use aruna_operations::auth::error::token_grant;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
 use aruna_operations::driver::drive;
-use aruna_operations::groups::imports::discovery::bucket_access;
-use aruna_operations::groups::imports::last_run;
 use aruna_operations::s3::bucket::linked::{
     BucketJob, BucketJobOperation, LinkedAction, LinkedError, RenameTotalOperation,
     ShownJobOperation,
 };
 use aruna_operations::s3::bucket::remap::{self, RemapScope};
+use aruna_operations::s3::imports::discovery::bucket_access;
+use aruna_operations::s3::imports::last_run;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -778,14 +778,14 @@ pub async fn link_status(
             conflicts: Vec::new(),
         }));
     };
-    let rules = aruna_operations::groups::imports::discovery::read_discovery(
+    let rules = aruna_operations::s3::imports::discovery::read_discovery(
         &context,
         rule.group_id,
         rule.import_id,
     )
     .await
     .map_err(map_error)?;
-    let earlier = aruna_operations::groups::imports::read_earlier(&context, rule.import_id)
+    let earlier = aruna_operations::s3::imports::read_earlier(&context, rule.import_id)
         .await
         .map_err(map_error)?;
     let mut conflicts = Vec::new();

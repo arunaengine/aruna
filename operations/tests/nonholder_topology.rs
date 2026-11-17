@@ -19,6 +19,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
@@ -843,14 +844,14 @@ async fn bystander_writes_forward() -> TestResult<()> {
         .map_err(|error| format!("registry read failed: {error:?}"))?
         .ok_or("the non-holder must carry the registry row")?;
     assert_eq!(record.placement, placement);
-    assert!(
-        !origin_holds_document(
-            &bystander.context,
-            realm.realm_id,
-            bystander.node_id(),
-            document_id,
-        )
-        .await?
+    let config = drive(
+        GetConfigOperation::new(realm.realm_id),
+        bystander.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(
+        origin_holds_document(&config, realm.realm_id, bystander.node_id(), document_id),
+        Some(false)
     );
 
     update_routed(

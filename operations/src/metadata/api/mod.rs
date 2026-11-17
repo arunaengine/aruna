@@ -82,19 +82,13 @@ use super::summary_cache::summary_cache;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::permission_paths::ResolvePathsOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::record_reads::{load_document_record, record_materialized_read};
 use crate::metadata::repository::{
     LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
     parse_registry_read, read_document_registry,
-};
-use crate::placement::selector::{
-    ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
-};
-use crate::placement::{
-    holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
-    registry_strategy, resolve_holders_limit, resolve_shard_holders,
 };
 use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::realm::load_config::load_realm_config;
@@ -107,6 +101,13 @@ use crate::s3::object::search::{
 use crate::s3::object::search_scan::search_local_objects;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
+use aruna_core::placement::selector::{
+    ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
+};
+use aruna_core::placement::{
+    holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
+    registry_strategy, resolve_holders_limit, resolve_shard_holders,
+};
 
 mod bucket_page;
 mod distributed;
@@ -177,7 +178,7 @@ pub enum MetadataApiError {
     /// The bucket has no usable activation, so the request cannot be routed.
     /// Never absence: no holder was resolved to answer it.
     #[error("placement unavailable: {0}")]
-    PlacementUnavailable(crate::placement::PlacementResolveError),
+    PlacementUnavailable(aruna_core::placement::PlacementResolveError),
     #[error("{0}")]
     InvalidCursor(String),
     /// The query is valid for the client but cannot be run as asked.

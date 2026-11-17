@@ -40,13 +40,10 @@ use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::cleanup::process_cleanup_batch;
 use aruna_operations::blob::purge::{scope_totals, storage_files};
 use aruna_operations::blob::unify::{Unified, preview_page, unify};
-use aruna_operations::driver::{DriverContext, drive, routing_snapshot};
+use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
-use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_operations::groups::imports::discovery::{
-    FileOutcome, SetDiscoveryOperation, authorized_preview,
-};
+use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::jobs::backend_import::run_backend_import;
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::query::insert_job;
@@ -56,6 +53,10 @@ use aruna_operations::jobs::store::state::{
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
+use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
+use aruna_operations::s3::imports::discovery::{
+    FileOutcome, SetDiscoveryOperation, authorized_preview,
+};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::storage_read::iter_prefix_page;
 use aruna_storage::storage;
@@ -699,9 +700,16 @@ async fn s3_unifies_uploads() {
     let context = setup_context().await;
     place(&context, "x.txt", b"abc").await;
     assert_eq!(run_import(&context, 0xC3).await, (1, 0, 0));
-    let routing = routing_snapshot(&context.driver, context.group_id, BUCKET)
-        .await
-        .unwrap();
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&context.driver),
+            context.group_id,
+            BucketRules::Named(BUCKET.to_string()),
+        ),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let body = BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
         b"abc".to_vec(),
     )));

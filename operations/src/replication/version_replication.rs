@@ -2,11 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::permission_rules::PermissionRules;
-use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
-use crate::blob::managed_copy::{
-    CopyRequest, serve_reads, split_serve_reads, validate_registration,
-};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
@@ -31,6 +29,9 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
     SYNC_REFERENCE_KEYSPACE,
+};
+use aruna_core::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use aruna_core::native_reference::NATIVE_RELATIONSHIP_ID;
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -572,7 +573,7 @@ impl Operation for ReplicateScopeOperation {
 #[derive(Debug, Error, PartialEq)]
 pub enum ReplicateObjectError {
     #[error(transparent)]
-    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    ManagedCopy(#[from] aruna_core::managed_copy::ManagedCopyError),
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
     #[error("could not load the group's routing inputs: {0}")]

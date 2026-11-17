@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::request_authorization::AuthorizeError;
+use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
 use crate::device::edit::accepts_edits;
@@ -34,7 +34,6 @@ use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::update_metadata_document;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
-use crate::placement::resolve_shard_holders;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
@@ -42,6 +41,7 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataError;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -227,10 +227,11 @@ pub async fn create_metadata_authorized(
     if path.is_empty() {
         return Err(CreateAuthorizedError::EmptyPath);
     }
-    let user_origin = is_user_origin(context, realm_id, local_node_id).await?;
     let realm_config = load_realm_config(context, realm_id)
         .await
         .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let user_origin =
+        is_user_origin(&realm_config, local_node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
     let actor = Actor {
         node_id: local_node_id,
         user_id: auth.user_id,
@@ -326,7 +327,8 @@ impl PinnedCreate {
         let config = load_realm_config(context, actor.realm_id)
             .await
             .ok_or(MetadataApiError::ServiceUnavailable)?;
-        let user_origin = is_user_origin(context, actor.realm_id, actor.node_id).await?;
+        let user_origin =
+            is_user_origin(&config, actor.node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
         let local = match user_origin {
             true => Err(CreateDocumentError::HoldsNoBucket),
             false => mint_local_document(&config, actor, group_id, &path),

@@ -99,8 +99,8 @@ pub(super) async fn rename_access(
 pub(super) fn granted<T>(
     loaded: Result<T, crate::auth::request_authorization::AuthorizeError>,
 ) -> Result<Option<T>, String> {
-    use crate::auth::request_authorization::AuthorizeError;
-    use crate::auth::request_policy::PolicyEnforcementError;
+    use crate::auth::error::AuthorizeError;
+    use crate::auth::error::PolicyEnforcementError;
     match loaded {
         Ok(access) => Ok(Some(access)),
         Err(AuthorizeError::PermissionDenied)
@@ -116,7 +116,7 @@ pub async fn read_earlier(
 ) -> Result<Earlier, String> {
     let mut earlier = Earlier::new();
     for rule in &routing.imports {
-        let patterns = crate::groups::imports::read_earlier(context, rule.import_id).await;
+        let patterns = crate::s3::imports::read_earlier(context, rule.import_id).await;
         let patterns = patterns.map_err(|error| error.to_string())?;
         if !patterns.is_empty() {
             earlier.insert(rule.import_id, patterns);
@@ -180,7 +180,7 @@ pub async fn process_migrations(
         None,
     )
     .await?;
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     let mut next = None::<Duration>;
     let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
     for (key, _) in rows {
@@ -293,7 +293,7 @@ pub(super) async fn migrate_page(
         if !hand_over_moves(context, bucket, record.started_at_ms).await? {
             return Ok(Some(MIGRATION_CONTINUE));
         }
-        record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+        record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
         store_progress(context, bucket, &record, None).await?;
         return Ok(None);
     }
@@ -306,7 +306,7 @@ pub(super) async fn migrate_page(
         true => match move_routing(context, bucket).await? {
             Some(routing) => Some(routing),
             None => {
-                record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+                record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
                 store_progress(context, bucket, &record, None).await?;
                 return Ok(None);
             }
@@ -476,7 +476,7 @@ pub(super) async fn migrate_page(
             "Files the rename's caller may not write keep their name"
         );
     }
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     let after = match (more, record.failed > 0) {
         // This run moved the cursor, so the rows left can go on at once.
         (true, _) => Some(Duration::ZERO),
@@ -565,7 +565,7 @@ pub(super) async fn end_aborted(
         return Ok(Some(MIGRATION_CONTINUE));
     }
     record.retry_at_ms = None;
-    record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+    record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
     store_progress(context, bucket, &record, None).await?;
     Ok(None)
 }
@@ -975,7 +975,7 @@ async fn is_broken(context: &crate::driver::DriverContext, key: &Key) -> bool {
     let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
         return false;
     };
-    let now_ms = crate::effect_adapters::routing::now_ms();
+    let now_ms = aruna_core::time::unix_timestamp_millis();
     let operation = check::CheckVersionOperation::new(version_key, now_ms);
     let outcome = crate::driver::drive(operation, context).await;
     matches!(outcome, Ok(check::CheckOutcome::Broken(_)))
@@ -996,7 +996,15 @@ pub async fn move_routing(
     let Some(info) = info.map_err(|error| error.to_string())? else {
         return Ok(None);
     };
-    let snapshot = crate::effect_adapters::routing::bucket_snapshot(context, &info).await;
+    let snapshot = crate::driver::drive(
+        crate::groups::routing::SnapshotOperation::new(
+            &crate::driver::node_routing(context),
+            info.group_id,
+            crate::groups::routing::BucketRules::of(&info),
+        ),
+        context,
+    )
+    .await;
     snapshot.map(Some).map_err(|error| error.to_string())
 }
 

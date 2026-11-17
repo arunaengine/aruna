@@ -245,7 +245,7 @@ impl RevokeUserOperation {
     fn commit(&mut self, txn_id: TxnId) -> Effects {
         self.state = RevokeUserState::CommitTransaction;
         let group = self.access.as_ref().map(|access| access.group_id);
-        smallvec![crate::abe::mark_due(group, txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(group, txn_id)]
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -276,7 +276,7 @@ impl Operation for RevokeUserOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let (RevokeUserState::CommitTransaction, Some(txn_id)) = (&self.state, self.txn_id)
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.emit_error(error.into()));
         }

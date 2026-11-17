@@ -19,11 +19,11 @@ use aruna_tasks::TaskHandle;
 use tracing::warn;
 use url::Url;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::federation::publish::{PUBLISH_INTERVAL, Publication, PublishOperation, still_due};
 use crate::federation::totals::realm_totals;
 use crate::metadata::stats::{count_realm_documents, count_realm_groups};
-use crate::realm::get_config::GetConfigOperation;
 use crate::tasks::task_persistence::persist_task_effect;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

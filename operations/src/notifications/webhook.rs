@@ -17,6 +17,7 @@ use aruna_outbound::Backoffs;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::notifications::email::{job_error, no_transport};
@@ -27,7 +28,6 @@ use crate::notifications::setting_rows::{
 use crate::notifications::settings::{
     Delivery, MetadataPeers, SettingPeers, delivery_setting, managers,
 };
-use crate::realm::get_config::GetConfigOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum WebhookError {

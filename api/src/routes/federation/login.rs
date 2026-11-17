@@ -10,12 +10,12 @@ use crate::server::state::ServerState;
 use aruna_core::federation::{RealmDescriptor, Signed};
 use aruna_core::handoff::{HandoffError, LoginHandoff};
 use aruna_core::time::unix_timestamp_secs;
+use aruna_operations::document_repository::GetConfigError;
 use aruna_operations::driver::drive;
 use aruna_operations::federation::login::{
     FederatedLoginConfig, FederatedLoginError, FederatedLoginOperation, IssueHandoffConfig,
     IssueHandoffError, IssueHandoffOperation,
 };
-use aruna_operations::realm::get_config::GetConfigError;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -346,11 +346,10 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
-    use aruna_operations::auth::bearer_token::{
-        ArunaBearerError, ArunaValidationState, validate_bearer_claims,
-    };
+    use aruna_operations::auth::bearer_token::{ArunaValidationState, validate_bearer_claims};
+    use aruna_operations::auth::error::ArunaBearerError;
+    use aruna_operations::document_repository::GetConfigOperation;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_config::GetConfigOperation;
     use aruna_operations::testing::test_context;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;

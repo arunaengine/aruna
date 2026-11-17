@@ -10,6 +10,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::placement::{build_view, resolve_holders, resolve_shard_holders};
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -19,13 +20,12 @@ use aruna_core::structs::placement::record::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::{DocumentEffect, DocumentNetEvent, StructuredId};
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::node::node_info::seed_info_document;
-use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
@@ -518,7 +518,7 @@ async fn seed_config_topic(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let target = DocumentTarget::RealmConfig { realm_id };
     let placement =
-        aruna_operations::placement::target_placement_ref(config, &target, Default::default());
+        aruna_core::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),

@@ -44,11 +44,11 @@ use crate::metadata::profile::rules::{
     crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
 };
 use crate::metadata::repository::{create_projection_entries, read_document_registry};
-use crate::placement::{
+use crate::sync::shard_placement::sort_node_ids;
+use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
-use crate::sync::shard_placement::sort_node_ids;
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -532,7 +532,7 @@ impl CreateDocumentOperation {
             return self.append_create_event(&realm_config, placement, holders);
         }
         let (key_space, key) =
-            crate::placement::fence::fence_read(&route.realm_id, &route.placement);
+            aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
         self.pending_realm_config = Some(realm_config);
         self.pending_placement = Some(placement);
         self.pending_holders = holders;
@@ -1004,7 +1004,7 @@ impl Operation for CreateDocumentOperation {
                     ) else {
                         return self.fail(CreateDocumentError::PlacementFenced);
                     };
-                    if !crate::placement::fence::admits(value.as_ref(), route.generation) {
+                    if !aruna_core::placement::fence::admits(value.as_ref(), route.generation) {
                         return self.fail(CreateDocumentError::PlacementFenced);
                     }
                     self.append_create_event(&config, placement, holders)
@@ -1131,7 +1131,7 @@ mod tests {
 
     use crate::driver::DriverContext;
     use crate::metadata::MetadataHandle;
-    use crate::placement::resolve_shard_holders;
+    use aruna_core::placement::resolve_shard_holders;
 
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
         Actor {

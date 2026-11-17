@@ -19,9 +19,8 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::retry::RetryView;
 use super::scan_rows::{ScanRowsError, ScanRowsOperation};
-use crate::auth::bearer_token::token_grant;
+use crate::auth::error::token_grant;
 
 /// Entries one device may hold. A device authors for one person, so the queue
 /// is a human-sized backlog rather than an unbounded spool.

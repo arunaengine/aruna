@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::{DocumentTarget, ShardManifest, ShardManifestEntry};
+use aruna_core::placement::resolve_shard_holders;
+use aruna_core::placement::{
+    PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
+};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -15,10 +19,6 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::persistent_id::read_mapping;
-use aruna_operations::placement::resolve_shard_holders;
-use aruna_operations::placement::{
-    PlacementResolutionContext, choose_origin_bucket, meta_bucket_subject, strategy_for_target,
-};
 use aruna_operations::shard::assemble_shard_manifest;
 use ulid::Ulid;
 

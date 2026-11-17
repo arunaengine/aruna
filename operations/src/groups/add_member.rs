@@ -32,11 +32,11 @@ use thiserror::Error;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddUserInput {
@@ -51,7 +51,7 @@ pub struct AddUserOperation {
     input: AddUserInput,
     /// Bucket the authorization rows publish onto, read inside the write
     /// transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: AddUserState,
     conflicts: u8,
     output: Option<Result<GroupAuthorizationDocument, AddUserError>>,
@@ -175,15 +175,6 @@ impl AddUserOperation {
         }
     }
 
-    fn auth_context(&self) -> AuthContext {
-        AuthContext {
-            user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
-    }
-
     fn handle_authorization(&mut self, event: Event) -> Effects {
         let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
@@ -239,33 +230,13 @@ impl AddUserOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
+        let [auth_doc, reducer_state, realm_config] = match super::member_reads(event) {
+            Ok(values) => values,
+            Err((expected, got)) => {
+                return self.unexpected_event(self.state.clone(), expected, got);
+            }
         };
-        let [
-            (_, auth_doc_value),
-            (_, reducer_state_value),
-            (_, realm_config_value),
-        ] = values.as_slice()
-        else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult) with auth doc, admin state, and realm config values",
-                got,
-            );
-        };
-
-        match self.emit_auth_write(
-            txn_id,
-            auth_doc_value.clone(),
-            reducer_state_value.clone(),
-            realm_config_value.clone(),
-        ) {
+        match self.emit_auth_write(txn_id, auth_doc, reducer_state, realm_config) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
@@ -508,7 +479,10 @@ impl AddUserOperation {
             newly_added,
         };
         if deny {
-            return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(
+                Some(self.input.group_id),
+                txn_id
+            )];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -699,7 +673,7 @@ impl Operation for AddUserOperation {
 
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.auth_context(),
+                auth_context: AuthContext::from(&self.input.actor),
                 path: format!(
                     "/{}/g/{}/admin/users/{}",
                     self.input.actor.realm_id, self.input.group_id, self.input.user_id
@@ -718,47 +692,67 @@ impl Operation for AddUserOperation {
             Err(effects) => return effects,
         };
         if let AddUserState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
 
-        match self.state.clone() {
+        match &self.state {
             AddUserState::Auth => self.handle_authorization(event),
             AddUserState::StartTransaction => self.handle_start_transaction(event),
-            AddUserState::ReadAdminState { txn_id } => self.handle_auth_read(event, txn_id),
+            AddUserState::ReadAdminState { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_auth_read(event, txn_id)
+            }
             AddUserState::WriteAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 stale_conflict_deletes,
                 newly_added,
-            } => self.handle_auth_write(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                stale_conflict_deletes,
-                newly_added,
-            ),
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                let newly_added = newly_added.clone();
+                self.handle_auth_write(
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    stale_conflict_deletes,
+                    newly_added,
+                )
+            }
             AddUserState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 newly_added,
-            } => self.handle_conflict_deletes(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                newly_added,
-            ),
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let newly_added = newly_added.clone();
+                self.handle_conflict_deletes(
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    newly_added,
+                )
+            }
             AddUserState::ReadBucketFence {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 newly_added,
             } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let newly_added = newly_added.clone();
                 self.handle_bucket_fence(event, txn_id, auth_doc, admin_outbox_written, newly_added)
             }
             AddUserState::CommitTransaction {
@@ -766,16 +760,30 @@ impl Operation for AddUserOperation {
                 admin_outbox_written,
                 newly_added,
                 ..
-            } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written, newly_added),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let newly_added = newly_added.clone();
+                self.handle_commit_transaction(event, auth_doc, admin_outbox_written, newly_added)
+            }
             AddUserState::ScheduleDocumentDrain {
                 auth_doc,
                 newly_added,
-            } => self.handle_drain_schedule(event, auth_doc, newly_added),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let newly_added = newly_added.clone();
+                self.handle_drain_schedule(event, auth_doc, newly_added)
+            }
             AddUserState::AnnounceAuthDoc {
                 auth_doc,
                 newly_added,
-            } => self.handle_auth_announce(event, auth_doc, newly_added),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let newly_added = newly_added.clone();
+                self.handle_auth_announce(event, auth_doc, newly_added)
+            }
             AddUserState::EmitNotifications { auth_doc } => {
+                let auth_doc = auth_doc.clone();
                 self.handle_emit_notifications(auth_doc)
             }
             AddUserState::Init | AddUserState::Finish | AddUserState::Error => {
@@ -1189,7 +1197,7 @@ pub mod test {
         for seed in 20..24u8 {
             realm_config.ensure_node(node(seed), RealmNodeKind::Server);
         }
-        let expected_placement = crate::placement::target_placement_ref(
+        let expected_placement = aruna_core::placement::target_placement_ref(
             &realm_config,
             &document_target,
             Default::default(),

@@ -13,7 +13,8 @@ use super::{
     Access, BucketScope, MembersConfig, MembersOutput, MembershipCaller, MembershipQuery,
     ReleaseError, ReleaseMembersOperation,
 };
-use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
 
 /// Loads the caller's access once, then runs the membership check.

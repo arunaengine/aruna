@@ -26,10 +26,10 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetGroupConfig {
@@ -53,7 +53,7 @@ pub struct SetGroupOperation {
     txn_id: Option<TxnId>,
     /// Bucket the authorization row publishes onto, read inside the write
     /// transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: SetGroupState,
     conflicts: u8,
     output: Option<Result<GroupAuthorizationDocument, SetGroupError>>,
@@ -111,7 +111,7 @@ pub enum SetGroupError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -296,7 +296,10 @@ impl SetGroupOperation {
             return self.fail(SetGroupError::MissingTransaction);
         };
         self.state = SetGroupState::CommitTransaction { document };
-        smallvec![crate::abe::mark_due(Some(self.config.group_id), txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(
+            Some(self.config.group_id),
+            txn_id
+        )]
     }
 
     fn fail(&mut self, error: SetGroupError) -> Effects {
@@ -306,7 +309,7 @@ impl SetGroupOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(SetGroupError::UnexpectedEvent {
             state,
@@ -337,11 +340,11 @@ impl Operation for SetGroupOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let (SetGroupState::CommitTransaction { .. }, Some(txn_id)) = (&self.state, self.txn_id)
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
-        match self.state.clone() {
+        match &self.state {
             SetGroupState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -363,14 +366,14 @@ impl Operation for SetGroupOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             SetGroupState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             SetGroupState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -382,7 +385,7 @@ impl Operation for SetGroupOperation {
                     else {
                         return self.unexpected_event(
                             "storage batch read result with group auth doc, admin state, and realm config",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self.emit_write_state(
@@ -395,63 +398,76 @@ impl Operation for SetGroupOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             SetGroupState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetGroupError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = SetGroupState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(SetGroupError::MissingTransaction);
+                        };
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = SetGroupState::DeleteAdminConflicts { document };
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit_transaction(document)
                     }
-                    self.emit_commit_transaction(document)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            SetGroupState::DeleteAdminConflicts { document } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
-            SetGroupState::ReadBucketFence { document } => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    if self.fence.admits(&values) {
-                        self.emit_commit(document)
-                    } else {
-                        self.fail(SetGroupError::PlacementFenced)
+            }
+            SetGroupState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                        self.emit_commit_transaction(document)
                     }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
-            },
-            SetGroupState::CommitTransaction { document } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = SetGroupState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    if error == StorageError::TransactionConflict
-                        && self.conflicts < super::CONFLICT_RETRIES
-                    {
-                        return self.restart_after_conflict();
+            }
+            SetGroupState::ReadBucketFence { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                        if self.fence.admits(&values) {
+                            self.emit_commit(document)
+                        } else {
+                            self.fail(SetGroupError::PlacementFenced)
+                        }
                     }
-                    self.fail(error.into())
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("bucket fence read result", other.label()),
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
+            }
+            SetGroupState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                        self.txn_id = None;
+                        self.state = SetGroupState::ScheduleSyncDrain { document };
+                        smallvec![schedule_drain_effect()]
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        self.txn_id = None;
+                        if error == StorageError::TransactionConflict
+                            && self.conflicts < super::CONFLICT_RETRIES
+                        {
+                            return self.restart_after_conflict();
+                        }
+                        self.fail(error.into())
+                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
+                }
+            }
             SetGroupState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = SetGroupState::Finish;
@@ -462,10 +478,8 @@ impl Operation for SetGroupOperation {
                     self.state = SetGroupState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             SetGroupState::Finish | SetGroupState::Error | SetGroupState::Init => {
                 smallvec![]
@@ -505,9 +519,9 @@ fn apply_reducer_policies(
 #[cfg(test)]
 mod tests {
     use super::{SetGroupConfig, SetGroupError, SetGroupOperation, SetGroupState};
+    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::{AuthorizationError, StorageError};

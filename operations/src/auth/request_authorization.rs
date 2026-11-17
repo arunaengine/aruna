@@ -4,45 +4,21 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, enforce_policies,
-    policy_request_with,
+use crate::auth::enforcement::{PolicyEvaluator, enforce_policies};
+use crate::auth::error::{AuthorizeError, check_error};
+use crate::auth::permission_rules::{
+    GroupPermissionRules, PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
-use aruna_core::errors::{AuthorizationError, StorageError};
+use aruna_core::errors::AuthorizationError;
+use aruna_core::permission_path::readable_roots;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::types::GroupId;
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum AuthorizeError {
-    #[error("permission denied")]
-    PermissionDenied,
-    #[error(transparent)]
-    Policy(#[from] PolicyEnforcementError),
-    /// Storage failed while deciding the request: an infrastructure fault that
-    /// callers must not present as an authorization verdict.
-    #[error(transparent)]
-    Storage(StorageError),
-    #[error("authorization check failed: {0}")]
-    CheckFailed(String),
-}
-
-/// A missing or malformed target is an authorization failure, not an internal error, matching
-/// the choke points that fed this boundary.
-pub(crate) fn check_error(error: AuthorizationError) -> AuthorizeError {
-    match error {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::DocNotFound => AuthorizeError::PermissionDenied,
-        AuthorizationError::StorageError(error) => AuthorizeError::Storage(error),
-        other => AuthorizeError::CheckFailed(other.to_string()),
-    }
-}
+use std::collections::{BTreeSet, HashMap};
 
 /// Authorizes one action: ordinary RBAC and public visibility first, then the
 /// realm and group deny/require policies. Neither layer may grant what the
@@ -134,7 +110,7 @@ pub struct BucketAccess {
     auth: AuthContext,
     bucket_path: String,
     rules: crate::auth::permission_rules::PermissionRules,
-    policies: crate::auth::request_policy::PolicyEvaluator,
+    policies: crate::auth::enforcement::PolicyEvaluator,
 }
 
 impl BucketAccess {
@@ -181,5 +157,68 @@ impl BucketAccess {
         self.allows(key, &Permission::READ)
             && self.rules.reads_below(&below)
             && !self.policies.reads_path()
+    }
+}
+
+/// The subtrees at or below `root` the caller reaches, decided from the realm
+/// and group roles together so a realm deny also applies, and narrowed by the
+/// credential's own restrictions. `root` selects the authorization documents.
+pub async fn reachable_roots(
+    context: &DriverContext,
+    auth_context: &AuthContext,
+    root: &str,
+) -> Result<Vec<String>, AuthorizationError> {
+    let rules = permission_rules(context, auth_context, root).await?;
+    Ok(readable_roots(
+        &rules.direct_patterns(),
+        auth_context.path_restrictions.as_deref(),
+        root,
+    ))
+}
+
+pub async fn permission_rules(
+    context: &DriverContext,
+    auth_context: &AuthContext,
+    root: &str,
+) -> Result<PermissionRules, AuthorizationError> {
+    drive(
+        PermissionRulesOperation::new(PermissionRulesConfig {
+            auth_context: auth_context.clone(),
+            path: root.to_string(),
+        }),
+        context,
+    )
+    .await
+}
+
+impl GroupPermissionRules {
+    /// One rules drive per distinct group. Anonymous callers hold no rules, and
+    /// a group whose collection fails keeps none, so its records stay hidden.
+    pub async fn collect(
+        context: &DriverContext,
+        auth_context: Option<&AuthContext>,
+        group_ids: impl IntoIterator<Item = GroupId>,
+    ) -> Self {
+        let Some(auth_context) = auth_context else {
+            return Self::default();
+        };
+
+        let mut groups = HashMap::new();
+        for group_id in group_ids.into_iter().collect::<BTreeSet<_>>() {
+            let Ok(rules) = drive(
+                PermissionRulesOperation::new(PermissionRulesConfig {
+                    auth_context: auth_context.clone(),
+                    path: format!("/{}/g/{group_id}", auth_context.realm_id),
+                }),
+                context,
+            )
+            .await
+            else {
+                continue;
+            };
+            groups.insert(group_id, rules);
+        }
+
+        Self::from_groups(Some(auth_context.realm_id), groups)
     }
 }

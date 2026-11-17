@@ -4,15 +4,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use aruna_core::NodeId;
-use aruna_core::document::DocumentTarget;
-use aruna_core::structs::identity::realm::{ClassStrategyError, RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::record::{
+use crate::NodeId;
+use crate::document::DocumentTarget;
+use crate::structs::identity::realm::{ClassStrategyError, RealmConfigDocument, RealmId};
+use crate::structs::placement::record::{
     AffinityEffect, BindingScope, DocumentClass, LabelMatch, PlacementOverride, PlacementStrategy,
 };
-use aruna_core::structs::placement::transition::{CandidateMapNode, CandidatePlacementMap};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::GroupId;
+use crate::structs::placement::transition::{CandidateMapNode, CandidatePlacementMap};
+use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use crate::types::GroupId;
 
 use crate::placement::selector::{ROLE_LOCATION, ROLE_NODE, rank_weighted};
 
@@ -403,7 +403,7 @@ fn resolve_class_strategy(
 
 /// Length of the normalized prefix when it equals `normalized_path` or is one of
 /// its `/`-boundary ancestors; `None` otherwise.
-pub(crate) fn path_prefix_match(normalized_path: &str, prefix: &str) -> Option<usize> {
+pub fn path_prefix_match(normalized_path: &str, prefix: &str) -> Option<usize> {
     let prefix = MetadataRegistryRecord::normalize_document_path(prefix);
     if prefix.is_empty()
         || normalized_path == prefix
@@ -432,14 +432,14 @@ fn binding_strategy<'a>(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
-    use aruna_core::admin_documents::AdminDocumentTarget;
-    use aruna_core::reducer::{AdminDocumentState, overlay_placement};
-    use aruna_core::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
-    use aruna_core::structs::placement::record::{
+    use crate::UserId;
+    use crate::admin_documents::AdminDocumentTarget;
+    use crate::reducer::{AdminDocumentState, overlay_placement};
+    use crate::structs::identity::realm::{RealmId, RealmNode, RealmNodeKind};
+    use crate::structs::placement::record::{
         AffinityRule, DEFAULT_LOCATION, DEFAULT_NODE_WEIGHT, NodePlacementEntry, StrategyBinding,
     };
-    use aruna_core::structs::storage::node_info::{KIND_LABEL_KEY, LOCATION_LABEL_KEY};
+    use crate::structs::storage::node_info::{KIND_LABEL_KEY, LOCATION_LABEL_KEY};
     use proptest::prelude::*;
     use ulid::Ulid;
 
@@ -1179,7 +1179,7 @@ mod pure_tests {
 
     #[test]
     fn variants_share_shard() {
-        use aruna_core::structs::placement::record::shard_for_subject;
+        use crate::structs::placement::record::shard_for_subject;
 
         let document_id = sid(4);
         let variants = [

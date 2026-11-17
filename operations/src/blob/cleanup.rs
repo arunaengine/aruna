@@ -28,10 +28,11 @@ use ulid::Ulid;
 
 use crate::blob::release::release_renamed;
 use crate::blob::trail::DropTrailOperation;
-use crate::driver::{DriverContext, drive, now_ms};
+use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{backend_key, parse_read};
 use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 use crate::storage_read::iter_prefix_page;
+use aruna_core::time::unix_timestamp_millis;
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -461,7 +462,7 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             upload_id,
             since_ms,
         } => {
-            let now = crate::effect_adapters::routing::now_ms();
+            let now = aruna_core::time::unix_timestamp_millis();
             // A copy may still be running; only an upload past the grace is its leftover.
             if now < since_ms.saturating_add(SETTLE_GRACE_MS) {
                 return RowOutcome::Kept;
@@ -561,7 +562,7 @@ async fn reconcile_target(
         }
     }
     let opened_ms = location.ulid.timestamp_ms();
-    if now_ms().saturating_sub(opened_ms) < BLOB_CLEANUP_AFTER.as_millis() as u64 {
+    if unix_timestamp_millis().saturating_sub(opened_ms) < BLOB_CLEANUP_AFTER.as_millis() as u64 {
         return RowOutcome::Kept;
     }
     // Read after the upload: a completion replaces this row in the commit that removes it.
@@ -1169,7 +1170,7 @@ mod tests {
             upload_id: "upload".to_string(),
             since_ms,
         };
-        let now = crate::effect_adapters::routing::now_ms();
+        let now = aruna_core::time::unix_timestamp_millis();
         let fresh = super::run_cleanup_work(&context, settle(now)).await;
         assert!(matches!(fresh, super::RowOutcome::Kept));
         // This context has no blob storage, so the abort cannot run and the row stays.

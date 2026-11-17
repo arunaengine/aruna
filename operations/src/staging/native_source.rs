@@ -28,12 +28,14 @@ use tokio::time::timeout;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::nonce::SpendNonceOperation;
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::is_sync_eligible;
 use crate::realm::load_config::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,

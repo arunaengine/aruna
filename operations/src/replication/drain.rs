@@ -44,7 +44,7 @@ use super::retire::{BlobJobOutcome, RetireJobOperation};
 use super::version_replication::{
     ReplicateScopeError, ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,
 };
-use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
+use crate::driver::{DriverContext, drive};
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
@@ -429,7 +429,12 @@ async fn process_blob_job(
     if job.reference_advance.is_some() && job.relationship_id.is_none() {
         return Ok(BlobJobOutcome::Failed);
     }
-    let routing = match quota_marked_routing(context).await {
+    let routing = match crate::driver::drive(
+        crate::groups::routing::QuotaOperation::new(crate::driver::node_routing(context)),
+        context,
+    )
+    .await
+    {
         Ok(routing) => routing,
         // Retrying a record that will never decode only pins the queue at its
         // backoff ceiling; the drain repair re-enqueues once it is repaired.
@@ -441,7 +446,15 @@ async fn process_blob_job(
     };
     // Reference materialization writes real bytes on this node, so the job
     // carries this node's destination details; a node mid-transition refuses.
-    let gate = match gate_context(context, job.input.auth_context.realm_id, now_ms()).await {
+    let gate = match crate::driver::drive(
+        crate::placement::policy::GateOperation::new(
+            job.input.auth_context.realm_id,
+            aruna_core::time::unix_timestamp_millis(),
+        ),
+        context,
+    )
+    .await
+    {
         Ok(gate) => gate,
         Err(error) => return Err(error.to_string()),
     };

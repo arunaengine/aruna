@@ -33,11 +33,11 @@ use ulid::Ulid;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 /// The profile a realm admin enters. A missing password keeps the stored one for the same username.
 #[derive(Debug, PartialEq)]
@@ -113,7 +113,7 @@ pub enum SetEmailError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -359,7 +359,7 @@ impl SetEmailOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(SetEmailError::UnexpectedEvent {
             state,
@@ -389,7 +389,7 @@ impl Operation for SetEmailOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             SetEmailState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -402,21 +402,21 @@ impl Operation for SetEmailOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             SetEmailState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             SetEmailState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self
@@ -427,33 +427,36 @@ impl Operation for SetEmailOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             SetEmailState::WriteDocumentState {
                 stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetEmailError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = SetEmailState::DeleteAdminConflicts;
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+            } => {
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(SetEmailError::MissingTransaction);
+                        };
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = SetEmailState::DeleteAdminConflicts;
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit_transaction()
                     }
-                    self.emit_commit_transaction()
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
+            }
             SetEmailState::DeleteAdminConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch delete result", other.label()),
             },
             SetEmailState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -471,7 +474,7 @@ impl Operation for SetEmailOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
             SetEmailState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -483,10 +486,8 @@ impl Operation for SetEmailOperation {
                     self.state = SetEmailState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             SetEmailState::Finish | SetEmailState::Error | SetEmailState::Init => smallvec![],
         }

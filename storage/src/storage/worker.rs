@@ -88,7 +88,8 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         StorageEffect::StartTransaction { .. }
         | StorageEffect::CommitTransaction { .. }
         | StorageEffect::AbortTransaction { .. }
-        | StorageEffect::SyncAll => None,
+        | StorageEffect::SyncAll
+        | StorageEffect::RealmOpen(_) => None,
     }
 }
 const STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
@@ -290,10 +291,11 @@ impl FjallStorage {
                 prefix,
                 txn_id,
             } => self.last(key_space, prefix, txn_id),
-            // The handle turns vault effects into row effects before they are queued.
+            // The handle runs vault and realm key effects before anything is queued.
             StorageEffect::VaultWrite { .. }
             | StorageEffect::VaultRead { .. }
-            | StorageEffect::VaultDelete { .. } => StorageEvent::Error {
+            | StorageEffect::VaultDelete { .. }
+            | StorageEffect::RealmOpen(_) => StorageEvent::Error {
                 error: StorageError::InvalidEffect,
             },
             StorageEffect::BeginUsageRebuild { key_space } => self.begin_usage_rebuild(key_space),

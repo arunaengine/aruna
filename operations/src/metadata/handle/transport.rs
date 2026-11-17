@@ -24,9 +24,12 @@ use super::{
     MetadataInner, MetadataRequestError, PAGE_ANSWER_TIMEOUT, SYNC_MIRROR_TIMEOUT,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::metadata::frames::{
+    read_message, read_message_budget, read_message_cap, write_encoded_message, write_message,
+};
 use crate::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage, encode_message, frame_class, read_message,
-    read_message_budget, read_message_cap, response_cap, write_encoded_message, write_message,
+    MetadataReadError, MetadataTransportMessage, decode_message, encode_message, frame_class,
+    response_cap,
 };
 use crate::s3::bucket::search::BucketPage;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
@@ -387,6 +390,21 @@ impl MetadataHandle {
             record_error(&span, &error.to_string());
         }
         result
+    }
+
+    /// Sends one request an operation encoded and returns the encoded answer.
+    pub(crate) async fn request_frame(
+        &self,
+        node_id: NodeId,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, MetadataRequestError> {
+        let message = decode_message(frame)
+            .map_err(|error| MetadataError::InvalidInput(error.to_string()))
+            .map_err(MetadataRequestError::definitely_not_sent)?;
+        let answer = self.request_forwarded_write(node_id, message).await?;
+        encode_message(&answer)
+            .map_err(MetadataError::Backend)
+            .map_err(MetadataRequestError::possibly_sent)
     }
 }
 

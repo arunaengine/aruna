@@ -11,12 +11,12 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase};
+use aruna_core::placement::build_view;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::node_state::PersistedNodeIdentity;
 use aruna_core::structs::identity::user::User;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::placement::build_view;
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use byteview::ByteView;
 use shared::{

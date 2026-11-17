@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::node_routing;
 use crate::driver::{DriverContext, drive};
-use crate::effect_adapters::routing::node_routing;
 use crate::groups::backends::query::GetBackendOperation;
-use crate::groups::bucket_jobs::{ActiveJob, active_job};
 use crate::groups::storage_routing::GroupInputsOperation;
+use crate::s3::bucket::bucket_jobs::{ActiveJob, active_job};
 use crate::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -61,7 +61,7 @@ pub async fn list_bucket_storage(
         .map_err(|error| error.to_string())?;
     let encrypted = encrypted_buckets(context, &page.buckets).await?;
     // Jobs show for every rule, also one whose write storage routing leaves out.
-    let rules = crate::groups::imports::list_imports(context, group_id).await;
+    let rules = crate::s3::imports::list_imports(context, group_id).await;
     let rules = rules.map_err(|error| error.to_string())?;
     let mut snapshot = node_routing(context)
         .snapshot(group_id)

@@ -8,7 +8,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::staging::SourceMapping;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
-use aruna_operations::auth::permission_rules::permission_rules;
+use aruna_operations::auth::request_authorization::permission_rules;
 use aruna_operations::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation,
 };

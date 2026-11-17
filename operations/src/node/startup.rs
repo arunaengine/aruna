@@ -1403,7 +1403,7 @@ mod tests {
                 shard: shard as u32,
             };
             config.placement_overrides.push(PlacementOverride {
-                subject: crate::placement::shard_subject_bytes(&placement),
+                subject: aruna_core::placement::shard_subject_bytes(&placement),
                 pinned: vec![local, *peer],
                 excluded: Vec::new(),
                 strategy_id: None,

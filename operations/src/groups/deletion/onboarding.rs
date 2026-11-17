@@ -2,54 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE};
-use aruna_core::onboarding::OnboardingTicket;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{group_deletion_entries, reducer_state_key};
 use aruna_core::structs::identity::group_delete::{
     GroupDeletePhase, GroupDeleteRecord, GroupDeletionError, MembershipFence,
 };
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
-
-use crate::driver::{DriverContext, drive};
-
-pub async fn install_onboarding(
-    context: &DriverContext,
-    ticket: &OnboardingTicket,
-    realm_id: RealmId,
-    node_id: NodeId,
-    now: u64,
-) -> Result<(), GroupDeletionError> {
-    if ticket.payload.realm_id != realm_id.to_string() {
-        return Err(GroupDeletionError::Invalid(
-            "onboarding realm mismatch".into(),
-        ));
-    }
-    ticket
-        .verify(
-            node_id,
-            &DocumentTarget::RealmAuthorization { realm_id },
-            now,
-        )
-        .map_err(|error| GroupDeletionError::Invalid(error.to_string()))?;
-    for record in &ticket.payload.group_deletions {
-        if record.plan.realm_id != realm_id {
-            return Err(GroupDeletionError::Invalid(
-                "deletion realm mismatch".into(),
-            ));
-        }
-        drive(InstallOperation::new(record.clone()), context).await?;
-    }
-    super::sync_decision(context).await
-}
 
 #[derive(Debug, PartialEq)]
 enum State {
@@ -63,7 +27,7 @@ enum State {
 }
 
 #[derive(Debug, PartialEq)]
-struct InstallOperation {
+pub(super) struct InstallOperation {
     record: GroupDeleteRecord,
     state: State,
     txn_id: Option<TxnId>,
@@ -72,7 +36,7 @@ struct InstallOperation {
 }
 
 impl InstallOperation {
-    fn new(record: GroupDeleteRecord) -> Self {
+    pub(super) fn new(record: GroupDeleteRecord) -> Self {
         Self {
             record,
             state: State::Init,

@@ -18,10 +18,12 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::{bucket_snapshot, drive, gate_context};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::driver::{drive, node_routing};
+use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::metadata::api::fanout::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::placement::policy::GateOperation;
 use aruna_operations::replication::live_queue::complete_put;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
@@ -1115,13 +1117,19 @@ pub(crate) async fn store_stream(
     .await
     .map_err(|error| internal(&error))?;
     let quota_ceiling = realm.quota.effective_group_ceiling(&bucket_info.group_id);
-    let routing = bucket_snapshot(&state.get_ctx(), bucket_info)
-        .await
-        .map_err(|error| internal(&error))?;
-    let gate = gate_context(
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&state.get_ctx()),
+            (bucket_info).group_id,
+            BucketRules::of(bucket_info),
+        ),
         &state.get_ctx(),
-        state.get_realm_id(),
-        unix_timestamp_millis(),
+    )
+    .await
+    .map_err(|error| internal(&error))?;
+    let gate = drive(
+        GateOperation::new(state.get_realm_id(), unix_timestamp_millis()),
+        &state.get_ctx(),
     )
     .await
     .map_err(|error| internal(&error))?;

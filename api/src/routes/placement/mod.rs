@@ -20,8 +20,9 @@ use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::driver::{drive, gate_context};
+use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
+use aruna_operations::placement::policy::GateOperation;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
 use aruna_operations::placement::policy::diagnostics::{
     DiagnosticsError, DiagnosticsInput, PolicyDiagnosticsOperation,
@@ -682,10 +683,13 @@ async fn local_subject(
     state: &ServerState,
     realm_id: aruna_core::structs::identity::realm::RealmId,
 ) -> ServerResult<aruna_core::structs::placement::policy::PlacementSubject> {
-    let gate = gate_context(&state.get_ctx(), realm_id, unix_timestamp_millis())
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))?;
+    let gate = drive(
+        GateOperation::new(realm_id, unix_timestamp_millis()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))?;
     if !gate.admitting {
         return Err(ServerError::ServiceUnavailableReason(
             "placement_admission_stopped".to_string(),

@@ -111,9 +111,7 @@ pub async fn balance_set(
             Some((node_id, permille(used, utilization.storage_capacity_bytes)?))
         })
         .collect();
-    let capacity = crate::effect_adapters::routing::node_routing(context)
-        .catalog
-        .capacity();
+    let capacity = crate::driver::node_routing(context).catalog.capacity();
     let global = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
     match drive(global, context).await {
         Ok(usage) => match permille(usage.stored_bytes, capacity) {

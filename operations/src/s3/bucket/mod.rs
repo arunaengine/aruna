@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod audit_retry;
+pub mod bucket_jobs;
+pub mod bucket_storage;
 pub mod checked_rename;
 pub mod compression;
 pub mod cors;

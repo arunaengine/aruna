@@ -20,7 +20,8 @@ use aruna_core::structs::identity::user::vault::{
 use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
-use aruna_operations::users::vault_route::{VaultRefusal, VaultRouteError, append_vault_routed};
+use aruna_operations::users::vault_route::{VaultRouteError, append_vault_routed};
+use aruna_operations::users::vault_write::VaultRefusal;
 use aruna_operations::users::vault_write::{
     AppendVaultConfig, AppendVaultError, VaultAppended, VaultChange,
 };

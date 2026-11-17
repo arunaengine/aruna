@@ -22,8 +22,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::warn;
 
-use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::reject;
+use crate::realm::peer_trust::is_sync_eligible;
 
 pub(crate) async fn apply_bucket_create(
     context: &Arc<DriverContext>,

@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
+use crate::driver::{DriverContext, drive};
+use crate::placement::policy::{GateContextError, GateOperation};
 use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
 use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
@@ -18,6 +19,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use std::time::SystemTime;
@@ -205,7 +207,11 @@ async fn gate_part(
     refs: &[PlacementPolicyRef],
     group_id: GroupId,
 ) -> Result<(), PartCopyError> {
-    let destination = gate_context(context, realm_id, now_ms()).await?;
+    let destination = drive(
+        GateOperation::new(realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await?;
     let Some(gate) =
         write_gate(destination.as_ref(), refs, Some(group_id)).map_err(UploadPartError::from)?
     else {
@@ -356,7 +362,8 @@ async fn read_upload(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::gate_context;
+    use crate::driver::drive;
+    use crate::placement::policy::GateOperation;
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
@@ -372,6 +379,7 @@ mod test {
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
     use aruna_core::structs::storage::routing::RoutingSnapshot;
+    use aruna_core::time::unix_timestamp_millis;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -427,7 +435,7 @@ mod test {
         key: &str,
         data: &'static [u8],
     ) {
-        let gate = gate_context(context, realm_id, 1_000)
+        let gate = drive(GateOperation::new(realm_id, 1_000), context)
             .await
             .expect("subject reads");
         let mut operation = PutObjectOperation::new(PutObjectConfig {

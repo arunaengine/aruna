@@ -42,22 +42,25 @@ use ulid::Ulid;
 use super::executor::{JobContext, JobRunOutcome};
 use super::store::{put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive, gate_context, now_ms, routing_snapshot};
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::backends::query::GetBackendOperation;
-use crate::groups::imports::discovery::read_discovery;
-use crate::groups::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
-use crate::groups::imports::{read_earlier, read_import};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::blob_request::BlobRequest;
+use crate::placement::policy::GateOperation;
 use crate::placement::policy::{GateContext, PolicyGateError};
-use crate::realm::get_config::GetConfigOperation;
 use crate::replication::live_queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::imports::discovery::read_discovery;
+use crate::s3::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
+use crate::s3::imports::{read_earlier, read_import};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, RuleScan, Trail,
     intent_keys, trail_ranges,
 };
 use crate::s3::purge_fence::PurgeFenceError;
+use aruna_core::time::unix_timestamp_millis;
 
 const LIST_PAGE: usize = 500;
 
@@ -334,17 +337,27 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
     if !allowed {
         return Err(permanent("the importing user may not write to the bucket"));
     }
-    let routing = routing_snapshot(&ctx.driver, rule.group_id, &rule.bucket)
-        .await
-        .map_err(retryable)?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&ctx.driver),
+            rule.group_id,
+            BucketRules::Named(rule.bucket.to_string()),
+        ),
+        &ctx.driver,
+    )
+    .await
+    .map_err(retryable)?;
     let quota = drive(GetConfigOperation::new(realm_id), &ctx.driver)
         .await
         .map_err(retryable)?
         .quota
         .effective_group_ceiling(&rule.group_id);
-    let gate = gate_context(&ctx.driver, realm_id, now_ms())
-        .await
-        .map_err(retryable)?;
+    let gate = drive(
+        GateOperation::new(realm_id, unix_timestamp_millis()),
+        &ctx.driver,
+    )
+    .await
+    .map_err(retryable)?;
     let discovery = read_discovery(&ctx.driver, rule.group_id, rule.import_id)
         .await
         .map_err(retryable)?;
@@ -1354,7 +1367,10 @@ async fn add_version(
     file: (BackendLocation, Option<String>),
 ) -> Result<Outcome, ItemError> {
     let rule = &run.rule;
-    let version_id = import_version(run, Some(object.modified_ms.unwrap_or_else(now_ms)));
+    let version_id = import_version(
+        run,
+        Some(object.modified_ms.unwrap_or_else(unix_timestamp_millis)),
+    );
     let committed = ImportedObject {
         key: Some(key.to_string()),
         ..ImportedObject::new(version_id, object)
@@ -2049,7 +2065,7 @@ async fn sharing_now(
         for (_, value) in rows {
             let other = BackendImport::from_bytes(&value);
             let other = other.map_err(|error| ItemError::System(error.to_string()))?;
-            if crate::groups::imports::shared::shares_folder(rule, &other) {
+            if crate::s3::imports::shared::shares_folder(rule, &other) {
                 found.insert(other.import_id);
             }
         }

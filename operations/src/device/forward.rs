@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::document_repository::GetGroupConfig;
+use crate::document_repository::GetGroupOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::groups::get_group::GetGroupConfig;
-use crate::groups::get_group::GetGroupOperation;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::read::ensure_record_readable;
@@ -58,12 +58,12 @@ use ulid::Ulid;
 use crate::forward::authorize::ForwardAuthError;
 use crate::forward::authorize::authorize_forwarded_caller;
 use crate::forward::authorize::authorize_write;
-use crate::forward::authorize::is_sync_eligible;
-use crate::forward::authorize::peer_acts_for;
 use crate::forward::replay::HeldRecordError;
 use crate::forward::replay::held_record;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::reject;
+use crate::realm::peer_trust::is_sync_eligible;
+use crate::realm::peer_trust::peer_acts_for;
 use std::str::FromStr;
 
 pub(super) const GROUP_SCAN_PAGE: usize = 10_000;

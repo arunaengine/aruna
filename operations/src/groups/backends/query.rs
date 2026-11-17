@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{RecordReadError, backend_key, index_prefix, parse_iter, parse_read};
-use crate::driver::DriverContext;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
@@ -193,26 +192,68 @@ impl Operation for ListBackendsOperation {
 
 /// Whether `bucket` exists on the storage without a bucket `backend_id`, and for an existing
 /// bucket whether Aruna may write and delete there. Nothing is created.
-pub async fn check_bucket(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct BucketCheckOperation {
     backend_id: Ulid,
-    bucket: &str,
-) -> Result<(bool, Option<bool>), BlobError> {
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return Err(BlobError::UnknownBackend(
-            "blob handle unavailable".to_string(),
-        ));
-    };
-    let effect = BlobEffect::HeadBucket {
-        backend: BackendRef::Group(backend_id),
-        bucket: bucket.to_string(),
-    };
-    match blob_handle.send_blob_effect(effect).await {
-        Event::Blob(BlobEvent::BucketExists { exists, writable }) => Ok((exists, writable)),
-        Event::Blob(BlobEvent::Error(error)) => Err(error),
-        other => Err(BlobError::UnknownBackend(format!(
-            "unexpected bucket check answer: {other:?}"
-        ))),
+    bucket: String,
+    started: bool,
+    output: Option<Result<(bool, Option<bool>), BlobError>>,
+}
+
+impl BucketCheckOperation {
+    pub fn new(backend_id: Ulid, bucket: &str) -> Self {
+        Self {
+            backend_id,
+            bucket: bucket.to_string(),
+            started: false,
+            output: None,
+        }
+    }
+}
+
+impl Operation for BucketCheckOperation {
+    type Output = (bool, Option<bool>);
+    type Error = BlobError;
+
+    fn start(&mut self) -> Effects {
+        self.started = true;
+        smallvec![Effect::Blob(BlobEffect::HeadBucket {
+            backend: BackendRef::Group(self.backend_id),
+            bucket: self.bucket.clone(),
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let started = std::mem::replace(&mut self.started, false);
+        self.output = Some(match event {
+            Event::Blob(BlobEvent::BucketExists { exists, writable }) if started => {
+                Ok((exists, writable))
+            }
+            // Kept from the direct handle call: a node without blob access says so this way.
+            Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) if started => Err(
+                BlobError::UnknownBackend("blob handle unavailable".to_string()),
+            ),
+            Event::Blob(BlobEvent::Error(error)) if started => Err(error),
+            other => Err(BlobError::UnknownBackend(format!(
+                "unexpected bucket check answer: {}",
+                other.label()
+            ))),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(BlobError::UnknownBackend(
+            "bucket check never completed".to_string(),
+        )))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
 }
 
@@ -220,12 +261,18 @@ pub async fn check_bucket(
 mod pure_tests {
     use super::super::RecordReadError;
     use super::super::{index_key, index_prefix};
-    use super::{GetBackendOperation, GroupQueryError, ListBackendsOperation};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use super::{
+        BucketCheckOperation, GetBackendOperation, GroupQueryError, ListBackendsOperation,
+    };
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::errors::BlobError;
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::BACKEND_INDEX_KEYSPACE;
     use aruna_core::operation::Operation;
-    use aruna_core::operation_check::{rejects_events, sample_events};
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -331,5 +378,68 @@ mod pure_tests {
                 "{error:?}"
             );
         }
+    }
+
+    fn bucket_check() -> BucketCheckOperation {
+        BucketCheckOperation::new(Ulid::from_bytes([9u8; 16]), "data")
+    }
+
+    #[test]
+    fn checks_one_bucket() {
+        // One head request on the group storage; its answer is the result.
+        let mut operation = bucket_check();
+        let head = Effect::Blob(BlobEffect::HeadBucket {
+            backend: BackendRef::Group(Ulid::from_bytes([9u8; 16])),
+            bucket: "data".to_string(),
+        });
+        let answer = Event::Blob(BlobEvent::BucketExists {
+            exists: true,
+            writable: Some(false),
+        });
+        check_trace(&mut operation, &[head], vec![(answer, vec![])]);
+        assert_eq!(operation.finalize(), Ok((true, Some(false))));
+    }
+
+    #[test]
+    fn bucket_errors_returned() {
+        // A storage error is returned as is; a node without blob access names that.
+        let mut operation = bucket_check();
+        operation.start();
+        let down = || BlobError::ConnectionFailed("down".to_string());
+        operation.step(Event::Blob(BlobEvent::Error(down())));
+        assert_eq!(operation.finalize(), Err(down()));
+        let mut operation = bucket_check();
+        operation.start();
+        operation.step(Event::Blob(BlobEvent::Error(BlobError::HandleMissing)));
+        assert_eq!(
+            operation.finalize(),
+            Err(BlobError::UnknownBackend(
+                "blob handle unavailable".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn bucket_rejects_events() {
+        // Any other event, or an answer before start, fails the check without effects.
+        for (label, effects, error) in rejects_events(bucket_check, sample_events, |_| false) {
+            assert!(effects.is_empty(), "{label} emitted effects");
+            assert!(matches!(error, BlobError::UnknownBackend(_)), "{label}");
+        }
+        let mut operation = bucket_check();
+        operation.step(Event::Blob(BlobEvent::BucketExists {
+            exists: true,
+            writable: None,
+        }));
+        assert!(operation.finalize().is_err());
+    }
+
+    #[test]
+    fn bucket_abort_finalize() {
+        // The check only reads: abort has nothing to clean up, and an early finalize fails.
+        let mut operation = bucket_check();
+        operation.start();
+        assert!(operation.abort().is_empty());
+        rejects_finalize(operation);
     }
 }

@@ -22,7 +22,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::session::{
     CreateSessionConfig, CreateSessionError, CreateSessionOperation, CreatedSession,
 };

@@ -10,7 +10,8 @@ use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 
 use super::{GroupToken, GroupTokensError, TokenCursor, TokenScan};
-use crate::groups::admin_check::{AdminCheckOperation, authorization_event};
+use crate::auth::check_permissions::authorization_event;
+use crate::groups::admin_check::AdminCheckOperation;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupTokensConfig {

@@ -20,7 +20,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::structs::identity::user::User;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::request_authorization::{AuthorizeError, check_error};
+use crate::auth::error::{AuthorizeError, check_error};
 use crate::document_repository::read_effect;
 use crate::shares::rules::{ShareRuleError, required_permission, validate_link, visit_expiry};
 use crate::shares::store::{LogShareOperation, ShareStoreError, save_effect};

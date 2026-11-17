@@ -37,13 +37,15 @@ use super::held::{HeldElsewhere, PullRequest, admitted};
 use super::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
-use crate::driver::{DriverContext, drive, now_ms};
+use crate::connectors::resolver::NATIVE_SET_ID;
+use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectError, GetObjectResult};
 use crate::s3::object::read::HolderFailures;
 use aruna_core::holder_choice::{HolderChoiceOperation, pick};
+use aruna_core::time::unix_timestamp_millis;
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
 
@@ -235,7 +237,7 @@ async fn member_of(
         .collect();
     // Replicas share the load by free download slots; the coordinator stays the fallback.
     if replicas > 1 {
-        let choice = HolderChoiceOperation::new(&holders[..replicas], now_ms());
+        let choice = HolderChoiceOperation::new(&holders[..replicas], unix_timestamp_millis());
         let candidates = drive(choice, context).await.unwrap_or_default();
         let chosen = pick(candidates, Ulid::generate().random());
         let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
@@ -248,7 +250,7 @@ async fn member_of(
         }
     }
     // Holders that failed lately or have no fresh heartbeat are asked only when no other is.
-    let choice = HolderChoiceOperation::new(&holders, now_ms());
+    let choice = HolderChoiceOperation::new(&holders, unix_timestamp_millis());
     let fresh: Vec<NodeId> = (drive(choice, context).await.unwrap_or_default().into_iter())
         .map(|candidate| candidate.node_id)
         .collect();
@@ -304,7 +306,7 @@ async fn from_holders(
             result,
             Err(BaoReadError::Blob(_) | BaoReadError::Refused(BaoReadRefusal::BackendFailure))
         ) {
-            context.avoid_holder(*holder, now_ms());
+            context.avoid_holder(*holder, unix_timestamp_millis());
         }
         if let Some(BaoReadOutput::Stream { blob, .. }) = failures.consider(result) {
             return Ok(blob);
@@ -389,7 +391,7 @@ async fn fill(
     let claim = claim_key(kind, held.set_id, held.version_id, held.identity);
     let claimed = FillClaim {
         claim_id: Ulid::generate(),
-        claimed_at_ms: now_ms(),
+        claimed_at_ms: unix_timestamp_millis(),
     };
     match drive(ClaimFillOperation::new(claim.clone(), claimed), context).await {
         Ok(Claimed::Claimed) => {}

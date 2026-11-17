@@ -25,7 +25,6 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::raw_revision::load_raw_view;
 use crate::metadata::revision_read::MetadataRawView;
 use crate::placement::process_placements::load_realm_config;
-use crate::placement::read_holder_sets;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
@@ -37,6 +36,7 @@ use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::metadata::MetadataRawRevision;
 use aruna_core::metadata::ProfileValidationStatus;
 use aruna_core::metadata::raw_context_digest;
+use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
@@ -48,10 +48,10 @@ use tokio::time::Instant;
 use tokio::time::timeout;
 use ulid::Ulid;
 
-use crate::forward::authorize::is_sync_eligible;
 use crate::forward::replay::routed_record_matches;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::read_error;
+use crate::realm::peer_trust::is_sync_eligible;
 use futures_util::StreamExt;
 
 pub(super) const READ_FANOUT_LIMIT: usize = 8;

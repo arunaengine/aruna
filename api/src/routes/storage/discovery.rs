@@ -11,10 +11,10 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::discovery::DiscoveryRule;
 use aruna_operations::driver::drive;
-use aruna_operations::groups::imports::discovery::{
+use aruna_operations::s3::imports::discovery::{
     FileOutcome, SetDiscoveryOperation, authorized_preview, bucket_access, read_discovery,
 };
-use aruna_operations::groups::imports::read_import;
+use aruna_operations::s3::imports::read_import;
 use axum::Json;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};

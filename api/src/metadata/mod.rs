@@ -9,6 +9,7 @@ pub use model::*;
 
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
+use crate::lookup::origin_holds;
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
@@ -18,8 +19,8 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::git::snapshot::unreadable_file;
 use aruna_operations::metadata::api::MetadataApiError;
@@ -38,7 +39,6 @@ use aruna_operations::metadata::forward::write::{
 };
 use aruna_operations::metadata::record_reads::load_document_record as load_metadata_record_by_document_from_operations;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
-use aruna_operations::realm::get_config::GetConfigOperation;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -325,7 +325,7 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
         }
         MetadataApiError::SearchIncomplete(reason) => ServerError::ServiceUnavailableReason(reason),
         MetadataApiError::PlacementUnavailable(
-            aruna_operations::placement::PlacementResolveError::ActivationConflicted(_),
+            aruna_core::placement::PlacementResolveError::ActivationConflicted(_),
         ) => ServerError::ServiceUnavailableReason("placement_activation_conflict".to_string()),
         MetadataApiError::PlacementUnavailable(_) => {
             ServerError::ServiceUnavailableReason("placement_activation_unavailable".to_string())
@@ -432,14 +432,9 @@ pub(crate) async fn local_write_record(
 ) -> ServerResult<Option<MetadataRegistryRecord>> {
     ensure_device_owner(state, auth).await?;
     let context = state.get_ctx();
-    if !run_origin_holds_document(
-        &context,
-        state.get_realm_id(),
-        state.get_node_id(),
-        document_id,
-    )
-    .await
-    .map_err(map_api_error)?
+    if !origin_holds(state, document_id)
+        .await
+        .ok_or(ServerError::ServiceUnavailable)?
     {
         return Ok(None);
     }

@@ -34,11 +34,11 @@ use thiserror::Error;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
+use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::Permission;
 
@@ -56,7 +56,7 @@ pub struct AddRoleOperation {
     input: AddRoleConfig,
     /// Bucket the authorization rows publish onto, read inside the write
     /// transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: AddRoleState,
     conflicts: u8,
     output: Option<Result<(Group, GroupAuthorizationDocument), AddRoleError>>,
@@ -352,34 +352,13 @@ impl AddRoleOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event, txn_id: TxnId, group: Group) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
+        let [auth_doc, reducer_state, realm_config] = match super::member_reads(event) {
+            Ok(values) => values,
+            Err((expected, got)) => {
+                return self.unexpected_event(self.state.clone(), expected, got);
+            }
         };
-        let [
-            (_, auth_doc_value),
-            (_, reducer_state_value),
-            (_, realm_config_value),
-        ] = values.as_slice()
-        else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult) with auth doc, admin state, and realm config values",
-                got,
-            );
-        };
-
-        match self.emit_document_write(
-            txn_id,
-            group,
-            auth_doc_value.clone(),
-            reducer_state_value.clone(),
-            realm_config_value.clone(),
-        ) {
+        match self.emit_document_write(txn_id, group, auth_doc, reducer_state, realm_config) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
@@ -626,7 +605,10 @@ impl AddRoleOperation {
                 .values()
                 .any(|p| *p == Permission::DENY)
         {
-            return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(
+                Some(self.input.group_id),
+                txn_id
+            )];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -886,76 +868,121 @@ impl Operation for AddRoleOperation {
             Err(effects) => return effects,
         };
         if let AddRoleState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
 
-        match self.state.clone() {
+        match &self.state {
             AddRoleState::Auth => self.handle_authorization(event),
             AddRoleState::StartTransaction => self.handle_start_transaction(event),
-            AddRoleState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
+            AddRoleState::GetGroup { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_get_group(event, txn_id)
+            }
             AddRoleState::GetAdminState { txn_id, group } => {
+                let txn_id = txn_id.clone();
+                let group = group.clone();
                 self.handle_auth_read(event, txn_id, group)
             }
-            state @ AddRoleState::WriteDocState { .. } => self.handle_document_write(event, state),
+            state @ AddRoleState::WriteDocState { .. } => {
+                let state = state.clone();
+                self.handle_document_write(event, state)
+            }
             AddRoleState::DeleteAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
                 new_members,
-            } => self.handle_conflict_deletes(
-                event,
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                new_members,
-            ),
+            } => {
+                let txn_id = txn_id.clone();
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let new_members = new_members.clone();
+                self.handle_conflict_deletes(
+                    event,
+                    txn_id,
+                    group,
+                    auth_doc,
+                    admin_outbox_written,
+                    new_members,
+                )
+            }
             AddRoleState::ReadBucketFence {
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
                 new_members,
-            } => self.handle_bucket_fence(
-                event,
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                new_members,
-            ),
+            } => {
+                let txn_id = txn_id.clone();
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let new_members = new_members.clone();
+                self.handle_bucket_fence(
+                    event,
+                    txn_id,
+                    group,
+                    auth_doc,
+                    admin_outbox_written,
+                    new_members,
+                )
+            }
             AddRoleState::CommitTransaction {
                 group,
                 auth_doc,
                 admin_outbox_written,
                 new_members,
                 ..
-            } => self.handle_commit_transaction(
-                event,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                new_members,
-            ),
+            } => {
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let new_members = new_members.clone();
+                self.handle_commit_transaction(
+                    event,
+                    group,
+                    auth_doc,
+                    admin_outbox_written,
+                    new_members,
+                )
+            }
             AddRoleState::ScheduleDocumentDrain {
                 group,
                 auth_doc,
                 new_members,
-            } => self.handle_drain_schedule(event, group, auth_doc, new_members),
+            } => {
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let new_members = new_members.clone();
+                self.handle_drain_schedule(event, group, auth_doc, new_members)
+            }
             AddRoleState::AnnounceGroupDoc {
                 group,
                 auth_doc,
                 new_members,
-            } => self.handle_group_announce(event, group, auth_doc, new_members),
+            } => {
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let new_members = new_members.clone();
+                self.handle_group_announce(event, group, auth_doc, new_members)
+            }
             AddRoleState::AnnounceAuthDoc {
                 group,
                 auth_doc,
                 new_members,
-            } => self.handle_auth_announce(event, group, auth_doc, new_members),
+            } => {
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let new_members = new_members.clone();
+                self.handle_auth_announce(event, group, auth_doc, new_members)
+            }
             AddRoleState::EmitNotifications { group, auth_doc } => {
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
                 self.handle_emit_notifications(group, auth_doc)
             }
             AddRoleState::Init | AddRoleState::Finish | AddRoleState::Error => {

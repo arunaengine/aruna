@@ -117,7 +117,9 @@ pub(super) fn resolve_publish_placement(
         return current;
     }
     match config {
-        Some(config) => crate::placement::target_placement_ref(config, target, Default::default()),
+        Some(config) => {
+            aruna_core::placement::target_placement_ref(config, target, Default::default())
+        }
         None => aruna_core::structs::placement::record::PlacementRef::NIL,
     }
 }
@@ -239,9 +241,9 @@ pub(super) fn classify_deferred_record(
     let node_id = net_handle.node_id();
     // Draining former holders may publish until flushed; true non-holders remain undeliverable.
     // The receiver history cutoff bounds a departing holder.
-    if crate::placement::holds_placement(config, &record.placement, node_id)
-        || crate::placement::is_draining_holder(config, &record.placement, node_id)
-        || crate::placement::retained_departing_holder(config, &record.placement, node_id)
+    if aruna_core::placement::holds_placement(config, &record.placement, node_id)
+        || aruna_core::placement::is_draining_holder(config, &record.placement, node_id)
+        || aruna_core::placement::retained_departing_holder(config, &record.placement, node_id)
     {
         DeferOutcome::Retry
     } else {
@@ -667,11 +669,11 @@ impl OperationsTaskHandler {
             if !record.target.uses_shard_topic()
                 || invocation.defer.deferred_topics.contains(topic)
                 || !config.is_none_or(|config| {
-                    crate::placement::holds_placement(
+                    aruna_core::placement::holds_placement(
                         config,
                         &record.placement,
                         net_handle.node_id(),
-                    ) || crate::placement::is_draining_holder(
+                    ) || aruna_core::placement::is_draining_holder(
                         config,
                         &record.placement,
                         net_handle.node_id(),
@@ -683,7 +685,9 @@ impl OperationsTaskHandler {
             }
             let mut bootstrap_peers = record.peers.clone();
             if let Some(config) = config {
-                for holder in crate::placement::resolve_shard_holders(config, &record.placement) {
+                for holder in
+                    aruna_core::placement::resolve_shard_holders(config, &record.placement)
+                {
                     if !bootstrap_peers.contains(&holder) {
                         bootstrap_peers.push(holder);
                     }
@@ -726,7 +730,8 @@ impl OperationsTaskHandler {
                     continue;
                 }
                 let members =
-                    crate::placement::bucket_membership(config, &record.placement, now_ms).members;
+                    aruna_core::placement::bucket_membership(config, &record.placement, now_ms)
+                        .members;
                 if !members.is_empty() {
                     record.peers = members;
                 }

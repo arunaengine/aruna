@@ -3,9 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::abe::copies::{copy_row, still_active};
-use crate::abe::rekey::RekeyProgress;
-use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, owner_write_effect, write_head_effect, write_version_effect,
 };
@@ -17,6 +14,8 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
+use crate::s3::abe_copies::{copy_row, still_active};
+use crate::s3::abe_rekey::RekeyProgress;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_publication, publication_read};
 use crate::s3::usage::{
@@ -31,6 +30,7 @@ use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_REKEY_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;

@@ -4,9 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::groups::backends::backend_key;
-use crate::groups::imports::ImportRuleError;
-use crate::groups::imports::create::{CreateImportInput, CreateImportOperation};
 use crate::groups::storage_routing::routing_key;
+use crate::s3::imports::ImportRuleError;
+use crate::s3::imports::create::{CreateImportInput, CreateImportOperation};
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };

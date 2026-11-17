@@ -9,7 +9,6 @@ use crate::metadata::create_document::accepted_create_matches;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::record_reads::load_document_record;
-use crate::placement::holds_placement;
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
@@ -17,6 +16,7 @@ use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::metadata::MetadataEventRecord;
+use aruna_core::placement::holds_placement;
 use aruna_core::storage_entries::create_acceptance_key;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
@@ -116,7 +116,8 @@ pub(crate) async fn accepted_create(
             Err(format!("metadata create acceptance read failed: {error}"))
         }
         other => Err(format!(
-            "unexpected metadata create acceptance read result: {other:?}"
+            "unexpected metadata create acceptance read result: {}",
+            other.label()
         )),
     }
 }

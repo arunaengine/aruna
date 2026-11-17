@@ -27,11 +27,11 @@ use url::Url;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 const MAX_ID_LEN: usize = 64;
 
@@ -111,7 +111,7 @@ pub enum SetProviderError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -306,7 +306,7 @@ impl SetProviderOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(SetProviderError::UnexpectedEvent {
             state,
@@ -343,7 +343,7 @@ impl Operation for SetProviderOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             SetProviderState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -360,21 +360,21 @@ impl Operation for SetProviderOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             SetProviderState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             SetProviderState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self
@@ -385,53 +385,63 @@ impl Operation for SetProviderOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             SetProviderState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetProviderError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = SetProviderState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(SetProviderError::MissingTransaction);
+                        };
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = SetProviderState::DeleteAdminConflicts { document };
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit_transaction(document)
                     }
-                    self.emit_commit_transaction(document)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            SetProviderState::DeleteAdminConflicts { document } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
+            }
+            SetProviderState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                        self.emit_commit_transaction(document)
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
-            SetProviderState::CommitTransaction { document } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = SetProviderState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
+            }
+            SetProviderState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                        self.txn_id = None;
+                        self.state = SetProviderState::ScheduleSyncDrain { document };
+                        smallvec![schedule_drain_effect()]
+                    }
+                    Event::Storage(StorageEvent::Error {
+                        error: StorageError::TransactionConflict,
+                    }) if self.attempts < COMMIT_ATTEMPTS => {
+                        self.txn_id = None;
+                        self.start_transaction()
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        self.txn_id = None;
+                        self.fail(error.into())
+                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }) if self.attempts < COMMIT_ATTEMPTS => {
-                    self.txn_id = None;
-                    self.start_transaction()
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
+            }
             SetProviderState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = SetProviderState::Finish;
@@ -442,10 +452,8 @@ impl Operation for SetProviderOperation {
                     self.state = SetProviderState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             SetProviderState::Finish | SetProviderState::Error | SetProviderState::Init => {
                 smallvec![]

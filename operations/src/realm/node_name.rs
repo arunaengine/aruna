@@ -29,11 +29,11 @@ use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 /// Whose authority names the node. An owner reaches only its own devices; a
 /// realm admin reaches every realm node.
@@ -141,7 +141,7 @@ pub enum NodeNameError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -310,7 +310,7 @@ impl NodeNameOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(NodeNameError::UnexpectedEvent {
             state,
@@ -350,7 +350,7 @@ impl Operation for NodeNameOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             NodeNameState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -365,21 +365,21 @@ impl Operation for NodeNameOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             NodeNameState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             NodeNameState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self.emit_name_write(document_value.clone(), reducer_state_value.clone())
@@ -389,31 +389,34 @@ impl Operation for NodeNameOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             NodeNameState::WriteState {
                 stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(NodeNameError::MissingTransaction);
-                    };
-                    if stale_conflict_deletes.is_empty() {
-                        return self.emit_commit();
+            } => {
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(NodeNameError::MissingTransaction);
+                        };
+                        if stale_conflict_deletes.is_empty() {
+                            return self.emit_commit();
+                        }
+                        self.state = NodeNameState::DeleteConflicts;
+                        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                            deletes: stale_conflict_deletes,
+                            txn_id: Some(txn_id),
+                        })]
                     }
-                    self.state = NodeNameState::DeleteConflicts;
-                    smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: stale_conflict_deletes,
-                        txn_id: Some(txn_id),
-                    })]
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
+            }
             NodeNameState::DeleteConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch delete result", other.label()),
             },
             NodeNameState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -431,7 +434,7 @@ impl Operation for NodeNameOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
             NodeNameState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -443,10 +446,8 @@ impl Operation for NodeNameOperation {
                     self.state = NodeNameState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             NodeNameState::Finish | NodeNameState::Error | NodeNameState::Init => {
                 smallvec![]
@@ -552,7 +553,7 @@ impl Operation for ReadNamesOperation {
             other => self.finish(Err(NodeNameError::UnexpectedEvent {
                 state: "ReadState".to_string(),
                 expected: "storage read result",
-                got: format!("{other:?}"),
+                got: other.label(),
             })),
         }
     }

@@ -94,7 +94,7 @@ impl Operation for ListSecretsOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match &self.state {
             ListSecretsState::Iter => {
                 let got = event.label();
                 let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
@@ -143,6 +143,7 @@ impl Operation for ListSecretsOperation {
                 smallvec![]
             }
             ListSecretsState::ReadStates { records } => {
+                let records = records.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     self.state = ListSecretsState::Error;

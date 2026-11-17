@@ -21,7 +21,8 @@ pub mod state;
 pub mod versions;
 
 use self::changes::PropertyConflict;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 use crate::metadata::record_reads::load_document_record;

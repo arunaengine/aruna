@@ -8,8 +8,8 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::GroupId;
 
 use super::version_replication::{SourceAuthorization, SourceAuthorizationError};
+use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
-use crate::auth::request_policy::PolicyEvaluator;
 use crate::driver::{DriverContext, drive};
 
 impl SourceAuthorization {

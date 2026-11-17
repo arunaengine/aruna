@@ -41,7 +41,8 @@ use super::{
     sync_progress,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::permission_rules::{PermissionRules, permission_rules};
+use crate::auth::permission_rules::PermissionRules;
+use crate::auth::request_authorization::permission_rules;
 use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
 use crate::distribution::guard::{
     GuardError, authority_reads, authority_rows, write_target, write_targets,

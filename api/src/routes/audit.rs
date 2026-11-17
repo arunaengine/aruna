@@ -5,11 +5,11 @@
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::user_origin;
 use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
-use aruna_operations::forward::routing::is_user_origin;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::audit::{AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest};
 use aruna_operations::metadata::audit_entry::list_audit as gather_audit;
@@ -180,13 +180,9 @@ pub async fn list_audit(
         .map(|id| Ulid::from_str(id).map_err(|_| ServerError::BadRequest))
         .transpose()?;
     let ctx = state.get_ctx();
-    let user_origin = tokio::time::timeout_at(
-        deadline,
-        is_user_origin(&ctx, state.get_realm_id(), state.get_node_id()),
-    )
-    .await
-    .map_err(|_| ServerError::ServiceUnavailable)?
-    .map_err(map_api_error)?;
+    let user_origin = tokio::time::timeout_at(deadline, user_origin(&state))
+        .await
+        .map_err(|_| ServerError::ServiceUnavailable)??;
     // A device holds no audit rows of its own, so this read is pure fan-out and
     // every peer re-checks the same group-admin authority on the caller's token.
     if !user_origin {

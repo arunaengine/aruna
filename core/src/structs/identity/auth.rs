@@ -298,6 +298,18 @@ pub struct Actor {
     pub realm_id: RealmId,
 }
 
+/// The actor's own unrestricted context, as an operation it runs checks permissions with.
+impl From<&Actor> for AuthContext {
+    fn from(actor: &Actor) -> Self {
+        Self {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+}
+
 impl TryFrom<&[u8]> for Actor {
     type Error = ConversionError;
 

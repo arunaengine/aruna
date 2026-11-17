@@ -372,9 +372,10 @@ impl Operation for ResolveConflictsOperation {
             Err(effects) => return effects,
         };
 
-        match self.state.clone() {
+        match &self.state {
             ResolveConflictsState::ReadSubjectIndex { .. } => self.accept_subject(event),
             ResolveConflictsState::ReadConflictingUser { user_id } => {
+                let user_id = user_id.clone();
                 self.accept_conflict(event, user_id)
             }
             ResolveConflictsState::WriteCanonicalUser => self.accept_canonical_write(event),

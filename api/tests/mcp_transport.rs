@@ -28,6 +28,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
@@ -36,7 +37,6 @@ use aruna_operations::realm::announce_presence::{
 };
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::{HeaderValue, header};

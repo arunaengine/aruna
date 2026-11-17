@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::shard::manifest_entry_digest;
+use crate::shard::manifest::manifest_entry_digest;
 
 /// A manifest request has only fixed-size identifiers and integer fields. This
 /// small envelope leaves encoding headroom without permitting a large body to
@@ -563,7 +563,7 @@ mod tests {
             updated_at_ms: 99,
             entries,
         };
-        let entry_digest = crate::shard::manifest_entry_digest(&manifest.entries);
+        let entry_digest = crate::shard::manifest::manifest_entry_digest(&manifest.entries);
         let sample_page = |entries: Vec<ShardManifestEntry>| ShardManifestPage {
             placement: manifest.placement,
             holder,

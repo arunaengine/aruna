@@ -62,8 +62,9 @@ use crate::device::sync::{
     UPLOAD_DEFER_AFTER, restore_sync_timers,
 };
 use crate::device::sync_note::{NoteSyncOperation, SyncNote};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::groups::backends::remove::remove_drained_backends;
+use crate::groups::backends::drain::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
@@ -85,13 +86,26 @@ use crate::metadata::projector::{
 use crate::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
 };
+use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
+use crate::node::node_info::observe_placement;
 use crate::node::usage_publish::restore_usage_timer;
-use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
+use crate::node::usage_stats::refresh_usage_targets;
+use crate::notifications::client::deliver_remote;
+use crate::notifications::inbox::upsert_with_report;
+use crate::notifications::outbox::RestoreOutboxOperation;
+use crate::notifications::outbox::{
+    DELIVERY_RETRY_AFTER, OUTBOX_BATCH_SIZE, OUTBOX_RETENTION_MS, delete_outbox_records,
+    read_outbox_batch, restore_idle_timer, restore_outbox_timer,
+};
+use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::RestorePruneOperation;
-use crate::notifications::watch::digest::{InterestOperation, WATCH_PUBLISH_DEBOUNCE};
-use crate::notifications::watch::interest::refresh_target_interest;
+use crate::notifications::prune::{
+    NOTIFICATION_POLL_AFTER, NOTIFICATION_RETRY_AFTER, process_prune_batch,
+};
+use crate::notifications::watch::digest::InterestOperation;
+use crate::notifications::watch::digest::WATCH_PUBLISH_DEBOUNCE;
+use crate::notifications::watch::interest::{rebuild_interest_table, refresh_target_interest};
 use crate::notifications::watch::table::RebuildTableOperation;
-use crate::placement::policy::observe_placement;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
@@ -386,15 +400,15 @@ impl OperationsTaskHandler {
         };
         // A User-kind device registers no holdership: the realm refuses its DHT
         // puts. An unreadable config is bootstrap, which registers.
-        if matches!(
-            crate::forward::routing::is_user_origin(
-                &self.context,
-                *net_handle.realm_id(),
-                net_handle.node_id()
-            )
-            .await,
-            Ok(true)
-        ) {
+        let config = drive(
+            GetConfigOperation::new(*net_handle.realm_id()),
+            &self.context,
+        )
+        .await;
+        let origin = config.ok().and_then(|config| {
+            crate::forward::routing::is_user_origin(&config, net_handle.node_id())
+        });
+        if origin == Some(true) {
             return;
         }
         let operation =
@@ -501,11 +515,11 @@ impl OperationsTaskHandler {
             }
             None => return false,
         };
-        let holders = crate::placement::resolve_shard_holders(config, &record.placement);
+        let holders = aruna_core::placement::resolve_shard_holders(config, &record.placement);
         if holders.is_empty() {
             return false;
         }
-        match crate::realm::forward::relay_admin_event(
+        match crate::forward::realm::relay_admin_event(
             &self.context,
             &holders,
             record.target.clone(),
@@ -756,10 +770,11 @@ impl OperationsTaskHandler {
             TaskKey::RealmPresence { realm_id, node_id } => Box::pin(async move {
                 // A User-kind device is DHT read-only and never publishes
                 // presence. An unreadable config is bootstrap, which announces.
-                if matches!(
-                    crate::forward::routing::is_user_origin(&self.context, realm_id, node_id).await,
-                    Ok(true)
-                ) {
+                let config = drive(GetConfigOperation::new(realm_id), &self.context).await;
+                let origin = config
+                    .ok()
+                    .and_then(|config| crate::forward::routing::is_user_origin(&config, node_id));
+                if origin == Some(true) {
                     return;
                 }
                 let op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
@@ -963,7 +978,7 @@ impl OperationsTaskHandler {
                 };
                 let retention_ms = self.rocrate_limits.artifact_retention_ms;
                 let now = unix_timestamp_millis();
-                let run = crate::groups::imports::schedule::run_due(
+                let run = crate::s3::imports::schedule::run_due(
                     &self.context,
                     net_handle.node_id(),
                     retention_ms,

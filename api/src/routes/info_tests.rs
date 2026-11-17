@@ -34,9 +34,8 @@ use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::placement::allocate_handle::{
-    HandleAllocationError, allocate_placement_binding,
-};
+use aruna_operations::placement::allocate_handle::HandleAllocationError;
+use aruna_operations::placement::provision::allocate_placement_binding;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::RealmPresence;
@@ -667,7 +666,7 @@ fn admin_auth(realm_id: RealmId, user_id: UserId) -> AuthContext {
 async fn deny_path(state: &ServerState, path: &str) {
     let realm_id = state.get_realm_id();
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -783,7 +782,7 @@ async fn placement_binding_lifecycle() {
     let (state, realm_id, admin, _tempdir) = setup_management_state().await;
     let auth = admin_auth(realm_id, admin);
     let family_strategy_id = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -1929,7 +1928,7 @@ async fn device_never_connected() {
     // this node answering about itself, may still not connect it.
     let (state, realm_id, owner, _tempdir) = setup_management_state().await;
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -1978,7 +1977,7 @@ async fn reports_device_seen() {
     // device's own node is serving the request, so it saw itself now.
     let (state, realm_id, owner, _tempdir) = setup_management_state().await;
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -2303,7 +2302,7 @@ async fn owner_names_device() {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let device = iroh::SecretKey::generate().public();
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await

@@ -149,15 +149,6 @@ impl AssignRolesOperation {
         }
     }
 
-    fn auth_context(&self) -> AuthContext {
-        AuthContext {
-            user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
-    }
-
     fn handle_authorization(&mut self, event: Event) -> Effects {
         let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
@@ -207,23 +198,13 @@ impl AssignRolesOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
+        let [auth_doc, reducer_state] = match super::role_reads(event) {
+            Ok(values) => values,
+            Err((expected, got)) => {
+                return self.unexpected_event(self.state.clone(), expected, got);
+            }
         };
-        let [(_, auth_doc_value), (_, reducer_state_value)] = values.as_slice() else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult) with auth doc and admin state values",
-                got,
-            );
-        };
-
-        match self.emit_auth_write(txn_id, auth_doc_value.clone(), reducer_state_value.clone()) {
+        match self.emit_auth_write(txn_id, auth_doc, reducer_state) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
@@ -388,7 +369,7 @@ impl AssignRolesOperation {
             admin_outbox_written,
         };
         if self.narrowed {
-            return smallvec![crate::abe::mark_due(None, txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(None, txn_id)];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -522,7 +503,7 @@ impl Operation for AssignRolesOperation {
 
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.auth_context(),
+                auth_context: AuthContext::from(&self.input.actor),
                 path: format!(
                     "/{}/admin/roles/{}",
                     self.input.realm_id, self.input.user_id
@@ -541,41 +522,61 @@ impl Operation for AssignRolesOperation {
             Err(effects) => return effects,
         };
         if let AssignRolesState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
 
-        match self.state.clone() {
+        match &self.state {
             AssignRolesState::Auth => self.handle_authorization(event),
             AssignRolesState::StartTransaction => self.handle_start_transaction(event),
-            AssignRolesState::ReadAdminState { txn_id } => self.handle_auth_read(event, txn_id),
+            AssignRolesState::ReadAdminState { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_auth_read(event, txn_id)
+            }
             AssignRolesState::WriteAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 stale_conflict_deletes,
-            } => self.handle_auth_write(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                stale_conflict_deletes,
-            ),
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                self.handle_auth_write(
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    stale_conflict_deletes,
+                )
+            }
             AssignRolesState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
-            } => self.delete_stale_conflicts(event, txn_id, auth_doc, admin_outbox_written),
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                self.delete_stale_conflicts(event, txn_id, auth_doc, admin_outbox_written)
+            }
             AssignRolesState::CommitTransaction {
                 auth_doc,
                 admin_outbox_written,
                 ..
-            } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                self.handle_commit_transaction(event, auth_doc, admin_outbox_written)
+            }
             AssignRolesState::ScheduleDocumentDrain { auth_doc } => {
+                let auth_doc = auth_doc.clone();
                 self.schedule_outbox_drain(event, auth_doc)
             }
             AssignRolesState::AnnounceAuthDoc { auth_doc } => {
+                let auth_doc = auth_doc.clone();
                 self.handle_auth_announce(event, auth_doc)
             }
             AssignRolesState::Init | AssignRolesState::Finish | AssignRolesState::Error => {

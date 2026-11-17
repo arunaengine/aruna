@@ -36,7 +36,8 @@ use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_kpabe::{Envelope, UserKey};
-use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
+use aruna_operations::auth::error::AuthorizeError;
+use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};

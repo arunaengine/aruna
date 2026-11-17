@@ -21,9 +21,9 @@ use super::copies::{
     Assembled, chunk_count, chunk_fits, has_local, read_chunk, read_local, reserve, store_chunk,
     store_local, sweep_copies,
 };
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
-use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
 use aruna_core::plugins::{ArtifactBytes, Chunk};
 

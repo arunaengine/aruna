@@ -12,6 +12,7 @@ pub mod list;
 pub mod names;
 pub mod quarantine;
 pub mod read;
+pub mod reconcile;
 pub mod resolve;
 pub mod resolve_set;
 pub mod subject;
@@ -25,8 +26,9 @@ pub use diagnostics::{
 pub(crate) use forward::apply_forwarded_policy;
 pub use forward::{PolicyForwardError, create_policy_routed};
 pub use gate::{
-    GateContext, GatedBucket, PolicyGateConfig, PolicyGateError, PolicyGateOperation,
-    PolicyGateOutcome, drift_reads, gate_decision, split_drift_reads, union_refs, write_gate,
+    GateContext, GateContextError, GateOperation, GatedBucket, PolicyGateConfig, PolicyGateError,
+    PolicyGateOperation, PolicyGateOutcome, drift_reads, gate_decision, split_drift_reads,
+    union_refs, write_gate,
 };
 pub use list::{
     ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, POLICY_LIST_DEFAULT,
@@ -39,13 +41,13 @@ pub use quarantine::{
 pub use read::{
     AuthenticPolicy, PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
+pub use reconcile::{LocalSubjectOperation, SubjectSyncOperation, SubjectTrigger};
 pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
 pub use resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 pub use subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
-    observe_placement, sync_subject,
 };
-pub(crate) use transport::{fetch_policy, serve_local_policy, sign_publication};
+pub use transport::ServePolicyOperation;
 
 use aruna_core::structs::placement::policy::PolicyResolution;
 use aruna_core::types::GroupId;
@@ -87,7 +89,7 @@ pub(crate) mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use ulid::Ulid;
 
-    use crate::placement::resolve_shard_holders;
+    use aruna_core::placement::resolve_shard_holders;
 
     /// Realm authorization granting `user` the realm-configuration write every
     /// policy publication is verified against.

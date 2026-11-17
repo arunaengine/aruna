@@ -38,10 +38,10 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_effect, schedule_prune_drain, write_audit_effect,
     write_graph_lifecycle, write_lifecycle_revision, write_prune_effect,
 };
-use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::outbox_record::{
     new_identified_record, schedule_drain_effect, write_transaction_effect,
 };
+use aruna_core::placement::{registry_placement, resolve_shard_holders};
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteDocumentOperation {
@@ -61,7 +61,7 @@ pub struct DeleteDocumentOperation {
     /// Reverse index rows the PID tombstone removes in the same transaction.
     pid_index_deletes: Vec<(String, ByteView)>,
     /// Buckets the tombstones publish onto, read inside the write transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     txn_id: Option<Ulid>,
     /// Phase-time and identity sampling; production keeps the defaults.
     phase_source: crate::metadata::MetadataPhaseSource,
@@ -1210,7 +1210,7 @@ mod pure_tests {
         config.default_strategy_id = Some(strategy.strategy_id);
         config.strategies = vec![strategy.clone()];
         config.ensure_node(actor.node_id, RealmNodeKind::Server);
-        record.placement = crate::placement::choose_origin_bucket(
+        record.placement = aruna_core::placement::choose_origin_bucket(
             &config,
             &strategy,
             actor.node_id,
@@ -1319,7 +1319,7 @@ mod pure_tests {
         config.strategies = vec![strategy.clone()];
         config.ensure_node(actor.node_id, RealmNodeKind::Server);
         config.snapshot_candidate_map();
-        record.placement = crate::placement::choose_origin_bucket(
+        record.placement = aruna_core::placement::choose_origin_bucket(
             &config,
             &strategy,
             actor.node_id,

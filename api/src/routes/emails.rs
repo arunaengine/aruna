@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use aruna_core::structs::execution::email::EmailPreference;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::notifications::email::{self, read_email, remove_email};
 use aruna_operations::notifications::opt_in::EmailError;
 use aruna_operations::notifications::setting_rows::SettingError;
-use aruna_operations::realm::get_config::GetConfigOperation;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;

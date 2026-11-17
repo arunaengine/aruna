@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::abe::copies::{CopyEnvelopeOperation, CopyOutcome, copy_row};
 use crate::abe::envelope::EnvelopeOperation;
-use crate::abe::rekey::RekeyOperation;
+use crate::s3::abe_copies::{CopyEnvelopeOperation, CopyOutcome, copy_row};
+use crate::s3::abe_rekey::RekeyOperation;
 use crate::s3::object::put::abe::envelope_write;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{

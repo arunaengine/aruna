@@ -91,7 +91,7 @@ pub async fn list_visible_documents(
     .await;
     // RBAC/public visibility is additionally constrained by the metadata.read
     // request policies, loaded once per distinct group (fail-closed on error).
-    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
+    let evaluators = crate::auth::enforcement::PolicyEvaluator::load_bulk(
         context,
         records
             .iter()
@@ -357,5 +357,5 @@ pub(super) fn record_matches_filters(
 
 fn path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
     let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
-    crate::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
+    aruna_core::placement::resolver::path_prefix_match(&normalized_path, path_prefix).is_some()
 }

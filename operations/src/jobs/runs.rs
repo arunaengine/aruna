@@ -9,8 +9,10 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 use crate::jobs::store::attempt::{read_crate_status, read_run_link};
 

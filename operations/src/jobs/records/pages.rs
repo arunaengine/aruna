@@ -18,9 +18,9 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::driver::DriverContext;
-use crate::forward::authorize::is_sync_eligible;
-use crate::placement::resolve_shard_holders;
 use crate::realm::load_config::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

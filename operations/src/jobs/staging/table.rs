@@ -34,11 +34,13 @@ use super::walk::{
 use super::{ItemFailure, pinned_bucket, queue_key};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
-use crate::driver::{bucket_snapshot, drive, gate_context, now_ms};
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{drive, node_routing};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::executor::JobContext;
+use crate::placement::policy::GateOperation;
 use crate::placement::policy::gate::PolicyGateError;
 use crate::placement::policy::read::ReadPolicyError;
-use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
@@ -50,6 +52,7 @@ use crate::s3::usage::QuotaGateError;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
+use aruna_core::time::unix_timestamp_millis;
 
 /// Directories the queue holds before the table is read further.
 const QUEUE_PAUSE: u64 = 1024;
@@ -772,13 +775,23 @@ async fn write_object(
     (body, metadata): (Bytes, &BTreeMap<String, String>),
 ) -> Result<(), ItemFailure> {
     let system = |error: String| ItemFailure::System(error);
-    let routing = bucket_snapshot(&ctx.driver, bucket)
-        .await
-        .map_err(|error| system(error.to_string()))?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&ctx.driver),
+            (bucket).group_id,
+            BucketRules::of(bucket),
+        ),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| system(error.to_string()))?;
     let auth = &spec.auth_context;
-    let gate = gate_context(&ctx.driver, auth.realm_id, now_ms())
-        .await
-        .map_err(|error| system(error.to_string()))?;
+    let gate = drive(
+        GateOperation::new(auth.realm_id, unix_timestamp_millis()),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| system(error.to_string()))?;
     let quota = drive(GetConfigOperation::new(auth.realm_id), &ctx.driver)
         .await
         .map_err(|error| system(error.to_string()))?

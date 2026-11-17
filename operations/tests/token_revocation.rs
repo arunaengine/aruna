@@ -18,9 +18,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, decode_bearer_token, realm_token_revoked,
-    realm_user_cutoff,
+    ArunaValidationState, decode_bearer_token, realm_token_revoked, realm_user_cutoff,
 };
+use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
@@ -292,7 +292,7 @@ async fn seed_sync_topic(
 ) -> TestResult<()> {
     let target = DocumentTarget::RealmConfig { realm_id };
     let placement =
-        aruna_operations::placement::target_placement_ref(config, &target, Default::default());
+        aruna_core::placement::target_placement_ref(config, &target, Default::default());
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: nodes[1].net.node_id(),

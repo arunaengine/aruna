@@ -14,7 +14,7 @@ use byteview::ByteView;
 
 use super::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
 use super::protocol::BaoReadRequest;
-use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
+use crate::driver::{DriverContext, drive};
 use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
 use crate::realm::mutate_placement::node_kind;
 
@@ -35,9 +35,17 @@ pub async fn managed_read(
     }
     // An admission stop is not decided here: `write_gate` below refuses once
     // the source has taught the refs that make this read a governed one.
-    let destination = match gate_context(context, request.realm_id, now_ms()).await {
+    let destination = match crate::driver::drive(
+        crate::placement::policy::GateOperation::new(
+            request.realm_id,
+            aruna_core::time::unix_timestamp_millis(),
+        ),
+        context,
+    )
+    .await
+    {
         Ok(destination) => destination,
-        Err(GateContextError::Routing(_)) => return Err(BaoReadError::NoDestination),
+        Err(_) => return Err(BaoReadError::NoDestination),
     };
     request.destination = destination.as_ref().map(|gate| gate.subject.clone());
     let mut taught: Vec<PlacementPolicyRef> = Vec::new();

@@ -23,6 +23,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::document_repository::read_effect;
+use crate::driver::{DriverContext, drive};
 
 /// How often the reporting node renews its registration.
 pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);

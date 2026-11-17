@@ -5,25 +5,19 @@
 
 pub mod client;
 pub mod incoming;
+pub(crate) mod manifest;
 pub mod protocol;
 pub mod verify;
 
-use aruna_core::document::{ShardManifest, ShardManifestEntry, shard_topic_id};
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::SHARD_MANIFEST_KEYSPACE;
-use aruna_core::storage_entries::{shard_manifest_prefix, sync_revision_key};
+use aruna_core::document::{ShardManifest, shard_topic_id};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Key;
 use aruna_net::NetHandle;
-use byteview::ByteView;
 use irokle::Storage as _;
 
-use crate::driver::DriverContext;
-
-const MANIFEST_SCAN_PAGE: usize = 512;
+use crate::driver::{DriverContext, drive};
+use manifest::ManifestScanOperation;
 
 /// Builds the local node's [`ShardManifest`] for one shard on demand: a prefix
 /// scan of the manifest keyspace for the entry set, plus the shard topic's
@@ -37,7 +31,7 @@ pub async fn assemble_shard_manifest(
         .net_handle
         .as_ref()
         .ok_or_else(|| "cannot assemble shard manifest without a net handle".to_string())?;
-    let entries = scan_manifest_entries(context, &placement).await?;
+    let entries = drive(ManifestScanOperation::new(&placement), context).await?;
     let topic = shard_topic_id(realm_id, &placement);
     let (digest, cursor) = topic_digest_cursor(net_handle, topic);
     Ok(ShardManifest {
@@ -48,77 +42,6 @@ pub async fn assemble_shard_manifest(
         digest,
         updated_at_ms: unix_timestamp_millis(),
     })
-}
-
-pub(crate) fn manifest_entry_digest(entries: &[ShardManifestEntry]) -> [u8; 32] {
-    let mut encoded_entries: Vec<Vec<u8>> = entries.iter().map(canonical_entry_bytes).collect();
-    encoded_entries.sort();
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&(encoded_entries.len() as u64).to_be_bytes());
-    for encoded in encoded_entries {
-        hasher.update(&(encoded.len() as u64).to_be_bytes());
-        hasher.update(&encoded);
-    }
-    *hasher.finalize().as_bytes()
-}
-
-fn canonical_entry_bytes(entry: &ShardManifestEntry) -> Vec<u8> {
-    let target_key = sync_revision_key(&entry.target);
-    let target_key = target_key.as_ref();
-    let mut bytes = Vec::with_capacity(4 + target_key.len() + 8 + 16 + 32 + 8);
-    bytes.extend_from_slice(&(target_key.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(target_key);
-    bytes.extend_from_slice(&entry.revision.generation.to_be_bytes());
-    bytes.extend_from_slice(&entry.revision.event_id.to_bytes());
-    bytes.extend_from_slice(entry.revision.actor.as_bytes());
-    bytes.extend_from_slice(&entry.revision.updated_at_ms.to_be_bytes());
-    bytes
-}
-
-async fn scan_manifest_entries(
-    context: &DriverContext,
-    placement: &PlacementRef,
-) -> Result<Vec<ShardManifestEntry>, String> {
-    let prefix = ByteView::from(shard_manifest_prefix(placement));
-    let mut entries = Vec::new();
-    let mut start_after: Option<Key> = None;
-    loop {
-        let batch = match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: SHARD_MANIFEST_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone()),
-                start: start_after.take().map(IterStart::After),
-                limit: MANIFEST_SCAN_PAGE,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                start_after = next_start_after;
-                values
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(format!("failed to scan shard manifest: {error}"));
-            }
-            other => {
-                return Err(format!("unexpected shard manifest iter result: {other:?}"));
-            }
-        };
-        for (_, value) in &batch {
-            let entry: ShardManifestEntry = postcard::from_bytes(value)
-                .map_err(|error| format!("failed to decode shard manifest entry: {error}"))?;
-            entries.push(entry);
-        }
-        if start_after.is_none() {
-            break;
-        }
-    }
-    Ok(entries)
 }
 
 // Irokle returns empty facts for a genesis-less topic and a zero digest on storage errors.
@@ -175,6 +98,8 @@ pub(crate) fn frontier_root(
 mod tests {
     use super::*;
     use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::shard_manifest_entry;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
@@ -261,10 +186,10 @@ mod tests {
         write_manifest_row(&context.storage_handle, 3, 2).await;
         write_manifest_row(&context.storage_handle, 4, 3).await;
 
-        let shard3 = scan_manifest_entries(&context, &placement(3))
+        let shard3 = drive(ManifestScanOperation::new(&placement(3)), &context)
             .await
             .expect("scan shard 3");
-        let shard4 = scan_manifest_entries(&context, &placement(4))
+        let shard4 = drive(ManifestScanOperation::new(&placement(4)), &context)
             .await
             .expect("scan shard 4");
 
@@ -354,36 +279,5 @@ mod tests {
             )
             .unwrap();
         assert_eq!(root, frontier_root(net, topic, &frontier).unwrap());
-    }
-
-    #[test]
-    fn digest_order_independent() {
-        let actor = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let first = ShardManifestEntry {
-            target: aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
-                document_id: Ulid::from_bytes([1; 16]),
-            },
-            revision: DocumentSyncRevision {
-                generation: 1,
-                event_id: Ulid::from_bytes([2; 16]),
-                actor,
-                updated_at_ms: 3,
-            },
-        };
-        let mut second = first.clone();
-        second.target = aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
-            document_id: Ulid::from_bytes([4; 16]),
-        };
-        let mut changed = second.clone();
-        changed.revision.generation += 1;
-
-        assert_eq!(
-            manifest_entry_digest(&[first.clone(), second.clone()]),
-            manifest_entry_digest(&[second.clone(), first.clone()])
-        );
-        assert_ne!(
-            manifest_entry_digest(&[first, second]),
-            manifest_entry_digest(&[changed])
-        );
     }
 }

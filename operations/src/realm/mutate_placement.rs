@@ -44,11 +44,11 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::shard_placement::schedule_revalidation;
+use aruna_core::placement::target_placement_ref;
 
 pub(crate) const CONFLICT_ATTEMPTS: usize = 10;
 
@@ -488,7 +488,7 @@ impl RealmPlacementMutation {
                 }
                 // The plan restates derived holder sets, so admission re-derives
                 // them: a plan naming sets this node disagrees with never enters.
-                if !crate::placement::transition::plan_is_derivable(document, plan) {
+                if !aruna_core::placement::transition::plan_is_derivable(document, plan) {
                     return Err(MutatePlacementError::InvalidInput(
                         "transition plan does not match the resolved holder sets".to_string(),
                     ));
@@ -800,7 +800,7 @@ pub enum MutatePlacementError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -914,14 +914,14 @@ impl MutatePlacementOperation {
         }
 
         if let Some((node_id, placement)) =
-            crate::placement::first_draining_change(&pre_document, &document)
+            aruna_core::placement::first_draining_change(&pre_document, &document)
         {
             return Err(MutatePlacementError::InvalidInput(format!(
                 "placement change alters drain-time holder set for node {node_id}, strategy {} shard {}",
                 placement.strategy_id, placement.shard
             )));
         }
-        if let Some(placement) = crate::placement::first_empty_shard(&document) {
+        if let Some(placement) = aruna_core::placement::first_empty_shard(&document) {
             return Err(MutatePlacementError::EmptyShardHolders {
                 strategy_id: placement.strategy_id,
                 shard: placement.shard,
@@ -1077,7 +1077,7 @@ impl MutatePlacementOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(MutatePlacementError::UnexpectedEvent {
             state,
@@ -1124,7 +1124,7 @@ impl Operation for MutatePlacementOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             MutatePlacementState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -1150,21 +1150,21 @@ impl Operation for MutatePlacementOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             MutatePlacementState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             MutatePlacementState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self
@@ -1175,132 +1175,151 @@ impl Operation for MutatePlacementOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
-            MutatePlacementState::ReadRegistryReferences { check } => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (_, value) in values {
-                        let record: MetadataRegistryRecord = match postcard::from_bytes(&value) {
-                            Ok(record) => record,
-                            Err(error) => return self.fail(ConversionError::from(error).into()),
-                        };
-                        if self.reference_matches(&record, check.strategy_id) {
-                            return self.fail(MutatePlacementError::StrategyReferenced {
-                                strategy_id: check.strategy_id,
-                            });
-                        }
-                    }
-                    match next_start_after {
-                        Some(start_after) => self.scan_registry_refs(check, Some(start_after)),
-                        None => self.scan_pending_refs(check, None),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event("metadata registry scan result", format!("{other:?}"))
-                }
-            },
-            MutatePlacementState::ReadPendingReferences { check } => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    if values.is_empty() {
-                        return match next_start_after {
-                            Some(start_after) => self.scan_pending_refs(check, Some(start_after)),
-                            None => self.write_after_check(check),
-                        };
-                    }
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(MutatePlacementError::MissingTransaction);
-                    };
-                    self.state = MutatePlacementState::ReadPendingEvents {
-                        check,
+            MutatePlacementState::ReadRegistryReferences { check } => {
+                let check = check.clone();
+                match event {
+                    Event::Storage(StorageEvent::IterResult {
+                        values,
                         next_start_after,
-                    };
-                    smallvec![Effect::Storage(StorageEffect::BatchRead {
-                        reads: values
-                            .into_iter()
-                            .map(|(key, _)| (EVENT_LOG_KEYSPACE.to_string(), key))
-                            .collect(),
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event("pending projection scan result", format!("{other:?}"))
-                }
-            },
-            MutatePlacementState::ReadPendingEvents {
-                check,
-                next_start_after,
-            } => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    for (key, value) in values {
-                        let Some(value) = value else {
-                            return self.fail(MutatePlacementError::StrategyReferenced {
-                                strategy_id: check.strategy_id,
-                            });
-                        };
-                        let event: MetadataEventRecord = match postcard::from_bytes(&value) {
-                            Ok(event) => event,
-                            Err(_) => {
+                    }) => {
+                        for (_, value) in values {
+                            let record: MetadataRegistryRecord = match postcard::from_bytes(&value)
+                            {
+                                Ok(record) => record,
+                                Err(error) => {
+                                    return self.fail(ConversionError::from(error).into());
+                                }
+                            };
+                            if self.reference_matches(&record, check.strategy_id) {
                                 return self.fail(MutatePlacementError::StrategyReferenced {
                                     strategy_id: check.strategy_id,
                                 });
                             }
-                        };
-                        let valid_target = pending_projection_target(key.as_ref()).is_some_and(
-                            |(document_id, event_id)| {
-                                event.record.document_id == document_id
-                                    && event.event_id == event_id
-                            },
-                        );
-                        if !valid_target || self.reference_matches(&event.record, check.strategy_id)
-                        {
-                            return self.fail(MutatePlacementError::StrategyReferenced {
-                                strategy_id: check.strategy_id,
-                            });
+                        }
+                        match next_start_after {
+                            Some(start_after) => self.scan_registry_refs(check, Some(start_after)),
+                            None => self.scan_pending_refs(check, None),
                         }
                     }
-                    match next_start_after {
-                        Some(start_after) => self.scan_pending_refs(check, Some(start_after)),
-                        None => self.write_after_check(check),
-                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("metadata registry scan result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("pending create event reads", format!("{other:?}")),
-            },
+            }
+            MutatePlacementState::ReadPendingReferences { check } => {
+                let check = check.clone();
+                match event {
+                    Event::Storage(StorageEvent::IterResult {
+                        values,
+                        next_start_after,
+                    }) => {
+                        if values.is_empty() {
+                            return match next_start_after {
+                                Some(start_after) => {
+                                    self.scan_pending_refs(check, Some(start_after))
+                                }
+                                None => self.write_after_check(check),
+                            };
+                        }
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(MutatePlacementError::MissingTransaction);
+                        };
+                        self.state = MutatePlacementState::ReadPendingEvents {
+                            check,
+                            next_start_after,
+                        };
+                        smallvec![Effect::Storage(StorageEffect::BatchRead {
+                            reads: values
+                                .into_iter()
+                                .map(|(key, _)| (EVENT_LOG_KEYSPACE.to_string(), key))
+                                .collect(),
+                            txn_id: Some(txn_id),
+                        })]
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("pending projection scan result", other.label()),
+                }
+            }
+            MutatePlacementState::ReadPendingEvents {
+                check,
+                next_start_after,
+            } => {
+                let check = check.clone();
+                let next_start_after = next_start_after.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                        for (key, value) in values {
+                            let Some(value) = value else {
+                                return self.fail(MutatePlacementError::StrategyReferenced {
+                                    strategy_id: check.strategy_id,
+                                });
+                            };
+                            let event: MetadataEventRecord = match postcard::from_bytes(&value) {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    return self.fail(MutatePlacementError::StrategyReferenced {
+                                        strategy_id: check.strategy_id,
+                                    });
+                                }
+                            };
+                            let valid_target = pending_projection_target(key.as_ref()).is_some_and(
+                                |(document_id, event_id)| {
+                                    event.record.document_id == document_id
+                                        && event.event_id == event_id
+                                },
+                            );
+                            if !valid_target
+                                || self.reference_matches(&event.record, check.strategy_id)
+                            {
+                                return self.fail(MutatePlacementError::StrategyReferenced {
+                                    strategy_id: check.strategy_id,
+                                });
+                            }
+                        }
+                        match next_start_after {
+                            Some(start_after) => self.scan_pending_refs(check, Some(start_after)),
+                            None => self.write_after_check(check),
+                        }
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("pending create event reads", other.label()),
+                }
+            }
             MutatePlacementState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(MutatePlacementError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = MutatePlacementState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(MutatePlacementError::MissingTransaction);
+                        };
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = MutatePlacementState::DeleteAdminConflicts { document };
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit_transaction(document)
                     }
-                    self.emit_commit_transaction(document)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            MutatePlacementState::DeleteAdminConflicts { document } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
+            }
+            MutatePlacementState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                        self.emit_commit_transaction(document)
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
+            }
             MutatePlacementState::CommitTransaction { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
@@ -1311,7 +1330,7 @@ impl Operation for MutatePlacementOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
             MutatePlacementState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -1329,10 +1348,8 @@ impl Operation for MutatePlacementOperation {
                         self.actor.node_id,
                     )]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             MutatePlacementState::SchedulePlacementRevalidation => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -1344,10 +1361,9 @@ impl Operation for MutatePlacementOperation {
                     self.state = MutatePlacementState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "placement revalidation timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => {
+                    self.unexpected_event("placement revalidation timer schedule", other.label())
+                }
             },
             MutatePlacementState::Finish
             | MutatePlacementState::Error
@@ -1375,55 +1391,6 @@ impl Operation for MutatePlacementOperation {
     }
 }
 
-/// Drives a realm placement mutation, then when it drains the local node kicks the
-/// installed outbox drain owner so pre-holdership-loss records retry without a second
-/// drainer or replacing a persisted deadline. `auth_context` is `None` for local origin.
-pub async fn drive_placement_mutation(
-    config: MutatePlacementConfig,
-    auth_context: Option<AuthContext>,
-    context: &crate::driver::DriverContext,
-) -> Result<RealmConfigDocument, MutatePlacementError> {
-    let drains_node = matches!(
-        &config.mutation,
-        RealmPlacementMutation::UpsertNode(entry)
-            if entry.draining
-                && context.net_handle.as_ref().map(|net| net.node_id()) == Some(entry.node_id)
-    );
-    let mut attempts = 0;
-    let outcome = loop {
-        let operation = match auth_context.clone() {
-            Some(auth_context) => {
-                MutatePlacementOperation::authorized(config.clone(), auth_context)
-            }
-            None => MutatePlacementOperation::new(config.clone()),
-        };
-        match crate::driver::drive(operation, context).await {
-            Err(MutatePlacementError::StorageError(StorageError::TransactionConflict))
-                if attempts < CONFLICT_ATTEMPTS =>
-            {
-                // Retrying with no wait spends every attempt in one contention window.
-                tokio::time::sleep(aruna_core::backoff::conflict_backoff(
-                    attempts,
-                    config.actor.node_id.as_bytes(),
-                ))
-                .await;
-                attempts += 1;
-            }
-            Err(MutatePlacementError::StorageError(StorageError::TransactionConflict)) => {
-                warn!(attempts, "Realm placement mutation kept conflicting");
-                break Err(MutatePlacementError::StorageError(
-                    StorageError::TransactionConflict,
-                ));
-            }
-            outcome => break outcome,
-        }
-    };
-    if outcome.is_ok() && drains_node && context.net_handle.is_some() {
-        crate::tasks::incoming::drive_sync_drain(std::sync::Arc::new(context.clone())).await;
-    }
-    outcome
-}
-
 #[cfg(test)]
 #[path = "mutate_placement_tests.rs"]
-mod tests;
+pub(crate) mod tests;

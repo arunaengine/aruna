@@ -7,7 +7,8 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{
-    Event, JobControlEvent, NetError, NetEvent, SnapshotSignEvent, StatementSignEvent,
+    Event, JobControlEvent, NetError, NetEvent, PolicySignEvent, SnapshotSignEvent,
+    StatementSignEvent, VaultSignEvent,
 };
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
@@ -91,6 +92,13 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                     },
                 ))
             }
+            // Sign effects keep their own unavailable answer, as when the runner signed them.
+            NetEffect::PolicySign(_) => Event::Net(NetEvent::PolicySign(
+                PolicySignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
+            NetEffect::VaultSign(_) => Event::Net(NetEvent::VaultSign(
+                VaultSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
             NetEffect::SnapshotSign(_) => Event::Net(NetEvent::SnapshotSign(
                 SnapshotSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),

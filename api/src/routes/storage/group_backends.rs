@@ -18,7 +18,7 @@ use aruna_operations::groups::backends::create::{
 };
 use aruna_operations::groups::backends::disable::{SetDisabledError, SetDisabledOperation};
 use aruna_operations::groups::backends::query::{
-    GetBackendOperation, ListBackendsOperation, check_bucket,
+    BucketCheckOperation, GetBackendOperation, ListBackendsOperation,
 };
 use aruna_operations::groups::backends::replace::ReplaceBackendOperation;
 use axum::Json;
@@ -938,7 +938,7 @@ pub async fn check_provider_bucket(
             "A bucket name has 3 to 63 lowercase letters, digits, dots or hyphens.".to_string(),
         ));
     }
-    let (exists, writable) = check_bucket(&context, backend_id, &bucket)
+    let (exists, writable) = drive(BucketCheckOperation::new(backend_id, &bucket), &context)
         .await
         .map_err(|error| ServerError::BadRequestMessage(error.reason()))?;
     Ok(Json(ProviderBucketResponse {

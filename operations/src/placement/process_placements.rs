@@ -21,10 +21,10 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::placement::{bucket_membership, draining_former_holders, resolve_shard_holders};
 use crate::sync::shard_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
+use aruna_core::placement::{bucket_membership, draining_former_holders, resolve_shard_holders};
 
 const PLACEMENT_PAGE_SIZE: usize = 256;
 
@@ -478,8 +478,8 @@ async fn reconcile_placements(
     retry_needed |=
         prune_released_transitions(context, realm_id, local_node_id, &config, deadline_now).await;
     // Arm the earliest grace deadline without postponing an earlier retry.
-    retry_needed |= crate::placement::drain_pending(&config, deadline_now);
-    if let Some(deadline) = crate::placement::next_release_ms(&config, deadline_now)
+    retry_needed |= aruna_core::placement::drain_pending(&config, deadline_now);
+    if let Some(deadline) = aruna_core::placement::next_release_ms(&config, deadline_now)
         && let Some(task_handle) = context.task_handle.as_ref()
     {
         let effect = crate::sync::shard_placement::schedule_placement_deadline(
@@ -535,23 +535,24 @@ async fn reconcile_placements(
 
             // A resolution failure keeps the durable record: deleting it on a
             // missing or conflicted activation would destroy the only retry.
-            let holders = match crate::placement::try_resolve_holders(&config, &record.placement) {
-                Ok(holders) => holders,
-                Err(error) => {
-                    debug!(error = %error, "Keeping placement record for unresolvable bucket");
-                    let refreshed = new_placement(
-                        realm_id,
-                        record.placement,
-                        local_node_id,
-                        record.selected_peers.clone(),
-                    );
-                    if let Ok(effect) = write_placement_effect(&refreshed) {
-                        let _ = context.storage_handle.send_effect(effect).await;
+            let holders =
+                match aruna_core::placement::try_resolve_holders(&config, &record.placement) {
+                    Ok(holders) => holders,
+                    Err(error) => {
+                        debug!(error = %error, "Keeping placement record for unresolvable bucket");
+                        let refreshed = new_placement(
+                            realm_id,
+                            record.placement,
+                            local_node_id,
+                            record.selected_peers.clone(),
+                        );
+                        if let Ok(effect) = write_placement_effect(&refreshed) {
+                            let _ = context.storage_handle.send_effect(effect).await;
+                        }
+                        retry_needed = true;
+                        continue;
                     }
-                    retry_needed = true;
-                    continue;
-                }
-            };
+                };
             if !holders.contains(&local_node_id) {
                 // The local node is no longer a holder of this shard. Drop the
                 // verification marker too so a later re-entry re-verifies.
@@ -663,8 +664,8 @@ fn has_transition_work(config: &RealmConfigDocument, now_ms: u64) -> bool {
                 .strategies
                 .iter()
                 .any(|strategy| config.activation(&strategy.strategy_id, 0).is_none()))
-        || crate::placement::next_release_ms(config, now_ms).is_some()
-        || crate::placement::drain_pending(config, now_ms)
+        || aruna_core::placement::next_release_ms(config, now_ms).is_some()
+        || aruna_core::placement::drain_pending(config, now_ms)
         // A cheap over-approximation of a pending successor expansion: an
         // activation trailing the newest map with no transition in flight.
         || config.newest_map_epoch().is_some_and(|newest| {

@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
@@ -31,11 +30,8 @@ use aruna_core::structs::{
     SyncPull, SyncPullStatus, SyncRefusal, SyncRelationship, SyncVersionPage,
 };
 use aruna_core::types::GroupId;
-use aruna_net::streams::BiStream;
 use craqle::GraphReplicaSnapshot;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
 
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -54,8 +50,8 @@ use aruna_core::metadata::AuthToken;
 pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;
 pub(crate) const INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const STANDARD_FRAME: u8 = 0;
-const AUDIT_FRAME: u8 = 1;
+pub(crate) const STANDARD_FRAME: u8 = 0;
+pub(crate) const AUDIT_FRAME: u8 = 1;
 const POSTCARD_VARIANT_BYTES: usize = 5;
 const AUDIT_REQUEST_VARIANT: u32 = 31;
 const AUDIT_RESPONSE_VARIANT: u32 = 32;
@@ -518,7 +514,7 @@ pub enum MetadataTransportMessage {
     ForwardedVaultChange {
         result: Result<
             crate::users::vault_write::VaultAppended,
-            crate::users::vault_route::VaultRefusal,
+            crate::users::vault_write::VaultRefusal,
         >,
     },
     /// One user's vault heads or key records asked of a holder.
@@ -892,14 +888,6 @@ pub enum WriteAuthError {
     Forbidden,
 }
 
-pub(crate) async fn write_message(
-    stream: &mut BiStream,
-    message: &MetadataTransportMessage,
-) -> Result<(), String> {
-    let bytes = encode_message(message)?;
-    write_encoded_message(stream, frame_class(message), &bytes).await
-}
-
 pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u8>, String> {
     if frame_class(message) == AUDIT_FRAME {
         let size =
@@ -916,151 +904,9 @@ pub(crate) fn encode_message(message: &MetadataTransportMessage) -> Result<Vec<u
     Ok(bytes)
 }
 
-pub(crate) async fn write_encoded_message(
-    stream: &mut BiStream,
-    class: u8,
-    bytes: &[u8],
-) -> Result<(), String> {
-    if class != STANDARD_FRAME && class != AUDIT_FRAME {
-        return Err("invalid metadata frame class".to_string());
-    }
-    stream
-        .0
-        .write_all(&[class])
-        .await
-        .map_err(|err| err.to_string())?;
-    stream
-        .0
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await
-        .map_err(|err| err.to_string())?;
-    stream
-        .0
-        .write_all(bytes)
-        .await
-        .map_err(|err| err.to_string())?;
-    stream.0.flush().await.map_err(|err| err.to_string())?;
-    Ok(())
-}
-
-pub async fn read_message(stream: &mut BiStream) -> Result<MetadataTransportMessage, String> {
-    read_message_cap(&mut stream.1, MAX_MESSAGE_SIZE).await
-}
-
-pub(crate) async fn read_message_budget<R>(
-    reader: &mut R,
-    max_size: usize,
-    byte_budget: &Arc<Semaphore>,
-) -> Result<(MetadataTransportMessage, OwnedSemaphorePermit), String>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let (message, permit) = read_message_inner(reader, max_size, Some(byte_budget)).await?;
-    permit
-        .ok_or_else(|| "metadata inbound frame budget missing".to_string())
-        .map(|permit| (message, permit))
-}
-
-pub(crate) async fn read_message_cap<R>(
-    reader: &mut R,
-    max_size: usize,
-) -> Result<MetadataTransportMessage, String>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    read_message_inner(reader, max_size, None)
-        .await
-        .map(|(message, _)| message)
-}
-
-async fn read_message_inner<R>(
-    reader: &mut R,
-    max_size: usize,
-    byte_budget: Option<&Arc<Semaphore>>,
-) -> Result<(MetadataTransportMessage, Option<OwnedSemaphorePermit>), String>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let mut class_buf = [0u8; 1];
-    reader
-        .read_exact(&mut class_buf)
-        .await
-        .map_err(|err| err.to_string())?;
-    let class = class_buf[0];
-    if class != STANDARD_FRAME && class != AUDIT_FRAME {
-        return Err("invalid metadata frame class".to_string());
-    }
-
-    let mut len_buf = [0u8; 4];
-    reader
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|err| err.to_string())?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > max_size.min(MAX_MESSAGE_SIZE) {
-        return Err("metadata frame exceeds maximum size".to_string());
-    }
-    if class == AUDIT_FRAME && len > audit_frame_cap() {
-        return Err("metadata audit frame exceeds maximum size".to_string());
-    }
-
-    let permit = match byte_budget {
-        Some(byte_budget) => {
-            let permits = u32::try_from(len)
-                .map_err(|_| "metadata frame length is unsupported".to_string())?;
-            Some(
-                byte_budget
-                    .clone()
-                    .try_acquire_many_owned(permits)
-                    .map_err(|_| "metadata inbound frame budget unavailable".to_string())?,
-            )
-        }
-        None => None,
-    };
-
-    let mut variant = [0u8; POSTCARD_VARIANT_BYTES];
-    let variant_len = len.min(POSTCARD_VARIANT_BYTES);
-    let mut prefix_len = 0;
-    if variant_len > 0 {
-        reader
-            .read_exact(&mut variant[..1])
-            .await
-            .map_err(|err| err.to_string())?;
-        prefix_len = 1;
-        while prefix_len < variant_len && variant[prefix_len - 1] & 0x80 != 0 {
-            reader
-                .read_exact(&mut variant[prefix_len..prefix_len + 1])
-                .await
-                .map_err(|err| err.to_string())?;
-            prefix_len += 1;
-        }
-        let variant = parse_variant(&variant[..prefix_len])
-            .map_err(|_| "metadata frame variant is invalid".to_string())?;
-        if len > audit_frame_cap() && variant.is_some_and(is_audit_variant) {
-            return Err("metadata audit frame exceeds maximum size".to_string());
-        }
-    }
-
-    let mut bytes = vec![0u8; len];
-    bytes[..prefix_len].copy_from_slice(&variant[..prefix_len]);
-    reader
-        .read_exact(&mut bytes[prefix_len..])
-        .await
-        .map_err(|err| err.to_string())?;
-    let message = decode_message(&bytes).map_err(|err| err.to_string())?;
-    let decoded_class = frame_class(&message);
-    if decoded_class != class {
-        return Err("metadata frame class does not match message".to_string());
-    }
-    if decoded_class == AUDIT_FRAME && len > audit_frame_cap() {
-        return Err("metadata audit frame exceeds maximum size".to_string());
-    }
-    Ok((message, permit))
-}
-
 /// Decodes one frame. A realm node that predates `node_places` or `node_names` ends its realm
 /// documents before them, and an empty map is one zero byte; only that exact reply is padded.
-fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
+pub(crate) fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
     postcard::from_bytes(bytes).or_else(|error| {
         // One zero byte supplies `node_places`, two supply `node_names` as well.
         for missing in 1..=2 {
@@ -1079,11 +925,11 @@ fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Er
     })
 }
 
-fn audit_frame_cap() -> usize {
+pub(crate) fn audit_frame_cap() -> usize {
     MAX_PAGE_BYTES.saturating_add(AUDIT_FRAME_OVERHEAD)
 }
 
-fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
+pub(crate) fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
     let Some(&last) = prefix.last() else {
         return Ok(None);
     };
@@ -1095,7 +941,7 @@ fn parse_variant(prefix: &[u8]) -> Result<Option<u32>, ()> {
         .map_err(|_| ())
 }
 
-fn is_audit_variant(variant: u32) -> bool {
+pub(crate) fn is_audit_variant(variant: u32) -> bool {
     variant == AUDIT_REQUEST_VARIANT || variant == AUDIT_RESPONSE_VARIANT
 }
 
@@ -1120,6 +966,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::metadata::frames::{read_message_budget, read_message_cap};
     use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageRequest};
     use aruna_core::metadata::MAX_TOKEN_LEN;
@@ -1128,6 +975,7 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Semaphore;
 
     #[test]

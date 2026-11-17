@@ -3,14 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
-use crate::forward::authorize::is_sync_eligible;
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::forward::transport::reject;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
-use crate::placement::holds_placement;
-use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 use crate::sync::outbox_record::new_outbox_record;
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::sync::outbox_record::write_outbox_effect;
@@ -21,6 +20,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
 use aruna_core::handle::Handle;
+use aruna_core::placement::holds_placement;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use std::sync::Arc;
@@ -138,7 +138,10 @@ pub(crate) async fn apply_admin_relay(
     let Some(net_handle) = context.net_handle.as_ref() else {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
-    let Some(config) = load_realm_config(context, *net_handle.realm_id()).await else {
+    let Some(config) = drive(GetConfigOperation::new(*net_handle.realm_id()), context)
+        .await
+        .ok()
+    else {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     match admit_relayed_admin(
@@ -193,10 +196,10 @@ pub(crate) async fn apply_admin_relay(
 mod tests {
     use super::RelayAdmission;
     use super::admit_relayed_admin;
-    use crate::placement::resolve_shard_holders;
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentEvent;
+    use aruna_core::placement::resolve_shard_holders;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;

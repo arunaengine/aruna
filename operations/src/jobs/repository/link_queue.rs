@@ -38,9 +38,9 @@ use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::raw_revision::load_raw_revision;
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
-use crate::placement::holds_placement;
 use crate::realm::load_config::load_realm_config;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
+use aruna_core::placement::holds_placement;
 
 const QUEUE_PAGE: usize = 256;
 const ERROR_RETRY_MS: u64 = 60_000;

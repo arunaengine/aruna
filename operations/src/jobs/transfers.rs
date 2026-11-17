@@ -27,8 +27,9 @@ use ulid::Ulid;
 
 use super::executor::{JobContext, JobRunOutcome};
 use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
-use crate::driver::drive;
-use crate::effect_adapters::routing::{gate_context, routing_snapshot};
+use crate::driver::{drive, node_routing};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::placement::policy::GateOperation;
 use crate::plugins::bound::ReleaseKeys;
 use crate::plugins::broker::local_object;
 use crate::plugins::broker::unmarked;
@@ -57,7 +58,7 @@ pub async fn download_work(
     ctx: &JobContext,
     spec: &PluginWorkSpec,
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
-    (download, keys): (Download<'_>, &ReleaseKeys),
+    download: Download<'_>,
 ) -> JobRunOutcome {
     let patterns = match download_grants(ctx, install, (row, download.target)).await {
         Ok(found) => found,
@@ -80,7 +81,7 @@ pub async fn download_work(
         Ok(None) => {}
         Err(error) => return retryable(error.to_string()),
     }
-    let request = prepared(ctx, (install, config, row), keys).await;
+    let request = prepared(ctx, (install, config, row)).await;
     let (outgoing, exposure, _) = match request {
         Ok(prepared) => prepared,
         Err(error) => return refused(error),
@@ -129,11 +130,25 @@ pub async fn download_work(
         Arc::new(AtomicBool::new(false)),
     );
     let counted = counted(response, download.max_bytes, &pulled, (&over, &broken));
-    let routing = match routing_snapshot(&ctx.driver, install.group_id, &bucket).await {
+    let routing = match drive(
+        SnapshotOperation::new(
+            &node_routing(&ctx.driver),
+            install.group_id,
+            BucketRules::Named(bucket.to_string()),
+        ),
+        &ctx.driver,
+    )
+    .await
+    {
         Ok(routing) => routing,
         Err(error) => return retryable(error.to_string()),
     };
-    let gate = match gate_context(&ctx.driver, spec.realm_id, unix_timestamp_millis()).await {
+    let gate = match drive(
+        GateOperation::new(spec.realm_id, unix_timestamp_millis()),
+        &ctx.driver,
+    )
+    .await
+    {
         Ok(gate) => gate,
         Err(error) => return retryable(error.to_string()),
     };
@@ -239,7 +254,7 @@ pub async fn upload_work(
     ctx: &JobContext,
     spec: &PluginWorkSpec,
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
-    (upload, keys): (Upload<'_>, &ReleaseKeys),
+    upload: Upload<'_>,
 ) -> JobRunOutcome {
     let patterns = match upload_grants(ctx, install, (row, upload.source)).await {
         Ok(found) => found,
@@ -262,7 +277,7 @@ pub async fn upload_work(
         Ok(None) => return permanent("the object to upload is gone"),
         Err(error) => return refused(error),
     };
-    let (outgoing, exposure, fields) = match prepared(ctx, (install, config, row), keys).await {
+    let (outgoing, exposure, fields) = match prepared(ctx, (install, config, row)).await {
         Ok(prepared) => prepared,
         Err(error) => return refused(error),
     };
@@ -487,7 +502,6 @@ async fn download_grants(
 async fn prepared(
     ctx: &JobContext,
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
-    keys: &ReleaseKeys,
 ) -> Result<(OutgoingRequest, ResponseExposure, SecretFields), HostError> {
     let context = row.context.as_ref();
     let context = context.ok_or_else(|| HostError::new(ErrorKind::Invalid, "no request"))?;
@@ -500,7 +514,7 @@ async fn prepared(
         let fields = SecretFields::new(Default::default());
         return Ok((request, ResponseExposure::Full, fields));
     };
-    let place = (config, ctx.owner_node_id, keys);
+    let place = (config, ctx.owner_node_id);
     let released = release_into(
         &ctx.driver,
         place,

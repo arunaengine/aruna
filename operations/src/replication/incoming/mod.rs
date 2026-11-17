@@ -2,9 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::abe::copies::copy_row;
 use crate::blob::holders::dht_registration_effect;
-use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
     release_row_effect, write_location_effect, write_version_effect,
@@ -20,6 +18,7 @@ use crate::placement::policy::{
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::replication::queue::schedule_blob_drain;
+use crate::s3::abe_copies::copy_row;
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
@@ -40,6 +39,7 @@ use aruna_core::keyspaces::{
     OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, PENDING_CLAIM_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, SYNC_RECEIPT_KEYSPACE,
 };
+use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -72,10 +72,9 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
 };
+use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
-use aruna_core::structs::storage::replication_queue::{
-    LiveObligationRecord, live_obligation_effect,
-};
+use aruna_core::structs::storage::replication_queue::live_obligation_effect;
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };

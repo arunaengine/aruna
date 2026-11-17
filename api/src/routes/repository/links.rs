@@ -595,14 +595,11 @@ pub async fn create_link(
     let metadata_json = metadata_json(&state, request.metadata)?;
     Box::pin(ensure_requirements(&state, &auth, document_id, &view)).await?;
     let context = state.get_ctx();
-    let holds = aruna_operations::forward::routing::origin_holds_document(
-        &context,
-        state.get_realm_id(),
-        state.get_node_id(),
-        document_id,
-    )
-    .await
-    .map_err(|_| ServerError::ServiceUnavailableReason("dataset placement unavailable".into()))?;
+    let holds = crate::lookup::origin_holds(&state, document_id)
+        .await
+        .ok_or_else(|| {
+            ServerError::ServiceUnavailableReason("dataset placement unavailable".into())
+        })?;
     if !holds {
         return Err(ServerError::Conflict(
             "create the link on a node that holds this dataset".into(),

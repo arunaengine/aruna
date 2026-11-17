@@ -22,6 +22,7 @@ use aruna_outbound::Backoffs;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::notifications::opt_in::{EmailError, EmailOptIn, SetEmailOperation};
@@ -33,8 +34,7 @@ use crate::notifications::settings::{
     BACKOFF_START_MS, Delivery, MetadataPeers, SettingPeers, SettingWinner, delivery_setting,
     managers,
 };
-use crate::realm::get_config::GetConfigOperation;
-use crate::realm_vault::{prune_secret_cache, read_realm_secret};
+use crate::realm_vault::{PruneCacheOperation, ReadSecretOperation};
 
 /// Whether a mail sender can be built from `settings`: a valid sender address and host.
 pub fn check_smtp(settings: &SmtpSettings) -> Result<(), String> {
@@ -66,7 +66,7 @@ pub async fn refresh_mail(context: &DriverContext, realm_id: RealmId) {
     if let Some(outbound) = context.outbound_handle.as_ref() {
         outbound.refresh_mail(config.email.as_ref().map(|profile| profile.revision));
     }
-    if let Err(error) = prune_secret_cache(context, &config).await {
+    if let Err(error) = drive(PruneCacheOperation::new(&config), context).await {
         warn!(error = %error, "Pruning cached realm secrets failed");
     }
 }
@@ -270,7 +270,8 @@ async fn smtp_settings(
     let password = match profile.password {
         None => None,
         Some(reference) => {
-            let secret = read_realm_secret(&ctx.driver, config, reference)
+            let read = ReadSecretOperation::new(config, reference);
+            let secret = drive(read, &ctx.driver)
                 .await
                 .map_err(|error| JobError::retryable(error.to_string()))?;
             let text = String::from_utf8(secret.expose().to_vec())

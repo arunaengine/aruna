@@ -26,9 +26,9 @@ use aruna_core::structs::storage::node_info::AdvertisementEpoch;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
-use crate::realm::get_config::GetConfigOperation;
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;

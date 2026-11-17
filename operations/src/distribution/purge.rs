@@ -36,12 +36,14 @@ use super::feed_walks::split_key;
 use super::imports::drop_resume;
 use super::inventory::{Walk, route};
 use super::pull::drop_copy;
-use crate::driver::{DriverContext, drive, now_ms};
+use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
-use crate::s3::usage::{MarkDirtyOperation, dirty_rows};
+use crate::s3::usage::MarkDirtyOperation;
+use crate::s3::usage::dirty_rows;
+use aruna_core::time::unix_timestamp_millis;
 
 /// Inventory rows one page purges at most.
 const PAGE_ROWS: usize = 64;
@@ -356,7 +358,7 @@ async fn abort_uploads(
             bucket: target.bucket.clone(),
             key: position.key,
             upload_id,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         };
         let abort = AbortUploadOperation::new(input).including_in_progress();
         match drive(abort, context).await {

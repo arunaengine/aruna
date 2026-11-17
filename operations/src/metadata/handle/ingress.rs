@@ -31,7 +31,8 @@ use super::transport::{
 use super::{
     MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,
 };
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
@@ -47,8 +48,8 @@ use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, GetRelationshipOperation, RemoveOutgoingOperation,
     StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
-use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::metadata::AuthToken;
+use aruna_core::node_state::ReadInfoOperation;
 
 impl MetadataHandle {
     #[allow(clippy::too_many_arguments)]
@@ -902,7 +903,7 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 Box::pin(async {
-                    crate::auth::forward::apply_token_revoke(context, peer, forward).await
+                    crate::forward::token::apply_token_revoke(context, peer, forward).await
                 })
                 .await
             }
@@ -916,10 +917,20 @@ impl MetadataHandle {
                 .await
             }
             MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
-                Box::pin(async {
-                    crate::placement::policy::serve_local_policy(context, peer, policy_ref).await
-                })
-                .await
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::placement::policy::ServePolicyOperation::new(
+                            *net.realm_id(),
+                            peer,
+                            policy_ref,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                };
+                MetadataTransportMessage::ForwardedPlacementPolicy { result }
             }
             forward @ MetadataTransportMessage::ForwardVaultChange { .. } => {
                 Box::pin(async {
@@ -1004,7 +1015,7 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
                 Box::pin(async {
-                    crate::realm::forward::apply_admin_relay(context, peer, forward).await
+                    crate::forward::realm::apply_admin_relay(context, peer, forward).await
                 })
                 .await
             }
@@ -1174,28 +1185,77 @@ impl MetadataHandle {
                 )
             }
             MetadataTransportMessage::HandRealmKey { key } => {
-                let stored = crate::realm::promote_node::serve_realm_key(context, peer, key);
-                let result = Box::pin(stored).await;
+                let request = crate::realm::promotion::PromotionRequest::HandKey(key);
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::realm::promotion::ServePromotionOperation::new(
+                            *net.realm_id(),
+                            net.node_id(),
+                            peer,
+                            request,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                }
+                .map(|_| ());
                 (MetadataTransportMessage::RealmKeyStored { result }, None)
             }
             MetadataTransportMessage::RealmSecret { entry, revision } => {
                 let request = aruna_core::realm_vault::RealmSecretRef { entry, revision };
-                let key = self.realm_vault_key();
-                let served =
-                    crate::realm_vault::serve_realm_secret(context, key.as_deref(), peer, request);
-                let result = Box::pin(served).await;
+                let request = crate::realm_vault::ServeRequest::Secret(request);
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::realm_vault::ServeSecretOperation::new(
+                            *net.realm_id(),
+                            net.node_id(),
+                            peer,
+                            request,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                };
                 (MetadataTransportMessage::RealmSecretResult { result }, None)
             }
             MetadataTransportMessage::OpenSetting { target, bytes } => {
-                let key = self.realm_seal_key();
-                let served =
-                    crate::realm_vault::serve_open(context, key.as_deref(), peer, target, bytes);
-                let result = Box::pin(served).await;
+                let request = crate::realm_vault::ServeRequest::Setting { target, bytes };
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::realm_vault::ServeSecretOperation::new(
+                            *net.realm_id(),
+                            net.node_id(),
+                            peer,
+                            request,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                };
                 (MetadataTransportMessage::OpenSettingResult { result }, None)
             }
             MetadataTransportMessage::PromotionCheck => {
-                let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
-                let result = Box::pin(ready).await;
+                let request = crate::realm::promotion::PromotionRequest::Check;
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::realm::promotion::ServePromotionOperation::new(
+                            *net.realm_id(),
+                            net.node_id(),
+                            peer,
+                            request,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                };
                 (MetadataTransportMessage::PromotionReady { result }, None)
             }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }

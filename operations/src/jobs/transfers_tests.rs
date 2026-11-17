@@ -278,7 +278,7 @@ async fn ungranted_target() {
 async fn narrowed_rule() {
     // A secret whose rule shows the status only would hide what the bucket keeps, so the work
     // ends after the release and before any request.
-    use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, keys, secret_with};
+    use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret_with};
     use crate::plugins::install::read_config;
     use aruna_core::secrets::ResponseExposure;
     let fixture = Fixture::keyed().await;
@@ -309,7 +309,8 @@ async fn narrowed_rule() {
         max_bytes: None,
     };
     let ctx = job_context(&blob, &fixture);
-    let outcome = download_work(&ctx, &spec, (&install, &config, &row), (download, &keys())).await;
+    hold_keys(&fixture.ctx);
+    let outcome = download_work(&ctx, &spec, (&install, &config, &row), download).await;
     let (kind, message) = failed(outcome);
     assert_eq!(kind, JobErrorKind::Permanent);
     assert_eq!(message, "this connection does not expose its whole answer");

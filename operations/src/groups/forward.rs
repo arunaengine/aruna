@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::forward::authorize::authorize_forwarded_caller;
 use crate::forward::authorize::authorize_write;
 use crate::forward::authorize::forward_auth_error;
-use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::RetryDisposition;
 use crate::forward::transport::reject;
 use crate::forward::transport::retry_disposition;
@@ -17,11 +17,11 @@ use crate::groups::create_group::CreateGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
-use crate::placement::process_placements::load_realm_config;
-use crate::placement::selector::select_top_peers;
+use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::AuthToken;
+use aruna_core::placement::selector::select_top_peers;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -58,7 +58,7 @@ pub async fn forward_group_create(
     auth_token: AuthToken,
     display_name: String,
 ) -> Result<(Group, GroupAuthorizationDocument), ForwardGroupError> {
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
         return Err(MetadataApiError::ServiceUnavailable.into());
     };
     let Some(metadata) = context.metadata_handle.as_ref() else {
@@ -144,7 +144,7 @@ pub(crate) async fn apply_group_create(
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     let realm_id = *net_handle.realm_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     if !is_sync_eligible(&config, net_handle.node_id()) {

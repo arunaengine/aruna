@@ -68,10 +68,17 @@ impl SettingPeers for MetadataPeers<'_> {
     ) -> Result<SecretBytes, MetadataReadError> {
         let metadata = self.ctx.metadata_handle.as_ref();
         if node == self.local {
-            let key = metadata.and_then(|metadata| metadata.realm_seal_key());
-            let served =
-                crate::realm_vault::serve_open(self.ctx, key.as_deref(), self.local, target, bytes);
-            return Box::pin(served).await;
+            let net = self.ctx.net_handle.as_ref();
+            let net = net.ok_or(MetadataReadError::Unavailable)?;
+            let request = crate::realm_vault::ServeRequest::Setting { target, bytes };
+            let serve = crate::realm_vault::ServeSecretOperation::new(
+                *net.realm_id(),
+                self.local,
+                self.local,
+                request,
+            );
+            let served = crate::driver::drive(serve, self.ctx);
+            return Box::pin(served).await.and_then(|answer| answer);
         }
         let metadata = metadata.ok_or(MetadataReadError::Unavailable)?;
         metadata.request_open(node, target, bytes).await

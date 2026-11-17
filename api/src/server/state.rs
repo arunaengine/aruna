@@ -18,9 +18,11 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
-    realm_token_revoked, realm_user_cutoff,
+    ArunaValidationState, IssuerKeyCache, realm_linked_owner, realm_token_revoked,
+    realm_user_cutoff,
 };
+use aruna_operations::auth::error::ArunaBearerError;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation, StateError};
@@ -30,7 +32,6 @@ use aruna_operations::onboarding::issue_ticket::{
 use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_tasks::wipe::DeviceWipe;
 use aruna_wire::address::client_host_url;
 use aruna_wire::info::PortalStatus;

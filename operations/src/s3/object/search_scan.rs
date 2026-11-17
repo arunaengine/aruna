@@ -23,9 +23,9 @@ use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_core::types::{GroupId, Key, TxnId};
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
-};
+use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 

@@ -24,8 +24,8 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 
 /// One change a user makes to their own vault records.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +84,13 @@ pub enum VaultAppended {
     Key(Box<UserKeyRecord>),
 }
 
+/// Why a holder refused a forwarded vault change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultRefusal {
+    Invalid,
+    TooManyKeys,
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum AppendVaultError {
     #[error(transparent)]
@@ -113,7 +120,7 @@ pub enum AppendVaultError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -669,6 +676,13 @@ impl Operation for AppendVaultOperation {
             AppendVaultError::NotHolder { .. }
                 | AppendVaultError::Record(_)
                 | AppendVaultError::TooManyKeys
+        )
+    }
+
+    fn is_conflict(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            AppendVaultError::Storage(StorageError::TransactionConflict)
         )
     }
 }

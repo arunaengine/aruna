@@ -18,7 +18,8 @@ use aruna_core::types::GroupId;
 use ulid::Ulid;
 
 use super::accept_delegation::{AcceptDelegationOperation, DelegateError};
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
+use crate::driver::drive;
 
 /// How long an issued delegation is valid.
 const DELEGATION_SECS: u64 = 15;

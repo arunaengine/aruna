@@ -36,18 +36,21 @@ use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use aruna_core::node_state::ReadInfoOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::demand::{demand_snapshot, read_reservations};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::node::heartbeat::SendHeartbeatOperation;
 use crate::node::info_publish::PublishInfoOperation;
 use crate::node::info_write::{InfoChange, InfoWriteOperation};
-use crate::placement::{build_view, held_buckets};
-use crate::realm::get_config::GetConfigOperation;
+use crate::placement::policy::{
+    SubjectScanError, SubjectScanMode, SubjectScanResult, SubjectSyncOperation, SubjectTrigger,
+};
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::usage::LoadCountersOperation;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::node_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
+use aruna_core::placement::{build_view, held_buckets};
 use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
 
 /// Assembles this node's info document from its executors, current
@@ -313,6 +316,27 @@ async fn revise_node_info(
         .map_err(|error| error.to_string())
 }
 
+/// Reacts to an observed placement change for this node. A node the realm still
+/// places revalidates its inventory under the observed subject; one draining or
+/// no longer placed departs, blocking admission and recording copies unresolved.
+pub async fn observe_placement(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    now_ms: u64,
+) -> Result<Option<SubjectScanResult>, SubjectScanError> {
+    let observe = SubjectSyncOperation::new(realm_id, node_id, SubjectTrigger::Observe, now_ms);
+    let Some((mode, result)) = drive(observe, context).await? else {
+        return Ok(None);
+    };
+    // Compute follows departure state as best effort because departure cannot block on it.
+    let departing = matches!(mode, SubjectScanMode::Depart);
+    if let Err(error) = set_departure_state(context, node_id, realm_id, departing).await {
+        warn!(%error, "failed to publish compute departure state");
+    }
+    Ok(Some(result))
+}
+
 /// Applies an observed departure, or a return, to this node's compute plane. Departing
 /// stops offers/admissions, records reserved executions as unresolved without blocking
 /// removal; returning clears the flags. `Ok(false)` means the state already matched.
@@ -533,9 +557,7 @@ async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
 
 /// The bytes this node's backends may store, from their quotas.
 fn storage_capacity(ctx: &DriverContext) -> Option<u64> {
-    crate::effect_adapters::routing::node_routing(ctx)
-        .catalog
-        .capacity()
+    crate::driver::node_routing(ctx).catalog.capacity()
 }
 
 /// Counts documents this node holds, degrading to `None` with a warning so a
@@ -1657,7 +1679,7 @@ mod tests {
         config.placement_map.clear();
         config.nodes.clear();
         write_realm_config(&ctx, &config).await;
-        crate::placement::policy::observe_placement(&ctx, realm_id, local, 10)
+        observe_placement(&ctx, realm_id, local, 10)
             .await
             .expect("observation completes");
 

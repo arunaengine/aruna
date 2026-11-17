@@ -5,11 +5,11 @@
 
 use crate::blob::migration::drain::MIGRATION_CONTINUE;
 use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
-use crate::driver::{DriverContext, drive};
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::driver::DriverContext;
+use crate::driver::drive;
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
-use aruna_core::errors::ConversionError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
@@ -31,7 +31,7 @@ use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionState, cleanup_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, TxnId};
 use aruna_storage::StorageHandle;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
@@ -121,7 +121,7 @@ pub(crate) async fn resume_transitions(
 /// Advances every queued transition by one page. Returns when the task must run again.
 pub async fn process_transitions(context: &DriverContext) -> Result<Option<Duration>, String> {
     let storage = &context.storage_handle;
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     let mut next = None::<Duration>;
     let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
     let mut after = None;
@@ -185,7 +185,7 @@ async fn advance(
     bucket: &str,
     mut record: EncryptionTransition,
 ) -> Result<Option<Duration>, String> {
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     record.retry_at_ms = None;
     if record.state == TransitionState::Finished {
         return finish(context, bucket, record).await;
@@ -313,7 +313,7 @@ async fn settle(
         }
     }
     record.cleanup_remaining = left;
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     if left > 0 {
         record.retry_at_ms = Some(now.saturating_add(RECHECK.as_millis() as u64));
         store(storage, bucket, &mut record).await?;
@@ -337,7 +337,7 @@ async fn finish(
     bucket: &str,
     mut record: EncryptionTransition,
 ) -> Result<Option<Duration>, String> {
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     if let Some(source) = record.source
         && record.target.plan.map(|plan| plan.key) != Some(source)
     {
@@ -655,7 +655,7 @@ async fn stage(
             };
             record.blocked_reason = (versions == 0).then(|| PENDING_REASON.to_string());
             record.retry_at_ms = Some(
-                crate::effect_adapters::routing::now_ms()
+                aruna_core::time::unix_timestamp_millis()
                     .saturating_add(RECHECK.as_millis() as u64),
             );
         }
@@ -1608,7 +1608,7 @@ mod tests {
             archive: aruna_core::structs::storage::blob::ArchiveKey::of(&pending(Some(source))),
         };
         let version = VersionKey::new("b", "copy", Ulid::generate());
-        let copy_row = crate::abe::copies::copy_row(source.bucket_id, &version).unwrap();
+        let copy_row = crate::s3::abe_copies::copy_row(source.bucket_id, &version).unwrap();
         let value = copy.to_bytes().unwrap();
         put(&context, ABE_COPY_KEYSPACE, copy_row.clone(), value).await;
         let storage = &context.storage_handle;

@@ -901,6 +901,25 @@ pub fn open_value(
     )?)
 }
 
+/// The sealed value of a readable secret, for the storage backend that holds the realm keys.
+pub fn sealed_value(
+    realm_id: RealmId,
+    entry: &SecretEntry,
+) -> Result<aruna_core::realm_vault::RealmSealed, OwnerSecretError> {
+    let value = entry.value.as_ref().ok_or(ChangeError::NotFound)?;
+    let SecretBody::Value(sealed) = &value.body else {
+        return Err(ChangeError::NotFound.into());
+    };
+    Ok(aruna_core::realm_vault::RealmSealed::Named {
+        realm_id,
+        owner: value.owner,
+        name: value.name.clone(),
+        incarnation: value.incarnation,
+        value_id: value.stamp.write_id,
+        sealed: sealed.sealed.clone(),
+    })
+}
+
 #[cfg(test)]
 #[path = "owner_tests.rs"]
 mod tests;

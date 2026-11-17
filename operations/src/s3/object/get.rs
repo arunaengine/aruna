@@ -2,6 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::blob::records::blob_location_read;
+use crate::connectors::repository::{connector_reference_write, source_connector_key};
+use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::distribution::held::{
+    HeldElsewhere, kept_location, kept_reads, kept_source_location, kept_source_reads,
+};
+use crate::driver::{DriverContext, drive};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
+use crate::replication::protocol::BaoReadRefusal;
+use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use crate::s3::object::lookup::{
+    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
+    multipart_summary_read, summary_from_read,
+};
+use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use crate::s3::object::source::choice::{Candidate, choose_source};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use futures_util::StreamExt;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
@@ -17,6 +34,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
     SOURCE_INDEX_KEYSPACE,
 };
+use aruna_core::managed_copy::ManagedCopyError;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ExpectedChecksum, HASH_MD5, unmatched_checksum};
@@ -38,32 +56,19 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
-use aruna_core::structs::storage::replication_queue::{
-    LiveObligationRecord, ReferenceAdvance, live_obligation_entry,
-};
+use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::live_obligation_entry;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
+use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::{debug, warn};
-
-use crate::blob::managed_copy::ManagedCopyError;
-use crate::blob::records::blob_location_read;
-use crate::connectors::repository::{connector_reference_write, source_connector_key};
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::distribution::held::{
-    HeldElsewhere, kept_location, kept_reads, kept_source_location, kept_source_reads,
-};
-use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use crate::s3::object::lookup::{
-    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
-    multipart_summary_read, summary_from_read,
-};
-use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
-use crate::s3::object::source::choice::{Candidate, choose_source};
-use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 
 /// Maximum successors attempted before a still-changing current read fails.
 const MAX_DRIFT_ATTEMPTS: u8 = 3;

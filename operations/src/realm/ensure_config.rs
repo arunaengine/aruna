@@ -34,10 +34,10 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsureConfigParams {
@@ -120,7 +120,7 @@ pub enum EnsureConfigError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -496,7 +496,7 @@ impl EnsureConfigOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(EnsureConfigError::UnexpectedEvent {
             state,
@@ -518,13 +518,13 @@ impl Operation for EnsureConfigOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             EnsureConfigState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             EnsureConfigState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -536,7 +536,7 @@ impl Operation for EnsureConfigOperation {
                     else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     let membership = match MembershipFence::from_value(membership.as_deref()) {
@@ -552,35 +552,42 @@ impl Operation for EnsureConfigOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             EnsureConfigState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(EnsureConfigError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = EnsureConfigState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(EnsureConfigError::MissingTransaction);
+                        };
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = EnsureConfigState::DeleteAdminConflicts { document };
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit_transaction(document)
                     }
-                    self.emit_commit_transaction(document)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            EnsureConfigState::DeleteAdminConflicts { document } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
+            }
+            EnsureConfigState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                        self.emit_commit_transaction(document)
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
+            }
             EnsureConfigState::CommitNoop { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
@@ -591,20 +598,23 @@ impl Operation for EnsureConfigOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
-            EnsureConfigState::CommitTransaction { document } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = EnsureConfigState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
+            EnsureConfigState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                        self.txn_id = None;
+                        self.state = EnsureConfigState::ScheduleSyncDrain { document };
+                        smallvec![schedule_drain_effect()]
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        self.txn_id = None;
+                        self.fail(error.into())
+                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
+            }
             EnsureConfigState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = EnsureConfigState::Finish;
@@ -615,10 +625,8 @@ impl Operation for EnsureConfigOperation {
                     self.state = EnsureConfigState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             EnsureConfigState::Finish | EnsureConfigState::Error | EnsureConfigState::Init => {
                 smallvec![]

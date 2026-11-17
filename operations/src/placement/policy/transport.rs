@@ -1,133 +1,133 @@
-//! Runs the adapter side of a policy fetch, one request per resolved holder in rank order.
-//! It uses the existing control transport and never reroutes or widens the holder list.
+//! Serves one policy document to a peer that fetches it, after checking the peer and the hash.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, PolicyFetchEffect, StorageEffect};
-use aruna_core::events::{Event, PolicyFetchEvent, PolicySignEvent, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::{
-    PlacementPolicyDocument, PolicyPublicationClaim, placement_policy_target,
+    PlacementPolicyDocument, placement_policy_target,
 };
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, VerifiedPolicy};
-use tokio::time::timeout_at;
+use aruna_core::types::{Effects, Value};
+use smallvec::smallvec;
 use tracing::warn;
 
-use crate::driver::DriverContext;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::metadata::transport_message_kind;
-use crate::realm::load_config::load_realm_config;
+use crate::document_repository::read_effect;
+use crate::metadata::protocol::MetadataReadError;
 
-/// Asks each holder in turn for the document. A holder that answers without it
-/// contributes `NotFound`; only a complete absence of answers is `Unavailable`,
-/// so a missing policy can never be reported as a definitive denial.
-pub(crate) async fn fetch_policy(
-    context: &DriverContext,
-    effect: PolicyFetchEffect,
-) -> PolicyFetchEvent {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return PolicyFetchEvent::Unavailable("metadata transport unavailable".to_string());
-    };
-    let deadline = tokio::time::Instant::now() + effect.deadline;
-    let mut answered = false;
-    for holder in effect.holders.as_slice() {
-        let request = MetadataTransportMessage::ForwardPlacementPolicy {
-            policy_ref: effect.policy_ref,
+/// The answer a peer gets: the stored document, none, or why it is refused.
+pub type PolicyAnswer = Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError>;
+
+#[derive(Debug, PartialEq)]
+enum ServeState {
+    Init,
+    Config,
+    Policy,
+    Done,
+}
+
+/// Serves one policy document to a peer. The peer must be a sync-eligible node of this realm,
+/// and the answer must hash to the requested ref. The original publication travels with it:
+/// this holder never becomes the author. A refused or unreadable request is part of the answer.
+#[derive(Debug, PartialEq)]
+pub struct ServePolicyOperation {
+    realm_id: RealmId,
+    peer: NodeId,
+    policy_ref: PlacementPolicyRef,
+    state: ServeState,
+    output: Option<Result<PolicyAnswer, MetadataReadError>>,
+}
+
+impl ServePolicyOperation {
+    pub fn new(realm_id: RealmId, peer: NodeId, policy_ref: PlacementPolicyRef) -> Self {
+        Self {
+            realm_id,
+            peer,
+            policy_ref,
+            state: ServeState::Init,
+            output: None,
+        }
+    }
+
+    fn answer(&mut self, answer: PolicyAnswer) -> Effects {
+        self.state = ServeState::Done;
+        self.output = Some(Ok(answer));
+        smallvec![]
+    }
+
+    fn config(&mut self, value: Option<Value>) -> Effects {
+        let config = value.and_then(|value| RealmConfigDocument::from_bytes(&value).ok());
+        let Some(config) = config else {
+            return self.answer(Err(MetadataReadError::Unavailable));
         };
-        let reply =
-            match timeout_at(deadline, metadata.request_forwarded_write(*holder, request)).await {
-                Ok(Ok(reply)) => reply,
-                Ok(Err(error)) => {
-                    warn!(peer = %holder, error = %error, "Policy fetch failed");
-                    continue;
-                }
-                Err(_) => break,
-            };
-        match reply {
-            MetadataTransportMessage::ForwardedPlacementPolicy {
-                result: Ok(Some(document)),
-            } => {
-                return PolicyFetchEvent::Fetched {
-                    publisher: *holder,
-                    document,
-                };
+        if !sync_eligible_peer(&config, self.peer) {
+            return self.answer(Err(MetadataReadError::Forbidden));
+        }
+        let target = placement_policy_target(self.policy_ref.policy_id);
+        self.state = ServeState::Policy;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })]
+    }
+
+    fn policy(&mut self, value: Option<Value>) -> Effects {
+        let answer = match value {
+            None => Ok(None),
+            Some(value) => stored_policy(self.realm_id, self.policy_ref, &value),
+        };
+        self.answer(answer.map(|document| document.map(Box::new)))
+    }
+}
+
+impl Operation for ServePolicyOperation {
+    type Output = PolicyAnswer;
+    type Error = MetadataReadError;
+
+    fn start(&mut self) -> Effects {
+        self.state = ServeState::Config;
+        let config = DocumentTarget::RealmConfig {
+            realm_id: self.realm_id,
+        };
+        smallvec![read_effect(&config, None)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (std::mem::replace(&mut self.state, ServeState::Done), event) {
+            (ServeState::Config, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.config(value)
             }
-            MetadataTransportMessage::ForwardedPlacementPolicy { result: Ok(None) } => {
-                answered = true;
+            (ServeState::Policy, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.policy(value)
             }
-            MetadataTransportMessage::ForwardedPlacementPolicy { result: Err(error) } => {
-                warn!(peer = %holder, error = ?error, "Policy holder refused the fetch");
-            }
-            other => {
-                // Only the discriminant: a peer reply may carry a bearer token.
-                warn!(
-                    peer = %holder,
-                    reply = transport_message_kind(&other),
-                    "Unexpected policy fetch reply"
-                );
+            (
+                ServeState::Config | ServeState::Policy,
+                Event::Storage(StorageEvent::Error { .. }),
+            ) => self.answer(Err(MetadataReadError::Unavailable)),
+            (state, event) => {
+                warn!(state = ?state, event = event.label(), "Unexpected event serving a policy");
+                self.output = Some(Err(MetadataReadError::Unavailable));
+                smallvec![]
             }
         }
     }
-    if answered {
-        return PolicyFetchEvent::NotFound;
-    }
-    PolicyFetchEvent::Unavailable("no policy holder answered".to_string())
-}
 
-/// Signs one publication claim with this node's key. A claim naming another
-/// publisher is refused, so no operation can mint provenance for a peer.
-pub(crate) fn sign_publication(
-    context: &DriverContext,
-    claim: PolicyPublicationClaim,
-) -> PolicySignEvent {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return PolicySignEvent::Unavailable("net transport unavailable".to_string());
-    };
-    if claim.publisher != net_handle.node_id() {
-        return PolicySignEvent::Unavailable("claim names another publisher".to_string());
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
     }
-    PolicySignEvent::Signed(Box::new(
-        claim.signed_with(|message| net_handle.sign(message)),
-    ))
-}
 
-/// Serves one policy document to a peer. The peer must be a sync-eligible node
-/// of this realm, and the answer must hash to the requested ref. The original
-/// publication travels with it: this holder never becomes the author.
-pub(crate) async fn serve_local_policy(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    policy_ref: PlacementPolicyRef,
-) -> MetadataTransportMessage {
-    MetadataTransportMessage::ForwardedPlacementPolicy {
-        result: local_policy_result(context, peer, policy_ref).await,
+    fn finalize(self) -> Result<PolicyAnswer, MetadataReadError> {
+        self.output.unwrap_or(Err(MetadataReadError::Unavailable))
     }
-}
 
-async fn local_policy_result(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    policy_ref: PlacementPolicyRef,
-) -> Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context.as_ref(), realm_id)
-        .await
-        .ok_or(MetadataReadError::Unavailable)?;
-    if !sync_eligible_peer(&config, peer) {
-        return Err(MetadataReadError::Forbidden);
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
-    let Some(document) = read_policy(context, realm_id, policy_ref).await? else {
-        return Ok(None);
-    };
-    Ok(Some(Box::new(document)))
 }
 
 fn sync_eligible_peer(config: &RealmConfigDocument, peer: NodeId) -> bool {
@@ -136,28 +136,14 @@ fn sync_eligible_peer(config: &RealmConfigDocument, peer: NodeId) -> bool {
         .is_ok_and(|eligible| eligible.contains(&peer))
 }
 
-async fn read_policy(
-    context: &Arc<DriverContext>,
+/// The stored row as the policy `policy_ref` names, or none when the row is another policy.
+fn stored_policy(
     realm_id: RealmId,
     policy_ref: PlacementPolicyRef,
+    value: &[u8],
 ) -> Result<Option<PlacementPolicyDocument>, MetadataReadError> {
-    let target = placement_policy_target(policy_ref.policy_id);
-    let event = context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        }))
-        .await;
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-        return Err(MetadataReadError::Unavailable);
-    };
-    let Some(value) = value else {
-        return Ok(None);
-    };
     let document =
-        PlacementPolicyDocument::from_bytes(&value).map_err(|_| MetadataReadError::Unavailable)?;
+        PlacementPolicyDocument::from_bytes(value).map_err(|_| MetadataReadError::Unavailable)?;
     // A stored row that no longer matches the requested ref is not this policy:
     // answering with it would let one id resolve to two definitions.
     if document.realm_id != realm_id {
@@ -177,3 +163,7 @@ async fn read_policy(
         Err(_) => Err(MetadataReadError::Unavailable),
     }
 }
+
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod tests;

@@ -41,7 +41,7 @@ pub enum ReadUserError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("read user document did not finish")]
     NotFinished,
@@ -76,7 +76,7 @@ impl ReadUserOperation {
             other => self.fail(ReadUserError::UnexpectedEvent {
                 state: format!("{:?}", self.state),
                 expected: "storage read result",
-                got: format!("{other:?}"),
+                got: other.label(),
             }),
         }
     }

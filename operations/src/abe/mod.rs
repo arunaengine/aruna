@@ -2,20 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub mod copies;
 mod enumerate;
 pub mod envelope;
 mod epoch;
 mod member;
 mod reissue;
-pub mod rekey;
 mod requests;
 mod snapshot;
 
-use crate::driver::{DriverContext, drive};
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::NodeId;
-use aruna_core::backoff::conflict_backoff;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQuery};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -30,7 +26,6 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, EncryptionMode,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
-pub use epoch::{EpochDueOperation, mark_due, marked};
 pub use member::MemberKeysOperation;
 pub use reissue::ReissueOperation;
 use smallvec::smallvec;
@@ -428,29 +423,6 @@ impl KeyOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 }
-const CONFLICT_RETRIES: usize = 3;
-/// Runs a key action, rerunning it from the start after a transaction conflict.
-pub async fn drive_key(
-    bucket: String,
-    auth: AuthContext,
-    node: NodeId,
-    action: KeyAction,
-    context: &DriverContext,
-) -> Result<KeyResult, KeyError> {
-    let seed = Ulid::generate().to_bytes();
-    let mut attempt = 0;
-    loop {
-        let now = aruna_core::time::unix_timestamp_millis();
-        let operation = KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now);
-        match drive(operation, context).await {
-            Err(KeyError::Conflict) if attempt < CONFLICT_RETRIES => {
-                tokio::time::sleep(conflict_backoff(attempt, &seed)).await;
-                attempt += 1;
-            }
-            result => return result,
-        }
-    }
-}
 impl Operation for KeyOperation {
     type Output = KeyResult;
     type Error = KeyError;
@@ -594,6 +566,9 @@ impl Operation for KeyOperation {
         self.txn.take().map_or_else(Effects::new, |txn_id| {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
+    }
+    fn is_conflict(error: &KeyError) -> bool {
+        matches!(error, KeyError::Conflict)
     }
 }
 

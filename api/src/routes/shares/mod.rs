@@ -12,10 +12,9 @@ use aruna_core::structs::storage::share::{
     ShareAction, ShareEvent, ShareLink, ShareMode, ShareTarget, ShareUses,
 };
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::auth::request_authorization::AuthorizeError;
-use aruna_operations::auth::request_policy::{
-    PolicyRequestExtras, enforce_policies, policy_request_with,
-};
+use aruna_operations::auth::enforcement::enforce_policies;
+use aruna_operations::auth::error::AuthorizeError;
+use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::driver::drive;
 use aruna_operations::shares::lifecycle::{
     CreateShareConfig, CreateShareOperation, RevokeShareOperation, ShareError,

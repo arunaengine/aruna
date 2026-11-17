@@ -18,7 +18,7 @@ use aruna_core::types::Effects;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum TransferAdmitError {

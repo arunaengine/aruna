@@ -25,17 +25,16 @@ use tracing::{debug, error, warn};
 use ulid::Ulid;
 
 use super::{IncomingVersionOperation, IncomingVersionResult};
+use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
 use crate::auth::permission_rules::GroupPermissionRules;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
-};
+use crate::auth::request_authorization::authorize;
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::driver::{
-    DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
-};
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive, node_routing};
 use crate::notifications::watch::emit::emit_watch_event;
-use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoOperation;
 use crate::replication::locations::LocationSummaryOperation;
@@ -125,7 +124,12 @@ async fn accept_version_replication(
     let watch_manifest = manifest.clone();
     // Only a materialized item can place a blob, so only it reads the caps.
     let routing = if manifest.kind == ReplicationItemKind::Materialized {
-        match quota_marked_routing(context).await {
+        match crate::driver::drive(
+            crate::groups::routing::QuotaOperation::new(crate::driver::node_routing(context)),
+            context,
+        )
+        .await
+        {
             Ok(routing) => routing,
             Err(error) => {
                 error!(
@@ -154,7 +158,15 @@ async fn accept_version_replication(
                 return;
             }
         };
-    let gate = match gate_context(context, realm_id, now_ms()).await {
+    let gate = match crate::driver::drive(
+        crate::placement::policy::GateOperation::new(
+            realm_id,
+            aruna_core::time::unix_timestamp_millis(),
+        ),
+        context,
+    )
+    .await
+    {
         Ok(gate) => gate,
         Err(error) => {
             error!(
@@ -215,7 +227,7 @@ async fn answer_bao_read(
     let op = IncomingBaoOperation::new(peer, local_node, realm_id, stream_id, request)
         .with_policy_paths(policy_paths)
         .with_policy_candidates(policy_candidates, had_denial)
-        .with_now(now_ms())
+        .with_now(aruna_core::time::unix_timestamp_millis())
         .with_snapshot();
     if let Err(error) = drive(op, context).await {
         error!(

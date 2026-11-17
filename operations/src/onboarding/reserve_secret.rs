@@ -239,7 +239,7 @@ impl Operation for ReserveSecretOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match &self.state {
             ReserveSecretState::StartTransaction => {
                 let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
@@ -269,6 +269,7 @@ impl Operation for ReserveSecretOperation {
                 })]
             }
             ReserveSecretState::ReadRecords { txn_id } => {
+                let txn_id = txn_id.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return fail(
@@ -319,6 +320,9 @@ impl Operation for ReserveSecretOperation {
                 record,
                 owner,
             } => {
+                let txn_id = txn_id.clone();
+                let record = record.clone();
+                let owner = owner.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
@@ -370,6 +374,11 @@ impl Operation for ReserveSecretOperation {
                 enrolled,
                 pending,
             } => {
+                let txn_id = txn_id.clone();
+                let record = record.clone();
+                let cap = cap.clone();
+                let enrolled = enrolled.clone();
+                let pending = pending.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::IterResult {
                     values,
@@ -411,6 +420,8 @@ impl Operation for ReserveSecretOperation {
                 }
             }
             ReserveSecretState::WriteReserved { txn_id, record } => {
+                let txn_id = txn_id.clone();
+                let record = record.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
@@ -429,6 +440,7 @@ impl Operation for ReserveSecretOperation {
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             ReserveSecretState::CommitTransaction { record } => {
+                let record = record.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(

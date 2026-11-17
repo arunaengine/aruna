@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{GitError, records};
-use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::placement::policy::GateOperation;
 use crate::replication::bao_read::BaoReadOutput;
 use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -27,6 +29,7 @@ use aruna_core::structs::storage::dataset_location::default_bucket;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::time::unix_timestamp_millis;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use std::time::{Duration, UNIX_EPOCH};
@@ -124,12 +127,22 @@ pub async fn put(
 ) -> Result<StoredObject, GitError> {
     let node = local(context)?;
     let group_id = bucket.group_id;
-    let routing = bucket_snapshot(context, &bucket)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    let gate = gate_context(context, auth.realm_id, now_ms())
-        .await
-        .map_err(|_| GitError::Unavailable)?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(context),
+            bucket.group_id,
+            BucketRules::of(&bucket),
+        ),
+        context,
+    )
+    .await
+    .map_err(|_| GitError::Unavailable)?;
+    let gate = drive(
+        GateOperation::new(auth.realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await
+    .map_err(|_| GitError::Unavailable)?;
     let quota = drive(GetConfigOperation::new(auth.realm_id), context)
         .await
         .map_err(|_| GitError::Unavailable)?

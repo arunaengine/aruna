@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use aruna_core::NodeId;
+use crate::NodeId;
 
 pub const PLACEMENT_DOMAIN: &[u8] = b"aruna-placement-rendezvous-v3";
 pub const ROLE_LOCATION: u8 = b'L';
@@ -49,7 +49,7 @@ pub fn neg_log2_q48(h: u64) -> u64 {
 }
 
 /// Rendezvous rank of one node under `subject`; lower is better.
-pub(crate) fn peer_rank(subject: &[u8], node_id: NodeId) -> u64 {
+pub fn peer_rank(subject: &[u8], node_id: NodeId) -> u64 {
     neg_log2_q48(selector_hash(ROLE_NODE, subject, node_id.as_bytes()))
 }
 
@@ -62,7 +62,7 @@ fn rank_order(left: &(u64, NodeId), right: &(u64, NodeId)) -> Ordering {
 /// Keeps the `limit` best-ranked nodes, ties by node bytes ascending and
 /// deduplicated. Each candidate that leaves the selection is reported to
 /// `on_omitted` in scan order.
-pub(crate) fn select_top_peers<I, F>(
+pub fn select_top_peers<I, F>(
     nodes: I,
     subject: &[u8],
     limit: usize,

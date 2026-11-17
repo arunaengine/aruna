@@ -253,8 +253,7 @@ fn any_held_placement(config: &RealmConfigDocument, node_id: NodeId) -> Placemen
             strategy_id: strategy.strategy_id,
             shard,
         };
-        if aruna_operations::placement::resolve_shard_holders(config, &placement).contains(&node_id)
-        {
+        if aruna_core::placement::resolve_shard_holders(config, &placement).contains(&node_id) {
             return placement;
         }
     }
@@ -272,7 +271,7 @@ fn nonholder_placement(
             strategy_id: strategy.strategy_id,
             shard,
         };
-        let holders = aruna_operations::placement::resolve_shard_holders(config, &placement);
+        let holders = aruna_core::placement::resolve_shard_holders(config, &placement);
         if !holders.contains(&responder) {
             continue;
         }

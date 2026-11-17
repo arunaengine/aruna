@@ -22,8 +22,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
-use crate::driver::{DriverContext, drive};
+use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::metadata::repository::StorageReadError;
 use crate::metadata::timestamp_index::delete_index_keys;
 use crate::metadata::updated_page::{UpdatedPageError, UpdatedPageOperation};

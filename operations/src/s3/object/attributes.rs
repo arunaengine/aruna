@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::managed_copy::{ManagedCopyError, serve_reads};
 use crate::blob::records::{blob_location_read, pending_location_read};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, finish_pending_check,
@@ -15,6 +14,7 @@ use aruna_core::events::{Event, StorageEvent};
 #[cfg(test)]
 use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, OBJECT_METADATA_KEYSPACE};
+use aruna_core::managed_copy::{ManagedCopyError, serve_reads};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;

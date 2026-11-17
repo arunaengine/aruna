@@ -7,16 +7,16 @@ use std::time::Duration;
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{
-    Effect, HolderList, IterStart, MAX_FETCH_HOLDERS, NetEffect, StorageEffect, VaultFetchEffect,
-    VaultQuery,
+    Effect, HolderList, IterStart, MAX_FETCH_HOLDERS, StorageEffect, VaultFetchEffect, VaultQuery,
 };
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StorageEvent, VaultFetchEvent};
-use aruna_core::operation::Operation;
+use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
-    MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, retain_newest_keys,
-    user_record_prefix,
+    MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, VaultRevision,
+    retain_newest_keys, user_record_prefix,
 };
 use aruna_core::types::{Effects, Key, Value};
 use aruna_core::{NodeId, UserId};
@@ -24,9 +24,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::placement::{
+use aruna_core::placement::{
     PlacementResolveError, holds_placement, plan_target_placement, read_holder_sets,
 };
+
+use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
+use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadVaultConfig {
@@ -64,7 +67,7 @@ pub enum ReadVaultError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -124,19 +127,8 @@ impl ReadVaultOperation {
         let plan = plan_target_placement(&config, &target, Default::default())?
             .ok_or(ReadVaultError::PlacementUnavailable)?;
         if holds_placement(&config, &plan.placement, self.config.node_id) {
-            let limit = if self.reads_heads() {
-                MAX_VAULT_HEADS
-            } else {
-                MAX_KEY_RECORDS
-            };
             self.state = ReadState::ReadLocal;
-            return Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-                key_space: target.storage_keyspace().to_string(),
-                prefix: Some(user_record_prefix(user_id)),
-                start: None,
-                limit,
-                txn_id: None,
-            })]);
+            return Ok(smallvec![page_effect(user_id, self.reads_heads(), None)]);
         }
         let mut holders = read_holder_sets(&config, &plan.placement)?;
         holders.retain(|holder| *holder != self.config.node_id);
@@ -144,32 +136,16 @@ impl ReadVaultOperation {
         let holders = HolderList::new(holders)
             .map_err(|_| ReadVaultError::Unavailable("the vault has no holder".to_string()))?;
         self.state = ReadState::Fetch;
-        Ok(smallvec![Effect::Net(NetEffect::VaultFetch(Box::new(
-            VaultFetchEffect {
-                holders,
-                user_id,
-                query: self.config.query.clone(),
-                deadline: self.config.deadline,
-            }
-        )))])
+        Ok(smallvec![fetch_effect(&VaultFetchEffect {
+            holders,
+            user_id,
+            query: self.config.query.clone(),
+            deadline: self.config.deadline,
+        })])
     }
 
     fn local(&self, rows: Vec<(Key, Value)>) -> Result<VaultRecords, ReadVaultError> {
-        let values = rows.iter().map(|(_, value)| value.as_ref());
-        let records = if self.reads_heads() {
-            VaultRecords::Heads(
-                values
-                    .map(aruna_core::structs::identity::user::vault::VaultRevision::from_bytes)
-                    .collect::<Result<_, _>>()?,
-            )
-        } else {
-            VaultRecords::Keys(
-                values
-                    .map(aruna_core::structs::identity::user::vault::UserKeyRecord::from_bytes)
-                    .collect::<Result<_, _>>()?,
-            )
-        };
-        Ok(records)
+        Ok(decode_page(self.reads_heads(), rows)?)
     }
 
     /// A fetched answer is accepted only for this user, realm and query, signed by its origin.
@@ -254,13 +230,7 @@ impl Operation for ReadVaultOperation {
                     self.keys.extend(keys);
                     retain_newest_keys(&mut self.keys);
                     if let Some(start) = next_start_after {
-                        return smallvec![Effect::Storage(StorageEffect::Iter {
-                            key_space: aruna_core::keyspaces::USER_KEY_KEYSPACE.to_string(),
-                            prefix: Some(user_record_prefix(self.config.user_id)),
-                            start: Some(IterStart::After(start)),
-                            limit: MAX_KEY_RECORDS,
-                            txn_id: None,
-                        })];
+                        return smallvec![page_effect(self.config.user_id, false, Some(start))];
                     }
                     let keys = std::mem::take(&mut self.keys);
                     self.finish(Ok(VaultRecords::Keys(keys)))
@@ -292,12 +262,164 @@ impl Operation for ReadVaultOperation {
     }
 }
 
+/// Reads one user's vault heads, or all its newest key records page by page, on this holder.
+#[derive(Debug, PartialEq)]
+pub(crate) struct LocalRecordsOperation {
+    user_id: UserId,
+    heads: bool,
+    keys: Vec<UserKeyRecord>,
+    reading: bool,
+    output: Option<Result<VaultRecords, MetadataReadError>>,
+}
+
+impl LocalRecordsOperation {
+    pub(crate) fn new(user_id: UserId, heads: bool) -> Self {
+        Self {
+            user_id,
+            heads,
+            keys: Vec::new(),
+            reading: false,
+            output: None,
+        }
+    }
+
+    fn finish(&mut self, output: Result<VaultRecords, MetadataReadError>) -> Effects {
+        self.reading = false;
+        self.output = Some(output);
+        smallvec![]
+    }
+}
+
+impl Operation for LocalRecordsOperation {
+    type Output = VaultRecords;
+    type Error = MetadataReadError;
+
+    fn start(&mut self) -> Effects {
+        self.reading = true;
+        smallvec![page_effect(self.user_id, self.heads, None)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) = event
+        else {
+            return self.finish(Err(MetadataReadError::Unavailable));
+        };
+        if !self.reading {
+            return self.finish(Err(MetadataReadError::Unavailable));
+        }
+        match decode_page(self.heads, values) {
+            Ok(VaultRecords::Keys(keys)) => {
+                self.keys.extend(keys);
+                retain_newest_keys(&mut self.keys);
+                if let Some(start) = next_start_after {
+                    return smallvec![page_effect(self.user_id, false, Some(start))];
+                }
+                let keys = std::mem::take(&mut self.keys);
+                self.finish(Ok(VaultRecords::Keys(keys)))
+            }
+            Ok(heads) => self.finish(Ok(heads)),
+            Err(_) => self.finish(Err(MetadataReadError::Unavailable)),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(MetadataReadError::Unavailable))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// The first or a following page of one user's vault heads or key records on this node.
+fn page_effect(user_id: UserId, heads: bool, start: Option<Key>) -> Effect {
+    let (key_space, limit) = match heads {
+        true => (VAULT_REVISION_KEYSPACE, MAX_VAULT_HEADS),
+        false => (USER_KEY_KEYSPACE, MAX_KEY_RECORDS),
+    };
+    Effect::Storage(StorageEffect::Iter {
+        key_space: key_space.to_string(),
+        prefix: Some(user_record_prefix(user_id)),
+        start: start.map(IterStart::After),
+        limit,
+        txn_id: None,
+    })
+}
+
+fn decode_page(heads: bool, rows: Vec<(Key, Value)>) -> Result<VaultRecords, ConversionError> {
+    let values = rows.iter().map(|(_, value)| value.as_ref());
+    Ok(match heads {
+        true => VaultRecords::Heads(
+            values
+                .map(VaultRevision::from_bytes)
+                .collect::<Result<_, _>>()?,
+        ),
+        false => VaultRecords::Keys(
+            values
+                .map(UserKeyRecord::from_bytes)
+                .collect::<Result<_, _>>()?,
+        ),
+    })
+}
+
+impl HolderRecord for VaultRecords {
+    const LABEL: &'static str = "vault";
+
+    fn read(message: MetadataTransportMessage) -> Answer<Self> {
+        match message {
+            MetadataTransportMessage::FetchedVaultRecords {
+                result: Ok(records),
+            } if records.is_empty() => Answer::Missing,
+            MetadataTransportMessage::FetchedVaultRecords {
+                result: Ok(records),
+            } => Answer::Found(records),
+            MetadataTransportMessage::FetchedVaultRecords {
+                result: Err(MetadataReadError::Unauthorized | MetadataReadError::Forbidden),
+            } => Answer::Denied,
+            _ => Answer::Skip,
+        }
+    }
+}
+
+/// Asks the holders in rank order, each with its share of the deadline; the answer arrives as a
+/// vault fetch event.
+pub(crate) fn fetch_effect(fetch: &VaultFetchEffect) -> Effect {
+    let request = MetadataTransportMessage::FetchVaultRecords {
+        user_id: fetch.user_id,
+        query: fetch.query.clone(),
+    };
+    let holders = fetch.holders.as_slice();
+    let operation =
+        HolderFetchOperation::<VaultRecords>::new(holders, &request, fetch.deadline, Budget::Split);
+    Effect::SubOperation(boxed_suboperation(operation, |result| {
+        Event::Net(NetEvent::VaultFetch(match result {
+            Ok(Fetched::Found { holder, value }) => VaultFetchEvent::Fetched {
+                holder,
+                records: value,
+            },
+            Ok(Fetched::NotFound) => VaultFetchEvent::NotFound,
+            Ok(Fetched::Denied) => VaultFetchEvent::Denied,
+            Ok(Fetched::Unavailable(reason)) => VaultFetchEvent::Unavailable(reason),
+            Err(error) => VaultFetchEvent::Unavailable(error.to_string()),
+        }))
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-    use aruna_core::structs::identity::user::vault::VaultRevision;
     use aruna_core::structs::placement::record::PlacementRef;
 
     fn node(seed: u8) -> NodeId {
@@ -365,11 +487,15 @@ mod tests {
     #[test]
     fn fetches_from_holders() {
         let (mut operation, effects, holders) = started(false, VaultQuery::Keys);
-        let Some(Effect::Net(NetEffect::VaultFetch(fetch))) = effects.first() else {
-            panic!("a non-holder fetches, got {effects:?}");
-        };
-        assert_eq!(fetch.holders.as_slice(), holders.as_slice());
-        assert_eq!(fetch.user_id, user(7));
+        let (asked, request) = crate::tests::policy::fetch_requests(effects);
+        assert_eq!(asked, holders);
+        assert_eq!(
+            request,
+            MetadataTransportMessage::FetchVaultRecords {
+                user_id: user(7),
+                query: VaultQuery::Keys,
+            }
+        );
         // Every reached holder answered without records: the user has none.
         fetched(&mut operation, VaultFetchEvent::NotFound);
         assert_eq!(operation.finalize(), Ok(VaultRecords::Keys(Vec::new())));
@@ -385,10 +511,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn reads_newest_keys() {
-        let (mut operation, _, _) = started(true, VaultQuery::Keys);
-        let rows: Vec<_> = (1..=65)
+    /// 65 key records of user 7; records 1 and 65 are the newest.
+    fn key_rows() -> Vec<(Key, Value)> {
+        (1..=65)
             .map(|id| {
                 let record = UserKeyRecord {
                     realm_id: user(7).realm_id,
@@ -408,7 +533,13 @@ mod tests {
                     record.to_bytes().unwrap().into(),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn reads_newest_keys() {
+        let (mut operation, _, _) = started(true, VaultQuery::Keys);
+        let rows = key_rows();
         let cursor = rows[63].0.clone();
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
             values: rows[..64].to_vec(),
@@ -489,5 +620,211 @@ mod tests {
             },
         );
         assert_eq!(operation.finalize(), Err(ReadVaultError::ForeignRecords));
+    }
+
+    fn key_record(node_id: NodeId) -> UserKeyRecord {
+        UserKeyRecord {
+            realm_id: user(7).realm_id,
+            user_id: user(7),
+            record_id: Ulid::from_bytes([1; 16]),
+            key_id: "key-1".to_string(),
+            public_key: [1; 32],
+            fingerprint: aruna_core::vault_format::key_fingerprint(&[1; 32]),
+            has_recovery: false,
+            node_id,
+            placement: PlacementRef::NIL,
+            created_at_ms: 1,
+            signature: None,
+        }
+    }
+
+    fn vault_fetch() -> (Box<dyn aruna_core::operation::SubOperation>, Vec<NodeId>) {
+        let holders = vec![node(1), node(2)];
+        let effect = fetch_effect(&VaultFetchEffect {
+            holders: HolderList::new(holders.clone()).unwrap(),
+            user_id: user(7),
+            query: VaultQuery::Keys,
+            deadline: Duration::from_secs(10),
+        });
+        let Effect::SubOperation(fetch) = effect else {
+            panic!("a vault fetch is a sub-operation");
+        };
+        (fetch, holders)
+    }
+
+    fn answer(
+        peer: NodeId,
+        seconds: u64,
+        result: Result<VaultRecords, MetadataReadError>,
+    ) -> Event {
+        let message = MetadataTransportMessage::FetchedVaultRecords { result };
+        let frame = crate::metadata::protocol::encode_message(&message).unwrap();
+        reply(peer, seconds, Ok(frame))
+    }
+
+    fn reply(
+        peer: NodeId,
+        seconds: u64,
+        result: Result<Vec<u8>, aruna_core::events::PeerRequestError>,
+    ) -> Event {
+        Event::Net(NetEvent::MetadataAnswer(Box::new(
+            aruna_core::events::MetadataAnswer {
+                peer,
+                elapsed: Duration::from_secs(seconds),
+                result,
+            },
+        )))
+    }
+
+    fn timed_out(peer: NodeId) -> Event {
+        reply(peer, 5, Err(aruna_core::events::PeerRequestError::TimedOut))
+    }
+
+    fn timeout_of(effects: &Effects) -> Duration {
+        let Some(Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(request))) =
+            effects.first()
+        else {
+            panic!("expected a holder request, got {effects:?}");
+        };
+        request.timeout
+    }
+
+    #[test]
+    fn tries_later_holder() {
+        // A silent holder spends only its share of the deadline; the next one still answers.
+        let (mut fetch, holders) = vault_fetch();
+        assert_eq!(timeout_of(&fetch.start()), Duration::from_secs(5));
+        let next = fetch.step(timed_out(holders[0]));
+        assert_eq!(timeout_of(&next), Duration::from_secs(5));
+        let keys = VaultRecords::Keys(vec![key_record(node(2))]);
+        assert!(
+            fetch
+                .step(answer(holders[1], 1, Ok(keys.clone())))
+                .is_empty()
+        );
+        assert_eq!(
+            fetch.finalize(),
+            Event::Net(NetEvent::VaultFetch(VaultFetchEvent::Fetched {
+                holder: holders[1],
+                records: keys,
+            }))
+        );
+    }
+
+    #[test]
+    fn preserves_fetch_results() {
+        // Silence is unavailable, an empty answer is a miss, and a refusal ends the fetch.
+        let empty = || Ok(VaultRecords::Keys(Vec::new()));
+        let forbidden = || Err(MetadataReadError::Forbidden);
+        let cases: [(Vec<Option<Event>>, VaultFetchEvent); 4] = [
+            (
+                vec![Some(timed_out(node(1))), Some(timed_out(node(2)))],
+                VaultFetchEvent::Unavailable("no vault holder answered".to_string()),
+            ),
+            (
+                vec![Some(answer(node(1), 1, empty())), Some(timed_out(node(2)))],
+                VaultFetchEvent::NotFound,
+            ),
+            (
+                vec![
+                    Some(timed_out(node(1))),
+                    Some(answer(node(2), 1, forbidden())),
+                ],
+                VaultFetchEvent::Denied,
+            ),
+            (
+                vec![Some(answer(node(1), 1, forbidden())), None],
+                VaultFetchEvent::Denied,
+            ),
+        ];
+        for (events, expected) in cases {
+            let (mut fetch, _) = vault_fetch();
+            fetch.start();
+            for event in events.into_iter().flatten() {
+                fetch.step(event);
+            }
+            assert!(fetch.is_complete());
+            assert_eq!(fetch.finalize(), Event::Net(NetEvent::VaultFetch(expected)));
+        }
+    }
+
+    fn page(values: Vec<(Key, Value)>, next_start_after: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        })
+    }
+
+    #[test]
+    fn serves_newest_keys() {
+        // A holder serves the newest key records over every page.
+        let rows = key_rows();
+        let cursor = rows[63].0.clone();
+        let mut operation = LocalRecordsOperation::new(user(7), false);
+        check_trace(
+            &mut operation,
+            &[page_effect(user(7), false, None)],
+            vec![
+                (
+                    page(rows[..64].to_vec(), Some(cursor.clone())),
+                    vec![page_effect(user(7), false, Some(cursor))],
+                ),
+                (page(rows[64..].to_vec(), None), vec![]),
+            ],
+        );
+        let VaultRecords::Keys(keys) = operation.finalize().unwrap() else {
+            panic!("expected keys");
+        };
+        assert_eq!(keys.len(), MAX_KEY_RECORDS);
+        assert_eq!(keys[0].record_id, Ulid::from_bytes([65; 16]));
+        assert_eq!(keys[1].record_id, Ulid::from_bytes([1; 16]));
+    }
+
+    #[test]
+    fn serves_heads_once() {
+        // Heads are bounded by one page; a cursor after it is not followed.
+        let mut operation = LocalRecordsOperation::new(user(7), true);
+        assert_eq!(
+            operation.start().into_vec(),
+            vec![page_effect(user(7), true, None)]
+        );
+        let more = Some(Key::from(vec![1u8]));
+        assert!(operation.step(page(Vec::new(), more)).is_empty());
+        assert_eq!(operation.finalize(), Ok(VaultRecords::Heads(Vec::new())));
+    }
+
+    #[test]
+    fn local_read_failures() {
+        // A storage error or an undecodable row answers unavailable.
+        let mut operation = LocalRecordsOperation::new(user(7), false);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(operation.finalize(), Err(MetadataReadError::Unavailable));
+        let mut operation = LocalRecordsOperation::new(user(7), false);
+        operation.start();
+        let broken = vec![(Key::from(vec![1u8]), Value::from(vec![0xff; 3]))];
+        operation.step(page(broken, None));
+        assert_eq!(operation.finalize(), Err(MetadataReadError::Unavailable));
+    }
+
+    #[test]
+    fn local_rejects_events() {
+        // Before start every event fails the read, without effects.
+        let make = || LocalRecordsOperation::new(user(7), false);
+        for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty(), "{label} emitted effects");
+            assert_eq!(error, MetadataReadError::Unavailable, "{label}");
+        }
+    }
+
+    #[test]
+    fn local_abort_finalize() {
+        // The local read only reads: abort has nothing to clean up, and an early finalize fails.
+        let mut operation = LocalRecordsOperation::new(user(7), false);
+        operation.start();
+        assert!(operation.abort().is_empty());
+        rejects_finalize(operation);
     }
 }

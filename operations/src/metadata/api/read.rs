@@ -453,7 +453,7 @@ pub(crate) async fn ensure_record_readable(
             crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
         );
         let result = match txn_id {
-            Some(txn_id) => crate::auth::request_policy::PolicyEvaluator::load_with_txn(
+            Some(txn_id) => crate::auth::enforcement::PolicyEvaluator::load_with_txn(
                 context,
                 realm_id,
                 record.group_id,
@@ -461,9 +461,7 @@ pub(crate) async fn ensure_record_readable(
             )
             .await
             .and_then(|evaluator| evaluator.evaluate(&request)),
-            None => {
-                crate::auth::request_policy::enforce_policies(context, realm_id, &request).await
-            }
+            None => crate::auth::enforcement::enforce_policies(context, realm_id, &request).await,
         };
         return result.map_err(|_| MetadataApiError::NotFound);
     }
@@ -497,7 +495,7 @@ pub(crate) async fn can_read_record(
     record: &MetadataRegistryRecord,
 ) -> Result<bool, MetadataApiError> {
     if record.public {
-        let allowed = crate::auth::request_policy::enforce_policies(
+        let allowed = crate::auth::enforcement::enforce_policies(
             context,
             realm_id,
             &crate::auth::request_policy::policy_request_with(
@@ -578,13 +576,13 @@ pub(super) async fn ensure_permission(
         crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
     );
     match txn_id {
-        Some(txn_id) => crate::auth::request_policy::PolicyEvaluator::load_with_txn(
+        Some(txn_id) => crate::auth::enforcement::PolicyEvaluator::load_with_txn(
             context, realm_id, group_id, txn_id,
         )
         .await
         .and_then(|evaluator| evaluator.evaluate(&request))
         .map_err(|_| MetadataApiError::Forbidden)?,
-        None => crate::auth::request_policy::enforce_policies(context, realm_id, &request)
+        None => crate::auth::enforcement::enforce_policies(context, realm_id, &request)
             .await
             .map_err(|_| MetadataApiError::Forbidden)?,
     }

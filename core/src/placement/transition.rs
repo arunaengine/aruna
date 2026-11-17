@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
-use aruna_core::structs::placement::transition::{
+use crate::NodeId;
+use crate::structs::identity::realm::RealmConfigDocument;
+use crate::structs::placement::record::{PlacementRef, PlacementStrategy};
+use crate::structs::placement::transition::{
     BucketPlan, CandidatePlacementMap, TRANSITION_OVERDUE_MS, TransitionLimits, TransitionPlan,
 };
 use thiserror::Error;
@@ -286,8 +286,8 @@ fn locations_of(config: &RealmConfigDocument, holders: &[NodeId]) -> Vec<String>
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-    use aruna_core::structs::placement::transition::{
+    use crate::structs::identity::realm::{RealmId, RealmNodeKind};
+    use crate::structs::placement::transition::{
         PlacementTransition, StallReport, TransitionStatus,
     };
 

@@ -3,11 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::groups::imports::LinkScan;
+use crate::blob::migration::queue::encrypt_rows;
 use crate::s3::bucket::key::rows::{
     SettingsError, audit_row, authority_read, copy_targets, full_scan, generation_rows,
     group_bucket_key, parse_authority, uploads_open,
 };
+use crate::s3::imports::LinkScan;
 use aruna_blob::blob::pithos::MAX_SIZE;
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::IterStart;
@@ -92,7 +93,7 @@ pub enum EnableError {
     /// `vault_locked` needs two ready holders, or one whose key declares a recovery code.
     #[error("the key holders do not meet the recovery rule")]
     RecoveryUnmet,
-    #[error("{}", crate::groups::imports::MAPPED_REASON)]
+    #[error("{}", crate::s3::imports::MAPPED_REASON)]
     Mapped,
     #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {

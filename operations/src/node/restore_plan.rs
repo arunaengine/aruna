@@ -12,7 +12,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 
 use crate::node::recovery::RecoveryError;
-use crate::placement::{draining_former_holders, resolve_shard_holders};
+use aruna_core::placement::{draining_former_holders, resolve_shard_holders};
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on
 /// these; see [`DocumentTarget::sync_topic_id`]).
@@ -185,7 +185,7 @@ pub(super) fn plan_shard_groups(
             let holders = resolve_shard_holders(config, &placement);
             // During transitions, target and retained departing holders stay members.
             // Publishers remain the authority set.
-            let membership = crate::placement::bucket_membership(config, &placement, now_ms);
+            let membership = aruna_core::placement::bucket_membership(config, &placement, now_ms);
             if !membership.members.contains(&node_id) {
                 continue;
             }

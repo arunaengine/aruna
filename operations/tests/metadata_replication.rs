@@ -21,6 +21,10 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataBatchSource, MetadataDeleteRecord, MetadataEffect, MetadataEvent,
     MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
 };
+use aruna_core::placement::{
+    PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
+    strategy_for_target, subject_bytes,
+};
 use aruna_core::storage_entries::{
     create_event_entry, event_log_key, lifecycle_revision_change, metadata_registry_key,
 };
@@ -30,6 +34,7 @@ use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
@@ -43,14 +48,9 @@ use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::update_metadata_document;
-use aruna_operations::placement::{
-    PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
-    strategy_for_target, subject_bytes,
-};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
@@ -1068,7 +1068,7 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
     let event_id = Ulid::generate();
     let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
     let lifecycle_target = DocumentTarget::MetadataDocumentLifecycle { document_id };
-    let placement = aruna_operations::placement::target_placement_ref(
+    let placement = aruna_core::placement::target_placement_ref(
         &realm_config,
         &lifecycle_target,
         Default::default(),

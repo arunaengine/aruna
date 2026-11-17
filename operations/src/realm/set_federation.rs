@@ -32,11 +32,11 @@ use url::Url;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetFederationConfig {
@@ -123,7 +123,7 @@ pub enum SetFederationError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -376,7 +376,7 @@ impl SetFederationOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(SetFederationError::UnexpectedEvent {
             state,
@@ -409,7 +409,7 @@ impl Operation for SetFederationOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             SetFederationState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -426,21 +426,21 @@ impl Operation for SetFederationOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             SetFederationState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             SetFederationState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self
@@ -451,66 +451,79 @@ impl Operation for SetFederationOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             SetFederationState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetFederationError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = SetFederationState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(SetFederationError::MissingTransaction);
+                        };
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = SetFederationState::DeleteAdminConflicts { document };
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit_transaction(document)
                     }
-                    self.emit_commit_transaction(document)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            SetFederationState::DeleteAdminConflicts { document } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
+            }
+            SetFederationState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                        self.emit_commit_transaction(document)
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
-            SetFederationState::CommitTransaction { document } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = SetFederationState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
+            }
+            SetFederationState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                        self.txn_id = None;
+                        self.state = SetFederationState::ScheduleSyncDrain { document };
+                        smallvec![schedule_drain_effect()]
+                    }
+                    Event::Storage(StorageEvent::Error {
+                        error: StorageError::TransactionConflict,
+                    }) if self.attempts < COMMIT_ATTEMPTS => {
+                        self.txn_id = None;
+                        self.start_transaction()
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        self.txn_id = None;
+                        self.fail(error.into())
+                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }) if self.attempts < COMMIT_ATTEMPTS => {
-                    self.txn_id = None;
-                    self.start_transaction()
+            }
+            SetFederationState::ScheduleSyncDrain { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                        self.schedule_publication(&document)
+                    }
+                    Event::Task(TaskEvent::Error { message, .. }) => {
+                        warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
+                        self.schedule_publication(&document)
+                    }
+                    other => self.unexpected_event(
+                        "document sync outbox drain timer schedule",
+                        other.label(),
+                    ),
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
-            SetFederationState::ScheduleSyncDrain { document } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.schedule_publication(&document)
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.schedule_publication(&document)
-                }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
-            },
+            }
             SetFederationState::SchedulePublication => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = SetFederationState::Finish;
@@ -521,8 +534,9 @@ impl Operation for SetFederationOperation {
                     self.state = SetFederationState::Finish;
                     smallvec![]
                 }
-                other => self
-                    .unexpected_event("registry publication timer schedule", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("registry publication timer schedule", other.label())
+                }
             },
             SetFederationState::Finish | SetFederationState::Error | SetFederationState::Init => {
                 smallvec![]
@@ -588,8 +602,8 @@ fn apply_reducer_federation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document_repository::GetConfigOperation;
     use crate::driver::{DriverContext, drive};
-    use crate::realm::get_config::GetConfigOperation;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::document::DocumentOutboxRecord;

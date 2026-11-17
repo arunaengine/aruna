@@ -15,9 +15,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::{Effects, Key, Value};
 
 use super::DrainOutboxOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::outbox::OUTBOX_DRAIN_BATCH;
-use crate::realm::get_config::GetConfigOperation;
 use crate::tests::records::{Family, REALM, actor, node};
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
@@ -258,7 +258,7 @@ fn clears_without_holders() {
         .family_placement(family.submission_id)
         .expect("family placement resolves");
     assert_eq!(
-        crate::placement::resolve_shard_holders(&config, &family.placement),
+        aruna_core::placement::resolve_shard_holders(&config, &family.placement),
         vec![node(1)]
     );
     family.config = config;

@@ -23,9 +23,9 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};
@@ -678,7 +678,7 @@ async fn abort_uploads(
                 bucket: upload.bucket,
                 key: upload.key,
                 upload_id: upload.upload_id,
-                now_ms: crate::driver::now_ms(),
+                now_ms: aruna_core::time::unix_timestamp_millis(),
             });
             if resume {
                 abort = abort.resuming_abort();
@@ -1323,7 +1323,7 @@ mod tests {
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, mut upload) = offered_folder(&context).await;
         upload.status = MultipartUploadStatus::Completing;
-        upload.completing_since_ms = Some(crate::driver::now_ms());
+        upload.completing_since_ms = Some(aruna_core::time::unix_timestamp_millis());
         store_upload(&context, &upload).await;
 
         assert_eq!(

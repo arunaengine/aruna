@@ -21,9 +21,9 @@ use aruna_core::task::{TaskEffect, TaskKey};
 use tempfile::tempdir;
 
 use super::*;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::placement::transition::{TransitionRequest, plan_transition};
-use crate::realm::get_config::GetConfigOperation;
+use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
 };
@@ -39,7 +39,7 @@ fn node_secret(node_id: &aruna_core::NodeId) -> iroh::SecretKey {
         .expect("fixture node keys are seeded")
 }
 
-fn actor(realm_id: RealmId) -> Actor {
+pub(crate) fn actor(realm_id: RealmId) -> Actor {
     Actor {
         node_id: node(1),
         user_id: UserId::local(Ulid::from_bytes([1; 16]), realm_id),
@@ -47,7 +47,7 @@ fn actor(realm_id: RealmId) -> Actor {
     }
 }
 
-fn context(root: &str) -> DriverContext {
+pub(crate) fn context(root: &str) -> DriverContext {
     DriverContext {
         storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
         net_handle: None,
@@ -60,7 +60,7 @@ fn context(root: &str) -> DriverContext {
     }
 }
 
-async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocument {
+pub(crate) async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocument {
     let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     document.seed_default_placement();
     document.ensure_node(actor.node_id, RealmNodeKind::Management);
@@ -114,43 +114,7 @@ fn conflict_is_expected() {
     ));
 }
 
-#[tokio::test]
-async fn concurrent_mutations_land() {
-    // Writers racing on one document conflict at commit; each re-drives
-    // its own mutation, so all of them land instead of one failing.
-    let root = tempdir().unwrap();
-    let context = context(root.path().to_str().unwrap());
-    let actor = actor(RealmId::from_bytes([21; 32]));
-    seed_config(&context, &actor).await;
-    let ids: Vec<Ulid> = (1..=6u8).map(|seed| Ulid::from_bytes([seed; 16])).collect();
-    let mut tasks = Vec::new();
-    for strategy_id in ids.clone() {
-        let context = context.clone();
-        let actor = actor.clone();
-        tasks.push(tokio::spawn(async move {
-            drive_placement_mutation(
-                MutatePlacementConfig {
-                    actor,
-                    mutation: RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
-                },
-                None,
-                &context,
-            )
-            .await
-        }));
-    }
-    for task in tasks {
-        task.await.unwrap().expect("every mutation lands");
-    }
-    let config = drive(GetConfigOperation::new(actor.realm_id), &context)
-        .await
-        .unwrap();
-    for strategy_id in ids {
-        assert!(config.strategy(&strategy_id).is_some());
-    }
-}
-
-fn strategy(strategy_id: Ulid) -> PlacementStrategy {
+pub(crate) fn strategy(strategy_id: Ulid) -> PlacementStrategy {
     PlacementStrategy {
         strategy_id,
         name: "hot".to_string(),

@@ -15,8 +15,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use super::nonce::{NonceError, SpendNonceOperation};
-use crate::forward::authorize::is_sync_eligible;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::realm::peer_trust::is_sync_eligible;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DelegateError {

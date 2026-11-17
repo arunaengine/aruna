@@ -506,7 +506,7 @@ mod tests {
     /// Whether the mapping bucket's write fence still admits the route's generation.
     async fn fence_open(ctx: &DriverContext, route: &MappingRoute) -> bool {
         let (key_space, key) =
-            crate::placement::fence::fence_read(&route.realm_id, &route.placement);
+            aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
         let read = StorageEffect::Read {
             key_space,
             key,
@@ -514,7 +514,7 @@ mod tests {
         };
         match ctx.storage_handle.send_storage_effect(read).await {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                crate::placement::fence::admits(value.as_ref(), route.generation)
+                aruna_core::placement::fence::admits(value.as_ref(), route.generation)
             }
             other => panic!("fence read failed: {}", other.label()),
         }

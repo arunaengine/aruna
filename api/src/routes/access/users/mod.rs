@@ -28,8 +28,9 @@ use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOpera
 use aruna_operations::device::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
 };
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::delete_secret::{
@@ -37,7 +38,6 @@ use aruna_operations::onboarding::delete_secret::{
 };
 use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
 use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
@@ -1168,7 +1168,7 @@ pub(crate) async fn authorize_directory(
         state.get_realm_id(),
         user_id.unwrap_or("**")
     );
-    aruna_operations::auth::request_policy::enforce_policies(
+    aruna_operations::auth::enforcement::enforce_policies(
         &state.get_ctx(),
         state.get_realm_id(),
         &aruna_operations::auth::request_policy::policy_request_with(
@@ -1180,7 +1180,7 @@ pub(crate) async fn authorize_directory(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::auth::request_policy::PolicyEnforcementError::Denied { .. } => {
+        aruna_operations::auth::error::PolicyEnforcementError::Denied { .. } => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.into()),

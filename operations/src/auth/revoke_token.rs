@@ -5,7 +5,8 @@
 use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::{
-    revocation_live, revocation_retained, valid_revocation_expiry, valid_token_hash,
+    revocation_live, revocation_retained, user_cutoff_expiry, user_cutoff_hash,
+    valid_revocation_expiry, valid_token_hash,
 };
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -28,11 +29,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
 const REVOCATION_CAP: usize = REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;
@@ -57,6 +58,18 @@ pub struct RevokeTokenConfig {
     pub admission: RevokeTokenAdmission,
     /// Current unix seconds, used to prune revocations that expired.
     pub now: u64,
+}
+
+/// Moves `owner`'s token cutoff past `issued_at` on behalf of `actor`.
+pub fn owner_cutoff(actor: Actor, owner: UserId, issued_at: u64, now: u64) -> RevokeTokenConfig {
+    RevokeTokenConfig {
+        token_hash: user_cutoff_hash(&owner),
+        expires_at: user_cutoff_expiry(issued_at.saturating_add(1)),
+        token_owner: owner,
+        admission: RevokeTokenAdmission::Privileged,
+        actor,
+        now,
+    }
 }
 
 /// Appends one bearer token hash to the realm's revocation set. Rides the admin
@@ -151,7 +164,7 @@ pub enum RevokeTokenError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -332,7 +345,7 @@ impl RevokeTokenOperation {
             return Err(RevokeTokenError::UnexpectedEvent {
                 state: format!("{:?}", self.state),
                 expected: "one outbox value for every revocation index key",
-                got: format!("{} values for {} keys", values.len(), index_keys.len()),
+                got: "a different number of outbox values",
             });
         }
 
@@ -587,7 +600,7 @@ impl RevokeTokenOperation {
         }
         self.state = RevokeTokenState::CommitTransaction { document };
         if self.cutoff_raised {
-            return smallvec![crate::abe::mark_due(None, txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(None, txn_id)];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -599,7 +612,7 @@ impl RevokeTokenOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(RevokeTokenError::UnexpectedEvent {
             state,
@@ -626,24 +639,24 @@ impl Operation for RevokeTokenOperation {
     fn step(&mut self, event: Event) -> Effects {
         if let (RevokeTokenState::CommitTransaction { .. }, Some(txn_id)) =
             (&self.state, self.txn_id)
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
-        match self.state.clone() {
+        match &self.state {
             RevokeTokenState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             RevokeTokenState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self.emit_read_result(document_value.clone(), reducer_state_value.clone())
@@ -653,7 +666,7 @@ impl Operation for RevokeTokenOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             RevokeTokenState::ReadOutboxCapacity {
                 document,
@@ -663,13 +676,43 @@ impl Operation for RevokeTokenOperation {
                 write_canonical,
                 pending_deletes,
                 pending_live,
-            } => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    if values.is_empty() && next_start_after.is_none() {
-                        return match self.finish_capacity(
+            } => {
+                let document = document.clone();
+                let reducer_state = reducer_state.clone();
+                let revocation_index = revocation_index.clone();
+                let apply_event = apply_event.clone();
+                let write_canonical = write_canonical.clone();
+                let pending_deletes = pending_deletes.clone();
+                let pending_live = pending_live.clone();
+                match event {
+                    Event::Storage(StorageEvent::IterResult {
+                        values,
+                        next_start_after,
+                    }) => {
+                        if values.is_empty() && next_start_after.is_none() {
+                            return match self.finish_capacity(
+                                document,
+                                reducer_state,
+                                revocation_index,
+                                apply_event,
+                                write_canonical,
+                                pending_deletes,
+                                pending_live,
+                            ) {
+                                Ok(effects) => effects,
+                                Err(error) => self.fail(error),
+                            };
+                        }
+                        let index_keys: Vec<_> = values.into_iter().map(|(key, _)| key).collect();
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(RevokeTokenError::MissingTransaction);
+                        };
+                        let reads = index_keys
+                            .iter()
+                            .cloned()
+                            .map(|key| (SYNC_OUTBOX_KEYSPACE.to_string(), key))
+                            .collect();
+                        self.state = RevokeTokenState::ReadOutboxRecords {
                             document,
                             reducer_state,
                             revocation_index,
@@ -677,158 +720,162 @@ impl Operation for RevokeTokenOperation {
                             write_canonical,
                             pending_deletes,
                             pending_live,
-                        ) {
-                            Ok(effects) => effects,
-                            Err(error) => self.fail(error),
+                            index_keys,
+                            next_start_after,
                         };
+                        smallvec![Effect::Storage(StorageEffect::BatchRead {
+                            reads,
+                            txn_id: Some(txn_id),
+                        })]
                     }
-                    let index_keys: Vec<_> = values.into_iter().map(|(key, _)| key).collect();
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(RevokeTokenError::MissingTransaction);
-                    };
-                    let reads = index_keys
-                        .iter()
-                        .cloned()
-                        .map(|key| (SYNC_OUTBOX_KEYSPACE.to_string(), key))
-                        .collect();
-                    self.state = RevokeTokenState::ReadOutboxRecords {
-                        document,
-                        reducer_state,
-                        revocation_index,
-                        apply_event,
-                        write_canonical,
-                        pending_deletes,
-                        pending_live,
-                        index_keys,
-                        next_start_after,
-                    };
-                    smallvec![Effect::Storage(StorageEffect::BatchRead {
-                        reads,
-                        txn_id: Some(txn_id),
-                    })]
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("outbox capacity iteration result", other.label())
+                    }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event("outbox capacity iteration result", format!("{other:?}"))
-                }
-            },
+            }
             RevokeTokenState::ReadOutboxRecords {
                 document,
                 reducer_state,
                 revocation_index,
                 apply_event,
                 write_canonical,
-                mut pending_deletes,
-                mut pending_live,
+                pending_deletes,
+                pending_live,
                 index_keys,
                 next_start_after,
-            } => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    if let Err(error) = self.collect_pending(
-                        index_keys,
-                        values,
-                        &mut pending_deletes,
-                        &mut pending_live,
-                    ) {
-                        return self.fail(error);
-                    }
-                    if let Some(start_after) = next_start_after {
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(RevokeTokenError::MissingTransaction);
-                        };
-                        self.state = RevokeTokenState::ReadOutboxCapacity {
-                            document,
-                            reducer_state,
-                            revocation_index,
-                            apply_event,
-                            write_canonical,
-                            pending_deletes,
-                            pending_live,
-                        };
-                        smallvec![Effect::Storage(StorageEffect::Iter {
-                            key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
-                            prefix: Some(admin_outbox_prefix(self.config.actor.node_id)),
-                            start: Some(IterStart::After(start_after)),
-                            limit: REVOCATIONS_PER_ORIGIN,
-                            txn_id: Some(txn_id),
-                        })]
-                    } else {
-                        match self.finish_capacity(
-                            document,
-                            reducer_state,
-                            revocation_index,
-                            apply_event,
-                            write_canonical,
-                            pending_deletes,
-                            pending_live,
+            } => {
+                let document = document.clone();
+                let reducer_state = reducer_state.clone();
+                let revocation_index = revocation_index.clone();
+                let apply_event = apply_event.clone();
+                let write_canonical = write_canonical.clone();
+                let mut pending_deletes = pending_deletes.clone();
+                let mut pending_live = pending_live.clone();
+                let index_keys = index_keys.clone();
+                let next_start_after = next_start_after.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                        if let Err(error) = self.collect_pending(
+                            index_keys,
+                            values,
+                            &mut pending_deletes,
+                            &mut pending_live,
                         ) {
-                            Ok(effects) => effects,
-                            Err(error) => self.fail(error),
+                            return self.fail(error);
+                        }
+                        if let Some(start_after) = next_start_after {
+                            let Some(txn_id) = self.txn_id else {
+                                return self.fail(RevokeTokenError::MissingTransaction);
+                            };
+                            self.state = RevokeTokenState::ReadOutboxCapacity {
+                                document,
+                                reducer_state,
+                                revocation_index,
+                                apply_event,
+                                write_canonical,
+                                pending_deletes,
+                                pending_live,
+                            };
+                            smallvec![Effect::Storage(StorageEffect::Iter {
+                                key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
+                                prefix: Some(admin_outbox_prefix(self.config.actor.node_id)),
+                                start: Some(IterStart::After(start_after)),
+                                limit: REVOCATIONS_PER_ORIGIN,
+                                txn_id: Some(txn_id),
+                            })]
+                        } else {
+                            match self.finish_capacity(
+                                document,
+                                reducer_state,
+                                revocation_index,
+                                apply_event,
+                                write_canonical,
+                                pending_deletes,
+                                pending_live,
+                            ) {
+                                Ok(effects) => effects,
+                                Err(error) => self.fail(error),
+                            }
                         }
                     }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("outbox record batch read result", other.label())
+                    }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event("outbox record batch read result", format!("{other:?}"))
-                }
-            },
+            }
             RevokeTokenState::DeletePendingOutbox {
                 document,
                 reducer_state,
                 revocation_index,
                 apply_event,
                 write_canonical,
-            } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => match self
-                    .emit_after_capacity(
-                        document,
-                        reducer_state,
-                        revocation_index,
-                        apply_event,
-                        write_canonical,
-                    ) {
-                    Ok(effects) => effects,
-                    Err(error) => self.fail(error),
-                },
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event("pending outbox cleanup result", format!("{other:?}"))
+            } => {
+                let document = document.clone();
+                let reducer_state = reducer_state.clone();
+                let revocation_index = revocation_index.clone();
+                let apply_event = apply_event.clone();
+                let write_canonical = write_canonical.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => match self
+                        .emit_after_capacity(
+                            document,
+                            reducer_state,
+                            revocation_index,
+                            apply_event,
+                            write_canonical,
+                        ) {
+                        Ok(effects) => effects,
+                        Err(error) => self.fail(error),
+                    },
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("pending outbox cleanup result", other.label()),
                 }
-            },
+            }
             RevokeTokenState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
                 schedule_drain,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(RevokeTokenError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = RevokeTokenState::DeleteAdminConflicts {
-                            document,
-                            schedule_drain,
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                let schedule_drain = schedule_drain.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(RevokeTokenError::MissingTransaction);
                         };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = RevokeTokenState::DeleteAdminConflicts {
+                                document,
+                                schedule_drain,
+                            };
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit(document, schedule_drain)
                     }
-                    self.emit_commit(document, schedule_drain)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
+            }
             RevokeTokenState::DeleteAdminConflicts {
                 document,
                 schedule_drain,
-            } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit(document, schedule_drain)
+            } => {
+                let document = document.clone();
+                let schedule_drain = schedule_drain.clone();
+                match event {
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                        self.emit_commit(document, schedule_drain)
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
+            }
             RevokeTokenState::CommitNoop { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
@@ -839,20 +886,23 @@ impl Operation for RevokeTokenOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
-            RevokeTokenState::CommitTransaction { document } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = RevokeTokenState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
+            RevokeTokenState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
+                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                        self.txn_id = None;
+                        self.state = RevokeTokenState::ScheduleSyncDrain { document };
+                        smallvec![schedule_drain_effect()]
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        self.txn_id = None;
+                        self.fail(error.into())
+                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
+            }
             RevokeTokenState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = RevokeTokenState::Finish;
@@ -863,10 +913,8 @@ impl Operation for RevokeTokenOperation {
                     self.state = RevokeTokenState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             RevokeTokenState::Finish | RevokeTokenState::Error | RevokeTokenState::Init => {
                 smallvec![]
@@ -904,9 +952,9 @@ mod tests {
         REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
         RevokeTokenOperation, StorageEffect, StorageEvent, reducer_state_key,
     };
+    use crate::document_repository::GetConfigOperation;
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_config::GetConfigOperation;
     use crate::sync::outbox_record::admin_outbox_prefix;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;

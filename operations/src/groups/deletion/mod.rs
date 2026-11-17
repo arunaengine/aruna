@@ -10,10 +10,8 @@ mod peer;
 mod prepare;
 mod resources;
 
-pub use check::check_group;
-pub use coordinator::delete_group;
 pub(crate) use coordinator::sync_decision;
-pub use onboarding::install_onboarding;
+pub use coordinator::{check_group, delete_group, install_onboarding};
 pub(crate) use peer::apply_request;
 
 #[cfg(test)]

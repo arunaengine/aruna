@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -17,6 +17,9 @@ use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::replication::catch_up::wake_bootstrap;
+use crate::replication::protocol::{
+    LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
+};
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::sync::reconcile::ReconcileTopicsOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
@@ -28,7 +31,8 @@ use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::task::TaskKey;
-use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms, record_elapsed_ms};
+use aruna_core::telemetry::record_elapsed_ms;
+use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use aruna_tasks::shutdown::Shutdown;
@@ -161,7 +165,7 @@ async fn serve_metadata_stream(
 /// request back for the metadata domain.
 async fn peer_request(
     context: &Arc<DriverContext>,
-    metadata: &MetadataHandle,
+    _metadata: &MetadataHandle,
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> Result<MetadataTransportMessage, MetadataTransportMessage> {
@@ -186,7 +190,8 @@ async fn peer_request(
             Ok(MetadataTransportMessage::EventsDecided { result })
         }
         MetadataTransportMessage::ReleaseSecret { request } => {
-            let keys = (metadata.realm_seal_key(), metadata.realm_vault_key());
+            let keys = crate::plugins::release::node_keys(context);
+            let keys = (keys.seal, keys.vault);
             let released = crate::plugins::release::serve_release(context, keys, peer, request);
             let result = Box::pin(released).await;
             Ok(MetadataTransportMessage::SecretReleased { result })

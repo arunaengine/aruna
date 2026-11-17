@@ -15,7 +15,7 @@ use ulid::Ulid;
 use super::keep::{ClaimFillOperation, Claimed, KeptCopy, PublishKeptOperation, Published};
 use super::pull::{drop_copy, drop_evicted, fill_slot, release};
 use super::source_plan::{KeepPlanOperation, Plan, SourceKeep, SpoolSourceOperation};
-use crate::driver::{DriverContext, drive, now_ms};
+use crate::driver::{DriverContext, drive};
 
 /// Keeps the reference's bytes per the member's strategy and range behaviour: before the read
 /// is served when it fills first (`true`), else in the background when a fill slot is free.
@@ -59,7 +59,7 @@ async fn keep_source(
     let claim = claim_key(plan.kind, plan.set_id, keep.version_id, plan.identity);
     let claimed = FillClaim {
         claim_id: Ulid::generate(),
-        claimed_at_ms: now_ms(),
+        claimed_at_ms: unix_timestamp_millis(),
     };
     match drive(ClaimFillOperation::new(claim.clone(), claimed), context).await {
         Ok(Claimed::Claimed) => {}

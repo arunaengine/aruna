@@ -64,7 +64,7 @@ use super::submit::{
 };
 use super::unavailable;
 use super::work::RequestContext;
-use crate::auth::request_authorization::AuthorizeError;
+use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;

@@ -2,44 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::request_authorization::AuthorizeError;
+use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::DriverContext;
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
-use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::time_stage;
 use aruna_core::types::GroupId;
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
-
-pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
-    config
-        .node_kind(&node_id)
-        .is_some_and(RealmNodeKind::is_sync_eligible)
-}
-
-/// A User peer is owner-bound: it may forward only for the owner its realm
-/// config names, whatever token it managed to present. Other kinds are not
-/// owner-bound, so any authenticated caller may travel through them.
-pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
-    match config.node_kind(&peer).and_then(RealmNodeKind::owner) {
-        Some(owner) => owner == user_id,
-        None => true,
-    }
-}
 
 pub(crate) async fn authorize_forwarded_pid(
     context: &Arc<DriverContext>,
@@ -101,7 +83,7 @@ pub(crate) async fn authorize_forwarded_caller(
     }
     // A User peer is owner-bound: whatever token it presents, the write it
     // forwards must be its owner's own.
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
         return Err(ForwardAuthError::Unavailable(
             "forwarded metadata write needs the realm configuration".to_string(),
         ));

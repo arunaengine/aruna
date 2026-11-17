@@ -32,10 +32,10 @@ use thiserror::Error;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoveFromInput {
@@ -51,7 +51,7 @@ pub struct RemoveFromOperation {
     input: RemoveFromInput,
     /// Bucket the authorization rows publish onto, read inside the write
     /// transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: RemoveFromState,
     conflicts: u8,
     output: Option<Result<GroupAuthorizationDocument, RemoveFromError>>,
@@ -173,15 +173,6 @@ impl RemoveFromOperation {
         }
     }
 
-    fn auth_context(&self) -> AuthContext {
-        AuthContext {
-            user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
-    }
-
     fn handle_authorization(&mut self, event: Event) -> Effects {
         let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
@@ -237,33 +228,13 @@ impl RemoveFromOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
+        let [auth_doc, reducer_state, realm_config] = match super::member_reads(event) {
+            Ok(values) => values,
+            Err((expected, got)) => {
+                return self.unexpected_event(self.state.clone(), expected, got);
+            }
         };
-        let [
-            (_, auth_doc_value),
-            (_, reducer_state_value),
-            (_, realm_config_value),
-        ] = values.as_slice()
-        else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult) with auth doc, admin state, and realm config values",
-                got,
-            );
-        };
-
-        match self.emit_auth_write(
-            txn_id,
-            auth_doc_value.clone(),
-            reducer_state_value.clone(),
-            realm_config_value.clone(),
-        ) {
+        match self.emit_auth_write(txn_id, auth_doc, reducer_state, realm_config) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
@@ -510,7 +481,10 @@ impl RemoveFromOperation {
             admin_outbox_written,
             was_member,
         };
-        smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(
+            Some(self.input.group_id),
+            txn_id
+        )]
     }
 
     fn handle_commit_transaction(
@@ -671,7 +645,7 @@ impl Operation for RemoveFromOperation {
 
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.auth_context(),
+                auth_context: AuthContext::from(&self.input.actor),
                 path: format!(
                     "/{}/g/{}/admin/users/{}",
                     self.input.actor.realm_id, self.input.group_id, self.input.user_id
@@ -690,47 +664,67 @@ impl Operation for RemoveFromOperation {
             Err(effects) => return effects,
         };
         if let RemoveFromState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
 
-        match self.state.clone() {
+        match &self.state {
             RemoveFromState::Auth => self.handle_authorization(event),
             RemoveFromState::StartTransaction => self.handle_start_transaction(event),
-            RemoveFromState::ReadAdminState { txn_id } => self.handle_auth_read(event, txn_id),
+            RemoveFromState::ReadAdminState { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_auth_read(event, txn_id)
+            }
             RemoveFromState::WriteAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 conflict_delete_keys,
                 was_member,
-            } => self.handle_auth_write(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                conflict_delete_keys,
-                was_member,
-            ),
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let conflict_delete_keys = conflict_delete_keys.clone();
+                let was_member = was_member.clone();
+                self.handle_auth_write(
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    conflict_delete_keys,
+                    was_member,
+                )
+            }
             RemoveFromState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 was_member,
-            } => self.handle_conflict_deletes(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                was_member,
-            ),
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let was_member = was_member.clone();
+                self.handle_conflict_deletes(
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    was_member,
+                )
+            }
             RemoveFromState::ReadBucketFence {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 was_member,
             } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let was_member = was_member.clone();
                 self.handle_bucket_fence(event, txn_id, auth_doc, admin_outbox_written, was_member)
             }
             RemoveFromState::CommitTransaction {
@@ -738,12 +732,22 @@ impl Operation for RemoveFromOperation {
                 admin_outbox_written,
                 was_member,
                 ..
-            } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written, was_member),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let was_member = was_member.clone();
+                self.handle_commit_transaction(event, auth_doc, admin_outbox_written, was_member)
+            }
             RemoveFromState::ScheduleDocumentDrain {
                 auth_doc,
                 was_member,
-            } => self.handle_drain_schedule(event, auth_doc, was_member),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let was_member = was_member.clone();
+                self.handle_drain_schedule(event, auth_doc, was_member)
+            }
             RemoveFromState::EmitNotifications { auth_doc } => {
+                let auth_doc = auth_doc.clone();
                 self.handle_emit_notifications(auth_doc)
             }
             RemoveFromState::Init | RemoveFromState::Finish | RemoveFromState::Error => {
@@ -882,10 +886,10 @@ pub mod test {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
+    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
     use crate::groups::remove_member::{
         RemoveFromError, RemoveFromInput, RemoveFromOperation, RemoveFromState,
     };

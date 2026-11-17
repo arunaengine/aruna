@@ -39,6 +39,7 @@ use crate::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
@@ -479,6 +480,10 @@ pub enum StorageEvent {
     Error {
         error: StorageError,
     },
+    /// The opened realm secret, or why this node could not open it.
+    RealmOpened {
+        result: Result<SecretBytes, crate::realm_vault::RealmVaultError>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -506,6 +511,25 @@ pub enum NetEvent {
     ),
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
+    MetadataAnswer(Box<MetadataAnswer>),
+}
+
+/// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
+/// and how long the request took, so one deadline can span the requests to several peers.
+#[derive(Debug, PartialEq)]
+pub struct MetadataAnswer {
+    pub peer: NodeId,
+    pub elapsed: Duration,
+    pub result: Result<Vec<u8>, PeerRequestError>,
+}
+
+/// Why a peer request has no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRequestError {
+    /// The request failed before an answer arrived.
+    Failed(String),
+    /// No answer arrived within the request's timeout.
+    TimedOut,
 }
 
 /// Reply to a [`crate::effects::NetEffect::PolicySign`]. The adapter signs only
@@ -516,8 +540,8 @@ pub enum PolicySignEvent {
     Unavailable(String),
 }
 
-/// Reply to a [`crate::effects::PolicyFetchEffect`]. A fetched document is a
-/// candidate only; the operation verifies its definition and publication
+/// Result of a policy fetch from the holders of a [`crate::effects::PolicyFetchEffect`]. A
+/// fetched document is a candidate only; the operation verifies its definition and publication
 /// authority before it may be cached or matched against a subject.
 #[derive(Debug, PartialEq)]
 pub enum PolicyFetchEvent {
@@ -555,7 +579,7 @@ pub enum StatementSignEvent {
     Unavailable(String),
 }
 
-/// Reply to a [`crate::effects::VaultFetchEffect`].
+/// Result of a vault fetch from the holders of a [`crate::effects::VaultFetchEffect`].
 #[derive(Debug, PartialEq)]
 pub enum VaultFetchEvent {
     Fetched {
@@ -918,6 +942,7 @@ impl Event {
                     IterResult,
                     VaultResult,
                     Error,
+                    RealmOpened,
                 }
             ),
             Event::Net(event) => variant_label!(
@@ -939,6 +964,7 @@ impl Event {
                     Release,
                     Error,
                     ArtifactStored,
+                    MetadataAnswer,
                     Notification,
                     InboxWoken,
                     Heartbeat,

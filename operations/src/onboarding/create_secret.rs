@@ -167,7 +167,7 @@ impl Operation for CreateSecretOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match &self.state {
             CreateSecretState::StartTransaction => {
                 let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
@@ -194,6 +194,7 @@ impl Operation for CreateSecretOperation {
                 })]
             }
             CreateSecretState::ReadRealmConfig { txn_id } => {
+                let txn_id = txn_id.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
@@ -240,6 +241,10 @@ impl Operation for CreateSecretOperation {
                 enrolled,
                 pending,
             } => {
+                let txn_id = txn_id.clone();
+                let cap = cap.clone();
+                let enrolled = enrolled.clone();
+                let pending = pending.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::IterResult {
                     values,
@@ -280,6 +285,7 @@ impl Operation for CreateSecretOperation {
                 }
             }
             CreateSecretState::WriteRecord { txn_id } => {
+                let txn_id = txn_id.clone();
                 let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(

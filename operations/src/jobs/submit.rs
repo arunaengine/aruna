@@ -35,8 +35,8 @@ use thiserror::Error;
 use tracing::warn;
 
 use super::import::upload::{UploadClaimError, claim_upload};
-use crate::groups::imports::cron::is_running;
 use crate::harvest::repository::source_key;
+use crate::s3::imports::cron::is_running;
 use aruna_core::structs::execution::job::upload_key;
 use aruna_core::structs::execution::job::{dedup_index_key, job_insert_entries};
 

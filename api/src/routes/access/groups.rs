@@ -7,6 +7,7 @@ use crate::auth::{
     ValidatedBearer, ensure_permission, permission_granted, require_unrestricted_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::user_origin;
 use crate::metadata::map_api_error;
 use crate::routes::git::location::StorageLocationRequest;
 use crate::routes::plugin_installs::{refuse_plugin_account, refuse_plugin_role};
@@ -23,8 +24,9 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
 use aruna_operations::device::realm_documents::install_group_docs;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::forward::routing::is_user_origin;
 use aruna_operations::git::GitError;
 use aruna_operations::git::location::{check_default, group_default};
 use aruna_operations::groups::add_member::{AddUserError, AddUserInput, AddUserOperation};
@@ -33,7 +35,6 @@ use aruna_operations::groups::create_group::{
     CreateGroupConfig, CreateGroupError, CreateGroupOperation,
 };
 use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
-use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::groups::remove_member::{
     RemoveFromError, RemoveFromInput, RemoveFromOperation,
@@ -46,7 +47,6 @@ use aruna_operations::groups::update_group::{
 };
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::stats::count_group_purpose;
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::object::pages::ListRequest;
@@ -331,10 +331,7 @@ fn require_unrestricted(auth: Option<AuthContext>) -> ServerResult<AuthContext> 
 /// admin envelope a device originated, so applying it locally would answer the
 /// caller with success and then diverge; the action journal replaces this.
 pub(crate) async fn refuse_group_edit(state: &ServerState) -> ServerResult<()> {
-    let device = is_user_origin(&state.get_ctx(), state.get_realm_id(), state.get_node_id())
-        .await
-        .map_err(map_api_error)?;
-    match device {
+    match user_origin(state).await? {
         true => Err(ServerError::Conflict(
             "group changes are made through the realm".to_string(),
         )),
@@ -482,10 +479,7 @@ pub async fn create_group(
     let ctx = state.get_ctx();
     // A device originates no realm administration, so the create travels to an
     // ingress, which decides quota and permission under the caller's own token.
-    if is_user_origin(&ctx, realm_id, state.get_node_id())
-        .await
-        .map_err(map_api_error)?
-    {
+    if user_origin(&state).await? {
         let caller_token = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
         let auth_token = forwarded_bearer(Some(caller_token.as_str()))
             .map_err(map_api_error)?

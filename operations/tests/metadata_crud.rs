@@ -15,6 +15,9 @@ use aruna_core::keyspaces::{
     REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventPayload, MetadataEventRecord};
+use aruna_core::placement::{
+    PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
+};
 use aruna_core::storage_entries::{
     create_event_entry, create_projection_entries, event_log_prefix, graph_lifecycle_entry,
     metadata_document_key, metadata_registry_key, pending_projection_key, registry_write_entries,
@@ -40,9 +43,6 @@ use aruna_operations::metadata::projector::{
 };
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
-};
-use aruna_operations::placement::{
-    PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
 };
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;

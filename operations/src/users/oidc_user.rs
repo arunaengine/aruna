@@ -31,11 +31,11 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::subject_index::rewrite_subjects;
+use aruna_core::placement::target_placement_ref;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolveOidcInput {
     pub actor: Actor,
@@ -57,7 +57,7 @@ pub struct ResolveOidcOperation {
     input: ResolveOidcInput,
     realm_config: Option<RealmConfigDocument>,
     /// Bucket the user's rows publish onto, read inside the write transaction.
-    fence: crate::placement::fence::WriteFence,
+    fence: aruna_core::placement::fence::WriteFence,
     state: ResolveOidcState,
     output: Option<Result<User, ResolveOidcError>>,
 }
@@ -514,26 +514,47 @@ impl Operation for ResolveOidcOperation {
             Err(effects) => return effects,
         };
 
-        match self.state.clone() {
+        match &self.state {
             ResolveOidcState::StartTransaction => self.handle_start_txn(event),
-            ResolveOidcState::ReadSubjectIndex { txn_id } => self.accept_subject(event, txn_id),
+            ResolveOidcState::ReadSubjectIndex { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.accept_subject(event, txn_id)
+            }
             ResolveOidcState::WriteDocumentRevision { txn_id, user } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
                 self.handle_write_user(event, txn_id, user)
             }
             ResolveOidcState::WriteSubjectIndex { txn_id, user } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
                 self.accept_subject_write(event, txn_id, user)
             }
-            ResolveOidcState::ReadExistingUser { txn_id } => self.accept_existing(event, txn_id),
-            ResolveOidcState::ScanUsers { txn_id } => self.accept_users(event, txn_id),
+            ResolveOidcState::ReadExistingUser { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.accept_existing(event, txn_id)
+            }
+            ResolveOidcState::ScanUsers { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.accept_users(event, txn_id)
+            }
             ResolveOidcState::ReadBucketFence {
                 txn_id,
                 user,
                 announce,
-            } => self.handle_bucket_fence(event, txn_id, user, announce),
+            } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
+                let announce = announce.clone();
+                self.handle_bucket_fence(event, txn_id, user, announce)
+            }
             ResolveOidcState::CommitTransaction { user, announce } => {
+                let user = user.clone();
+                let announce = announce.clone();
                 self.handle_commit_txn(event, user, announce)
             }
             ResolveOidcState::ScheduleDocumentDrain { user } => {
+                let user = user.clone();
                 self.schedule_outbox_drain(event, user)
             }
             ResolveOidcState::Init | ResolveOidcState::Finish | ResolveOidcState::Error => {

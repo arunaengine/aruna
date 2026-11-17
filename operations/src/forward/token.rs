@@ -6,6 +6,7 @@ use crate::auth::revoke_token::RevokeTokenAdmission;
 use crate::auth::revoke_token::RevokeTokenConfig;
 use crate::auth::revoke_token::RevokeTokenError;
 use crate::auth::revoke_token::RevokeTokenOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::forward::authorize::authorize_forwarded_caller;
@@ -16,12 +17,11 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::handle::MetadataRequestError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
-use crate::placement::process_placements::load_realm_config;
-use crate::placement::selector::select_top_peers;
 use aruna_core::NodeId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::auth::valid_revocation_expiry;
 use aruna_core::metadata::AuthToken;
+use aruna_core::placement::selector::select_top_peers;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -47,7 +47,7 @@ pub async fn forward_token_revoke(
     auth_token: AuthToken,
     token: String,
 ) -> Result<(), MetadataApiError> {
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
         return Err(MetadataApiError::ServiceUnavailable);
     };
     let Some(metadata) = context.metadata_handle.as_ref() else {
@@ -150,7 +150,7 @@ pub(crate) async fn apply_token_revoke(
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     let realm_id = *net_handle.realm_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     let local_node = config

@@ -22,12 +22,12 @@ use smallvec::smallvec;
 use super::list::{admin_check, authorized};
 use super::{Cutoffs, GroupToken, GroupTokensError, TokenKind, TokenStatus};
 use super::{parse_config, read_config};
+use crate::auth::check_permissions::authorization_event;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::revoke_token::RevokeTokenOperation;
-use crate::groups::admin_check::authorization_event;
+use crate::auth::revoke_token::owner_cutoff;
 use crate::s3::access::revoke::RevokeUserOperation;
 use crate::s3::session::{RevokeS3Config, RevokeS3Operation};
-use crate::session::revoke::owner_cutoff;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RevokeTarget {

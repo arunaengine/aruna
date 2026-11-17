@@ -251,7 +251,7 @@ async fn update_config(
 ) {
     let realm_id = state.get_realm_id();
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
