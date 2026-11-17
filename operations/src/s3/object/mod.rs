@@ -11,6 +11,9 @@ pub mod head;
 pub mod link;
 pub mod list;
 mod lookup;
+#[cfg(test)]
+#[path = "managed_copy_tests.rs"]
+mod managed_copy_tests;
 pub mod metadata;
 pub mod origin;
 pub mod pages;

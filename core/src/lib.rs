@@ -31,6 +31,7 @@ pub mod key_seal;
 pub mod keys;
 pub mod keyspaces;
 pub mod link;
+pub mod managed_copy;
 pub mod metadata;
 pub mod metrics;
 pub mod node_vault;

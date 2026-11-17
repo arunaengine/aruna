@@ -6,7 +6,6 @@ pub mod cleanup;
 pub mod cleanup_rows;
 pub mod hidden;
 pub mod holders;
-pub mod managed_copy;
 pub mod migration;
 pub mod pending_reclaim;
 pub mod permission_paths;
