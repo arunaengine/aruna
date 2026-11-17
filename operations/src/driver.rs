@@ -10,6 +10,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::types::{Effects, TxnId};
+use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
@@ -37,6 +38,7 @@ pub struct DriverContext {
     pub net_handle: Option<NetHandle>,
     pub blob_handle: Option<BlobHandle>,
     pub metadata_handle: Option<MetadataHandle>,
+    pub graph_handle: Option<GraphHandle>,
     pub task_handle: Option<TaskHandle>,
     /// Enabled executor backends; `None` on nodes with no compute plane.
     pub compute_handle: Option<std::sync::Arc<ExecutorRegistry>>,
@@ -65,12 +67,11 @@ impl DriverContext {
             .map(|net| (net.node_id(), *net.realm_id()))
     }
 
-    /// This context with its storage effects and metadata reads on the bulk lane, so
+    /// This context with its storage effects on the bulk lane, so
     /// background work never delays request traffic.
     pub fn bulk(&self) -> Self {
         let mut context = self.clone();
         context.storage_handle = context.storage_handle.bulk();
-        context.metadata_handle = context.metadata_handle.as_ref().map(MetadataHandle::bulk);
         context
     }
 }
@@ -81,6 +82,7 @@ impl std::fmt::Debug for DriverContext {
             .field("net_handle", &self.net_handle)
             .field("blob_handle", &self.blob_handle.is_some())
             .field("metadata_handle", &self.metadata_handle.is_some())
+            .field("graph_handle", &self.graph_handle.is_some())
             .field("task_handle", &self.task_handle.is_some())
             .field("compute_handle", &self.compute_handle.is_some())
             .finish_non_exhaustive()
@@ -1073,6 +1075,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -1111,6 +1114,7 @@ mod test {
                 net_handle: None,
                 blob_handle: Some(blob_handle),
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
             },
@@ -1266,6 +1270,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -1299,6 +1304,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -1401,6 +1407,7 @@ mod test {
             net_handle: None,
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -1952,6 +1959,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -1993,6 +2001,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -2065,6 +2074,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -2160,6 +2170,7 @@ mod test {
             net_handle: None,
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -2235,6 +2246,7 @@ mod test {
                         net_handle: None,
                         blob_handle: None,
                         metadata_handle: None,
+                        graph_handle: None,
                         task_handle: None,
                         compute_handle: None,
                     };
@@ -2264,6 +2276,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         }

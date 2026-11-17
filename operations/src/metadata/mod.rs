@@ -31,7 +31,6 @@ mod queue_storage;
 pub mod raw_revision;
 pub mod repository;
 mod search_cursor;
-mod search_enrichment;
 pub mod secondary_ids;
 pub mod stats;
 mod summary_cache;
@@ -95,7 +94,12 @@ impl MetadataPhaseSource {
 
 pub use builtin::builtin_shapes;
 pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
-pub use handle::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+pub use handle::{
+    MetadataHandle, MetadataHandleOptions, export_rocrate_jsonld, export_rocrate_page,
+    export_summary_jsonld, list_cached_group, list_cached_records, list_group_records,
+    prune_deleted_graphs, prune_if_deleted, query_authorized_local, reconcile_document_sync,
+    search_authorized_local, search_local_filtered, send_metadata_effect, warm_caches,
+};
 pub(crate) use handle::{WritePeerError, transport_message_kind};
 pub use protocol::{
     AuthToken, AuthTokenError, MetadataPathWinner, MetadataReadError, PersistentIdResolution,
@@ -107,10 +111,10 @@ pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
     timestamp_index::spawn_index_sweep(Arc::clone(&context), shutdown);
     visibility_index::spawn_visibility_index(Arc::clone(&context), shutdown);
     shutdown.spawn(async move {
-        let Some(handle) = context.metadata_handle.clone() else {
+        if context.metadata_handle.is_none() {
             return;
-        };
-        if let Err(error) = handle.warm_caches().await {
+        }
+        if let Err(error) = warm_caches(&context).await {
             warn!(error = %error, "Metadata visibility cache warmup failed");
             return;
         }

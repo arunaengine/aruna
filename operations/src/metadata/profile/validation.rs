@@ -24,11 +24,11 @@ use oxttl::NQuadsParser;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::MetadataHandle;
+use aruna_graph::GraphHandle;
 use crate::metadata::api::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 use crate::metadata::forward::{PROFILE_DOCUMENT_PREFIX, export_profile_routed};
-use crate::metadata::profile::shacl::{
+use aruna_core::profile_shapes::{
     CRAQLE_BASE_IRI, ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
 use crate::metadata::raw_revision::load_raw_revision;
@@ -388,7 +388,7 @@ struct ProfileAssessment {
 }
 
 async fn evaluate_profile(
-    metadata: &MetadataHandle,
+    metadata: &GraphHandle,
     profile: &ResolvedProfile,
     jsonld: &str,
 ) -> Result<ProfileAssessment, MetadataError> {
@@ -517,8 +517,8 @@ fn single_profile_tag(
 fn evaluator_handle<'a>(
     context: &'a DriverContext,
     profile_revision: Option<&str>,
-) -> Result<&'a MetadataHandle, MetadataError> {
-    match context.metadata_handle.as_ref() {
+) -> Result<&'a GraphHandle, MetadataError> {
+    match context.graph_handle.as_ref() {
         Some(metadata) if metadata.profile_validation_available() => Ok(metadata),
         _ => Err(unavailable_error(
             "validator_unavailable",
@@ -1425,6 +1425,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
