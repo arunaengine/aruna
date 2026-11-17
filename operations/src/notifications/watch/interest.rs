@@ -4,46 +4,39 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::pin;
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::structs::execution::notification_watch::{
-    WATCH_DIRTY_PREFIX, WatchEventKind, WatchEventMask, WatchInterestDigest, WatchInterestEntry,
-    WatchInterestTable, dirty_interest_realm, interest_dirty_key, interest_node_id,
-    interest_node_key, interest_node_prefix, interest_pending_key, interest_realm_id,
-    interest_realm_prefix,
+    WATCH_DIRTY_PREFIX, WatchInterestDigest, WatchInterestEntry, WatchInterestTable,
+    dirty_interest_realm, interest_node_id, interest_node_key, interest_node_prefix,
+    interest_pending_key, interest_realm_id, interest_realm_prefix,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
-use byteview::ByteView;
 use futures_util::TryStreamExt;
 use tracing::warn;
-use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::notifications::protocol::DIRTY_REALM_CAP;
 use crate::notifications::watch::authorization::filter_authorized_subscriptions;
+use crate::notifications::watch::digest::{
+    catchall_digest, digest_over, dirty_marker_write, schedule_publish_effect,
+};
 use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::records::WatchSubscriptionError;
 use crate::notifications::watch::subscriptions::list_realm_subscriptions;
 use crate::realm::get_config::GetConfigOperation;
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
-use aruna_core::structs::execution::notification_watch::{INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP};
-
-/// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
-/// fires this long after the first dirty write, collapsing a run of watch CRUD
-/// into one publish with bounded latency.
-pub const WATCH_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Ensures this node has a document to announce when joining the shared
 /// realm-scoped watch-interest topic. Existing digests may contain live watches
@@ -89,26 +82,6 @@ pub async fn ensure_interest_digest(
             "unexpected local watch interest digest read result: {other:?}"
         )),
     }
-}
-
-/// Schedules (or shortens toward) the debounced watch-interest publish task.
-pub fn schedule_publish_effect() -> Effect {
-    Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::PublishWatchInterest,
-        after: WATCH_PUBLISH_DEBOUNCE,
-    })
-}
-
-/// Dirty marker written in the same transaction as a subscription row change,
-/// so the debounced publisher knows which realm's digest to rebuild. The value
-/// is a generation id; a marker is only cleared if its generation still matches.
-pub fn dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
-    let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
-    (
-        WATCH_INTEREST_KEYSPACE.to_string(),
-        ByteView::from(interest_dirty_key(realm_id)),
-        generation,
-    )
 }
 
 /// Sends the debounced publish schedule from a CRUD call site. Best-effort: when
@@ -346,28 +319,6 @@ async fn build_realm_digest(
         return Ok((catchall_digest(node_id), false));
     }
     Ok((digest, filtered.check_failed))
-}
-
-fn digest_over(digest: &WatchInterestDigest) -> Result<bool, String> {
-    if digest.entries.len() > INTEREST_ENTRY_CAP {
-        return Ok(true);
-    }
-    Ok(digest.to_bytes().map_err(|error| error.to_string())?.len() > INTEREST_BYTES_CAP)
-}
-
-fn catchall_digest(node_id: NodeId) -> WatchInterestDigest {
-    WatchInterestDigest {
-        node_id,
-        entries: vec![WatchInterestEntry {
-            path_prefix: String::new(),
-            event_mask: WatchEventMask::from_kinds([
-                WatchEventKind::MetadataCreated,
-                WatchEventKind::DataUploaded,
-                WatchEventKind::SyncCompleted,
-                WatchEventKind::SyncFailed,
-            ]),
-        }],
-    }
 }
 
 /// Persists changed digests and their pending markers atomically.
@@ -680,6 +631,9 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::execution::notification_watch::{
+        INTEREST_ENTRY_CAP, interest_dirty_key,
+    };
+    use aruna_core::structs::execution::notification_watch::{
         WatchEventKind, WatchEventMask, WatchInterestEntry,
     };
     use aruna_core::structs::identity::auth::Actor;
@@ -690,6 +644,7 @@ mod tests {
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
+    use ulid::Ulid;
 
     use crate::notifications::watch::subscriptions::{create_local_watch, delete_local_watch};
 

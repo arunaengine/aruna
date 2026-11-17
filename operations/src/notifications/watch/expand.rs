@@ -27,9 +27,8 @@ use crate::notifications::protocol::{
 };
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{authorize_watch_event, evaluate_watch_delivery};
-use crate::notifications::watch::interest::{
-    dirty_marker_write, mark_interest_dirty, schedule_interest_publish,
-};
+use crate::notifications::watch::digest::dirty_marker_write;
+use crate::notifications::watch::interest::{mark_interest_dirty, schedule_interest_publish};
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::subscriptions::list_watch_page;
 

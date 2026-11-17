@@ -22,7 +22,7 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
 use crate::notifications::watch::authorization::evaluate_watch_creation;
-use crate::notifications::watch::interest::dirty_marker_write;
+use crate::notifications::watch::digest::dirty_marker_write;
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
     WatchReplication, WatchSubscriptionError, decode_stored_subscription, validated_subscription,
