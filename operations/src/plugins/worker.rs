@@ -615,7 +615,7 @@ const MARK_PAGE: usize = 100;
 /// Drops the marks nothing can need any more, a page at a time: the work that minted the
 /// version can write no more, as its row is settled or gone, and only then the version is
 /// absent. The delete reads the row again, so it conflicts with a settlement or reservation.
-pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
+pub(crate) async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
     let (mut dropped, mut after) = (0, None);
     loop {
         let page = page_rows(PLUGIN_WORK_KEYSPACE, vec![MARK_ROW], after, MARK_PAGE);

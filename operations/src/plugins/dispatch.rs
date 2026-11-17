@@ -149,7 +149,7 @@ pub async fn start_run(
 
 /// A run of the install's handler for the event's kind, due at `now_ms`, or `None` when the
 /// manifest has no trigger of that kind.
-pub fn event_run(
+pub(crate) fn event_run(
     config: &RealmConfigDocument,
     install: &PluginInstall,
     event: &SourceEvent,
@@ -162,7 +162,7 @@ pub fn event_run(
 
 /// Queues the due `every` occurrence of each active install this node receives. Missed
 /// occurrences collapse into the latest; one over the queue bound is counted as skipped.
-pub async fn enqueue_timers(
+pub(crate) async fn enqueue_timers(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -296,7 +296,7 @@ impl Plan for EnqueueTimer {
 }
 
 /// The timer row of an install, if its timer ran before.
-pub fn read_timer(install_id: Ulid) -> RowsOperation<ReadTimer> {
+pub(crate) fn read_timer(install_id: Ulid) -> RowsOperation<ReadTimer> {
     RowsOperation::direct(ReadTimer(timer_key(install_id)))
 }
 

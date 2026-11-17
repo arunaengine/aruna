@@ -31,7 +31,7 @@ const PAGE: usize = 100;
 
 /// The work row of job `id` of `install`; a row of an earlier install under the same id is not
 /// this install's job.
-pub async fn job_row(
+pub(crate) async fn job_row(
     ctx: &DriverContext,
     install: &PluginInstall,
     id: &str,
@@ -45,7 +45,7 @@ pub async fn job_row(
 }
 
 /// What job `id` did: from its kept summary once settled, else from its job record.
-pub async fn job_status(
+pub(crate) async fn job_status(
     ctx: &DriverContext,
     (install, local): (&PluginInstall, NodeId),
     id: &str,
@@ -100,7 +100,7 @@ pub async fn job_status(
 }
 
 /// One page of the objects job `id` wrote, after the output at `cursor`.
-pub async fn job_outputs(
+pub(crate) async fn job_outputs(
     ctx: &DriverContext,
     (install, local): (&PluginInstall, NodeId),
     id: &str,
@@ -167,7 +167,7 @@ pub async fn cancel_job(
 
 /// Keeps the summary of every work whose job finished, so its status outlives the job record;
 /// a reserved work first takes the job its dedup key names. Answers how many settled.
-pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+pub(crate) async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
     let mut settled = 0;
     for (key, value) in drive(scan_rows(work_scan()), ctx).await? {
         let row: WorkRow = decode(&value)?;
@@ -214,7 +214,7 @@ pub(crate) async fn reconcile(
 
 /// Asks the jobs of removed installs to cancel and deletes their rows once each job is settled
 /// and kept; a row stays as long as its cancel was not accepted. Answers how many rows went.
-pub async fn retire_work(
+pub(crate) async fn retire_work(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     now_ms: u64,

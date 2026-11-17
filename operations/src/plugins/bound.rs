@@ -53,7 +53,7 @@ pub enum Sealed {
 }
 
 /// The kind the install's manifest declares for `slot`.
-pub fn slot_kind(
+pub(crate) fn slot_kind(
     config: &RealmConfigDocument,
     install: &PluginInstall,
     slot: &str,
@@ -195,7 +195,7 @@ pub struct BindPlace {
 /// The bindings of every slot the manifest declares, from `requested` (slot to `scope:name`)
 /// or the same name in the group, each checked where it lives; and the warnings for slots whose
 /// use rule a realm admin must add.
-pub async fn bind_slots(
+pub(crate) async fn bind_slots(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     place: BindPlace,
@@ -279,7 +279,7 @@ pub async fn bind_slots(
 
 /// Whether the webhook that `slot` verifies reads its delivery id from the header the secret
 /// checks, so the id would carry the credential. Install and receiver both refuse it.
-pub fn delivery_clash(
+pub(crate) fn delivery_clash(
     manifest: &aruna_plugins::manifest::Manifest,
     slot: &str,
     settings: &SecretSettings,
@@ -301,7 +301,7 @@ pub enum BindError {
 
 /// Whether this node holds the node secret `name` with `kind`; answers the header its `header`
 /// setting names, in lowercase. Never the value.
-pub async fn node_secret_fits(
+pub(crate) async fn node_secret_fits(
     ctx: &DriverContext,
     name: &SecretName,
     kind: &SecretKind,
@@ -323,7 +323,7 @@ pub async fn node_secret_fits(
 
 /// Checks a node binding where it lives: on `receiver`, here or over the metadata transport;
 /// answers the secret's checked header as [`node_secret_fits`] does.
-pub async fn check_node_binding(
+pub(crate) async fn check_node_binding(
     ctx: &DriverContext,
     (local, receiver): (NodeId, NodeId),
     name: &SecretName,

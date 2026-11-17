@@ -49,7 +49,7 @@ pub enum Step {
 
 /// The next step of a keyed create from how its row was found and what a lookup found. A
 /// missing document is sent again only to the stored node, with the stored arguments.
-pub fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
+pub(crate) fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
     match (claim, lookup) {
         (Claim::Fresh, _) => Step::Dispatch,
         (Claim::Earlier, None) => Step::Lookup,
@@ -144,7 +144,7 @@ impl Plan for ClaimKey {
 
 /// Closes one attempt of `key` whose outcome is known: it committed, or it was refused without
 /// an effect, `rejected` when the refusal concerns its arguments.
-pub fn settle_key(
+pub(crate) fn settle_key(
     (install, key): (&PluginInstall, &str),
     rejected: bool,
 ) -> RowsOperation<SettleKey> {

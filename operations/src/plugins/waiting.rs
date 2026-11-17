@@ -17,7 +17,7 @@ use crate::driver::{DriverContext, drive};
 use aruna_core::plugin_runs::Outcome;
 
 /// Decides each waiting event that is ready or expired; returns how many left the waiting set.
-pub async fn recheck_waiting(
+pub(crate) async fn recheck_waiting(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,

@@ -49,7 +49,7 @@ impl Target {
 }
 
 /// The manifest trigger a journaled event kind starts.
-pub fn event_trigger(kind: SourceKind) -> TriggerKind {
+pub(crate) fn event_trigger(kind: SourceKind) -> TriggerKind {
     match kind {
         SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
         SourceKind::DataUploaded => TriggerKind::DataUploaded,
@@ -63,7 +63,7 @@ pub fn event_trigger(kind: SourceKind) -> TriggerKind {
 /// One page of pending rows in one transaction, matched with at most `bound` forward rows per
 /// install: the forward rows and gaps of the targets each row matches, and the pending rows
 /// deleted. Answers how many rows were read; a full page of `JOURNAL_PAGE` means more may follow.
-pub fn match_page(
+pub(crate) fn match_page(
     (targets, keep): (&[Target], bool),
     now_ms: u64,
     bound: usize,

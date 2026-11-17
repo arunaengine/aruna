@@ -32,7 +32,7 @@ pub struct RunScope {
 
 /// Steps 0 to 2: this node runs the install, the account is the active account the record
 /// names, and the record is active with the run's artifact.
-pub fn check_run<'a>(
+pub(crate) fn check_run<'a>(
     scope: &RunScope,
     config: &'a RealmConfigDocument,
     account: Option<&User>,
@@ -42,7 +42,7 @@ pub fn check_run<'a>(
 }
 
 /// Steps 0 to 2 for install `install_id` pinned at `digest`, run by `local`.
-pub fn check_install<'a>(
+pub(crate) fn check_install<'a>(
     place: (&'a RealmConfigDocument, RealmId, NodeId),
     binding: (Ulid, &str),
     account: Option<&User>,
@@ -59,7 +59,7 @@ pub fn check_install<'a>(
 
 /// The install whatever its state: this node runs it, its account is active and marked with
 /// it, and it still pins `digest`.
-pub fn check_identity<'a>(
+pub(crate) fn check_identity<'a>(
     (config, realm_id, local): (&'a RealmConfigDocument, RealmId, NodeId),
     (install_id, digest): (Ulid, &str),
     account: Option<&User>,
@@ -110,7 +110,7 @@ pub fn matching(
 
 /// Step 4: each access of `permission` on `target`, as the account restricted to `patterns`,
 /// against roles, denies and policies with the operation `plugin.<permission>`.
-pub async fn authorize_call(
+pub(crate) async fn authorize_call(
     ctx: &DriverContext,
     install: &PluginInstall,
     permission: Permission,
@@ -125,7 +125,7 @@ pub async fn authorize_call(
 
 /// One access on `target` under the operation `plugin.<permission>`, such as READ on the source
 /// of a copy, whose target needs WRITE.
-pub async fn authorize_access(
+pub(crate) async fn authorize_access(
     ctx: &DriverContext,
     install: &PluginInstall,
     (permission, access): (Permission, Access),
@@ -156,7 +156,7 @@ pub async fn authorize_access(
 
 /// The patterns a copy reads `source` and writes `target` under: read on the source and write
 /// on the target, each authorized with the operation `plugin.objects.copy`.
-pub async fn copy_grants(
+pub(crate) async fn copy_grants(
     ctx: &DriverContext,
     install: &PluginInstall,
     (source, target): (&str, &str),
@@ -171,7 +171,7 @@ pub async fn copy_grants(
 
 /// Steps 0 to 4 for one call; `target` is the permission and resource a guarded call names.
 /// State and log calls name none and pass steps 0 to 2 only.
-pub async fn check_call(
+pub(crate) async fn check_call(
     ctx: &DriverContext,
     scope: &RunScope,
     target: Option<(Permission, &str)>,

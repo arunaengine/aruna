@@ -27,7 +27,7 @@ type Pairs<'a> = &'a [(String, String)];
 
 /// The request a run asks for, with the connection's address resolved from the settings the run
 /// was admitted with; a work row keeps it, so its job needs no run. No credential header is kept.
-pub fn request_context(
+pub(crate) fn request_context(
     manifest: &Manifest,
     (connection, method): (&str, Method),
     settings: &str,
@@ -84,7 +84,7 @@ pub fn outgoing(
 }
 
 /// The realm keys this node releases group and realm secrets with, if it holds them.
-pub fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
+pub(crate) fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
     (ctx.metadata_handle.as_ref())
         .map(|handle| ReleaseKeys {
             seal: handle.realm_seal_key(),
@@ -95,7 +95,7 @@ pub fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
 
 /// Releases the secret of `slot` for one request of a work that run `run_id` started and adds it
 /// to `outgoing`; answers the exposure the rule allows now and the fields it added.
-pub async fn release_into(
+pub(crate) async fn release_into(
     ctx: &DriverContext,
     (config, local, keys): (&RealmConfigDocument, NodeId, &ReleaseKeys),
     (install, slot, run_id): (&PluginInstall, &str, Ulid),

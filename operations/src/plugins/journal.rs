@@ -56,7 +56,7 @@ impl Plan for JournalPage {
 
 /// Deletes kept rows journaled longer than the retention ago, and source-id rows past the
 /// dedup horizon, after which a source is not journaled again; returns how many rows.
-pub fn prune_journal(now_ms: u64) -> RowsOperation<PruneJournal> {
+pub(crate) fn prune_journal(now_ms: u64) -> RowsOperation<PruneJournal> {
     let kept_from = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
     RowsOperation::direct(PruneJournal {
         now_ms,

@@ -33,7 +33,7 @@ static SEEN: LazyLock<Mutex<HashMap<UserId, u64>>> = LazyLock::new(Default::defa
 
 /// Deactivates the active plugin accounts the canonical records have not named for the grace
 /// period, as a realm administrator. Returns how many it deactivated.
-pub async fn sweep_orphans(
+pub(crate) async fn sweep_orphans(
     ctx: &DriverContext,
     node_id: NodeId,
     config: &RealmConfigDocument,

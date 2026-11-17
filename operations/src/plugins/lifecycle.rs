@@ -362,7 +362,7 @@ pub fn targets(config: &RealmConfigDocument) -> Vec<Target> {
 
 /// The installs this node matches pending rows to, and whether it keeps its journal: a user
 /// node keeps none, so its rows are deleted unmatched.
-pub fn match_targets(config: &RealmConfigDocument, local: NodeId) -> (Vec<Target>, bool) {
+pub(crate) fn match_targets(config: &RealmConfigDocument, local: NodeId) -> (Vec<Target>, bool) {
     let keep = !matches!(node_kind(config, local), Some(RealmNodeKind::User { .. }));
     let targets = match keep {
         true => targets(config),

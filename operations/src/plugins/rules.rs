@@ -55,7 +55,7 @@ pub fn consumer(install: &PluginInstall) -> SecretConsumer {
 /// Sets this install's rules on the group secret `name` to `wanted`, keeping every other
 /// consumer's rules; returns whether it wrote. A guard the local record no longer meets writes
 /// nothing, and so does a list that is already in place.
-pub async fn edit_rules(
+pub(crate) async fn edit_rules(
     ctx: &DriverContext,
     actor: &Actor,
     (group_id, name): (GroupId, &SecretName),
@@ -128,7 +128,7 @@ async fn guard_holds(
 /// The rules the install needs on each group secret it binds, from its manifest, grants and
 /// settings: `inject` for granted connections, `verify` for the webhook, `value` for a granted
 /// `secrets.value`.
-pub fn wanted_rules(
+pub(crate) fn wanted_rules(
     install: &PluginInstall,
     manifest: &Manifest,
 ) -> Result<BTreeMap<SecretName, Vec<UseRule>>, String> {
@@ -219,7 +219,7 @@ fn distinct(rules: &mut Vec<UseRule>) {
 }
 
 /// Ensures the install's rules on every group secret it binds, for its current revision.
-pub async fn ensure_rules(
+pub(crate) async fn ensure_rules(
     ctx: &DriverContext,
     actor: &Actor,
     install: &PluginInstall,
@@ -245,7 +245,7 @@ pub async fn ensure_rules(
 }
 
 /// Removes the rules of a removing, abandoned or removed install from its group secrets.
-pub async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginInstall) {
+pub(crate) async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginInstall) {
     let guard = RuleGuard::Retired {
         install_id: install.install_id,
     };

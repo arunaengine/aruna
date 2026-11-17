@@ -64,19 +64,19 @@ impl std::fmt::Debug for Assembled {
 }
 
 /// The chunks an artifact of `total` bytes has.
-pub fn chunk_count(total: u64) -> u32 {
+pub(crate) fn chunk_count(total: u64) -> u32 {
     total.div_ceil(CHUNK as u64) as u32
 }
 
 /// The exact length of chunk `index` of an artifact of `total` bytes.
-pub fn chunk_len(total: u64, index: u32) -> u64 {
+pub(crate) fn chunk_len(total: u64, index: u32) -> u64 {
     total
         .saturating_sub(u64::from(index) * CHUNK as u64)
         .min(CHUNK as u64)
 }
 
 /// The `index`-th chunk of `bytes`, ready to send.
-pub fn chunk_of(digest: &str, bytes: &[u8], index: u32) -> Chunk {
+pub(crate) fn chunk_of(digest: &str, bytes: &[u8], index: u32) -> Chunk {
     let start = (index as usize * CHUNK).min(bytes.len());
     let end = (start + CHUNK).min(bytes.len());
     Chunk {
@@ -88,19 +88,19 @@ pub fn chunk_of(digest: &str, bytes: &[u8], index: u32) -> Chunk {
 }
 
 /// Whether a chunk fits its artifact: a size within the limit, an index and the exact length.
-pub fn chunk_fits(chunk: &Chunk) -> bool {
+pub(crate) fn chunk_fits(chunk: &Chunk) -> bool {
     let sized = (1..=MAX_ARTIFACT as u64).contains(&chunk.total);
     let placed = chunk.index < chunk_count(chunk.total);
     sized && placed && chunk.bytes.0.len() as u64 == chunk_len(chunk.total, chunk.index)
 }
 
 /// Whether this node keeps a complete copy, without reading it.
-pub async fn has_local(ctx: &DriverContext, digest: &str) -> Result<bool, ArtifactError> {
+pub(crate) async fn has_local(ctx: &DriverContext, digest: &str) -> Result<bool, ArtifactError> {
     Ok(read_done(ctx, digest).await?.is_some())
 }
 
 /// Reads this node's complete copy within the memory budget, or `None` without one.
-pub async fn read_local(
+pub(crate) async fn read_local(
     ctx: &DriverContext,
     digest: &str,
 ) -> Result<Option<Assembled>, ArtifactError> {
@@ -113,7 +113,7 @@ pub async fn read_local(
 }
 
 /// One chunk of this node's complete copy and the copy's length.
-pub async fn read_chunk(
+pub(crate) async fn read_chunk(
     ctx: &DriverContext,
     digest: &str,
     index: u32,
@@ -130,7 +130,7 @@ pub async fn read_chunk(
 
 /// Writes this node's whole copy and syncs before anyone is told. Progress is kept with every
 /// chunk, so an interrupted write is counted and swept like an unfinished copy from a peer.
-pub async fn store_local(
+pub(crate) async fn store_local(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     digest: &str,
@@ -161,7 +161,7 @@ pub async fn store_local(
 /// Keeps one chunk of a copy another management node sends. Once every chunk is here and the
 /// whole artifact checks out, the copy is done; `true` means it is done and synced now. A
 /// resend to a done copy restarts its retention before it is acknowledged.
-pub async fn store_chunk(
+pub(crate) async fn store_chunk(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     chunk: Chunk,
@@ -210,7 +210,7 @@ pub async fn store_chunk(
 /// Deletes unfinished copies and unpublished complete copies untouched for the grace period.
 /// Published and pinned copies stay, and a stale progress row next to a done row only loses
 /// itself. Returns how many copies it deleted.
-pub async fn sweep_copies(
+pub(crate) async fn sweep_copies(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     now_ms: u64,

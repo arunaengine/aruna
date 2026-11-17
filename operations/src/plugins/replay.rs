@@ -89,7 +89,7 @@ fn growth(
 
 /// Starts a replay for each active install whose coverage grew here since its coverage row;
 /// `probe` reads another node's clock. Returns how many replays started.
-pub async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
+pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -282,14 +282,14 @@ impl Plan for StartReplay {
 }
 
 /// Every replay key, for [`replay_page`].
-pub fn replay_scan() -> Scan {
+pub(crate) fn replay_scan() -> Scan {
     Scan::new(PLUGIN_REPLAYS_KEYSPACE, vec![REPLAY_ROW])
 }
 
 /// One page of `page` rows of the replay at `key` in one transaction: forward rows for the newly
 /// covered events it reads, then the replay row continued, or the coverage row written once the
 /// replay reaches `until`. Answers the rows read and whether the replay ended.
-pub fn replay_page(key: Vec<u8>, now_ms: u64, page: usize) -> RowsOperation<ReplayPage> {
+pub(crate) fn replay_page(key: Vec<u8>, now_ms: u64, page: usize) -> RowsOperation<ReplayPage> {
     RowsOperation::transaction(ReplayPage {
         key,
         now_ms,

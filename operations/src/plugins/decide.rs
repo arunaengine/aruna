@@ -64,7 +64,7 @@ pub(crate) enum Verdict {
 }
 
 /// Key of an event's dedup record: install, trigger kind, then the source id.
-pub fn seen_key(install_id: Ulid, kind: SourceKind, source: &str) -> Vec<u8> {
+pub(crate) fn seen_key(install_id: Ulid, kind: SourceKind, source: &str) -> Vec<u8> {
     let mut key = install_id.to_bytes().to_vec();
     key.push(kind as u8);
     key.extend_from_slice(source.as_bytes());
@@ -86,7 +86,7 @@ pub(crate) async fn serve_events(
 }
 
 /// Decides each event of a batch from `sender` and keeps its newest gap reports.
-pub async fn decide_batch(
+pub(crate) async fn decide_batch(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     (local, sender): (NodeId, NodeId),
@@ -321,7 +321,7 @@ impl GapCount {
 }
 
 /// Deletes the dedup records past their retention; returns how many.
-pub fn prune_seen(now_ms: u64) -> RowsOperation<PruneSeen> {
+pub(crate) fn prune_seen(now_ms: u64) -> RowsOperation<PruneSeen> {
     RowsOperation::direct(PruneSeen {
         now_ms,
         after: None,

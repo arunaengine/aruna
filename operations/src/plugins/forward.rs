@@ -95,7 +95,7 @@ fn receiver_requests(
 /// Sends each reachable receiver its batches and applies their decisions; returns how many
 /// rows were decided. Rows of removed installs are dropped, rows past their send expiry become
 /// gaps.
-pub async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
+pub(crate) async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     now_ms: u64,

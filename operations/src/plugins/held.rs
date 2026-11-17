@@ -55,7 +55,7 @@ impl HeldSecrets {
 }
 
 /// One release for a run on `local`. A refusal ends the search; an unavailable node is skipped.
-pub async fn ask_release(
+pub(crate) async fn ask_release(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     (local, keys): (NodeId, &ReleaseKeys),

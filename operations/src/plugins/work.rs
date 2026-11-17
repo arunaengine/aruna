@@ -208,7 +208,7 @@ pub enum Reserve {
     Earlier,
 }
 
-pub fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreError> {
+pub(crate) fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreError> {
     Ok([&[WORK_ROW][..], &install_id.to_bytes(), &encode(identity)?].concat())
 }
 
@@ -388,7 +388,7 @@ impl Plan for ReadWork {
 }
 
 /// Whether a plugin work job must keep its record: its work row exists and is not settled yet.
-pub fn holds_job(spec: &PluginWorkSpec) -> RowsOperation<HoldsJob> {
+pub(crate) fn holds_job(spec: &PluginWorkSpec) -> RowsOperation<HoldsJob> {
     RowsOperation::direct(HoldsJob(ReadWork(WorkLookup::new(
         spec.install_id,
         spec.work_id,
@@ -539,7 +539,7 @@ impl Plan for UpdateWork {
 
 /// Moves the send boundary of work `work_id` before an attempt sends, in one transaction, unless
 /// the boundary earlier attempts left decides already.
-pub fn begin_send(ids: (Ulid, Ulid), again: bool) -> RowsOperation<BeginSend> {
+pub(crate) fn begin_send(ids: (Ulid, Ulid), again: bool) -> RowsOperation<BeginSend> {
     RowsOperation::transaction(BeginSend {
         lookup: WorkLookup::new(ids.0, ids.1),
         again,
@@ -613,7 +613,7 @@ pub fn retried(status: u16) -> bool {
 
 /// The summary of a finished job, or `None` while it may still run. A job record that is gone
 /// leaves the outcome unknown.
-pub fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
+pub(crate) fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
     let Some(record) = record else {
         let mut gone = Summary::of(FinalState::Unknown);
         gone.message = Some("the job record is gone".into());
@@ -654,13 +654,13 @@ impl Summary {
 }
 
 /// Reads every work row.
-pub fn work_scan() -> Scan {
+pub(crate) fn work_scan() -> Scan {
     Scan::new(PLUGIN_WORK_KEYSPACE, vec![WORK_ROW])
 }
 
 /// Deletes the rows nobody can ask for again: settled and delivered, no cancel open, kept past
 /// the run retention, and their run record pruned.
-pub fn prune_work(now_ms: u64) -> RowsOperation<PruneWork> {
+pub(crate) fn prune_work(now_ms: u64) -> RowsOperation<PruneWork> {
     RowsOperation::direct(PruneWork {
         now_ms,
         phase: PrunePhase::Scanning(work_scan()),

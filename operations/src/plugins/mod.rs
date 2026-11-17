@@ -57,7 +57,7 @@ mod events_tests;
 
 /// Management nodes that must hold a copy before a publish is answered: a majority, and at
 /// least two once the realm has two. Plain copies with acknowledgements, no vote.
-pub fn copies_needed(managers: usize) -> usize {
+pub(crate) fn copies_needed(managers: usize) -> usize {
     match managers {
         0 | 1 => 1,
         count => count / 2 + 1,

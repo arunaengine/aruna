@@ -43,7 +43,7 @@ pub struct CopyRequest {
 }
 
 /// Starts or finds the copy of `request` and answers its work id. A paused install starts nothing.
-pub async fn start_copy(
+pub(crate) async fn start_copy(
     ctx: &DriverContext,
     scope: &RunScope,
     request: CopyRequest,
@@ -118,7 +118,7 @@ pub struct DownloadRequest {
 
 /// Starts or finds the download of `request` and answers its work id. It needs the connection's
 /// grant and the download grant on the target; a paused install starts nothing.
-pub async fn start_download(
+pub(crate) async fn start_download(
     ctx: &DriverContext,
     scope: &RunScope,
     request: DownloadRequest,
@@ -191,7 +191,7 @@ pub struct UploadRequest {
 
 /// Starts or finds the upload of `request` and answers its work id. It needs the connection's
 /// grant and read on the source, whose version must not be marked; a paused install starts nothing.
-pub async fn start_upload(
+pub(crate) async fn start_upload(
     ctx: &DriverContext,
     scope: &RunScope,
     request: UploadRequest,

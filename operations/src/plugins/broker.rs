@@ -1338,7 +1338,7 @@ impl Broker for RunBroker {
 
 /// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
 /// when it is marked; `None` when there is no such object, so nothing is read either.
-pub async fn unmarked(
+pub(crate) async fn unmarked(
     ctx: &DriverContext,
     (bucket, key): (&str, &str),
     version: Option<Ulid>,

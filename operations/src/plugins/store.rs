@@ -16,7 +16,7 @@ pub struct Txn<'a> {
 }
 
 /// Runs `body` in one transaction and commits it, or aborts it when `body` fails.
-pub async fn transact<T, E: From<StoreError>>(
+pub(crate) async fn transact<T, E: From<StoreError>>(
     ctx: &DriverContext,
     body: impl AsyncFnOnce(&Txn<'_>) -> Result<T, E>,
 ) -> Result<T, E> {

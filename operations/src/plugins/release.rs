@@ -25,7 +25,7 @@ use super::rows::write_rows;
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::driver::{DriverContext, drive};
 
-pub fn delivery_name(delivery: Delivery) -> &'static str {
+pub(crate) fn delivery_name(delivery: Delivery) -> &'static str {
     match delivery {
         Delivery::Inject => "inject",
         Delivery::Verify => "verify",
@@ -34,7 +34,7 @@ pub fn delivery_name(delivery: Delivery) -> &'static str {
 }
 
 /// The permission path a `secret.use` policy decides on.
-pub fn secret_path(
+pub(crate) fn secret_path(
     realm_id: RealmId,
     scope: SecretScope,
     name: &SecretName,

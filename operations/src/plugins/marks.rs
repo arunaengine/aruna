@@ -38,11 +38,11 @@ fn mark_key((bucket, key, version_id): Version<'_>) -> Result<Vec<u8>, StoreErro
 
 /// The row that marks `version`, written in the transaction that reserves it, before any byte
 /// is written.
-pub fn mark_row(version: Version<'_>, mark: &Mark) -> Result<Row, StoreError> {
+pub(crate) fn mark_row(version: Version<'_>, mark: &Mark) -> Result<Row, StoreError> {
     Ok(row(PLUGIN_WORK_KEYSPACE, mark_key(version)?, encode(mark)?))
 }
 
-pub fn is_marked(version: Version<'_>) -> Result<RowsOperation<IsMarked>, StoreError> {
+pub(crate) fn is_marked(version: Version<'_>) -> Result<RowsOperation<IsMarked>, StoreError> {
     Ok(RowsOperation::direct(IsMarked(mark_key(version)?)))
 }
 

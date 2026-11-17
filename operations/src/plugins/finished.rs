@@ -24,7 +24,7 @@ use crate::driver::{DriverContext, drive};
 /// Admits a `job_finished` run for every settled work whose starting run succeeded and marks the
 /// work notified in the same transaction; a manifest without the trigger is notified without a
 /// run. Answers how many works were notified.
-pub async fn notify_work(
+pub(crate) async fn notify_work(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,

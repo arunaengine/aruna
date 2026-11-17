@@ -208,7 +208,7 @@ impl Plan for Unfinished {
 
 /// The rows that save a run: its record, and its queue row marked for attention or, once it
 /// ended, removed.
-pub fn saved_rows(run: &PluginRun) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
+pub(crate) fn saved_rows(run: &PluginRun) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
     let mut rows = vec![row(
         PLUGIN_RUNS_KEYSPACE,
         run_key(run.install_id, run.run_id),
@@ -328,7 +328,7 @@ impl Plan for ResolveRun {
 /// Removes runs that ended longer than `RUN_RETENTION_MS` ago, each with its intents in one batch.
 /// A run waiting for a person, for its job's end, or whose calls may have had effects or cannot
 /// be read stays.
-pub fn prune_runs(now_ms: u64) -> RowsOperation<PruneRuns> {
+pub(crate) fn prune_runs(now_ms: u64) -> RowsOperation<PruneRuns> {
     RowsOperation::direct(PruneRuns {
         now_ms,
         phase: PrunePhase::Runs(Scan::new(PLUGIN_RUNS_KEYSPACE, vec![RUN_ROW])),
@@ -449,7 +449,7 @@ impl Plan for PruneRuns {
 
 /// The runs a completion still waits on among the work `rows`: those of works not notified yet,
 /// which keep their record until the completion is delivered or dropped.
-pub fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
+pub(crate) fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
     let mut runs = Vec::new();
     for (_, value) in rows {
         let row: WorkRow = decode(&value)?;

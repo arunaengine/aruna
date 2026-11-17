@@ -365,7 +365,7 @@ impl Plan for ReadRows {
 }
 
 /// Every row a scan reads, each page on its own.
-pub fn scan_rows(scan: Scan) -> RowsOperation<ScanRows> {
+pub(crate) fn scan_rows(scan: Scan) -> RowsOperation<ScanRows> {
     RowsOperation::direct(ScanRows(scan))
 }
 
@@ -389,7 +389,7 @@ impl Plan for ScanRows {
 }
 
 /// At most `limit` rows below `prefix` after the key `after`, and the key to continue after.
-pub fn page_rows(
+pub(crate) fn page_rows(
     space: &'static str,
     prefix: Vec<u8>,
     after: Option<Vec<u8>>,
@@ -464,12 +464,12 @@ pub fn sync_all() -> RowsOperation<Change> {
 }
 
 /// Writes rows, each batch on its own.
-pub fn write_rows(rows: Vec<Row>) -> RowsOperation<Change> {
+pub(crate) fn write_rows(rows: Vec<Row>) -> RowsOperation<Change> {
     RowsOperation::direct(Change(Some(Ask::Write(rows))))
 }
 
 /// Deletes rows, each batch on its own.
-pub fn delete_rows(keys: Vec<(&'static str, Vec<u8>)>) -> RowsOperation<Change> {
+pub(crate) fn delete_rows(keys: Vec<(&'static str, Vec<u8>)>) -> RowsOperation<Change> {
     RowsOperation::direct(Change(Some(Ask::Delete(keys))))
 }
 
