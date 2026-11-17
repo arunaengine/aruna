@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::structs::storage::read_grant::{ReadGrant, SignedGrant};
+use aruna_core::structs::storage::read_grant::{READ_OPERATION, ReadGrant, SignedGrant};
 use aruna_core::types::GroupId;
 use thiserror::Error;
 
@@ -15,11 +15,6 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-
-/// The policy operation of a byte read, the same name the S3 surface uses.
-pub const READ_OPERATION: &str = "s3.GetObject";
-/// The policy operation of a metadata read or of one listed entry.
-pub const HEAD_OPERATION: &str = "s3.HeadObject";
 
 /// Why one source read is not allowed. Only `Denied` and `NotFound` are verdicts.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

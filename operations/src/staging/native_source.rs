@@ -15,7 +15,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::distribution::delegation::SignedDelegation;
 use aruna_core::structs::storage::read_grant::{
-    self, GrantScope, GrantedRequest, MAX_REQUEST_SECS, SignedGrant, SignedRequest,
+    self, GrantScope, GrantedRequest, HEAD_OPERATION, MAX_REQUEST_SECS, READ_OPERATION,
+    SignedGrant, SignedRequest,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{SyncRelationship, SyncState};
@@ -32,7 +33,6 @@ use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::distribution::nonce::SpendNonceOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
-use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION};
 use crate::metadata::api::load_realm_config;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
