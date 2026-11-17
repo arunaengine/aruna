@@ -12,6 +12,7 @@ use aruna_core::keyspaces::{
     BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, PURGE_FILES_KEYSPACE,
 };
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, names_version, object_key, version_key,
 };
@@ -19,7 +20,8 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, HashIndex, VersionKey,
 };
 use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
-use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::types::{Effects, GroupId, Key, Value};
+use smallvec::smallvec;
 use std::collections::HashMap;
 use ulid::Ulid;
 
@@ -457,34 +459,131 @@ pub async fn plan_files(
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum PauseError {
+    #[error("could not change the purge pause: {0}")]
+    Storage(#[from] aruna_core::errors::StorageError),
+    #[error("unexpected event for the purge pause: {0}")]
+    UnexpectedEvent(String),
+    #[error("the purge pause did not finish")]
+    NotFinished,
+}
+
 /// Pauses or resumes the purge `job_id` between its batches.
-pub async fn set_paused(context: &DriverContext, job_id: Ulid, paused: bool) -> Result<(), String> {
-    let key = pause_key(job_id);
-    let effect = match paused {
-        true => StorageEffect::Write {
-            key_space: PURGE_FILES_KEYSPACE.to_string(),
-            key,
-            value: Vec::new().into(),
-            txn_id: None,
-        },
-        false => StorageEffect::Delete {
-            key_space: PURGE_FILES_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        },
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
-            Ok(())
+#[derive(Debug, PartialEq)]
+pub struct PausePurgeOperation {
+    job_id: Ulid,
+    paused: bool,
+    output: Option<Result<(), PauseError>>,
+}
+
+impl PausePurgeOperation {
+    pub fn new(job_id: Ulid, paused: bool) -> Self {
+        Self {
+            job_id,
+            paused,
+            output: None,
         }
-        other => Err(format!("could not change the purge pause: {other:?}")),
+    }
+}
+
+impl Operation for PausePurgeOperation {
+    type Output = ();
+    type Error = PauseError;
+
+    fn start(&mut self) -> Effects {
+        let key = pause_key(self.job_id);
+        let effect = match self.paused {
+            true => StorageEffect::Write {
+                key_space: PURGE_FILES_KEYSPACE.to_string(),
+                key,
+                value: Vec::new().into(),
+                txn_id: None,
+            },
+            false => StorageEffect::Delete {
+                key_space: PURGE_FILES_KEYSPACE.to_string(),
+                key,
+                txn_id: None,
+            },
+        };
+        smallvec![Effect::Storage(effect)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.output = Some(match (&self.output, event) {
+            (
+                None,
+                Event::Storage(
+                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
+                ),
+            ) => Ok(()),
+            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (_, event) => Err(PauseError::UnexpectedEvent(format!("{event:?}"))),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<(), PauseError> {
+        self.output.unwrap_or(Err(PauseError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
 }
 
 /// Whether the purge `job_id` is paused.
-pub async fn is_paused(context: &DriverContext, job_id: Ulid) -> Result<bool, String> {
-    let read = vec![(PURGE_FILES_KEYSPACE.to_string(), pause_key(job_id))];
-    Ok(batch(context, read).await?.pop().flatten().is_some())
+#[derive(Debug, PartialEq)]
+pub struct PausedOperation {
+    job_id: Ulid,
+    output: Option<Result<bool, PauseError>>,
+}
+
+impl PausedOperation {
+    pub fn new(job_id: Ulid) -> Self {
+        Self {
+            job_id,
+            output: None,
+        }
+    }
+}
+
+impl Operation for PausedOperation {
+    type Output = bool;
+    type Error = PauseError;
+
+    fn start(&mut self) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: PURGE_FILES_KEYSPACE.to_string(),
+            key: pause_key(self.job_id),
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.output = Some(match (&self.output, event) {
+            (None, Event::Storage(StorageEvent::ReadResult { value, .. })) => Ok(value.is_some()),
+            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (_, event) => Err(PauseError::UnexpectedEvent(format!("{event:?}"))),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<bool, PauseError> {
+        self.output.unwrap_or(Err(PauseError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
 }
 
 #[cfg(test)]

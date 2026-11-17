@@ -961,9 +961,10 @@ pub async fn control_purge(
     match action.as_str() {
         "pause" | "resume" => {
             let paused = action == "pause";
-            aruna_operations::blob::purge::set_paused(&context, id, paused)
+            let pause = aruna_operations::blob::purge::PausePurgeOperation::new(id, paused);
+            drive(pause, &context)
                 .await
-                .map_err(failed)?;
+                .map_err(|error| failed(error.to_string()))?;
         }
         "abort" => {
             let runtime = state.jobs_runtime();
@@ -974,9 +975,10 @@ pub async fn control_purge(
             if let CancelJobOutcome::AlreadyTerminal(_) | CancelJobOutcome::Requested(_) = outcome
                 && purge_ended(&state, job_id).await?
             {
-                aruna_operations::blob::purge::set_paused(&context, id, false)
+                let resume = aruna_operations::blob::purge::PausePurgeOperation::new(id, false);
+                drive(resume, &context)
                     .await
-                    .map_err(failed)?;
+                    .map_err(|error| failed(error.to_string()))?;
             }
         }
         _ => return Err(ServerError::BadRequest),
@@ -1006,7 +1008,8 @@ async fn purge_job(
             .await
             .map_err(|error| ServerError::InternalError(error.into()))?
             .ok_or(ServerError::NotFound)?;
-    let paused = aruna_operations::blob::purge::is_paused(&context, job_id.as_ulid())
+    let paused = aruna_operations::blob::purge::PausedOperation::new(job_id.as_ulid());
+    let paused = drive(paused, &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let paused = paused && !record.state.is_terminal();

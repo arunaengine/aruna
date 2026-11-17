@@ -56,8 +56,8 @@ pub async fn run_storage_purge(
     // The planned files wait in the cleanup queue until the job has ended.
     let outcome = run_fenced_purge(ctx, spec, files).await;
     if !matches!(outcome, Err(PurgeRunError::Interrupted)) {
-        let unpaused = crate::blob::purge::set_paused(&ctx.driver, ctx.job_id.as_ulid(), false);
-        if let Err(error) = unpaused.await {
+        let resume = crate::blob::purge::PausePurgeOperation::new(ctx.job_id.as_ulid(), false);
+        if let Err(error) = drive(resume, &ctx.driver).await {
             tracing::warn!(%error, "A purge's pause mark could not be removed");
         }
     }
