@@ -5,22 +5,20 @@
 
 use crate::driver::DriverContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, LINKED_JOB_KEYSPACE,
     RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -97,10 +95,8 @@ struct Rows {
 }
 
 impl Rows {
-    fn parse(values: Vec<(Key, Option<Value>)>) -> Result<Self, LinkedError> {
-        let Ok([bucket, encryption, linked, migration, rename]) =
-            <[_; 5]>::try_from(values).map(|values| values.map(|(_, value)| value))
-        else {
+    fn parse(values: Vec<Option<Value>>) -> Result<Self, LinkedError> {
+        let Ok([bucket, encryption, linked, migration, rename]) = <[_; 5]>::try_from(values) else {
             return Err(LinkedError::Unexpected);
         };
         Ok(Self {
@@ -209,17 +205,15 @@ fn decide(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlState {
-    Init,
-    Start,
     Read,
     Delete,
     Write,
-    Commit,
-    Finish,
 }
 
+type ControlStep = Result<Next<BucketJob>, LinkedError>;
+
 /// Applies one action to the bucket's job in one transaction and wakes the worker for a job
-/// that runs again.
+/// that runs again, once the change committed.
 #[derive(Debug, PartialEq)]
 pub struct BucketJobOperation {
     bucket: String,
@@ -227,9 +221,8 @@ pub struct BucketJobOperation {
     action: LinkedAction,
     now_ms: u64,
     state: ControlState,
-    txn_id: Option<TxnId>,
     writes: Vec<(String, Key, Value)>,
-    output: Option<Result<BucketJob, LinkedError>>,
+    output: Option<BucketJob>,
 }
 
 impl BucketJobOperation {
@@ -239,113 +232,63 @@ impl BucketJobOperation {
             group_id,
             action,
             now_ms,
-            state: ControlState::Init,
-            txn_id: None,
+            state: ControlState::Read,
             writes: Vec::new(),
             output: None,
         }
     }
 
-    fn fail(&mut self, error: LinkedError) -> Effects {
-        self.state = ControlState::Finish;
-        self.output = Some(Err(error));
-        self.abort()
+    fn read(&mut self, values: Vec<Option<Value>>) -> ControlStep {
+        let rows = Rows::parse(values)?;
+        let (writes, deletes, job) =
+            decide(rows, &self.bucket, self.group_id, &self.action, self.now_ms)?;
+        self.writes = writes;
+        self.output = Some(job);
+        self.state = ControlState::Delete;
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
-    fn read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let decided = Rows::parse(values)
-            .and_then(|rows| decide(rows, &self.bucket, self.group_id, &self.action, self.now_ms));
-        match decided {
-            Ok((writes, deletes, job)) => {
-                self.writes = writes;
-                self.output = Some(Ok(job));
-                self.state = ControlState::Delete;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes,
-                    txn_id: self.txn_id,
-                })]
-            }
-            Err(error) => self.fail(error),
+    /// The job left, with the worker's wake after the commit unless the job only paused. An
+    /// abort wakes the worker too, which ends an aborted rename.
+    fn finish(&mut self) -> ControlStep {
+        let output = self.output.take().ok_or(IoError::Unfinished)?;
+        if matches!(self.action, LinkedAction::Pause) {
+            return Ok(Next::Done(output));
         }
-    }
-
-    fn wakes(&self) -> bool {
-        // An abort wakes the worker too, which ends an aborted rename.
-        !matches!(self.action, LinkedAction::Pause)
+        let wake = TaskEffect::ShortenTimer {
+            key: TaskKey::MigrateCompression,
+            after: Duration::ZERO,
+        };
+        let calls = vec![IoCall::Effect(Box::new(Effect::Task(wake)))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl EffectOperation for BucketJobOperation {
+impl Operation for BucketJobOperation {
     type Output = BucketJob;
     type Error = LinkedError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ControlState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> ControlStep {
+        Ok(Next::Call(IoCall::Read(reads(&self.bucket))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let Event::Storage(event) = event else {
-            return self.fail(LinkedError::Unexpected);
-        };
-        match (self.state, event) {
-            (_, StorageEvent::Error { error }) => self.fail(error.into()),
-            (ControlState::Start, StorageEvent::TransactionStarted { txn_id }) => {
-                self.txn_id = Some(txn_id);
-                self.state = ControlState::Read;
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: reads(&self.bucket),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (ControlState::Read, StorageEvent::BatchReadResult { values }) => self.read(values),
-            (ControlState::Delete, StorageEvent::BatchDeleteResult { .. }) => {
-                self.state = ControlState::Write;
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes: std::mem::take(&mut self.writes),
-                    txn_id: self.txn_id,
-                })]
-            }
-            (ControlState::Write, StorageEvent::BatchWriteResult { .. }) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(LinkedError::Unexpected);
-                };
-                self.state = ControlState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (ControlState::Commit, StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
-                self.state = ControlState::Finish;
-                match self.wakes() {
-                    true => smallvec![Effect::Task(TaskEffect::ShortenTimer {
-                        key: TaskKey::MigrateCompression,
-                        after: Duration::ZERO,
-                    })],
-                    false => smallvec![],
-                }
-            }
-            _ => self.fail(LinkedError::Unexpected),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == ControlState::Finish
-    }
-
-    fn finalize(self) -> Result<BucketJob, LinkedError> {
+    fn next(&mut self, result: IoResult) -> ControlStep {
         match self.state {
-            ControlState::Finish => self.output.unwrap_or(Err(LinkedError::Unexpected)),
-            _ => Err(LinkedError::Unexpected),
+            ControlState::Read => self.read(result.values()?),
+            ControlState::Delete => {
+                result.done()?;
+                self.state = ControlState::Write;
+                Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
+            }
+            ControlState::Write => {
+                result.done()?;
+                self.finish()
+            }
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
