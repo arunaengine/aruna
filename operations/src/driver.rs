@@ -9,7 +9,7 @@ use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEff
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::{HoldScope, Operation, SubOperation};
+use aruna_core::operation::{EffectOperation, HoldScope, Runnable, SubOperation};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
@@ -466,9 +466,9 @@ fn delivery(record: Option<u64>, event: &Event) -> u64 {
 
 /// Parent adapter: the operation borrows, while typed finalization stays in the
 /// parent entry points. The second field is the run's record number when recording is on.
-struct ParentRun<'a, O: Operation>(&'a mut O, Option<u64>);
+struct ParentRun<'a, O: EffectOperation>(&'a mut O, Option<u64>);
 
-impl<O: Operation> Drive for ParentRun<'_, O> {
+impl<O: EffectOperation> Drive for ParentRun<'_, O> {
     fn start(&mut self) -> Effects {
         let now = unix_timestamp_millis();
         self.1 = recorder::begin(type_name::<O>(), now, || format!("{:?}", self.0));
@@ -559,11 +559,97 @@ type Dispatch<'a> = dyn Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> + Se
 
 /// Dispatches one effect through the adapters, as the effect loop does for a single effect.
 fn adapter_dispatch(context: &DriverContext, depth: usize) -> Box<Dispatch<'_>> {
-    Box::new(move |effect, until| {
-        Box::pin(effect_adapters::dispatch_effect_until(
+    let limits = hang_limits();
+    Box::new(move |effect, until| Box::pin(dispatch_bounded(effect, context, depth, until, limits)))
+}
+
+/// How long the runner waits for the adapter of each effect kind before it answers
+/// `Event::Hung`; `None` waits without a limit. Blob streams, local files, sub operations,
+/// groups, delays and managed effects have no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HangLimits {
+    pub storage: Option<Duration>,
+    pub net: Option<Duration>,
+    pub metadata: Option<Duration>,
+    pub task: Option<Duration>,
+    pub staging_source: Option<Duration>,
+}
+
+impl HangLimits {
+    /// Generous bounds far above every adapter's own timeouts; they only catch a hung adapter.
+    pub const DEFAULT: Self = Self {
+        storage: Some(Duration::from_secs(60)),
+        net: Some(Duration::from_secs(30 * 60)),
+        metadata: Some(Duration::from_secs(30 * 60)),
+        task: Some(Duration::from_secs(60)),
+        staging_source: Some(Duration::from_secs(15 * 60)),
+    };
+}
+
+impl Default for HangLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+static HANG_LIMITS: std::sync::RwLock<HangLimits> = std::sync::RwLock::new(HangLimits::DEFAULT);
+
+/// Sets the hang limits every later effect of this process uses.
+pub fn set_hang_limits(limits: HangLimits) {
+    if let Ok(mut current) = HANG_LIMITS.write() {
+        *current = limits;
+    }
+}
+
+fn hang_limits() -> HangLimits {
+    HANG_LIMITS
+        .read()
+        .map_or(HangLimits::DEFAULT, |limits| *limits)
+}
+
+fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
+    if managed_effect(effect) {
+        return None;
+    }
+    match effect {
+        Effect::Storage(_) => limits.storage,
+        Effect::Net(_) => limits.net,
+        Effect::Metadata(_) => limits.metadata,
+        Effect::Task(_) => limits.task,
+        Effect::StagingSource(_) => limits.staging_source,
+        Effect::Blob(_)
+        | Effect::LocalFile(_)
+        | Effect::SubOperation(_)
+        | Effect::Group(_)
+        | Effect::Delay(_)
+        | Effect::Search()
+        | Effect::Stream() => None,
+    }
+}
+
+/// Dispatches one effect; an adapter that outlasts the hang limit of its kind is answered with
+/// `Event::Hung`, which fails the run with a typed error.
+async fn dispatch_bounded(
+    effect: Effect,
+    context: &DriverContext,
+    depth: usize,
+    until: Option<Instant>,
+    limits: HangLimits,
+) -> Event {
+    let limit = hang_limit(&effect, limits);
+    let kind = effect_adapters::effect_kind(&effect);
+    let dispatch: BoxFuture<'_, Event> = match until {
+        Some(_) => Box::pin(effect_adapters::dispatch_effect_until(
             effect, context, depth, until,
-        ))
-    })
+        )),
+        None => Box::pin(effect_adapters::dispatch_effect(effect, context, depth)),
+    };
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, dispatch)
+            .await
+            .unwrap_or(Event::Hung { effect: kind }),
+        None => dispatch.await,
+    }
 }
 
 /// When group members stop: at `at` every member still running ends as unfinished, except a
@@ -868,11 +954,12 @@ async fn drive_effects(
             } else if let Some(deadline) = deadline {
                 let managed = managed_effect(&effect);
                 // Managed effects own their timeout and must not be canceled here.
-                let dispatch = Box::pin(effect_adapters::dispatch_effect_until(
+                let dispatch = Box::pin(dispatch_bounded(
                     effect,
                     context,
                     depth,
                     Some(deadline),
+                    hang_limits(),
                 ));
                 if managed {
                     dispatch.await
@@ -900,7 +987,14 @@ async fn drive_effects(
                     }
                 }
             } else {
-                Box::pin(effect_adapters::dispatch_effect(effect, context, depth)).await
+                Box::pin(dispatch_bounded(
+                    effect,
+                    context,
+                    depth,
+                    None,
+                    hang_limits(),
+                ))
+                .await
             };
             state.record_outcome(transaction, &event);
             if !executable.is_complete() {
@@ -991,7 +1085,7 @@ async fn take_hold(
     }
 }
 
-/// Drives an operation under one wall-clock deadline. Cleanup after expiry is
+/// Drives an operation of either kind under one wall-clock deadline. Cleanup after expiry is
 /// bounded and unresolved transaction ownership is handed to storage.
 #[tracing::instrument(
     name = "operation",
@@ -999,7 +1093,18 @@ async fn take_hold(
     skip(operation, context),
     fields(operation = type_name::<O>())
 )]
-pub async fn drive_until<O: Operation>(
+pub async fn drive_until<O, K>(
+    operation: O,
+    context: &DriverContext,
+    deadline: tokio::time::Instant,
+) -> Result<O::Output, O::Error>
+where
+    O: Runnable<K>,
+{
+    machine_until(operation.into_machine(), context, deadline).await
+}
+
+async fn machine_until<O: EffectOperation>(
     mut operation: O,
     context: &DriverContext,
     deadline: tokio::time::Instant,
@@ -1059,16 +1164,22 @@ pub async fn drive_until<O: Operation>(
     result
 }
 
-/// Drives an operation without a deadline. Transaction ownership and the effect
-/// loop are the same as [`drive_until`]; only the deadline and its logging
-/// differ.
+/// Drives an operation of either kind without a deadline. Transaction ownership and the effect
+/// loop are the same as [`drive_until`]; only the deadline and its logging differ.
 #[tracing::instrument(
     name = "operation",
     level = "debug",
     skip(operation, context),
     fields(operation = type_name::<O>())
 )]
-pub async fn drive<O: Operation>(
+pub async fn drive<O, K>(operation: O, context: &DriverContext) -> Result<O::Output, O::Error>
+where
+    O: Runnable<K>,
+{
+    drive_machine(operation.into_machine(), context).await
+}
+
+async fn drive_machine<O: EffectOperation>(
     mut operation: O,
     context: &DriverContext,
 ) -> Result<O::Output, O::Error> {
@@ -1120,17 +1231,28 @@ pub async fn drive<O: Operation>(
     result
 }
 
-/// Drives a fresh operation from `build`; after a conflict ([`Operation::is_conflict`]) it
-/// waits a backoff seeded by `seed` and reruns, at most [`Operation::conflict_retries`] times.
-/// The same seed gives the same waits; distinct seeds spread conflicting writers out.
-pub async fn drive_retry<O: Operation>(
+/// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it waits a backoff
+/// seeded by `seed` and reruns, at most `conflict_retries` times. The same seed gives the same
+/// waits; distinct seeds spread conflicting writers out.
+pub async fn drive_retry<O, K>(
+    mut build: impl FnMut() -> O,
+    context: &DriverContext,
+    seed: &[u8],
+) -> Result<O::Output, O::Error>
+where
+    O: Runnable<K>,
+{
+    retry_machine(move || build().into_machine(), context, seed).await
+}
+
+async fn retry_machine<O: EffectOperation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
     seed: &[u8],
 ) -> Result<O::Output, O::Error> {
     let mut attempt = 0;
     loop {
-        match drive(build(), context).await {
+        match drive_machine(build(), context).await {
             Err(error) if O::is_conflict(&error) && attempt < O::conflict_retries() => {
                 let wait = conflict_backoff(usize::try_from(attempt).unwrap_or(usize::MAX), seed);
                 tokio::time::sleep(wait).await;
@@ -1144,9 +1266,10 @@ pub async fn drive_retry<O: Operation>(
 #[cfg(test)]
 mod test {
     use crate::driver::{
-        DeadlineAbort, DriverContext, GroupEnd, GroupRun, Instant, MAX_TRACKED_TRANSACTIONS,
-        MemberStop, ParentRun, TransactionEffect, TransactionState, TransactionTracker, drive,
-        drive_retry, drive_until, extend_unblocked, run_all, run_window,
+        DeadlineAbort, DriverContext, GroupEnd, GroupRun, HangLimits, Instant,
+        MAX_TRACKED_TRANSACTIONS, MemberStop, ParentRun, TransactionEffect, TransactionState,
+        TransactionTracker, dispatch_bounded, drive, drive_retry, drive_until, extend_unblocked,
+        run_all, run_window,
     };
     use aruna_core::effects::{
         BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
@@ -1156,7 +1279,7 @@ mod test {
         BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
         SubOperationEvent,
     };
-    use aruna_core::operation::{HoldScope, Operation, boxed_suboperation};
+    use aruna_core::operation::{EffectOperation, HoldScope, boxed_suboperation};
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
@@ -1188,7 +1311,7 @@ mod test {
         }
     }
 
-    impl Operation for TestOperation {
+    impl EffectOperation for TestOperation {
         type Output = ();
         type Error = ();
 
@@ -1266,7 +1389,7 @@ mod test {
         txn_id: Option<TxnId>,
     }
 
-    impl Operation for MarkerAbortOperation {
+    impl EffectOperation for MarkerAbortOperation {
         type Output = ();
         type Error = ();
 
@@ -1338,7 +1461,7 @@ mod test {
         }
     }
 
-    impl Operation for DeadlineOperation {
+    impl EffectOperation for DeadlineOperation {
         type Output = bool;
         type Error = ();
 
@@ -1828,7 +1951,7 @@ mod test {
         output: Option<Result<(), u8>>,
     }
 
-    impl Operation for CommitDeadline {
+    impl EffectOperation for CommitDeadline {
         type Output = ();
         type Error = u8;
 
@@ -1910,7 +2033,7 @@ mod test {
         }
     }
 
-    impl Operation for LateOptIn {
+    impl EffectOperation for LateOptIn {
         type Output = ();
         type Error = ();
 
@@ -1995,7 +2118,7 @@ mod test {
         done: bool,
     }
 
-    impl Operation for NestedTransactionOperation {
+    impl EffectOperation for NestedTransactionOperation {
         type Output = ();
         type Error = ();
 
@@ -2057,7 +2180,7 @@ mod test {
         }
     }
 
-    impl Operation for PendingTxn {
+    impl EffectOperation for PendingTxn {
         type Output = bool;
         type Error = ();
 
@@ -2136,7 +2259,7 @@ mod test {
         }
     }
 
-    impl Operation for NestedDeadline {
+    impl EffectOperation for NestedDeadline {
         type Output = ();
         type Error = ();
 
@@ -2292,7 +2415,7 @@ mod test {
         steps: usize,
     }
 
-    impl Operation for StallingOperation {
+    impl EffectOperation for StallingOperation {
         type Output = bool;
         type Error = Infallible;
 
@@ -2405,7 +2528,7 @@ mod test {
         }
     }
 
-    impl Operation for EffectOrderOperation {
+    impl EffectOperation for EffectOrderOperation {
         type Output = Vec<&'static str>;
         type Error = ();
 
@@ -2479,7 +2602,7 @@ mod test {
         }
     }
 
-    impl Operation for StagingDispatchOperation {
+    impl EffectOperation for StagingDispatchOperation {
         type Output = bool;
         type Error = ();
 
@@ -2571,7 +2694,7 @@ mod test {
         }
     }
 
-    impl Operation for RecursiveSubOperation {
+    impl EffectOperation for RecursiveSubOperation {
         type Output = Event;
         type Error = Infallible;
 
@@ -2799,7 +2922,7 @@ mod test {
         closed: bool,
     }
 
-    impl Operation for WindowRows {
+    impl EffectOperation for WindowRows {
         type Output = ();
         type Error = ();
 
@@ -2867,7 +2990,7 @@ mod test {
         results: Option<Vec<GroupResult>>,
     }
 
-    impl Operation for OneGroup {
+    impl EffectOperation for OneGroup {
         type Output = Vec<GroupResult>;
         type Error = ();
 
@@ -2948,7 +3071,7 @@ mod test {
         }
     }
 
-    impl Operation for HeldGroup {
+    impl EffectOperation for HeldGroup {
         type Output = bool;
         type Error = ();
 
@@ -3017,7 +3140,7 @@ mod test {
         conflicts: usize,
     }
 
-    impl<const RETRIES: u32> Operation for Conflicted<RETRIES> {
+    impl<const RETRIES: u32> EffectOperation for Conflicted<RETRIES> {
         type Output = usize;
         type Error = StorageError;
 
@@ -3119,7 +3242,7 @@ mod test {
         }
     }
 
-    impl Operation for Holding {
+    impl EffectOperation for Holding {
         type Output = ();
         type Error = ();
 
@@ -3253,7 +3376,7 @@ mod test {
         woke: bool,
     }
 
-    impl Operation for Sleeper {
+    impl EffectOperation for Sleeper {
         type Output = ();
         type Error = ();
 
@@ -3303,7 +3426,7 @@ mod test {
         woke: bool,
     }
 
-    impl Operation for Echo {
+    impl EffectOperation for Echo {
         type Output = bool;
         type Error = ();
 
@@ -3375,5 +3498,32 @@ mod test {
                 Entry::Ended { .. },
             ]
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hang_limit_answers() {
+        // A storage handle without a worker never answers; its own request timeout is longer.
+        let (storage_handle, _receivers) = storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let limits = HangLimits {
+            storage: Some(Duration::from_secs(1)),
+            ..HangLimits::DEFAULT
+        };
+        let read = Effect::Storage(StorageEffect::Read {
+            key_space: "default".to_string(),
+            key: ByteView::from(*b"hung"),
+            txn_id: None,
+        });
+        let started = Instant::now();
+        let event = dispatch_bounded(read, &context, 0, None, limits).await;
+        assert_eq!(event, Event::Hung { effect: "storage" });
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 }

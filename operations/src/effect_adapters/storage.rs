@@ -77,7 +77,7 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::types::TxnId;
@@ -94,7 +94,7 @@ mod tests {
         txn_id: Option<TxnId>,
     }
 
-    impl Operation for CommitOutcome {
+    impl EffectOperation for CommitOutcome {
         type Output = ();
         type Error = ();
 

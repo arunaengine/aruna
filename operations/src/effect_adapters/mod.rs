@@ -165,7 +165,7 @@ pub(crate) async fn dispatch_effect_until(
     event
 }
 
-fn effect_kind(effect: &Effect) -> &'static str {
+pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
