@@ -1224,7 +1224,8 @@ mod tests {
 
     #[tokio::test]
     async fn promoted_reencode_retried() {
-        use aruna_core::operation::EffectOperation;
+        use aruna_core::calls::{IoResult, Next};
+        use aruna_core::operation::Operation;
         use aruna_core::structs::storage::blob::ArchiveKey;
         use aruna_core::structs::storage::format::StoredLayout;
         for kind in [
@@ -1271,12 +1272,16 @@ mod tests {
                 record.clone(),
                 SystemTime::UNIX_EPOCH,
             );
-            rewrite.start();
-            rewrite.step(Event::Storage(StorageEvent::ReadResult {
-                key: version_key.to_bytes().unwrap().into(),
-                value: Some(version.to_bytes().unwrap().into()),
-            }));
-            assert_eq!(rewrite.finalize(), Ok(RewriteOutcome::Skipped));
+            rewrite.first().unwrap();
+            let read = IoResult::Values(vec![Some(version.to_bytes().unwrap().into())]);
+            let step = rewrite.next(read);
+            assert!(matches!(
+                step,
+                Ok(Next::Then {
+                    output: RewriteOutcome::Skipped,
+                    ..
+                })
+            ));
             let pending_key = ArchiveKey::of(&location).to_bytes();
             put(
                 &context,

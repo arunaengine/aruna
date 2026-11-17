@@ -377,7 +377,9 @@ fn concurrent_put_converted() {
             transition,
             SystemTime::UNIX_EPOCH,
         );
-        rewrite.start();
+        use aruna_core::calls::{IoCall, IoResult, Next};
+        use aruna_core::operation::{Operation, SubOperation};
+        rewrite.first().unwrap();
         let version = aruna_core::structs::storage::blob::BlobVersion::materialized(
             [1; 32],
             location.backend.clone(),
@@ -386,23 +388,25 @@ fn concurrent_put_converted() {
             admin(),
             None,
         );
-        rewrite.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(version.to_bytes().unwrap().into()),
-        }));
-        let effects = rewrite.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(location.to_bytes().unwrap().into()),
-        }));
+        let read = |bytes: Vec<u8>| IoResult::Values(vec![Some(bytes.into())]);
+        rewrite.next(read(version.to_bytes().unwrap())).unwrap();
+        let mut step = rewrite.next(read(location.to_bytes().unwrap()));
         // The version has no envelope rows.
+        let Ok(Next::Call(IoCall::Child(child))) = &mut step else {
+            panic!("expected the envelope reads")
+        };
+        let effects = child.start();
         let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
             panic!("expected the envelope reads, got {effects:?}")
         };
-        let values = reads.iter().map(|(_, key)| (key.clone(), None)).collect();
-        let effects = rewrite.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        let values = reads.iter().map(|_| None).collect();
+        let step = rewrite.next(IoResult::Values(values));
+        let Ok(Next::Call(IoCall::Effect(effect))) = step else {
+            panic!("expected the admission")
+        };
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::AdmitRead { .. })]
+            *effect,
+            Effect::Blob(BlobEffect::AdmitRead { .. })
         ));
     }
 }
