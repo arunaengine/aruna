@@ -49,6 +49,7 @@ pub mod key_wait;
 pub mod list_jobs;
 pub mod mark_start;
 pub mod mutation;
+pub mod park_wake;
 pub mod query;
 pub mod remote_wait;
 pub mod state;

@@ -34,7 +34,8 @@ use super::executor::{
 };
 use super::reconcile::ExternalReconciler;
 use super::store::JobMutationError;
-use super::store::key_wait::{AwaitOutcome, park_job, satisfy_key_wait};
+use super::store::key_wait::{park_job, satisfy_key_wait};
+use super::store::park_wake::AwaitOutcome;
 use super::store::state::{
     ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, defer_job, exhaust_job,
     fail_job, flush_progress, handoff_external_attempt, read_job_record, release_job, renew_lease,
