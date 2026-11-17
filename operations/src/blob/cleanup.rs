@@ -27,10 +27,11 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::blob::release::release_renamed;
+use crate::blob::trail::DropTrailOperation;
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::groups::backends::{backend_key, parse_read};
-use crate::storage_read::iter_prefix_page;
 use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use crate::storage_read::iter_prefix_page;
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
 pub const BLOB_CLEANUP_RETRY: Duration = Duration::from_secs(30);
@@ -503,9 +504,8 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             bucket,
             incarnation,
         } => {
-            match crate::blob::trail::drop_trail(context, group_id, bucket.as_deref(), incarnation)
-                .await
-            {
+            let drop = DropTrailOperation::new(group_id, bucket.as_deref(), incarnation);
+            match drive(drop, context).await {
                 Ok(()) => RowOutcome::Done,
                 Err(error) => {
                     warn!(%error, "Delete trail of a removed bucket could not be dropped");
