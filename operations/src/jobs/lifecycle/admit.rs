@@ -25,10 +25,14 @@ use tracing::{debug, warn};
 
 use super::ids::workspace_of;
 use super::{LifecycleError, stored_view};
-use crate::jobs::records::keys::{alias_key, family_prefix, record_key, submission_prefix};
-use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
 use crate::jobs::records::verify::{Evidence, FamilyView};
 use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
+use aruna_core::structs::execution::job::record_keys::{
+    alias_key, family_prefix, record_key, submission_prefix,
+};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
+};
 
 /// The alias this node would mint, with the records it already signed for it.
 #[derive(Debug, Clone, PartialEq, Eq)]

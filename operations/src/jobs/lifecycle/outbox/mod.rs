@@ -25,8 +25,8 @@ use smallvec::smallvec;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use crate::jobs::records::keys::record_key;
-use crate::jobs::records::rows::{OutboxEntry, from_bytes, to_bytes};
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::{OutboxEntry, from_bytes, to_bytes};
 
 /// Records one drain pass delivers before it re-arms.
 pub const OUTBOX_DRAIN_BATCH: usize = 32;

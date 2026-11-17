@@ -26,10 +26,14 @@ use super::admit::{
     Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_append,
     relayable,
 };
-use super::keys::{alias_key, conflict_key, family_prefix, kind_prefix, record_key};
-use super::rows::{OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes};
 use super::verify::{EvidencePlan, FamilyView};
 use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
+use aruna_core::structs::execution::job::record_keys::{
+    alias_key, conflict_key, family_prefix, kind_prefix, record_key,
+};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes,
+};
 
 /// The rows a batch read found, dropping the keys that hold nothing.
 fn stored_rows(values: Vec<(Key, Option<Value>)>) -> impl Iterator<Item = (Key, Value)> {
@@ -445,7 +449,9 @@ impl AppendRecordOperation {
             digest,
             deferred: matches!(
                 admission,
-                Admission::Pending(super::rows::PendingNeed::LocalView)
+                Admission::Pending(
+                    aruna_core::structs::execution::job::record_rows::PendingNeed::LocalView
+                )
             ),
             admission,
             admitted,

@@ -19,10 +19,10 @@ use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::keys::{alias_key, record_key};
-use crate::jobs::records::rows::to_bytes;
 use crate::tests::records::Family;
 use aruna_core::structs::execution::job::JobRecordKind;
+use aruna_core::structs::execution::job::record_keys::{alias_key, record_key};
+use aruna_core::structs::execution::job::record_rows::to_bytes;
 
 fn fixture() -> Family {
     Family::new([5u8; 32])

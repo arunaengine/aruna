@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::errors::ConversionError;
-use aruna_core::structs::execution::job::{JobProjection, JobRecordEnvelope, JobRecordKind};
+use super::{JobProjection, JobRecordEnvelope, JobRecordKind};
+use crate::NodeId;
+use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};
 
 /// What a pending record is still waiting for. A pending record is never

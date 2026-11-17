@@ -140,12 +140,12 @@ impl EmptyCheck {
                     }
                     FAMILY_RECORD_KEYSPACE => {
                         let envelope: JobRecordEnvelope =
-                            crate::jobs::records::rows::from_bytes(&value)?;
+                            aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
                         matches!(envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
                     }
                     FAMILY_PENDING_KEYSPACE => {
-                        let pending: crate::jobs::records::rows::PendingRecord =
-                            crate::jobs::records::rows::from_bytes(&value)?;
+                        let pending: aruna_core::structs::execution::job::record_rows::PendingRecord =
+                            aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
                         matches!(pending.envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
                     }
                     S3_BUCKET_KEYSPACE => BucketInfo::from_bytes(&value)?.group_id == self.group_id,

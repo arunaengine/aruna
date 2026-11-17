@@ -15,9 +15,9 @@ use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use super::keys::{family_prefix, kind_prefix};
-use super::rows::from_bytes;
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE};
+use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 
 /// Why one family could not be read completely. Every variant leaves the caller
 /// undecided; none of them means the family is empty.

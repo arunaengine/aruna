@@ -17,10 +17,10 @@ use aruna_core::types::{Effects, Key, Value};
 use super::DrainOutboxOperation;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::outbox::OUTBOX_DRAIN_BATCH;
-use crate::jobs::records::keys::record_key;
-use crate::jobs::records::rows::{OutboxEntry, to_bytes};
 use crate::realm::get_config::GetConfigOperation;
 use crate::tests::records::{Family, REALM, actor, node};
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
 
 fn config_read() -> Effects {
     GetConfigOperation::new(REALM).start()

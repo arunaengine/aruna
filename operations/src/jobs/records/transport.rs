@@ -26,13 +26,13 @@ use super::admit::Admission;
 use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use super::family::LoadFamilyOperation;
-use super::rows::PendingNeed;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
 use crate::node::dashboard::notify_dashboard_change;
 use crate::placement::holds_placement;
+use aruna_core::structs::execution::job::record_rows::PendingNeed;
 
 /// Publishes one record to the family holders, or reads a bounded page back.
 pub async fn dispatch_record(context: &DriverContext, effect: JobRecordEffect) -> JobRecordEvent {

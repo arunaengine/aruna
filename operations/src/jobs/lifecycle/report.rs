@@ -24,10 +24,10 @@ use super::witness::{WitnessExplain, has_deadline};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::keys::submission_prefix;
-use crate::jobs::records::rows::from_bytes;
 use crate::jobs::route::JobRouteError;
 use crate::jobs::store::query::iter_prefix_page;
+use aruna_core::structs::execution::job::record_keys::submission_prefix;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 
 /// Sibling families of one submission a conflict count may scan.
 const MAX_SIBLING_SCAN: usize = 256;

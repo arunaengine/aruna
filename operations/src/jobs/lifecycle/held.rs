@@ -12,8 +12,8 @@ use smallvec::smallvec;
 
 use super::LifecycleError;
 use super::reservation::MAX_RESERVATION_SCAN;
-use crate::jobs::records::rows::from_bytes;
 use aruna_core::compute::quota::JobReservationRecord;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 
 /// Reads every held reservation, or only the one of `job_id`, oldest key first.
 #[derive(Debug, PartialEq)]

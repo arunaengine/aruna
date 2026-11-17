@@ -42,10 +42,8 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
-use crate::jobs::records::keys::{family_prefix, kind_prefix};
 use crate::jobs::records::pages::{load_chain, page_request};
 use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
-use crate::jobs::records::rows::ProjectionCache;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::{mint_local_job, validate_execution};
 use crate::jobs::source_read::{SourceReadError, authorize_read, issue_grant, public_read};
@@ -58,6 +56,8 @@ use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_des
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_core::jobs::{InputResolveRequest, SubmissionAck, SubmissionRefusal};
+use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
+use aruna_core::structs::execution::job::record_rows::ProjectionCache;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
@@ -1805,7 +1805,7 @@ mod tests {
         state: LogicalJobState,
     ) {
         let cache = ProjectionCache {
-            version: crate::jobs::records::rows::PROJECTION_CACHE_VERSION,
+            version: aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION,
             revision: 1,
             stale: false,
             projection: Some(aruna_core::structs::execution::job::JobProjection {

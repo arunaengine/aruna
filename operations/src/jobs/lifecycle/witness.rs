@@ -36,10 +36,10 @@ use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::store::query::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
+use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";

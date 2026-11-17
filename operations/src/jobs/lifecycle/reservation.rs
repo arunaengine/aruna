@@ -26,10 +26,12 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::{LifecycleError, stored_view};
-use crate::jobs::records::keys::{family_prefix, record_key};
-use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
 use crate::jobs::records::verify::{Evidence, FamilyView};
 use aruna_core::structs::execution::job::job_insert_entries;
+use aruna_core::structs::execution::job::record_keys::{family_prefix, record_key};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
+};
 
 /// Reservations one capacity decision reads. A node cannot run more concurrent
 /// executions than this without its backend ceiling stopping it first.

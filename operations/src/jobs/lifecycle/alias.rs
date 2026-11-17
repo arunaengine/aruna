@@ -10,8 +10,10 @@ use aruna_core::structs::execution::job::{JobFamilyId, JobId};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 
-use crate::jobs::records::keys::{MAX_ALIAS_FAMILIES, alias_family, alias_prefix};
 use crate::jobs::route::JobRouteError;
+use aruna_core::structs::execution::job::record_keys::{
+    MAX_ALIAS_FAMILIES, alias_family, alias_prefix,
+};
 
 /// The family of one alias, ordered by key, so two families claiming one alias
 /// resolve identically on every replica. `None` names no family here.
@@ -100,8 +102,10 @@ mod state_machine_tests {
     use aruna_core::types::{Key, Value};
 
     use super::AliasFamilyOperation;
-    use crate::jobs::records::keys::{MAX_ALIAS_FAMILIES, alias_key, alias_prefix};
     use crate::jobs::route::JobRouteError;
+    use aruna_core::structs::execution::job::record_keys::{
+        MAX_ALIAS_FAMILIES, alias_key, alias_prefix,
+    };
 
     fn job() -> JobId {
         JobId::from_bytes([4u8; 16])

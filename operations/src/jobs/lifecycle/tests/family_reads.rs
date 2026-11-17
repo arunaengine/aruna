@@ -14,8 +14,8 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
-use crate::jobs::records::keys::record_key;
 use crate::tests::records::{Family, REALM, context};
+use aruna_core::structs::execution::job::record_keys::record_key;
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {

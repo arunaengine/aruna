@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::effects::{FetchCursor, FrameBoundsError};
-use aruna_core::structs::execution::job::{
+use super::{
     JobFamilyId, JobId, JobRecordError, JobRecordKey, JobRecordKind, RECORD_KEY_BYTES, SubmissionId,
 };
-use aruna_core::types::Key;
+use crate::NodeId;
+use crate::effects::{FetchCursor, FrameBoundsError};
+use crate::types::Key;
 
 /// Encoded width of a conflict row key: record key plus the rejected digest.
 pub const CONFLICT_KEY_BYTES: usize = RECORD_KEY_BYTES + 32;

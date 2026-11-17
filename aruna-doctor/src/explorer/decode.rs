@@ -21,6 +21,10 @@ use aruna_core::keyspaces::{
     UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::structs::execution::job::record_keys::alias_family;
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, OutboxEntry, PendingNeed, PendingRecord, ProjectionCache,
+};
 use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -42,10 +46,6 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
-use aruna_operations::jobs::records::keys::alias_family;
-use aruna_operations::jobs::records::rows::{
-    ConflictRecord, OutboxEntry, PendingNeed, PendingRecord, ProjectionCache,
-};
 use aruna_operations::placement::policy::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
@@ -979,6 +979,11 @@ mod tests {
         UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
+    use aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION;
+    use aruna_core::structs::execution::job::record_rows::{
+        ConflictRecord, PendingNeed, PendingRecord,
+    };
+    use aruna_core::structs::execution::job::record_rows::{OutboxEntry, ProjectionCache};
     use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -1004,9 +1009,6 @@ mod tests {
     };
     use aruna_net::dht::storage::StoredEntry;
     use aruna_operations::jobs::lifecycle::witness::{WitnessDeadline, WitnessExplain};
-    use aruna_operations::jobs::records::rows::PROJECTION_CACHE_VERSION;
-    use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
-    use aruna_operations::jobs::records::rows::{OutboxEntry, ProjectionCache};
     use aruna_operations::placement::policy::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{

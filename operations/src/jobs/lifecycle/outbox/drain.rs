@@ -18,9 +18,9 @@ use tracing::warn;
 
 use super::{OUTBOX_DRAIN_BATCH, PublishRecordConfig, PublishRecordOperation};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::records::rows::from_bytes;
 use crate::placement::resolve_shard_holders;
 use crate::realm::get_config::GetConfigOperation;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 
 const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 

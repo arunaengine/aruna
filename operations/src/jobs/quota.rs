@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
-use crate::jobs::records::rows::from_bytes;
 use crate::node::node_info::group_demand;
 use aruna_core::NodeId;
 use aruna_core::compute::quota::{
@@ -13,6 +12,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ADMISSION_QUOTA_KEYSPACE;
 use aruna_core::structs::execution::job::EffectiveResources;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, Key};
 use tracing::{info, warn};

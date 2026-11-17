@@ -13,15 +13,17 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::types::{Key, TxnId, Value};
 
-use crate::jobs::records::keys::record_key;
 use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::records::rows::{PROJECTION_CACHE_VERSION, ProjectionCache, to_bytes};
 use crate::jobs::records::{MAX_PROJECTION_RECORDS, RecordStoreError};
 use crate::tests::records::{Family, payload, user};
 use aruna_core::structs::execution::job::JobWrites;
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::{
+    PROJECTION_CACHE_VERSION, ProjectionCache, to_bytes,
+};
 
 /// What one sans-I/O run of the projection did, with no storage behind it.
 struct Run {

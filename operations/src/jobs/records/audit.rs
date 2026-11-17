@@ -12,9 +12,11 @@ use aruna_core::structs::execution::job::{
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 
-use super::keys::{cursor_key, cursor_of, family_prefix, record_key, submission_prefix};
-use super::rows::{ConflictRecord, from_bytes};
 use super::{MAX_CONFLICT_ROWS, RecordStoreError};
+use aruna_core::structs::execution::job::record_keys::{
+    cursor_key, cursor_of, family_prefix, record_key, submission_prefix,
+};
+use aruna_core::structs::execution::job::record_rows::{ConflictRecord, from_bytes};
 
 /// Records of which scope one audit pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
