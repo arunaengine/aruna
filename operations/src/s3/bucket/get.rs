@@ -96,14 +96,16 @@ impl Operation for GetBucketOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.emit_error(error.clone().into());
-        }
-        match self.state {
-            GetBucketState::Init => self.handle_init(),
-            GetBucketState::ReadBucket => self.handle_bucket_read(event),
-            GetBucketState::Finish => smallvec![],
-            GetBucketState::Error => self.abort(),
+        match (&self.state, event) {
+            (GetBucketState::ReadBucket, Event::Storage(StorageEvent::Error { error })) => {
+                self.emit_error(error.into())
+            }
+            (GetBucketState::ReadBucket, event) => self.handle_bucket_read(event),
+            (_, event) => self.emit_error(GetBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "no event",
+                received: event,
+            }),
         }
     }
 
