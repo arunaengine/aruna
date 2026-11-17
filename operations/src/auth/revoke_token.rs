@@ -345,7 +345,7 @@ impl RevokeTokenOperation {
             return Err(RevokeTokenError::UnexpectedEvent {
                 state: format!("{:?}", self.state),
                 expected: "one outbox value for every revocation index key",
-                got: format!("{} values for {} keys", values.len(), index_keys.len()),
+                got: "a different number of outbox values",
             });
         }
 
@@ -656,7 +656,7 @@ impl Operation for RevokeTokenOperation {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self.emit_read_result(document_value.clone(), reducer_state_value.clone())

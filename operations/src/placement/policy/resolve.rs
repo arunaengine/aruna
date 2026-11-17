@@ -158,7 +158,7 @@ impl ResolvePolicyOperation {
             Err(error) => return self.fail(error.into()),
         };
         let Some(authentic) = self.cached.take() else {
-            return self.unexpected_event("cached policy", String::new());
+            return self.unexpected_event("cached policy", "nothing");
         };
         if let Err(error) =
             verify_policy_authority(&authentic.document, &config, &auth, group_auth.as_ref())
@@ -323,7 +323,7 @@ impl Operation for ResolvePolicyOperation {
                     return effects;
                 }
                 let Some(reader) = self.reader.take() else {
-                    return self.unexpected_event("active policy read", String::new());
+                    return self.unexpected_event("active policy read", "nothing");
                 };
                 self.after_read(reader.finalize())
             }

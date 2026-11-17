@@ -536,7 +536,7 @@ impl Operation for EnsureConfigOperation {
                     else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     let membership = match MembershipFence::from_value(membership.as_deref()) {

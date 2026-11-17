@@ -194,7 +194,7 @@ impl Operation for RecoverInitialOperation {
                     return self.fail(RecoverInitialError::UnexpectedEvent {
                         state: format!("{:?}", self.state),
                         expected: "one state per onboarding secret",
-                        got: format!("{values:?}"),
+                        got: "a different number of states",
                     });
                 }
 

@@ -394,8 +394,10 @@ impl Operation for ReadPolicyOperation {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, policy_value), (_, config_value), (_, auth_value)] = values.as_slice()
                     else {
-                        return self
-                            .unexpected_event("policy row and realm view", format!("{values:?}"));
+                        return self.unexpected_event(
+                            "policy row and realm view",
+                            "a batch read with other rows",
+                        );
                     };
                     if let Err(error) = self.store_realm(config_value.clone(), auth_value.clone()) {
                         return self.finish(Err(error));

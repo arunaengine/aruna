@@ -278,7 +278,7 @@ impl SetAdminOperation {
         self.fail(SetAdminError::UnexpectedEvent {
             state,
             expected,
-            got: format!("{got:?}"),
+            got: got.label(),
         })
     }
 }

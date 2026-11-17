@@ -440,7 +440,7 @@ impl Operation for SetFederationOperation {
                     let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
                         return self.unexpected_event(
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self

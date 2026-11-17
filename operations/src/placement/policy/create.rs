@@ -377,7 +377,7 @@ impl Operation for CreatePolicyOperation {
                     else {
                         return self.unexpected_event(
                             "realm config and policy row",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match (self.config.policy.owner_group_id, tail) {
@@ -392,8 +392,10 @@ impl Operation for CreatePolicyOperation {
                         }
                         (None, []) => {}
                         _ => {
-                            return self
-                                .unexpected_event("group deletion fence", format!("{values:?}"));
+                            return self.unexpected_event(
+                                "group deletion fence",
+                                "a batch read with other rows",
+                            );
                         }
                     }
                     match self.plan_write(config_value.clone(), policy_value.clone()) {

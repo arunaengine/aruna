@@ -385,7 +385,7 @@ impl Operation for SetGroupOperation {
                     else {
                         return self.unexpected_event(
                             "storage batch read result with group auth doc, admin state, and realm config",
-                            format!("{values:?}"),
+                            "a batch read with other rows",
                         );
                     };
                     match self.emit_write_state(

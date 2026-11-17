@@ -79,7 +79,7 @@ impl SubjectCheckOperation {
         self.fail(SubjectCheckError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{got:?}"),
+            got: got.label(),
         })
     }
 
