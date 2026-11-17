@@ -328,3 +328,294 @@ impl Operation for RefreshUsageOperation {
     }
 }
 
+#[cfg(test)]
+mod state_machine_tests {
+    use std::time::SystemTime;
+
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys, usage_summary_key};
+    use aruna_core::task::{TaskEvent, TaskKey};
+    use aruna_core::types::Value;
+
+    use super::*;
+
+    const REALM: RealmId = RealmId([4; 32]);
+    const GROUP: GroupId = Ulid::from_parts(6, 6);
+    const GENERATION: Ulid = Ulid::from_parts(1, 1);
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn bucket(group_id: GroupId, distributed: bool) -> Value {
+        let info = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: Default::default(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: distributed.then(|| DistributionBinding {
+                set_id: Ulid::from_parts(8, 8),
+                member_id: Ulid::from_parts(9, 9),
+                incarnation: 1,
+                revision: Default::default(),
+            }),
+        };
+        Value::from(info.to_bytes().unwrap())
+    }
+
+    fn page(values: Vec<(Key, Value)>, next: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: next,
+        })
+    }
+
+    fn failed() -> Event {
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        })
+    }
+
+    fn config_changed() -> RefreshUsageOperation {
+        let target = DocumentTarget::RealmConfig { realm_id: REALM };
+        RefreshUsageOperation::new(node(1), None, &[target], GENERATION)
+    }
+
+    fn summary_key(group_id: GroupId) -> Key {
+        Key::from(usage_summary_key(group_id))
+    }
+
+    fn global_read() -> Effect {
+        Effect::Storage(StorageEffect::BatchRead {
+            reads: global_shard_keys()
+                .into_iter()
+                .map(|key| (aruna_core::keyspaces::USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
+                .collect(),
+            txn_id: None,
+        })
+    }
+
+    #[test]
+    fn config_change_marks_groups() {
+        let mut operation = config_changed();
+        let summary = summary_key(GROUP);
+        let deletes = vec![
+            (NODE_STATS_KEYSPACE.to_string(), Key::from(SUMMARY_GLOBAL_KEY.to_vec())),
+            (NODE_STATS_KEYSPACE.to_string(), summary.clone()),
+        ];
+        let buckets = vec![
+            (Key::from(b"plain".to_vec()), bucket(Ulid::from_parts(7, 7), false)),
+            (Key::from(b"spire".to_vec()), bucket(GROUP, true)),
+        ];
+        check_trace(
+            &mut operation,
+            &RefreshUsageOperation::summary_page(None),
+            vec![
+                (
+                    page(vec![(summary.clone(), Value::from(vec![1]))], Some(summary.clone())),
+                    RefreshUsageOperation::summary_page(Some(summary)).to_vec(),
+                ),
+                (
+                    page(Vec::new(), None),
+                    vec![Effect::Storage(StorageEffect::BatchDelete {
+                        deletes,
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchDeleteResult {
+                        entries: Vec::new(),
+                    }),
+                    RefreshUsageOperation::bucket_page(None).to_vec(),
+                ),
+                (
+                    page(buckets, None),
+                    vec![Effect::Storage(StorageEffect::BatchWrite {
+                        writes: dirty_rows([GROUP], GENERATION),
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchWriteResult {
+                        entries: Vec::new(),
+                    }),
+                    vec![schedule_snapshot_publish()],
+                ),
+                (
+                    Event::Task(TaskEvent::TimerScheduled {
+                        key: TaskKey::PublishUsageSnapshots,
+                        after: std::time::Duration::from_secs(2),
+                    }),
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn usage_targets_sum() {
+        let target = DocumentTarget::NodeUsage {
+            realm_id: REALM,
+            node_id: node(2),
+            group_id: None,
+        };
+        let mut operation = RefreshUsageOperation::new(node(1), None, &[target], GENERATION);
+        let total = UsageCounters::default().to_bytes().unwrap();
+        check_trace(
+            &mut operation,
+            &[global_read()],
+            vec![
+                (
+                    Event::Storage(StorageEvent::BatchReadResult { values: Vec::new() }),
+                    vec![Effect::Storage(StorageEffect::Iter {
+                        key_space: NODE_STATS_KEYSPACE.to_string(),
+                        prefix: Some(Key::from(
+                            aruna_core::structs::storage::usage::USAGE_GLOBAL_PREFIX.to_vec(),
+                        )),
+                        start: None,
+                        limit: 1_000,
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    page(Vec::new(), None),
+                    vec![Effect::Storage(StorageEffect::BatchWrite {
+                        writes: vec![(
+                            NODE_STATS_KEYSPACE.to_string(),
+                            Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
+                            Value::from(total),
+                        )],
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchWriteResult {
+                        entries: Vec::new(),
+                    }),
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(()));
+
+        // Targets that touch no usage scope and no config refresh nothing.
+        let other = DocumentTarget::NodeInfo {
+            realm_id: REALM,
+            node_id: node(2),
+        };
+        let mut idle = RefreshUsageOperation::new(node(1), None, &[other], GENERATION);
+        check_trace(&mut idle, &[], vec![]);
+        assert_eq!(idle.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn failed_steps_continue() {
+        // A failed summary scan skips to the bucket scan, a failed bucket scan to the end.
+        let mut operation = config_changed();
+        operation.start();
+        assert_eq!(
+            operation.step(failed()).to_vec(),
+            RefreshUsageOperation::bucket_page(None).to_vec()
+        );
+        assert!(operation.step(failed()).is_empty());
+        assert_eq!(operation.finalize(), Ok(()));
+
+        // A failed delete still scans the buckets; a failed marker write ends the refresh.
+        let mut operation = config_changed();
+        operation.start();
+        operation.step(page(Vec::new(), None));
+        assert_eq!(
+            operation.step(failed()).to_vec(),
+            RefreshUsageOperation::bucket_page(None).to_vec()
+        );
+        operation.step(page(vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))], None));
+        assert!(operation.step(failed()).is_empty());
+        assert_eq!(operation.finalize(), Ok(()));
+
+        // An unreadable bucket row and a refused timer end the marking, not the refresh.
+        let mut operation = config_changed();
+        operation.start();
+        operation.step(page(Vec::new(), None));
+        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        let garbled = (Key::from(b"bad".to_vec()), Value::from(vec![0xff; 3]));
+        assert!(operation.step(page(vec![garbled], None)).is_empty());
+        assert_eq!(operation.finalize(), Ok(()));
+        let mut operation = config_changed();
+        operation.start();
+        operation.step(page(Vec::new(), None));
+        operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }));
+        operation.step(page(vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))], None));
+        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        let refused = Event::Task(TaskEvent::Error {
+            key: Some(TaskKey::PublishUsageSnapshots),
+            message: "no task handle".to_string(),
+        });
+        assert!(operation.step(refused).is_empty());
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_stray_events() {
+        let started = || {
+            let mut operation = config_changed();
+            operation.start();
+            operation
+        };
+        let scan = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (label, effects, error) in rejects_events(started, sample_events, scan) {
+            assert!(effects.is_empty(), "{label} emitted effects");
+            assert!(matches!(error, RefreshUsageError::UnexpectedEvent(_)), "{label}");
+        }
+        let waking = || {
+            let mut operation = started();
+            operation.step(page(Vec::new(), None));
+            operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+                entries: Vec::new(),
+            }));
+            operation.step(page(vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))], None));
+            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            }));
+            operation
+        };
+        let task = |event: &Event| matches!(event, Event::Task(_));
+        for (label, effects, error) in rejects_events(waking, sample_events, task) {
+            assert!(effects.is_empty(), "{label} emitted effects");
+            assert!(matches!(error, RefreshUsageError::UnexpectedEvent(_)), "{label}");
+        }
+        let fresh = || config_changed();
+        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), sample_events().len());
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        let mut operation = config_changed();
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+        operation.step(page(Vec::new(), None));
+        check_abort(&mut operation, &[]);
+        rejects_finalize(operation);
+    }
+}
