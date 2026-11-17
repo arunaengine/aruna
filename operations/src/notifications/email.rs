@@ -28,7 +28,7 @@ use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::notifications::opt_in::{EmailError, EmailOptIn, SetEmailOperation};
 use crate::notifications::send::{SendError, SendOperation};
 use crate::notifications::setting_rows::{
-    ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
+    ReadSettingOperation, SettingValue, SettingWrite, WriteSettingOperation,
 };
 use crate::notifications::settings::{
     BACKOFF_START_MS, Delivery, MetadataPeers, SettingPeers, SettingWinner, delivery_setting,

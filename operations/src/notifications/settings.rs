@@ -13,7 +13,6 @@ use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_outbound::Backoffs;
-use thiserror::Error;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
