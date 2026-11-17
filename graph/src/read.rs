@@ -16,6 +16,7 @@ use craqle::{
     SearchRequest,
 };
 use oxrdf::{NamedNode, Term};
+use tokio::sync::Semaphore;
 use tracing::{Span, warn};
 
 use crate::GraphHandle;
@@ -38,23 +39,21 @@ pub enum ReadScope {
 pub type Properties = Vec<(String, Term)>;
 
 impl ReadScope {
-    fn authorizer(&self) -> ScopeAuthorizer<'_> {
+    fn authorizer(&self) -> ScopeAuthorizer {
         match self {
-            Self::Graphs(graphs) => {
-                ScopeAuthorizer::Graphs(graphs.iter().map(String::as_str).collect())
-            }
-            Self::Visible(visible) => ScopeAuthorizer::Visible(visible.as_ref()),
+            Self::Graphs(graphs) => ScopeAuthorizer::Graphs(graphs.iter().cloned().collect()),
+            Self::Visible(visible) => ScopeAuthorizer::Visible(visible.clone()),
         }
     }
 }
 
 // Craqle's stored policy is ignored on purpose: the caller's scope is authoritative.
-enum ScopeAuthorizer<'a> {
-    Graphs(HashSet<&'a str>),
-    Visible(&'a (dyn Fn(&str) -> bool + Send + Sync)),
+enum ScopeAuthorizer {
+    Graphs(HashSet<String>),
+    Visible(Arc<dyn Fn(&str) -> bool + Send + Sync>),
 }
 
-impl CraqleAuthorizer for ScopeAuthorizer<'_> {
+impl CraqleAuthorizer for ScopeAuthorizer {
     fn authorize(
         &self,
         graph: &GraphId,
@@ -180,45 +179,12 @@ impl GraphHandle {
         targets: Vec<(String, String)>,
         span: &Span,
     ) -> Vec<Properties> {
-        if targets.is_empty() {
-            return Vec::new();
-        }
-        let chunk_size = targets.len().div_ceil(ENRICH_TASKS);
-        let tasks = targets
-            .chunks(chunk_size)
-            .map(<[(String, String)]>::to_vec)
-            .map(|chunk| {
-                let permits = self.inner.read_permits.clone();
-                let inner = self.inner.clone();
-                let scope = scope.clone();
-                let span = span.clone();
-                async move {
-                    let chunk_len = chunk.len();
-                    let _permit = permits.acquire_owned().await.ok();
-                    tokio::task::spawn_blocking(move || {
-                        let authorizer = scope.authorizer();
-                        span.in_scope(|| {
-                            chunk
-                                .iter()
-                                .map(|(graph_iri, subject_iri)| {
-                                    describe_subject(&inner.node, &authorizer, graph_iri, subject_iri)
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        warn!(%error, "metadata search enrichment task failed");
-                        vec![Vec::new(); chunk_len]
-                    })
-                }
-            })
-            .collect::<Vec<_>>();
-        futures_util::future::join_all(tasks)
-            .await
-            .into_iter()
-            .flatten()
-            .collect()
+        let inner = self.inner.clone();
+        let authorizer = scope.authorizer();
+        let describe: Describe = Arc::new(move |graph_iri, subject_iri| {
+            describe_subject(&inner.node, &authorizer, graph_iri, subject_iri)
+        });
+        describe_parallel(&self.inner.read_permits, targets, describe, span).await
     }
 
     /// Properties of a document's root subject (its graph IRI); empty on any backend
@@ -247,6 +213,54 @@ impl GraphHandle {
         .await
         .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
     }
+}
+
+/// Describes one `(graph_iri, subject_iri)`.
+type Describe = Arc<dyn Fn(&str, &str) -> Properties + Send + Sync>;
+
+/// Runs `describe` over `targets` in contiguous chunks, one blocking task each, and
+/// concatenates the chunks in order, so results never depend on completion order.
+async fn describe_parallel(
+    read_permits: &Arc<Semaphore>,
+    targets: Vec<(String, String)>,
+    describe: Describe,
+    span: &Span,
+) -> Vec<Properties> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let chunk_size = targets.len().div_ceil(ENRICH_TASKS);
+    let tasks = targets
+        .chunks(chunk_size)
+        .map(<[(String, String)]>::to_vec)
+        .map(|chunk| {
+            let permits = read_permits.clone();
+            let describe = describe.clone();
+            let span = span.clone();
+            async move {
+                let chunk_len = chunk.len();
+                let _permit = permits.acquire_owned().await.ok();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(|| {
+                        chunk
+                            .iter()
+                            .map(|(graph_iri, subject_iri)| describe(graph_iri, subject_iri))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    warn!(%error, "metadata search enrichment task failed");
+                    vec![Vec::new(); chunk_len]
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    futures_util::future::join_all(tasks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn search_scope(
@@ -423,4 +437,76 @@ fn names_aruna_data(value: &str) -> bool {
                 .unwrap_or_default(),
         )
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxrdf::Literal;
+    use std::sync::Mutex;
+
+    #[test]
+    fn scope_refuses_writes() {
+        let scope = ReadScope::Graphs(vec!["urn:graph".to_string()]);
+        let policy = GraphPolicy {
+            public: true,
+            permission_paths: Vec::new(),
+        };
+        let graph = GraphId::new("urn:graph");
+        let authorizer = scope.authorizer();
+        assert!(authorizer.authorize(&graph, &policy, CraqleAction::Read).is_ok());
+        assert!(authorizer.authorize(&graph, &policy, CraqleAction::Write).is_err());
+        let other = GraphId::new("urn:other");
+        assert!(authorizer.authorize(&other, &policy, CraqleAction::Read).is_err());
+    }
+
+    #[tokio::test]
+    async fn enrichment_keeps_order() {
+        // The gate forces the describes to complete in exactly reverse order;
+        // the properties must still line up with the targets that asked for them.
+        let count = ENRICH_TASKS;
+        let gate = Arc::new((Mutex::new(count - 1), std::sync::Condvar::new()));
+        let describe_gate = gate.clone();
+        let describe: Describe = Arc::new(move |_graph_iri, subject_iri: &str| {
+            let index = subject_iri
+                .rsplit('/')
+                .next()
+                .and_then(|tail| tail.parse::<usize>().ok())
+                .expect("indexed subject");
+            let (turn, ready) = &*describe_gate;
+            let mut turn = turn.lock().expect("gate lock");
+            // Bounded so a lost wakeup fails the assertion instead of hanging.
+            while *turn != index {
+                let (guard, wait) = ready
+                    .wait_timeout(turn, Duration::from_secs(30))
+                    .expect("gate lock");
+                turn = guard;
+                if wait.timed_out() {
+                    break;
+                }
+            }
+            *turn = index.wrapping_sub(1);
+            ready.notify_all();
+            vec![(
+                "urn:test:index".to_string(),
+                Term::Literal(Literal::new_simple_literal(index.to_string())),
+            )]
+        });
+
+        let targets = (0..count)
+            .map(|index| ("urn:graph".to_string(), format!("urn:subject/{index}")))
+            .collect::<Vec<_>>();
+        let permits = Arc::new(tokio::sync::Semaphore::new(count));
+        let properties = describe_parallel(&permits, targets, describe, &Span::none()).await;
+
+        let expected = (0..count)
+            .map(|index| {
+                vec![(
+                    "urn:test:index".to_string(),
+                    Term::Literal(Literal::new_simple_literal(index.to_string())),
+                )]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(properties, expected);
+    }
 }

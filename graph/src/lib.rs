@@ -228,11 +228,13 @@ impl GraphHandle {
             .await
     }
 
-    /// Binds one graph to its document sync topic.
-    pub async fn bind_topic(&self, graph_iri: String) -> Result<(), MetadataError> {
+    /// Binds one graph to its document sync topic, when the sync store knows one.
+    pub async fn bind_topic(
+        &self,
+        graph_iri: String,
+    ) -> Result<Option<irokle::TopicId>, MetadataError> {
         self.blocking(move |node| node.bind_irokle_topic(&GraphId::new(&graph_iri)))
             .await
-            .map(|_| ())
     }
 
     /// Creates the document sync topic of one graph with `members`.
@@ -337,5 +339,108 @@ impl GraphHandle {
             .await
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
             .map_err(error_from_craqle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use craqle::CraqleFjallPersistMode;
+
+    fn node_id(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn memory_options() -> GraphOptions {
+        GraphOptions::default().with_search_storage(MetadataSearchStorage::Memory)
+    }
+
+    #[test]
+    fn maps_violations() {
+        let error = error_from_craqle(CraqleError::Update(craqle::UpdateError::ValidationFailed(
+            vec![craqle::CrateViolation {
+                code: "missing_root_data_entity",
+                message: "missing root".to_string(),
+                pointer: "/@graph".to_string(),
+                entity_id: Some("./".to_string()),
+            }],
+        )));
+
+        let MetadataError::Validation(violations) = error else {
+            panic!("expected structured metadata validation error");
+        };
+        assert_eq!(violations[0].code, "missing_root_data_entity");
+        assert_eq!(violations[0].pointer, "/@graph");
+        assert_eq!(violations[0].entity_id.as_deref(), Some("./"));
+    }
+
+    #[test]
+    fn maps_io_failures() {
+        // Infrastructure must stay distinguishable from a rejected payload: the
+        // materialization queue retries the former forever and parks the latter.
+        let error = error_from_craqle(CraqleError::Io(std::io::Error::other("disk")));
+
+        assert!(matches!(error, MetadataError::Persist(_)));
+    }
+
+    #[test]
+    fn maps_cancelled_work() {
+        // Cancelled or budget-limited work clears on retry, so it must not be parked.
+        let error = error_from_craqle(CraqleError::QueryCancelled);
+
+        assert!(matches!(error, MetadataError::Persist(_)));
+    }
+
+    #[test]
+    fn options_default_buffered() {
+        let options = GraphOptions::default();
+
+        assert!(!options.sync_all);
+        assert_eq!(options.search_storage, MetadataSearchStorage::Disk);
+    }
+
+    #[tokio::test]
+    async fn flush_without_sync() {
+        let dir = tempfile::tempdir().expect("graph dir");
+        let graph = GraphHandle::open(dir.path(), node_id(1), None, None, memory_options())
+            .expect("graph store opens");
+
+        assert_eq!(
+            graph.inner.node.graph_store_persist_mode(),
+            CraqleFjallPersistMode::Buffer
+        );
+        graph
+            .flush_persistence()
+            .await
+            .expect("graph persistence flushes");
+    }
+
+    #[tokio::test]
+    async fn flush_with_sync() {
+        let dir = tempfile::tempdir().expect("graph dir");
+        let sync_dir = tempfile::tempdir().expect("document sync dir");
+        let sync_db = fjall::OptimisticTxDatabase::builder(
+            sync_dir.path().to_str().expect("document sync path"),
+        )
+        .manual_journal_persist(true)
+        .open()
+        .expect("document sync db opens");
+        let graph = GraphHandle::open(
+            dir.path(),
+            node_id(2),
+            None,
+            Some(sync_db),
+            memory_options().with_sync_all(true),
+        )
+        .expect("graph store opens");
+
+        assert_eq!(
+            graph.inner.node.graph_store_persist_mode(),
+            CraqleFjallPersistMode::SyncAll
+        );
+        graph
+            .flush_persistence()
+            .await
+            .expect("graph and document sync persistence flush");
     }
 }
