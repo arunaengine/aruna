@@ -48,6 +48,7 @@ use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::node::drain_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
+use crate::node::heartbeat::SendHeartbeatOperation;
 use crate::node::info_publish::PublishInfoOperation;
 use crate::node::info_write::{InfoChange, InfoWriteOperation};
 use crate::placement::{build_view, held_buckets};
@@ -416,7 +417,10 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
             .map(|change| change.current.generation)
             .unwrap_or_default()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("realm config revision read failed: {}", other.label())),
+        other => Err(format!(
+            "realm config revision read failed: {}",
+            other.label()
+        )),
     }
 }
 
@@ -461,7 +465,7 @@ pub(crate) async fn refresh_info_heartbeat(
     };
     revise_node_info(ctx, node_id, realm_id, change).await?;
     publish_info(ctx, node_id, realm_id, true).await?;
-    let (Some(net_handle), Some(stored)) = (
+    let (Some(_), Some(stored)) = (
         ctx.net_handle.as_ref(),
         node_info_row(&ctx.storage_handle, node_id).await?,
     ) else {
@@ -493,8 +497,9 @@ pub(crate) async fn refresh_info_heartbeat(
         demand: ComputeDemandSnapshot { epoch, ..demand },
         jobs,
     };
-    crate::node::heartbeat::send_heartbeat(net_handle, heartbeat).await;
-    Ok(())
+    drive(SendHeartbeatOperation::new(heartbeat), ctx)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Applies `change` to the stored node-info row in one write transaction, retried after a lost

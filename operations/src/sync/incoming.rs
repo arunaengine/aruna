@@ -21,6 +21,7 @@ use crate::metadata::projector::{
     PROJECTION_RETRY_AFTER, project_create_events, project_logged_events, schedule_projection_drain,
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
+use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
@@ -45,6 +46,7 @@ use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, Doc
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -1164,12 +1166,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     .await
                 }
                 Alpn::Heartbeat => {
-                    Box::pin(crate::node::heartbeat::handle_heartbeat_stream(
-                        self.context.as_ref(),
-                        stream,
-                        node_id,
-                    ))
-                    .await
+                    Box::pin(receive_heartbeat(self.context.as_ref(), stream, node_id)).await
                 }
                 Alpn::JobControl => {
                     Box::pin(async {
@@ -1376,6 +1373,57 @@ async fn run_sync_maintenance(
             "Metadata graph prune failed"
         ),
     }
+}
+
+/// Reads one bounded heartbeat frame of `peer` within the stream limits and keeps it through
+/// the heartbeat operation; every refusal is only logged.
+async fn receive_heartbeat(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return;
+    };
+    let Some(_slot) = net_handle.heartbeat_slot(peer) else {
+        debug!(%peer, "Dropping a heartbeat stream past the stream limits");
+        return;
+    };
+    let read = tokio::time::timeout(HEARTBEAT_IO_TIMEOUT, heartbeat_frame(&mut stream)).await;
+    let _ = stream.0.finish();
+    let frame = match read {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(error)) => {
+            debug!(%peer, %error, "Dropping an invalid heartbeat");
+            return;
+        }
+        Err(_) => {
+            debug!(%peer, "Heartbeat read timed out");
+            return;
+        }
+    };
+    let receive = ReceiveHeartbeatOperation::new(peer, *net_handle.realm_id(), frame);
+    if let Err(error) = drive(receive, context).await {
+        debug!(%peer, %error, "Heartbeat not kept");
+    }
+}
+
+/// One length-prefixed heartbeat frame, at most [`MAX_HEARTBEAT_BYTES`] long.
+async fn heartbeat_frame(stream: &mut BiStream) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut length = [0u8; 4];
+    stream
+        .1
+        .read_exact(&mut length)
+        .await
+        .map_err(|error| error.to_string())?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_HEARTBEAT_BYTES {
+        return Err("heartbeat frame exceeds the size limit".to_string());
+    }
+    let mut bytes = vec![0u8; length];
+    stream
+        .1
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
