@@ -2,9 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::convert::Infallible;
-
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::outbox_write_entry;
@@ -12,10 +11,21 @@ use aruna_core::structs::execution::notification::{NotificationOutboxRecord, Not
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
+use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::notifications::outbox_record::schedule_drain_effect;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum EmitNotificationsError {
+    #[error(transparent)]
+    Storage(StorageError),
+    #[error("unexpected event in state {state}: {got}")]
+    UnexpectedEvent { state: &'static str, got: String },
+    #[error("the notification emission did not finish")]
+    NotFinished,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EmitNotificationsInput {
@@ -26,9 +36,10 @@ pub struct EmitNotificationsInput {
 pub struct EmitNotificationsOperation {
     input: EmitNotificationsInput,
     state: EmitNotificationsState,
+    error: Option<EmitNotificationsError>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EmitNotificationsState {
     Init,
     StartTransaction,
@@ -38,16 +49,39 @@ pub enum EmitNotificationsState {
     Finish,
 }
 
+impl EmitNotificationsState {
+    fn name(&self) -> &'static str {
+        match self {
+            EmitNotificationsState::Init => "init",
+            EmitNotificationsState::StartTransaction => "start transaction",
+            EmitNotificationsState::WriteOutbox { .. } => "write outbox",
+            EmitNotificationsState::CommitTransaction { .. } => "commit transaction",
+            EmitNotificationsState::ScheduleDrain => "schedule drain",
+            EmitNotificationsState::Finish => "finish",
+        }
+    }
+}
+
 impl EmitNotificationsOperation {
     pub fn new(input: EmitNotificationsInput) -> Self {
         Self {
             input,
             state: EmitNotificationsState::Init,
+            error: None,
         }
     }
 
-    fn drop_emission(&mut self, event_desc: &str, txn_id: Option<TxnId>) -> Effects {
-        warn!(state = ?self.state, event = %event_desc, "Dropping notification emission");
+    /// Ends the emission with the failure `event` shows, aborting its open transaction.
+    fn drop_emission(&mut self, event: Event, txn_id: Option<TxnId>) -> Effects {
+        let error = match event {
+            Event::Storage(StorageEvent::Error { error }) => EmitNotificationsError::Storage(error),
+            other => EmitNotificationsError::UnexpectedEvent {
+                state: self.state.name(),
+                got: other.label().to_string(),
+            },
+        };
+        warn!(%error, "Dropping notification emission");
+        self.error.get_or_insert(error);
         self.state = EmitNotificationsState::Finish;
         match txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
@@ -56,9 +90,9 @@ impl EmitNotificationsOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.drop_emission(got, None);
+        let txn_id = match event {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => return self.drop_emission(other, None),
         };
 
         let mut writes: Vec<(KeySpace, Key, Value)> = Vec::with_capacity(self.input.records.len());
@@ -86,19 +120,20 @@ impl EmitNotificationsOperation {
     }
 
     fn handle_write_outbox(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.drop_emission(got, Some(txn_id));
-        };
+        if !matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
+            return self.drop_emission(event, Some(txn_id));
+        }
         self.state = EmitNotificationsState::CommitTransaction { txn_id };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
     fn handle_commit_transaction(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.drop_emission(got, Some(txn_id));
-        };
+        if !matches!(
+            event,
+            Event::Storage(StorageEvent::TransactionCommitted { .. })
+        ) {
+            return self.drop_emission(event, Some(txn_id));
+        }
         self.state = EmitNotificationsState::ScheduleDrain;
         smallvec![schedule_drain_effect()]
     }
@@ -114,7 +149,7 @@ impl EmitNotificationsOperation {
 
 impl Operation for EmitNotificationsOperation {
     type Output = ();
-    type Error = Infallible;
+    type Error = EmitNotificationsError;
 
     fn start(&mut self) -> Effects {
         if self.input.records.is_empty() {
@@ -128,7 +163,7 @@ impl Operation for EmitNotificationsOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match self.state {
             EmitNotificationsState::StartTransaction => self.handle_start_transaction(event),
             EmitNotificationsState::WriteOutbox { txn_id } => {
                 self.handle_write_outbox(event, txn_id)
@@ -137,7 +172,9 @@ impl Operation for EmitNotificationsOperation {
                 self.handle_commit_transaction(event, txn_id)
             }
             EmitNotificationsState::ScheduleDrain => self.handle_schedule_drain(event),
-            EmitNotificationsState::Init | EmitNotificationsState::Finish => smallvec![],
+            EmitNotificationsState::Init | EmitNotificationsState::Finish => {
+                self.drop_emission(event, None)
+            }
         }
     }
 
@@ -146,7 +183,11 @@ impl Operation for EmitNotificationsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        Ok(())
+        match (self.state, self.error) {
+            (_, Some(error)) => Err(error),
+            (EmitNotificationsState::Finish, None) => Ok(()),
+            _ => Err(EmitNotificationsError::NotFinished),
+        }
     }
 
     fn abort(&mut self) -> Effects {
@@ -160,12 +201,14 @@ impl Operation for EmitNotificationsOperation {
     }
 }
 
-pub fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Effect {
+pub(crate) fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         EmitNotificationsOperation::new(EmitNotificationsInput { records }),
         |result| match result {
             Ok(()) => Event::SubOperation(SubOperationEvent::NotificationsEmitted),
-            Err(never) => match never {},
+            Err(error) => Event::SubOperation(SubOperationEvent::NotificationsFailed {
+                reason: error.to_string(),
+            }),
         },
     ))
 }
@@ -175,7 +218,6 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context_with_storage, record, user};
-    use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
     use aruna_core::structs::execution::notification::{
         NotificationClass, notification_outbox_key,
@@ -184,6 +226,7 @@ mod tests {
     use aruna_storage::storage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
+    use std::convert::Infallible;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -282,7 +325,39 @@ mod tests {
         }));
         assert!(effects.is_empty());
         assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(
+            operation.finalize(),
+            Err(EmitNotificationsError::Storage(StorageError::WriteError(
+                "boom".to_string()
+            )))
+        );
+    }
+
+    // A storage failure must not reach the parent as a successful emission.
+    #[test]
+    fn storage_failure_reported() {
+        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
+            records: vec![make_record(1, 2)],
+        });
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError("boom".to_string()),
+        }));
+        assert!(operation.is_complete());
+        assert!(operation.finalize().is_err());
+
+        let Effect::SubOperation(mut emit) = emit_notifications_effect(vec![make_record(1, 2)])
+        else {
+            panic!("emit is a sub-operation");
+        };
+        emit.start();
+        emit.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError("boom".to_string()),
+        }));
+        assert_ne!(
+            emit.finalize(),
+            Event::SubOperation(SubOperationEvent::NotificationsEmitted)
+        );
     }
 
     #[test]
@@ -311,7 +386,12 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert!(effects.is_empty());
         assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(
+            operation.finalize(),
+            Err(EmitNotificationsError::Storage(StorageError::WriteError(
+                "boom".to_string()
+            )))
+        );
     }
 
     #[test]
@@ -340,11 +420,16 @@ mod tests {
             other => panic!("expected a single abort effect, got {other:?}"),
         }
         assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(
+            operation.finalize(),
+            Err(EmitNotificationsError::Storage(StorageError::WriteError(
+                "boom".to_string()
+            )))
+        );
     }
 
     #[test]
-    fn unexpected_event_swallowed() {
+    fn unexpected_event_fails() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
@@ -358,7 +443,10 @@ mod tests {
             [Effect::Storage(StorageEffect::AbortTransaction { .. })]
         ));
         assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(()));
+        assert!(matches!(
+            operation.finalize(),
+            Err(EmitNotificationsError::UnexpectedEvent { .. })
+        ));
     }
 
     #[derive(Debug, PartialEq)]
@@ -515,6 +603,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(

@@ -23,9 +23,10 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::notifications::inbox::upsert_inbox_records;
+use aruna_operations::driver::drive;
+use aruna_operations::notifications::inbox::UpsertInboxOperation;
 use aruna_operations::notifications::routing::route_watch_event;
-use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
+use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_storage::storage::FjallStorage;
 use axum::http::StatusCode;
 use base64::Engine;
@@ -60,6 +61,7 @@ async fn build_state(realm_id: RealmId, node_id: NodeId) -> (TempDir, Arc<Server
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = ServerState::new(
         ctx,
@@ -102,6 +104,7 @@ async fn build_network_state(
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = ServerState::new(
         ctx,
@@ -270,6 +273,11 @@ fn bearer() -> Extension<Option<ValidatedBearer>> {
     )))
 }
 
+async fn seed_inbox(state: &ServerState, records: &[NotificationRecord]) {
+    let upsert = UpsertInboxOperation::new(records.to_vec());
+    drive(upsert, &state.get_ctx()).await.expect("seed inbox");
+}
+
 #[tokio::test]
 async fn list_requires_auth() {
     let realm_id = realm_id(1);
@@ -373,9 +381,7 @@ async fn local_path_serves() {
         direct_record(user_id, 2),
         direct_record(user_id, 3),
     ];
-    upsert_inbox_records(&state.get_ctx().storage_handle, &records)
-        .await
-        .expect("seed inbox");
+    seed_inbox(&state, &records).await;
 
     let (_, listed) = list_notifications(
         State(state.clone()),
@@ -446,12 +452,7 @@ async fn local_stream_emits() {
     assert_eq!(initial, 0);
     assert!(!initial_capped);
 
-    upsert_inbox_records(
-        &state.get_ctx().storage_handle,
-        &[direct_record(user_id, 1)],
-    )
-    .await
-    .expect("seed inbox");
+    seed_inbox(&state, &[direct_record(user_id, 1)]).await;
     net.notify_inbox_activity(user_id);
 
     let (after_wake, after_wake_capped) = timeout(Duration::from_secs(2), events.next())
@@ -612,12 +613,7 @@ async fn local_recheck_refetches() {
 
     // Seed a record but deliberately fire no wake: only the recheck backstop
     // can surface it.
-    upsert_inbox_records(
-        &state.get_ctx().storage_handle,
-        &[direct_record(user_id, 1)],
-    )
-    .await
-    .expect("seed inbox");
+    seed_inbox(&state, &[direct_record(user_id, 1)]).await;
 
     let (after_recheck, _) = timeout(Duration::from_secs(2), events.next())
         .await
@@ -669,12 +665,7 @@ async fn remote_stream_emits() {
         .expect("stream open");
     assert_eq!(initial, 0);
 
-    upsert_inbox_records(
-        &state.get_ctx().storage_handle,
-        &[direct_record(user_id, 1)],
-    )
-    .await
-    .expect("seed inbox");
+    seed_inbox(&state, &[direct_record(user_id, 1)]).await;
 
     let (changed, _) = timeout(Duration::from_secs(2), events.next())
         .await
@@ -1152,9 +1143,11 @@ async fn cross_group_watch() {
 
     let canonical = watch_resource_path(bucket_group, bucket_node, "reports", "quarterly/");
     assert_eq!(created.path_prefix, canonical);
-    let subscriptions = list_watch_subscriptions(&state.get_ctx().storage_handle, watcher)
+    let list = ListWatchesOperation::new(WatchScope::Owner(watcher));
+    let subscriptions = drive(list, &state.get_ctx())
         .await
-        .expect("watch lists");
+        .expect("watch lists")
+        .subscriptions;
     let event_path =
         watch_resource_path(bucket_group, bucket_node, "reports", "quarterly/result.csv");
     let event = WatchEvent {

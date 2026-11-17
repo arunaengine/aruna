@@ -76,6 +76,7 @@ async fn setup_auth(expression: Option<&str>) -> (tempfile::TempDir, DriverConte
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let relationship = relationship();
     let realm_id = relationship.source.realm_id;
@@ -166,6 +167,7 @@ fn storage_context() -> (tempfile::TempDir, DriverContext) {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     (tempdir, context)
 }
@@ -414,6 +416,7 @@ async fn delete_supersedes_reconcile() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let relationship = relationship();
 
@@ -448,6 +451,7 @@ async fn delete_blocks_status() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let relationship = relationship();
     drive(
@@ -483,6 +487,7 @@ async fn status_stages_reconcile() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let mut relationship = relationship();
     relationship.state = SyncState::Failed {
@@ -593,6 +598,7 @@ async fn failure_needs_commit() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let mut relationship = relationship;
     stored(&context, &relationship).await;
@@ -612,6 +618,7 @@ async fn status_stays_handling() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let mut current = relationship();
     let stale = current.clone();

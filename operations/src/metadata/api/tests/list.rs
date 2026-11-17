@@ -158,6 +158,7 @@ async fn group_scan_capped() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let within = load_group_records(&context, group_id, 2)

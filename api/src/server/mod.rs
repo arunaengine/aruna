@@ -231,6 +231,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let state = Arc::new(
             ServerState::new(
@@ -293,6 +294,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let state = Arc::new(
             ServerState::new(

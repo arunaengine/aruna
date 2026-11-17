@@ -178,6 +178,7 @@ async fn fixture() -> Fixture {
         metadata_handle: None,
         task_handle: Some(aruna_tasks::TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();

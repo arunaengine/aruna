@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -18,25 +17,24 @@ use aruna_core::types::{Key, KeySpace, TxnId};
 use tracing::warn;
 
 use crate::driver::DriverContext;
-use crate::notifications::inbox::{InboxWriteOutcome, UpsertFailure, upsert_transactionally};
+use crate::driver::drive;
+use crate::notifications::inbox::{InboxError, InboxWriteOutcome, UpsertInboxOperation};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::protocol::{
-    EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, EXPANSION_WORK_CAP,
-    RETRY_BATCH_CAP, RETRY_BYTES_CAP,
+    EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, RETRY_BATCH_CAP,
+    RETRY_BYTES_CAP, add_limit, expansion_budget, page_limit, valid_retry,
 };
 use crate::notifications::routing::route_watch_event;
-use crate::notifications::watch::authorization::{
-    WatchAuthorization, authorize_watch_event, evaluate_watch_delivery,
-};
-use crate::notifications::watch::interest::{
-    dirty_marker_write, mark_interest_dirty, schedule_interest_publish,
-};
-use crate::notifications::watch::subscriptions::list_watch_page;
+use crate::notifications::watch::authorization::{authorize_watch_event, evaluate_watch_delivery};
+use crate::notifications::watch::digest::InterestOperation;
+use crate::notifications::watch::digest::dirty_marker_write;
+use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
+use crate::notifications::watch::paths::WatchAuthorization;
 
 /// Expands one bounded subscription page into idempotent inbox records.
 /// Later pages are durably retried; placement and authorization are rechecked.
 /// Returns the write outcome and whether stale or unauthorized rows were skipped.
-pub async fn expand_watch_events(
+pub(crate) async fn expand_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
     realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
@@ -82,8 +80,6 @@ type WatchCandidate<'a> = (
     Vec<NotificationRecord>,
 );
 
-const WATCH_PAGE_LIMIT: usize = 256;
-
 async fn expand_events_once(
     context: &DriverContext,
     realm_id: RealmId,
@@ -94,10 +90,15 @@ async fn expand_events_once(
     retry_key: Option<Vec<u8>>,
 ) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
     let page_size = page_limit(events.len()).map_err(UpsertFailure::Fatal)?;
-    let (subscriptions, next) =
-        list_watch_page(&context.storage_handle, realm_id, start, page_size)
-            .await
-            .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+    let scope = WatchScope::Page {
+        realm_id,
+        start,
+        limit: page_size,
+    };
+    let page = drive(ListWatchesOperation::new(scope), context)
+        .await
+        .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+    let (subscriptions, next) = (page.subscriptions, page.next);
     let (subscriptions, found_stale) =
         filter_local_subscriptions(subscriptions, realm_config, local_node_id)
             .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
@@ -181,7 +182,7 @@ async fn expand_events_once(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
             if queue_changed && next.is_some() {
-                schedule_interest_publish(context).await;
+                let _ = drive(InterestOperation::publish(), context).await;
             }
             Ok((outcome, dropped))
         }
@@ -251,7 +252,7 @@ async fn stage_retry_change(
     Ok(true)
 }
 
-pub async fn drain_watch_events(
+pub(crate) async fn drain_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
     realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
@@ -341,28 +342,11 @@ pub async fn drain_watch_events(
 }
 
 async fn defer_retry(context: &DriverContext, realm_id: RealmId, error: String) -> String {
-    if let Err(marker) = mark_interest_dirty(context, realm_id).await {
+    if let Err(marker) = drive(InterestOperation::mark(realm_id), context).await {
         warn!(%realm_id, %marker, "Failed to retain watch retry marker");
         return format!("{error}; failed to retain retry marker: {marker}");
     }
     error
-}
-
-fn valid_retry(retry: &WatchEventRetry, realm_id: RealmId, key: &[u8]) -> bool {
-    let Some(first) = retry.events.first() else {
-        return false;
-    };
-    let Some(cursor) = retry.cursor.as_ref() else {
-        return false;
-    };
-    retry.events.len() <= EVENT_BATCH_SIZE
-        && retry
-            .events
-            .iter()
-            .all(|event| event.realm_id == realm_id && !event.event_id.is_nil())
-        && cursor.len() == 64
-        && cursor.starts_with(UserId::storage_prefix(realm_id).as_ref())
-        && key == watch_retry_key(realm_id, first.event_id).as_slice()
 }
 
 fn retry_error(error: &UpsertFailure) -> String {
@@ -370,23 +354,6 @@ fn retry_error(error: &UpsertFailure) -> String {
         UpsertFailure::Conflict => "storage conflict".to_string(),
         UpsertFailure::Fatal(error) => error.clone(),
     }
-}
-
-fn page_limit(events: usize) -> Result<usize, String> {
-    if events == 0 {
-        return Err("watch event batch is empty".to_string());
-    }
-    let mut limit = WATCH_PAGE_LIMIT;
-    for cap in [
-        EXPANSION_WORK_CAP,
-        EXPANSION_CANDIDATE_CAP,
-        EXPANSION_RECORD_CAP,
-    ] {
-        limit = limit.min(cap / events);
-    }
-    (limit > 0)
-        .then_some(limit)
-        .ok_or_else(|| "watch event batch exceeds expansion caps".to_string())
 }
 
 async fn stage_retry_write(
@@ -636,9 +603,11 @@ async fn stage_watch_expansion(
     if records.is_empty() {
         return Ok((InboxWriteOutcome::default(), dropped));
     }
-    upsert_transactionally(&context.storage_handle, &records, txn_id)
-        .await
-        .map(|outcome| (outcome, dropped))
+    match drive(UpsertInboxOperation::within(records, txn_id), context).await {
+        Ok(outcome) => Ok((outcome, dropped)),
+        Err(InboxError::Conflict) => Err(UpsertFailure::Conflict),
+        Err(error) => Err(UpsertFailure::Fatal(error.to_string())),
+    }
 }
 
 async fn start_write_transaction(context: &DriverContext) -> Result<TxnId, UpsertFailure> {
@@ -655,37 +624,18 @@ async fn start_write_transaction(context: &DriverContext) -> Result<TxnId, Upser
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum UpsertFailure {
+    Conflict,
+    Fatal(String),
+}
+
 fn classify_storage_error(error: StorageError) -> UpsertFailure {
     if matches!(error, StorageError::TransactionConflict) {
         UpsertFailure::Conflict
     } else {
         UpsertFailure::Fatal(error.to_string())
     }
-}
-
-fn expansion_budget(events: usize, subscriptions: usize) -> Result<usize, String> {
-    let work = events
-        .checked_mul(subscriptions)
-        .ok_or_else(|| "watch expansion work budget overflow".to_string())?;
-    if work > EXPANSION_WORK_CAP {
-        return Err(format!(
-            "watch expansion work {} exceeds cap {}",
-            work, EXPANSION_WORK_CAP
-        ));
-    }
-    Ok(work)
-}
-
-fn add_limit(total: usize, added: usize, limit: usize, label: &str) -> Result<usize, String> {
-    let next = total
-        .checked_add(added)
-        .ok_or_else(|| format!("watch expansion {label} budget overflow"))?;
-    if next > limit {
-        return Err(format!(
-            "watch expansion {label} count {next} exceeds cap {limit}"
-        ));
-    }
-    Ok(next)
 }
 
 async fn abort_transaction(context: &DriverContext, txn_id: TxnId) {
@@ -711,6 +661,8 @@ fn record_delivery_suppression(context: &DriverContext, reason: WatchMetricReaso
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::protocol::WATCH_PAGE_LIMIT;
+    use aruna_core::UserId;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -731,7 +683,8 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::{create_holder_watch, create_local_watch};
+    use crate::notifications::watch::subscriptions::create_holder_watch;
+    use crate::tests::notifications::create_local_watch;
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
         let dir = tempdir().expect("temp dir");
@@ -746,6 +699,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             },
         )
     }

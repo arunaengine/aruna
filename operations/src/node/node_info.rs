@@ -1257,6 +1257,7 @@ mod tests {
             // Node info replication is strict, so its drain scheduling must succeed.
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 

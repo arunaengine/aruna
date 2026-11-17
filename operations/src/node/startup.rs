@@ -1919,6 +1919,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         });
         crate::sync::incoming::initialize_incoming_fixture(context.clone());
         RecoveryNode {
@@ -2465,6 +2466,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let units = vec![RestoreUnit {
             kind: RestoreKind::Shared,
@@ -2520,6 +2522,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         // A failed config read must not unbind the cursor from its plan.
         let bound = ShardRestoreCursor {

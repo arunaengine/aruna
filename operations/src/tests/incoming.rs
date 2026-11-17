@@ -126,6 +126,7 @@ pub(crate) fn outbox_handler() -> (tempfile::TempDir, OperationsTaskHandler, Tas
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         }),
         JobsRuntime::new(),
     );
@@ -181,6 +182,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = Arc::new(
         OperationsTaskHandler::new(context.clone(), JobsRuntime::new()).with_outbox_limits(1, 1, 2),

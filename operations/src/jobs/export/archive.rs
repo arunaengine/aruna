@@ -689,12 +689,7 @@ fn property_key(
         .unwrap_or_else(|| safe_term(keywords, compact, values, absolute))
 }
 
-fn safe_term(
-    keywords: &JsonLdKeywords,
-    compact: &str,
-    values: &[&str],
-    absolute: &str,
-) -> String {
+fn safe_term(keywords: &JsonLdKeywords, compact: &str, values: &[&str], absolute: &str) -> String {
     if keywords.term_matches(compact, values) {
         compact.to_string()
     } else {

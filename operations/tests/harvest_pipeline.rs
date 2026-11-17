@@ -90,7 +90,6 @@ impl Fixture {
             shutdown: shutdown.clone(),
             progress: ProgressReporter::from_progress(&JobProgress::new("records")),
             range_turns: Default::default(),
-            mail: Default::default(),
         };
         (ctx, cancel, shutdown)
     }
@@ -155,6 +154,7 @@ async fn build_fixture() -> Result<Fixture, BoxError> {
         metadata_handle: Some(metadata),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(Fixture {
         _root: root,

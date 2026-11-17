@@ -922,6 +922,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut writes = [&base, &late, &latest]
             .into_iter()

@@ -235,6 +235,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(ListDocumentsOperation::new(group_id), &context)
@@ -293,6 +294,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(ListDocumentsOperation::new(group_id), &context)

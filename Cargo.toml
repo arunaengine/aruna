@@ -16,6 +16,7 @@ members = [
     "net",
     "tasks",
     "operations",
+    "outbound",
     "aruna-doctor",
     "cli",
     "plugins",
@@ -49,6 +50,7 @@ aruna-compute = { path = "compute", default-features = false }
 aruna-core = { path = "core" }
 aruna-net = { path = "net" }
 aruna-operations = { path = "operations" }
+aruna-outbound = { path = "outbound" }
 aruna-plugin = { path = "plugins/sdk" }
 aruna-plugins = { path = "plugins", default-features = false }
 aruna-storage = { path = "storage" }

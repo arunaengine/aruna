@@ -1039,6 +1039,7 @@ pub async fn test_put_object() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     // Jesus, Take the Wheel!
     let result = drive(put_operation, &context).await.unwrap();
@@ -1294,6 +1295,7 @@ pub async fn deduplicates_blob() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let data = b"hello, world!";
@@ -1477,6 +1479,7 @@ async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) 
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         },
         hot_root,
         cold_root,
@@ -2079,6 +2082,7 @@ pub async fn overwrite_retains_index() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -2263,6 +2267,7 @@ async fn mismatch_cleans_blob() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let data = b"hello, world!";

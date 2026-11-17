@@ -781,6 +781,7 @@ async fn rest_stack(cors: crate::cors::CorsConfig) -> RestStack {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
@@ -1017,6 +1018,7 @@ async fn s3_stack(
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let server = crate::s3::server::S3Server::new(
         "127.0.0.1:0",

@@ -694,6 +694,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let locked = BucketEncryption {
             mode: EncryptionMode::NodeManaged,

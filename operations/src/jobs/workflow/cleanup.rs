@@ -272,6 +272,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: Some(Arc::new(registry)),
+                outbound_handle: None,
             }),
             job_id: JobId::from_bytes([0xCB; 16]),
             owner_node_id: iroh::SecretKey::from_bytes(&[0xCD; 32]).public(),
@@ -281,7 +282,6 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
             range_turns: Default::default(),
-            mail: Default::default(),
         }
     }
 

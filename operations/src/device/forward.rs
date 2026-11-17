@@ -596,6 +596,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let member = UserId::local(Ulid::from_bytes([8u8; 16]), realm_id);

@@ -154,6 +154,16 @@ impl EgressPolicy {
         self.extra_deny.iter().any(|net| net.contains(&address))
     }
 
+    /// Screens a literal host. A name passes here and is screened again against its resolved
+    /// addresses when the connection opens.
+    pub fn check_host(&self, host: &str) -> Result<(), EgressError> {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        match host.parse::<IpAddr>() {
+            Ok(address) => self.check(address),
+            Err(_) => Ok(()),
+        }
+    }
+
     pub fn check(&self, address: IpAddr) -> Result<(), EgressError> {
         let normalized = normalize(address);
         // A deny may be written in either spelling of a translated address.

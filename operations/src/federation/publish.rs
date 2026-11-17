@@ -702,6 +702,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let config = config(RegistrationMode::Enabled, true);
         let target = DocumentTarget::RealmConfig {
@@ -743,6 +744,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let config = config(RegistrationMode::Disabled, true);
         let target = DocumentTarget::RealmConfig {
@@ -786,6 +788,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([7; 32]);
         let kpis = realm_kpis(&context, realm_id, Some(2)).await;

@@ -1991,6 +1991,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         assert!(
@@ -2016,6 +2017,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let error = collect_outputs(
@@ -2181,6 +2183,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let job_id = JobId::from_bytes([4; 16]);
         let record = JobRecord::new(
@@ -2557,6 +2560,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([1; 32]);
         let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
@@ -2630,6 +2634,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut record = JobRecord::new(
             JobId::from_bytes([4; 16]),

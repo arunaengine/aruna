@@ -592,6 +592,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(task),
             compute_handle: None,
+            outbound_handle: None,
         });
 
         assert!(start_sync_run(&context).await);
@@ -623,6 +624,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         note_contact(&context).await;
         let now = unix_timestamp_millis();
@@ -645,6 +647,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let document_id = Ulid::generate();
         let retryable = draft(PublishState::Failed {

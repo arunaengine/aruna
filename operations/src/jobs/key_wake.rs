@@ -321,6 +321,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let storage = &context.storage_handle;
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
@@ -367,6 +368,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let storage = &context.storage_handle;
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
@@ -429,6 +431,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);

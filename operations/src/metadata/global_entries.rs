@@ -406,6 +406,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm = RealmId::from_bytes([1; 32]);
         let version_id = seed(&context, "shared", true).await;

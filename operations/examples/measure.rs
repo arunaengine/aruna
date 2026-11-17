@@ -718,6 +718,7 @@ async fn spawn_single() -> Result<Node, BoxError> {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(Node {
         _dir: dir,
@@ -826,6 +827,7 @@ async fn measure_runner() -> Result<(), BoxError> {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     for (detail, reads, grouped) in [
         ("short", 1, false),

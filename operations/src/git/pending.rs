@@ -231,6 +231,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let merge = PendingMerge {
             user_id: aruna_core::UserId::new(Ulid::from(1), RealmId([1; 32])),

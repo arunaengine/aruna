@@ -142,6 +142,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let record = BucketAuditRecord {
             event_id: next_event_id(5),
@@ -211,6 +212,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let handler = Arc::new(OperationsTaskHandler::new(context, JobsRuntime::new()));
         // The handler is stopped after a growing number of steps, as a crash would stop it,

@@ -341,6 +341,7 @@ async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerS
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id(),

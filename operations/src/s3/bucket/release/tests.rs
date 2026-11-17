@@ -39,6 +39,7 @@ async fn fixture() -> Fixture {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([1; 32]);
     let auth = |seed: u8| AuthContext {

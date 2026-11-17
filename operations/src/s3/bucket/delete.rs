@@ -1270,6 +1270,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let bucket = "bucket-a".to_string();
@@ -1407,6 +1408,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let bucket = "bucket-a".to_string();
         let info = BucketInfo {
@@ -1522,6 +1524,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let bucket = "bucket-a".to_string();
@@ -1574,6 +1577,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let bucket = "ws-temporary".to_string();
         drive(
@@ -1694,6 +1698,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let bucket = "bucket-a".to_string();
@@ -1762,6 +1767,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let bucket = "bucket-a".to_string();

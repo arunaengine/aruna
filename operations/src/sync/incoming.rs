@@ -1340,6 +1340,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let documents = vec![evicted(1), evicted(2)];
         let (failed, receivers) = aruna_storage::StorageHandle::new();
@@ -1425,6 +1426,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
@@ -1464,6 +1466,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let foreign_realm = RealmId::from_bytes([5u8; 32]);
@@ -1706,6 +1709,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
@@ -1767,6 +1771,7 @@ mod tests {
                 metadata_handle: Some(metadata_handle),
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             });
 
             let fixture =
@@ -1884,6 +1889,7 @@ mod tests {
                     metadata_handle: None,
                     task_handle: None,
                     compute_handle: None,
+                    outbound_handle: None,
                 }),
                 RoCrateLimits::default(),
                 JobsRuntime::new(),
@@ -2109,6 +2115,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let foreign_realm = RealmId::from_bytes([10u8; 32]);

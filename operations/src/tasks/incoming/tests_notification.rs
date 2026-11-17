@@ -5,6 +5,21 @@
 use super::harness::*;
 use super::*;
 
+/// The outbox rows still waiting.
+async fn outbox_rows(storage: &aruna_storage::StorageHandle) -> Vec<(Key, ByteView)> {
+    let read = StorageEffect::Iter {
+        key_space: aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 1024,
+        txn_id: None,
+    };
+    match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        other => panic!("unexpected outbox read: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn notification_drain_holder() {
     let realm_id = RealmId::from_bytes([5u8; 32]);
@@ -28,16 +43,15 @@ async fn notification_drain_holder() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    handler.drain_notification_outbox().await;
+    handler.run_trigger(TaskKey::DrainNotificationOutbox).await;
 
     let inbox = read_inbox_records(&storage).await;
     assert_eq!(inbox, vec![record]);
-    let remaining = read_outbox_batch(&storage, None, 1024, None)
-        .await
-        .expect("outbox read");
-    assert!(remaining.records.is_empty());
+    let remaining = outbox_rows(&storage).await;
+    assert!(remaining.is_empty());
 }
 
 #[tokio::test]
@@ -60,14 +74,13 @@ async fn notification_drain_unresolvable() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    handler.drain_notification_outbox().await;
+    handler.run_trigger(TaskKey::DrainNotificationOutbox).await;
 
-    let remaining = read_outbox_batch(&storage, None, 1024, None)
-        .await
-        .expect("outbox read");
-    assert_eq!(remaining.records.len(), 1);
+    let remaining = outbox_rows(&storage).await;
+    assert_eq!(remaining.len(), 1);
     assert!(read_inbox_records(&storage).await.is_empty());
 
     let Event::Task(TaskEvent::TimerScheduled { after, .. }) = task_handle
@@ -134,6 +147,7 @@ async fn notification_delivers_holder() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     crate::sync::incoming::initialize_incoming_fixture(context_b.clone());
 
@@ -144,15 +158,14 @@ async fn notification_delivers_holder() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context_a, JobsRuntime::new());
-    handler.drain_notification_outbox().await;
+    handler.run_trigger(TaskKey::DrainNotificationOutbox).await;
 
     assert_eq!(read_inbox_records(&storage_b).await, vec![record]);
-    let remaining = read_outbox_batch(&storage_a, None, 1024, None)
-        .await
-        .expect("outbox read");
-    assert!(remaining.records.is_empty());
+    let remaining = outbox_rows(&storage_a).await;
+    assert!(remaining.is_empty());
 }
 
 #[tokio::test]
@@ -180,15 +193,14 @@ async fn notification_drain_warn() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    handler.drain_notification_outbox().await;
+    handler.run_trigger(TaskKey::DrainNotificationOutbox).await;
 
     assert!(read_inbox_records(&storage).await.is_empty());
-    let remaining = read_outbox_batch(&storage, None, 1024, None)
-        .await
-        .expect("outbox read");
-    assert!(remaining.records.is_empty());
+    let remaining = outbox_rows(&storage).await;
+    assert!(remaining.is_empty());
 }
 
 /// A local drain whose webhook cannot be queued keeps its outbox row, and the next drain
@@ -232,28 +244,21 @@ async fn drain_retries_queueing() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    handler.drain_notification_outbox().await;
+    handler.run_trigger(TaskKey::DrainNotificationOutbox).await;
 
     assert_eq!(read_inbox_records(&storage).await, vec![record.clone()]);
-    let remaining = read_outbox_batch(&storage, None, 1024, None)
-        .await
-        .expect("outbox read");
-    assert_eq!(
-        remaining.records.len(),
-        1,
-        "a failed queue keeps the outbox row"
-    );
+    let remaining = outbox_rows(&storage).await;
+    assert_eq!(remaining.len(), 1, "a failed queue keeps the outbox row");
 
     config.seed_job_control(node_id, 0);
     write_realm_config(&storage, realm_id, &config, node_id).await;
-    handler.drain_notification_outbox().await;
+    handler.run_trigger(TaskKey::DrainNotificationOutbox).await;
 
-    let remaining = read_outbox_batch(&storage, None, 1024, None)
-        .await
-        .expect("outbox read");
-    assert!(remaining.records.is_empty());
+    let remaining = outbox_rows(&storage).await;
+    assert!(remaining.is_empty());
     let key = format!("webhook/{}", record.notification_id);
     let key = aruna_core::structs::execution::job::user_dedup_key(recipient, &key);
     let queued = crate::jobs::store::query::find_dedup_plan(&storage, recipient, &key, None)
@@ -345,6 +350,7 @@ async fn device_skips_holders() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());

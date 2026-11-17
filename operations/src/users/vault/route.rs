@@ -419,6 +419,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let user_id = fetch_effect().user_id;
         let writes = (1..=65)

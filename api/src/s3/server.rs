@@ -1180,6 +1180,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let mut builder = S3ServiceBuilder::new(TestS3);
         let mut auth = s3s::auth::SimpleAuth::from_single("TOKENKEY", "signing-secret");
@@ -1545,6 +1546,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let address = listener.local_addr().expect("local addr");
@@ -1608,6 +1610,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let address = listener.local_addr().expect("local addr");
@@ -1668,6 +1671,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
         let server = S3Server::new(
@@ -1731,6 +1735,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let node_id = iroh::SecretKey::from_bytes(&[0x56; 32]).public();
         let server = S3Server::new(
@@ -1792,6 +1797,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let node_id = iroh::SecretKey::from_bytes(&[0x57; 32]).public();
         let server = S3Server::new(

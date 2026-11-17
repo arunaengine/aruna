@@ -43,13 +43,9 @@ async fn durable_rearm_loop(
         restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
-        crate::notifications::watch::interest::restore_publish_timer(
-            &context.storage_handle,
-            &task_handle,
-        )
-        .await;
+        restore_watch_interest(&context, &task_handle).await;
         crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
-        restore_idle_timer(&context.storage_handle, &task_handle, DELIVERY_RETRY_AFTER).await;
+        restore_notification_outbox(&context, &task_handle, None).await;
         restore_projection_timer(&context.storage_handle, &task_handle).await;
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
         // tick would scan the keyspace far more often than it can yield work.
@@ -59,8 +55,7 @@ async fn durable_rearm_loop(
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
             .await;
-        crate::notifications::prune::restore_prune_timer(&context.storage_handle, &task_handle)
-            .await;
+        restore_notification_prune(&context, &task_handle).await;
         restore_drain_timer(&context.storage_handle, &task_handle).await;
         restore_prune_timer(&context.storage_handle, &task_handle).await;
         restore_mirror_timer(&context, &task_handle).await;
@@ -69,6 +64,71 @@ async fn durable_rearm_loop(
             &task_handle,
         )
         .await;
+    }
+}
+
+/// Arms the notification drain when outbox rows wait: within `shorten`, or else at the retry
+/// delay unless a drain runs already.
+async fn restore_notification_outbox(
+    context: &DriverContext,
+    task_handle: &TaskHandle,
+    shorten: Option<Duration>,
+) {
+    let context = DriverContext {
+        task_handle: Some(task_handle.clone()),
+        ..context.clone()
+    };
+    let restore = match shorten {
+        Some(after) => RestoreOutboxOperation::shorten(after),
+        None => RestoreOutboxOperation::probe(),
+    };
+    match drive(restore, &context).await {
+        Ok(true) if shorten.is_none() => {
+            let key = TaskKey::DrainNotificationOutbox;
+            let event = task_handle
+                .schedule_idle_timer(key, DELIVERY_RETRY_AFTER)
+                .await;
+            if let TaskEvent::Error { message, .. } = event {
+                warn!(message = %message, "Failed to restore notification outbox timer");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => warn!(%error, "Failed to restore notification outbox timer"),
+    }
+}
+
+/// The watch interest table of the stored digests; empty when they cannot be read.
+async fn interest_table(
+    context: &DriverContext,
+) -> aruna_core::structs::execution::notification_watch::WatchInterestTable {
+    drive(RebuildTableOperation::default(), context)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "Failed to scan watch interest digests");
+            Default::default()
+        })
+}
+
+/// Requests the watch interest publish when a dirty marker is left over.
+async fn restore_watch_interest(context: &DriverContext, task_handle: &TaskHandle) {
+    let context = DriverContext {
+        task_handle: Some(task_handle.clone()),
+        ..context.clone()
+    };
+    if let Err(error) = drive(InterestOperation::restore(), &context).await {
+        warn!(%error, "Failed to restore watch interest publish timer");
+    }
+}
+
+/// Arms the notification prune timer on the task handle the queues run on.
+async fn restore_notification_prune(context: &DriverContext, task_handle: &TaskHandle) {
+    let context = DriverContext {
+        task_handle: Some(task_handle.clone()),
+        ..context.clone()
+    };
+    let restore = RestorePruneOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(restore, &context).await {
+        warn!(%error, "Failed to restore notification prune timer");
     }
 }
 
@@ -157,8 +217,7 @@ async fn install_task_handler(
     // Prime the origin-side watch interest cache from any digests already in
     // local storage so matching works before the first reconcile.
     if let Some(net_handle) = context.net_handle.as_ref() {
-        let table = rebuild_interest_table(&context.storage_handle).await;
-        net_handle.replace_watch_interest(table);
+        net_handle.replace_watch_interest(interest_table(&context).await);
     }
     TaskQueues {
         context,
@@ -225,11 +284,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::notifications::watch::interest::restore_publish_timer(
-            &context.storage_handle,
-            &task_handle,
-        )
-        .await;
+        restore_watch_interest(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -242,7 +297,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_outbox_timer(&context.storage_handle, &task_handle, Duration::ZERO).await;
+        restore_notification_outbox(&context, &task_handle, Some(Duration::ZERO)).await;
         if stopped() {
             return;
         }
@@ -263,8 +318,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::notifications::prune::restore_prune_timer(&context.storage_handle, &task_handle)
-            .await;
+        restore_notification_prune(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -408,11 +462,7 @@ impl OperationsTaskHandler {
             // Fold this node's freshly written digest into the origin-side cache;
             // the local write bypasses the reconcile path that refreshes remotes.
             Ok(true) => {
-                let table = crate::notifications::watch::interest::rebuild_interest_table(
-                    &self.context.storage_handle,
-                )
-                .await;
-                net_handle.replace_watch_interest(table);
+                net_handle.replace_watch_interest(interest_table(&self.context).await);
             }
             Ok(false) => {}
             Err(error) => {
@@ -669,290 +719,6 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
-    pub(super) async fn prune_notifications(&self) {
-        let after = match process_prune_batch(&self.context).await {
-            Ok(outcome) if outcome.has_more => Duration::ZERO,
-            Ok(outcome) => outcome
-                .next_due_after
-                .unwrap_or(NOTIFICATION_POLL_AFTER)
-                .min(NOTIFICATION_POLL_AFTER),
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PruneNotifications, error = %error, "Failed to prune notifications");
-                NOTIFICATION_RETRY_AFTER
-            }
-        };
-        self.reschedule_timer(TaskKey::PruneNotifications, after)
-            .await;
-    }
-}
-
-impl OperationsTaskHandler {
-    pub(super) async fn read_realm_config(&self, realm_id: RealmId) -> Option<RealmConfigDocument> {
-        match self
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: ByteView::from(realm_id.as_bytes().to_vec()),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult {
-                value: Some(bytes), ..
-            }) => match RealmConfigDocument::from_bytes(&bytes) {
-                Ok(document) => Some(document),
-                Err(error) => {
-                    warn!(task_id = ?TaskKey::DrainNotificationOutbox, realm_id = %realm_id, error = %error, "Failed to decode realm config for notification drain");
-                    None
-                }
-            },
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => None,
-            Event::Storage(StorageEvent::Error { error }) => {
-                warn!(task_id = ?TaskKey::DrainNotificationOutbox, realm_id = %realm_id, error = %error, "Failed to read realm config for notification drain");
-                None
-            }
-            other => {
-                warn!(task_id = ?TaskKey::DrainNotificationOutbox, realm_id = %realm_id, event = ?other, "Unexpected realm config read result for notification drain");
-                None
-            }
-        }
-    }
-}
-
-impl OperationsTaskHandler {
-    pub(super) async fn drain_notification_outbox(&self) {
-        let retry_key = TaskKey::DrainNotificationOutbox;
-
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(task_id = ?retry_key, "Cannot drain notification outbox without net handle");
-            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
-            return;
-        };
-        let local_node_id = net_handle.node_id();
-
-        let mut snapshot_owner = match self.context.storage_handle.start_transaction(true).await {
-            Ok(owner) => owner,
-            Err(error) => {
-                warn!(task_id = ?retry_key, error = %error, "Failed to start notification outbox snapshot");
-                self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
-                return;
-            }
-        };
-        let Some(snapshot_txn_id) = snapshot_owner.id() else {
-            warn!(task_id = ?retry_key, "Notification outbox snapshot owner missing transaction");
-            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
-            return;
-        };
-
-        let mut start_after: Option<Vec<u8>> = None;
-        let mut retry_needed = false;
-        let mut realm_configs: HashMap<RealmId, Option<RealmConfigDocument>> = HashMap::new();
-        // One delivery attempt per remote holder per run: later records for a
-        // holder already found unreachable are marked retry without another RPC.
-        let mut failed_holders: HashSet<aruna_core::NodeId> = HashSet::new();
-
-        // Scan the snapshot in full so a dead holder cannot hide healthy records
-        // behind it, while rows appended during this run wait for the next run.
-        loop {
-            let batch = match read_outbox_batch(
-                &self.context.storage_handle,
-                start_after.clone(),
-                OUTBOX_BATCH_SIZE,
-                Some(snapshot_txn_id),
-            )
-            .await
-            {
-                Ok(batch) => batch,
-                Err(error) => {
-                    warn!(task_id = ?retry_key, error = %error, "Failed to read notification outbox record");
-                    retry_needed = true;
-                    break;
-                }
-            };
-
-            let has_more = batch.has_more;
-            start_after = batch.next_start_after;
-            if batch.records.is_empty() {
-                if has_more && start_after.is_some() {
-                    continue;
-                }
-                break;
-            }
-
-            let mut local_records: Vec<NotificationRecord> = Vec::new();
-            let mut local_keys: Vec<Vec<u8>> = Vec::new();
-            let mut remote_groups: HashMap<
-                aruna_core::NodeId,
-                (Vec<NotificationRecord>, Vec<Vec<u8>>),
-            > = HashMap::new();
-
-            for (record_key, outbox_record) in batch.records {
-                let age_ms =
-                    unix_timestamp_millis().saturating_sub(outbox_record.outbox_id.timestamp_ms());
-                if age_ms > OUTBOX_RETENTION_MS {
-                    warn!(task_id = ?retry_key, outbox_id = %outbox_record.outbox_id, age_ms, "Dropping expired notification outbox record");
-                    if let Err(error) =
-                        delete_outbox_records(&self.context.storage_handle, vec![record_key]).await
-                    {
-                        warn!(task_id = ?retry_key, error = %error, "Failed to delete expired notification outbox record");
-                        retry_needed = true;
-                    }
-                    continue;
-                }
-
-                let record = outbox_record.record;
-                let realm_id = record.recipient.realm_id;
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    realm_configs.entry(realm_id)
-                {
-                    let config = self.read_realm_config(realm_id).await;
-                    entry.insert(config);
-                }
-                let Some(config) = realm_configs.get(&realm_id).and_then(Option::as_ref) else {
-                    warn!(task_id = ?retry_key, realm_id = %realm_id, "Notification realm config unavailable; retrying delivery");
-                    retry_needed = true;
-                    continue;
-                };
-
-                let holder = match resolve_inbox_holder(&record.recipient, config) {
-                    Ok(holder) => holder,
-                    Err(error) => {
-                        warn!(task_id = ?retry_key, recipient = %record.recipient, error = %error, "Failed to resolve notification inbox holder");
-                        retry_needed = true;
-                        continue;
-                    }
-                };
-                let Some(holder) = holder else {
-                    warn!(task_id = ?retry_key, recipient = %record.recipient, "No eligible notification inbox holder; retrying delivery");
-                    retry_needed = true;
-                    continue;
-                };
-
-                if holder == local_node_id {
-                    local_records.push(record);
-                    local_keys.push(record_key);
-                } else if failed_holders.contains(&holder) {
-                    retry_needed = true;
-                } else {
-                    let group = remote_groups.entry(holder).or_default();
-                    group.0.push(record);
-                    group.1.push(record_key);
-                }
-            }
-
-            if !local_records.is_empty() {
-                match upsert_with_report(&self.context.storage_handle, &local_records).await {
-                    Ok(outcome) => {
-                        for recipient in &outcome.recipients {
-                            net_handle.notify_inbox_activity(*recipient);
-                        }
-                        let mut queued = crate::notifications::webhook::enqueue_webhooks(
-                            &self.context,
-                            local_node_id,
-                            &outcome.held,
-                        )
-                        .await;
-                        if queued.is_ok() {
-                            queued = crate::notifications::email::enqueue_emails(
-                                &self.context,
-                                local_node_id,
-                                &outcome.held,
-                            )
-                            .await;
-                        }
-                        // The outbox rows stay until their deliveries are queued.
-                        if let Err(error) = queued {
-                            warn!(task_id = ?retry_key, error = %error, "Failed to queue notification deliveries");
-                            retry_needed = true;
-                        } else if let Err(error) =
-                            delete_outbox_records(&self.context.storage_handle, local_keys).await
-                        {
-                            warn!(task_id = ?retry_key, error = %error, "Failed to delete delivered notification outbox records");
-                            retry_needed = true;
-                        }
-                    }
-                    Err(error) => {
-                        warn!(task_id = ?retry_key, error = %error, "Failed to deliver notifications to local inbox");
-                        retry_needed = true;
-                    }
-                }
-            }
-
-            for (holder, (records, keys)) in remote_groups {
-                match deliver_remote(net_handle, holder, records).await {
-                    Ok(_) => {
-                        if let Err(error) =
-                            delete_outbox_records(&self.context.storage_handle, keys).await
-                        {
-                            warn!(task_id = ?retry_key, error = %error, "Failed to delete delivered notification outbox records");
-                            retry_needed = true;
-                        }
-                    }
-                    Err(error) => {
-                        warn!(task_id = ?retry_key, holder = %holder, error = %error, "Failed to deliver notifications to remote holder");
-                        failed_holders.insert(holder);
-                        retry_needed = true;
-                    }
-                }
-            }
-
-            if !has_more {
-                break;
-            }
-        }
-
-        match self
-            .context
-            .storage_handle
-            .send_storage_effect(StorageEffect::CommitTransaction {
-                txn_id: snapshot_txn_id,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id })
-                if txn_id == snapshot_txn_id =>
-            {
-                snapshot_owner.finish()
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                warn!(task_id = ?retry_key, error = %error, "Failed to close notification outbox snapshot");
-                match error {
-                    aruna_core::errors::StorageError::TransactionConflict
-                    | aruna_core::errors::StorageError::TransactionNotFound => {
-                        snapshot_owner.finish();
-                    }
-                    aruna_core::errors::StorageError::QueueFull => {}
-                    _ => snapshot_owner.unknown(),
-                }
-                retry_needed = true;
-            }
-            other => {
-                warn!(task_id = ?retry_key, event = ?other, "Unexpected notification outbox snapshot close result");
-                snapshot_owner.unknown();
-                retry_needed = true;
-            }
-        }
-
-        if retry_needed {
-            self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
-        } else {
-            match read_outbox_batch(&self.context.storage_handle, None, 1, None).await {
-                Ok(batch) => {
-                    if let Some(after) = batch.retry_after() {
-                        self.reschedule_timer(retry_key, after).await;
-                    }
-                }
-                Err(error) => {
-                    warn!(task_id = ?retry_key, error = %error, "Failed to check for notification outbox records appended during drain");
-                    self.reschedule_timer(retry_key, DELIVERY_RETRY_AFTER).await;
-                }
-            }
-        }
-    }
-}
-
-impl OperationsTaskHandler {
     pub(super) async fn drain_job_queue(&self) {
         if !self.jobs_runtime.is_started() {
             return;
@@ -1133,7 +899,7 @@ impl OperationsTaskHandler {
 #[doc(hidden)]
 pub async fn drain_notification_outbox(context: Arc<DriverContext>) {
     OperationsTaskHandler::new(context, JobsRuntime::new())
-        .drain_notification_outbox()
+        .run_trigger(TaskKey::DrainNotificationOutbox)
         .await;
 }
 
@@ -1155,6 +921,7 @@ mod stop_tests {
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         });
         let queues = install_task_queues(
             context,

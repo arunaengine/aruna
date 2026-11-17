@@ -38,6 +38,7 @@ fn reclaim_retry_climbs() {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }),
         JobsRuntime::new(),
     );
@@ -71,6 +72,7 @@ async fn paused_runtime_waits() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let job_id = job_id();
     let record = JobRecord::new(
@@ -125,6 +127,7 @@ async fn start_keeps_job() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let job_id = job_id();
     let record = JobRecord::new(

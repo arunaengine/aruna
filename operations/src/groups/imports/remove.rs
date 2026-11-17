@@ -883,6 +883,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let import_id = Ulid::from_parts(2, 2);
         let mut writes = record_writes(&deleting()).unwrap();
@@ -946,6 +947,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let import_id = Ulid::from_parts(2, 2);
         let intent = |mover| WriteIntent {

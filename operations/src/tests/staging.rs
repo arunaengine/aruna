@@ -52,6 +52,7 @@ pub(crate) async fn setup_driver_context() -> StagingTestContext {
     )
     .await
     .expect("blob handle must initialize");
+    let (http, policy) = blob_handle.repository_client();
 
     StagingTestContext {
         _tempdir: tempdir,
@@ -62,6 +63,7 @@ pub(crate) async fn setup_driver_context() -> StagingTestContext {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: Some(aruna_outbound::OutboundHandle::new(http, policy)),
         },
     }
 }

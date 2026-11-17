@@ -13,6 +13,7 @@ mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
+use aruna_core::outbound::{OutboundEffect, OutboundError, OutboundEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -117,7 +118,29 @@ pub(crate) async fn dispatch_effect_until(
             };
             Event::Net(NetEvent::ArtifactStored(stored))
         }
+        // Notification frames and inbox wakes need the net handle the runner holds.
+        Effect::Net(NetEffect::Notification(request)) => {
+            Event::Net(NetEvent::Notification(match context.net_handle.as_ref() {
+                Some(net_handle) => {
+                    let answer = net_handle.notification_request(request.node, &request.message);
+                    Box::pin(answer).await.map(Box::new)
+                }
+                None => Err("the notification transport is unavailable".to_string()),
+            }))
+        }
+        Effect::Net(NetEffect::WakeInbox(recipients)) => {
+            if let Some(net_handle) = context.net_handle.as_ref() {
+                for recipient in recipients {
+                    net_handle.notify_inbox_activity(recipient);
+                }
+            }
+            Event::Net(NetEvent::InboxWoken)
+        }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
+        Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
+            Some(outbound) => Event::Outbound(Box::pin(outbound.run(effect)).await),
+            None => Event::Outbound(outbound_unavailable(&effect)),
+        },
         Effect::Metadata(metadata_effect) => {
             metadata::dispatch_metadata(metadata_effect, context).await
         }
@@ -191,5 +214,15 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Stream() => "stream",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Outbound(_) => "outbound",
+    }
+}
+
+/// The answer to an outbound effect on a node without the outbound backend.
+fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
+    let error = OutboundError::Retryable("the outbound backend is unavailable".to_string());
+    match effect {
+        OutboundEffect::Post(_) => OutboundEvent::Posted { result: Err(error) },
+        OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
     }
 }

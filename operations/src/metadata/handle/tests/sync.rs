@@ -108,6 +108,7 @@ async fn sync_creates_bucket() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let (_, realm_id, user_id) = realm_fixture();
     let group_id = Ulid::generate();

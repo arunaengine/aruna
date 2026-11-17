@@ -207,6 +207,7 @@ async fn setup() -> Fixture {
         metadata_handle: Some(metadata_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = Arc::new(
         ServerState::new(

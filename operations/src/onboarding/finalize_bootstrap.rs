@@ -22,7 +22,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::notifications::watch::interest::mark_interest_dirty;
+use crate::notifications::watch::digest::InterestOperation;
 use crate::onboarding::consume_secret::{
     ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
 };
@@ -202,13 +202,9 @@ async fn emit_onboarded_notification(realm_id: RealmId, node_id: NodeId, context
     if records.is_empty() {
         return;
     }
-    if let Err(never) = drive(
-        EmitNotificationsOperation::new(EmitNotificationsInput { records }),
-        context,
-    )
-    .await
-    {
-        match never {}
+    let emit = EmitNotificationsOperation::new(EmitNotificationsInput { records });
+    if let Err(error) = drive(emit, context).await {
+        warn!(%error, "Failed to emit onboarding notifications");
     }
 }
 
@@ -221,7 +217,7 @@ async fn ensure_realm_node(
     for _ in 0..NODE_UPDATE_RETRIES {
         match ensure_node_once(input, mode, context).await {
             Ok(()) => {
-                if let Err(error) = mark_interest_dirty(context, input.realm_id).await {
+                if let Err(error) = drive(InterestOperation::mark(input.realm_id), context).await {
                     warn!(%error, "Failed to rebuild watch placement after onboarding realm change");
                 }
                 return Ok(());
@@ -451,6 +447,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
@@ -605,6 +602,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             net_handle,
         )
@@ -1104,6 +1102,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();

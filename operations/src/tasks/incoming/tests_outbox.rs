@@ -205,6 +205,7 @@ async fn topic_page_blocks() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let blocked_target = DocumentTarget::Group {
         group_id: Ulid::from_parts(10, 1),
@@ -303,6 +304,7 @@ async fn admin_page_blocks() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     // The local node is the origin: it can only publish envelopes it signs.
     let origin = net.node_id();
@@ -753,6 +755,7 @@ async fn blocked_keeps_backoff() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
@@ -823,6 +826,7 @@ async fn deferred_head_paginates() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     // Every head-page record targets one shard topic with no local genesis,
@@ -977,6 +981,7 @@ async fn rotation_streak() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(
         1,
@@ -1066,6 +1071,7 @@ async fn draining_a_topics() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     // Install the config so this sole node is rank-0 of every shard, but do
@@ -1165,6 +1171,7 @@ async fn retry_publishes_once() {
         metadata_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     // An unreachable server peer makes every sync of the realm topic fail.
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -1288,6 +1295,7 @@ async fn config_setup() -> ConfigHarness {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 2);
@@ -1349,6 +1357,7 @@ async fn pull_reaches_holder() {
         metadata_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     }));
 
     // The live config resolves the shard's holders to this node only: the
@@ -1422,6 +1431,7 @@ async fn pull_reaches_holder() {
         metadata_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1550,6 +1560,7 @@ impl BoundaryHarness {
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         });
         let handler =
             OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);

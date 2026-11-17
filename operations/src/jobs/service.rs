@@ -47,8 +47,8 @@ use super::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
 use super::store::state::{read_artifact_tombstone, read_job_record};
 use super::store::{JobMutationError, RunDelete, delete_finished_run};
 use super::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
-    schedule_drain_effect,
+    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
+    mint_job_id, schedule_drain_effect,
 };
 use super::workflow::finalize::finalize_followups;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
@@ -96,36 +96,6 @@ pub(crate) async fn mint_local_job(
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
     mint_configured_job(&config, owner_node_id, subject)
-}
-
-/// Synchronous form used by producer transactions that already fenced and read
-/// the realm config. The resulting job id and dedup shard can therefore be
-/// written atomically with the producer's own records.
-pub(crate) fn mint_configured_job(
-    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    owner_node_id: NodeId,
-    subject: &[u8],
-) -> Result<JobId, SubmitJobError> {
-    let handle = config.job_control_handle(&owner_node_id).ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable(
-            "serving node has no job-control binding yet".to_string(),
-        )
-    })?;
-    let tuple = config
-        .binding_directory()
-        .resolve(handle)
-        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    let strategy = config.strategy(&tuple.strategy_id).ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable("job-control strategy unavailable".to_string())
-    })?;
-    let shard = shard_for_subject(subject, strategy.shard_count);
-    let bucket = u16::try_from(shard)
-        .ok()
-        .and_then(|shard| BucketId::new(shard).ok())
-        .ok_or_else(|| {
-            SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
-        })?;
-    Ok(mint_job_id(handle, bucket)?)
 }
 
 /// The accepting node is the immutable owner: creation, listing, dedup,
@@ -1686,6 +1656,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([1u8; 32]);
         let mut spec = ExecutionSpec {
@@ -1950,6 +1921,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let payload = JobPayload::Probe {
@@ -2007,6 +1979,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let job_id = JobId::from_bytes([3u8; 16]);
@@ -2045,6 +2018,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([1u8; 32]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
@@ -2102,6 +2076,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let runtime = JobsRuntime::new();

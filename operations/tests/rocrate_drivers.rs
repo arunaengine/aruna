@@ -1414,6 +1414,7 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
         metadata_handle: Some(metadata),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     create_bucket(&context, &actor, group_id).await?;
     Ok(Fixture {
@@ -1866,7 +1867,6 @@ async fn claim_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        mail: Default::default(),
     })
 }
 

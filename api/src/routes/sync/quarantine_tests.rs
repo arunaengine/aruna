@@ -43,6 +43,7 @@ async fn setup() -> Fixture {
         metadata_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[31u8; 32])

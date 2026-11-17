@@ -23,6 +23,7 @@ aruna-core = { workspace = true }
 aruna-plugins = { workspace = true, features = ["runtime"] }
 aruna-storage = { workspace = true }
 aruna-net = { workspace = true }
+aruna-outbound = { workspace = true }
 aruna-tasks = { workspace = true }
 craqle = { workspace = true }
 async-compression = { workspace = true }
@@ -45,7 +46,6 @@ http = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
-lettre = { workspace = true }
 lru = { workspace = true }
 opentelemetry = { workspace = true }
 postcard = { workspace = true }

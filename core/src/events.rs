@@ -11,6 +11,7 @@ use crate::effects::{
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::node_vault::VaultEntry;
+use crate::outbound::OutboundEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{
     ListCursor, ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
@@ -54,6 +55,7 @@ pub enum Event {
     Stream(),
     Group(GroupEvent),
     Session(Box<crate::compute::session::SessionAnswer>),
+    Outbound(OutboundEvent),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -152,6 +154,10 @@ pub enum SubOperationEvent {
     /// One version of a re-key page ended.
     VersionRekeyed {
         outcome: RekeyOutcome,
+    },
+    /// The emission stored no notification; its failure as text.
+    NotificationsFailed {
+        reason: String,
     },
 }
 
@@ -470,6 +476,11 @@ pub enum NetEvent {
     Error(NetError),
     /// Whether the node holds the complete artifact after the chunk, or why it was not stored.
     ArtifactStored(Result<bool, String>),
+    /// The holder's answer frame, or why none came.
+    Notification(
+        Result<Box<crate::structs::execution::notification::NotificationTransportMessage>, String>,
+    ),
+    InboxWoken,
 }
 
 /// Reply to a [`crate::effects::NetEffect::PolicySign`]. The adapter signs only
@@ -869,6 +880,8 @@ impl Event {
                     Release,
                     Error,
                     ArtifactStored,
+                    Notification,
+                    InboxWoken,
                 }
             ),
             Event::Metadata(event) => variant_label!(
@@ -926,6 +939,7 @@ impl Event {
                     KeyRequestsFailed,
                     ReissuePaged,
                     VersionRekeyed,
+                    NotificationsFailed,
                 }
             ),
             Event::Task(event) => variant_label!(
@@ -948,6 +962,7 @@ impl Event {
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Session(_) => "Event::Session",
+            Event::Outbound(event) => variant_label!(event, OutboundEvent { Posted, MailSent }),
         }
     }
 }

@@ -131,6 +131,7 @@ mod test {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let realm_id = RealmId([3u8; 32]);
@@ -303,6 +304,7 @@ mod test {
             metadata_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let realm_id = RealmId([0u8; 32]);

@@ -485,10 +485,7 @@ pub(super) async fn pinned_bucket(
     Ok(bucket_info)
 }
 
-async fn load_live_bucket(
-    ctx: &JobContext,
-    bucket: &str,
-) -> Result<BucketInfo, ItemFailure> {
+async fn load_live_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, ItemFailure> {
     match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
         Ok(bucket_info) => Ok(bucket_info),
         Err(GetBucketError::NotFound) => Err(ItemFailure::Stage(
@@ -767,7 +764,6 @@ mod pure_tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
-            mail: Default::default(),
         };
 
         let pinned = StagingJobSpec {

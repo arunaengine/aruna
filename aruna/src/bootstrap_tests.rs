@@ -142,6 +142,7 @@ fn context(storage_handle: aruna_storage::StorageHandle) -> DriverContext {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 
@@ -156,6 +157,7 @@ fn context_net(
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 

@@ -3,40 +3,31 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::Duration;
-
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::errors::ConversionError;
-use aruna_core::realm_vault::seal_setting;
-use aruna_core::register::RegisterStamp;
-use aruna_core::structs::execution::job::{
-    JobError, JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
-};
-use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
+use aruna_core::structs::execution::job::JobResultPayload;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::{
-    DELIVERY_HEADER, SIGNATURE_HEADER, URL_BYTES, WebhookDeliverySpec, WebhookSubscription,
-    sign_delivery, valid_url,
+    URL_BYTES, WebhookDeliverySpec, WebhookSubscription, valid_url,
 };
 use aruna_core::time::unix_timestamp_millis;
+use aruna_outbound::Backoffs;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
-use crate::jobs::submit::SubmitJobSpec;
-use crate::notifications::email::no_transport;
+use crate::notifications::email::{job_error, no_transport};
+use crate::notifications::send::SendOperation;
+use crate::notifications::setting_rows::{
+    ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
+};
 use crate::notifications::settings::{
-    Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting,
-    managers, write_setting,
+    Delivery, MetadataPeers, SettingPeers, delivery_setting, managers,
 };
 use crate::realm::get_config::GetConfigOperation;
-
-/// Total time one delivery attempt may take; the job runtime retries a timed out attempt.
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error, PartialEq)]
 pub enum WebhookError {
@@ -62,7 +53,8 @@ pub async fn read_webhook(
     ctx: &DriverContext,
     owner: UserId,
 ) -> Result<Option<WebhookSubscription>, WebhookError> {
-    let bytes = local_setting(ctx, SettingChannel::Webhook, owner).await?;
+    let read = ReadSettingOperation::new(SettingChannel::Webhook, owner);
+    let bytes = drive(read, ctx).await?;
     Ok(bytes
         .as_deref()
         .map(WebhookSubscription::from_bytes)
@@ -80,20 +72,8 @@ pub async fn set_webhook(
         return Err(WebhookError::InvalidUrl);
     }
     let secret: [u8; 32] = rand::random();
-    let sealed_secret = SecretBytes::new(secret.to_vec());
-    let build = |stamp: RegisterStamp| {
-        let id = stamp.write_id;
-        let sealed = seal_setting(
-            &owner.realm_id,
-            SettingChannel::Webhook,
-            &owner,
-            id,
-            &sealed_secret,
-        )
-        .map_err(|error| SettingError::Build(error.to_string()))?;
-        webhook_bytes(owner, stamp, Some(url.clone()), Some(sealed))
-    };
-    let subscription = write_webhook(ctx, local, owner, &build).await?;
+    let target = Some((url, SecretBytes::new(secret.to_vec())));
+    let subscription = write_webhook(ctx, local, owner, target).await?;
     Ok(WebhookOutcome {
         subscription,
         secret: hex::encode(secret),
@@ -106,93 +86,33 @@ pub async fn remove_webhook(
     local: NodeId,
     owner: UserId,
 ) -> Result<(), WebhookError> {
-    let build = |stamp: RegisterStamp| webhook_bytes(owner, stamp, None, None);
-    write_webhook(ctx, local, owner, &build).await.map(|_| ())
+    write_webhook(ctx, local, owner, None).await.map(|_| ())
 }
 
 async fn write_webhook(
     ctx: &DriverContext,
     local: NodeId,
     owner: UserId,
-    build: &(dyn Fn(RegisterStamp) -> Result<Vec<u8>, SettingError> + Sync),
+    target: Option<(String, SecretBytes)>,
 ) -> Result<WebhookSubscription, WebhookError> {
-    let bytes = write_setting(ctx, local, SettingChannel::Webhook, owner, build).await?;
-    Ok(WebhookSubscription::from_bytes(&bytes)?)
-}
-
-fn webhook_bytes(
-    owner: UserId,
-    stamp: RegisterStamp,
-    url: Option<String>,
-    sealed: Option<Vec<u8>>,
-) -> Result<Vec<u8>, SettingError> {
-    let subscription = WebhookSubscription {
-        subscription_id: stamp.write_id,
-        user_id: owner,
-        stamp,
-        url,
-        sealed,
-        created_at_ms: unix_timestamp_millis(),
+    let write = SettingWrite {
+        owner,
+        local,
+        write_id: Ulid::generate(),
+        event_id: Ulid::generate(),
+        now_ms: unix_timestamp_millis(),
+        value: SettingValue::Webhook { target },
     };
-    subscription
-        .to_bytes()
-        .map_err(|error| SettingError::Build(error.to_string()))
-}
-
-/// Queues one delivery job per held share upload notification, whatever the settings say now;
-/// the job decides from the setting when it runs. The notification id deduplicates; a failure is returned
-/// so the sender delivers again.
-pub async fn enqueue_webhooks(
-    context: &DriverContext,
-    owner_node_id: NodeId,
-    records: &[NotificationRecord],
-) -> Result<(), String> {
-    for record in records {
-        if !matches!(record.kind, NotificationKind::ShareUpload { .. }) {
-            continue;
-        }
-        let dedup_key = user_dedup_key(
-            record.recipient,
-            &format!("webhook/{}", record.notification_id),
-        );
-        let queued = find_dedup_job(context, record.recipient, &dedup_key).await;
-        if queued
-            .map_err(|error| format!("webhook delivery lookup: {error}"))?
-            .is_some()
-        {
-            continue;
-        }
-        let realm_id = record.recipient.realm_id;
-        let submitted = async {
-            let job_id = mint_local_job(context, realm_id, owner_node_id, Some(&dedup_key)).await?;
-            let spec = SubmitJobSpec {
-                payload: JobPayload::WebhookDelivery(WebhookDeliverySpec {
-                    subscription_id: Ulid::nil(),
-                    notification: record.clone(),
-                }),
-                created_by: record.recipient,
-                owner_node_id,
-                dedup_key: Some(dedup_key.clone()),
-                now_ms: unix_timestamp_millis(),
-                retention_ms: crate::jobs::JOB_RETENTION_MS,
-                workspace_mode: WorkspaceMode::default(),
-                workspace_bucket: None,
-                active_cap: None,
-            };
-            submit_local_job(context, spec, job_id).await
-        };
-        submitted
-            .await
-            .map_err(|error| format!("webhook delivery queue: {error}"))?;
-    }
-    Ok(())
+    let bytes = drive(WriteSettingOperation::new(write), ctx).await?;
+    Ok(WebhookSubscription::from_bytes(&bytes)?)
 }
 
 /// Sends one signed delivery when this node's current setting has the webhook on. A 4xx answer
 /// other than 408 and 429 is permanent; while no management node opens the secret, the job
 /// waits without an attempt.
-pub async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> JobRunOutcome {
-    let Some(metadata) = ctx.driver.metadata_handle.as_ref() else {
+pub(crate) async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> JobRunOutcome {
+    let (Some(_), Some(outbound)) = (&ctx.driver.metadata_handle, &ctx.driver.outbound_handle)
+    else {
         return no_transport();
     };
     let local = (ctx.driver.net_handle.as_ref()).map_or(ctx.owner_node_id, |net| net.node_id());
@@ -201,7 +121,7 @@ pub async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> Jo
         local,
     };
     let now_ms = unix_timestamp_millis();
-    deliver_webhook(ctx, spec, &peers, metadata.setting_backoffs(), now_ms).await
+    deliver_webhook(ctx, spec, &peers, outbound.backoffs(), now_ms).await
 }
 
 pub(crate) async fn deliver_webhook(
@@ -243,73 +163,18 @@ pub(crate) async fn deliver_webhook(
     else {
         return JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None });
     };
-    match deliver(ctx, spec, &url, secret.expose()).await {
-        Ok(status) => JobRunOutcome::Succeeded(JobResultPayload::Webhook { status }),
-        Err(Failure::Cancelled) => JobRunOutcome::Cancelled,
-        Err(Failure::Interrupted) => JobRunOutcome::Interrupted,
-        Err(Failure::Job(error)) => JobRunOutcome::Failed(error),
-    }
-}
-
-enum Failure {
-    Cancelled,
-    Interrupted,
-    Job(JobError),
-}
-
-async fn deliver(
-    ctx: &JobContext,
-    spec: &WebhookDeliverySpec,
-    url: &str,
-    secret: &[u8],
-) -> Result<Option<u16>, Failure> {
-    let body = spec
-        .body()
-        .ok_or_else(|| permanent("only share upload notifications are delivered"))?;
-    let body = serde_json::to_vec(&body).map_err(|error| permanent(error.to_string()))?;
-    let url = url::Url::parse(url).map_err(|error| permanent(error.to_string()))?;
-    let blob = ctx
-        .driver
-        .blob_handle
-        .as_ref()
-        .ok_or_else(|| retryable("blob handle unavailable for webhook egress"))?;
-    let timestamp = unix_timestamp_millis() / 1000;
-    let request = blob
-        .repository_request(reqwest::Method::POST, url)
-        .map_err(|error| permanent(format!("egress screen: {error}")))?
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            DELIVERY_HEADER,
-            spec.notification.notification_id.to_string(),
-        )
-        .header(SIGNATURE_HEADER, sign_delivery(secret, timestamp, &body))
-        .body(body);
-    let response = tokio::select! {
+    let now_s = unix_timestamp_millis() / 1000;
+    let send = SendOperation::webhook(spec, &url, secret.expose(), now_s);
+    let sent = tokio::select! {
         biased;
-        () = ctx.cancel.cancelled() => return Err(Failure::Cancelled),
-        () = ctx.shutdown.cancelled() => return Err(Failure::Interrupted),
-        result = tokio::time::timeout(DELIVERY_DEADLINE, request.send()) => result,
+        () = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
+        () = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
+        sent = drive(send, &ctx.driver) => sent,
     };
-    let response = response
-        .map_err(|_| retryable("the webhook receiver did not answer in time"))?
-        .map_err(|error| retryable(format!("webhook request: {error}")))?;
-    let status = response.status();
-    if status.is_success() {
-        return Ok(Some(status.as_u16()));
+    match sent {
+        Ok(status) => JobRunOutcome::Succeeded(JobResultPayload::Webhook { status }),
+        Err(error) => JobRunOutcome::Failed(job_error(error)),
     }
-    let message = format!("the webhook receiver answered {status}");
-    match status.is_client_error() && !matches!(status.as_u16(), 408 | 429) {
-        true => Err(permanent(message)),
-        false => Err(retryable(message)),
-    }
-}
-
-fn retryable(message: impl Into<String>) -> Failure {
-    Failure::Job(JobError::retryable(message))
-}
-
-fn permanent(message: impl Into<String>) -> Failure {
-    Failure::Job(JobError::permanent(message))
 }
 
 #[cfg(test)]

@@ -1607,11 +1607,7 @@ async fn page_inputs(
 }
 
 /// Whether each capture comes from the node its input names, or from ingress when it names none.
-fn sources_match(
-    inputs: &[InputSelection],
-    captured: &[CapturedInput],
-    ingress: NodeId,
-) -> bool {
+fn sources_match(inputs: &[InputSelection], captured: &[CapturedInput], ingress: NodeId) -> bool {
     captured.iter().all(|captured| {
         inputs.iter().any(|input| {
             input.dest_key == captured.destination_key
@@ -1769,6 +1765,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 

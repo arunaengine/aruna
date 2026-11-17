@@ -328,6 +328,7 @@ dependencies = [
  "aruna-kpabe",
  "aruna-net",
  "aruna-operations",
+ "aruna-outbound",
  "aruna-storage",
  "aruna-tasks",
  "aruna-wire",
@@ -736,6 +737,7 @@ dependencies = [
  "aruna-core",
  "aruna-net",
  "aruna-operations",
+ "aruna-outbound",
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
@@ -761,7 +763,6 @@ dependencies = [
  "iroh",
  "irokle",
  "jsonwebtoken",
- "lettre",
  "lru",
  "md5",
  "opentelemetry",
@@ -793,6 +794,18 @@ dependencies = [
  "unicode-normalization",
  "url",
  "zip",
+]
+
+[[package]]
+name = "aruna-outbound"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-core",
+ "async-trait",
+ "lettre",
+ "reqwest 0.13.5",
+ "tokio",
+ "ulid 3.0.0",
 ]
 
 [[package]]

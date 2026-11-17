@@ -55,6 +55,7 @@ pub enum Effect {
     /// Independent effects the runner runs at the same time; never persisted.
     Group(EffectGroup),
     Session(Box<crate::compute::session::SessionEffect>),
+    Outbound(crate::outbound::OutboundEffect),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at
@@ -755,6 +756,10 @@ pub enum NetEffect {
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
     /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.
     ArtifactStore(Box<crate::plugins::ArtifactStore>),
+    /// Sends one notification request frame to a holder and reads its answer frame.
+    Notification(Box<crate::structs::execution::notification::NotificationRequest>),
+    /// Wakes the live inbox streams of these local recipients.
+    WakeInbox(Vec<crate::UserId>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

@@ -19,7 +19,8 @@ use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
 use aruna_core::structs::execution::notification_watch::{
-    WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable, watch_resource_path,
+    WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable, WatchSubscription,
+    watch_resource_path,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -42,7 +43,7 @@ use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::notifications::watch::subscriptions::create_local_watch;
+use aruna_operations::notifications::watch::store::StoreWatchOperation;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aruna_operations::s3::object::get::ObjectInfo;
 use aruna_operations::s3::object::list::ListContinuationToken;
@@ -84,6 +85,7 @@ fn parser_service(realm_id: RealmId, node_id: NodeId) -> (TempDir, ArunaS3Servic
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     (
         storage_dir,
@@ -401,6 +403,7 @@ async fn put_survives_queue() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([40u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
@@ -516,6 +519,7 @@ async fn build_watch_context(
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     (storage_dir, context, net)
 }
@@ -618,15 +622,11 @@ async fn put_expands_watch() {
         watch_prefix.clone(),
     ));
     install_watch_authorization(&context, realm_id, net.node_id(), group_id, watcher).await;
-    create_local_watch(
-        &context.storage_handle,
-        watcher,
-        watch_prefix,
-        WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
-        0,
-    )
-    .await
-    .expect("watch subscription creates");
+    let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+    let subscription = WatchSubscription::new(watcher, watch_prefix, mask, 0);
+    drive(StoreWatchOperation::create(subscription, None), &context)
+        .await
+        .expect("watch subscription creates");
     let auth = AuthContext {
         user_id,
         realm_id,
@@ -753,6 +753,7 @@ async fn refresh_failure_hidden() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let refresh = ReferenceRefresh {
         bucket: "bucket".to_string(),
@@ -858,6 +859,7 @@ fn setup_state() -> TestState {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = aruna_core::structs::identity::realm::RealmId([9u8; 32]);
 
@@ -2423,6 +2425,7 @@ async fn setup_copy_authorization(
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([36u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2610,6 +2613,7 @@ async fn source_policy_denied() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([37u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2705,6 +2709,7 @@ async fn delete_uses_context() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([38u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2879,6 +2884,7 @@ async fn delimiter_groups_results() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([2u8; 32]);
     let group_id = Ulid::generate();
@@ -2957,6 +2963,7 @@ async fn delimiter_paginates() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([3u8; 32]);
     let group_id = Ulid::generate();
@@ -3110,6 +3117,7 @@ async fn prefix_page_complete() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([33u8; 32]);
     let group_id = Ulid::generate();
@@ -3176,6 +3184,7 @@ async fn listing_counts_entries() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([34u8; 32]);
     let group_id = Ulid::generate();
@@ -3297,6 +3306,7 @@ async fn large_group_collapses() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([4u8; 32]);
     let group_id = Ulid::generate();
@@ -3381,6 +3391,7 @@ async fn reference_returns_metadata() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([5u8; 32]);
     let group_id = Ulid::generate();
@@ -3564,6 +3575,7 @@ async fn zero_max_honored() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([6u8; 32]);
     let group_id = Ulid::generate();
@@ -3629,6 +3641,7 @@ async fn start_after_prefixes() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([7u8; 32]);
     let group_id = Ulid::generate();
@@ -3704,6 +3717,7 @@ async fn listing_requires_access() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([8u8; 32]);
     let service =
@@ -3741,6 +3755,7 @@ async fn max_keys_validated() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([35u8; 32]);
     let group_id = Ulid::generate();
@@ -3802,6 +3817,7 @@ async fn listing_applies_encoding() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([36u8; 32]);
     let group_id = Ulid::generate();
@@ -3877,6 +3893,7 @@ async fn fetch_owner_group() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([37u8; 32]);
     let group_id = Ulid::generate();

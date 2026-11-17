@@ -38,6 +38,7 @@ async fn run_read_rights() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([1; 32]);
     let (submitter, reader, other) = (user(2, realm_id), user(3, realm_id), user(4, realm_id));

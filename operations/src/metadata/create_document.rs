@@ -624,7 +624,7 @@ impl CreateDocumentOperation {
                 }
             };
             let dedup_key = pid_dedup_key(create_event.record.document_id);
-            let job_id = crate::jobs::service::mint_configured_job(
+            let job_id = crate::jobs::submit::mint_configured_job(
                 realm_config,
                 create_event.node_id,
                 &dedup_key,
@@ -2103,6 +2103,7 @@ mod tests {
             metadata_handle: Some(metadata_handle),
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         })
     }
 

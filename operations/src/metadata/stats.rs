@@ -374,6 +374,7 @@ mod tests {
             metadata_handle: Some(metadata_handle),
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         Fixture {
             _storage_dir: storage_dir,
@@ -670,6 +671,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         assert_eq!(

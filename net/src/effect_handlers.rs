@@ -252,6 +252,11 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
         )),
+        // Notification requests and inbox wakes need the net handle, which the runner holds.
+        NetEffect::Notification(_) => NetEvent::Notification(Err(
+            "notification requests must be dispatched by the operations runner".to_string(),
+        )),
+        NetEffect::WakeInbox(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
     }
 }
 
@@ -535,6 +540,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::StatementSign(_) => "statement_sign",
         NetEffect::Release(_) => "release",
         NetEffect::ArtifactStore(_) => "artifact_store",
+        NetEffect::Notification(_) => "notification",
+        NetEffect::WakeInbox(_) => "wake_inbox",
     }
 }
 

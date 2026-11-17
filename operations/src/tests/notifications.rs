@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::metadata::protocol::MetadataReadError;
-use crate::notifications::inbox::upsert_inbox_records;
+use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::settings::SettingPeers;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
@@ -32,6 +33,7 @@ pub(crate) fn context(storage: &StorageHandle) -> DriverContext {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 
@@ -61,10 +63,9 @@ pub(crate) fn record(
 }
 
 pub(crate) async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
-    assert_eq!(
-        upsert_inbox_records(storage, records).await,
-        Ok(records.len())
-    );
+    let upsert = UpsertInboxOperation::new(records.to_vec());
+    let outcome = drive(upsert, &context(storage)).await;
+    assert_eq!(outcome.map(|outcome| outcome.written), Ok(records.len()));
 }
 
 /// Management nodes that open every setting with a fixed secret and count the requests. A node
@@ -118,4 +119,39 @@ pub(crate) async fn store_setting(
 /// Three management nodes, in config order.
 pub(crate) fn managers() -> [aruna_core::NodeId; 3] {
     [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+}
+
+/// Stores a watch of `owner` on this node without authorization or replication.
+pub(crate) async fn create_local_watch(
+    storage: &StorageHandle,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: aruna_core::structs::execution::notification_watch::WatchEventMask,
+    now_ms: u64,
+) -> Result<
+    aruna_core::structs::execution::notification_watch::WatchSubscription,
+    crate::notifications::watch::records::WatchSubscriptionError,
+> {
+    let subscription = crate::notifications::watch::records::validated_subscription(
+        owner,
+        path_prefix,
+        event_mask,
+        now_ms,
+        Default::default(),
+    )?;
+    let store =
+        crate::notifications::watch::store::StoreWatchOperation::create(subscription.clone(), None);
+    drive(store, &context(storage)).await?;
+    Ok(subscription)
+}
+
+/// Deletes a watch of `owner` on this node without replication.
+pub(crate) async fn delete_local_watch(
+    storage: &StorageHandle,
+    owner: UserId,
+    watch_id: Ulid,
+) -> Result<(), crate::notifications::watch::records::WatchSubscriptionError> {
+    let store =
+        crate::notifications::watch::store::StoreWatchOperation::delete(owner, watch_id, None);
+    drive(store, &context(storage)).await.map(|_| ())
 }

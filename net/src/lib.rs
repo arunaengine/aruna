@@ -19,6 +19,7 @@ pub mod error;
 mod eviction;
 mod heartbeat;
 pub mod job_control;
+pub mod notification;
 pub mod streams;
 mod tasks;
 mod telemetry;
@@ -1098,6 +1099,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
         Effect::Net(NetEffect::Release(_)) => "release",
         Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
+        Effect::Net(NetEffect::Notification(_)) => "notification",
+        Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",
@@ -1109,6 +1112,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Stream() => "stream",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Outbound(_) => "outbound",
     }
 }
 pub(crate) fn unique_endpoint_addrs(
