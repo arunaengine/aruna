@@ -8,7 +8,7 @@ use aruna_core::structs::execution::job::JobId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row, values, StoreError, decode, encode};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row, values, StoreError, encode};
 use super::work::{Found, WorkKind, WorkLookup, WorkState};
 
 /// Row kind of the marks in the work keyspace, apart from the rows an install's removal deletes.

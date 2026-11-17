@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_runs::{
-    EVENTS_QUEUED, ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW,
+    ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW,
     SourceEvent, SourceKind, gap_key, outbox_key, source_key,
 };
 use aruna_core::types::GroupId;

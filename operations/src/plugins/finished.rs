@@ -14,7 +14,7 @@ use ulid::Ulid;
 
 use super::dispatch::event_run;
 use super::intents::{intent_scan, undone_keys};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, scan_rows, values, Rows, StoreError, decode, encode};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, scan_rows, values, decode, encode};
 use super::runs::{ADMISSIONS, Admission, RunError, audit_rows, read_run};
 use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_scan, work_state};
 use crate::driver::{DriverContext, drive};

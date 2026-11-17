@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use super::intents::{first_open, intent_keys, intent_scan, resolved_rows};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, Writes, done, row, unexpected, values, writes, StoreError, decode, encode};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, Writes, done, row, unexpected, values, writes, Rows, StoreError, decode, encode};
 use super::work::{WorkRow, work_scan};
 
 /// Serializes admissions on this node, so no install passes its queue bound.

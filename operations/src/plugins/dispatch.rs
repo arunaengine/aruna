@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{
-    MAX_INPUT, PluginRun, RunState, RunTrigger, SourceEvent, SourceKind, timer_key,
+    MAX_INPUT, PluginRun, RunState, RunTrigger, SourceEvent, timer_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
