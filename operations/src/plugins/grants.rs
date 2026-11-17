@@ -5,9 +5,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use aruna_core::NodeId;
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::types::GroupId;
+use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::manifest::Manifest;
 use aruna_plugins::permission::{Grant, Permission};
 use thiserror::Error;
@@ -293,6 +297,50 @@ pub fn parse_grants(stored: &BTreeMap<String, Vec<String>>) -> Grants {
             Some((name.parse().ok()?, patterns.iter().cloned().collect()))
         })
         .collect()
+}
+
+/// The full permission path of an object path a plugin gives: a path below the realm as it is,
+/// or `bucket/key` (a prefix ends in `/`) on this node. Expanded before any grant check, so a
+/// path the plugin did not mean is never checked.
+pub(crate) fn object_path(
+    (realm_id, local): (RealmId, NodeId),
+    group: GroupId,
+    text: &str,
+) -> Result<String, HostError> {
+    if text.starts_with('/') {
+        return Ok(text.to_string());
+    }
+    let invalid = || {
+        let message = format!("`{text}` is not a bucket path such as `bucket/key`");
+        HostError::new(ErrorKind::Invalid, message)
+    };
+    let (bucket, key) = text.split_once('/').unwrap_or((text, ""));
+    let segments: Vec<&str> = key.split('/').collect();
+    let last = segments.len() - 1;
+    let plain = (segments.iter().enumerate()).all(|(index, segment)| {
+        !matches!(*segment, "." | "..") && (index == last || !segment.is_empty())
+    });
+    if matches!(bucket, "" | "." | "..") || !plain {
+        return Err(invalid());
+    }
+    Ok(object_permission_path(realm_id, group, local, bucket, key))
+}
+
+/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
+/// text stays as it is.
+pub(crate) fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
+    let realm = install.account.realm_id;
+    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
+    path.strip_prefix(&root).unwrap_or(path).to_string()
+}
+
+/// The scope of an install, for its generated grant paths.
+pub(crate) fn install_scope(install: &PluginInstall) -> InstallScope {
+    InstallScope {
+        realm_id: install.account.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    }
 }
 
 #[cfg(test)]

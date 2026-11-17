@@ -40,9 +40,14 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::check::{RunScope, authorize_call, check_call, matching};
-use super::creates::{Lookup, Step, claim_key, next_step, settle_key};
-use super::dataset::{dataset_change, dataset_crate, dataset_of, file_entities, file_entity};
-use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
+use super::creates::{
+    Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
+};
+use super::dataset::{
+    content_urls, dataset_change, dataset_crate, dataset_of, file_entities, file_entity,
+    parse_document, same_revision,
+};
+use super::grants::{accesses, install_scope, object_path, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row, written};
@@ -682,33 +687,6 @@ fn check_key(key: &str) -> Result<(), HostError> {
     }
 }
 
-/// The full permission path of an object path a plugin gives: a path below the realm as it is,
-/// or `bucket/key` (a prefix ends in `/`) on this node. Expanded before any grant check, so a
-/// path the plugin did not mean is never checked.
-pub(crate) fn object_path(
-    (realm_id, local): (aruna_core::structs::identity::realm::RealmId, NodeId),
-    group: aruna_core::types::GroupId,
-    text: &str,
-) -> Result<String, HostError> {
-    if text.starts_with('/') {
-        return Ok(text.to_string());
-    }
-    let invalid = || {
-        let message = format!("`{text}` is not a bucket path such as `bucket/key`");
-        HostError::new(ErrorKind::Invalid, message)
-    };
-    let (bucket, key) = text.split_once('/').unwrap_or((text, ""));
-    let segments: Vec<&str> = key.split('/').collect();
-    let last = segments.len() - 1;
-    let plain = (segments.iter().enumerate()).all(|(index, segment)| {
-        !matches!(*segment, "." | "..") && (index == last || !segment.is_empty())
-    });
-    if matches!(bucket, "" | "." | "..") || !plain {
-        return Err(invalid());
-    }
-    Ok(object_permission_path(realm_id, group, local, bucket, key))
-}
-
 /// The version id a plugin gave as text.
 fn version_id(text: &str) -> Result<Ulid, HostError> {
     let invalid = || HostError::new(ErrorKind::Invalid, format!("`{text}` is not a version id"));
@@ -721,38 +699,6 @@ fn byte_size(bytes: usize) -> String {
         0 => format!("{} MiB", bytes >> 20),
         _ => format!("{bytes} bytes"),
     }
-}
-
-/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
-/// text stays as it is.
-pub(crate) fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
-    let realm = install.account.realm_id;
-    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
-    path.strip_prefix(&root).unwrap_or(path).to_string()
-}
-
-/// Refuses a `contentUrl` that names nothing readers can resolve, such as a short bucket path:
-/// it must be an absolute IRI such as an `s3://` address, an object path below the realm, or a
-/// reference inside the crate.
-fn content_urls(file: &Value) -> Result<(), HostError> {
-    let urls = match file.get("contentUrl") {
-        Some(Value::Array(urls)) => urls.iter().collect(),
-        Some(url) => vec![url],
-        None => Vec::new(),
-    };
-    for url in urls {
-        let text = (url.get("@id").unwrap_or(url).as_str()).unwrap_or_default();
-        let scheme = text
-            .split_once(':')
-            .is_some_and(|(scheme, _)| !scheme.is_empty() && !scheme.contains('/'));
-        if !(scheme || text.starts_with('/') || text.starts_with("./")) {
-            let message = format!(
-                "the contentUrl `{text}` names no object; use the object's s3:// address or path"
-            );
-            return Err(HostError::new(ErrorKind::Invalid, message));
-        }
-    }
-    Ok(())
 }
 
 /// The bucket and key on `local` of an object path below the install's group data; a bucket of
@@ -1427,19 +1373,6 @@ const FILE_PAGE: usize = 100;
 const MAX_KEY: usize = 256;
 
 /// The intent reply of a create: the document id and its establishing revision.
-fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
-    format!("{document_id} {revision}")
-}
-
-fn stored_created(reply: &str) -> Result<Created, HostError> {
-    let (resource, revision) = (reply.split_once(' '))
-        .ok_or_else(|| unavailable("the stored create reply is not readable"))?;
-    Ok(Created {
-        resource: resource.to_string(),
-        revision: revision.to_string(),
-    })
-}
-
 /// Whether a failed create had no effect, or may have had one.
 fn create_outcome(error: CreateAuthorizedError) -> Outcome {
     let none = |kind, message: String| Outcome::None(HostError::new(kind, message));
@@ -1467,28 +1400,6 @@ fn create_outcome(error: CreateAuthorizedError) -> Outcome {
 
 /// Refuses a copy at another revision than the patch expects: one behind it is retryable,
 /// one ahead of it is a conflict the plugin resolves by reading again.
-fn same_revision(exported: Ulid, expected: Ulid) -> Result<(), HostError> {
-    match exported.cmp(&expected) {
-        std::cmp::Ordering::Equal => Ok(()),
-        std::cmp::Ordering::Less => Err(unavailable(format!(
-            "the copy read is at {exported}, before the expected {expected}; try again"
-        ))),
-        std::cmp::Ordering::Greater => Err(HostError::new(
-            ErrorKind::Conflict,
-            format!("the document is at {exported}, not at the expected {expected}"),
-        )),
-    }
-}
-
-fn parse_document(resource: &str) -> Result<Ulid, HostError> {
-    Ulid::from_string(resource).map_err(|_| {
-        HostError::new(
-            ErrorKind::Invalid,
-            format!("{resource} is not a document id"),
-        )
-    })
-}
-
 /// A read error as the guest sees it; an unreachable or not yet visible document is retryable.
 fn api_error(error: MetadataApiError) -> HostError {
     match error {
@@ -1704,15 +1615,6 @@ impl RunBroker {
         let shown = self.shown.lock();
         let shown = shown.unwrap_or_else(|poisoned| poisoned.into_inner());
         (shown.iter()).fold(text.to_string(), |text, fields| scrub(&text, fields))
-    }
-}
-
-/// The scope of an install, for its generated grant paths.
-fn install_scope(install: &PluginInstall) -> InstallScope {
-    InstallScope {
-        realm_id: install.account.realm_id,
-        group_id: install.group_id,
-        install_id: install.install_id,
     }
 }
 

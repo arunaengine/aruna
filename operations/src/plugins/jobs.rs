@@ -14,7 +14,7 @@ use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::broker::short_path;
+use super::grants::short_path;
 use super::marks::is_marked;
 use super::rows::{StoreError, decode, delete_rows, scan_rows};
 use super::unavailable;

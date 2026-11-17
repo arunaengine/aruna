@@ -34,7 +34,7 @@ use ulid::Ulid;
 use super::account::prerequisites_held;
 use super::artifacts::fetch_artifact;
 use super::artifacts::local_config;
-use super::broker::{RunBroker, absent, short_path};
+use super::broker::{RunBroker, absent};
 use super::check::{RunScope, check_call};
 use super::cleanup::sweep_events;
 use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start, probe_clock};
@@ -48,7 +48,7 @@ use super::forward::{
     Backoff, REQUEST_BYTES, Requests, apply, dataset_facts, drop_rows, expire_rows, next_install,
     receiver_requests,
 };
-use super::grants::{parse_grants, patterns_for};
+use super::grants::{parse_grants, patterns_for, short_path};
 use super::install::read_config;
 use super::intents::open_intent;
 use super::jobs::{retire_work, settle_work};

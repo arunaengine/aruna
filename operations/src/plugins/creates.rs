@@ -6,12 +6,14 @@
 use aruna_core::UserId;
 use aruna_core::keyspaces::PLUGIN_CREATES_KEYSPACE;
 use aruna_core::plugin_installs::PluginInstall;
+use aruna_plugins::broker::{Created, HostError};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::rows::{
     Answer, Ask, Plan, RowsOperation, StoreError, Turn, decode, done, encode, row, values,
 };
+use super::unavailable;
 use crate::metadata::forward::PinnedCreate;
 
 /// How the key row of a create was found.
@@ -194,6 +196,21 @@ impl Plan for SettleKey {
         let write = row(PLUGIN_CREATES_KEYSPACE, self.row.clone(), encode(&stored)?);
         Ok(Turn::Ask(Ask::Write(vec![write])))
     }
+}
+
+/// The stored reply of a create: its document id and establishing revision.
+pub(crate) fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
+    format!("{document_id} {revision}")
+}
+
+/// A create reply read back from its stored form.
+pub(crate) fn stored_created(reply: &str) -> Result<Created, HostError> {
+    let (resource, revision) = (reply.split_once(' '))
+        .ok_or_else(|| unavailable("the stored create reply is not readable"))?;
+    Ok(Created {
+        resource: resource.to_string(),
+        revision: revision.to_string(),
+    })
 }
 
 #[cfg(test)]

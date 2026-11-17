@@ -5,6 +5,7 @@
 
 use aruna_plugins::broker::{ErrorKind, HostError};
 use serde_json::Value;
+use ulid::Ulid;
 
 use super::unavailable;
 
@@ -247,4 +248,52 @@ fn literal_objects(change: &mut Value) {
             _ => {}
         }
     }
+}
+
+/// Refuses a `contentUrl` that names nothing readers can resolve, such as a short bucket path:
+/// it must be an absolute IRI such as an `s3://` address, an object path below the realm, or a
+/// reference inside the crate.
+pub(crate) fn content_urls(file: &Value) -> Result<(), HostError> {
+    let urls = match file.get("contentUrl") {
+        Some(Value::Array(urls)) => urls.iter().collect(),
+        Some(url) => vec![url],
+        None => Vec::new(),
+    };
+    for url in urls {
+        let text = (url.get("@id").unwrap_or(url).as_str()).unwrap_or_default();
+        let scheme = text
+            .split_once(':')
+            .is_some_and(|(scheme, _)| !scheme.is_empty() && !scheme.contains('/'));
+        if !(scheme || text.starts_with('/') || text.starts_with("./")) {
+            let message = format!(
+                "the contentUrl `{text}` names no object; use the object's s3:// address or path"
+            );
+            return Err(HostError::new(ErrorKind::Invalid, message));
+        }
+    }
+    Ok(())
+}
+
+/// The establishing revision a write expects, against the one the document is at.
+pub(crate) fn same_revision(exported: Ulid, expected: Ulid) -> Result<(), HostError> {
+    match exported.cmp(&expected) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less => Err(unavailable(format!(
+            "the copy read is at {exported}, before the expected {expected}; try again"
+        ))),
+        std::cmp::Ordering::Greater => Err(HostError::new(
+            ErrorKind::Conflict,
+            format!("the document is at {exported}, not at the expected {expected}"),
+        )),
+    }
+}
+
+/// The document id a plugin gave as its resource.
+pub(crate) fn parse_document(resource: &str) -> Result<Ulid, HostError> {
+    Ulid::from_string(resource).map_err(|_| {
+        HostError::new(
+            ErrorKind::Invalid,
+            format!("{resource} is not a document id"),
+        )
+    })
 }
