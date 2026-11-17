@@ -11,8 +11,8 @@ use aruna_core::keyspaces::MATERIALIZATION_JOB_KEYSPACE;
 use aruna_core::metadata::{
     ApplyRoCrateRequest, MaterializationState, MaterializationStatusRecord, MetadataBatch,
     MetadataCrateRequest, MetadataEffect, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
-    MetadataGraphPolicy, MetadataRequestDurability, UpsertEntityRequest,
-    deterministic_materialization_actor, resolve_raw_revision,
+    MetadataGraphPolicy, MetadataMaterializationRecord, MetadataRequestDurability,
+    UpsertEntityRequest, deterministic_materialization_actor, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
     create_event_entry, document_job_entry, materialization_job_entry,
@@ -24,9 +24,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_graph::GraphHandle;
 use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::materialization_queue::{
-    new_materialization_job, new_pending_status, process_materialization_batch,
-};
+use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::{MetadataHandle, send_metadata_effect};
 use aruna_storage::{FjallStorage, StorageHandle};
 use craqle::{
@@ -255,8 +253,8 @@ async fn retries_interrupted_apply() -> Result<(), Box<dyn std::error::Error>> {
     let document_id = Ulid::from_bytes([1u8; 16]);
     let event_id = Ulid::from_parts(10, 1);
     let event = create_event(&test, document_id, event_id, "crash-window");
-    let status = new_pending_status(&event, 1);
-    let job = new_materialization_job(&event, 1);
+    let status = MaterializationStatusRecord::pending(&event, 1);
+    let job = MetadataMaterializationRecord::new(&event, 1);
     write_entries(
         &test.context.storage_handle,
         vec![
@@ -293,7 +291,7 @@ async fn cleans_leftover_job() -> Result<(), Box<dyn std::error::Error>> {
     let document_id = Ulid::from_bytes([2u8; 16]);
     let event_id = Ulid::from_parts(20, 1);
     let event = create_event(&test, document_id, event_id, "final-leftover");
-    let job = new_materialization_job(&event, 1);
+    let job = MetadataMaterializationRecord::new(&event, 1);
     let final_status = MaterializationStatusRecord {
         document_id,
         event_id,

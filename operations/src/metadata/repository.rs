@@ -26,9 +26,11 @@ pub use aruna_core::storage_entries::{
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
 };
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
+use std::time::Duration;
 use ulid::Ulid;
 
 use crate::storage_read::{parse_storage_iter, parse_storage_read};
@@ -337,6 +339,14 @@ pub(crate) fn parse_registry_iter(
 
 pub(crate) fn empty_effects() -> Effects {
     smallvec![]
+}
+
+/// Wakes the materialization drain at once.
+pub(crate) fn schedule_materialization() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainMaterializationQueue,
+        after: Duration::ZERO,
+    })
 }
 
 #[cfg(test)]

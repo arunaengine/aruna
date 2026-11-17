@@ -12,7 +12,7 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::drain::restore_drain_timer;
 use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::spawn_metadata_warmup;
+use aruna_operations::metadata::warmup::spawn_metadata_warmup;
 use aruna_operations::node::startup::{RecoveryConfig, RecoveryStatus};
 use aruna_operations::plugins::artifacts::spawn_repair;
 use aruna_operations::plugins::worker::spawn_worker;

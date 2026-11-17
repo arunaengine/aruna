@@ -216,27 +216,6 @@ impl From<MetadataIriError> for MetadataMaterializationError {
     }
 }
 
-pub(crate) fn schedule_materialization() -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainMaterializationQueue,
-        after: Duration::ZERO,
-    })
-}
-
-pub fn new_materialization_job(
-    event: &MetadataEventRecord,
-    due_at_ms: u64,
-) -> MetadataMaterializationRecord {
-    MetadataMaterializationRecord::new(event, due_at_ms)
-}
-
-pub fn new_pending_status(
-    event: &MetadataEventRecord,
-    updated_at_ms: u64,
-) -> MaterializationStatusRecord {
-    MaterializationStatusRecord::pending(event, updated_at_ms)
-}
-
 pub(crate) async fn restore_materialization_timer(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
@@ -1022,7 +1001,7 @@ async fn requeue_dead_letter(
     };
     let status = MaterializationStatusRecord {
         failures: job.failures,
-        ..new_pending_status(&event, unix_timestamp_millis())
+        ..MaterializationStatusRecord::pending(&event, unix_timestamp_millis())
     };
     let txn_id = start_write_transaction(storage).await?;
     let result = requeue_in_txn(storage, txn_id, &job, &status).await;

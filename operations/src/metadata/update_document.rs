@@ -9,9 +9,10 @@ use aruna_core::keyspaces::{
     METADATA_CHECKPOINT_KEYSPACE, RAW_BUDGET_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::{
-    EVENT_LIMIT, MetadataActor, MetadataBatch, MetadataBatchSource, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
-    ProfileValidationStatus, RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
+    EVENT_LIMIT, MaterializationStatusRecord, MetadataActor, MetadataBatch, MetadataBatchSource,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
+    MetadataLifecycleRecord, MetadataMaterializationRecord, ProfileValidationStatus,
+    RAW_BYTES_LIMIT, RawOriginBudget, raw_quotas,
 };
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
@@ -35,14 +36,12 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::metadata::materialization_queue::{
-    new_materialization_job, new_pending_status, schedule_materialization,
-};
 use crate::metadata::profile::validation::{
     batch_adds_profile, not_profiled_status, profile_path_rule, stale_status,
     submission_profile_tag,
 };
 use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
+use crate::metadata::repository::schedule_materialization;
 use crate::metadata::repository::{
     StorageReadError, event_projection_entries, parse_registry_read, read_registry_effect,
 };
@@ -445,8 +444,8 @@ impl UpdateDocumentOperation {
             create_outbox_record(event, message, self.realm_config.as_ref(), false)
                 .fenced_at(self.generation_of(&event.record.placement));
         let outbox = (!event.record.holder_node_ids.is_empty()).then_some(&lifecycle_outbox);
-        let status = new_pending_status(event, now);
-        let job = new_materialization_job(event, now);
+        let status = MaterializationStatusRecord::pending(event, now);
+        let job = MetadataMaterializationRecord::new(event, now);
         let mut writes = event_projection_entries(event, &audit, outbox, &status, &job)?;
         // Refresh the everywhere-bound registry row so non-holders see the new
         // revision, not just the bucket's holders.

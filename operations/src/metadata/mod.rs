@@ -41,13 +41,7 @@ pub mod timestamp_index;
 pub mod update_document;
 pub mod update_entry;
 pub mod visibility_index;
-
-use std::sync::Arc;
-
-use aruna_core::shutdown::Shutdown;
-use tracing::warn;
-
-use crate::driver::DriverContext;
+pub mod warmup;
 
 /// The phase-time and identity samples a metadata operation stamps records
 /// with. Production keeps the defaults and samples per phase; tests replace the
@@ -108,22 +102,3 @@ pub(crate) use handle::{
 pub use protocol::{
     AuthToken, AuthTokenError, MetadataPathWinner, MetadataReadError, PersistentIdResolution,
 };
-
-/// Primes the metadata caches off the boot path so the first user query
-/// finds them warm. Never blocks startup.
-pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
-    timestamp_index::spawn_index_sweep(Arc::clone(&context), shutdown);
-    visibility_index::spawn_visibility_index(Arc::clone(&context), shutdown);
-    shutdown.spawn(async move {
-        if context.metadata_handle.is_none() {
-            return;
-        }
-        if let Err(error) = warm_caches(&context).await {
-            warn!(error = %error, "Metadata visibility cache warmup failed");
-            return;
-        }
-        if let Err(error) = iri_index::rebuild_index(&context).await {
-            warn!(error = %error, "Metadata IRI reference index rebuild failed");
-        }
-    });
-}

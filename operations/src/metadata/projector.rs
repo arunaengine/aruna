@@ -21,7 +21,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventPayload,
-    MetadataEventRecord, MetadataLifecycleRecord,
+    MetadataEventRecord, MetadataLifecycleRecord, MetadataMaterializationRecord,
 };
 use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, SourceEvent, journal_entries, source_key};
 use aruna_core::storage_entries::{
@@ -47,9 +47,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::materialization_queue::{
-    new_materialization_job, new_pending_status, schedule_materialization,
-};
+use crate::metadata::repository::schedule_materialization;
 use crate::metadata::repository::{
     StorageReadError, create_materialization_entries, create_outbox_entries, parse_lifecycle_read,
     parse_status_read, read_document_registry, read_lifecycle_effect, read_status_effect,
@@ -524,7 +522,10 @@ pub async fn project_create_events(
             && let MetadataEventPayload::ApplyBatch { batch, .. } = &event.payload
             && !dot_applied(context, &event.record.graph_iri, batch).await?
         {
-            let job = new_materialization_job(&event, aruna_core::time::unix_timestamp_millis());
+            let job = MetadataMaterializationRecord::new(
+                &event,
+                aruna_core::time::unix_timestamp_millis(),
+            );
             writes.push(materialization_job_entry(&job)?);
             writes.push(document_job_entry(&job)?);
             late_graphs.insert(event.record.graph_iri.clone());
@@ -593,8 +594,8 @@ pub async fn project_create_events(
         let audit = audit_record(&event, message.as_deref());
         if needs_materialization {
             let now = aruna_core::time::unix_timestamp_millis();
-            let status = new_pending_status(&event, now);
-            let job = new_materialization_job(&event, now);
+            let status = MaterializationStatusRecord::pending(&event, now);
+            let job = MetadataMaterializationRecord::new(&event, now);
             writes.extend(create_materialization_entries(
                 &event.record,
                 &audit,
