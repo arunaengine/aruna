@@ -187,6 +187,17 @@ impl From<ConversionError> for GroupDeletionError {
     }
 }
 
+/// A lost transaction is a conflict to retry; any other runner failure leaves deletion unavailable.
+impl From<crate::calls::IoError> for GroupDeletionError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict => StorageError::TransactionConflict.into(),
+            crate::calls::IoError::Storage(error) => error.into(),
+            error => Self::Unavailable(error.to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupDeleteRecord {
     pub plan: GroupDeletePlan,
