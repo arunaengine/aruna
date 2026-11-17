@@ -3,10 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod dashboard;
+pub mod drain_state;
 pub mod heartbeat;
 pub mod holder_choice;
 pub mod node_info;
+pub mod realm_usage;
 mod rebuild_counts;
 pub mod startup;
+pub mod usage_publish;
 mod usage_rebuild;
 pub mod usage_stats;
