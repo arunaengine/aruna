@@ -27,7 +27,9 @@ use aruna_core::types::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox_record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
@@ -95,7 +97,8 @@ impl AnnounceTopicOperation {
         let change = self.document_upsert_change(&self.document, &bytes)?;
         // Announce only ever emits Upsert here, so the record mirrors the
         // change's placement; the admin fallback is unused.
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            self.derived_id(b"outbox", &bytes),
             self.local_node_id,
             self.document.clone(),
             self.peers.clone(),
@@ -106,6 +109,19 @@ impl AnnounceTopicOperation {
         let row = outbox_write_entry(&record).map_err(ConversionError::from)?;
         self.phase = Phase::Writing;
         Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    /// An id from the run's time and a hash of `kind`, this node, the document and its bytes:
+    /// unique per content and millisecond, without a random input.
+    fn derived_id(&self, kind: &[u8], bytes: &[u8]) -> Ulid {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(kind);
+        hasher.update(self.local_node_id.as_bytes());
+        hasher.update(self.document.storage_key().as_ref());
+        hasher.update(bytes);
+        let mut random = [0u8; 16];
+        random.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Ulid::from_parts(self.now_ms, u128::from_be_bytes(random))
     }
 
     fn document_upsert_change(
@@ -238,7 +254,7 @@ impl AnnounceTopicOperation {
                     base: None,
                     current: DocumentSyncRevision {
                         generation: record.updated_at_ms,
-                        event_id: Ulid::generate(),
+                        event_id: self.derived_id(b"event", bytes),
                         actor: self.local_node_id,
                         updated_at_ms: record.updated_at_ms,
                     },
@@ -308,7 +324,7 @@ impl AnnounceTopicOperation {
                 base: None,
                 current: DocumentSyncRevision {
                     generation: self.now_ms,
-                    event_id: Ulid::generate(),
+                    event_id: self.derived_id(b"event", bytes),
                     actor: self.local_node_id,
                     updated_at_ms: self.now_ms,
                 },
@@ -467,11 +483,35 @@ mod pure_tests {
             AnnounceTopicOperation::new(document, node_id, Vec::new(), PlacementRef::NIL, false);
         operation.stamp(77);
         let record = written_record(operation.next(read(Some(b"info".to_vec()))));
+        assert_eq!(record.outbox_id.timestamp_ms(), 77);
         let DocumentOutboxEvent::Upsert { change, .. } = record.event else {
             panic!("expected revisioned upsert");
         };
         assert_eq!(change.current.generation, 77);
         assert_eq!(change.current.updated_at_ms, 77);
+        assert_eq!(change.current.event_id.timestamp_ms(), 77);
+        assert_ne!(change.current.event_id, record.outbox_id);
+    }
+
+    #[test]
+    fn ids_follow_inputs() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let node_id = local_node_id();
+        let document = DocumentTarget::NodeInfo { realm_id, node_id };
+        let outbox_id = |now_ms: u64, bytes: &[u8]| {
+            let mut operation = AnnounceTopicOperation::new(
+                document.clone(),
+                node_id,
+                Vec::new(),
+                PlacementRef::NIL,
+                false,
+            );
+            operation.stamp(now_ms);
+            written_record(operation.next(read(Some(bytes.to_vec())))).outbox_id
+        };
+        assert_eq!(outbox_id(5, b"a"), outbox_id(5, b"a"));
+        assert_ne!(outbox_id(5, b"a"), outbox_id(5, b"b"));
+        assert_ne!(outbox_id(5, b"a"), outbox_id(6, b"a"));
     }
 
     #[test]
