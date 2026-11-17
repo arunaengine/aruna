@@ -10,7 +10,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, JOB_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::structs::execution::job::{
-    JobId, JobPayload, RECORD_KEY_PREFIX, StagingJobCheckpoint, StagingJobSpec,
+    JobId, JobPayload, JobRecord, RECORD_KEY_PREFIX, StagingJobCheckpoint, StagingJobSpec,
 };
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -29,7 +29,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::JOB_RETENTION_MS;
 use crate::jobs::service::submit_handed_job;
 use crate::jobs::staging::{handed_checkpoint, read_staging_checkpoint};
-use crate::jobs::store::decode_job_record;
+
 use crate::metadata::protocol::MetadataReadError;
 use crate::s3::bucket::get::GetBucketOperation;
 
@@ -79,7 +79,7 @@ pub(crate) async fn open_imports(
         let prefix = Some(RECORD_KEY_PREFIX.to_vec());
         let (rows, next) = page(context, JOB_KEYSPACE, prefix, start, JOB_PAGE).await?;
         for (_, value) in rows {
-            let Ok(record) = decode_job_record(&value) else {
+            let Ok(record) = JobRecord::from_bytes(&value) else {
                 continue;
             };
             if let JobPayload::Staging(spec) = record.payload

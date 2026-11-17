@@ -11,6 +11,7 @@ use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE,
 };
+use aruna_core::structs::execution::job::prune_delete_entries;
 use aruna_core::structs::execution::job::{
     EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
     JobPayload, JobRecord, JobRecordEnvelope, JobRetryPolicy, RunCrateStatus, SubmissionClaim,
@@ -22,7 +23,6 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
-use aruna_operations::jobs::store::prune_delete_entries;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -511,6 +511,7 @@ mod tests {
         JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
         WITNESS_DEADLINE_KEYSPACE,
     };
+    use aruna_core::structs::execution::job::job_insert_entries;
     use aruna_core::structs::execution::job::{
         EffectiveResources, ExecutionReceipt, ExecutionSpec, JobAdmissionRecord, JobFamilyId,
         JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, JobRecordKey,
@@ -523,7 +524,7 @@ mod tests {
     use aruna_core::types::GroupId;
     use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord};
     use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_operations::jobs::store::{job_insert_entries, list_user_jobs};
+    use aruna_operations::jobs::store::list_user_jobs;
     use aruna_storage::FjallStorage;
     use serde::Serialize;
     use std::collections::BTreeMap;

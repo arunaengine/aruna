@@ -19,7 +19,7 @@ use super::keys::{MAX_ALIAS_FAMILIES, alias_family, alias_prefix, family_prefix,
 use super::reduce::reduce_family;
 use super::rows::{ProjectionCache, from_bytes, to_bytes};
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
-use crate::jobs::store::{JobDeletes, JobWrites};
+use aruna_core::structs::execution::job::{JobDeletes, JobWrites};
 
 /// Aliases one family may bridge into local job rows.
 const MAX_BRIDGED_ALIASES: usize = 64;

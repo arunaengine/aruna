@@ -34,9 +34,9 @@ use thiserror::Error;
 use tracing::warn;
 
 use super::import::{UploadClaimError, claim_upload, upload_key};
-use super::store::{decode_job_record, dedup_index_key, job_insert_entries};
 use crate::groups::imports::cron::is_running;
 use crate::harvest::repository::source_key;
+use aruna_core::structs::execution::job::{dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_drain_effect() -> Effect {
@@ -506,7 +506,7 @@ impl SubmitJobOperation {
                 "import run check without a rule".to_string(),
             ));
         };
-        match value.map(decode_job_record).transpose() {
+        match value.map(JobRecord::from_bytes).transpose() {
             Ok(Some(last)) if is_running(last.state) => self.fail(SubmitJobError::ImportRunning),
             Ok(_) => self.claim_import(txn_id, rule),
             Err(error) => self.fail(error.into()),
@@ -554,7 +554,7 @@ impl SubmitJobOperation {
                 "source run check without a source".to_string(),
             ));
         };
-        match value.map(decode_job_record).transpose() {
+        match value.map(JobRecord::from_bytes).transpose() {
             Ok(Some(last)) if is_running(last.state) => self.fail(SubmitJobError::SourceRunning),
             Ok(_) => self.claim_source(txn_id, source),
             Err(error) => self.fail(error.into()),
@@ -725,7 +725,7 @@ impl Operation for SubmitJobOperation {
             } => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
-                }) => match decode_job_record(&value) {
+                }) => match JobRecord::from_bytes(&value) {
                     Ok(_) if digest_matches => self.finish_existing(txn_id, job_id),
                     Ok(_) => self.fail(SubmitJobError::JobPlanConflict {
                         existing_job_id: job_id,

@@ -8,12 +8,11 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::jobs::RunningJobView;
 use aruna_core::keyspaces::JOB_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use std::collections::HashMap;
 use thiserror::Error;
-
-use crate::jobs::store::decode_job_record;
 
 const PAGE: usize = 256;
 
@@ -90,7 +89,7 @@ impl Operation for RecentJobsOperation {
             }
         };
         for (_, value) in values {
-            let record = match decode_job_record(&value) {
+            let record = match JobRecord::from_bytes(&value) {
                 Ok(record) => record,
                 Err(error) => return self.finish(Err(error.into())),
             };

@@ -20,8 +20,8 @@ use crate::jobs::records::project::{
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::rows::{PROJECTION_CACHE_VERSION, ProjectionCache, to_bytes};
 use crate::jobs::records::{MAX_PROJECTION_RECORDS, RecordStoreError};
-use crate::jobs::store::JobWrites;
 use crate::tests::records::{Family, payload, user};
+use aruna_core::structs::execution::job::JobWrites;
 
 /// What one sans-I/O run of the projection did, with no storage behind it.
 struct Run {

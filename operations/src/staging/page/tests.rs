@@ -171,7 +171,7 @@ fn record(claim_token: Ulid) -> JobRecord {
 }
 
 fn claim(record: &JobRecord) -> Option<Value> {
-    let guard = crate::jobs::store::ClaimGuard::of(record)?;
+    let guard = aruna_core::structs::execution::job::ClaimGuard::of(record)?;
     value(guard.to_bytes().unwrap())
 }
 

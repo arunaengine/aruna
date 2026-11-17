@@ -10,10 +10,10 @@ use ulid::Ulid;
 use super::admission_race::{config, envelope, seed};
 use crate::jobs::lifecycle::target::commit_receipt;
 use crate::jobs::store::{
-    batch_delete, prune_delete_entries, put_crate_outcome, read_crate_status, read_job_record,
-    read_run_link,
+    batch_delete, put_crate_outcome, read_crate_status, read_job_record, read_run_link,
 };
 use crate::tests::records::{Family, context};
+use aruna_core::structs::execution::job::prune_delete_entries;
 
 #[tokio::test]
 async fn run_link_lasts() {
