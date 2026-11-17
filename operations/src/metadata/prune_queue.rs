@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::materialization_queue::metadata_graph_deleted;
+use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::repository::schedule_prune_drain;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::repository::link_queue::queue_deleted;
 
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
@@ -318,7 +318,10 @@ async fn process_prune_job(
 ) -> Result<ProcessedJobGroup, MetadataGraphError> {
     let job_keys = jobs.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
     let job = representative_job(&graph_iri, &jobs);
-    if !metadata_graph_deleted::<MetadataGraphError>(&context.storage_handle, &graph_iri).await? {
+    let deleted = drive(GraphDeletedOperation::new(&graph_iri), context)
+        .await
+        .map_err(GraphDeletedError::into_error::<MetadataGraphError>)?;
+    if !deleted {
         return Ok(ProcessedJobGroup {
             completed_keys: job_keys,
             processed: 0,

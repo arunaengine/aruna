@@ -40,7 +40,8 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 
 use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
 
@@ -52,10 +53,7 @@ use super::queue_storage::{
     start_write_transaction,
 };
 use super::raw_revision::{RawReadError, RawStateCache};
-use super::repository::{
-    StorageReadError, parse_lifecycle_read, parse_status_read, read_lifecycle_effect,
-    read_status_effect,
-};
+use super::repository::{StorageReadError, parse_status_read, read_status_effect};
 
 const MATERIALIZATION_PAGE_SIZE: usize = 512;
 const MATERIALIZATION_BATCH_SIZE: usize = 512;
@@ -1493,11 +1491,9 @@ async fn process_materialization_job(
         }
         Err(error) => return Err(error),
     };
-    if metadata_graph_deleted::<MetadataMaterializationError>(
-        &context.storage_handle,
-        &event.record.graph_iri,
-    )
-    .await?
+    if drive(GraphDeletedOperation::new(&event.record.graph_iri), context)
+        .await
+        .map_err(GraphDeletedError::into_error::<MetadataMaterializationError>)?
     {
         return Ok(ProcessedMaterializationJob::completed(
             CompletedMaterializationJob {
@@ -2101,21 +2097,6 @@ fn job_key_parts(key: &[u8]) -> Option<(u64, Ulid, Ulid)> {
         Ulid::from_bytes(document_id),
         Ulid::from_bytes(event_id),
     ))
-}
-
-pub(crate) async fn metadata_graph_deleted<E: From<StorageError> + From<ConversionError>>(
-    storage: &StorageHandle,
-    graph_iri: &str,
-) -> Result<bool, E> {
-    let event = storage
-        .send_effect(read_lifecycle_effect(graph_iri, None))
-        .await;
-    parse_lifecycle_read(event)
-        .map(|record| record.is_some_and(|record| record.is_deleted()))
-        .map_err(|error| match error {
-            StorageReadError::Storage(error) => error.into(),
-            StorageReadError::Conversion(error) => error.into(),
-        })
 }
 
 struct MaterializedCreateEvent {

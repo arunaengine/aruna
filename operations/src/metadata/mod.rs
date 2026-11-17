@@ -18,6 +18,7 @@ pub mod document_holder;
 pub mod forward;
 pub mod get_document;
 pub mod global_entries;
+pub(crate) mod graph_deleted;
 pub(crate) mod handle;
 pub mod id_mapping;
 pub mod identifier_lookup;

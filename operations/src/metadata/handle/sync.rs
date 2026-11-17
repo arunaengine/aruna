@@ -13,8 +13,8 @@ use aruna_net::NetHandle;
 use tracing::{Span, debug, field};
 
 use super::handles;
-use super::lifecycle::graph_lifecycle_deleted;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::graph_deleted::GraphDeletedOperation;
 
 #[tracing::instrument(
     name = "metadata.graph_sync.once",
@@ -38,8 +38,8 @@ pub(super) async fn sync_graph_once(
     if peers.is_empty() {
         return Ok(());
     }
-    let (metadata, graph) = handles(context)?;
-    if graph_lifecycle_deleted(metadata.inner.storage_handle.clone(), &graph_iri).await? {
+    let (_, graph) = handles(context)?;
+    if drive(GraphDeletedOperation::new(&graph_iri), context).await? {
         return Ok(());
     }
     let net_handle = context

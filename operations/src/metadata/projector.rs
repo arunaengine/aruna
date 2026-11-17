@@ -42,11 +42,12 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::repository::{
     StorageReadError, create_materialization_entries, create_outbox_entries, create_outbox_record,
-    parse_lifecycle_read, parse_status_read, read_document_registry, read_lifecycle_effect,
-    read_status_effect, registry_outbox_record, schedule_materialization,
+    parse_status_read, read_document_registry, read_status_effect, registry_outbox_record,
+    schedule_materialization,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::outbox_record::schedule_drain_effect;
@@ -1138,25 +1139,11 @@ async fn graph_deleted_cached(
     if let Some(deleted) = lifecycle_cache.get(graph_iri) {
         return Ok(*deleted);
     }
-    let deleted = metadata_graph_deleted(context, graph_iri).await?;
+    let deleted = drive(GraphDeletedOperation::new(graph_iri), context)
+        .await
+        .map_err(GraphDeletedError::into_error::<MetadataProjectionError>)?;
     lifecycle_cache.insert(graph_iri.to_string(), deleted);
     Ok(deleted)
-}
-
-async fn metadata_graph_deleted(
-    context: &DriverContext,
-    graph_iri: &str,
-) -> Result<bool, MetadataProjectionError> {
-    let event = context
-        .storage_handle
-        .send_effect(read_lifecycle_effect(graph_iri, None))
-        .await;
-    parse_lifecycle_read(event)
-        .map(|record| record.is_some_and(|record| record.is_deleted()))
-        .map_err(|error| match error {
-            StorageReadError::Storage(error) => error.into(),
-            StorageReadError::Conversion(error) => error.into(),
-        })
 }
 
 fn audit_record(event: &MetadataEventRecord, message: Option<&str>) -> MetadataAuditRecord {

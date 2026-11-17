@@ -18,7 +18,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
 use aruna_graph::GraphHandle;
-use aruna_storage::StorageHandle;
 use tokio::time::sleep;
 use tracing::{Span, field, warn};
 use ulid::Ulid;
@@ -28,11 +27,9 @@ use super::{
     MetadataVisibilityCache, REGISTRY_CANDIDATE_LIMIT, RegistryCacheEntry, VISIBILITY_CACHE_TTL,
     VisibilityFillResult, handles, metadata_graph_fence,
 };
-use crate::driver::DriverContext;
-use crate::metadata::repository::{
-    StorageReadError, iter_registry_effect, parse_lifecycle_read, parse_registry_iter,
-    read_lifecycle_effect,
-};
+use crate::driver::{DriverContext, drive};
+use crate::metadata::graph_deleted::GraphDeletedOperation;
+use crate::metadata::repository::{iter_registry_effect, parse_registry_iter};
 use crate::metadata::summary_cache::summary_cache;
 
 impl MetadataVisibilityCache {
@@ -426,7 +423,7 @@ pub(crate) async fn prune_if_deleted(
         .map_err(|error| {
             MetadataError::Backend(format!("metadata graph fence unavailable: {error}"))
         })?;
-    if !graph_lifecycle_deleted(context.storage_handle.clone(), &graph_iri).await? {
+    if !drive(GraphDeletedOperation::new(&graph_iri), context).await? {
         return Ok(false);
     }
     metadata
@@ -530,19 +527,6 @@ pub(super) fn sync_best_effort(
     MetadataEvent::GraphSyncScheduled { graph_iri, peers }
 }
 
-async fn graph_lifecycle_record(
-    storage_handle: StorageHandle,
-    graph_iri: &str,
-) -> Result<Option<GraphLifecycleRecord>, MetadataError> {
-    let event = storage_handle
-        .send_effect(read_lifecycle_effect(graph_iri, None))
-        .await;
-    parse_lifecycle_read(event).map_err(|error| match error {
-        StorageReadError::Storage(error) => MetadataError::Storage(error),
-        StorageReadError::Conversion(error) => MetadataError::Backend(error.to_string()),
-    })
-}
-
 pub(super) async fn metadata_graph_deleted(
     context: &DriverContext,
     graph_iri: &str,
@@ -553,21 +537,11 @@ pub(super) async fn metadata_graph_deleted(
         return Ok(true);
     }
 
-    let deleted = graph_lifecycle_deleted(context.storage_handle.clone(), graph_iri).await?;
+    let deleted = drive(GraphDeletedOperation::new(graph_iri), context).await?;
     inner
         .visibility_cache
         .store_lifecycle_deleted(graph_iri.to_string(), deleted);
     Ok(deleted)
-}
-
-pub(super) async fn graph_lifecycle_deleted(
-    storage_handle: StorageHandle,
-    graph_iri: &str,
-) -> Result<bool, MetadataError> {
-    Ok(graph_lifecycle_record(storage_handle, graph_iri)
-        .await?
-        .map(|record| record.is_deleted())
-        .unwrap_or(false))
 }
 
 pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
