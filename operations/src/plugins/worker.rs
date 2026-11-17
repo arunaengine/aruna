@@ -3,18 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
-    PLUGIN_REPLAYS_KEYSPACE, PLUGIN_WAITING_KEYSPACE, PLUGIN_WORK_KEYSPACE,
+    PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
+    PLUGIN_WORK_KEYSPACE,
 };
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{
-    DEDUP_RETENTION_MS, EVENTS_QUEUED, ForwardRow, GapReason, PluginRun, RUNS_PARALLEL, RunState,
-    RunTrigger, SourceEvent, WAITING_EXPIRY_MS,
+    DEDUP_RETENTION_MS, EVENTS_QUEUED, ForwardRow, GapReason, GapRow, PluginRun, RUNS_PARALLEL,
+    RunState, RunTrigger, SENDER_GAP, SourceEvent, SourceKind, WAITING_EXPIRY_MS,
 };
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -43,7 +44,10 @@ use super::decide::{
 use super::dispatch::enqueue_timers;
 use super::dispatch::event_run;
 use super::finished::notify_work;
-use super::forward::{Backoff, send_outbox};
+use super::forward::{
+    Backoff, REQUEST_BYTES, Requests, apply, dataset_facts, drop_rows, expire_rows, next_install,
+    receiver_requests,
+};
 use super::grants::{parse_grants, patterns_for};
 use super::install::read_config;
 use super::intents::open_intent;
@@ -72,6 +76,7 @@ use super::runs::{
 use super::waiting::SettleWaiting;
 use super::work::prune_work;
 use crate::driver::{DriverContext, drive};
+use crate::metadata::projector::dot_applied;
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -703,6 +708,136 @@ async fn trigger_check(
     let target = needs.map(|permission| (permission, row.event.path.as_str()));
     check_call(ctx, &scope, target).await?;
     Ok(scope.run)
+}
+
+/// Sends each reachable receiver its batches and applies their decisions; returns how many
+/// rows were decided. Rows of removed installs are dropped, rows past their send expiry become
+/// gaps.
+pub(crate) async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    send_bounded(ctx, config, (now_ms, REQUEST_BYTES), backoff, send).await
+}
+
+pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    (now_ms, bound): (u64, usize),
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    let mut batches: BTreeMap<NodeId, Requests> = BTreeMap::new();
+    let open = |node: NodeId| lost_reason(config, node).is_none() && backoff.ready(node, now_ms);
+    let mut after = None;
+    while let Some(install_id) = drive(next_install(after), ctx).await? {
+        after = Some(install_id);
+        let install = (config.installs.iter()).find(|i| i.install_id == install_id);
+        let Some(install) = install.filter(|i| i.state != InstallState::Removing) else {
+            let prefix = install_id.to_bytes().to_vec();
+            drive(drop_rows(PLUGIN_OUTBOX_KEYSPACE, prefix), ctx).await?;
+            continue;
+        };
+        let pending = open(install.receiver)
+            .then(|| receiver_requests(&mut batches, install.receiver, bound));
+        collect(ctx, install_id, now_ms, pending).await?;
+    }
+    let gaps = Scan::new(PLUGIN_GAPS_KEYSPACE, vec![SENDER_GAP]);
+    for (key, value) in drive(scan_rows(gaps), ctx).await? {
+        let install_id = Ulid::from_bytes(key[1..17].try_into().unwrap_or_default());
+        let install = (config.installs.iter()).find(|i| i.install_id == install_id);
+        let Some(install) = install.filter(|i| i.state != InstallState::Removing) else {
+            drive(drop_rows(PLUGIN_GAPS_KEYSPACE, key), ctx).await?;
+            continue;
+        };
+        let row: GapRow = decode(&value)?;
+        if row.sequence > row.acked && open(install.receiver) {
+            let (batch, _) =
+                receiver_requests(&mut batches, install.receiver, bound).room(value.len() + 16);
+            batch.gaps.push((install_id, row));
+        }
+    }
+    let mut decided = 0;
+    for (receiver, requests) in batches {
+        let mut failed = false;
+        for ((batch, keys), _) in requests.open {
+            let Ok(decisions) = send(receiver, batch).await else {
+                failed = true;
+                break;
+            };
+            let (count, busy) = drive(apply(&keys, decisions), ctx).await?;
+            decided += count;
+            if busy {
+                failed = true;
+                break;
+            }
+        }
+        match failed {
+            true => backoff.failed(receiver, now_ms),
+            false => backoff.cleared(receiver),
+        }
+    }
+    Ok(decided)
+}
+
+/// Reads the install's first rows: those past their send expiry become gaps, the others join
+/// `pending` unless their dataset is not readable here yet.
+async fn collect(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    now_ms: u64,
+    mut pending: Option<&mut Requests>,
+) -> Result<(), StoreError> {
+    let kept = drive(expire_rows(install_id, now_ms), ctx).await?;
+    let Some(requests) = pending.as_deref_mut() else {
+        return Ok(());
+    };
+    for (key, value) in kept {
+        let row: ForwardRow = decode(&value)?;
+        if unreadable(ctx, &row).await? {
+            continue;
+        }
+        let (batch, keys) = requests.room(value.len());
+        keys.insert((install_id, row.event.source.clone()), key);
+        batch.events.push(row);
+    }
+    Ok(())
+}
+
+/// Whether a dataset event is not readable here yet: its own change is not materialized and the
+/// document is not deleted. A parked job keeps the row until its send expiry counts a gap.
+pub(crate) async fn unreadable(ctx: &DriverContext, row: &ForwardRow) -> Result<bool, StoreError> {
+    let event = &row.event;
+    let parsed = (
+        event.resource.parse::<Ulid>(),
+        event.revision.parse::<Ulid>(),
+    );
+    let (Ok(document), Ok(event_id)) = parsed else {
+        return Ok(false);
+    };
+    let mut facts = match event.kind {
+        SourceKind::DataUploaded
+        | SourceKind::SyncCompleted
+        | SourceKind::SyncFailed
+        | SourceKind::JobFinished => {
+            return Ok(false);
+        }
+        SourceKind::DatasetCreated | SourceKind::DatasetUpdated => {
+            let updated = event.kind == SourceKind::DatasetUpdated;
+            drive(dataset_facts(document, event_id, updated), ctx).await?
+        }
+    };
+    let applied = match (event.kind, facts.batch.take()) {
+        (SourceKind::DatasetCreated, _) => facts.materialized(|id| id >= event_id),
+        (_, Some((graph_iri, batch))) => dot_applied(ctx, &graph_iri, &batch)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?,
+        (_, None) => facts.logged && facts.materialized(|id| id == event_id),
+    };
+    Ok(!applied && !facts.deleted)
 }
 
 /// Decides each waiting event that is ready or expired; returns how many left the waiting set.

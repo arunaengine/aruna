@@ -17,29 +17,24 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataBatch,
     MetadataEventPayload, MetadataEventRecord,
 };
-use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
-    Decisions, EventBatch, ForwardRow, GapReason, GapRow, Outcome, SEND_EXPIRY_MS, SENDER_GAP,
-    SourceKind, gap_key,
+    Decisions, EventBatch, ForwardRow, GapReason, GapRow, Outcome, SEND_EXPIRY_MS, SourceKind,
+    gap_key,
 };
 use aruna_core::storage_entries::{event_log_key, graph_lifecycle_key, materialization_status_key};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
 use super::matcher::Outbox;
-use super::receiver::lost_reason;
 use super::rows::{
-    Answer, Ask, Plan, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode,
-    row as row_of, scan_rows, unexpected, values,
+    Answer, Ask, Plan, Rows, RowsOperation, StoreError, Turn, decode, done, encode, row as row_of,
+    unexpected, values,
 };
-use crate::driver::{DriverContext, drive};
-use crate::metadata::projector::dot_applied;
 
 /// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;
 /// Encoded row bytes of one request at most, well below the transport's 16 MiB message bound.
-const REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// The longest wait before a receiver is tried again.
 const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
@@ -48,32 +43,37 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 pub struct Backoff(BTreeMap<NodeId, (u32, u64)>);
 
 impl Backoff {
-    fn ready(&self, node: NodeId, now_ms: u64) -> bool {
+    pub(crate) fn ready(&self, node: NodeId, now_ms: u64) -> bool {
         self.0.get(&node).is_none_or(|(_, at)| *at <= now_ms)
     }
 
-    fn failed(&mut self, node: NodeId, now_ms: u64) {
+    pub(crate) fn failed(&mut self, node: NodeId, now_ms: u64) {
         let tries = self.0.get(&node).map_or(0, |(tries, _)| *tries) + 1;
         let wait = capped_backoff(Duration::from_secs(1), MAX_BACKOFF, tries, 0);
         let wait = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
         self.0.insert(node, (tries, now_ms + wait));
     }
+
+    /// A receiver that took every request is tried at once next time.
+    pub(crate) fn cleared(&mut self, node: NodeId) {
+        self.0.remove(&node);
+    }
 }
 
 /// One request's batch and the outbox key of each event in it by install and source id.
-type Pending = (EventBatch, BTreeMap<(Ulid, String), Vec<u8>>);
+pub(crate) type Pending = (EventBatch, BTreeMap<(Ulid, String), Vec<u8>>);
 
 /// One receiver's requests, each with the encoded row bytes it holds.
 #[derive(Default)]
-struct Requests {
+pub(crate) struct Requests {
     bound: usize,
-    open: Vec<(Pending, usize)>,
+    pub(crate) open: Vec<(Pending, usize)>,
 }
 
 impl Requests {
     /// The request with room for `size` more bytes; a new one when the last is full. A row
     /// larger than the bound gets a request of its own.
-    fn room(&mut self, size: usize) -> &mut Pending {
+    pub(crate) fn room(&mut self, size: usize) -> &mut Pending {
         let fits =
             (self.open.last()).is_some_and(|(_, used)| *used == 0 || used + size <= self.bound);
         if !fits {
@@ -87,7 +87,7 @@ impl Requests {
 }
 
 /// The requests to `node`, each holding at most `bound` encoded row bytes.
-fn receiver_requests(
+pub(crate) fn receiver_requests(
     batches: &mut BTreeMap<NodeId, Requests>,
     node: NodeId,
     bound: usize,
@@ -97,81 +97,8 @@ fn receiver_requests(
     requests
 }
 
-/// Sends each reachable receiver its batches and applies their decisions; returns how many
-/// rows were decided. Rows of removed installs are dropped, rows past their send expiry become
-/// gaps.
-pub(crate) async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    now_ms: u64,
-    backoff: &mut Backoff,
-    send: impl Fn(NodeId, EventBatch) -> F,
-) -> Result<usize, StoreError> {
-    send_bounded(ctx, config, (now_ms, REQUEST_BYTES), backoff, send).await
-}
-
-pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    (now_ms, bound): (u64, usize),
-    backoff: &mut Backoff,
-    send: impl Fn(NodeId, EventBatch) -> F,
-) -> Result<usize, StoreError> {
-    let mut batches: BTreeMap<NodeId, Requests> = BTreeMap::new();
-    let open = |node: NodeId| lost_reason(config, node).is_none() && backoff.ready(node, now_ms);
-    let mut after = None;
-    while let Some(install_id) = drive(next_install(after), ctx).await? {
-        after = Some(install_id);
-        let install = (config.installs.iter()).find(|i| i.install_id == install_id);
-        let Some(install) = install.filter(|i| i.state != InstallState::Removing) else {
-            let prefix = install_id.to_bytes().to_vec();
-            drive(drop_rows(PLUGIN_OUTBOX_KEYSPACE, prefix), ctx).await?;
-            continue;
-        };
-        let pending = open(install.receiver)
-            .then(|| receiver_requests(&mut batches, install.receiver, bound));
-        collect(ctx, install_id, now_ms, pending).await?;
-    }
-    let gaps = Scan::new(PLUGIN_GAPS_KEYSPACE, vec![SENDER_GAP]);
-    for (key, value) in drive(scan_rows(gaps), ctx).await? {
-        let install_id = Ulid::from_bytes(key[1..17].try_into().unwrap_or_default());
-        let install = (config.installs.iter()).find(|i| i.install_id == install_id);
-        let Some(install) = install.filter(|i| i.state != InstallState::Removing) else {
-            drive(drop_rows(PLUGIN_GAPS_KEYSPACE, key), ctx).await?;
-            continue;
-        };
-        let row: GapRow = decode(&value)?;
-        if row.sequence > row.acked && open(install.receiver) {
-            let (batch, _) =
-                receiver_requests(&mut batches, install.receiver, bound).room(value.len() + 16);
-            batch.gaps.push((install_id, row));
-        }
-    }
-    let mut decided = 0;
-    for (receiver, requests) in batches {
-        let mut failed = false;
-        for ((batch, keys), _) in requests.open {
-            let Ok(decisions) = send(receiver, batch).await else {
-                failed = true;
-                break;
-            };
-            let (count, busy) = drive(apply(&keys, decisions), ctx).await?;
-            decided += count;
-            if busy {
-                failed = true;
-                break;
-            }
-        }
-        match failed {
-            true => backoff.failed(receiver, now_ms),
-            false => _ = backoff.0.remove(&receiver),
-        }
-    }
-    Ok(decided)
-}
-
 /// The next install after `after` with forward rows on this node.
-fn next_install(after: Option<Ulid>) -> RowsOperation<NextInstall> {
+pub(crate) fn next_install(after: Option<Ulid>) -> RowsOperation<NextInstall> {
     // A forward key is the install id, then 24 bytes of journal time and event id.
     let start = after.map(|id| [&id.to_bytes()[..], &[0xff; 24]].concat());
     RowsOperation::direct(NextInstall(start))
@@ -203,7 +130,7 @@ impl Plan for NextInstall {
 }
 
 /// Deletes every row below `prefix`, a page at a time.
-fn drop_rows(space: &'static str, prefix: Vec<u8>) -> RowsOperation<DropRows> {
+pub(crate) fn drop_rows(space: &'static str, prefix: Vec<u8>) -> RowsOperation<DropRows> {
     RowsOperation::direct(DropRows {
         space,
         prefix,
@@ -254,33 +181,9 @@ impl Plan for DropRows {
     }
 }
 
-/// Reads the install's first rows: those past their send expiry become gaps, the others join
-/// `pending` unless their dataset is not readable here yet.
-async fn collect(
-    ctx: &DriverContext,
-    install_id: Ulid,
-    now_ms: u64,
-    mut pending: Option<&mut Requests>,
-) -> Result<(), StoreError> {
-    let kept = drive(expire_rows(install_id, now_ms), ctx).await?;
-    let Some(requests) = pending.as_deref_mut() else {
-        return Ok(());
-    };
-    for (key, value) in kept {
-        let row: ForwardRow = decode(&value)?;
-        if unreadable(ctx, &row).await? {
-            continue;
-        }
-        let (batch, keys) = requests.room(value.len());
-        keys.insert((install_id, row.event.source.clone()), key);
-        batch.events.push(row);
-    }
-    Ok(())
-}
-
 /// Counts the install's first rows past their send expiry as gaps and deletes them in one
 /// transaction; answers the other rows.
-fn expire_rows(install_id: Ulid, now_ms: u64) -> RowsOperation<ExpireRows> {
+pub(crate) fn expire_rows(install_id: Ulid, now_ms: u64) -> RowsOperation<ExpireRows> {
     RowsOperation::transaction(ExpireRows {
         install_id,
         now_ms,
@@ -358,42 +261,13 @@ impl Plan for ExpireRows {
     }
 }
 
-/// Whether a dataset event is not readable here yet: its own change is not materialized and the
-/// document is not deleted. A parked job keeps the row until its send expiry counts a gap.
-async fn unreadable(ctx: &DriverContext, row: &ForwardRow) -> Result<bool, StoreError> {
-    let event = &row.event;
-    let parsed = (
-        event.resource.parse::<Ulid>(),
-        event.revision.parse::<Ulid>(),
-    );
-    let (Ok(document), Ok(event_id)) = parsed else {
-        return Ok(false);
-    };
-    let mut facts = match event.kind {
-        SourceKind::DataUploaded
-        | SourceKind::SyncCompleted
-        | SourceKind::SyncFailed
-        | SourceKind::JobFinished => {
-            return Ok(false);
-        }
-        SourceKind::DatasetCreated | SourceKind::DatasetUpdated => {
-            let updated = event.kind == SourceKind::DatasetUpdated;
-            drive(dataset_facts(document, event_id, updated), ctx).await?
-        }
-    };
-    let applied = match (event.kind, facts.batch.take()) {
-        (SourceKind::DatasetCreated, _) => facts.materialized(|id| id >= event_id),
-        (_, Some((graph_iri, batch))) => dot_applied(ctx, &graph_iri, &batch)
-            .await
-            .map_err(|error| StoreError(error.to_string()))?,
-        (_, None) => facts.logged && facts.materialized(|id| id == event_id),
-    };
-    Ok(!applied && !facts.deleted)
-}
-
 /// What this node holds about a dataset event: the document's status, the event's own record
 /// and whether the document is deleted.
-fn dataset_facts(document: Ulid, event_id: Ulid, updated: bool) -> RowsOperation<DatasetFacts> {
+pub(crate) fn dataset_facts(
+    document: Ulid,
+    event_id: Ulid,
+    updated: bool,
+) -> RowsOperation<DatasetFacts> {
     RowsOperation::direct(DatasetFacts {
         document,
         event_id,
@@ -414,15 +288,15 @@ pub struct DatasetFacts {
 pub struct Facts {
     status: Option<MaterializationStatusRecord>,
     /// Whether the event's record is in the event log.
-    logged: bool,
+    pub(crate) logged: bool,
     /// The graph and batch of a logged change that has one.
-    batch: Option<(String, MetadataBatch)>,
-    deleted: bool,
+    pub(crate) batch: Option<(String, MetadataBatch)>,
+    pub(crate) deleted: bool,
 }
 
 impl Facts {
     /// Whether the document's status is materialized at an event id that `covers` accepts.
-    fn materialized(&self, covers: impl Fn(Ulid) -> bool) -> bool {
+    pub(crate) fn materialized(&self, covers: impl Fn(Ulid) -> bool) -> bool {
         self.status.as_ref().is_some_and(|status| {
             status.state == MaterializationState::Materialized && covers(status.event_id)
         })
@@ -473,7 +347,10 @@ impl Plan for DatasetFacts {
 
 /// Deletes the decided rows and records the acknowledged gap sequences in one transaction;
 /// returns how many rows were decided and whether any was busy.
-fn apply(keys: &BTreeMap<(Ulid, String), Vec<u8>>, decisions: Decisions) -> RowsOperation<Apply> {
+pub(crate) fn apply(
+    keys: &BTreeMap<(Ulid, String), Vec<u8>>,
+    decisions: Decisions,
+) -> RowsOperation<Apply> {
     let busy = (decisions.events.iter()).any(|(.., outcome)| *outcome == Outcome::Busy);
     let decided: Vec<_> = (decisions.events.into_iter())
         .filter(|(.., outcome)| *outcome != Outcome::Busy)

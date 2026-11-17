@@ -15,6 +15,7 @@ use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::store::Txn;
 use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{created, installed};
+use crate::plugins::worker::{send_bounded, send_outbox, unreadable};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 

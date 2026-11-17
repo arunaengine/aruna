@@ -11,7 +11,7 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use crate::driver::drive;
-use crate::plugins::forward::{Backoff, send_outbox};
+use crate::plugins::forward::Backoff;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::{pause_install, set_grants};
 use crate::plugins::matcher::tests::{config, forwarded, journal};
@@ -20,6 +20,7 @@ use crate::plugins::store::Txn;
 use crate::plugins::worker::decide_batch;
 use crate::plugins::worker::match_journal;
 use crate::plugins::worker::plan_replays;
+use crate::plugins::worker::send_outbox;
 use crate::plugins::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced, worker,
 };
