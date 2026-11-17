@@ -325,6 +325,7 @@ dependencies = [
  "aruna-cli",
  "aruna-compute",
  "aruna-core",
+ "aruna-graph",
  "aruna-kpabe",
  "aruna-net",
  "aruna-operations",
@@ -383,6 +384,7 @@ dependencies = [
  "aruna-blob",
  "aruna-compute",
  "aruna-core",
+ "aruna-graph",
  "aruna-net",
  "aruna-operations",
  "aruna-plugins",
@@ -665,6 +667,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-graph"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-core",
+ "chrono",
+ "craqle",
+ "fjall",
+ "futures-util",
+ "iroh",
+ "irokle",
+ "oxrdf",
+ "oxttl",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aruna-kpabe"
 version = "3.0.0-alpha.207"
 dependencies = [
@@ -729,6 +750,7 @@ dependencies = [
  "aruna-blob",
  "aruna-compute",
  "aruna-core",
+ "aruna-graph",
  "aruna-net",
  "aruna-plugins",
  "aruna-storage",
