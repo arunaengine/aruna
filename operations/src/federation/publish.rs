@@ -7,23 +7,21 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::Effect;
+use aruna_core::errors::ConversionError;
+use aruna_core::events::Event;
 use aruna_core::federation::{PUBLISH_SOON, RealmDescriptor, RegistrationMode, Signed};
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{done, encoded_row, read_row, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::Effects;
+use aruna_core::types::Key;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use url::Url;
-
-use crate::document_repository::read_effect;
-use crate::driver::{DriverContext, drive};
 
 /// How often the reporting node renews its registration.
 pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
@@ -145,30 +143,19 @@ pub(crate) fn still_due(
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("operation did not finish")]
-    NotFinished,
     #[error("the realm config is missing")]
     ConfigMissing,
     #[error("the publication timer was not armed: {0}")]
     Timer(String),
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum PublishState {
-    Init,
-    Read,
-    Write,
-    Finish,
-    Error,
+/// The realm config row of `realm_id`.
+fn config_read(realm_id: RealmId) -> (String, Key) {
+    let config = DocumentTarget::RealmConfig { realm_id };
+    (config.storage_keyspace().to_string(), config.storage_key())
 }
 
 /// Decides the publication and records the attempt before any request is sent, so a crash
@@ -177,8 +164,8 @@ enum PublishState {
 pub(crate) struct PublishOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    state: PublishState,
-    output: Option<Result<Publication, PublishError>>,
+    /// The decided publication while its state write runs.
+    decided: Option<Publication>,
 }
 
 impl PublishOperation {
@@ -186,30 +173,13 @@ impl PublishOperation {
         Self {
             realm_id,
             node_id,
-            state: PublishState::Init,
-            output: None,
+            decided: None,
         }
     }
 
-    fn fail(&mut self, error: PublishError) -> Effects {
-        self.state = PublishState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn finish(&mut self, publication: Publication) -> Effects {
-        self.state = PublishState::Finish;
-        self.output = Some(Ok(publication));
-        smallvec![]
-    }
-
-    fn on_read(
-        &mut self,
-        config: Option<&[u8]>,
-        stored: Option<&[u8]>,
-    ) -> Result<Effects, PublishError> {
+    fn on_read(&mut self, config: Option<&[u8]>, stored: Option<&[u8]>) -> PublishTurn {
         let Some(config) = config else {
-            return Ok(self.finish(Publication::Nothing));
+            return Ok(Next::Done(Publication::Nothing));
         };
         let config = RealmConfigDocument::from_bytes(config)?;
         let previous: PublicationState = stored
@@ -219,88 +189,39 @@ impl PublishOperation {
             .unwrap_or_default();
         let (publication, next) = decide(&config, self.node_id, previous.clone());
         if next == previous {
-            return Ok(self.finish(publication));
+            return Ok(Next::Done(publication));
         }
-        self.state = PublishState::Write;
-        self.output = Some(Ok(publication));
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: FEDERATION_KEYSPACE.to_string(),
-            key: STATE_KEY.into(),
-            value: postcard::to_allocvec(&next)
-                .map_err(ConversionError::from)?
-                .into(),
-            txn_id: None,
-        })])
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(PublishError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+        self.decided = Some(publication);
+        let row = encoded_row(FEDERATION_KEYSPACE, STATE_KEY, &next)?;
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
-impl EffectOperation for PublishOperation {
+type PublishTurn = Result<Next<Publication>, PublishError>;
+
+impl Operation for PublishOperation {
     type Output = Publication;
     type Error = PublishError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PublishState::Read;
-        let config = DocumentTarget::RealmConfig {
-            realm_id: self.realm_id,
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (config.storage_keyspace().to_string(), config.storage_key()),
-                (FEDERATION_KEYSPACE.to_string(), STATE_KEY.into()),
-            ],
-            txn_id: None,
-        })]
+    fn first(&mut self) -> PublishTurn {
+        let state = (FEDERATION_KEYSPACE.to_string(), STATE_KEY.into());
+        Ok(Next::Call(IoCall::Read(vec![
+            config_read(self.realm_id),
+            state,
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            PublishState::Read => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, config), (_, stored)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "realm config and publication state",
-                            "a batch read of another size",
-                        );
-                    };
-                    match self.on_read(config.as_deref(), stored.as_deref()) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", other.label()),
-            },
-            PublishState::Write => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    self.state = PublishState::Finish;
-                    smallvec![]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", other.label()),
-            },
-            PublishState::Init | PublishState::Finish | PublishState::Error => smallvec![],
+    fn next(&mut self, result: IoResult) -> PublishTurn {
+        match self.decided.take() {
+            None => {
+                let [config, stored] = values::<2>(result)?;
+                self.on_read(config.as_deref(), stored.as_deref())
+            }
+            Some(publication) => {
+                done(result)?;
+                Ok(Next::Done(publication))
+            }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PublishState::Finish | PublishState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PublishError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -311,21 +232,13 @@ fn publishes_soon(config: &RealmConfigDocument, node_id: NodeId) -> bool {
         && is_reporting(config, node_id)
 }
 
-#[derive(Debug, PartialEq)]
-enum SoonState {
-    Idle,
-    ReadConfig,
-    ArmTimer,
-    Done(Result<bool, PublishError>),
-}
-
 /// Moves the registry publication up on the reporting node after replicated realm settings
 /// materialize here, also when another management node served the change. True when armed.
 #[derive(Debug, PartialEq)]
 pub(crate) struct PublishSoonOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    state: SoonState,
+    arming: bool,
 }
 
 impl PublishSoonOperation {
@@ -333,96 +246,55 @@ impl PublishSoonOperation {
         Self {
             realm_id,
             node_id,
-            state: SoonState::Idle,
+            arming: false,
         }
     }
 
-    fn label(&self) -> &'static str {
-        match self.state {
-            SoonState::Idle => "idle",
-            SoonState::ReadConfig => "reading the realm config",
-            SoonState::ArmTimer => "arming the publication timer",
-            SoonState::Done(_) => "done",
+    fn arm(&mut self, result: IoResult) -> Result<Next<bool>, PublishError> {
+        let [bytes] = values::<1>(result)?;
+        let config = RealmConfigDocument::from_bytes(&bytes.ok_or(PublishError::ConfigMissing)?)?;
+        if !publishes_soon(&config, self.node_id) {
+            return Ok(Next::Done(false));
         }
-    }
-
-    fn decide(&mut self, event: Event) -> Result<Effects, PublishError> {
-        let (state, got) = (self.label(), event.label());
-        let expected = match self.state {
-            SoonState::ReadConfig => "storage read result",
-            _ => "task timer result",
-        };
-        let unexpected = move || PublishError::UnexpectedEvent {
-            state: state.to_string(),
-            expected,
-            got,
-        };
-        match self.state {
-            SoonState::ReadConfig => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let bytes = value.ok_or(PublishError::ConfigMissing)?;
-                    let config = RealmConfigDocument::from_bytes(&bytes)?;
-                    if !publishes_soon(&config, self.node_id) {
-                        self.state = SoonState::Done(Ok(false));
-                        return Ok(smallvec![]);
-                    }
-                    self.state = SoonState::ArmTimer;
-                    Ok(smallvec![Effect::Task(TaskEffect::ShortenTimer {
-                        key: TaskKey::PublishRegistration,
-                        after: PUBLISH_SOON,
-                    })])
-                }
-                Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-                _ => Err(unexpected()),
-            },
-            SoonState::ArmTimer => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SoonState::Done(Ok(true));
-                    Ok(smallvec![])
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => Err(PublishError::Timer(message)),
-                _ => Err(unexpected()),
-            },
-            SoonState::Idle | SoonState::Done(_) => Err(unexpected()),
-        }
+        self.arming = true;
+        let timer = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishRegistration,
+            after: PUBLISH_SOON,
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(timer))))
     }
 }
 
-impl EffectOperation for PublishSoonOperation {
+impl Operation for PublishSoonOperation {
     type Output = bool;
     type Error = PublishError;
 
-    fn start(&mut self) -> Effects {
-        self.state = SoonState::ReadConfig;
-        let config = DocumentTarget::RealmConfig {
-            realm_id: self.realm_id,
-        };
-        smallvec![read_effect(&config, None)]
+    fn first(&mut self) -> Result<Next<bool>, PublishError> {
+        let (space, key) = config_read(self.realm_id);
+        Ok(Next::Call(read_row(&space, key)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.decide(event) {
-            Ok(effects) => effects,
-            Err(error) => {
-                self.state = SoonState::Done(Err(error));
-                smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, PublishError> {
+        if !self.arming {
+            return self.arm(result);
+        }
+        let IoResult::Event(event) = result else {
+            let got = result.label();
+            return Err(IoError::Unexpected {
+                expected: "a task timer result",
+                got,
             }
+            .into());
+        };
+        match *event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(Next::Done(true)),
+            Event::Task(TaskEvent::Error { message, .. }) => Err(PublishError::Timer(message)),
+            event => Err(IoError::Unexpected {
+                expected: "a task timer result",
+                got: event.label(),
+            }
+            .into()),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SoonState::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            SoonState::Done(result) => result,
-            _ => Err(PublishError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -432,12 +304,10 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::tasks::task_persistence::read_timer;
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings};
     use aruna_core::handle::Handle;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
-    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::time::unix_timestamp_secs;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
@@ -595,24 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn realm_url_joins() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let url = realm_url(
-            &Url::parse("https://r.example.org/base").unwrap(),
-            &realm_id,
-        );
-        let url = url.unwrap();
-        assert_eq!(
-            url.as_str(),
-            format!("https://r.example.org/base/v1/realms/{realm_id}")
-        );
-        assert_eq!(
-            totals_url(url).unwrap().as_str(),
-            format!("https://r.example.org/base/v1/realms/{realm_id}/totals")
-        );
-    }
-
-    #[test]
     fn reporter_publishes_soon() {
         // The management node that served the change may not report; the reporter acts.
         let unset = config(RegistrationMode::Enabled, false);
@@ -718,41 +570,39 @@ mod tests {
         assert_eq!(sent, MAX_WITHDRAWALS);
     }
 
-    fn soon_read(realm_id: RealmId) -> Effect {
-        read_effect(&DocumentTarget::RealmConfig { realm_id }, None)
+    fn soon_read(realm_id: RealmId) -> Result<Next<bool>, PublishError> {
+        let target = DocumentTarget::RealmConfig { realm_id };
+        let read = read_row(target.storage_keyspace(), target.storage_key());
+        Ok(Next::Call(read))
     }
 
-    fn soon_config(config: &RealmConfigDocument) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(postcard::to_allocvec(config).unwrap().into()),
-        })
+    fn soon_config(config: &RealmConfigDocument) -> IoResult {
+        IoResult::Values(vec![Some(postcard::to_allocvec(config).unwrap().into())])
     }
 
-    fn soon_timer() -> Effect {
-        Effect::Task(TaskEffect::ShortenTimer {
+    fn soon_timer() -> Result<Next<bool>, PublishError> {
+        let timer = Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::PublishRegistration,
             after: PUBLISH_SOON,
-        })
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(timer))))
+    }
+
+    fn task(event: TaskEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Task(event)))
     }
 
     #[test]
     fn soon_arms_reporter() {
         let config = config(RegistrationMode::Enabled, true);
         let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
-        let scheduled = Event::Task(TaskEvent::TimerScheduled {
+        assert_eq!(operation.first(), soon_read(config.realm_id));
+        assert_eq!(operation.next(soon_config(&config)), soon_timer());
+        let scheduled = task(TaskEvent::TimerScheduled {
             key: TaskKey::PublishRegistration,
             after: PUBLISH_SOON,
         });
-        check_trace(
-            &mut operation,
-            &[soon_read(config.realm_id)],
-            vec![
-                (soon_config(&config), vec![soon_timer()]),
-                (scheduled, vec![]),
-            ],
-        );
-        assert_eq!(operation.finalize(), Ok(true));
+        assert_eq!(operation.next(scheduled), Ok(Next::Done(true)));
 
         // Another node, or settings without a registry, arm nothing.
         let other = lower(node(1), node(2)).1;
@@ -761,12 +611,8 @@ mod tests {
             (self::config(RegistrationMode::Enabled, false), reporter()),
         ] {
             let mut operation = PublishSoonOperation::new(config.realm_id, node_id);
-            check_trace(
-                &mut operation,
-                &[soon_read(config.realm_id)],
-                vec![(soon_config(&config), vec![])],
-            );
-            assert_eq!(operation.finalize(), Ok(false));
+            operation.first().unwrap();
+            assert_eq!(operation.next(soon_config(&config)), Ok(Next::Done(false)));
         }
     }
 
@@ -775,82 +621,20 @@ mod tests {
         let config = config(RegistrationMode::Enabled, true);
         let started = || {
             let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
-            operation.start();
+            operation.first().unwrap();
             operation
         };
-        let mut missing = started();
-        missing.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
-        assert_eq!(missing.finalize(), Err(PublishError::ConfigMissing));
-        let mut failed = started();
-        failed.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(failed.finalize(), Err(StorageError::Timeout.into()));
+        let missing = started().next(IoResult::Values(vec![None]));
+        assert_eq!(missing, Err(PublishError::ConfigMissing));
         let mut refused = started();
-        refused.step(soon_config(&config));
-        refused.step(Event::Task(TaskEvent::Error {
+        refused.next(soon_config(&config)).unwrap();
+        let error = task(TaskEvent::Error {
             key: Some(TaskKey::PublishRegistration),
             message: "full".to_string(),
-        }));
+        });
         assert_eq!(
-            refused.finalize(),
+            refused.next(error),
             Err(PublishError::Timer("full".to_string()))
         );
-    }
-
-    #[test]
-    fn soon_rejects_stray() {
-        let config = config(RegistrationMode::Enabled, true);
-        let started = || {
-            let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
-            operation.start();
-            operation
-        };
-        let expected = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (label, effects, error) in rejects_events(started, sample_events, expected) {
-            assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(
-                matches!(error, PublishError::UnexpectedEvent { .. }),
-                "{label}"
-            );
-        }
-        let arming = || {
-            let mut operation = started();
-            operation.step(soon_config(&config));
-            operation
-        };
-        let expected = |event: &Event| matches!(event, Event::Task(TaskEvent::Error { .. }));
-        for (label, effects, error) in rejects_events(arming, sample_events, expected) {
-            assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(
-                matches!(error, PublishError::UnexpectedEvent { .. }),
-                "{label}"
-            );
-        }
-        let fresh = || PublishSoonOperation::new(config.realm_id, reporter());
-        assert_eq!(
-            rejects_events(fresh, sample_events, |_| false).len(),
-            sample_events().len()
-        );
-    }
-
-    #[test]
-    fn soon_abort_finalize() {
-        let config = config(RegistrationMode::Enabled, true);
-        let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-        operation.step(soon_config(&config));
-        check_abort(&mut operation, &[]);
-        rejects_finalize(operation);
     }
 }

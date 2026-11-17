@@ -56,6 +56,19 @@ impl From<aruna_kpabe::Error> for AbeError {
     }
 }
 
+/// A storage fault or conflict leaves the record unavailable; any other runner failure means
+/// the stored rows did not fit together.
+impl From<crate::calls::IoError> for AbeError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict | crate::calls::IoError::Storage(_) => {
+                Self::Unavailable
+            }
+            _ => Self::Context,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbeParameters {
     pub realm_id: RealmId,

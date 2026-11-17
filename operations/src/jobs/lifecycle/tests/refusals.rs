@@ -1,18 +1,17 @@
-//! Checks that the reservation and its release refuse an event before they start.
+//! Checks the first calls of a reservation and that it refuses an unfit result.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
-use aruna_core::effects::JobRecordFrame;
-use aruna_core::operation_check::{rejects_events, sample_events};
+use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyRecord, JobPayload, JobRecord,
 };
-use ulid::Ulid;
 
-use crate::jobs::lifecycle::reservation::{
-    ReleaseExecutionOperation, ReserveExecutionConfig, ReserveExecutionOperation,
-};
+use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::tests::records::{Family, REALM};
 
 fn reserve() -> ReserveExecutionOperation {
@@ -58,14 +57,23 @@ fn reserve() -> ReserveExecutionOperation {
 }
 
 #[test]
-fn rejects_unstarted_reserve() {
-    let refusals = rejects_events(reserve, sample_events, |_| false);
-    assert_eq!(refusals.len(), sample_events().len());
+fn reads_config_outside() {
+    // The realm view is read outside the reservation transaction.
+    let mut operation = reserve();
+    assert!(operation.transaction());
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Effect(effect)))
+            if matches!(*effect, Effect::Storage(StorageEffect::Read { txn_id: None, .. }))
+    ));
 }
 
 #[test]
-fn rejects_unstarted_release() {
-    let release = || ReleaseExecutionOperation::new(Ulid::from_bytes([5u8; 16]));
-    let refusals = rejects_events(release, sample_events, |_| false);
-    assert_eq!(refusals.len(), sample_events().len());
+fn rejects_unfit_result() {
+    let mut operation = reserve();
+    operation.first().expect("config read");
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Err(LifecycleError::UnexpectedEvent { .. })
+    ));
 }

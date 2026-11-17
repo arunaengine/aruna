@@ -3,13 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::metadata::{EVENT_LIMIT, RAW_BYTES_LIMIT};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use thiserror::Error;
 
 use crate::driver::{DriverContext, drive};
-use crate::metadata::checkpoint_window::{CheckpointWindowError, CheckpointWindowOperation, due};
+use crate::metadata::checkpoint_window::{CheckpointWindowOperation, due};
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
@@ -18,7 +19,7 @@ use crate::metadata::update_entry::update_metadata_document;
 #[derive(Debug, Error)]
 pub enum CheckpointError {
     #[error(transparent)]
-    Window(#[from] CheckpointWindowError),
+    Window(#[from] IoError),
     #[error(transparent)]
     Update(#[from] UpdateDocumentError),
 }

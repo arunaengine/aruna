@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     EVENTS_QUEUED, GapReason, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
@@ -20,8 +22,8 @@ use ulid::Ulid;
 use super::grants::held_covers;
 use super::matcher::{Counting, Outbox, Target};
 use super::rows::{
-    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode,
-    row as row_of, unexpected, values,
+    Row, Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
+    read_call, row as row_of, unexpected, values,
 };
 
 pub(crate) const COVERAGE_ROW: u8 = b'c';
@@ -83,29 +85,29 @@ pub(crate) fn growth(
 }
 
 /// The coverage row and the replay row of an install.
-pub(crate) fn replay_rows(install_id: Ulid) -> RowsOperation<ReplayRows> {
-    RowsOperation::direct(ReplayRows(install_id))
+pub(crate) fn replay_rows(install_id: Ulid) -> ReplayRows {
+    ReplayRows(install_id)
 }
 
 #[derive(Debug, PartialEq)]
 pub struct ReplayRows(Ulid);
 
-impl Plan for ReplayRows {
+impl Operation for ReplayRows {
     type Output = (Option<CoverageRow>, Option<ReplayRow>);
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(read_call(vec![
             (PLUGIN_REPLAYS_KEYSPACE, row_key(COVERAGE_ROW, self.0)),
             (PLUGIN_REPLAYS_KEYSPACE, row_key(REPLAY_ROW, self.0)),
         ])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         let [coverage, task] = values::<2>(answer)?;
         let coverage = coverage.map(|bytes| decode(&bytes)).transpose()?;
         let task = task.map(|bytes| decode(&bytes)).transpose()?;
-        Ok(Turn::Finish((coverage, task)))
+        Ok(Next::Done((coverage, task)))
     }
 }
 
@@ -177,46 +179,42 @@ impl StartReplay {
     }
 }
 
-impl Plan for StartReplay {
+impl Operation for StartReplay {
     type Output = ();
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<()>, StoreError> {
+    fn first(&mut self) -> Result<Next<()>, StoreError> {
         match &self.phase {
-            StartPhase::Gaps(outbox) => Ok(Turn::Ask(outbox.gap_ask())),
+            StartPhase::Gaps(outbox) => Ok(Next::Call(outbox.gap_ask())),
             _ => Err(StoreError("started twice".into())),
         }
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<()>, StoreError> {
         match std::mem::replace(&mut self.phase, StartPhase::Writing) {
             StartPhase::Gaps(outbox) => {
-                let Answer::Values(values) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let values = all_values(answer)?;
                 self.phase = StartPhase::Pending(outbox.rows(values)?);
-                Ok(Turn::Ask(Ask::Page {
-                    space: EVENT_JOURNAL_KEYSPACE,
-                    prefix: vec![PENDING_ROW],
-                    after: None,
-                    limit: 1,
-                }))
+                Ok(Next::Call(page_call(
+                    EVENT_JOURNAL_KEYSPACE,
+                    vec![PENDING_ROW],
+                    None,
+                    1,
+                )))
             }
             StartPhase::Pending(mut rows) => {
-                let Answer::Page(pending, _) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let (pending, _) = page_of(answer)?;
                 self.task.until = match pending.first() {
                     Some((key, _)) => [&[JOURNAL_ROW][..], &key[1..]].concat(),
                     None => journal_key(JOURNAL_ROW, self.now_ms.saturating_add(1), Ulid::nil()),
                 };
                 let key = row_key(REPLAY_ROW, self.install_id);
                 rows.push(row_of(PLUGIN_REPLAYS_KEYSPACE, key, encode(&*self.task)?));
-                Ok(Turn::Ask(Ask::Write(rows)))
+                Ok(Next::Call(IoCall::Write(rows)))
             }
             StartPhase::Writing => {
                 done(answer)?;
-                Ok(Turn::Finish(()))
+                Ok(Next::Done(()))
             }
         }
     }
@@ -230,13 +228,13 @@ pub(crate) fn replay_scan() -> Scan {
 /// One page of `page` rows of the replay at `key` in one transaction: forward rows for the newly
 /// covered events it reads, then the replay row continued, or the coverage row written once the
 /// replay reaches `until`. Answers the rows read and whether the replay ended.
-pub(crate) fn replay_page(key: Vec<u8>, now_ms: u64, page: usize) -> RowsOperation<ReplayPage> {
-    RowsOperation::transaction(ReplayPage {
+pub(crate) fn replay_page(key: Vec<u8>, now_ms: u64, page: usize) -> ReplayPage {
+    ReplayPage {
         key,
         now_ms,
         page,
         phase: PagePhase::Task,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -268,7 +266,7 @@ impl ReplayPage {
         mut task: ReplayRow,
         (rows, more): (Rows, bool),
         queued: BTreeMap<Ulid, usize>,
-    ) -> Result<Turn<(usize, bool)>, StoreError> {
+    ) -> Result<Next<(usize, bool)>, StoreError> {
         let install_id = self.install_id();
         let target = |coverage: &Coverage| Target {
             install_id,
@@ -302,7 +300,7 @@ impl ReplayPage {
         };
         let ask = outbox.gap_ask();
         self.phase = PagePhase::Gaps(Box::new(outbox), vec![written], (read, ended));
-        Ok(Turn::Ask(ask))
+        Ok(Next::Call(ask))
     }
 
     /// Whether any row of the page is a newly covered event, so the install's queue is counted.
@@ -322,74 +320,74 @@ impl ReplayPage {
     }
 }
 
-impl Plan for ReplayPage {
+impl Operation for ReplayPage {
     type Output = (usize, bool);
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(read_call(vec![(
             PLUGIN_REPLAYS_KEYSPACE,
             self.key.clone(),
         )])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         match std::mem::replace(&mut self.phase, PagePhase::Writing((0, true))) {
             PagePhase::Task => {
                 let [task] = values::<1>(answer)?;
                 let Some(bytes) = task else {
-                    return Ok(Turn::Finish((0, true)));
+                    return Ok(Next::Done((0, true)));
                 };
                 let task: ReplayRow = decode(&bytes)?;
-                let page = Ask::Page {
-                    space: EVENT_JOURNAL_KEYSPACE,
-                    prefix: vec![JOURNAL_ROW],
-                    after: Some(task.after.clone()),
-                    limit: self.page,
-                };
+                let page = page_call(
+                    EVENT_JOURNAL_KEYSPACE,
+                    vec![JOURNAL_ROW],
+                    Some(task.after.clone()),
+                    self.page,
+                );
                 self.phase = PagePhase::Journal(Box::new(task));
-                Ok(Turn::Ask(page))
+                Ok(Next::Call(page))
             }
             PagePhase::Journal(task) => {
-                let Answer::Page(rows, next) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let (rows, next) = page_of(answer)?;
                 let more = next.is_some();
                 if !self.offers(&task, &rows) {
                     return self.matched(*task, (rows, more), BTreeMap::new());
                 }
                 let counting = Counting::new(BTreeSet::from([self.install_id()]), EVENTS_QUEUED);
-                let ask = counting.ask().ok_or_else(|| unexpected(Answer::Done))?;
+                let ask = counting.ask().ok_or_else(|| unexpected(IoResult::Done))?;
                 self.phase = PagePhase::Counting(task, rows, more, counting);
-                Ok(Turn::Ask(ask))
+                Ok(Next::Call(ask))
             }
             PagePhase::Counting(task, rows, more, mut counting) => {
                 counting.take(answer)?;
                 self.matched(*task, (rows, more), counting.counted())
             }
             PagePhase::Gaps(outbox, mut written, outcome) => {
-                let Answer::Values(values) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let values = all_values(answer)?;
                 let mut rows = outbox.rows(values)?;
                 rows.append(&mut written);
                 self.phase = PagePhase::Writing(outcome);
-                Ok(Turn::Ask(Ask::Write(rows)))
+                Ok(Next::Call(IoCall::Write(rows)))
             }
             PagePhase::Writing(outcome) => {
                 done(answer)?;
                 if !outcome.1 {
-                    return Ok(Turn::Finish(outcome));
+                    return Ok(Next::Done(outcome));
                 }
                 self.phase = PagePhase::Deleting(outcome);
-                Ok(Turn::Ask(Ask::Delete(vec![(
+                Ok(Next::Call(delete_call(vec![(
                     PLUGIN_REPLAYS_KEYSPACE,
                     self.key.clone(),
                 )])))
             }
             PagePhase::Deleting(outcome) => {
                 done(answer)?;
-                Ok(Turn::Finish(outcome))
+                Ok(Next::Done(outcome))
             }
         }
     }

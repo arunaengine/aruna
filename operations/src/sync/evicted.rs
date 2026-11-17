@@ -5,14 +5,12 @@
 use std::collections::VecDeque;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentEvictedDocument;
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
-use thiserror::Error;
 use tracing::warn;
 
 use crate::sync::outbox_record::{
@@ -28,33 +26,14 @@ pub struct ReemitOutcome {
     pub drain_error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum ReemitError {
-    #[error("unexpected event while re-emitting evicted documents: {0}")]
-    UnexpectedEvent(String),
-    #[error("re-emit of evicted documents did not finish")]
-    NotFinished,
-    #[error("re-emit of evicted documents was aborted")]
-    Aborted,
-}
-
-#[derive(Debug, PartialEq)]
-enum ReemitState {
-    Ready,
-    Writing,
-    Scheduling,
-    Done(Result<(), ReemitError>),
-}
-
 /// Writes one outbox record per evicted document under its evicted event id, so a replay
 /// lands once and mints no genesis, then arms the outbox drain when anything was written.
+/// A failed write only marks the outcome incomplete.
 #[derive(Debug, PartialEq)]
 pub struct ReemitEvictedOperation {
     writes: VecDeque<Effect>,
-    written: usize,
-    complete: bool,
-    drain_error: Option<String>,
-    state: ReemitState,
+    outcome: ReemitOutcome,
+    scheduling: bool,
 }
 
 impl ReemitEvictedOperation {
@@ -81,87 +60,65 @@ impl ReemitEvictedOperation {
         }
         Self {
             writes,
-            written: 0,
-            complete,
-            drain_error: None,
-            state: ReemitState::Ready,
+            outcome: ReemitOutcome {
+                written: 0,
+                complete,
+                drain_error: None,
+            },
+            scheduling: false,
         }
     }
 
-    fn next_write(&mut self) -> Effects {
+    fn advance(&mut self) -> Next<ReemitOutcome> {
         if let Some(effect) = self.writes.pop_front() {
-            self.state = ReemitState::Writing;
-            return smallvec![effect];
+            return Next::Call(IoCall::Effect(Box::new(effect)));
         }
-        if self.written == 0 {
-            self.state = ReemitState::Done(Ok(()));
-            return Effects::new();
+        if self.outcome.written == 0 {
+            return Next::Done(self.outcome.clone());
         }
-        self.state = ReemitState::Scheduling;
-        smallvec![schedule_drain_effect()]
-    }
-
-    fn reject(&mut self, event: &Event) -> Effects {
-        self.state = ReemitState::Done(Err(ReemitError::UnexpectedEvent(format!("{event:?}"))));
-        Effects::new()
+        self.scheduling = true;
+        Next::Call(IoCall::Effect(Box::new(schedule_drain_effect())))
     }
 }
 
-impl EffectOperation for ReemitEvictedOperation {
+impl Operation for ReemitEvictedOperation {
     type Output = ReemitOutcome;
-    type Error = ReemitError;
+    type Error = IoError;
 
-    fn start(&mut self) -> Effects {
-        match self.state {
-            ReemitState::Ready => self.next_write(),
-            _ => Effects::new(),
-        }
+    fn first(&mut self) -> Result<Next<ReemitOutcome>, IoError> {
+        Ok(self.advance())
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, &event) {
-            (ReemitState::Writing, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.written += 1;
-                self.next_write()
+    fn next(&mut self, result: IoResult) -> Result<Next<ReemitOutcome>, IoError> {
+        let IoResult::Event(event) = result else {
+            return Err(unexpected(result.label()));
+        };
+        match (self.scheduling, *event) {
+            (false, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.outcome.written += 1;
+                Ok(self.advance())
             }
-            (ReemitState::Writing, Event::Storage(StorageEvent::Error { error })) => {
+            (false, Event::Storage(StorageEvent::Error { error })) => {
                 warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to write re-emitted eviction outbox record");
-                self.complete = false;
-                self.next_write()
+                self.outcome.complete = false;
+                Ok(self.advance())
             }
-            (ReemitState::Scheduling, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                self.state = ReemitState::Done(Ok(()));
-                Effects::new()
+            (true, Event::Task(TaskEvent::TimerScheduled { .. })) => {
+                Ok(Next::Done(self.outcome.clone()))
             }
-            (ReemitState::Scheduling, Event::Task(TaskEvent::Error { message, .. })) => {
-                self.drain_error = Some(message.clone());
-                self.state = ReemitState::Done(Ok(()));
-                Effects::new()
+            (true, Event::Task(TaskEvent::Error { message, .. })) => {
+                self.outcome.drain_error = Some(message);
+                Ok(Next::Done(self.outcome.clone()))
             }
-            _ => self.reject(&event),
+            (_, other) => Err(unexpected(other.label())),
         }
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ReemitState::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            ReemitState::Done(Ok(())) => Ok(ReemitOutcome {
-                written: self.written,
-                complete: self.complete,
-                drain_error: self.drain_error,
-            }),
-            ReemitState::Done(Err(error)) => Err(error),
-            _ => Err(ReemitError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        // Each write stands alone, so nothing needs undoing.
-        self.state = ReemitState::Done(Err(ReemitError::Aborted));
-        Effects::new()
+fn unexpected(got: &'static str) -> IoError {
+    IoError::Unexpected {
+        expected: "an outbox write or drain schedule result",
+        got,
     }
 }
 
@@ -169,13 +126,11 @@ impl EffectOperation for ReemitEvictedOperation {
 mod tests {
     use super::*;
     use aruna_core::document::{
-        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
-        DocumentTarget,
+        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+        DocumentSyncRevision, DocumentTarget,
     };
+    use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
-    use aruna_core::operation_check::{
-        check_abort, rejects_events, rejects_finalize, sample_events,
-    };
     use aruna_core::structs::placement::record::PlacementRef;
     use std::time::Duration;
     use ulid::Ulid;
@@ -208,114 +163,106 @@ mod tests {
         }
     }
 
-    /// The outbox record of the one unbatched write in `effects`.
-    fn written_record(effects: &[Effect]) -> aruna_core::document::DocumentOutboxRecord {
-        let [
-            Effect::Storage(aruna_core::effects::StorageEffect::Write {
-                value,
-                txn_id: None,
-                ..
-            }),
-        ] = effects
-        else {
-            panic!("expected one outbox write, got {effects:?}");
+    /// The outbox record of the one unbatched write the operation asked for.
+    fn written_record(next: Result<Next<ReemitOutcome>, IoError>) -> DocumentOutboxRecord {
+        let Ok(Next::Call(IoCall::Effect(effect))) = next else {
+            panic!("expected one outbox write");
         };
-        postcard::from_bytes(value).expect("outbox record decodes")
+        let Effect::Storage(StorageEffect::Write {
+            value,
+            txn_id: None,
+            ..
+        }) = *effect
+        else {
+            panic!("expected one outbox write");
+        };
+        postcard::from_bytes(&value).expect("outbox record decodes")
     }
 
-    fn written() -> Event {
-        Event::Storage(StorageEvent::WriteResult {
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn written() -> IoResult {
+        event(Event::Storage(StorageEvent::WriteResult {
             key: Vec::<u8>::new().into(),
-        })
+        }))
     }
 
-    fn scheduled() -> Event {
-        Event::Task(TaskEvent::TimerScheduled {
+    fn failed() -> IoResult {
+        event(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }))
+    }
+
+    fn scheduled() -> IoResult {
+        event(Event::Task(TaskEvent::TimerScheduled {
             key: TaskKey::DrainSyncOutbox,
             after: Duration::ZERO,
-        })
+        }))
     }
 
-    fn writing() -> ReemitEvictedOperation {
-        let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1)]);
-        operation.start();
-        operation
+    fn schedule() -> Next<ReemitOutcome> {
+        Next::Call(IoCall::Effect(Box::new(schedule_drain_effect())))
     }
 
     #[test]
     fn writes_then_schedules() {
         let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1), evicted(2)]);
-        let first = written_record(&operation.start());
+        let first = written_record(operation.first());
         assert_eq!(first.outbox_id, evicted(1).event_id);
-        let second = written_record(&operation.step(written()));
+        assert_eq!(first.node_id, node());
+        let second = written_record(operation.next(written()));
         assert_eq!(second.outbox_id, evicted(2).event_id);
-        assert_eq!(
-            operation.step(written()).as_slice(),
-            &[schedule_drain_effect()]
-        );
-        assert!(operation.step(scheduled()).is_empty());
-        let outcome = operation.finalize().expect("re-emit finishes");
-        assert_eq!(
-            outcome,
-            ReemitOutcome {
-                written: 2,
-                complete: true,
-                drain_error: None,
-            }
-        );
-    }
-
-    #[test]
-    fn records_keep_ids() {
-        let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(3)]);
-        let record = written_record(&operation.start());
-        assert_eq!(record.outbox_id, evicted(3).event_id);
-        assert_eq!(record.node_id, node());
+        assert_eq!(operation.next(written()), Ok(schedule()));
+        let outcome = ReemitOutcome {
+            written: 2,
+            complete: true,
+            drain_error: None,
+        };
+        assert_eq!(operation.next(scheduled()), Ok(Next::Done(outcome)));
     }
 
     #[test]
     fn failed_write_incomplete() {
         let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1), evicted(2)]);
-        let failed = Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        });
-        operation.start();
-        let second = written_record(&operation.step(failed));
+        operation.first().unwrap();
+        let second = written_record(operation.next(failed()));
         assert_eq!(second.outbox_id, evicted(2).event_id);
-        assert_eq!(
-            operation.step(written()).as_slice(),
-            &[schedule_drain_effect()]
-        );
-        operation.step(scheduled());
-        let outcome = operation.finalize().expect("re-emit finishes");
+        assert_eq!(operation.next(written()), Ok(schedule()));
+        let Ok(Next::Done(outcome)) = operation.next(scheduled()) else {
+            panic!("re-emit finishes");
+        };
         assert_eq!((outcome.written, outcome.complete), (1, false));
     }
 
     #[test]
     fn empty_skips_drain() {
-        let mut operation = writing();
-        let failed = Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        });
-        assert!(operation.step(failed).is_empty());
-        assert!(operation.is_complete());
-        let outcome = operation.finalize().expect("re-emit finishes");
+        let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1)]);
+        operation.first().unwrap();
+        let Ok(Next::Done(outcome)) = operation.next(failed()) else {
+            panic!("re-emit finishes");
+        };
         assert_eq!((outcome.written, outcome.complete), (0, false));
-
         let mut empty = ReemitEvictedOperation::new(node(), Vec::new());
-        assert!(empty.start().is_empty());
-        assert_eq!(empty.finalize().expect("empty re-emit").written, 0);
+        let Ok(Next::Done(outcome)) = empty.first() else {
+            panic!("empty re-emit finishes");
+        };
+        assert_eq!(outcome.written, 0);
     }
 
     #[test]
     fn drain_error_reported() {
-        let mut operation = writing();
-        operation.step(written());
-        operation.step(Event::Task(TaskEvent::Error {
+        let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1)]);
+        operation.first().unwrap();
+        operation.next(written()).unwrap();
+        let refused = event(Event::Task(TaskEvent::Error {
             key: Some(TaskKey::DrainSyncOutbox),
             message: "task handle unavailable".to_string(),
         }));
-        let outcome = operation.finalize().expect("re-emit finishes");
+        let Ok(Next::Done(outcome)) = operation.next(refused) else {
+            panic!("re-emit finishes");
+        };
         assert!(outcome.complete);
         assert_eq!(
             outcome.drain_error.as_deref(),
@@ -324,44 +271,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_foreign_events() {
-        let refusals = rejects_events(writing, sample_events, |event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::Error { .. })
-            )
-        });
-        assert!(!refusals.is_empty());
-        for (label, effects, error) in refusals {
-            assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(matches!(error, ReemitError::UnexpectedEvent(_)), "{label}");
-        }
-        let scheduling = || {
-            let mut operation = writing();
-            operation.step(written());
-            operation
-        };
-        let refusals = rejects_events(scheduling, sample_events, |event| {
-            matches!(event, Event::Task(TaskEvent::Error { .. }))
-        });
-        assert!(!refusals.is_empty());
-        let mut early = ReemitEvictedOperation::new(node(), vec![evicted(1)]);
-        early.step(written());
+    fn refuses_other_results() {
+        let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1)]);
+        operation.first().unwrap();
         assert!(matches!(
-            early.finalize(),
-            Err(ReemitError::UnexpectedEvent(_))
+            operation.next(scheduled()),
+            Err(IoError::Unexpected { .. })
         ));
-    }
-
-    #[test]
-    fn abort_and_finalize() {
-        rejects_finalize(writing());
-        let mut operation = writing();
-        check_abort(&mut operation, &[]);
-        assert_eq!(operation.finalize(), Err(ReemitError::Aborted));
-        let mut scheduling = writing();
-        scheduling.step(written());
-        check_abort(&mut scheduling, &[]);
-        assert_eq!(scheduling.finalize(), Err(ReemitError::Aborted));
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(IoError::Unexpected { .. })
+        ));
+        operation.next(written()).unwrap();
+        assert!(matches!(
+            operation.next(written()),
+            Err(IoError::Unexpected { .. })
+        ));
     }
 }

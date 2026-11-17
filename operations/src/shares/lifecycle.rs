@@ -4,15 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::SHARE_LINK_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::share::{ShareAction, ShareEvent, ShareLink, ShareToken};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -21,9 +21,8 @@ use aruna_core::structs::identity::user::User;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::error::{AuthorizeError, check_error};
-use crate::document_repository::read_effect;
 use crate::shares::rules::{ShareRuleError, required_permission, validate_link, visit_expiry};
-use crate::shares::store::{LogShareOperation, ShareStoreError, save_effect};
+use crate::shares::store::{LogShareOperation, ShareStoreError, save_rows};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ShareError {
@@ -62,38 +61,24 @@ impl From<StorageError> for ShareError {
     }
 }
 
-fn read_link(id: Ulid) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: SHARE_LINK_KEYSPACE.to_string(),
-        key: id.to_bytes().to_vec().into(),
-        txn_id: None,
-    })
-}
-
-fn parse_link(event: Event, id: Ulid) -> Result<Option<ShareLink>, ShareError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
-            Some(bytes) => {
-                let link = ShareLink::from_bytes(&bytes).map_err(ShareStoreError::from)?;
-                match link.id == id {
-                    true => Ok(Some(link)),
-                    false => Err(ShareError::UnexpectedEvent("read")),
-                }
-            }
-            None => Ok(None),
-        },
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(ShareError::UnexpectedEvent("read")),
+impl From<IoError> for ShareError {
+    fn from(error: IoError) -> Self {
+        Self::Store(error.into())
     }
 }
 
-fn written(event: Event, state: &'static str) -> Result<(), ShareError> {
-    match event {
-        Event::Storage(
-            StorageEvent::BatchWriteResult { .. } | StorageEvent::WriteResult { .. },
-        ) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(ShareError::UnexpectedEvent(state)),
+fn read_link(id: Ulid) -> IoCall {
+    rows::read_row(SHARE_LINK_KEYSPACE, id.to_bytes().to_vec())
+}
+
+fn parse_link(value: Option<Value>, id: Ulid) -> Result<Option<ShareLink>, ShareError> {
+    let Some(bytes) = value else {
+        return Ok(None);
+    };
+    let link = ShareLink::from_bytes(&bytes).map_err(ShareStoreError::from)?;
+    match link.id == id {
+        true => Ok(Some(link)),
+        false => Err(ShareError::UnexpectedEvent("read")),
     }
 }
 
@@ -117,107 +102,64 @@ pub struct CreateShareConfig {
     pub now: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CreateState {
-    Init,
-    Authorize,
-    Save,
-    Done,
-    Failed,
-}
-
 /// Checks a new link and the creator's permission on its target, then stores it.
 #[derive(Debug, PartialEq)]
 pub struct CreateShareOperation {
     config: CreateShareConfig,
-    state: CreateState,
-    error: Option<ShareError>,
+    saving: bool,
 }
 
 impl CreateShareOperation {
     pub fn new(config: CreateShareConfig) -> Self {
         Self {
             config,
-            state: CreateState::Init,
-            error: None,
+            saving: false,
         }
-    }
-
-    fn fail(&mut self, error: ShareError) -> Effects {
-        self.state = CreateState::Failed;
-        self.error = Some(error);
-        smallvec![]
     }
 }
 
-impl EffectOperation for CreateShareOperation {
+impl Operation for CreateShareOperation {
     type Output = ShareLink;
     type Error = ShareError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<ShareLink>, ShareError> {
         let config = &self.config;
         if config.link.created_by != config.auth.user_id {
-            return self.fail(ShareError::Denied);
+            return Err(ShareError::Denied);
         }
-        if let Err(error) = validate_link(&config.link, config.now) {
-            return self.fail(error.into());
-        }
-        self.state = CreateState::Authorize;
+        validate_link(&config.link, config.now)?;
         let check = CheckPermissionsConfig {
             auth_context: config.auth.clone(),
             path: config.path.clone(),
             required_permission: required_permission(config.link.mode),
         };
-        smallvec![Effect::SubOperation(boxed_suboperation(
+        Ok(Next::Call(IoCall::Child(boxed_suboperation(
             CheckPermissionsOperation::new(check),
             |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (
-                CreateState::Authorize,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => match allowed {
-                Ok(true) => match save_effect(&self.config.link) {
-                    Ok(effect) => {
-                        self.state = CreateState::Save;
-                        smallvec![effect]
-                    }
-                    Err(error) => self.fail(error.into()),
-                },
-                Ok(false) => self.fail(ShareError::Denied),
-                Err(error) => match check_error(error) {
-                    AuthorizeError::PermissionDenied => self.fail(ShareError::Denied),
-                    error => self.fail(ShareError::Check(error.to_string())),
-                },
-            },
-            (CreateState::Save, event) => match written(event, "save") {
-                Ok(()) => {
-                    self.state = CreateState::Done;
-                    smallvec![]
-                }
-                Err(error) => self.fail(error),
-            },
-            _ => self.fail(ShareError::UnexpectedEvent("create")),
+    fn next(&mut self, result: IoResult) -> Result<Next<ShareLink>, ShareError> {
+        if self.saving {
+            rows::done(result)?;
+            return Ok(Next::Done(self.config.link.clone()));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, CreateState::Done | CreateState::Failed)
-    }
-
-    fn finalize(self) -> Result<ShareLink, ShareError> {
-        match (self.state, self.error) {
-            (CreateState::Done, _) => Ok(self.config.link),
-            (_, Some(error)) => Err(error),
-            _ => Err(ShareError::NotFinished),
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) =
+            rows::event(result)?
+        else {
+            return Err(ShareError::UnexpectedEvent("create"));
+        };
+        match allowed {
+            Ok(true) => {
+                self.saving = true;
+                Ok(Next::Call(IoCall::Write(save_rows(&self.config.link)?)))
+            }
+            Ok(false) => Err(ShareError::Denied),
+            Err(error) => match check_error(error) {
+                AuthorizeError::PermissionDenied => Err(ShareError::Denied),
+                error => Err(ShareError::Check(error.to_string())),
+            },
         }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -251,16 +193,14 @@ pub struct OpenedShare {
     pub expires_at: u64,
 }
 
+/// The call an open waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenState {
-    Init,
     Load,
     /// Reads the creator's account; a deactivated creator ends the link before any password.
     CheckCreator,
     LogOpen,
     LogWrong,
-    Done,
-    Failed,
 }
 
 /// Opens a link with its URL token and, when it has one, its password; logs the outcome.
@@ -270,27 +210,19 @@ pub struct OpenShareOperation {
     state: OpenState,
     link: Option<ShareLink>,
     opened: Option<OpenedShare>,
-    error: Option<ShareError>,
 }
 
 impl OpenShareOperation {
     pub fn new(config: OpenShareConfig) -> Self {
         Self {
             config,
-            state: OpenState::Init,
+            state: OpenState::Load,
             link: None,
             opened: None,
-            error: None,
         }
     }
 
-    fn fail(&mut self, error: ShareError) -> Effects {
-        self.state = OpenState::Failed;
-        self.error = Some(error);
-        smallvec![]
-    }
-
-    fn log(&mut self, action: ShareAction, state: OpenState) -> Effects {
+    fn log(&mut self, action: ShareAction, state: OpenState) -> Next<OpenedShare> {
         let event = ShareEvent {
             at: self.config.now.saturating_mul(1000),
             action,
@@ -301,13 +233,13 @@ impl OpenShareOperation {
         let share_id = self.config.token.share_id();
         self.state = state;
         let log = LogShareOperation::new(share_id, self.config.entry_id, event);
-        smallvec![Effect::SubOperation(boxed_suboperation(log, |result| {
+        Next::Call(IoCall::Child(boxed_suboperation(log, |result| {
             let result = result.map_err(|error| error.to_string());
             Event::SubOperation(SubOperationEvent::ShareLogged { result })
-        }))]
+        })))
     }
 
-    fn loaded(&mut self, link: Option<ShareLink>) -> Effects {
+    fn loaded(&mut self, link: Option<ShareLink>) -> Result<Next<OpenedShare>, ShareError> {
         let now = self.config.now;
         let link = match link {
             Some(link)
@@ -317,42 +249,38 @@ impl OpenShareOperation {
             {
                 link
             }
-            _ => return self.fail(ShareError::Unavailable),
+            _ => return Err(ShareError::Unavailable),
         };
         let creator = DocumentTarget::User {
             user_id: link.created_by,
         };
         self.link = Some(link);
         self.state = OpenState::CheckCreator;
-        smallvec![read_effect(&creator, None)]
+        Ok(Next::Call(rows::read_row(
+            creator.storage_keyspace(),
+            creator.storage_key(),
+        )))
     }
 
-    fn creator_read(&mut self, event: Event) -> Effects {
-        let active = match event {
-            // An account without a user document counts as active, as everywhere else.
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-                .map(|bytes| User::from_bytes(&bytes).map(|user| !user.is_deactivated()))
-                .transpose()
-                .map(|active| active.unwrap_or(true)),
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            _ => return self.fail(ShareError::UnexpectedEvent("creator")),
-        };
-        match (active, self.link.take()) {
-            (Ok(true), Some(link)) => self.admit(link),
-            (Ok(false), _) => self.fail(ShareError::Unavailable),
-            (Err(error), _) => self.fail(error.into()),
-            (Ok(true), None) => self.fail(ShareError::UnexpectedEvent("creator")),
+    fn creator_read(&mut self, value: Option<Value>) -> Result<Next<OpenedShare>, ShareError> {
+        // An account without a user document counts as active, as everywhere else.
+        let user = value.map(|bytes| User::from_bytes(&bytes)).transpose()?;
+        if user.is_some_and(|user| user.is_deactivated()) {
+            return Err(ShareError::Unavailable);
         }
+        let link = self
+            .link
+            .take()
+            .ok_or(ShareError::UnexpectedEvent("creator"))?;
+        self.admit(link)
     }
 
-    fn admit(&mut self, link: ShareLink) -> Effects {
+    fn admit(&mut self, link: ShareLink) -> Result<Next<OpenedShare>, ShareError> {
         let now = self.config.now;
         if let Some(hash) = &link.password {
-            let Some(password) = self.config.password.as_deref() else {
-                return self.fail(ShareError::PasswordRequired);
-            };
+            let password = (self.config.password.as_deref()).ok_or(ShareError::PasswordRequired)?;
             if !hash.verify(password) {
-                return self.log(ShareAction::WrongPassword, OpenState::LogWrong);
+                return Ok(self.log(ShareAction::WrongPassword, OpenState::LogWrong));
             }
         }
         let expires_at = visit_expiry(&link, now);
@@ -361,67 +289,35 @@ impl OpenShareOperation {
             expires_at,
             link,
         });
-        self.log(ShareAction::Open, OpenState::LogOpen)
+        Ok(self.log(ShareAction::Open, OpenState::LogOpen))
     }
 }
 
-impl EffectOperation for OpenShareOperation {
+impl Operation for OpenShareOperation {
     type Output = OpenedShare;
     type Error = ShareError;
 
-    fn start(&mut self) -> Effects {
-        self.state = OpenState::Load;
-        smallvec![read_link(self.config.token.share_id())]
+    fn first(&mut self) -> Result<Next<OpenedShare>, ShareError> {
+        Ok(Next::Call(read_link(self.config.token.share_id())))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Result<Next<OpenedShare>, ShareError> {
         match self.state {
-            OpenState::Load => match parse_link(event, self.config.token.share_id()) {
-                Ok(link) => self.loaded(link),
-                Err(error) => self.fail(error),
-            },
-            OpenState::CheckCreator => self.creator_read(event),
-            OpenState::LogOpen => match logged(event) {
-                Ok(()) => {
-                    self.state = OpenState::Done;
-                    smallvec![]
-                }
-                Err(error) => self.fail(error),
-            },
-            OpenState::LogWrong => match logged(event) {
-                Ok(()) => self.fail(ShareError::WrongPassword),
-                Err(error) => self.fail(error),
-            },
-            OpenState::Init | OpenState::Done | OpenState::Failed => {
-                self.fail(ShareError::UnexpectedEvent("open"))
+            OpenState::Load => {
+                let link = parse_link(rows::value(result)?, self.config.token.share_id())?;
+                self.loaded(link)
+            }
+            OpenState::CheckCreator => self.creator_read(rows::value(result)?),
+            OpenState::LogOpen => {
+                logged(rows::event(result)?)?;
+                (self.opened.take().map(Next::Done)).ok_or(ShareError::NotFinished)
+            }
+            OpenState::LogWrong => {
+                logged(rows::event(result)?)?;
+                Err(ShareError::WrongPassword)
             }
         }
     }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, OpenState::Done | OpenState::Failed)
-    }
-
-    fn finalize(self) -> Result<OpenedShare, ShareError> {
-        match (self.state, self.opened, self.error) {
-            (OpenState::Done, Some(opened), _) => Ok(opened),
-            (_, _, Some(error)) => Err(error),
-            _ => Err(ShareError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RevokeState {
-    Init,
-    Load,
-    Save,
-    Done,
-    Failed,
 }
 
 /// Revokes one link of `owner`; another user's link is `Unavailable` like an unknown one.
@@ -430,8 +326,7 @@ pub struct RevokeShareOperation {
     owner: UserId,
     id: Ulid,
     now: u64,
-    state: RevokeState,
-    error: Option<ShareError>,
+    saving: bool,
 }
 
 impl RevokeShareOperation {
@@ -440,77 +335,36 @@ impl RevokeShareOperation {
             owner,
             id,
             now,
-            state: RevokeState::Init,
-            error: None,
+            saving: false,
         }
-    }
-
-    fn fail(&mut self, error: ShareError) -> Effects {
-        self.state = RevokeState::Failed;
-        self.error = Some(error);
-        smallvec![]
     }
 }
 
-impl EffectOperation for RevokeShareOperation {
+impl Operation for RevokeShareOperation {
     type Output = ();
     type Error = ShareError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RevokeState::Load;
-        smallvec![read_link(self.id)]
+    fn first(&mut self) -> Result<Next<()>, ShareError> {
+        Ok(Next::Call(read_link(self.id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            RevokeState::Load => match parse_link(event, self.id) {
-                Ok(Some(link)) if link.created_by == self.owner => {
-                    if link.revoked_at.is_some() {
-                        self.state = RevokeState::Done;
-                        return smallvec![];
-                    }
-                    let revoked = ShareLink {
-                        revoked_at: Some(self.now),
-                        ..link
-                    };
-                    match save_effect(&revoked) {
-                        Ok(effect) => {
-                            self.state = RevokeState::Save;
-                            smallvec![effect]
-                        }
-                        Err(error) => self.fail(error.into()),
-                    }
-                }
-                Ok(_) => self.fail(ShareError::Unavailable),
-                Err(error) => self.fail(error),
-            },
-            RevokeState::Save => match written(event, "save") {
-                Ok(()) => {
-                    self.state = RevokeState::Done;
-                    smallvec![]
-                }
-                Err(error) => self.fail(error),
-            },
-            RevokeState::Init | RevokeState::Done | RevokeState::Failed => {
-                self.fail(ShareError::UnexpectedEvent("revoke"))
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareError> {
+        if self.saving {
+            rows::done(result)?;
+            return Ok(Next::Done(()));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RevokeState::Done | RevokeState::Failed)
-    }
-
-    fn finalize(self) -> Result<(), ShareError> {
-        match (self.state, self.error) {
-            (RevokeState::Done, _) => Ok(()),
-            (_, Some(error)) => Err(error),
-            _ => Err(ShareError::NotFinished),
+        let link = parse_link(rows::value(result)?, self.id)?;
+        let link = link.filter(|link| link.created_by == self.owner);
+        let link = link.ok_or(ShareError::Unavailable)?;
+        if link.revoked_at.is_some() {
+            return Ok(Next::Done(()));
         }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        let revoked = ShareLink {
+            revoked_at: Some(self.now),
+            ..link
+        };
+        self.saving = true;
+        Ok(Next::Call(IoCall::Write(save_rows(&revoked)?)))
     }
 }
 

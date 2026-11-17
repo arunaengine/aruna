@@ -4,19 +4,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::federation::Signed;
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, JOB_STATE_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{decode, values};
 use aruna_core::structs::execution::job::{ExportSelection, JobId};
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::transfer::{
     ExportGrant, GrantError, GrantRecord, MAX_TRANSFER_SECS, check_issued, selection_digest,
 };
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use ulid::Ulid;
 use url::Url;
 
@@ -45,15 +43,11 @@ pub(crate) struct IssueGrantConfig {
 #[derive(Debug, PartialEq)]
 pub(crate) struct IssueGrantOperation {
     config: IssueGrantConfig,
-    output: Option<Result<(bool, GrantRecord), GrantError>>,
 }
 
 impl IssueGrantOperation {
     pub(crate) fn new(config: IssueGrantConfig) -> Self {
-        Self {
-            config,
-            output: None,
-        }
+        Self { config }
     }
 
     fn stored(&self, record: GrantRecord) -> Result<(bool, GrantRecord), GrantError> {
@@ -102,65 +96,33 @@ impl IssueGrantOperation {
         Ok((false, record))
     }
 
-    fn decide(&self, event: Event) -> Result<(bool, GrantRecord), GrantError> {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return Err(GrantError::Storage(format!(
-                "unexpected event {}",
-                event.label()
-            )));
-        };
-        let [(_, record), (_, checkpoint)] = values.as_slice() else {
-            return Err(GrantError::Storage("unexpected read result".to_string()));
-        };
-        let decode = |error: postcard::Error| GrantError::Storage(error.to_string());
+    fn decide(&self, result: IoResult) -> Result<(bool, GrantRecord), GrantError> {
+        let [record, checkpoint] = values::<2>(result)?;
         if let Some(record) = record {
-            return self.stored(postcard::from_bytes(record).map_err(decode)?);
+            return self.stored(decode(&record)?);
         }
-        let checkpoint = checkpoint.as_ref().ok_or(GrantError::Unfinished)?;
-        self.sign(postcard::from_bytes(checkpoint).map_err(decode)?)
+        let checkpoint = checkpoint.ok_or(GrantError::Unfinished)?;
+        self.sign(decode(&checkpoint)?)
     }
 }
 
-impl EffectOperation for IssueGrantOperation {
+impl Operation for IssueGrantOperation {
     /// Whether the record was stored before, and the record.
     type Output = (bool, GrantRecord);
     type Error = GrantError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<Self::Output>, GrantError> {
         let job_id = self.config.job_id;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (FEDERATION_KEYSPACE.to_string(), record_key(job_id).into()),
-                (
-                    JOB_STATE_KEYSPACE.to_string(),
-                    job_id.to_bytes().to_vec().into()
-                ),
-            ],
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(vec![
+            (FEDERATION_KEYSPACE.to_string(), record_key(job_id).into()),
+            (
+                JOB_STATE_KEYSPACE.to_string(),
+                job_id.to_bytes().to_vec().into(),
+            ),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        // Only the one read answers; a decided grant takes no further event.
-        self.output = Some(match self.output {
-            Some(_) => Err(GrantError::Storage(
-                "unexpected event after the grant".to_string(),
-            )),
-            None => self.decide(event),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(GrantError::Storage("not finished".to_string())))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, GrantError> {
+        self.decide(result).map(Next::Done)
     }
 }

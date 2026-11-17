@@ -8,14 +8,13 @@ use std::ops::Deref;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::keys::realm_presence_key;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 
 // Budget for a cold presence lookup in an interactive request path, enforced by
@@ -62,16 +61,6 @@ impl PartialEq<HashSet<NodeId>> for RealmPresence {
 #[derive(Debug, PartialEq)]
 pub struct GetNodesOperation {
     realm_id: RealmId,
-    state: GetNodesState,
-    output: Option<Result<RealmPresence, GetNodesError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum GetNodesState {
-    Init,
-    ReadDocument,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -88,76 +77,62 @@ pub enum GetNodesError {
     },
 }
 
-impl GetNodesOperation {
-    pub fn new(realm_id: RealmId) -> Self {
-        Self {
-            realm_id,
-            state: GetNodesState::Init,
-            output: None,
+impl From<IoError> for GetNodesError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ReadDocument".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
         }
-    }
-
-    fn fail(&mut self, error: GetNodesError) -> Effects {
-        self.state = GetNodesState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(GetNodesError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
     }
 }
 
-impl EffectOperation for GetNodesOperation {
+impl GetNodesOperation {
+    pub fn new(realm_id: RealmId) -> Self {
+        Self { realm_id }
+    }
+}
+
+impl Operation for GetNodesOperation {
     type Output = RealmPresence;
     type Error = GetNodesError;
 
-    fn start(&mut self) -> Effects {
-        self.state = GetNodesState::ReadDocument;
-        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
-            key: realm_presence_key(&self.realm_id),
-            realm_filter: Some(self.realm_id),
-            // Multi-publisher presence must stay exhaustive; the driver enforces
-            // the same budget the caller races this operation against.
-            options: DhtGetOptions::presence(REALM_DISCOVERY_TIMEOUT, self.realm_id),
-        }))]
+    fn first(&mut self) -> Result<Next<RealmPresence>, GetNodesError> {
+        Ok(Next::Call(IoCall::Effect(Effect::Net(NetEffect::Dht(
+            DhtEffect::Get {
+                key: realm_presence_key(&self.realm_id),
+                realm_filter: Some(self.realm_id),
+                // Multi-publisher presence must stay exhaustive; the driver enforces
+                // the same budget the caller races this operation against.
+                options: DhtGetOptions::presence(REALM_DISCOVERY_TIMEOUT, self.realm_id),
+            },
+        )))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            GetNodesState::ReadDocument => match event {
-                Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, stale, .. })) => {
-                    self.state = GetNodesState::Finish;
-                    self.output = Some(Ok(RealmPresence::new(
-                        values.into_iter().map(|entry| entry.node_id).collect(),
-                        stale,
-                    )));
-                    smallvec![]
-                }
-                Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => self.fail(error.into()),
-                other => self.unexpected_event("dht get result", other.label()),
-            },
-            GetNodesState::Finish | GetNodesState::Error | GetNodesState::Init => {
-                smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<RealmPresence>, GetNodesError> {
+        let IoResult::Event(event) = result else {
+            return Err(GetNodesError::NotFinished);
+        };
+        match *event {
+            Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, stale, .. })) => {
+                let nodes = values.into_iter().map(|entry| entry.node_id).collect();
+                Ok(Next::Done(RealmPresence::new(nodes, stale)))
             }
+            Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => Err(error.into()),
+            other => Err(GetNodesError::UnexpectedEvent {
+                state: "ReadDocument".to_string(),
+                expected: "dht get result",
+                got: other.label(),
+            }),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GetNodesState::Finish | GetNodesState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(GetNodesError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    /// A lookup has no transaction, so a failure is never a conflict to retry.
+    fn is_conflict(_error: &GetNodesError) -> bool {
+        false
     }
 }
 
@@ -175,8 +150,8 @@ mod pure_tests {
 
     fn presence(realm_id: RealmId, stale: bool) -> RealmPresence {
         let mut operation = GetNodesOperation::new(realm_id);
-        let _ = operation.start();
-        let _ = operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
+        operation.first().unwrap();
+        let answer = Event::Net(NetEvent::Dht(DhtEvent::GetResult {
             key: DhtKeyId::from_data(b"presence"),
             values: vec![DhtEntry {
                 node_id: node(1),
@@ -185,8 +160,11 @@ mod pure_tests {
                 expires_at: 0,
             }],
             stale,
-        })));
-        operation.finalize().expect("presence output")
+        }));
+        match operation.next(IoResult::Event(Box::new(answer))) {
+            Ok(Next::Done(presence)) => presence,
+            other => panic!("expected the presence, got {other:?}"),
+        }
     }
 
     #[test]
@@ -194,9 +172,12 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let mut operation = GetNodesOperation::new(realm_id);
 
+        let Ok(Next::Call(IoCall::Effect(effect))) = operation.first() else {
+            panic!("expected a DHT lookup");
+        };
         assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::Net(NetEffect::Dht(DhtEffect::Get { options, .. }))]
+            effect,
+            Effect::Net(NetEffect::Dht(DhtEffect::Get { options, .. }))
                 if options.presence == Some(realm_id)
                     && options.deadline == REALM_DISCOVERY_TIMEOUT
                     && options.completion == DhtCompletion::Exhaustive
@@ -213,5 +194,24 @@ mod pure_tests {
         let stale = presence(realm_id, true);
         assert!(stale.is_stale());
         assert!(stale.contains(&node(1)));
+    }
+
+    #[test]
+    fn lookup_failures_end() {
+        // A DHT error or an answer of another kind fails the lookup.
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let mut operation = GetNodesOperation::new(realm_id);
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(GetNodesError::NotFinished)
+        ));
+        let mut operation = GetNodesOperation::new(realm_id);
+        operation.first().unwrap();
+        let other = IoResult::Event(Box::new(Event::Net(NetEvent::InboxWoken)));
+        assert!(matches!(
+            operation.next(other),
+            Err(GetNodesError::UnexpectedEvent { .. })
+        ));
     }
 }

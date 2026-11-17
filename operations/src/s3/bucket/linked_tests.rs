@@ -220,19 +220,14 @@ fn bucket_key() -> Key {
 fn job_rows(
     linked: Option<&LinkedJob>,
     rename: Option<(&CompressionMigration, &RenameRequest)>,
-) -> Event {
+) -> IoResult {
     let migration = rename.map(|(record, _)| record.to_bytes().unwrap().into());
     let request = rename.map(|(_, request)| request.to_bytes().unwrap().into());
-    Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                bucket_key(),
-                linked.map(|row| row.to_bytes().unwrap().into()),
-            ),
-            (bucket_key(), migration),
-            (bucket_key(), request),
-        ],
-    })
+    IoResult::Values(vec![
+        linked.map(|row| row.to_bytes().unwrap().into()),
+        migration,
+        request,
+    ])
 }
 
 fn linked_job(state: LinkedState, started_at_ms: u64) -> LinkedJob {
@@ -257,11 +252,8 @@ fn rename_move(started_at_ms: u64, request_ms: u64) -> (CompressionMigration, Re
     (record, request)
 }
 
-fn shown(event: Event) -> Result<Option<BucketJob>, LinkedError> {
-    let mut operation = ShownJobOperation::new(BUCKET);
-    operation.start();
-    operation.step(event);
-    operation.finalize()
+fn shown(result: IoResult) -> Result<Next<Option<BucketJob>>, LinkedError> {
+    ShownJobOperation::new(BUCKET).next(result)
 }
 
 #[test]
@@ -274,15 +266,11 @@ fn reads_bucket_job() {
     let reads = reads
         .map(|space| (space.to_string(), bucket_key()))
         .to_vec();
-    let start = Effect::Storage(StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    });
-    let running = linked_job(LinkedState::Running, 3);
     let mut operation = ShownJobOperation::new(BUCKET);
-    let steps = vec![(job_rows(Some(&running), None), vec![])];
-    aruna_core::operation_check::check_trace(&mut operation, &[start], steps);
-    assert_eq!(operation.finalize(), Ok(Some(BucketJob::Linked(running))));
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(reads))));
+    let running = linked_job(LinkedState::Running, 3);
+    let answer = operation.next(job_rows(Some(&running), None));
+    assert_eq!(answer, Ok(Next::Done(Some(BucketJob::Linked(running)))));
 }
 
 #[test]
@@ -296,9 +284,12 @@ fn shows_job_chosen() {
     let mut ended = record.clone();
     ended.finished_at_ms = Some(8);
     let (other, unrelated) = rename_move(7, 6);
-    let linked = |row: &LinkedJob| Ok(Some(BucketJob::Linked(row.clone())));
+    let linked = |row: &LinkedJob| Ok(Next::Done(Some(BucketJob::Linked(row.clone()))));
     let renamed = |record: &CompressionMigration| {
-        Ok(Some(BucketJob::Rename(record.clone(), request.clone())))
+        Ok(Next::Done(Some(BucketJob::Rename(
+            record.clone(),
+            request.clone(),
+        ))))
     };
     let cases = [
         (Some(&running), Some((&record, &request)), linked(&running)),
@@ -307,7 +298,7 @@ fn shows_job_chosen() {
         (Some(&early), Some((&ended, &request)), renamed(&ended)),
         (Some(&early), Some((&other, &unrelated)), linked(&early)),
         (None, Some((&ended, &request)), renamed(&ended)),
-        (None, None, Ok(None)),
+        (None, None, Ok(Next::Done(None))),
     ];
     for (row, rename, expected) in cases {
         assert_eq!(shown(job_rows(row, rename)), expected);
@@ -316,17 +307,17 @@ fn shows_job_chosen() {
 
 #[test]
 fn bucket_job_errors() {
-    let failed = Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    });
-    assert_eq!(
-        shown(failed),
-        Err(LinkedError::Storage(StorageError::Timeout))
-    );
-    let corrupt = Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(bucket_key(), Some(vec![0xff].into()))],
-    });
+    let corrupt = IoResult::Values(vec![Some(vec![0xff].into()), None, None]);
     assert!(matches!(shown(corrupt), Err(LinkedError::Conversion(_))));
+    assert!(matches!(
+        shown(IoResult::Done),
+        Err(LinkedError::Io(IoError::Unexpected { .. }))
+    ));
+    let conflict = LinkedError::from(IoError::Conflict);
+    assert_eq!(
+        conflict,
+        LinkedError::Storage(StorageError::TransactionConflict)
+    );
 }
 
 #[test]
@@ -335,56 +326,18 @@ fn reads_rename_total() {
         started_at_ms,
         total: 3,
     };
-    let read = |value: Option<RenameTotal>| {
-        Event::Storage(StorageEvent::ReadResult {
-            key: bucket_key(),
-            value: value.map(|row| row.to_bytes().unwrap().into()),
-        })
+    let stored = |value: Option<RenameTotal>| {
+        IoResult::Values(vec![value.map(|row| row.to_bytes().unwrap().into())])
     };
-    let start = Effect::Storage(StorageEffect::Read {
-        key_space: RENAME_TOTAL_KEYSPACE.to_string(),
-        key: bucket_key(),
-        txn_id: None,
-    });
     let mut operation = RenameTotalOperation::new(BUCKET, 7);
-    let steps = vec![(read(Some(row(7))), vec![])];
-    aruna_core::operation_check::check_trace(&mut operation, &[start], steps);
-    assert_eq!(operation.finalize(), Ok(Some(3)));
+    let read = vec![(RENAME_TOTAL_KEYSPACE.to_string(), bucket_key())];
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
+    assert_eq!(
+        operation.next(stored(Some(row(7)))),
+        Ok(Next::Done(Some(3)))
+    );
     // A total stored for another move, or none, is no total.
     for value in [Some(row(8)), None] {
-        let mut operation = RenameTotalOperation::new(BUCKET, 7);
-        operation.start();
-        operation.step(read(value));
-        assert_eq!(operation.finalize(), Ok(None));
+        assert_eq!(operation.next(stored(value)), Ok(Next::Done(None)));
     }
-}
-
-#[test]
-fn job_reads_contract() {
-    use aruna_core::operation_check::{
-        check_abort, rejects_events, rejects_finalize, sample_events,
-    };
-    let make = || {
-        let mut operation = ShownJobOperation::new(BUCKET);
-        operation.start();
-        operation
-    };
-    let accepted =
-        |event: &Event| matches!(event, Event::Storage(StorageEvent::BatchReadResult { .. }));
-    let refused = rejects_events(make, sample_events, accepted);
-    assert_eq!(refused.len(), sample_events().len() - 1);
-    let make = || {
-        let mut operation = RenameTotalOperation::new(BUCKET, 7);
-        operation.start();
-        operation
-    };
-    let accepted = |event: &Event| matches!(event, Event::Storage(StorageEvent::ReadResult { .. }));
-    let refused = rejects_events(make, sample_events, accepted);
-    assert_eq!(refused.len(), sample_events().len() - 1);
-    let mut fresh = ShownJobOperation::new(BUCKET);
-    check_abort(&mut fresh, &[]);
-    rejects_finalize(fresh);
-    let mut fresh = RenameTotalOperation::new(BUCKET, 7);
-    check_abort(&mut fresh, &[]);
-    rejects_finalize(fresh);
 }

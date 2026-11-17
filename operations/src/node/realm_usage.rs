@@ -5,22 +5,20 @@
 use std::collections::HashSet;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::usage::{
     NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, UsageCounterError, UsageCounters,
     usage_group_key, usage_group_prefix, usage_node_id, usage_summary_key,
 };
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 
-use crate::s3::usage::{counted, global_shard_read, global_sum};
+use crate::s3::usage::{counted, global_shard_rows, global_sum};
 
 /// Snapshot rows one page reads.
 const PAGE_LIMIT: usize = 1_000;
@@ -59,20 +57,15 @@ impl RealmUsage {
 #[derive(Debug, Error, PartialEq)]
 pub enum RealmUsageError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Counter(#[from] UsageCounterError),
-    #[error("unexpected event while {0}")]
-    UnexpectedEvent(&'static str),
-    #[error("the realm usage sum has not finished")]
-    Unfinished,
 }
 
 #[derive(Debug, PartialEq)]
 enum Phase {
-    Idle,
     Config,
     Local,
     Snapshots {
@@ -81,20 +74,6 @@ enum Phase {
         replicas: UsageCounters,
     },
     Summary,
-    Done(Result<Vec<RealmUsage>, RealmUsageError>),
-}
-
-impl Phase {
-    fn label(&self) -> &'static str {
-        match self {
-            Phase::Idle => "idle",
-            Phase::Config => "reading the realm config",
-            Phase::Local => "reading the local counters",
-            Phase::Snapshots { .. } => "reading the node snapshots",
-            Phase::Summary => "writing the realm summary",
-            Phase::Done(_) => "done",
-        }
-    }
 }
 
 /// Sums each scope's realm-wide total from the live local counters and the remote snapshots,
@@ -110,6 +89,8 @@ pub struct RealmUsageOperation {
     totals: Vec<RealmUsage>,
     phase: Phase,
 }
+
+type Turn = Result<Next<Vec<RealmUsage>>, RealmUsageError>;
 
 impl RealmUsageOperation {
     /// Sums one scope; its output holds exactly one total.
@@ -145,83 +126,66 @@ impl RealmUsageOperation {
             scopes,
             write_summary,
             active: None,
-            phase: Phase::Idle,
+            phase: Phase::Config,
         }
     }
 
-    fn fail(&mut self, error: RealmUsageError) -> Effects {
-        self.phase = Phase::Done(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self) -> Effects {
-        let error = RealmUsageError::UnexpectedEvent(self.phase.label());
-        self.fail(error)
-    }
-
-    fn read_config(&mut self, value: Option<Value>) -> Result<Effects, RealmUsageError> {
+    fn read_config(&mut self, value: Option<Value>) -> Turn {
         if let Some(bytes) = value {
             let config = RealmConfigDocument::from_bytes(bytes.as_ref())?;
             self.active = Some(config.sync_eligible_nodes()?.into_iter().collect());
         }
-        Ok(self.next_scope())
+        self.next_scope()
     }
 
-    fn next_scope(&mut self) -> Effects {
+    fn next_scope(&mut self) -> Turn {
         let Some(scope) = self.scopes.get(self.totals.len()) else {
             return self.finish_scopes();
         };
         self.phase = Phase::Local;
-        let effect = match scope {
-            RealmUsageScope::Global => global_shard_read(None),
-            RealmUsageScope::Group(group_id) => StorageEffect::Read {
-                key_space: USAGE_STATS_KEYSPACE.to_string(),
-                key: Key::from(usage_group_key(*group_id)),
-                txn_id: None,
-            },
+        let reads = match scope {
+            RealmUsageScope::Global => global_shard_rows(),
+            RealmUsageScope::Group(group_id) => {
+                let key = Key::from(usage_group_key(*group_id));
+                vec![(USAGE_STATS_KEYSPACE.to_string(), key)]
+            }
         };
-        smallvec![Effect::Storage(effect)]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn local_counters(&self, event: StorageEvent) -> Result<UsageCounters, RealmUsageError> {
-        let scope = self.scopes.get(self.totals.len());
-        match (scope, event) {
-            (Some(RealmUsageScope::Global), StorageEvent::BatchReadResult { values }) => {
-                global_sum(values)
-            }
-            (Some(RealmUsageScope::Group(_)), StorageEvent::ReadResult { value, .. }) => value
+    fn local_counters(&self, values: Vec<Option<Value>>) -> Result<UsageCounters, RealmUsageError> {
+        match self.scopes.get(self.totals.len()) {
+            Some(RealmUsageScope::Global) => global_sum(values),
+            _ => (values.into_iter().next().flatten())
                 .map(|bytes| UsageCounters::from_bytes(bytes.as_ref()))
                 .transpose()
                 .map(Option::unwrap_or_default)
                 .map_err(RealmUsageError::from),
-            _ => Err(RealmUsageError::UnexpectedEvent(self.phase.label())),
         }
     }
 
-    fn snapshot_page(&self, start: Option<Key>) -> Effects {
+    fn snapshot_page(&self, after: Option<Key>) -> Turn {
         let prefix = match self.scopes.get(self.totals.len()) {
             Some(RealmUsageScope::Group(group_id)) => usage_group_prefix(*group_id),
             _ => USAGE_GLOBAL_PREFIX.to_vec(),
         };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: NODE_STATS_KEYSPACE.to_string(),
-            prefix: Some(Key::from(prefix)),
-            start: start.map(IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: NODE_STATS_KEYSPACE.to_string(),
+            prefix: Key::from(prefix),
+            after,
             limit: PAGE_LIMIT,
-            txn_id: None,
-        })]
+        }))
     }
 
     /// Adds every node's replica share and each counted remote node's counters. The local
     /// snapshot is skipped for the counters, which come from the live local rows.
-    fn add_page(&mut self, values: Vec<(Key, Value)>) -> Result<(), RealmUsageError> {
-        let Phase::Snapshots {
-            remote, replicas, ..
-        } = &mut self.phase
-        else {
-            return Err(RealmUsageError::UnexpectedEvent("adding a snapshot page"));
-        };
-        for (key, value) in values {
+    fn add_page(
+        &self,
+        rows: Vec<(Key, Value)>,
+        remote: &mut UsageCounters,
+        replicas: &mut UsageCounters,
+    ) -> Result<(), RealmUsageError> {
+        for (key, value) in rows {
             let key_node_id = usage_node_id(key.as_ref());
             let local = key_node_id == Some(self.local_node_id);
             if !local && !counted(self.active.as_ref(), key_node_id) {
@@ -240,21 +204,7 @@ impl RealmUsageOperation {
         Ok(())
     }
 
-    fn finish_scope(&mut self) -> Result<Effects, RealmUsageError> {
-        let Phase::Snapshots {
-            local,
-            remote,
-            replicas,
-        } = std::mem::replace(&mut self.phase, Phase::Idle)
-        else {
-            return Err(RealmUsageError::UnexpectedEvent("finishing a scope"));
-        };
-        let total = RealmUsage::of(local, (remote, replicas))?;
-        self.totals.push(total);
-        Ok(self.next_scope())
-    }
-
-    fn finish_scopes(&mut self) -> Effects {
+    fn finish_scopes(&mut self) -> Turn {
         let mut writes = Vec::new();
         if self.write_summary {
             for (scope, total) in self.scopes.iter().zip(&self.totals) {
@@ -262,112 +212,72 @@ impl RealmUsageOperation {
                     RealmUsageScope::Global => SUMMARY_GLOBAL_KEY.to_vec(),
                     RealmUsageScope::Group(group_id) => usage_summary_key(*group_id),
                 };
-                let value = match total.counters.to_bytes() {
-                    Ok(value) => value,
-                    Err(error) => return self.fail(error.into()),
-                };
-                writes.push((
-                    NODE_STATS_KEYSPACE.to_string(),
-                    Key::from(key),
-                    Value::from(value),
-                ));
+                let value = Value::from(total.counters.to_bytes()?);
+                writes.push((NODE_STATS_KEYSPACE.to_string(), Key::from(key), value));
             }
         }
-        if writes.is_empty() {
-            self.phase = Phase::Done(Ok(std::mem::take(&mut self.totals)));
-            return smallvec![];
-        }
         self.phase = Phase::Summary;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for RealmUsageOperation {
+    /// One total per scope, in scope order.
+    type Output = Vec<RealmUsage>;
+    type Error = RealmUsageError;
+
+    fn first(&mut self) -> Turn {
+        let Some(realm_id) = self.realm_id else {
+            return self.next_scope();
+        };
+        let key = DocumentTarget::RealmConfig { realm_id }.storage_key();
+        Ok(Next::Call(IoCall::Read(vec![(
+            REALM_CONFIG_KEYSPACE.to_string(),
+            key,
+        )])))
     }
 
-    fn handle(&mut self, event: StorageEvent) -> Result<Effects, RealmUsageError> {
-        if let StorageEvent::Error { error } = event {
-            return Err(error.into());
-        }
-        let unexpected = RealmUsageError::UnexpectedEvent(self.phase.label());
-        match self.phase {
-            Phase::Config => match event {
-                StorageEvent::ReadResult { value, .. } => self.read_config(value),
-                _ => Err(unexpected),
-            },
-            Phase::Local => {
-                let local = self.local_counters(event)?;
+    fn next(&mut self, result: IoResult) -> Turn {
+        match (std::mem::replace(&mut self.phase, Phase::Config), result) {
+            (Phase::Config, IoResult::Values(values)) => {
+                self.read_config(values.into_iter().next().flatten())
+            }
+            (Phase::Local, IoResult::Values(values)) => {
+                let local = self.local_counters(values)?;
                 self.phase = Phase::Snapshots {
                     local,
                     remote: UsageCounters::default(),
                     replicas: UsageCounters::default(),
                 };
-                Ok(self.snapshot_page(None))
+                self.snapshot_page(None)
             }
-            Phase::Snapshots { .. } => match event {
-                StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                } => {
-                    self.add_page(values)?;
-                    match next_start_after {
-                        Some(start) => Ok(self.snapshot_page(Some(start))),
-                        None => self.finish_scope(),
-                    }
+            (
+                Phase::Snapshots {
+                    local,
+                    mut remote,
+                    mut replicas,
+                },
+                IoResult::Page { rows, next },
+            ) => {
+                self.add_page(rows, &mut remote, &mut replicas)?;
+                if next.is_some() {
+                    self.phase = Phase::Snapshots {
+                        local,
+                        remote,
+                        replicas,
+                    };
+                    return self.snapshot_page(next);
                 }
-                _ => Err(unexpected),
-            },
-            Phase::Summary => match event {
-                StorageEvent::BatchWriteResult { .. } => {
-                    self.phase = Phase::Done(Ok(std::mem::take(&mut self.totals)));
-                    Ok(smallvec![])
-                }
-                _ => Err(unexpected),
-            },
-            Phase::Idle | Phase::Done(_) => Err(unexpected),
+                self.totals.push(RealmUsage::of(local, (remote, replicas))?);
+                self.next_scope()
+            }
+            (Phase::Summary, IoResult::Done) => Ok(Next::Done(std::mem::take(&mut self.totals))),
+            _ => Err(IoError::Unexpected {
+                expected: "the answer to the realm usage call",
+                got: "another result",
+            }
+            .into()),
         }
-    }
-}
-
-impl EffectOperation for RealmUsageOperation {
-    /// One total per scope, in scope order.
-    type Output = Vec<RealmUsage>;
-    type Error = RealmUsageError;
-
-    fn start(&mut self) -> Effects {
-        let Some(realm_id) = self.realm_id else {
-            return self.next_scope();
-        };
-        self.phase = Phase::Config;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: DocumentTarget::RealmConfig { realm_id }.storage_key(),
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let Event::Storage(event) = event else {
-            return self.unexpected();
-        };
-        match self.handle(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.phase, Phase::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.phase {
-            Phase::Done(result) => result,
-            _ => Err(RealmUsageError::Unfinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -376,15 +286,10 @@ mod state_machine_tests {
     use std::collections::BTreeMap;
 
     use aruna_core::NodeId;
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::document::DocumentTarget;
-    use aruna_core::effects::{Effect, IterStart, StorageEffect};
-    use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::structs::storage::usage::{
         NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, UsageCounters,
@@ -395,6 +300,7 @@ mod state_machine_tests {
     use ulid::Ulid;
 
     use super::{RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope};
+    use crate::s3::usage::global_shard_rows;
 
     const REALM: RealmId = RealmId([7; 32]);
     const GROUP: GroupId = Ulid::from_parts(4, 4);
@@ -437,70 +343,42 @@ mod state_machine_tests {
         (Key::from(key), Value::from(snapshot.to_bytes().unwrap()))
     }
 
-    fn storage(event: StorageEvent) -> Event {
-        Event::Storage(event)
+    type Turn = Result<Next<Vec<RealmUsage>>, RealmUsageError>;
+
+    fn call(call: IoCall) -> Turn {
+        Ok(Next::Call(call))
     }
 
-    fn read(value: Option<Value>) -> Event {
-        storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value,
-        })
+    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Page { rows, next }
     }
 
-    fn page(values: Vec<(Key, Value)>, next: Option<Key>) -> Event {
-        storage(StorageEvent::IterResult {
-            values,
-            next_start_after: next,
-        })
-    }
-
-    fn snapshots(prefix: Vec<u8>, start: Option<Key>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: NODE_STATS_KEYSPACE.to_string(),
-            prefix: Some(Key::from(prefix)),
-            start: start.map(IterStart::After),
+    fn snapshots(prefix: Vec<u8>, after: Option<Key>) -> Turn {
+        call(IoCall::Page {
+            space: NODE_STATS_KEYSPACE.to_string(),
+            prefix: Key::from(prefix),
+            after,
             limit: 1_000,
-            txn_id: None,
         })
     }
 
-    fn config_read() -> Effect {
-        Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: DocumentTarget::RealmConfig { realm_id: REALM }.storage_key(),
-            txn_id: None,
-        })
+    fn config_read() -> Turn {
+        let key = DocumentTarget::RealmConfig { realm_id: REALM }.storage_key();
+        call(IoCall::Read(vec![(REALM_CONFIG_KEYSPACE.to_string(), key)]))
     }
 
-    fn global_read() -> Effect {
-        Effect::Storage(StorageEffect::BatchRead {
-            reads: global_shard_keys()
-                .into_iter()
-                .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
-                .collect(),
-            txn_id: None,
-        })
+    fn group_read() -> Turn {
+        let key = Key::from(usage_group_key(GROUP));
+        call(IoCall::Read(vec![(USAGE_STATS_KEYSPACE.to_string(), key)]))
     }
 
-    fn group_read() -> Effect {
-        Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: Key::from(usage_group_key(GROUP)),
-            txn_id: None,
-        })
-    }
-
-    fn shard_values() -> Event {
-        let shards = global_shard_keys();
+    /// Shard 0 and 2 hold counters, every other shard is absent.
+    fn shard_values() -> IoResult {
         let value = |used: UsageCounters| Some(Value::from(used.to_bytes().unwrap()));
-        storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(shards[0].clone()), value(counters(1, 10))),
-                (Key::from(shards[1].clone()), None),
-                (Key::from(shards[2].clone()), value(counters(2, 5))),
-            ],
-        })
+        let mut values = vec![None; global_shard_keys().len()];
+        values[0] = value(counters(1, 10));
+        values[2] = value(counters(2, 5));
+        IoResult::Values(values)
     }
 
     /// Node 1 is local, node 2 counts, node 3 is a device and a row of node 4 names node 2.
@@ -513,22 +391,15 @@ mod state_machine_tests {
         ]
     }
 
-    fn summary_write(global: &RealmUsage, group: &RealmUsage) -> Effect {
+    fn summary_write(global: &RealmUsage, group: &RealmUsage) -> Turn {
         let row = |key: Vec<u8>, total: &RealmUsage| {
-            let value = total.counters.to_bytes().unwrap();
-            (
-                NODE_STATS_KEYSPACE.to_string(),
-                Key::from(key),
-                Value::from(value),
-            )
+            let value = Value::from(total.counters.to_bytes().unwrap());
+            (NODE_STATS_KEYSPACE.to_string(), Key::from(key), value)
         };
-        Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                row(SUMMARY_GLOBAL_KEY.to_vec(), global),
-                row(usage_summary_key(GROUP), group),
-            ],
-            txn_id: None,
-        })
+        call(IoCall::Write(vec![
+            row(SUMMARY_GLOBAL_KEY.to_vec(), global),
+            row(usage_summary_key(GROUP), group),
+        ]))
     }
 
     #[test]
@@ -537,132 +408,60 @@ mod state_machine_tests {
         let continued = Key::from(usage_global_key(node(2)));
         let global = RealmUsage::of(counters(3, 15), (counters(4, 40), counters(3, 3))).unwrap();
         let group = RealmUsage::of(counters(0, 0), (counters(0, 0), counters(0, 0))).unwrap();
-        check_trace(
-            &mut operation,
-            &[config_read()],
-            vec![
-                (read(Some(config_bytes())), vec![global_read()]),
-                (
-                    shard_values(),
-                    vec![snapshots(USAGE_GLOBAL_PREFIX.to_vec(), None)],
-                ),
-                (
-                    page(global_page(), Some(continued.clone())),
-                    vec![snapshots(USAGE_GLOBAL_PREFIX.to_vec(), Some(continued))],
-                ),
-                (page(Vec::new(), None), vec![group_read()]),
-                (read(None), vec![snapshots(usage_group_prefix(GROUP), None)]),
-                (page(Vec::new(), None), vec![summary_write(&global, &group)]),
-                (
-                    storage(StorageEvent::BatchWriteResult {
-                        entries: Vec::new(),
-                    }),
-                    vec![],
-                ),
-            ],
+        let global_prefix = || USAGE_GLOBAL_PREFIX.to_vec();
+        assert_eq!(operation.first(), config_read());
+        let config = IoResult::Values(vec![Some(config_bytes())]);
+        assert_eq!(
+            operation.next(config),
+            call(IoCall::Read(global_shard_rows()))
         );
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap(), vec![global, group]);
+        assert_eq!(
+            operation.next(shard_values()),
+            snapshots(global_prefix(), None)
+        );
+        let first = page(global_page(), Some(continued.clone()));
+        assert_eq!(
+            operation.next(first),
+            snapshots(global_prefix(), Some(continued))
+        );
+        assert_eq!(operation.next(page(Vec::new(), None)), group_read());
+        let absent = IoResult::Values(vec![None]);
+        let group_prefix = usage_group_prefix(GROUP);
+        assert_eq!(operation.next(absent), snapshots(group_prefix, None));
+        let last = operation.next(page(Vec::new(), None));
+        assert_eq!(last, summary_write(&global, &group));
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Done(vec![global, group]))
+        );
     }
 
     #[test]
     fn all_nodes_count() {
         // Without a realm config every node's snapshot counts, and a sum writes nothing.
         let mut operation = RealmUsageOperation::new(node(1), None, RealmUsageScope::Global);
-        check_trace(
-            &mut operation,
-            &[global_read()],
-            vec![
-                (
-                    storage(StorageEvent::BatchReadResult { values: Vec::new() }),
-                    vec![snapshots(USAGE_GLOBAL_PREFIX.to_vec(), None)],
-                ),
-                (page(global_page(), None), vec![]),
-            ],
-        );
+        assert_eq!(operation.first(), call(IoCall::Read(global_shard_rows())));
+        let empty = IoResult::Values(vec![None; global_shard_keys().len()]);
+        let global_prefix = USAGE_GLOBAL_PREFIX.to_vec();
+        assert_eq!(operation.next(empty), snapshots(global_prefix, None));
+        let last = operation.next(page(global_page(), None));
+        assert_eq!(last, call(IoCall::Write(Vec::new())));
         let total = RealmUsage::of(counters(0, 0), (counters(13, 49), counters(12, 12))).unwrap();
-        assert_eq!(operation.finalize().unwrap(), vec![total]);
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(vec![total])));
     }
 
     #[test]
-    fn storage_errors_end() {
-        let error = || {
-            storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
-        let prefixes: Vec<Vec<Event>> = vec![
-            vec![],
-            vec![read(Some(config_bytes()))],
-            vec![read(Some(config_bytes())), shard_values()],
-            vec![
-                read(Some(config_bytes())),
-                shard_values(),
-                page(Vec::new(), None),
-                read(None),
-                page(Vec::new(), None),
-            ],
-        ];
-        for events in prefixes {
-            let mut operation =
-                RealmUsageOperation::summary(node(1), Some(REALM), true, vec![GROUP]);
-            operation.start();
-            for event in events {
-                assert!(!operation.step(event).is_empty());
-            }
-            assert!(operation.step(error()).is_empty());
-            assert!(operation.is_complete());
-            let result = operation.finalize();
-            assert_eq!(result, Err(RealmUsageError::Storage(StorageError::Timeout)));
-        }
-    }
-
-    #[test]
-    fn rejects_stray_events() {
-        let started = || {
-            let mut operation =
-                RealmUsageOperation::new(node(1), Some(REALM), RealmUsageScope::Global);
-            operation.start();
-            operation
-        };
-        let expected = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        let refusals = rejects_events(started, sample_events, expected);
-        assert!(!refusals.is_empty());
-        for (label, effects, error) in refusals {
-            assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(
-                matches!(error, RealmUsageError::UnexpectedEvent(_)),
-                "{label}: {error:?}"
-            );
-        }
-        // A group scope answers with one row, never a batch.
-        let mut group = RealmUsageOperation::new(node(1), None, RealmUsageScope::Group(GROUP));
-        group.start();
-        assert!(group.step(shard_values()).is_empty());
+    fn rejects_bad_answers() {
+        let mut garbled = RealmUsageOperation::new(node(1), Some(REALM), RealmUsageScope::Global);
+        let config = IoResult::Values(vec![Some(Value::from(vec![0xff; 3]))]);
         assert!(matches!(
-            group.finalize(),
-            Err(RealmUsageError::UnexpectedEvent(_))
+            garbled.next(config),
+            Err(RealmUsageError::Conversion(_))
         ));
-    }
-
-    #[test]
-    fn abort_needs_nothing() {
-        let mut operation = RealmUsageOperation::summary(node(1), Some(REALM), true, vec![GROUP]);
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-        operation.step(read(None));
-        check_abort(&mut operation, &[]);
-        rejects_finalize(operation);
-        rejects_finalize(RealmUsageOperation::new(
-            node(1),
-            None,
-            RealmUsageScope::Global,
+        let mut early = RealmUsageOperation::new(node(1), None, RealmUsageScope::Group(GROUP));
+        assert!(matches!(
+            early.next(page(Vec::new(), None)),
+            Err(RealmUsageError::Io(_))
         ));
     }
 }

@@ -7,11 +7,8 @@ use std::time::Instant;
 
 use aruna_core::NodeId;
 use aruna_core::injection::verify_request;
-use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall};
-use aruna_core::plugin_runs::{
-    HookRequest, MAX_INPUT, PluginRun, RunState, RunTrigger, SourceEvent, timer_key,
-};
+use aruna_core::plugin_runs::{HookRequest, MAX_INPUT, PluginRun, RunTrigger, SourceEvent};
 use aruna_core::plugins::ReleaseRequest;
 use aruna_core::secrets::Delivery;
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
@@ -19,10 +16,9 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugins::manifest::SecretKind;
 use aruna_plugins::trigger::{Trigger, TriggerKind};
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::bound::{ReleaseKeys, check_node_binding, delivery_clash, select, vault_kind};
+use super::bound::{check_node_binding, delivery_clash, select, vault_kind};
 use super::finished::retry_run;
 use super::held::{HeldSecrets, ask_release};
 use super::hooks::{AdmitHook, DROPPED, HookError};
@@ -30,10 +26,8 @@ use super::install::{InstallError, check_admin, pick_version, read_config, read_
 use super::matcher::event_trigger;
 use super::rate::take_hook;
 use super::receiver::lost_reason;
-use super::rows::{
-    Answer, Ask, Plan, RowsOperation, StoreError, Turn, decode, done, encode, row as row_of, values,
-};
-use super::runs::{ADMISSIONS, Admission, RunError, admit};
+use super::rows::StoreError;
+use super::runs::{ADMISSIONS, RunError, admit, enqueue_timer, new_run};
 use super::settings::{SettingError, check_fields};
 use crate::driver::{DriverContext, drive};
 
@@ -58,13 +52,6 @@ pub enum StartError {
     Run(#[from] RunError),
 }
 
-/// The last due occurrence of an install's timer, and occurrences skipped at the queue bound.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TimerRow {
-    pub last_due_ms: u64,
-    pub skipped: u64,
-}
-
 /// The trigger's name when the install's pinned version declares it; the guest picks its
 /// function by this name.
 fn handler(
@@ -83,35 +70,6 @@ fn trigger(
 ) -> Option<Trigger> {
     let plugin = pick_version(config, &install.plugin, Some(&install.digest)).ok()?;
     read_manifest(&plugin).ok()?.triggers.remove(&kind)
-}
-
-/// A queued run of the install's current revision, due at `due_ms`.
-pub(super) fn new_run(
-    install: &PluginInstall,
-    handler: String,
-    trigger: RunTrigger,
-    due_ms: u64,
-) -> PluginRun {
-    PluginRun {
-        run_id: Ulid::generate(),
-        install_id: install.install_id,
-        group_id: install.group_id,
-        plugin: install.plugin.clone(),
-        version: install.version.clone(),
-        revision: install.revision,
-        digest: install.digest.clone(),
-        handler,
-        settings: install.settings.clone(),
-        trigger,
-        state: RunState::Queued,
-        attempts: 0,
-        due_ms,
-        created_ms: due_ms,
-        finished_ms: None,
-        message: None,
-        output: None,
-        log: Vec::new(),
-    }
 }
 
 /// Queues a manual run for a group admin with the form's values, defaults filled in. Only the
@@ -207,133 +165,6 @@ pub(crate) async fn enqueue_timers(
     Ok(queued)
 }
 
-/// Queues the due occurrence of an install's timer, or counts it as skipped over the queue bound;
-/// the caller holds `ADMISSIONS`.
-fn enqueue_timer(
-    install: &PluginInstall,
-    handler: String,
-    interval_ms: u64,
-    now_ms: u64,
-) -> RowsOperation<EnqueueTimer> {
-    RowsOperation::transaction(EnqueueTimer {
-        install: Box::new(install.clone()),
-        handler,
-        interval_ms,
-        now_ms,
-        key: timer_key(install.install_id),
-        phase: TimerPhase::Reading,
-    })
-}
-
-#[derive(Debug, PartialEq)]
-pub struct EnqueueTimer {
-    install: Box<PluginInstall>,
-    handler: String,
-    interval_ms: u64,
-    now_ms: u64,
-    key: Vec<u8>,
-    phase: TimerPhase,
-}
-
-#[derive(Debug, PartialEq)]
-enum TimerPhase {
-    Reading,
-    Admitting(TimerRow, Admission),
-    Writing(bool),
-}
-
-impl Plan for EnqueueTimer {
-    type Output = bool;
-    type Error = StoreError;
-
-    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(
-            PLUGIN_RUNS_KEYSPACE,
-            self.key.clone(),
-        )])))
-    }
-
-    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
-        match std::mem::replace(&mut self.phase, TimerPhase::Writing(false)) {
-            TimerPhase::Reading => {
-                let [found] = values::<1>(answer)?;
-                let mut row = match found {
-                    Some(bytes) => decode::<TimerRow>(&bytes)?,
-                    None => TimerRow::default(),
-                };
-                // Occurrences count from the last activation, so a pause is never replayed.
-                let base =
-                    (row.last_due_ms).max(self.install.active_since_ms.unwrap_or(self.now_ms));
-                if self.now_ms < base.saturating_add(self.interval_ms) {
-                    return Ok(Turn::Finish(false));
-                }
-                let occurrence = base + (self.now_ms - base) / self.interval_ms * self.interval_ms;
-                let trigger = RunTrigger::Timer {
-                    occurrence_ms: occurrence,
-                };
-                let handler = std::mem::take(&mut self.handler);
-                let run = new_run(&self.install, handler, trigger, self.now_ms);
-                row.last_due_ms = occurrence;
-                let admission = Admission::new(run);
-                let ask = admission.ask();
-                self.phase = TimerPhase::Admitting(row, admission);
-                Ok(Turn::Ask(ask))
-            }
-            TimerPhase::Admitting(row, mut admission) => {
-                let (admitted, rows) = match admission.take(answer) {
-                    Ok(None) => {
-                        let ask = admission.ask();
-                        self.phase = TimerPhase::Admitting(row, admission);
-                        return Ok(Turn::Ask(ask));
-                    }
-                    Ok(Some(rows)) => (true, rows),
-                    Err(RunError::Store(error)) => return Err(error),
-                    Err(_) => (false, Vec::new()),
-                };
-                let mut row = row;
-                row.skipped += u64::from(!admitted);
-                let mut rows = rows;
-                rows.push(row_of(
-                    PLUGIN_RUNS_KEYSPACE,
-                    self.key.clone(),
-                    encode(&row)?,
-                ));
-                self.phase = TimerPhase::Writing(admitted);
-                Ok(Turn::Ask(Ask::Write(rows)))
-            }
-            TimerPhase::Writing(admitted) => {
-                done(answer)?;
-                Ok(Turn::Finish(admitted))
-            }
-        }
-    }
-}
-
-/// The timer row of an install, if its timer ran before.
-pub(crate) fn read_timer(install_id: Ulid) -> RowsOperation<ReadTimer> {
-    RowsOperation::direct(ReadTimer(timer_key(install_id)))
-}
-
-#[derive(Debug, PartialEq)]
-pub struct ReadTimer(Vec<u8>);
-
-impl Plan for ReadTimer {
-    type Output = Option<TimerRow>;
-    type Error = StoreError;
-
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(
-            PLUGIN_RUNS_KEYSPACE,
-            self.0.clone(),
-        )])))
-    }
-
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
-        let [found] = values::<1>(answer)?;
-        Ok(Turn::Finish(found.map(|bytes| decode(&bytes)).transpose()?))
-    }
-}
-
 /// Queues a failed or cancelled run again under the admission lock; see [`retry_run`].
 pub async fn run_again(
     ctx: &DriverContext,
@@ -349,7 +180,7 @@ pub async fn run_again(
 /// `false` for a delivery id the receiver already admitted, which starts nothing.
 pub async fn admit_hook(
     ctx: &DriverContext,
-    (local, keys): (NodeId, &ReleaseKeys),
+    local: NodeId,
     (realm_id, install_id): (RealmId, Ulid),
     mut request: HookRequest,
     now_ms: u64,
@@ -386,7 +217,7 @@ pub async fn admit_hook(
         held: None,
         run_id: None,
     };
-    let ask = |release| ask_release(ctx, &config, (local, keys), release);
+    let ask = |release| ask_release(ctx, &config, local, release);
     let released = HeldSecrets::default().obtain(release, ask).await;
     let (released, fields) = released.map_err(|error| unavailable(error.to_string()))?;
     // A secret edit can make the checked header the delivery id; nothing starts then.
@@ -411,7 +242,7 @@ pub async fn admit_hook(
     let run = new_run(install, handler, RunTrigger::Webhook(request), now_ms);
     let _admitting = ADMISSIONS.lock().await;
     let admit = AdmitHook::new(run, (install_id, delivery_id), now_ms)?;
-    Ok(drive(RowsOperation::transaction(admit), ctx).await?)
+    Ok(drive(admit, ctx).await?)
 }
 
 /// Whether a relay from `local` passes `authorization` on: only when the install's verify secret

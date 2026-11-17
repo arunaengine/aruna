@@ -73,6 +73,7 @@ async fn read_local_global(
 ) -> Result<UsageCounters, String> {
     match storage.send_storage_effect(global_shard_read(txn_id)).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            let values = values.into_iter().map(|(_, value)| value);
             global_sum::<LoadCountersError>(values).map_err(|error| error.to_string())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),

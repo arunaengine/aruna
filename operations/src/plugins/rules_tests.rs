@@ -182,7 +182,6 @@ pub(crate) async fn plain_secret(
         readable: false,
         now_ms: 1,
         write_ids: [1, 2, 3].map(|_| Ulid::generate()),
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), &fixture.ctx)
         .await

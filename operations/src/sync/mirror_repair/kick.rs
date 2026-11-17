@@ -4,156 +4,90 @@
 
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 
-use super::SyncMirrorError;
-
-#[derive(Debug, PartialEq)]
-enum KickState {
-    Ready,
-    Scheduling,
-    Done(Result<(), SyncMirrorError>),
-}
+use super::{SyncMirrorError, unexpected};
 
 /// Shortens the mirror repair timer to now; a refusal of the task backend is the error.
-#[derive(Debug, PartialEq)]
-pub struct KickRepairOperation {
-    state: KickState,
-}
+#[derive(Debug, Default, PartialEq)]
+pub struct KickRepairOperation;
 
 impl KickRepairOperation {
     pub fn new() -> Self {
-        Self {
-            state: KickState::Ready,
-        }
+        Self
     }
 }
 
-impl Default for KickRepairOperation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl EffectOperation for KickRepairOperation {
+impl Operation for KickRepairOperation {
     type Output = ();
     type Error = SyncMirrorError;
 
-    fn start(&mut self) -> Effects {
-        if self.state != KickState::Ready {
-            return Effects::new();
-        }
-        self.state = KickState::Scheduling;
-        smallvec![Effect::Task(TaskEffect::ShortenTimer {
-            key: TaskKey::DrainMirrorRepair,
-            after: Duration::ZERO,
-        })]
+    fn first(&mut self) -> Result<Next<()>, SyncMirrorError> {
+        Ok(Next::Call(IoCall::Effect(Effect::Task(
+            TaskEffect::ShortenTimer {
+                key: TaskKey::DrainMirrorRepair,
+                after: Duration::ZERO,
+            },
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let result = match (&self.state, event) {
-            (KickState::Scheduling, Event::Task(TaskEvent::TimerScheduled { .. })) => Ok(()),
-            (KickState::Scheduling, Event::Task(TaskEvent::Error { message, .. })) => {
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncMirrorError> {
+        match result {
+            IoResult::Event(Event::Task(TaskEvent::TimerScheduled { .. })) => Ok(Next::Done(())),
+            IoResult::Event(Event::Task(TaskEvent::Error { message, .. })) => {
                 Err(SyncMirrorError::Mirror(message))
             }
-            (_, event) => Err(SyncMirrorError::Unexpected(event)),
-        };
-        self.state = KickState::Done(result);
-        Effects::new()
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, KickState::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            KickState::Done(result) => result,
-            _ => Err(SyncMirrorError::Unfinished),
+            other => Err(unexpected("TaskEvent::TimerScheduled", &other)),
         }
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.state = KickState::Done(Err(SyncMirrorError::Unfinished));
-        Effects::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
-
-    fn scheduling() -> KickRepairOperation {
-        let mut operation = KickRepairOperation::new();
-        operation.start();
-        operation
-    }
+    use aruna_core::calls::IoError;
 
     #[test]
     fn shortens_timer() {
         let mut operation = KickRepairOperation::new();
-        check_trace(
-            &mut operation,
-            &[Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::DrainMirrorRepair,
-                after: Duration::ZERO,
-            })],
-            vec![(
-                Event::Task(TaskEvent::TimerScheduled {
-                    key: TaskKey::DrainMirrorRepair,
-                    after: Duration::ZERO,
-                }),
-                vec![],
-            )],
+        let shorten = TaskEffect::ShortenTimer {
+            key: TaskKey::DrainMirrorRepair,
+            after: Duration::ZERO,
+        };
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(Effect::Task(shorten))))
         );
-        assert_eq!(operation.finalize(), Ok(()));
+        let scheduled = TaskEvent::TimerScheduled {
+            key: TaskKey::DrainMirrorRepair,
+            after: Duration::ZERO,
+        };
+        assert_eq!(
+            operation.next(IoResult::Event(Event::Task(scheduled))),
+            Ok(Next::Done(()))
+        );
     }
 
     #[test]
     fn refusal_fails() {
-        let mut operation = scheduling();
-        operation.step(Event::Task(TaskEvent::Error {
+        let refused = TaskEvent::Error {
             key: Some(TaskKey::DrainMirrorRepair),
             message: "stopped".to_string(),
-        }));
+        };
         assert_eq!(
-            operation.finalize(),
+            KickRepairOperation::new().next(IoResult::Event(Event::Task(refused))),
             Err(SyncMirrorError::Mirror("stopped".to_string()))
         );
-    }
-
-    #[test]
-    fn rejects_foreign_events() {
-        let refusals = rejects_events(scheduling, sample_events, |event| {
-            matches!(event, Event::Task(TaskEvent::Error { .. }))
-        });
-        assert!(!refusals.is_empty());
-        for (label, effects, error) in refusals {
-            assert!(effects.is_empty(), "{label}");
-            assert!(matches!(error, SyncMirrorError::Unexpected(_)), "{label}");
-        }
-        let mut early = KickRepairOperation::new();
-        early.step(Event::Task(TaskEvent::TimerScheduled {
+        let cancelled = TaskEvent::TimerCancelled {
             key: TaskKey::DrainMirrorRepair,
-            after: Duration::ZERO,
-        }));
-        assert!(early.finalize().is_err());
-    }
-
-    #[test]
-    fn abort_and_finalize() {
-        rejects_finalize(KickRepairOperation::new());
-        rejects_finalize(scheduling());
-        let mut operation = scheduling();
-        check_abort(&mut operation, &[]);
-        assert_eq!(operation.finalize(), Err(SyncMirrorError::Unfinished));
+        };
+        assert!(matches!(
+            KickRepairOperation::new().next(IoResult::Event(Event::Task(cancelled))),
+            Err(SyncMirrorError::Io(IoError::Unexpected { .. }))
+        ));
     }
 }

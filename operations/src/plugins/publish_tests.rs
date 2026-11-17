@@ -8,8 +8,9 @@ use crate::plugins::copies::read_local;
 use crate::plugins::runs::tests::opened;
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
-use aruna_core::operation_check::{check_abort, rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use std::collections::BTreeSet;
 use ulid::Ulid;
@@ -245,9 +246,9 @@ async fn counts_current_managers() {
 }
 
 /// A finished window member with the answer `stored`.
-fn answered(index: usize, stored: Result<bool, String>) -> Event {
+fn answered(index: usize, stored: Result<bool, String>) -> IoResult {
     let event = Event::Net(NetEvent::ArtifactStored(stored));
-    Event::Group(GroupEvent::Member {
+    IoResult::Group(GroupEvent::Member {
         index,
         result: GroupResult::Done(Box::new(event)),
     })
@@ -272,48 +273,32 @@ fn copies_in_window() {
         limit: 2,
         form: GroupForm::Window,
     };
-    assert_eq!(copy.start().as_slice(), [Effect::Group(group)]);
+    assert_eq!(copy.first(), Ok(Next::Call(IoCall::Group(group))));
     // The first node goes on with its second chunk and completes; the second fails.
+    let next = Box::new(sent(first, &artifact, 1));
     assert_eq!(
-        copy.step(answered(0, Ok(false))).as_slice(),
-        [sent(first, &artifact, 1)]
+        copy.next(answered(0, Ok(false))),
+        Ok(Next::Call(IoCall::Effect(next)))
     );
-    assert!(copy.step(answered(1, Err("down".into()))).is_empty());
-    assert!(copy.step(answered(2, Ok(true))).is_empty());
-    rejects_finalize(copy_artifact(vec![first], "sha256:d".into(), vec![1]));
-    assert!(!copy.is_complete());
-    copy.step(Event::Group(GroupEvent::Closed));
-    assert_eq!(copy.finalize(), Ok(BTreeSet::from([first])));
+    assert_eq!(copy.next(answered(1, Err("down".into()))), Ok(Next::Wait));
+    assert_eq!(copy.next(answered(2, Ok(true))), Ok(Next::Wait));
+    let closed = IoResult::Group(GroupEvent::Closed);
+    assert_eq!(copy.next(closed), Ok(Next::Done(BTreeSet::from([first]))));
 }
 
 #[test]
-fn copy_refuses_events() {
+fn copy_refuses_answers() {
     let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1]);
-    copy.start();
-    let unknown = answered(5, Ok(true));
-    assert!(copy.step(unknown).is_empty());
-    assert!(copy.is_complete());
+    copy.first().unwrap();
+    let got = "GroupEvent::Member";
+    let unknown = copy.next(answered(5, Ok(true)));
+    assert_eq!(unknown, Err(CopyError::Unexpected { got }));
+    let got = "IoResult::Done";
     assert_eq!(
-        copy.finalize(),
-        Err(CopyError::Unexpected {
-            got: "GroupEvent::Member"
-        })
+        copy.next(IoResult::Done),
+        Err(CopyError::Unexpected { got })
     );
-    let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1]);
-    copy.start();
-    let refusals = rejects_events(
-        || {
-            let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1]);
-            copy.start();
-            copy
-        },
-        sample_events,
-        |_| false,
-    );
-    assert_eq!(refusals.len(), sample_events().len());
-    check_abort(&mut copy, &[]);
     // Without peers nothing is sent and no node confirms.
     let mut alone = copy_artifact(Vec::new(), "sha256:d".into(), vec![1]);
-    assert!(alone.start().is_empty());
-    assert_eq!(alone.finalize(), Ok(BTreeSet::new()));
+    assert_eq!(alone.first(), Ok(Next::Done(BTreeSet::new())));
 }

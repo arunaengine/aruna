@@ -5,11 +5,13 @@
 
 // The claim only steers naming; the create-only write is what keeps a file from being replaced.
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARE_NAME_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::rows;
 use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
 
@@ -161,49 +163,28 @@ impl EffectOperation for ClaimNameOperation {
 #[derive(Debug, PartialEq)]
 pub struct ReleaseNameOperation {
     row: Key,
-    output: Option<Result<(), ShareError>>,
 }
 
 impl ReleaseNameOperation {
     pub fn new(bucket: &str, key: &str) -> Self {
         Self {
             row: name_key(bucket, key),
-            output: None,
         }
     }
 }
 
-impl EffectOperation for ReleaseNameOperation {
+impl Operation for ReleaseNameOperation {
     type Output = ();
     type Error = ShareError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: SHARE_NAME_KEYSPACE.to_string(),
-            key: self.row.clone(),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<()>, ShareError> {
+        let row = (SHARE_NAME_KEYSPACE.to_string(), self.row.clone());
+        Ok(Next::Call(IoCall::Delete(vec![row])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(match event {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            _ => Err(ShareError::UnexpectedEvent("release")),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<(), ShareError> {
-        self.output.unwrap_or(Err(ShareError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareError> {
+        rows::done(result)?;
+        Ok(Next::Done(()))
     }
 }
 

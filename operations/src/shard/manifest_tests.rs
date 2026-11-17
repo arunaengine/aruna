@@ -4,7 +4,6 @@
 
 use aruna_core::document::{DocumentSyncRevision, DocumentTarget};
 use aruna_core::errors::StorageError;
-use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 use aruna_core::types::Value;
 use ulid::Ulid;
 
@@ -36,10 +35,16 @@ fn row(seed: u8) -> (Key, Value) {
     (Key::from(vec![seed]), Value::from(value))
 }
 
-fn page(values: Vec<(Key, Value)>, next_start_after: Option<Key>) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values,
-        next_start_after,
+fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+    IoResult::Page { rows, next }
+}
+
+fn call(after: Option<Key>) -> Next<Vec<ShardManifestEntry>> {
+    Next::Call(IoCall::Page {
+        space: SHARD_MANIFEST_KEYSPACE.to_string(),
+        prefix: ByteView::from(shard_manifest_prefix(&placement())),
+        after,
+        limit: MANIFEST_SCAN_PAGE,
     })
 }
 
@@ -47,50 +52,38 @@ fn page(values: Vec<(Key, Value)>, next_start_after: Option<Key>) -> Event {
 fn scans_every_page() {
     // The scan follows the cursor under the shard prefix and keeps every entry in order.
     let mut operation = ManifestScanOperation::new(&placement());
-    let first = operation.page(None);
-    let next = operation.page(Some(Key::from(vec![1u8])));
-    check_trace(
-        &mut operation,
-        &[first],
-        vec![
-            (page(vec![row(1)], Some(Key::from(vec![1u8]))), vec![next]),
-            (page(vec![row(2)], None), vec![]),
-        ],
-    );
-    assert_eq!(operation.finalize(), Ok(vec![entry(1), entry(2)]));
+    assert_eq!(operation.first(), Ok(call(None)));
+    let cursor = Key::from(vec![1u8]);
+    let answer = operation.next(page(vec![row(1)], Some(cursor.clone())));
+    assert_eq!(answer, Ok(call(Some(cursor))));
+    let answer = operation.next(page(vec![row(2)], None));
+    assert_eq!(answer, Ok(Next::Done(vec![entry(1), entry(2)])));
 }
 
 #[test]
 fn scan_failures_end() {
-    // A storage error or an undecodable row ends the scan with the reason.
+    // An undecodable row or an answer that is not a page ends the scan with the reason.
     let mut operation = ManifestScanOperation::new(&placement());
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    }));
-    assert!(operation.finalize().is_err());
-    let mut operation = ManifestScanOperation::new(&placement());
-    operation.start();
+    operation.first().unwrap();
     let broken = (Key::from(vec![1u8]), Value::from(vec![0xff; 3]));
-    assert!(operation.step(page(vec![broken], None)).is_empty());
-    assert!(operation.finalize().is_err());
-}
-
-#[test]
-fn rejects_unexpected_events() {
-    // Before start every event ends the scan, without effects.
-    let make = || ManifestScanOperation::new(&placement());
-    let refusals = rejects_events(make, sample_events, |_| false);
-    assert!(refusals.iter().all(|(_, effects, _)| effects.is_empty()));
-}
-
-#[test]
-fn abort_and_finalize() {
-    // The scan only reads: abort has nothing to clean up, and an early finalize fails.
+    let answer = operation.next(page(vec![broken], None));
+    assert!(matches!(answer, Err(ManifestScanError::Decode(_))));
     let mut operation = ManifestScanOperation::new(&placement());
-    operation.start();
-    assert!(operation.abort().is_empty());
-    rejects_finalize(operation);
+    operation.first().unwrap();
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Err(ManifestScanError::Io(IoError::Unexpected { .. }))
+    ));
+}
+
+#[test]
+fn runner_errors_carry() {
+    // A storage failure the runner reports keeps its cause.
+    let error = ManifestScanError::from(IoError::Storage(StorageError::Timeout));
+    assert_eq!(
+        error,
+        ManifestScanError::Io(IoError::Storage(StorageError::Timeout))
+    );
 }
 
 #[test]

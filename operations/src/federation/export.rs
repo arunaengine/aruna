@@ -281,8 +281,9 @@ pub async fn revoke_grant(context: &DriverContext, job_id: JobId) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::operation::Operation;
     use aruna_core::transfer::{MAX_TRANSFER_SECS, TransferError, selection_digest};
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
@@ -578,32 +579,17 @@ mod tests {
             capabilities: capabilities(),
             now: NOW,
         };
-        let read = |record: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![
-                    (Vec::new().into(), record.map(Into::into)),
-                    (Vec::new().into(), None),
-                ],
-            })
-        };
+        let read = |record: Option<Vec<u8>>| IoResult::Values(vec![record.map(Into::into), None]);
         let mut operation = IssueGrantOperation::new(config.clone());
-        assert_eq!(operation.start().len(), 1);
-        assert!(operation.step(read(None)).is_empty());
-        assert_eq!(operation.finalize(), Err(GrantError::Unfinished));
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(operation.next(read(None)), Err(GrantError::Unfinished));
         let revoked = GrantRecord {
             revoked: true,
             ..record
         };
-        let mut operation = IssueGrantOperation::new(config.clone());
-        operation.start();
-        operation.step(read(Some(postcard::to_allocvec(&revoked).unwrap())));
-        assert_eq!(operation.finalize(), Err(GrantError::Revoked));
-        // A decided grant takes no further event.
-        let mut late = IssueGrantOperation::new(config);
-        late.start();
-        late.step(read(None));
-        late.step(read(None));
-        assert!(matches!(late.finalize(), Err(GrantError::Storage(_))));
+        let mut operation = IssueGrantOperation::new(config);
+        let revoked = postcard::to_allocvec(&revoked).unwrap();
+        assert_eq!(operation.next(read(Some(revoked))), Err(GrantError::Revoked));
     }
 
     #[tokio::test]

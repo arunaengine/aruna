@@ -6,14 +6,14 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows;
 use aruna_core::structs::execution::harvest::{
     RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
 };
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 use thiserror::Error;
 
 use crate::endpoint_screening;
@@ -54,14 +54,6 @@ pub struct CreateConnectorResult {
     pub has_secret_config: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum State {
-    Init,
-    WriteRecords,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateConnectorError {
     #[error(transparent)]
@@ -88,107 +80,28 @@ pub enum CreateConnectorError {
     EmptyValue(String),
     #[error("CreateRepositoryConnector failed")]
     Failed,
-    #[error("state [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
-    InvalidStateEvent {
-        state: String,
-        expected: &'static str,
-        received: Event,
-    },
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for CreateConnectorError {
+    fn from(error: IoError) -> Self {
+        error.into_storage().map_or_else(Self::Io, Self::Storage)
+    }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct CreateConnectorOperation {
     input: CreateConnectorInput,
-    state: State,
-    connector: Option<RepositoryConnector>,
-    has_secret: bool,
-    output: Option<Result<CreateConnectorResult, CreateConnectorError>>,
+    result: Option<CreateConnectorResult>,
 }
 
 impl CreateConnectorOperation {
     pub fn new(input: CreateConnectorInput) -> Self {
         Self {
             input,
-            state: State::Init,
-            connector: None,
-            has_secret: false,
-            output: None,
+            result: None,
         }
-    }
-
-    fn emit_error(&mut self, error: CreateConnectorError) -> Effects {
-        self.state = State::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        if let Err(error) = validate_connector(
-            &self.input.name,
-            self.input.kind,
-            &self.input.endpoint,
-            &self.input.public_config,
-            &self.input.secret_config,
-        ) {
-            return self.emit_error(error);
-        }
-
-        let now = SystemTime::now();
-        let connector = RepositoryConnector::new(
-            ulid::Ulid::generate(),
-            self.input.group_id,
-            self.input.name.clone(),
-            self.input.kind,
-            self.input.endpoint.clone(),
-            self.input.public_config.clone(),
-            now,
-            now,
-            self.input.created_by,
-        );
-        let secret = RepositoryConnectorSecret::new(
-            connector.connector_id,
-            self.input.secret_config.clone(),
-            now,
-        );
-
-        let writes = match connector_writes(&connector, secret.as_ref()) {
-            Ok(writes) => writes,
-            Err(error) => return self.emit_error(error.into()),
-        };
-
-        self.has_secret = secret.is_some();
-        self.connector = Some(connector);
-        self.state = State::WriteRecords;
-        smallvec![crate::groups::fence::write_group_records(
-            self.input.group_id,
-            writes
-        )]
-    }
-
-    fn handle_written(&mut self, event: Event) -> Effects {
-        if !matches!(
-            &event,
-            Event::SubOperation(aruna_core::events::SubOperationEvent::GroupWritten { .. })
-        ) {
-            return self.emit_error(CreateConnectorError::InvalidStateEvent {
-                state: "WriteRecords".into(),
-                expected: "group write result",
-                received: event,
-            });
-        }
-        if let Err(error) = crate::groups::fence::group_write_result(event) {
-            return self.emit_error(error.into());
-        }
-        let Some(connector) = self.connector.clone() else {
-            return self.emit_error(CreateConnectorError::Failed);
-        };
-
-        self.state = State::Finish;
-        self.output = Some(Ok(CreateConnectorResult {
-            connector,
-            has_secret_config: self.has_secret,
-        }));
-        smallvec![]
     }
 }
 
@@ -271,39 +184,48 @@ pub const INVENIO_COMMUNITY: &str = "community";
 /// Secret config key of the optional read token an Invenio connector keeps.
 pub const INVENIO_TOKEN: &str = "token";
 
-impl EffectOperation for CreateConnectorOperation {
+impl Operation for CreateConnectorOperation {
     type Output = CreateConnectorResult;
     type Error = CreateConnectorError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Result<Next<Self::Output>, CreateConnectorError> {
+        validate_connector(
+            &self.input.name,
+            self.input.kind,
+            &self.input.endpoint,
+            &self.input.public_config,
+            &self.input.secret_config,
+        )?;
+        let now = SystemTime::now();
+        let connector = RepositoryConnector::new(
+            ulid::Ulid::generate(),
+            self.input.group_id,
+            self.input.name.clone(),
+            self.input.kind,
+            self.input.endpoint.clone(),
+            self.input.public_config.clone(),
+            now,
+            now,
+            self.input.created_by,
+        );
+        let secret = RepositoryConnectorSecret::new(
+            connector.connector_id,
+            self.input.secret_config.clone(),
+            now,
+        );
+        let writes = connector_writes(&connector, secret.as_ref())?;
+        self.result = Some(CreateConnectorResult {
+            connector,
+            has_secret_config: secret.is_some(),
+        });
+        let write = crate::groups::fence::write_group_records(self.input.group_id, writes);
+        Ok(Next::Call(write.into()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            State::Init => self.handle_init(),
-            State::WriteRecords => self.handle_written(event),
-            State::Finish => smallvec![],
-            State::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Finish | State::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == State::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(CreateConnectorError::Failed);
-        }
-        self.output.ok_or(CreateConnectorError::Failed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CreateConnectorError> {
+        crate::groups::fence::group_write_result(rows::event(result)?)?;
+        let result = self.result.take().ok_or(CreateConnectorError::Failed)?;
+        Ok(Next::Done(result))
     }
 }
 
@@ -312,7 +234,8 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::harvest::repository::{parse_connector_read, read_connector_effect};
-    use aruna_core::events::StorageEvent;
+    use aruna_core::calls::IoCall;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_storage::storage;
     use tempfile::tempdir;
@@ -336,9 +259,7 @@ mod tests {
             name: "  ".to_string(),
             ..input()
         });
-        assert!(op.start().is_empty());
-        assert!(op.is_complete());
-        assert_eq!(op.finalize().unwrap_err(), CreateConnectorError::EmptyName);
+        assert_eq!(op.first(), Err(CreateConnectorError::EmptyName));
     }
 
     #[test]
@@ -357,10 +278,10 @@ mod tests {
                 endpoint: endpoint.to_string(),
                 ..input()
             });
-            assert!(op.start().is_empty(), "{endpoint}");
             assert_eq!(
-                op.finalize().unwrap_err(),
-                CreateConnectorError::AmbiguousEndpoint
+                op.first(),
+                Err(CreateConnectorError::AmbiguousEndpoint),
+                "{endpoint}"
             );
         }
     }
@@ -376,7 +297,11 @@ mod tests {
                 endpoint: endpoint.to_string(),
                 ..input()
             });
-            assert_eq!(op.start().len(), 1, "{endpoint}");
+            let next = op.first();
+            assert!(
+                matches!(next, Ok(Next::Call(IoCall::Child(_)))),
+                "{endpoint}"
+            );
         }
     }
 
@@ -463,16 +388,14 @@ mod tests {
     #[test]
     fn wrong_event_errors() {
         let mut op = CreateConnectorOperation::new(input());
-        let effects = op.start();
-        assert_eq!(effects.len(), 1);
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: byteview::ByteView::from(Vec::new()),
-            value: None,
-        }));
-        assert!(matches!(
-            op.finalize().unwrap_err(),
-            CreateConnectorError::InvalidStateEvent { .. }
-        ));
+        op.first().unwrap();
+        let read = op.next(IoResult::Event(Box::new(Event::Storage(
+            StorageEvent::ReadResult {
+                key: byteview::ByteView::from(Vec::new()),
+                value: None,
+            },
+        ))));
+        assert!(matches!(read, Err(CreateConnectorError::GroupWrite(_))));
     }
 
     #[tokio::test]

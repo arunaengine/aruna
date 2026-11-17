@@ -50,21 +50,15 @@ fn keys() -> KeyLookup {
 
 /// Runs a grant by admin user(1) up to its seal or write step against an encrypted bucket, or a
 /// plain one.
-fn started(lookup: KeyLookup, encrypted: bool) -> (GrantHolderOperation, Effects) {
+fn started(lookup: KeyLookup, encrypted: bool) -> (GrantHolderOperation, Step) {
     granted(lookup, encrypted, &[user(1)])
 }
 
 /// Runs a grant by user(1) while `admins` hold the group admin role in the transaction.
-fn granted(
-    lookup: KeyLookup,
-    encrypted: bool,
-    admins: &[UserId],
-) -> (GrantHolderOperation, Effects) {
+fn granted(lookup: KeyLookup, encrypted: bool, admins: &[UserId]) -> (GrantHolderOperation, Step) {
     let mut operation = GrantHolderOperation::new(input(lookup));
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
+    assert!(operation.transaction());
+    let _ = operation.first();
     let info = BucketInfo {
         group_id: Ulid::from_bytes([3; 16]),
         created_at: SystemTime::UNIX_EPOCH,
@@ -84,21 +78,19 @@ fn granted(
     };
     let settings = encrypted.then_some(&settings);
     let values = authority_rows(&info, settings, admins);
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let values = values.into_iter().map(|(_, value)| value).collect();
+    let turn = operation.next(IoResult::Values(values));
     if !encrypted || !admins.contains(&user(1)) {
-        return (operation, effects);
+        return (operation, turn);
     }
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(Vec::new()),
-        value: None,
-    }));
-    (operation, effects)
+    let turn = operation.next(IoResult::Values(vec![None]));
+    (operation, turn)
 }
 
 /// The grant row a write step stores.
-fn written_grant(effects: &Effects) -> (BucketHolder, usize) {
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the grant write, got {effects:?}");
+fn written_grant(turn: &Step) -> (BucketHolder, usize) {
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected the grant write, got {turn:?}");
     };
     let (space, _, value) = writes.last().unwrap();
     assert_eq!(space, BUCKET_HOLDER_KEYSPACE);
@@ -118,20 +110,24 @@ fn written_grant(effects: &Effects) -> (BucketHolder, usize) {
 }
 
 fn committed(mut operation: GrantHolderOperation) -> GrantResult {
-    operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
-    operation.finalize().unwrap()
+    match operation.next(IoResult::Done) {
+        Ok(Next::Done(result)) => result,
+        other => panic!("expected the grant, got {other:?}"),
+    }
+}
+
+fn sealed(operation: &mut GrantHolderOperation, event: Event) -> Step {
+    operation.next(IoResult::Event(Box::new(event)))
 }
 
 #[test]
 fn unlocked_grant_seals() {
-    let (mut operation, effects) = started(keys(), true);
-    let [Effect::Blob(BlobEffect::SealUnlocked { key, holders, .. })] = effects.as_slice() else {
-        panic!("expected sealing with the unlocked key, got {effects:?}");
+    let (mut operation, turn) = started(keys(), true);
+    let Ok(Next::Call(IoCall::Effect(effect))) = &turn else {
+        panic!("expected sealing with the unlocked key, got {turn:?}");
+    };
+    let Effect::Blob(BlobEffect::SealUnlocked { key, holders, .. }) = effect.as_ref() else {
+        panic!("expected sealing with the unlocked key, got {turn:?}");
     };
     assert_eq!(*key, BucketKeyRef::new(BUCKET_ID, 2));
     let copy = SealedCopy {
@@ -143,8 +139,12 @@ fn unlocked_grant_seals() {
         ciphertext: vec![0; 48],
         created_at_ms: 9,
     };
-    let effects = operation.step(Event::Blob(BlobEvent::CopiesSealed { copies: vec![copy] }));
-    let (grant, copies) = written_grant(&effects);
+    let copies = vec![copy];
+    let turn = sealed(
+        &mut operation,
+        Event::Blob(BlobEvent::CopiesSealed { copies }),
+    );
+    let (grant, copies) = written_grant(&turn);
     assert_eq!(
         (grant.state, grant.origin, copies),
         (GrantState::Ready, HolderOrigin::Explicit, 1)
@@ -156,36 +156,28 @@ fn unlocked_grant_seals() {
 fn locked_grant_waits() {
     let (mut operation, _) = started(keys(), true);
     let locked = BlobError::BucketKey(BucketKeyError::Locked(BUCKET_ID));
-    let effects = operation.step(Event::Blob(BlobEvent::Error(locked)));
-    let (grant, copies) = written_grant(&effects);
+    let turn = sealed(&mut operation, Event::Blob(BlobEvent::Error(locked)));
+    let (grant, copies) = written_grant(&turn);
     assert_eq!((grant.state, copies), (GrantState::Pending, 0));
     assert_eq!(grant.granted_by, user(1));
     assert_eq!(committed(operation).state, HolderState::Pending);
 
     // A user without a published key is granted, but reported as missing a key.
-    let (operation, effects) = started(KeyLookup::Missing, true);
-    let (grant, _) = written_grant(&effects);
+    let (operation, turn) = started(KeyLookup::Missing, true);
+    let (grant, _) = written_grant(&turn);
     assert_eq!(grant.state, GrantState::Pending);
     assert_eq!(committed(operation).state, HolderState::MissingKey);
 }
 
 #[test]
 fn plain_bucket_refused() {
-    let (operation, effects) = started(keys(), false);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(operation.finalize(), Err(GrantError::NotEncrypted));
+    let (_, turn) = started(keys(), false);
+    assert_eq!(turn, Err(GrantError::NotEncrypted));
 }
 
 #[test]
 fn revoked_admin_refused() {
     // The route saw user(1) as admin, but the role was revoked before the grant's transaction.
-    let (operation, effects) = granted(keys(), true, &[]);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(operation.finalize(), Err(GrantError::NotAdmin));
+    let (_, turn) = granted(keys(), true, &[]);
+    assert_eq!(turn, Err(GrantError::NotAdmin));
 }

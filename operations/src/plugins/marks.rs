@@ -3,14 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::JobId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, StoreError, Turn, done, encode, row, values,
-};
+use super::rows::{Row, StoreError, delete_call, done, encode, read_call, row, values};
 use super::work::{Found, WorkKind, WorkLookup, WorkState};
 
 /// Row kind of the marks in the work keyspace, apart from the rows an install's removal deletes.
@@ -42,25 +42,25 @@ pub(crate) fn mark_row(version: Version<'_>, mark: &Mark) -> Result<Row, StoreEr
     Ok(row(PLUGIN_WORK_KEYSPACE, mark_key(version)?, encode(mark)?))
 }
 
-pub(crate) fn is_marked(version: Version<'_>) -> Result<RowsOperation<IsMarked>, StoreError> {
-    Ok(RowsOperation::direct(IsMarked(mark_key(version)?)))
+pub(crate) fn is_marked(version: Version<'_>) -> Result<IsMarked, StoreError> {
+    Ok(IsMarked(mark_key(version)?))
 }
 
 #[derive(Debug, PartialEq)]
 pub struct IsMarked(Vec<u8>);
 
-impl Plan for IsMarked {
+impl Operation for IsMarked {
     type Output = bool;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
+    fn first(&mut self) -> Result<Next<bool>, StoreError> {
         let read = vec![(PLUGIN_WORK_KEYSPACE, self.0.clone())];
-        Ok(Turn::Ask(Ask::Read(read)))
+        Ok(Next::Call(read_call(read)))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
         let [row] = values::<1>(answer)?;
-        Ok(Turn::Finish(row.is_some()))
+        Ok(Next::Done(row.is_some()))
     }
 }
 
@@ -75,43 +75,44 @@ pub struct MarkEnded {
 }
 
 impl MarkEnded {
-    pub fn check(mark: &Mark, key: Option<Vec<u8>>) -> RowsOperation<MarkEnded> {
+    pub fn check(mark: &Mark, key: Option<Vec<u8>>) -> MarkEnded {
         let lookup = WorkLookup::new(mark.install_id, mark.work_id);
-        let plan = MarkEnded {
+        MarkEnded {
             lookup,
             deleted: false,
             key,
-        };
-        match plan.key.is_some() {
-            true => RowsOperation::transaction(plan),
-            false => RowsOperation::direct(plan),
         }
     }
 }
 
-impl Plan for MarkEnded {
+impl Operation for MarkEnded {
     type Output = bool;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
-        Ok(Turn::Ask(self.lookup.ask()))
+    /// With the mark's key the delete runs in one transaction with the lookup.
+    fn transaction(&self) -> bool {
+        self.key.is_some()
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
+    fn first(&mut self) -> Result<Next<bool>, StoreError> {
+        Ok(Next::Call(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
         if self.deleted {
             done(answer)?;
-            return Ok(Turn::Finish(true));
+            return Ok(Next::Done(true));
         }
         let ended = match self.lookup.take(answer)? {
-            Found::Ask(ask) => return Ok(Turn::Ask(ask)),
+            Found::Ask(ask) => return Ok(Next::Call(ask)),
             Found::Row(row) => row.is_none_or(|(_, row)| row.state == WorkState::Settled),
         };
         match (ended, self.key.take()) {
             (true, Some(key)) => {
                 self.deleted = true;
-                Ok(Turn::Ask(Ask::Delete(vec![(PLUGIN_WORK_KEYSPACE, key)])))
+                Ok(Next::Call(delete_call(vec![(PLUGIN_WORK_KEYSPACE, key)])))
             }
-            (ended, _) => Ok(Turn::Finish(ended)),
+            (ended, _) => Ok(Next::Done(ended)),
         }
     }
 }

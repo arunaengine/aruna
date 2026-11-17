@@ -19,7 +19,6 @@ pub mod lifecycle;
 pub mod metadata_class;
 pub mod output_record;
 pub mod persistent_id;
-pub mod plugin_work;
 pub(crate) mod protocol;
 pub mod prune;
 pub mod quota;
@@ -38,7 +37,6 @@ pub mod source_read;
 pub mod staging;
 pub mod store;
 pub mod submit;
-mod transfers;
 pub mod workflow;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
