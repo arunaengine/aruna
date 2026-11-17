@@ -1,23 +1,20 @@
-//! Announces a sync topic and queues its documents and user pages for publishing.
+//! Writes one document to the sync outbox and arms the outbox drain.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
-
-use aruna_core::UserId;
+use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::metadata::MetadataError;
+use aruna_core::events::Event;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryLink;
+use aruna_core::rows::{done, read_row, values};
 use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::PersistentIdMapping;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRevision};
 use aruna_core::structs::persistent_id_change;
 use aruna_core::structs::placement::policy::document::{
@@ -26,53 +23,31 @@ use aruna_core::structs::placement::policy::document::{
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key};
-use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_repository;
-use crate::sync::outbox_record::{new_outbox_record, schedule_drain_effect, write_outbox_effect};
+use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
-const USER_PAGE_SIZE: usize = 256;
-
-#[derive(Debug, Clone, PartialEq)]
-enum PendingDocumentSync {
-    Document {
-        document: DocumentTarget,
-        bytes: Option<Vec<u8>>,
-    },
-    UserPage {
-        realm_id: RealmId,
-        start_after: Option<Key>,
-    },
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Phase {
+    Reading,
+    Writing,
+    Scheduling,
 }
 
+/// Reads `document` and writes it to the sync outbox for `peers` with its revision change,
+/// then arms the outbox drain; a missing document has nothing to announce.
 #[derive(Debug, PartialEq)]
 pub struct AnnounceTopicOperation {
-    topic: TopicId,
-    document: Option<DocumentTarget>,
+    document: DocumentTarget,
     local_node_id: NodeId,
     peers: Vec<NodeId>,
-    document_bytes: Option<Vec<u8>>,
     placement: PlacementRef,
     allow_genesis: bool,
-    state: AnnounceTopicState,
-    pending: VecDeque<PendingDocumentSync>,
-    current: Option<DocumentTarget>,
-    output: Option<Result<(), AnnounceTopicError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum AnnounceTopicState {
-    Init,
-    ReadDocument,
-    ListUsers,
-    WriteOutbox,
-    ScheduleSync,
-    Finish,
-    Error,
+    /// The run's time, the revision of single-writer documents.
+    now_ms: u64,
+    phase: Phase,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -81,160 +56,56 @@ pub enum AnnounceTopicError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error(transparent)]
-    MetadataError(#[from] MetadataError),
     #[error("document sync failed: {0}")]
     DocumentSync(String),
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for AnnounceTopicError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 impl AnnounceTopicOperation {
-    pub fn new(topic: TopicId, local_node_id: NodeId, allow_genesis: bool) -> Self {
-        Self::new_for_document(topic, local_node_id, None, allow_genesis)
-    }
-
-    pub fn new_for_document(
-        topic: TopicId,
+    pub fn new(
+        document: DocumentTarget,
         local_node_id: NodeId,
-        document: Option<DocumentTarget>,
-        allow_genesis: bool,
-    ) -> Self {
-        Self::new_with_peers(topic, local_node_id, document, Vec::new(), allow_genesis)
-    }
-
-    pub fn new_with_peers(
-        topic: TopicId,
-        local_node_id: NodeId,
-        document: Option<DocumentTarget>,
-        peers: Vec<NodeId>,
-        allow_genesis: bool,
-    ) -> Self {
-        Self::new_with_placement(
-            topic,
-            local_node_id,
-            document,
-            peers,
-            PlacementRef::NIL,
-            allow_genesis,
-        )
-    }
-
-    pub fn new_with_placement(
-        topic: TopicId,
-        local_node_id: NodeId,
-        document: Option<DocumentTarget>,
         peers: Vec<NodeId>,
         placement: PlacementRef,
         allow_genesis: bool,
     ) -> Self {
         Self {
-            topic,
             document,
             local_node_id,
             peers,
-            document_bytes: None,
             placement,
             allow_genesis,
-            state: AnnounceTopicState::Init,
-            pending: VecDeque::new(),
-            current: None,
-            output: None,
+            now_ms: 0,
+            phase: Phase::Reading,
         }
     }
 
-    pub fn new_with_bytes(
-        topic: TopicId,
-        local_node_id: NodeId,
-        document: DocumentTarget,
-        peers: Vec<NodeId>,
-        bytes: Vec<u8>,
-        allow_genesis: bool,
-    ) -> Self {
-        Self {
-            topic,
-            document: Some(document),
-            local_node_id,
-            peers,
-            document_bytes: Some(bytes),
-            placement: PlacementRef::NIL,
-            allow_genesis,
-            state: AnnounceTopicState::Init,
-            pending: VecDeque::new(),
-            current: None,
-            output: None,
-        }
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.state = AnnounceTopicState::Error;
-        self.output = Some(Err(AnnounceTopicError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        }));
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: AnnounceTopicError) -> Effects {
-        self.state = AnnounceTopicState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn finish(&mut self) -> Effects {
-        self.state = AnnounceTopicState::Finish;
-        self.output = Some(Ok(()));
-        smallvec![]
-    }
-
-    fn queue_topic_documents(&mut self) {
-        if !self.pending.is_empty() {
-            return;
-        }
-
-        if let Some(document) = self.document.clone() {
-            self.pending.push_back(PendingDocumentSync::Document {
-                document,
-                bytes: self.document_bytes.take(),
-            });
-        }
-    }
-
-    fn write_outbox(&mut self, document: DocumentTarget, bytes: Vec<u8>) -> Effects {
-        let change = match self.document_upsert_change(&document, &bytes) {
-            Ok(change) => change,
-            Err(error) => return self.fail(error),
-        };
-        self.write_outbox_event(document, DocumentOutboxEvent::Upsert { bytes, change })
-    }
-
-    fn write_outbox_event(
-        &mut self,
-        document: DocumentTarget,
-        event: DocumentOutboxEvent,
-    ) -> Effects {
-        self.current = Some(document.clone());
-        self.state = AnnounceTopicState::WriteOutbox;
+    fn write_outbox(&mut self, bytes: Value) -> Result<Next<()>, AnnounceTopicError> {
+        let bytes = bytes.to_vec();
+        let change = self.document_upsert_change(&self.document, &bytes)?;
         // Announce only ever emits Upsert here, so the record mirrors the
         // change's placement; the admin fallback is unused.
         let record = new_outbox_record(
             self.local_node_id,
-            document,
+            self.document.clone(),
             self.peers.clone(),
-            event,
+            DocumentOutboxEvent::Upsert { bytes, change },
             PlacementRef::NIL,
             self.allow_genesis,
         );
-        match write_outbox_effect(&record) {
-            Ok(effect) => smallvec![effect],
-            Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),
-        }
+        let row = outbox_write_entry(&record).map_err(ConversionError::from)?;
+        self.phase = Phase::Writing;
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
     fn document_upsert_change(
@@ -433,161 +304,70 @@ impl AnnounceTopicOperation {
             // Single-writer upserts need only this node's monotonic wall-clock generation.
             DocumentTarget::NodeUsage { .. }
             | DocumentTarget::WatchInterest { .. }
-            | DocumentTarget::NodeInfo { .. } => {
-                let now = aruna_core::time::unix_timestamp_millis();
-                Ok(DocumentChange {
-                    base: None,
-                    current: DocumentSyncRevision {
-                        generation: now,
-                        event_id: Ulid::generate(),
-                        actor: self.local_node_id,
-                        updated_at_ms: now,
-                    },
-                    kind: DocumentChangeKind::Upsert,
-                    placement: self.placement,
-                })
-            }
-        }
-    }
-
-    fn next_effect(&mut self) -> Effects {
-        match self.pending.pop_front() {
-            Some(PendingDocumentSync::Document { document, bytes }) => {
-                if let Some(bytes) = bytes {
-                    self.write_outbox(document, bytes)
-                } else {
-                    self.current = Some(document.clone());
-                    self.state = AnnounceTopicState::ReadDocument;
-                    smallvec![document_repository::read_effect(&document, None)]
-                }
-            }
-            Some(PendingDocumentSync::UserPage {
-                realm_id,
-                start_after,
-            }) => {
-                self.state = AnnounceTopicState::ListUsers;
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: USER_KEYSPACE.to_string(),
-                    prefix: Some(UserId::storage_prefix(realm_id)),
-                    start: start_after.map(IterStart::After),
-                    limit: USER_PAGE_SIZE,
-                    txn_id: None,
-                })]
-            }
-            None => self.finish(),
+            | DocumentTarget::NodeInfo { .. } => Ok(DocumentChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: self.now_ms,
+                    event_id: Ulid::generate(),
+                    actor: self.local_node_id,
+                    updated_at_ms: self.now_ms,
+                },
+                kind: DocumentChangeKind::Upsert,
+                placement: self.placement,
+            }),
         }
     }
 }
 
-impl EffectOperation for AnnounceTopicOperation {
+impl Operation for AnnounceTopicOperation {
     type Output = ();
     type Error = AnnounceTopicError;
 
-    fn start(&mut self) -> Effects {
-        self.queue_topic_documents();
-        self.next_effect()
+    fn first(&mut self) -> Result<Next<()>, AnnounceTopicError> {
+        let read = read_row(
+            self.document.storage_keyspace(),
+            self.document.storage_key(),
+        );
+        Ok(Next::Call(read))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            AnnounceTopicState::ReadDocument => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let Some(document) = self.current.clone() else {
-                        return self.unexpected_event(
-                            "tracked document sync target",
-                            "missing current document".to_string(),
-                        );
-                    };
-                    let Some(bytes) = value else {
-                        return self.next_effect();
-                    };
-                    self.write_outbox(document, bytes.to_vec())
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage read result", format!("{other:?}")),
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, AnnounceTopicError> {
+        match self.phase {
+            Phase::Reading => match values::<1>(result)? {
+                [Some(bytes)] => self.write_outbox(bytes),
+                [None] => Ok(Next::Done(())),
             },
-            AnnounceTopicState::ListUsers => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    let TopicId::Users(realm_id) = self.topic else {
-                        return self.unexpected_event(
-                            "users topic",
-                            format!("unexpected topic {:?}", self.topic),
-                        );
-                    };
-                    for (key, _) in values {
-                        let user_id = match UserId::from_storage_key(&key) {
-                            Ok(user_id) => user_id,
-                            Err(error) => return self.fail(error.into()),
-                        };
-                        if user_id.realm_id == realm_id {
-                            self.pending.push_back(PendingDocumentSync::Document {
-                                document: DocumentTarget::User { user_id },
-                                bytes: None,
-                            });
-                        }
+            Phase::Writing => {
+                done(result)?;
+                self.phase = Phase::Scheduling;
+                let schedule = Box::new(schedule_drain_effect());
+                Ok(Next::Call(IoCall::Effect(schedule)))
+            }
+            Phase::Scheduling => {
+                let IoResult::Event(event) = result else {
+                    return Err(unexpected(result.label()));
+                };
+                match *event {
+                    Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(Next::Done(())),
+                    Event::Task(TaskEvent::Error { message, .. }) => {
+                        Err(AnnounceTopicError::DocumentSync(format!(
+                            "durable document sync scheduling failed: {message}"
+                        )))
                     }
-                    if let Some(start_after) = next_start_after {
-                        self.pending.push_back(PendingDocumentSync::UserPage {
-                            realm_id,
-                            start_after: Some(start_after),
-                        });
-                    }
-                    self.next_effect()
+                    other => Err(unexpected(other.label())),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage iter result", format!("{other:?}")),
-            },
-            AnnounceTopicState::WriteOutbox => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    if self.current.is_none() {
-                        return self.unexpected_event(
-                            "tracked document sync target",
-                            "missing current document".to_string(),
-                        );
-                    }
-                    self.state = AnnounceTopicState::ScheduleSync;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event("document sync outbox write result", format!("{other:?}"))
-                }
-            },
-            AnnounceTopicState::ScheduleSync => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.current = None;
-                    self.next_effect()
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    self.fail(AnnounceTopicError::DocumentSync(format!(
-                        "durable document sync scheduling failed: {message}"
-                    )))
-                }
-                other => {
-                    self.unexpected_event("document sync timer schedule", format!("{other:?}"))
-                }
-            },
-            AnnounceTopicState::Finish | AnnounceTopicState::Error | AnnounceTopicState::Init => {
-                smallvec![]
             }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            AnnounceTopicState::Finish | AnnounceTopicState::Error
-        )
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
+}
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
+fn unexpected(got: &'static str) -> AnnounceTopicError {
+    AnnounceTopicError::Io(IoError::Unexpected {
+        expected: "TaskEvent::TimerScheduled",
+        got,
+    })
 }

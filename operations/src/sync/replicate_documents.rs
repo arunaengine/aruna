@@ -225,10 +225,9 @@ impl ReplicateDocumentsOperation {
         }
 
         self.phase = Phase::Publish;
-        let announce = AnnounceTopicOperation::new_with_placement(
-            document.topic_id(),
+        let announce = AnnounceTopicOperation::new(
+            document,
             self.config.local_node_id,
-            Some(document),
             selected_peers,
             placement,
             self.config.allow_genesis,
