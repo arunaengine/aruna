@@ -351,6 +351,11 @@ impl EffectOperation for ProjectFamilyOperation {
         error.is_conflict()
     }
 
+    /// The bounded attempts the hand-written loop made before: one try and seven retries.
+    fn conflict_retries() -> u32 {
+        7
+    }
+
     fn start(&mut self) -> Effects {
         match self.config.family {
             FamilyRef::Family(_) => self.read_cache(),

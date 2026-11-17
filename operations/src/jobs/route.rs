@@ -201,6 +201,15 @@ pub enum JobRouteError {
     Internal(String),
 }
 
+impl From<aruna_core::calls::IoError> for JobRouteError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        match error {
+            aruna_core::calls::IoError::Storage(error) => Self::Unavailable(error.to_string()),
+            error => Self::Unavailable(error.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;
