@@ -49,9 +49,9 @@ use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
 use aruna_core::time::unix_timestamp_millis;
 use crate::groups::backends::query::GetBackendOperation;
-use crate::groups::imports::discovery::read_discovery;
-use crate::groups::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
-use crate::groups::imports::{read_earlier, read_import};
+use crate::s3::imports::discovery::read_discovery;
+use crate::s3::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
+use crate::s3::imports::{read_earlier, read_import};
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::document_repository::GetConfigOperation;
 use crate::replication::queue::complete_put;
@@ -2033,7 +2033,7 @@ async fn sharing_now(
         for (_, value) in rows {
             let other = BackendImport::from_bytes(&value);
             let other = other.map_err(|error| ItemError::System(error.to_string()))?;
-            if crate::groups::imports::shared::shares_folder(rule, &other) {
+            if crate::s3::imports::shared::shares_folder(rule, &other) {
                 found.insert(other.import_id);
             }
         }

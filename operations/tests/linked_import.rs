@@ -44,8 +44,8 @@ use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
-use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_operations::groups::imports::discovery::{
+use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
+use aruna_operations::s3::imports::discovery::{
     FileOutcome, SetDiscoveryOperation, authorized_preview,
 };
 use aruna_operations::jobs::backend_import::run_backend_import;

@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::groups::imports::LinkScan;
+use crate::s3::imports::LinkScan;
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -57,7 +57,7 @@ pub enum PutCompressionError {
     /// Replacing an unfinished encryption transition would strand its source key.
     #[error("the bucket's stored copies are still moving to a new encryption")]
     TransitionRunning,
-    #[error("{}", crate::groups::imports::MAPPED_REASON)]
+    #[error("{}", crate::s3::imports::MAPPED_REASON)]
     Mapped,
     #[error("PutBucketCompression did not finish")]
     NotFinished,

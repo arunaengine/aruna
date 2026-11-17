@@ -160,7 +160,7 @@ pub async fn wake_schedule(context: &DriverContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::groups::imports::cron::parse_schedule;
+    use crate::s3::imports::cron::parse_schedule;
 
     const HOUR_MS: u64 = 3_600_000;
 

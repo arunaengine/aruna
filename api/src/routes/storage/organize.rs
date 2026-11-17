@@ -16,8 +16,8 @@ use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
 use aruna_operations::driver::drive;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::groups::imports::discovery::bucket_access;
-use aruna_operations::groups::imports::last_run;
+use aruna_operations::s3::imports::discovery::bucket_access;
+use aruna_operations::s3::imports::last_run;
 use aruna_operations::s3::bucket::linked::{
     BucketJob, BucketJobOperation, LinkedAction, LinkedError, read_bucket_job, rename_total,
 };
@@ -774,14 +774,14 @@ pub async fn link_status(
             conflicts: Vec::new(),
         }));
     };
-    let rules = aruna_operations::groups::imports::discovery::read_discovery(
+    let rules = aruna_operations::s3::imports::discovery::read_discovery(
         &context,
         rule.group_id,
         rule.import_id,
     )
     .await
     .map_err(map_error)?;
-    let earlier = aruna_operations::groups::imports::read_earlier(&context, rule.import_id)
+    let earlier = aruna_operations::s3::imports::read_earlier(&context, rule.import_id)
         .await
         .map_err(map_error)?;
     let mut conflicts = Vec::new();

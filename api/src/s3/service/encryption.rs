@@ -172,7 +172,7 @@ fn enable_error(error: EnableError) -> S3Error {
         EnableError::Mapped => s3_error!(
             InvalidRequest,
             "{}",
-            aruna_operations::groups::imports::MAPPED_REASON
+            aruna_operations::s3::imports::MAPPED_REASON
         ),
         EnableError::Blob(BlobError::SizeLimitExceeded { limit }) => {
             s3_error!(InvalidRequest, "{}", too_large(limit))

@@ -944,7 +944,7 @@ impl OperationsTaskHandler {
                 };
                 let retention_ms = self.rocrate_limits.artifact_retention_ms;
                 let now = unix_timestamp_millis();
-                let run = crate::groups::imports::schedule::run_due(
+                let run = crate::s3::imports::schedule::run_due(
                     &self.context,
                     net_handle.node_id(),
                     retention_ms,

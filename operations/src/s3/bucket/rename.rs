@@ -5,8 +5,8 @@
 
 use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
 use crate::driver::{DriverContext, drive};
-use crate::groups::imports::cron::is_running;
-use crate::groups::imports::validate_folder;
+use crate::s3::imports::cron::is_running;
+use crate::s3::imports::validate_folder;
 use crate::jobs::store::decode_job_record;
 use crate::replication::queue::queued_prefixes;
 use crate::s3::purge_fence::fence_key;

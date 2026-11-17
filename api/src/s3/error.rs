@@ -15,7 +15,7 @@ use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::inventory::InventoryError;
 use aruna_operations::groups::routing::RoutingInputsError;
 use aruna_operations::placement::policy::GateContextError;
-use aruna_operations::groups::imports::ImportRuleError;
+use aruna_operations::s3::imports::ImportRuleError;
 use aruna_operations::node::usage_stats::UsageUpdateError;
 use aruna_operations::placement::policy::PolicyGateError;
 use aruna_operations::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};

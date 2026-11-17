@@ -1042,7 +1042,7 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
         EnableError::Mapped => refused(
             StatusCode::CONFLICT,
             "mapped_bucket",
-            aruna_operations::groups::imports::MAPPED_REASON,
+            aruna_operations::s3::imports::MAPPED_REASON,
         ),
         other => ServerError::InternalError(other.into()),
     }

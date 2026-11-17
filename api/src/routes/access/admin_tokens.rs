@@ -15,12 +15,12 @@ use aruna_core::structs::storage::blob::NEVER_EXPIRES_SECS;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::revoke_token::RevokeTokenError;
 use aruna_operations::driver::drive;
-use aruna_operations::groups::tokens::TokenCursor;
-use aruna_operations::groups::tokens::list::{GroupTokensConfig, ListTokensOperation};
-use aruna_operations::groups::tokens::revoke::{
+use aruna_operations::s3::access::tokens::TokenCursor;
+use aruna_operations::s3::access::tokens::list::{GroupTokensConfig, ListTokensOperation};
+use aruna_operations::s3::access::tokens::revoke::{
     RevokeTarget, RevokeTokensConfig, RevokeTokensOperation,
 };
-use aruna_operations::groups::tokens::{GroupToken, GroupTokensError, TokenKind, TokenStatus};
+use aruna_operations::s3::access::tokens::{GroupToken, GroupTokensError, TokenKind, TokenStatus};
 use aruna_operations::users::revoke_all::{RevokeAllConfig, RevokeAllError, RevokeAllOperation};
 use axum::Json;
 use axum::extract::{Path, Query, State};

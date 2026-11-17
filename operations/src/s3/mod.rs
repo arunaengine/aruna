@@ -1,4 +1,5 @@
-//! Groups the S3 surface: buckets, objects, multipart uploads, access keys and policies.
+//! Groups the S3 surface: buckets, objects, multipart uploads, access keys, policies and the
+//! backend import rules that fill buckets from group storage.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,6 +7,7 @@ pub mod access;
 pub mod bucket;
 pub mod fence_store;
 pub mod holder_seal;
+pub mod imports;
 pub mod key_status;
 pub mod listing;
 pub mod multipart;
