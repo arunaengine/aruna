@@ -343,6 +343,7 @@ impl MetadataHandle {
                 Box::pin(async {
                     match self.authorize_read_peer(peer, auth_token, false).await {
                         Ok(auth_context) => match search_local_graphs(
+                            context,
                             self.inner.clone(),
                             graph,
                             auth_context,
@@ -380,6 +381,7 @@ impl MetadataHandle {
                 Box::pin(async {
                     match self.authorize_read_peer(peer, auth_token, false).await {
                         Ok(auth_context) => match search_local_graphs(
+                            context,
                             self.inner.clone(),
                             graph,
                             auth_context,

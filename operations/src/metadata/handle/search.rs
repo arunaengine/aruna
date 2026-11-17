@@ -23,7 +23,8 @@ use super::{
     handles,
 };
 use crate::auth::permission_rules::GroupPermissionRules;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::live_records::LiveRecordsOperation;
 use crate::metadata::query_cache::ScopeDigest;
 use crate::metadata::search_cursor::{MAX_PAGINATION_DEPTH, compare_hits, tie_order};
 
@@ -49,6 +50,7 @@ use crate::metadata::search_cursor::{MAX_PAGINATION_DEPTH, compare_hits, tie_ord
 )]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn search_local_graphs(
+    context: &DriverContext,
     inner: Arc<MetadataInner>,
     graph: &GraphHandle,
     auth_context: Option<AuthContext>,
@@ -84,6 +86,7 @@ pub(super) async fn search_local_graphs(
         search_realm_scope(inner, graph, auth_context, records, query, limit, &span).await
     } else {
         search_candidate_graphs(
+            context,
             inner,
             graph,
             auth_context,
@@ -192,6 +195,7 @@ async fn search_realm_scope(
 // set, so pre-filtering it stays cheaper than post-filtering the whole index.
 #[allow(clippy::too_many_arguments)]
 async fn search_candidate_graphs(
+    context: &DriverContext,
     inner: Arc<MetadataInner>,
     graph: &GraphHandle,
     auth_context: Option<AuthContext>,
@@ -206,7 +210,7 @@ async fn search_candidate_graphs(
     let (records, iri_matches) = match iri_filter.as_ref() {
         Some((predicate_iri, object_iri)) => {
             let (found, matches) = super::super::iri_index::lookup_iri_references(
-                &inner.storage_handle,
+                context,
                 predicate_iri,
                 object_iri,
                 REGISTRY_CANDIDATE_LIMIT,
@@ -347,10 +351,9 @@ pub(super) async fn list_visible_graphs(
         .ok_or_else(|| {
             MetadataError::Backend("metadata registry snapshot unavailable".to_string())
         })?;
-    let records =
-        super::super::api::read::filter_live_records(&inner.storage_handle, records.as_ref())
-            .await
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let records = drive(LiveRecordsOperation::new(records.to_vec(), None), context)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
     Ok(records.into_iter().map(|record| record.graph_iri).collect())
 }
 
@@ -689,6 +692,7 @@ pub async fn search_authorized_local(
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let (metadata, graph) = handles(context)?;
     search_local_graphs(
+        context,
         metadata.inner.clone(),
         graph,
         auth_context,
@@ -715,6 +719,7 @@ pub(crate) async fn search_local_filtered(
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
     let (metadata, graph) = handles(context)?;
     search_local_graphs(
+        context,
         metadata.inner.clone(),
         graph,
         auth_context,

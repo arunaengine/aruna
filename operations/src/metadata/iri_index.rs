@@ -25,7 +25,8 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::live_records::LiveRecordsOperation;
 
 use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows, iter_page};
 use super::queue_storage::{
@@ -255,11 +256,12 @@ fn group_key(prefix: &[u8], document_id: Ulid) -> Vec<u8> {
 /// their subjects: backlink pages by document id and one point read per document, at most
 /// `limit` documents and a bounded number of index rows. Never a walk over the registry.
 pub(crate) async fn lookup_iri_references(
-    storage: &StorageHandle,
+    context: &DriverContext,
     predicate_iri: &str,
     object_iri: &str,
     limit: usize,
 ) -> Result<(Vec<MetadataRegistryRecord>, BTreeMap<Ulid, Vec<String>>), MetadataError> {
+    let storage = &context.storage_handle;
     let mut budget = LinkBudget {
         seeks: limit.max(INDEX_PAGE_SIZE),
         rows: limit.saturating_mul(2).max(INDEX_PAGE_SIZE * 2),
@@ -295,7 +297,7 @@ pub(crate) async fn lookup_iri_references(
                 records.push(record);
             }
         }
-        let live = super::api::read::filter_live_records(storage, &records)
+        let live = drive(LiveRecordsOperation::new(records, None), context)
             .await
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
         let postings = page.documents.into_values().flatten().collect();
@@ -414,7 +416,7 @@ async fn rebuild_page(
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
     let storage = &context.storage_handle;
-    let registry_records = super::api::read::filter_live_records(storage, records)
+    let registry_records = drive(LiveRecordsOperation::new(records.to_vec(), None), context)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     let mut written = 0usize;
@@ -791,13 +793,22 @@ mod tests {
             };
             storage.send_storage_effect(write).await;
         }
-        let (found, matches) = lookup_iri_references(&storage, "p", OBJECT, 8)
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        };
+        let (found, matches) = lookup_iri_references(&context, "p", OBJECT, 8)
             .await
             .unwrap();
         let ids: Vec<Ulid> = found.iter().map(|record| record.document_id).collect();
         assert_eq!(ids, [first, last], "a stale posting names no document");
         assert_eq!(matches.len(), 2);
-        let (capped, _) = lookup_iri_references(&storage, "p", OBJECT, 1)
+        let (capped, _) = lookup_iri_references(&context, "p", OBJECT, 1)
             .await
             .unwrap();
         assert_eq!(capped.len(), 1);

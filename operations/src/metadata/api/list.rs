@@ -11,11 +11,13 @@ use super::{
     LIST_METADATA_SIZE, ListGroupOperation, MetadataApiError, MetadataEventRecord,
     MetadataRegistryRecord, PENDING_PROJECTION_KEYSPACE, REGISTRY_CANDIDATE_LIMIT, RealmId,
     StorageEffect, StorageEvent, drive, ensure_record_materialized, event_log_key,
-    export_summary_jsonld, filter_live_records, iter_registry_effect, metadata_read_request,
-    parse_registry_iter, pending_projection_target, stream,
+    export_summary_jsonld, iter_registry_effect, metadata_read_request, parse_registry_iter,
+    pending_projection_target, stream,
 };
 use aruna_core::handle::Handle;
 use futures_util::StreamExt;
+
+use crate::metadata::live_records::LiveRecordsOperation;
 
 // Bounded so a single summary page cannot saturate the craqle read permits.
 pub(super) const FANOUT_LIMIT: usize = 8;
@@ -216,7 +218,7 @@ pub(super) async fn load_group_records(
         }
         records
     };
-    filter_live_records(&context.storage_handle, &records).await
+    Ok(drive(LiveRecordsOperation::new(records, None), context).await?)
 }
 
 pub(super) async fn load_pending_records(
@@ -333,7 +335,7 @@ pub(super) async fn load_pending_records(
         return Ok(HashMap::new());
     }
 
-    let pending = filter_live_records(&context.storage_handle, &pending).await?;
+    let pending = drive(LiveRecordsOperation::new(pending, None), context).await?;
     let mut records: HashMap<GroupId, Vec<MetadataRegistryRecord>> = HashMap::new();
     for (count, record) in pending.into_iter().enumerate() {
         if count >= limit {

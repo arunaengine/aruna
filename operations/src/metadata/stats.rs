@@ -16,7 +16,8 @@ use serde_json::Value;
 
 use super::api::MetadataApiError;
 use super::repository::StorageReadError;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::live_records::LiveRecordsOperation;
 use crate::metadata::record_reads::record_materialized_read;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 
@@ -44,8 +45,7 @@ pub async fn count_realm_documents(
     let records = crate::metadata::list_cached_records(context)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let records =
-        super::api::read::filter_live_records(&context.storage_handle, records.as_ref()).await?;
+    let records = drive(LiveRecordsOperation::new(records.to_vec(), None), context).await?;
     Ok(Some(
         records
             .iter()
@@ -153,7 +153,7 @@ pub async fn count_group_purpose(
     let records = crate::metadata::list_cached_group(context, group_id)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let records = super::api::read::filter_live_records(&context.storage_handle, records.as_ref())
+    let records = drive(LiveRecordsOperation::new(records.to_vec(), None), context)
         .await?
         .into_iter()
         .filter(|record| record.realm_id == realm_id && record.group_id == group_id)
