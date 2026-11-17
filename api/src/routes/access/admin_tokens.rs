@@ -5,11 +5,12 @@
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ensure_permission, parse_group_id, permission_granted};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::access::groups::ensure_group_admin;
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::NEVER_EXPIRES_SECS;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::revoke_token::RevokeTokenError;
@@ -150,14 +151,6 @@ fn map_tokens_error(error: GroupTokensError) -> ServerError {
     }
 }
 
-fn actor_for(state: &ServerState, auth: &AuthContext) -> Actor {
-    Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: auth.realm_id,
-    }
-}
-
 async fn run_revocation(
     state: &ServerState,
     auth: AuthContext,
@@ -167,7 +160,7 @@ async fn run_revocation(
     ensure_group_admin(state, &auth, group_id).await?;
     let revocation = drive(
         RevokeTokensOperation::new(RevokeTokensConfig {
-            actor: actor_for(state, &auth),
+            actor: actor(state, &auth),
             auth_context: auth.clone(),
             group_id,
             target,
@@ -402,7 +395,7 @@ pub async fn revoke_user_tokens(
     ensure_permission(&state, &auth, path, Permission::WRITE).await?;
     drive(
         RevokeAllOperation::new(RevokeAllConfig {
-            actor: actor_for(&state, &auth),
+            actor: actor(&state, &auth),
             auth_context: auth,
             target,
             now: unix_timestamp_secs(),

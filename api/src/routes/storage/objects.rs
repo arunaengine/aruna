@@ -26,10 +26,10 @@ use utoipa_axum::routes;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
+use crate::lookup::map_guard_error;
 use crate::lookup::{RestForward, relay_get, relayed_set};
 use crate::mcp::data::{ObjectOutput, object_output};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::distributed::map_guard_error;
 use crate::server::state::ServerState;
 
 /// Entries one page returns by default and at most.

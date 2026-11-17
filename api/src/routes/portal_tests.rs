@@ -8,6 +8,7 @@ use crate::auth::extract;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;

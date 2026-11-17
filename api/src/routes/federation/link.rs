@@ -6,13 +6,13 @@
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::federation::login::SECRET_LEN;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::federation::Signed;
 use aruna_core::handoff::LoginHandoff;
 use aruna_core::link::LinkConfirmation;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::decode_bearer_token;
@@ -91,14 +91,6 @@ pub(crate) async fn bearer_auth_time(
         .await
         .map_err(|_| ServerError::Unauthorized)?;
     Ok(claims.auth_time)
-}
-
-fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
-    Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    }
 }
 
 #[utoipa::path(

@@ -2,8 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::lookup::map_guard_error;
 use aruna_core::NodeId;
+use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};
+use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::index_feed::IndexProgress;
 use aruna_operations::distribution::status::{
     CopyStatus, DeletionStatus, FillProgress, FillStatus, LifecycleStatus, MemberStatus,

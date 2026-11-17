@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_core::errors::StorageError;
 use aruna_core::realm_vault::RealmVaultKey;
 use aruna_core::secrets::SecretRecord;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::drive;
@@ -30,6 +30,7 @@ use super::{
 use crate::auth::UnrestrictedAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -76,11 +77,7 @@ async fn change(
         return Err(ServerError::Forbidden);
     };
     let input = RealmChange {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         vault_key: RealmVaultKey::derive(realm_signing_key),
         change,
         now_ms: unix_timestamp_millis(),

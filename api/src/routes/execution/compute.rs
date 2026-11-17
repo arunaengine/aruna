@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aruna_core::compute::quota::{ComputeQuota, ResourceTotals};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::compute_config::{
     GroupComputeQuota, LocationLink, RealmComputeConfig,
 };
@@ -32,6 +32,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::info::TelemetryState;
 use crate::server::state::ServerState;
 
@@ -476,11 +477,7 @@ pub async fn put_compute_config(
     let compute = compute_config(request)?;
     let stored = drive(
         SetComputeOperation::new(SetComputeConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(&state, &auth),
             auth_context: auth,
             compute,
         }),

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::{Actor, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
@@ -21,6 +21,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -113,11 +114,7 @@ pub async fn set_portal_features(
     .await?;
     let stored = drive(
         SetPortalOperation::new(SetPortalConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(&state, &auth),
             auth_context: auth,
             features: request.features,
         }),

@@ -5,6 +5,7 @@
 use super::*;
 use crate::auth::RealmAuth;
 use aruna_core::UserId;
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::driver::DriverContext;

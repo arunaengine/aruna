@@ -5,6 +5,7 @@
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::metadata::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
     MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, commit_message,
@@ -13,7 +14,7 @@ use crate::metadata::{
     serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::git::GitError;
 use aruna_operations::metadata::api::{
@@ -560,11 +561,7 @@ pub async fn delete_metadata_document(
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     run_delete_metadata_document(
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor(&state, &auth),
         record.as_ref(),
         document_id,
         forwarded_auth_token(bearer_token)?,

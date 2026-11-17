@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
 use aruna_core::plugins::{MAX_ARTIFACT, PublishedPlugin};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::plugins::artifacts::ArtifactError;
@@ -25,6 +25,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -136,11 +137,7 @@ pub async fn publish(
     request: Request,
 ) -> ServerResult<(StatusCode, Json<PluginView>)> {
     let (auth, body, _memory) = read_upload(&state, auth, request).await?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(&state, &auth);
     let published = publish_plugin(&state.get_ctx(), actor, auth, Vec::from(body))
         .await
         .map_err(map_publish_error)?;

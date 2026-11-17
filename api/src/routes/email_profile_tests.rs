@@ -7,6 +7,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::tests::routes::{test_context, test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};

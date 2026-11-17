@@ -11,10 +11,13 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
+use aruna_core::structs::storage::distribution::{ReadRoute, RouteError, WriteRoute};
 use aruna_operations::distribution::delegate::node_urls;
-use aruna_operations::distribution::guard::{read_coordinator, route_read, route_write};
+use aruna_operations::distribution::guard::{
+    GuardError, read_coordinator, route_read, route_write,
+};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::status::node_reach;
 use aruna_operations::driver::drive;
@@ -30,7 +33,6 @@ use ulid::Ulid;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::distributed::map_guard_error;
 use crate::server::state::ServerState;
 
 const API_PREFIX: &str = "/api/v1";
@@ -494,6 +496,30 @@ pub(crate) async fn bucket_info(state: &ServerState, bucket: &str) -> ServerResu
         Ok(info) => Ok(info),
         Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
         Err(error) => Err(ServerError::InternalError(error.into())),
+    }
+}
+
+/// The actor for an operation that `auth` starts on this node.
+pub(crate) fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
+    Actor {
+        node_id: state.get_node_id(),
+        user_id: auth.user_id,
+        realm_id: state.get_realm_id(),
+    }
+}
+
+/// A write this member of a distributed bucket may not take now: 503 when a retry or the
+/// coordinator can take it, 409 when the bucket state refuses it.
+pub(crate) fn map_guard_error(error: GuardError) -> ServerError {
+    match error {
+        GuardError::NotCoordinator { .. }
+        | GuardError::RecordMissing(_)
+        | GuardError::Unreadable(_)
+        | GuardError::Route(
+            RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
+        ) => ServerError::ServiceUnavailableReason(error.to_string()),
+        GuardError::Route(_) | GuardError::Unbound(_) => ServerError::Conflict(error.to_string()),
+        GuardError::Conversion(error) => ServerError::InternalError(error.into()),
     }
 }
 

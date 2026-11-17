@@ -1420,9 +1420,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         error @ PutObjectError::UsageRebuilding => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        PutObjectError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
+        PutObjectError::Distribution(error) => crate::lookup::map_guard_error(error),
         PutObjectError::InvalidOperationState => {
             ServerError::InternalError("invalid object write state".to_string().into())
         }

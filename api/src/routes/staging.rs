@@ -1710,7 +1710,7 @@ async fn coordinator_jobs(
 ) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
     let view = bound_view(state.get_ctx().as_ref(), binding)
         .await
-        .map_err(crate::routes::storage::distributed::map_guard_error)?;
+        .map_err(crate::lookup::map_guard_error)?;
     let snapshot = view.snapshot();
     // Refused before any relay, as the local job would be while a range moves away from here.
     let moving = (snapshot.lifecycle.transfers.iter()).any(|open| open.from == binding.member_id);
@@ -1905,9 +1905,7 @@ fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
         // never learn: the refusal is reported without them.
         MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
         MaterializeReferenceError::Purge(_) => ServerError::ServiceUnavailable,
-        MaterializeReferenceError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
+        MaterializeReferenceError::Distribution(error) => crate::lookup::map_guard_error(error),
     }
 }
 

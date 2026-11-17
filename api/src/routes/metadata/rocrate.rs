@@ -5,6 +5,7 @@
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::auth::{ValidatedBearer, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::metadata::{
     JsonLdObject, MetadataDocumentSummary, MetadataRoCrateResponse, MetadataRoCrateView,
     ReplaceRoCrateRequest, RoCrateExportParams, SubmitExportRequest, SubmitExportResponse,
@@ -18,7 +19,7 @@ use crate::routes::repository::links::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::execution::job::ExportRoCrateSpec;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
 use aruna_operations::jobs::service::submit_export_job;
@@ -573,11 +574,7 @@ pub async fn replace_metadata_rocrate(
         .map_err(|_| ServerError::BadRequestMessage("expected_revision is not a ULID".into()))?;
     let updated = run_update_metadata_document(
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor(&state, &auth),
         record.as_ref(),
         document_id,
         request.public,
@@ -682,11 +679,7 @@ pub async fn add_data_entity(
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor(&state, &auth),
         record.as_ref(),
         document_id,
         None,
@@ -786,11 +779,7 @@ pub async fn remove_data_entity(
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor(&state, &auth),
         record.as_ref(),
         document_id,
         None,
@@ -890,11 +879,7 @@ pub async fn add_contextual_entity(
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
     let updated = run_update_metadata_document(
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor(&state, &auth),
         record.as_ref(),
         document_id,
         None,

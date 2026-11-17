@@ -17,10 +17,11 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::plugin_installs::{
-    InstallView, actor, admin_call, map_error, secret_session, view, view_example,
+    InstallView, admin_call, map_error, secret_session, view, view_example,
 };
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_identifiers};
@@ -36,6 +36,7 @@ use super::metadata::{
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::lookup::bucket_info;
 use crate::metadata::{forwarded_auth_token, local_write_record, run_create_metadata};
 use crate::server::state::ServerState;
@@ -249,11 +250,7 @@ async fn remove_dataset(
 ) -> ServerResult<()> {
     let extras = PolicyRequestExtras::rest();
     let record = local_write_record(state, auth, dataset, extras).await?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(&state, &auth);
     let token = forwarded_auth_token(bearer)?;
     let ctx = state.get_ctx();
     route_metadata_delete(&ctx, actor, record.as_ref(), dataset, token)

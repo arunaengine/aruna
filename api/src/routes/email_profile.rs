@@ -8,7 +8,7 @@ use aruna_core::compute::SecretBytes;
 use aruna_core::errors::StorageError;
 use aruna_core::realm_vault::RealmVaultKey;
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::notifications::email::{SmtpMailer, SmtpSettings, refresh_mail};
@@ -28,6 +28,7 @@ use utoipa_axum::routes;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -294,11 +295,7 @@ async fn change_profile(
     };
     let stored = drive(
         SetEmailOperation::new(SetEmailConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(&state, &auth),
             auth_context: auth,
             vault_key: RealmVaultKey::derive(realm_signing_key),
             profile,

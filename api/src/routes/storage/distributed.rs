@@ -9,14 +9,13 @@ use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionSettings, MemberState, MetadataCoverage, RangeBehaviour, RouteError,
-    SetPhase, TransferRole,
+    DataStrategy, DistributionSettings, MemberState, MetadataCoverage, RangeBehaviour, SetPhase,
+    TransferRole,
 };
 use aruna_operations::distribution::create::{
     CreateError, CreateInput, CreationReport, LayoutKind, admit_pending, create_set,
 };
 use aruna_operations::distribution::forward::PublishRefusal;
-use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::status::{
     DeletionStatus, DistributionStatus, Reach, add_progress, read_status,
 };
@@ -542,21 +541,6 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
             .map(ToString::to_string)
             .collect(),
         publications_closed: status.lifecycle.publications_closed,
-    }
-}
-
-/// A write this member of a distributed bucket may not take now: 503 when a retry or the
-/// coordinator can take it, 409 when the bucket state refuses it.
-pub(crate) fn map_guard_error(error: GuardError) -> ServerError {
-    match error {
-        GuardError::NotCoordinator { .. }
-        | GuardError::RecordMissing(_)
-        | GuardError::Unreadable(_)
-        | GuardError::Route(
-            RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
-        ) => ServerError::ServiceUnavailableReason(error.to_string()),
-        GuardError::Route(_) | GuardError::Unbound(_) => ServerError::Conflict(error.to_string()),
-        GuardError::Conversion(error) => ServerError::InternalError(error.into()),
     }
 }
 

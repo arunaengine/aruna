@@ -619,9 +619,7 @@ fn map_bulk_error(error: BulkError) -> ServerError {
         BulkError::NoSuchBucket => ServerError::NotFound,
         BulkError::BucketChanged => ServerError::Conflict(error.to_string()),
         BulkError::ForeignPolicy { .. } => foreign_policy(),
-        BulkError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
+        BulkError::Distribution(error) => crate::lookup::map_guard_error(error),
         other => ServerError::InternalError(other.into()),
     }
 }
@@ -1617,9 +1615,7 @@ async fn coverage_here(
     .map_err(|error| match error {
         CoverageError::Unauthorized => ServerError::Forbidden,
         CoverageError::NoSuchBucket => ServerError::NotFound,
-        CoverageError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
+        CoverageError::Distribution(error) => crate::lookup::map_guard_error(error),
         other => ServerError::InternalError(other.into()),
     })?;
     Ok(coverage_response(bucket, report))

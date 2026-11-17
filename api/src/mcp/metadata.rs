@@ -8,7 +8,8 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     parse_ulid, request_auth, server_error, tool_extras,
 };
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use crate::lookup::actor;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::metadata::api::{
     DocumentQueryRequest, ExportMetadataRequest, MetadataQueryRequest, MetadataReferencesRequest,
@@ -419,11 +420,7 @@ impl McpServer {
         }
         let updated = route_metadata_update(
             &self.state.get_ctx(),
-            Actor {
-                node_id: self.state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: self.state.get_realm_id(),
-            },
+            actor(&self.state, &auth),
             record.as_ref(),
             document_id,
             input.public,

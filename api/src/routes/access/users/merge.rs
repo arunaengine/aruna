@@ -6,12 +6,13 @@ use super::{GetUserResponse, validate_oidc_token};
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, claims_for_revocation};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::federation::link::bearer_auth_time;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::link::MAX_LINK_SECS;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, oidc_subject_key};
+use aruna_core::structs::identity::auth::{AuthContext, oidc_subject_key};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::decode_bearer_token;
 use aruna_operations::driver::drive;
@@ -209,11 +210,7 @@ async fn merge_account(
         .try_into()
         .map_err(|_| refused(MergeError::TokenInvalid.to_string()))?;
     let config = MergeUsersConfig {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         survivor: auth,
         survivor_login,
         survivor_token: survivor_token.and_then(|token| AuthToken::bearer(token).ok()),
@@ -302,11 +299,7 @@ async fn attach_subject(
     let subject = oidc_subject_key(&identity.issuer, &identity.subject_id)
         .map_err(|_| ServerError::Unauthorized)?;
     let input = UpdateUserInput {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         self_realm_id: state.get_realm_id(),
         user_id: auth.user_id.to_string(),
         auth_context: auth,
@@ -378,11 +371,7 @@ async fn hand_off(
         .parse()
         .map_err(|_| ServerError::BadRequestReason("malformed node id".to_string()))?;
     let config = HandoffConfig {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         auth_context: auth,
         node_id,
     };

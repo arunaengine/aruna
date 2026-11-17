@@ -6,6 +6,7 @@ use crate::auth::RealmAuth;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ensure_permission, permission_granted};
 use crate::error::{ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::federation::AcceptedRealmsSetting;
 use crate::routes::node_names::CoordinatesBody;
 pub use crate::server::state::PortalStatus;
@@ -14,7 +15,7 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
@@ -1870,11 +1871,7 @@ pub async fn mutate_realm_placement(
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let action = request.into_core()?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(&state, &auth);
     let context = state.get_ctx();
     let document = match action {
         RealmPlacementAction::Mutation(mutation) => {
@@ -2072,11 +2069,7 @@ pub async fn set_realm_quota(
     )
     .await?;
     let (quota, replicas) = request.into_quota_config()?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(&state, &auth);
     let stored = drive(
         SetQuotaOperation::new(SetQuotaConfig {
             actor,

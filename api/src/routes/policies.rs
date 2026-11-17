@@ -5,13 +5,14 @@
 use crate::auth::RealmAuth;
 use crate::auth::{ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::access::groups::refuse_group_edit;
 use crate::server::state::ServerState;
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyDecision, PolicyKind, PolicyRequest, PolicySession, PolicyTraceEntry,
     RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
 };
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::set_policies::{SetGroupConfig, SetGroupError, SetGroupOperation};
@@ -493,11 +494,7 @@ pub async fn set_realm_policies(
 
     let document = drive(
         SetPoliciesOperation::new(SetPoliciesConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(&state, &auth),
             auth_context: auth.clone(),
             policies,
             expected_hash,
@@ -665,11 +662,7 @@ pub async fn set_group_policies(
 
     let document = drive(
         SetGroupOperation::new(SetGroupConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(&state, &auth),
             auth_context: auth.clone(),
             group_id,
             policies,

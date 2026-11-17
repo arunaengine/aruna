@@ -6,10 +6,11 @@
 use crate::auth::ensure_permission;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::NodeCoordinates;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
@@ -223,11 +224,7 @@ async fn set_name(
         coordinates,
     };
     let config = NodeNameConfig {
-        actor: Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
+        actor: actor(&state, &auth),
         auth_context: auth,
         node_id,
         change,

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
@@ -40,6 +40,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -409,14 +410,6 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(crate) fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
-    Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    }
-}
-
 pub(crate) fn parse_id(id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(id).map_err(|_| ServerError::BadRequestReason(format!("`{id}` is not an id")))
 }
@@ -693,6 +686,7 @@ mod tests {
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::plugin_installs::InstallState;
     use aruna_core::plugins::PublishedPlugin;
+    use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction};
     use aruna_core::structs::identity::realm::RealmId;
 
