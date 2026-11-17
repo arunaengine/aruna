@@ -4,6 +4,9 @@
 
 use std::any::Any;
 
+use smallvec::smallvec;
+
+use crate::backoff::conflict_backoff;
 use crate::calls::{CallRun, IoCall, IoError, IoResult, Next};
 use crate::effects::Effect;
 use crate::{events::Event, types::Effects};
@@ -339,6 +342,196 @@ where
     ))
 }
 
+/// Boxes a child built by `build` that reruns after a lost conflict as `drive_retry` does: each
+/// rerun is a fresh build whose `on_conflict` decides, after a backoff seeded by `seed`.
+pub fn boxed_retry<O, K, B, F>(mut build: B, seed: &[u8], map_result: F) -> Box<dyn SubOperation>
+where
+    O: Runnable<K> + 'static,
+    K: 'static,
+    O::Output: Send + 'static,
+    O::Error: Send + 'static,
+    B: FnMut() -> O + Send + 'static,
+    F: FnOnce(Result<O::Output, O::Error>) -> Event + Send + 'static,
+{
+    let mut build = move || build().into_machine();
+    Box::new(RetrySubOperation {
+        attempt: Some(Attempt::Running(build())),
+        build,
+        lost: 0,
+        seed: seed.to_vec(),
+        now_ms: None,
+        map_result,
+    })
+}
+
+/// A child that reruns per `on_conflict`. `attempt` is `None` only inside a method.
+struct RetrySubOperation<M: EffectOperation, B, F> {
+    build: B,
+    attempt: Option<Attempt<M>>,
+    lost: u32,
+    seed: Vec<u8>,
+    now_ms: Option<u64>,
+    map_result: F,
+}
+
+#[derive(Debug)]
+enum Attempt<M: EffectOperation> {
+    Running(M),
+    /// A fresh build waits for its backoff.
+    Waiting(M),
+    Ended(Result<M::Output, M::Error>),
+}
+
+impl<M: EffectOperation, B, F> RetrySubOperation<M, B, F>
+where
+    B: FnMut() -> M,
+{
+    /// Starts a fresh run, then reads its outcome if it needed no I/O.
+    fn run(&mut self, mut run: M) -> Effects {
+        if let Some(now_ms) = self.now_ms {
+            run.stamp(now_ms);
+        }
+        let effects = run.start();
+        self.settle(run, effects)
+    }
+
+    /// Keeps a running run; reads a finished one, where a lost conflict asks a fresh build.
+    fn settle(&mut self, run: M, mut effects: Effects) -> Effects {
+        if !run.is_complete() {
+            self.attempt = Some(Attempt::Running(run));
+            return effects;
+        }
+        let error = match run.finalize() {
+            Err(error) if M::is_conflict(&error) => error,
+            result => {
+                self.attempt = Some(Attempt::Ended(result));
+                return effects;
+            }
+        };
+        self.lost = self.lost.saturating_add(1);
+        let mut next = (self.build)();
+        self.attempt = Some(match next.on_conflict(self.lost) {
+            AfterConflict::Rerun => {
+                let index = usize::try_from(self.lost - 1).unwrap_or(usize::MAX);
+                effects.push(Effect::Delay(conflict_backoff(index, &self.seed)));
+                Attempt::Waiting(next)
+            }
+            AfterConflict::Finish(output) => Attempt::Ended(Ok(output)),
+            AfterConflict::Fail => Attempt::Ended(Err(error)),
+        });
+        effects
+    }
+}
+
+/// Equal runs in the same phase; ended attempts compare by their count of lost runs only.
+impl<M: EffectOperation, B, F> PartialEq for RetrySubOperation<M, B, F> {
+    fn eq(&self, other: &Self) -> bool {
+        let same = match (&self.attempt, &other.attempt) {
+            (Some(Attempt::Running(one)), Some(Attempt::Running(two)))
+            | (Some(Attempt::Waiting(one)), Some(Attempt::Waiting(two))) => one == two,
+            (Some(Attempt::Ended(_)), Some(Attempt::Ended(_))) | (None, None) => true,
+            _ => false,
+        };
+        same && self.lost == other.lost
+    }
+}
+
+impl<M: EffectOperation, B, F> std::fmt::Debug for RetrySubOperation<M, B, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetrySubOperation")
+            .field("attempt", &self.attempt)
+            .field("lost", &self.lost)
+            .finish()
+    }
+}
+
+impl<M, B, F> SubOperation for RetrySubOperation<M, B, F>
+where
+    M: EffectOperation + 'static,
+    M::Output: Send + 'static,
+    M::Error: Send + 'static,
+    B: FnMut() -> M + Send + 'static,
+    F: FnOnce(Result<M::Output, M::Error>) -> Event + Send + 'static,
+{
+    fn start(&mut self) -> Effects {
+        match self.attempt.take() {
+            Some(Attempt::Running(run)) => self.run(run),
+            other => {
+                self.attempt = other;
+                smallvec![]
+            }
+        }
+    }
+
+    /// While a rerun waits for its backoff, only `Event::Delayed` matters: other events answer
+    /// the cleanup of the lost run.
+    fn step(&mut self, event: Event) -> Effects {
+        match self.attempt.take() {
+            Some(Attempt::Running(mut run)) => {
+                let effects = run.step(event);
+                self.settle(run, effects)
+            }
+            Some(Attempt::Waiting(run)) if matches!(event, Event::Delayed) => self.run(run),
+            other => {
+                self.attempt = other;
+                smallvec![]
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.attempt, Some(Attempt::Ended(_)))
+    }
+
+    fn finalize(self: Box<Self>) -> Event {
+        let this = *self;
+        let result = match this
+            .attempt
+            .expect("a retry child holds an attempt between calls")
+        {
+            Attempt::Running(run) | Attempt::Waiting(run) => run.finalize(),
+            Attempt::Ended(result) => result,
+        };
+        (this.map_result)(result)
+    }
+
+    fn abort(&mut self) -> Effects {
+        match self.attempt.take() {
+            Some(Attempt::Running(mut run)) => {
+                let effects = run.abort();
+                self.attempt = Some(Attempt::Running(run));
+                effects
+            }
+            Some(Attempt::Waiting(run)) => {
+                self.attempt = Some(Attempt::Ended(run.finalize()));
+                smallvec![]
+            }
+            other => {
+                self.attempt = other;
+                smallvec![]
+            }
+        }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = Some(now_ms);
+        if let Some(Attempt::Running(run)) = self.attempt.as_mut() {
+            run.stamp(now_ms);
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn eq_dyn(&self, other: &dyn SubOperation) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<Self>()
+            .is_some_and(|other| self == other)
+    }
+}
+
 /// Marks an [`EffectOperation`] for [`Runnable`].
 pub enum ByEffects {}
 
@@ -369,5 +562,102 @@ impl<T: Operation> Runnable<ByCalls> for T {
 
     fn into_machine(self) -> impl EffectOperation<Output = Self::Output, Error = Self::Error> {
         CallRun::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+    use crate::calls::ChildOutcome;
+
+    /// Loses a conflict until its hook sets `recheck`; finishes on the lost run `finish_at`.
+    #[derive(Debug, PartialEq)]
+    struct Rechecking {
+        recheck: bool,
+        finish_at: Option<u32>,
+    }
+
+    impl Operation for Rechecking {
+        type Output = &'static str;
+        type Error = IoError;
+
+        fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+            match self.recheck {
+                true => Ok(Next::Done("rechecked")),
+                false => Err(IoError::Conflict),
+            }
+        }
+
+        fn next(&mut self, _: IoResult) -> Result<Next<Self::Output>, IoError> {
+            Err(IoError::Conflict)
+        }
+
+        fn on_conflict(&mut self, lost: u32) -> AfterConflict<Self::Output> {
+            if self.finish_at == Some(lost) {
+                return AfterConflict::Finish("finished");
+            }
+            self.recheck = lost >= 2;
+            AfterConflict::Rerun
+        }
+    }
+
+    const SEED: [u8; 16] = [7; 16];
+
+    /// A retry child of `Rechecking` and the count of runs it built.
+    fn child(finish_at: Option<u32>) -> (Box<dyn SubOperation>, Arc<AtomicU32>) {
+        let built = Arc::new(AtomicU32::new(0));
+        let count = built.clone();
+        let build = move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Rechecking {
+                recheck: false,
+                finish_at,
+            }
+        };
+        let child = boxed_retry(build, &SEED, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        (child, built)
+    }
+
+    fn outcome(result: Result<&'static str, IoError>) -> Event {
+        Event::Child(ChildOutcome::new(result))
+    }
+
+    #[test]
+    fn child_reruns_conflict() {
+        let (mut child, built) = child(None);
+        let first = Effect::Delay(conflict_backoff(0, &SEED));
+        assert_eq!(child.start().as_slice(), &[first]);
+        // While a rerun waits, other events answer the cleanup of the lost run.
+        assert!(child.step(Event::Hung { effect: "storage" }).is_empty());
+        let second = Effect::Delay(conflict_backoff(1, &SEED));
+        assert_eq!(child.step(Event::Delayed).as_slice(), &[second]);
+        assert!(!child.is_complete());
+        assert!(child.step(Event::Delayed).is_empty());
+        assert!(child.is_complete());
+        assert_eq!(built.load(Ordering::SeqCst), 3);
+        assert_eq!(child.finalize(), outcome(Ok("rechecked")));
+    }
+
+    #[test]
+    fn child_finishes_conflict() {
+        let (mut child, built) = child(Some(1));
+        assert!(child.start().is_empty());
+        assert!(child.is_complete());
+        assert_eq!(built.load(Ordering::SeqCst), 2);
+        assert_eq!(child.finalize(), outcome(Ok("finished")));
+    }
+
+    #[test]
+    fn abort_ends_backoff() {
+        let (mut child, _) = child(None);
+        assert_eq!(child.start().len(), 1);
+        assert!(child.abort().is_empty());
+        assert!(child.is_complete());
+        assert_eq!(child.finalize(), outcome(Err(IoError::Unfinished)));
     }
 }

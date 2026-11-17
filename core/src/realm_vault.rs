@@ -478,6 +478,8 @@ mod tests {
                 .vault
                 .seal(&realm_id, entry, revision, &secret)
                 .unwrap(),
+            changed_by: UserId::local(Ulid::from_bytes([7; 16]), realm_id),
+            changed_at_ms: 1,
         };
         let owner = UserId::local(Ulid::from_bytes([7; 16]), realm_id);
         let id = Ulid::from_bytes([9; 16]);

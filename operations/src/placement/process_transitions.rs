@@ -1445,4 +1445,152 @@ mod tests {
         publish(&mut divergent, 73, node(2), rival);
         assert!(materialize(&divergent).candidate_map(2).is_none());
     }
+
+    /// The bucket the fence close tests write to.
+    fn fenced_bucket() -> PlacementRef {
+        PlacementRef {
+            strategy_id: Ulid::from_bytes([7; 16]),
+            shard: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn close_conflicts_write() {
+        // A write that read the open fence and then paused must not commit
+        // after the departing holder closed that generation.
+        let directory = tempdir().unwrap();
+        let storage =
+            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([9; 32]);
+        let placement = fenced_bucket();
+
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("the write transaction starts");
+        };
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: aruna_core::keyspaces::WRITE_FENCE_KEYSPACE.to_string(),
+                key: aruna_core::storage_entries::placement_fence_key(&realm_id, &placement),
+                txn_id: Some(txn_id),
+            })
+            .await
+        else {
+            panic!("the fence read answers");
+        };
+        assert!(fence::admits(value.as_ref(), 1));
+
+        close(&storage, &realm_id, &placement, 1)
+            .await
+            .expect("the departing holder closes the fence");
+
+        let write = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE.to_string(),
+                key: ByteView::from(b"paused-row".to_vec()),
+                value: ByteView::from(vec![1u8]),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        assert!(matches!(
+            write,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let commit = storage
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+        assert!(
+            matches!(
+                commit,
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict
+                })
+            ),
+            "the paused predecessor write must conflict, got {commit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_is_monotone() {
+        let directory = tempdir().unwrap();
+        let storage =
+            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([10; 32]);
+        let placement = fenced_bucket();
+        let stored = || async {
+            match storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: aruna_core::keyspaces::WRITE_FENCE_KEYSPACE.to_string(),
+                    key: aruna_core::storage_entries::placement_fence_key(&realm_id, &placement),
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    fence::closed_generation(value.as_ref())
+                }
+                other => panic!("unexpected fence read: {other:?}"),
+            }
+        };
+
+        close(&storage, &realm_id, &placement, 3).await.unwrap();
+        assert_eq!(stored().await, 3);
+        // A stale re-close never reopens the bucket.
+        close(&storage, &realm_id, &placement, 2).await.unwrap();
+        assert_eq!(stored().await, 3);
+        close(&storage, &realm_id, &placement, 4).await.unwrap();
+        assert_eq!(stored().await, 4);
+
+        let (lower, higher) = tokio::join!(
+            close(&storage, &realm_id, &placement, 5),
+            close(&storage, &realm_id, &placement, 6),
+        );
+        lower.unwrap();
+        higher.unwrap();
+        assert_eq!(stored().await, 6);
+    }
+
+    #[tokio::test]
+    async fn close_heals_malformed() {
+        // An unparseable value admits no generation, so a close that reported
+        // success without rewriting it would brick the bucket for good.
+        let directory = tempdir().unwrap();
+        let storage =
+            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes([12; 32]);
+        let placement = fenced_bucket();
+        let (key_space, key) = fence_read(&realm_id, &placement);
+        let write = storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.clone(),
+                key: key.clone(),
+                value: ByteView::from(vec![9u8; 3]),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            write,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+
+        close(&storage, &realm_id, &placement, 4).await.unwrap();
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("the healed fence reads back");
+        };
+        assert_eq!(fence::closed_generation(value.as_ref()), 4);
+        assert!(
+            fence::admits(value.as_ref(), 5),
+            "a successor generation must be writable again"
+        );
+    }
 }
