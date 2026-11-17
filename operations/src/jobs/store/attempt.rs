@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::control_mutation::MutateControlOperation;
 use super::mark_start::MarkStartOperation;
 use super::settle_attempt;
 use super::*;
@@ -59,13 +60,13 @@ pub(super) async fn mutate_attempt_control<F>(
     mutate: F,
 ) -> Result<(JobRecord, AttemptControl), JobMutationError>
 where
-    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError> + Send,
 {
     mutate_control_with(context, job_id, Vec::new(), mutate).await
 }
 
 /// Same transaction as [`mutate_attempt_control`], plus writes that must land
-/// atomically with the control row.
+/// atomically with the control row; see [`MutateControlOperation`].
 pub(super) async fn mutate_control_with<F>(
     context: &DriverContext,
     job_id: JobId,
@@ -73,79 +74,23 @@ pub(super) async fn mutate_control_with<F>(
     mut mutate: F,
 ) -> Result<(JobRecord, AttemptControl), JobMutationError>
 where
-    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError> + Send,
 {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let result = async {
-            let Some(mut record) = read_job_record(context, job_id, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?
-            else {
-                return Err(JobMutationError::NotFound);
-            };
-            let epoch = record
-                .attempt_intent
-                .as_ref()
-                .map(|intent| intent.attempt_epoch)
-                .ok_or(JobMutationError::MissingControl)?;
-            let mut control = read_attempt_control(context, job_id, epoch, Some(txn_id))
-                .await?
-                .ok_or(JobMutationError::MissingControl)?;
-            if control.attempt_epoch != epoch {
-                return Err(JobMutationError::EpochMismatch);
-            }
-            let old = record.clone();
-            if matches!(mutate(&mut record, &mut control)?, JobMutation::Skip) {
-                return Ok((old, control));
-            }
-            if old.state != record.state {
-                validate_transition(old.execution_class, old.state, record.state)?;
-            }
-            let (mut writes, deletes) = index_deltas(&old, &record)
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-            writes.push((
-                ATTEMPT_CONTROL_KEYSPACE.to_string(),
-                ByteView::from(attempt_control_key(job_id, epoch)),
-                ByteView::from(
-                    control
-                        .to_bytes()
-                        .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-                ),
-            ));
-            writes.extend(extra.iter().cloned());
-            batch_write(context, writes, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            batch_delete(context, deletes, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            Ok((record, control))
-        }
-        .await;
-        match result {
-            Ok(value) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "attempt mutation exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(value),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
+    let mut attempt = 0;
+    loop {
+        let operation = MutateControlOperation::new(job_id, extra.clone(), &mut mutate);
+        let result = drive(operation, context).await;
+        match settle_attempt(
+            result,
+            attempt,
+            "attempt mutation exhausted conflict retries",
+        )
+        .await
+        {
+            Some(result) => return result,
+            None => attempt += 1,
         }
     }
-    Err(JobMutationError::Storage(
-        "attempt mutation exhausted conflict retries".to_string(),
-    ))
 }
 
 pub(super) fn bump_generation(control: &mut AttemptControl) -> Result<(), JobMutationError> {

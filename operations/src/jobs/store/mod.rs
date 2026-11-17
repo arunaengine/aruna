@@ -45,6 +45,7 @@ use crate::storage_read::iter_prefix_page;
 use crate::tasks::queue_backoff::retry_delay_ms;
 
 pub mod attempt;
+pub mod control_mutation;
 pub mod job_rows;
 pub mod key_wait;
 pub mod list_jobs;
