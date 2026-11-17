@@ -188,6 +188,10 @@ pub enum SubOperationEvent {
     WatchStored {
         result: Result<bool, String>,
     },
+    /// One notification delivery job was queued, or its failure as text.
+    DeliveryQueued {
+        result: Result<(), String>,
+    },
 }
 
 /// How the re-key of one version ended.
@@ -1008,6 +1012,7 @@ impl Event {
                     CopyWoken,
                     NotificationsFailed,
                     WatchStored,
+                    DeliveryQueued,
                 }
             ),
             Event::Task(event) => variant_label!(
