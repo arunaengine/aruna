@@ -124,7 +124,7 @@ fn rules_then_policies() {
 }
 
 #[test]
-fn refusals_keep_their_kind() {
+fn refusals_keep_kind() {
     let mut denied_rules = listing();
     denied_rules.first().unwrap();
     assert_eq!(
