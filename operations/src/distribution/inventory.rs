@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -13,6 +14,7 @@ use aruna_core::keyspaces::{
     RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE, SEARCH_FEED_KEYSPACE, SOURCE_ROOT_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, CurrentVersionPointer};
 use aruna_core::structs::storage::distribution::accounting::{
@@ -48,6 +50,116 @@ pub enum InventoryError {
     Storage(#[from] StorageError),
     #[error("inventory update received unexpected event: {0:?}")]
     UnexpectedEvent(Box<Event>),
+    #[error("inventory update failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for InventoryError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+/// A call of an embedded update: one for the host's transaction, or a read that runs outside
+/// it so that rows other writers change meanwhile never conflict the host's commit.
+#[derive(Debug, PartialEq)]
+pub enum StagedCall {
+    InTransaction(IoCall),
+    Outside(IoCall),
+}
+
+impl StagedCall {
+    /// The call a host operation makes; an outside read runs as its own child run, which never
+    /// joins the host's transaction.
+    pub fn into_call(self) -> IoCall {
+        match self {
+            Self::InTransaction(call) => call,
+            Self::Outside(call) => IoCall::child(OutsideRead { call: Some(call) }),
+        }
+    }
+
+    /// The effect of this call for a host that holds the transaction `txn_id` itself.
+    fn into_effect(self, txn_id: TxnId) -> Result<Effect, InventoryError> {
+        let (call, txn) = match self {
+            Self::InTransaction(call) => (call, Some(txn_id)),
+            Self::Outside(call) => (call, None),
+        };
+        let storage = match call {
+            IoCall::Read(reads) => StorageEffect::BatchRead { reads, txn_id: txn },
+            IoCall::Page {
+                space,
+                prefix,
+                after,
+                limit,
+            } => StorageEffect::Iter {
+                key_space: space,
+                prefix: Some(prefix),
+                start: after.map(IterStart::After),
+                limit,
+                txn_id: txn,
+            },
+            IoCall::Write(writes) => StorageEffect::BatchWrite {
+                writes,
+                txn_id: txn,
+            },
+            IoCall::Delete(deletes) => StorageEffect::BatchDelete {
+                deletes,
+                txn_id: txn,
+            },
+            IoCall::AddCounters { space, deltas } => StorageEffect::AddCounters {
+                key_space: space,
+                deltas,
+                txn_id,
+            },
+            IoCall::Effect(effect) => match *effect {
+                Effect::Storage(mut storage) => {
+                    if let Some(slot) = storage.txn_slot() {
+                        *slot = txn;
+                    }
+                    storage
+                }
+                other => return Ok(other),
+            },
+            // The update makes no other call.
+            _ => {
+                let expected = "a storage call";
+                let got = "another call";
+                return Err(IoError::Unexpected { expected, got }.into());
+            }
+        };
+        Ok(Effect::Storage(storage))
+    }
+}
+
+/// The answer of an outside read: a child outcome when a host ran it with [`StagedCall::into_call`],
+/// or the plain answer when a driver ran it itself.
+fn outside_answer(result: IoResult) -> Result<IoResult, IoError> {
+    match result {
+        IoResult::Child(_) => result.child::<IoResult, IoError>()?,
+        other => Ok(other),
+    }
+}
+
+/// One read outside any transaction, run as a child of a host in a transaction.
+#[derive(Debug, PartialEq)]
+struct OutsideRead {
+    call: Option<IoCall>,
+}
+
+impl Operation for OutsideRead {
+    type Output = IoResult;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<IoResult>, IoError> {
+        self.call.take().map(Next::Call).ok_or(IoError::Unfinished)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<IoResult>, IoError> {
+        Ok(Next::Done(result))
+    }
 }
 
 /// One version written to the key. An indexed id of the same key, epoch and content is the
@@ -229,68 +341,127 @@ impl InventoryUpdate {
         self.queued.front_mut().expect("a queued change")
     }
 
-    pub fn start(&mut self, txn_id: TxnId) -> Effects {
-        self.next_round(txn_id).unwrap_or_default()
+    /// The first call of the update, or `None` when it has nothing to do.
+    pub fn start_calls(&mut self) -> Option<StagedCall> {
+        self.next_round()
     }
 
-    /// Returns `Ok(Some(effects))` while storage work remains and `Ok(None)` once every row
-    /// and counter delta is staged in the transaction.
-    pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, InventoryError> {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            event => event,
-        };
-        match (&self.phase, event) {
-            (Phase::Locate, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+    /// The next call after `result`, or `None` once every row and counter delta is staged.
+    pub fn step_calls(&mut self, result: IoResult) -> Result<Option<StagedCall>, InventoryError> {
+        match self.phase {
+            Phase::Locate => {
+                let (values, _) = result.page()?;
                 self.locate(&values)?;
-                Ok(Some(self.locate_next(txn_id)))
+                Ok(Some(self.locate_next()))
             }
-            (Phase::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.plan_keys(values)?;
-                Ok(self.count_samples(txn_id))
+            Phase::Read => {
+                self.plan_keys(result.values()?)?;
+                Ok(self.count_samples())
             }
-            (Phase::SampleCount, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.size_samples(values)?;
-                Ok(self.next_sample(txn_id, false))
+            Phase::SampleCount => {
+                self.size_samples(outside_answer(result)?.values()?)?;
+                Ok(self.next_sample(false))
             }
-            (Phase::SampleProbe, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+            Phase::SampleProbe => {
+                let values = match outside_answer(result)?.event()? {
+                    Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+                    other => return Err(InventoryError::UnexpectedEvent(Box::new(other))),
+                };
                 let last = values.first().and_then(|(key, _)| SampleEntry::decode(key));
                 let first = self.sampling.front().and_then(|at| at.candidates.first());
                 let enters =
                     first.is_some_and(|first| last.is_none_or(|last| ranks_below(first, &last)));
                 if !enters {
                     self.sampling.pop_front();
-                    return Ok(self.next_sample(txn_id, false));
+                    return Ok(self.next_sample(false));
                 }
-                Ok(self.next_sample(txn_id, true))
+                Ok(self.next_sample(true))
             }
-            (
-                Phase::SampleRead,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
+            Phase::SampleRead => {
+                let (values, next) = match result.event()? {
+                    Event::Storage(StorageEvent::IterResult {
+                        values,
+                        next_start_after,
+                    }) => (values, next_start_after),
+                    other => return Err(InventoryError::UnexpectedEvent(Box::new(other))),
+                };
                 // A sample far above its size is not read whole; its candidates stay out.
-                if let (Some(sampling), None) = (self.sampling.pop_front(), next_start_after) {
+                if let (Some(sampling), None) = (self.sampling.pop_front(), next) {
                     let existing = values
                         .iter()
                         .filter_map(|(key, _)| SampleEntry::decode(key));
                     self.settle(sampling, existing.collect())?;
                 }
-                Ok(self.next_sample(txn_id, false))
+                Ok(self.next_sample(false))
             }
+            Phase::Write | Phase::Delete | Phase::Count => {
+                result.done()?;
+                Ok(self.next_effect())
+            }
+            Phase::Pending | Phase::Done => {
+                let expected = "no answer while the update is idle";
+                Err(IoError::Unexpected {
+                    expected,
+                    got: result.label(),
+                }
+                .into())
+            }
+        }
+    }
+
+    pub fn start(&mut self, txn_id: TxnId) -> Effects {
+        match self.start_calls().map(|call| call.into_effect(txn_id)) {
+            Some(Ok(effect)) => smallvec![effect],
+            // The first call is always a storage call.
+            Some(Err(_)) | None => smallvec![],
+        }
+    }
+
+    /// Returns `Ok(Some(effects))` while storage work remains and `Ok(None)` once every row
+    /// and counter delta is staged in the transaction.
+    pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, InventoryError> {
+        let result = self.answer_of(event)?;
+        match self.step_calls(result)? {
+            Some(call) => Ok(Some(smallvec![call.into_effect(txn_id)?])),
+            None => Ok(None),
+        }
+    }
+
+    /// The answer an event of the old interface gives the call of the current phase.
+    fn answer_of(&self, event: Event) -> Result<IoResult, InventoryError> {
+        match (&self.phase, event) {
+            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (
+                Phase::Locate,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => Ok(IoResult::Page {
+                rows: values,
+                next: next_start_after,
+            }),
+            (
+                Phase::Read | Phase::SampleCount,
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => Ok(IoResult::Values(
+                values.into_iter().map(|(_, value)| value).collect(),
+            )),
+            (
+                Phase::SampleProbe | Phase::SampleRead,
+                event @ Event::Storage(StorageEvent::IterResult { .. }),
+            ) => Ok(IoResult::Event(Box::new(event))),
             (Phase::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
             | (Phase::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. }))
             | (Phase::Count, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                Ok(self.next_effect(txn_id))
+                Ok(IoResult::Done)
             }
             (_, event) => Err(InventoryError::UnexpectedEvent(Box::new(event))),
         }
     }
 
     /// Takes the next round of distinct keys and version ids, or ends the update.
-    fn next_round(&mut self, txn_id: TxnId) -> Option<Effects> {
+    fn next_round(&mut self) -> Option<StagedCall> {
         let mut keys = BTreeSet::new();
         let mut ids = BTreeSet::new();
         while let Some(change) = self.queued.front() {
@@ -309,12 +480,12 @@ impl InventoryUpdate {
             self.phase = Phase::Done;
             return None;
         }
-        Some(self.locate_next(txn_id))
+        Some(self.locate_next())
     }
 
     /// Seeks the range of the first key outside every located range, or reads the round's
     /// rows once every key has its range.
-    fn locate_next(&mut self, txn_id: TxnId) -> Effects {
+    fn locate_next(&mut self) -> StagedCall {
         for change in std::mem::take(&mut self.unlocated) {
             let range =
                 (self.located.iter()).find(|range| range.contains(change.set_id, &change.key));
@@ -324,17 +495,16 @@ impl InventoryUpdate {
             }
         }
         let Some(change) = self.unlocated.first() else {
-            return self.read_rows(txn_id);
+            return self.read_rows();
         };
         self.phase = Phase::Locate;
         let set_id = change.set_id;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: RANGE_INDEX_KEYSPACE.to_string(),
-            prefix: Some(set_id.to_bytes().to_vec().into()),
-            start: Some(IterStart::After(slot_seek(set_id, &change.key).into())),
+        StagedCall::InTransaction(IoCall::Page {
+            space: RANGE_INDEX_KEYSPACE.to_string(),
+            prefix: set_id.to_bytes().to_vec().into(),
+            after: Some(slot_seek(set_id, &change.key).into()),
             limit: 1,
-            txn_id: Some(txn_id),
-        })]
+        })
     }
 
     /// Takes the range index row found for the first unlocated key.
@@ -364,7 +534,7 @@ impl InventoryUpdate {
         Ok(())
     }
 
-    fn read_rows(&mut self, txn_id: TxnId) -> Effects {
+    fn read_rows(&mut self) -> StagedCall {
         self.phase = Phase::Read;
         self.ranges.clear();
         for key in &self.keys {
@@ -381,15 +551,12 @@ impl InventoryUpdate {
         for key in &self.keys {
             reads.extend(key.reads());
         }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        StagedCall::InTransaction(IoCall::Read(reads))
     }
 
     /// Plans every key of the round from the read rows and gathers its staged work.
-    fn plan_keys(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<(), InventoryError> {
-        let mut values = values.into_iter().map(|(_, value)| value);
+    fn plan_keys(&mut self, values: Vec<Option<Value>>) -> Result<(), InventoryError> {
+        let mut values = values.into_iter();
         let mut accounts = Vec::with_capacity(self.ranges.len());
         for _ in &self.ranges {
             let account = values.next().flatten();
@@ -438,24 +605,21 @@ impl InventoryUpdate {
 
     /// Reads the size of each sample new keys may enter, outside the transaction, so inserts
     /// below the size never conflict.
-    fn count_samples(&mut self, txn_id: TxnId) -> Option<Effects> {
+    fn count_samples(&mut self) -> Option<StagedCall> {
         if self.sampling.is_empty() {
-            return self.next_effect(txn_id);
+            return self.next_effect();
         }
         self.phase = Phase::SampleCount;
         let reads = (self.sampling.iter())
             .map(|at| sample_count_key(at.set_id, at.range_id))
             .map(|key| (RANGE_COUNTER_KEYSPACE.to_string(), key.into()));
-        Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: reads.collect(),
-            txn_id: None,
-        })])
+        Some(StagedCall::Outside(IoCall::Read(reads.collect())))
     }
 
     /// Settles the samples all candidates fit into; the others are read before.
-    fn size_samples(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<(), InventoryError> {
+    fn size_samples(&mut self, values: Vec<Option<Value>>) -> Result<(), InventoryError> {
         let queue = std::mem::take(&mut self.sampling);
-        for (mut sampling, (_, value)) in queue.into_iter().zip(values) {
+        for (mut sampling, value) in queue.into_iter().zip(values) {
             let stored = value
                 .map(|value| RangeCounters::from_bytes(&value))
                 .transpose()?;
@@ -479,9 +643,9 @@ impl InventoryUpdate {
     /// Reads the next sample its candidates may enter: a full one is first probed outside the
     /// transaction, so keys that cannot enter never conflict on its largest entry. In the
     /// transaction, only the entries from the smallest candidate on are read.
-    fn next_sample(&mut self, txn_id: TxnId, probed: bool) -> Option<Effects> {
+    fn next_sample(&mut self, probed: bool) -> Option<StagedCall> {
         let Some(sampling) = self.sampling.front() else {
-            return self.next_effect(txn_id);
+            return self.next_effect();
         };
         let (set_id, range_id) = (sampling.set_id, sampling.range_id);
         let prefix = sample_prefix(set_id, range_id);
@@ -489,15 +653,16 @@ impl InventoryUpdate {
         // Entries staged earlier in this transaction are visible only inside it.
         if !probed && full && !self.sampled.contains_key(&range_id) {
             self.phase = Phase::SampleProbe;
-            return Some(smallvec![Effect::Storage(StorageEffect::Last {
+            let last = Effect::Storage(StorageEffect::Last {
                 key_space: KEY_SAMPLE_KEYSPACE.to_string(),
                 prefix: Some(prefix.into()),
                 txn_id: None,
-            })]);
+            });
+            return Some(StagedCall::Outside(IoCall::Effect(Box::new(last))));
         }
         let Some(first) = sampling.candidates.first() else {
             self.sampling.pop_front();
-            return self.next_sample(txn_id, false);
+            return self.next_sample(false);
         };
         let start = first.row_key(set_id, range_id);
         // The tag byte that ends the prefix is below 0xFF, so the next tag bounds the sample.
@@ -506,14 +671,16 @@ impl InventoryUpdate {
             *tag += 1;
         }
         self.phase = Phase::SampleRead;
-        Some(smallvec![Effect::Storage(StorageEffect::IterRange {
+        // Without a transaction id the range read joins the host's transaction.
+        let range = Effect::Storage(StorageEffect::IterRange {
             key_space: KEY_SAMPLE_KEYSPACE.to_string(),
             start: IterStart::At(start.into()),
             end: IterEnd::Before(end.into()),
             limit: SAMPLE_READ_ROWS,
             max_bytes: SAMPLE_READ_BYTES,
-            txn_id: Some(txn_id),
-        })])
+            txn_id: None,
+        });
+        Some(StagedCall::InTransaction(IoCall::Effect(Box::new(range))))
     }
 
     /// Keeps the `SAMPLE_SIZE` smallest of the sample and its candidates: candidates among them
@@ -570,33 +737,26 @@ impl InventoryUpdate {
         Ok(())
     }
 
-    fn next_effect(&mut self, txn_id: TxnId) -> Option<Effects> {
+    fn next_effect(&mut self) -> Option<StagedCall> {
         if !self.writes.is_empty() && self.phase != Phase::Write {
             self.phase = Phase::Write;
             let writes = std::mem::take(&mut self.writes);
-            return Some(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(txn_id),
-            })]);
+            return Some(StagedCall::InTransaction(IoCall::Write(writes)));
         }
         if !self.deletes.is_empty() && !matches!(self.phase, Phase::Delete | Phase::Count) {
             self.phase = Phase::Delete;
             let deletes = std::mem::take(&mut self.deletes);
-            return Some(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })]);
+            return Some(StagedCall::InTransaction(IoCall::Delete(deletes)));
         }
         if !self.counters.is_empty() && self.phase != Phase::Count {
             self.phase = Phase::Count;
             let deltas = std::mem::take(&mut self.counters);
-            return Some(smallvec![Effect::Storage(StorageEffect::AddCounters {
-                key_space: RANGE_COUNTER_KEYSPACE.to_string(),
+            return Some(StagedCall::InTransaction(IoCall::AddCounters {
+                space: RANGE_COUNTER_KEYSPACE.to_string(),
                 deltas,
-                txn_id,
-            })]);
+            }));
         }
-        self.next_round(txn_id)
+        self.next_round()
     }
 }
 
