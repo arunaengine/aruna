@@ -25,16 +25,12 @@ pub(in crate::document_sync) async fn apply_create_event(
         let txn_id = start_storage_transaction(storage).await?;
         match create_fence_txn(storage, event, txn_id).await {
             Ok(true) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(());
             }
             Ok(false) => {}
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         }

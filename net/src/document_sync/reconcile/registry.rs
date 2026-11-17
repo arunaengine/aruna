@@ -49,9 +49,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
         let delete_present = match delete_record_txn(storage, record.document_id, txn_id).await {
             Ok(delete) => delete.is_some(),
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
@@ -71,9 +69,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
                         postcard::from_bytes::<MetadataRegistryRecord>(&value).ok()
                     }),
                     Err(error) => {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(storage, txn_id).await;
                         return Err(error);
                     }
                 };
@@ -81,45 +77,33 @@ pub(in crate::document_sync) async fn store_registry_upsert(
                 match replace_batch_in(storage, txn_id, deletes, Vec::new()).await {
                     Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
                     Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(storage, txn_id).await;
                         continue;
                     }
                     Err(error) => {
-                        let _ = storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(storage, txn_id).await;
                         return Err(error);
                     }
                 }
             }
             Ok(false) => {}
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         }
         match transaction_placement_fence(storage, &record, txn_id).await {
             Ok(MetadataPlacementOutcome::Accepted(MetadataPlacementFence)) => {}
             Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(MetadataPlacementOutcome::Deferred(dependency));
             }
             Ok(MetadataPlacementOutcome::Rejected) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(MetadataPlacementOutcome::Rejected);
             }
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
@@ -133,9 +117,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
         {
             Ok(value) => value,
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
@@ -145,9 +127,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
         {
             Ok(existing) => existing,
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(NetError::Bootstrap(error.to_string()));
             }
         };
@@ -155,9 +135,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
             .as_ref()
             .is_some_and(|existing| !existing.same_identity(&record))
         {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(storage, txn_id).await;
             return Ok(MetadataPlacementOutcome::Rejected);
         }
         if let Some(existing) = existing
@@ -167,30 +145,22 @@ pub(in crate::document_sync) async fn store_registry_upsert(
             let repairs = match registry_sidecar_repairs(storage, existing, txn_id).await {
                 Ok(repairs) => repairs,
                 Err(error) => {
-                    let _ = storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(storage, txn_id).await;
                     return Err(error);
                 }
             };
             if repairs.is_empty() {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(MetadataPlacementOutcome::Accepted(()));
             }
             match replace_batch_in(storage, txn_id, Vec::new(), repairs).await {
                 Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
                 Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                    let _ = storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(storage, txn_id).await;
                     continue;
                 }
                 Err(error) => {
-                    let _ = storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(storage, txn_id).await;
                     return Err(error);
                 }
             }
@@ -221,16 +191,12 @@ pub(in crate::document_sync) async fn store_graph_lifecycle(
         let delete = match delete_record_txn(storage, record.document_id, txn_id).await {
             Ok(delete) => delete,
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
         let Some(delete) = delete else {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(storage, txn_id).await;
             return Ok(false);
         };
         let (registry_live, registry_row) = match registry_live_txn(
@@ -244,16 +210,12 @@ pub(in crate::document_sync) async fn store_graph_lifecycle(
         {
             Ok(live) => live,
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
         if !delete_matches_graph(&delete, record) || registry_live {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(storage, txn_id).await;
             return Ok(false);
         }
         let deletes = registry_row
@@ -280,9 +242,7 @@ pub(in crate::document_sync) async fn store_document_lifecycle(
         let writes = match current_lifecycle_entries(storage, record, &change, txn_id).await {
             Ok(writes) => writes,
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
@@ -292,9 +252,7 @@ pub(in crate::document_sync) async fn store_document_lifecycle(
             let current = match delete_record_txn(storage, record.document_id(), txn_id).await {
                 Ok(current) => current,
                 Err(error) => {
-                    let _ = storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(storage, txn_id).await;
                     return Err(error);
                 }
             };
@@ -318,9 +276,7 @@ pub(in crate::document_sync) async fn store_document_lifecycle(
             {
                 Ok(deletes) => deletes,
                 Err(error) => {
-                    let _ = storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(storage, txn_id).await;
                     return Err(error);
                 }
             }
@@ -328,9 +284,7 @@ pub(in crate::document_sync) async fn store_document_lifecycle(
             Vec::new()
         };
         if writes.is_none() && deletes.is_empty() {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(storage, txn_id).await;
             return Ok(false);
         }
         if commit_batch(storage, txn_id, deletes, writes.unwrap_or_default()).await? {
@@ -358,36 +312,26 @@ pub(in crate::document_sync) async fn store_pid_mapping(
         {
             Ok(MetadataPlacementOutcome::Accepted(_)) => {}
             Ok(MetadataPlacementOutcome::Deferred(dependency)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(MetadataPlacementOutcome::Deferred(dependency));
             }
             Ok(MetadataPlacementOutcome::Rejected) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(MetadataPlacementOutcome::Rejected);
             }
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         }
         let merged = match pid_merge_txn(storage, incoming, txn_id).await {
             Ok(Some(merged)) => merged,
             Ok(None) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(MetadataPlacementOutcome::Accepted(false));
             }
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
@@ -437,9 +381,7 @@ pub(in crate::document_sync) async fn store_policy_document(
         {
             Ok(MetadataPlacementOutcome::Accepted(_)) => {}
             Ok(outcome) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(match outcome {
                     MetadataPlacementOutcome::Deferred(dependency) => {
                         MetadataPlacementOutcome::Deferred(dependency)
@@ -448,30 +390,22 @@ pub(in crate::document_sync) async fn store_policy_document(
                 });
             }
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         }
         let merged = match policy_merge_txn(storage, incoming, txn_id).await {
             Ok(Ok(Some(merged))) => merged,
             Ok(Ok(None)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(MetadataPlacementOutcome::Accepted(false));
             }
             Ok(Err(())) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(MetadataPlacementOutcome::Rejected);
             }
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
@@ -610,32 +544,24 @@ pub(in crate::document_sync) async fn delete_registry_record(
         let delete = match delete_record_txn(storage, document_id, txn_id).await {
             Ok(delete) => delete,
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         };
         let Some(delete) = delete else {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(storage, txn_id).await;
             return Ok(());
         };
         let deletes =
             match registry_cleanup_txn(storage, group_id, document_id, &delete, txn_id).await {
                 Ok(deletes) => deletes,
                 Err(error) => {
-                    let _ = storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(storage, txn_id).await;
                     return Err(error);
                 }
             };
         if deletes.is_empty() {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(storage, txn_id).await;
             return Ok(());
         }
         if commit_batch(storage, txn_id, deletes, Vec::new()).await? {

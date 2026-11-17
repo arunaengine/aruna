@@ -450,9 +450,7 @@ pub(in crate::document_sync) async fn apply_group_authorization(
         match result {
             Ok(()) => return Ok(()),
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 if !matches!(error, NetError::Storage(StorageError::TransactionConflict)) {
                     return Err(error);
                 }

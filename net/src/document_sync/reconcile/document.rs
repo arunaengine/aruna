@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ::irokle::{Event as _, Storage as _};
 use aruna_core::document::{DocumentEvent, DocumentReconcileResult, DocumentTarget};
-use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE};
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::{
@@ -20,7 +19,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_sync::storage::{
-    replace_batch_in, start_storage_transaction, transaction_read,
+    abort_txn, replace_batch_in, start_storage_transaction, transaction_read,
 };
 use crate::document_sync::{
     DeferredRegistrationOutcome, DocumentSyncDependency, DocumentSyncService, FRAME_LEN_LIMIT,
@@ -399,10 +398,7 @@ impl DocumentSyncService {
             let fenced = match create_fence_txn(&self.storage, &apply.record, txn_id).await {
                 Ok(fenced) => fenced,
                 Err(error) => {
-                    let _ = self
-                        .storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(&self.storage, txn_id).await;
                     return Err(error);
                 }
             };
@@ -415,10 +411,7 @@ impl DocumentSyncService {
                     {
                         Ok(stale) => stale,
                         Err(error) => {
-                            let _ = self
-                                .storage
-                                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                                .await;
+                            let _ = abort_txn(&self.storage, txn_id).await;
                             return Err(error);
                         }
                     };
@@ -439,10 +432,7 @@ impl DocumentSyncService {
                 {
                     Ok(logged) => logged.is_some(),
                     Err(error) => {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(error);
                     }
                 } {
@@ -488,10 +478,7 @@ impl DocumentSyncService {
                     continue;
                 }
                 Err(error) => {
-                    let _ = self
-                        .storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(&self.storage, txn_id).await;
                     return Err(error);
                 }
             };
@@ -509,10 +496,7 @@ impl DocumentSyncService {
                 {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(error);
                     }
                 };
@@ -523,28 +507,19 @@ impl DocumentSyncService {
                 {
                     Ok(event) => event,
                     Err(error) => {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(NetError::Bootstrap(error.to_string()));
                     }
                 };
                 if let Some(event) = &event {
                     if !event.is_create() {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(NetError::Bootstrap(
                             "metadata create acceptance contains a non-create event".to_string(),
                         ));
                     }
                     if let Err(error) = validate_metadata_event(event) {
-                        let _ = self
-                            .storage
-                            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                            .await;
+                        let _ = abort_txn(&self.storage, txn_id).await;
                         return Err(error);
                     }
                     create_acceptances.insert(document_id, event.clone());
@@ -608,7 +583,7 @@ impl DocumentSyncService {
                 deferred_cursor_topics.extend(rejections.iter().map(|reject| reject.topic_id()));
             }
             Err(error) => {
-                self.abort_transaction(txn_id).await;
+                let _ = abort_txn(&self.storage, txn_id).await;
                 return Err(error);
             }
         }
@@ -616,10 +591,7 @@ impl DocumentSyncService {
             (!deferred_cursor_topics.contains(&topic_id)).then_some(write)
         }));
         if let Err(error) = replace_batch_in(&self.storage, txn_id, Vec::new(), writes).await {
-            let _ = self
-                .storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(&self.storage, txn_id).await;
             return Err(error);
         }
         for apply in accepted {

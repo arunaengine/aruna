@@ -118,21 +118,15 @@ pub(in crate::document_sync) async fn store_link(
         .await;
         match result {
             Ok(Some(outcome)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(outcome);
             }
             Ok(None) => return Ok(MetadataPlacementOutcome::Accepted(true)),
             Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
             }
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         }

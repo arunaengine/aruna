@@ -141,9 +141,7 @@ async fn store_head(
         match result {
             Ok(stored) => return Ok(stored),
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 if !matches!(error, NetError::Storage(StorageError::TransactionConflict)) {
                     return Err(error);
                 }

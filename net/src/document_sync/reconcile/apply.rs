@@ -415,27 +415,20 @@ impl DocumentSyncService {
         let mut writes = match self.quarantine_entries(rejections, txn_id).await {
             Ok(Some(entries)) => entries,
             Ok(None) => {
-                self.abort_transaction(txn_id).await;
+                let _ = abort_txn(&self.storage, txn_id).await;
                 return Ok(false);
             }
             Err(error) => {
-                self.abort_transaction(txn_id).await;
+                let _ = abort_txn(&self.storage, txn_id).await;
                 return Err(error);
             }
         };
         writes.push(cursor_write);
         if let Err(error) = replace_batch_in(&self.storage, txn_id, Vec::new(), writes).await {
-            self.abort_transaction(txn_id).await;
+            let _ = abort_txn(&self.storage, txn_id).await;
             return Err(error);
         }
         Ok(true)
-    }
-
-    pub(in crate::document_sync) async fn abort_transaction(&self, txn_id: TxnId) {
-        let _ = self
-            .storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
     }
 }
 
@@ -475,22 +468,16 @@ pub(in crate::document_sync) async fn store_watch_change(
             {
                 Ok(current) => current,
                 Err(error) => {
-                    let _ = storage
-                        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                        .await;
+                    let _ = abort_txn(storage, txn_id).await;
                     return Err(NetError::Bootstrap(error.to_string()));
                 }
             },
             Event::Storage(StorageEvent::Error { error }) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error.into());
             }
             other => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(NetError::Dht(format!(
                     "unexpected revision read while applying watch subscription: {other:?}"
                 )));
@@ -506,18 +493,14 @@ pub(in crate::document_sync) async fn store_watch_change(
             | (Some(DocumentChangeKind::Delete), _) => false,
         };
         if !apply {
-            let _ = storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
+            let _ = abort_txn(storage, txn_id).await;
             return Ok(false);
         }
 
         let revision_entry = match sync_revision_entry(&target, &change) {
             Ok(entry) => entry,
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(NetError::Bootstrap(error.to_string()));
             }
         };
