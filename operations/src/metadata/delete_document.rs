@@ -30,7 +30,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive_retry};
 use crate::metadata::persistent_id::{
     MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
 };
@@ -166,7 +165,7 @@ impl DeleteDocumentOperation {
         self
     }
 
-    fn fresh_copy(&self) -> Self {
+    pub(crate) fn fresh_copy(&self) -> Self {
         Self::new(self.actor.clone(), self.group_id, self.document_id)
             .with_phase_source(self.phase_source)
     }
@@ -981,18 +980,6 @@ fn delete_updated_index(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -
         key,
         txn_id,
     })
-}
-
-pub async fn delete_metadata_document(
-    operation: DeleteDocumentOperation,
-    context: &DriverContext,
-    document_id: Ulid,
-) -> Result<(), DeleteDocumentError> {
-    drive_retry(|| operation.fresh_copy(), context, &document_id.to_bytes()).await?;
-    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
-        metadata_handle.remove_cached_record(document_id);
-    }
-    Ok(())
 }
 
 impl Operation for DeleteDocumentOperation {

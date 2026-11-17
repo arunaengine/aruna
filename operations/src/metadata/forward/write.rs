@@ -7,7 +7,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
 use crate::device::edit::accepts_edits;
 use crate::device::edit::apply_local_edit;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive_retry};
 use crate::metadata::api::GetVisibleRequest;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::ensure_record_readable;
@@ -22,8 +22,7 @@ use crate::metadata::create_document::mint_forward_document;
 use crate::metadata::create_document::mint_local_document;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::create_entry::create_metadata_document;
-use crate::metadata::delete_document::DeleteDocumentOperation;
-use crate::metadata::delete_document::delete_metadata_document;
+use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::profile::validation::current_validation_status;
 use crate::metadata::profile::validation::revalidate_current;
 use crate::metadata::protocol::AuthToken;
@@ -1023,4 +1022,17 @@ pub(crate) async fn apply_forwarded_write(
             crate::metadata::handle::transport_message_kind(&other)
         )),
     }
+}
+
+/// Deletes a document held here, retrying lost conflicts, and drops it from the registry cache.
+async fn delete_metadata_document(
+    operation: DeleteDocumentOperation,
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<(), DeleteDocumentError> {
+    drive_retry(|| operation.fresh_copy(), context, &document_id.to_bytes()).await?;
+    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
+        metadata_handle.remove_cached_record(document_id);
+    }
+    Ok(())
 }
