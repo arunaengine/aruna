@@ -458,7 +458,7 @@ impl ServerState {
             .ok()
     }
 
-    pub(crate) fn try_acquire_download(&self) -> Option<OwnedSemaphorePermit> {
+    pub(crate) fn try_acquire_download(&self) -> Option<aruna_core::download_slots::SlotPermit> {
         self.limits.download_slots.try_acquire()
     }
 
