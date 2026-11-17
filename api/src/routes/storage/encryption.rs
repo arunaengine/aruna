@@ -30,9 +30,8 @@ use aruna_operations::s3::bucket::encryption::{
     EnableEncryptionOperation, EnableError, EnableInput,
 };
 use aruna_operations::s3::bucket::holders::LookupKeysOperation;
-use aruna_operations::s3::bucket::key_install::{
-    InstallInput, InstallKeyOperation, install_and_wake,
-};
+use aruna_operations::s3::bucket::key::wake::activate_and_wake;
+use aruna_operations::s3::bucket::key_install::{InstallInput, InstallKeyOperation};
 use aruna_operations::s3::bucket::key_rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
@@ -937,7 +936,7 @@ pub(crate) async fn change_bucket(
         let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), now_ms());
         let origin = (state.get_realm_id(), node_id);
         if let Err(error) =
-            install_and_wake(&context, install, origin, state.rocrate_limits()).await
+            activate_and_wake(&context, install, origin, state.rocrate_limits()).await
         {
             tracing::warn!(%bucket, ?error, "new bucket key stays locked");
         }
@@ -1016,7 +1015,7 @@ pub(crate) async fn enable_bucket(
     };
     // The bucket is encrypted either way; a failed install only leaves it locked.
     let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), now_ms());
-    if let Err(error) = install_and_wake(context, install, (realm_id, node_id), limits).await {
+    if let Err(error) = activate_and_wake(context, install, (realm_id, node_id), limits).await {
         tracing::warn!(%bucket, ?error, "new bucket key stays locked");
     }
     Ok(())

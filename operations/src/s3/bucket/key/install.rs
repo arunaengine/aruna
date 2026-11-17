@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
-use crate::jobs::key_wake::wake_unlocked;
 use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, retry_effect, retry_timer};
 use crate::s3::bucket::key::lock::{answers_timer, lock_timer};
 use aruna_core::compute::SharedSecret;
@@ -13,8 +11,6 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::RoCrateLimits;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, UnlockStatus, deadline_after,
 };
@@ -386,30 +382,13 @@ impl Operation for InstallKeyOperation {
     }
 }
 
-/// Installs a key, then resumes its waiting work; a failed resume is reported.
-pub async fn install_and_wake(
-    context: &DriverContext,
-    operation: InstallKeyOperation,
-    origin: (RealmId, NodeId),
-    limits: &RoCrateLimits,
-) -> Result<UnlockStatus, InstallError> {
-    let status = drive(operation, context).await?;
-    let now_ms = aruna_core::time::unix_timestamp_millis();
-    if let Err(error) = wake_unlocked(context, status.key, now_ms, origin, limits).await {
-        tracing::warn!(
-            bucket_id = %status.key.bucket_id,
-            generation = status.key.generation,
-            error = %error,
-            "Failed to resume work waiting for an installed key"
-        );
-    }
-    Ok(status)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3::bucket::key::wake::activate_and_wake;
     use aruna_core::compute::SecretBytes;
+    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{BucketKeyError, public_key_of};
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -827,7 +806,7 @@ mod tests {
             duration: None,
             max: None,
         });
-        let status = install_and_wake(&context, install, (realm, node), &RoCrateLimits::default())
+        let status = activate_and_wake(&context, install, (realm, node), &RoCrateLimits::default())
             .await
             .unwrap();
         assert!(status.active && status.remaining.is_none());
@@ -884,7 +863,7 @@ mod tests {
     async fn unlock_resumes_rewrite() {
         use crate::blob::migration::queue::{RECHECK, process_transitions};
         use crate::jobs::key_wake::read_row;
-        use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput, unlock_and_wake};
+        use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
         use crate::tests::incoming::{RecordingTaskHandler, freeze_clock};
         use aruna_core::handle::Handle;
         use aruna_core::keyspaces::{
@@ -1012,7 +991,7 @@ mod tests {
             now_ms: crate::driver::now_ms(),
         };
         let unlock = UnlockBucketOperation::new(input, enabled.private_key);
-        let status = unlock_and_wake(&context, unlock, (realm, node), &RoCrateLimits::default())
+        let status = activate_and_wake(&context, unlock, (realm, node), &RoCrateLimits::default())
             .await
             .unwrap();
         assert!(
