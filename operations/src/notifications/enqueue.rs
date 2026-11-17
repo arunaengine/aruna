@@ -18,8 +18,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::service::mint_configured_job;
-use crate::jobs::submit::{SubmitJobError, SubmitJobOperation, SubmitJobSpec};
+use crate::jobs::submit::{
+    SubmitJobError, SubmitJobOperation, SubmitJobSpec, mint_configured_job,
+};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnqueueError {

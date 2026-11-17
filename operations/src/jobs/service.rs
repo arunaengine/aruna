@@ -47,7 +47,8 @@ use super::store::{
     read_key_waits, set_cancel_requested,
 };
 use super::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
+    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
+    mint_job_id,
     schedule_drain_effect,
 };
 use super::workflow::finalize::finalize_followups;
@@ -93,36 +94,6 @@ pub(crate) async fn mint_local_job(
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
     mint_configured_job(&config, owner_node_id, subject)
-}
-
-/// Synchronous form used by producer transactions that already fenced and read
-/// the realm config. The resulting job id and dedup shard can therefore be
-/// written atomically with the producer's own records.
-pub(crate) fn mint_configured_job(
-    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    owner_node_id: NodeId,
-    subject: &[u8],
-) -> Result<JobId, SubmitJobError> {
-    let handle = config.job_control_handle(&owner_node_id).ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable(
-            "serving node has no job-control binding yet".to_string(),
-        )
-    })?;
-    let tuple = config
-        .binding_directory()
-        .resolve(handle)
-        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-    let strategy = config.strategy(&tuple.strategy_id).ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable("job-control strategy unavailable".to_string())
-    })?;
-    let shard = shard_for_subject(subject, strategy.shard_count);
-    let bucket = u16::try_from(shard)
-        .ok()
-        .and_then(|shard| BucketId::new(shard).ok())
-        .ok_or_else(|| {
-            SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
-        })?;
-    Ok(mint_job_id(handle, bucket)?)
 }
 
 /// The accepting node is the immutable owner: creation, listing, dedup,
