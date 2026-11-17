@@ -20,6 +20,7 @@ pub mod list_groups;
 pub mod list_requests;
 pub mod remove_member;
 pub mod remove_role;
+pub mod routing;
 pub mod search_groups;
 pub mod set_policies;
 pub mod storage_routing;
