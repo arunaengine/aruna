@@ -13,7 +13,7 @@ pub mod encryption;
 pub(crate) mod forward;
 pub mod get;
 pub mod holders;
-pub mod job_pages;
+pub(crate) mod job_pages;
 pub(crate) mod job_progress;
 pub mod key;
 pub mod linked;
