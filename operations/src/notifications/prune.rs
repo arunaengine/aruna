@@ -4,13 +4,14 @@
 
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::execution::notification::{
     DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
     notification_inbox_key, notification_prune_key, parse_prune_key,
@@ -20,6 +21,8 @@ use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
+
+use crate::notifications::unexpected;
 
 pub(crate) const PRUNE_PAGE_SIZE: usize = 512;
 pub(crate) const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
@@ -552,32 +555,28 @@ pub struct RestorePruneOperation {
 #[derive(Debug, Default, PartialEq)]
 enum RestoreState {
     #[default]
-    Init,
     Scan,
     Delete,
     Arm,
-    Done,
-    Failed(PruneError),
 }
 
 impl RestorePruneOperation {
     pub fn new(now_ms: u64) -> Self {
         Self {
             now_ms,
-            state: RestoreState::Init,
+            state: RestoreState::Scan,
         }
     }
 
-    fn arm(&mut self, after: Duration) -> Effects {
+    fn arm(&mut self, after: Duration) -> Result<Next<()>, IoError> {
         self.state = RestoreState::Arm;
-        smallvec![Effect::Task(TaskEffect::ShortenTimer {
-            key: TaskKey::PruneNotifications,
-            after,
-        })]
+        let key = TaskKey::PruneNotifications;
+        let arm = TaskEffect::ShortenTimer { key, after };
+        Ok(Next::Call(IoCall::Effect(Effect::Task(arm))))
     }
 
-    fn scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
-        let Some((key, _)) = values.into_iter().next() else {
+    fn scanned(&mut self, rows: Vec<(Key, Value)>) -> Result<Next<()>, IoError> {
+        let Some((key, _)) = rows.into_iter().next() else {
             return self.arm(NOTIFICATION_POLL_AFTER);
         };
         match parse_prune_key(key.as_ref()) {
@@ -588,69 +587,35 @@ impl RestorePruneOperation {
             Err(error) => {
                 warn!(%error, key = ?key.as_ref(), "Deleting malformed notification prune index row during restore");
                 self.state = RestoreState::Delete;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)],
-                    txn_id: None,
-                })]
+                let deletes = vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)];
+                Ok(Next::Call(IoCall::Delete(deletes)))
             }
         }
     }
 }
 
-impl EffectOperation for RestorePruneOperation {
+impl Operation for RestorePruneOperation {
     type Output = ();
-    type Error = PruneError;
+    type Error = IoError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RestoreState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: PRUNE_INDEX_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::Page {
+            space: PRUNE_INDEX_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
             limit: 1,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::take(&mut self.state), event) {
-            (RestoreState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.scanned(values)
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        match (&self.state, result) {
+            (RestoreState::Scan, IoResult::Page { rows, .. }) => self.scanned(rows),
+            (RestoreState::Delete, IoResult::Done) => self.arm(Duration::ZERO),
+            (RestoreState::Arm, IoResult::Event(Event::Task(TaskEvent::TimerScheduled { .. }))) => {
+                Ok(Next::Done(()))
             }
-            (RestoreState::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.arm(Duration::ZERO)
-            }
-            (RestoreState::Arm, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                self.state = RestoreState::Done;
-                smallvec![]
-            }
-            (_, event) => {
-                self.state = RestoreState::Failed(match event {
-                    Event::Storage(StorageEvent::Error { error }) => PruneError::Storage(error),
-                    other => PruneError::UnexpectedEvent {
-                        state: "restore",
-                        got: format!("{other:?}"),
-                    },
-                });
-                smallvec![]
-            }
+            (_, other) => Err(unexpected("a prune index page, delete or timer", &other)),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RestoreState::Done | RestoreState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            RestoreState::Done => Ok(()),
-            RestoreState::Failed(error) => Err(error),
-            _ => Err(PruneError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -1423,7 +1388,6 @@ mod state_machine_tests {
         let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
         operation.start();
         rejects_finalize(operation);
-        rejects_finalize(RestorePruneOperation::new(NOW_MS));
     }
 
     #[test]
@@ -1431,50 +1395,41 @@ mod state_machine_tests {
         let mut operation = RestorePruneOperation::new(NOW_MS);
         let malformed = (Key::from(vec![1, 2]), Value::from(Vec::new()));
         let arm = |after| {
-            Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::PruneNotifications,
-                after,
-            })
+            Ok(Next::Call(IoCall::Effect(Effect::Task(
+                TaskEffect::ShortenTimer {
+                    key: TaskKey::PruneNotifications,
+                    after,
+                },
+            ))))
         };
-        check_trace(
-            &mut operation,
-            &[iter(PRUNE_INDEX_KEYSPACE, None, 1)],
-            vec![
-                (
-                    page(vec![malformed.clone()], None),
-                    vec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: vec![space(PRUNE_INDEX_KEYSPACE, malformed.0)],
-                        txn_id: None,
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::BatchDeleteResult {
-                        entries: Vec::new(),
-                    }),
-                    vec![arm(Duration::ZERO)],
-                ),
-                (
-                    Event::Task(TaskEvent::TimerScheduled {
-                        key: TaskKey::PruneNotifications,
-                        after: Duration::ZERO,
-                    }),
-                    vec![],
-                ),
-            ],
+        let rows = |rows| IoResult::Page { rows, next: None };
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { limit: 1, .. }))
+        ));
+        assert_eq!(
+            operation.next(rows(vec![malformed.clone()])),
+            Ok(Next::Call(IoCall::Delete(vec![space(
+                PRUNE_INDEX_KEYSPACE,
+                malformed.0
+            )])))
         );
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(operation.next(IoResult::Done), arm(Duration::ZERO));
+        let scheduled = Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::PruneNotifications,
+            after: Duration::ZERO,
+        });
+        assert_eq!(
+            operation.next(IoResult::Event(scheduled)),
+            Ok(Next::Done(()))
+        );
 
         let mut empty = RestorePruneOperation::new(NOW_MS);
-        empty.start();
-        assert_eq!(
-            empty.step(page(Vec::new(), None)).as_slice(),
-            [arm(NOTIFICATION_POLL_AFTER)]
-        );
-        let failed = empty.step(Event::Task(TaskEvent::Error {
+        assert_eq!(empty.next(rows(Vec::new())), arm(NOTIFICATION_POLL_AFTER));
+        let failed = Event::Task(TaskEvent::Error {
             key: None,
             message: "closed".to_string(),
-        }));
-        assert!(failed.is_empty());
-        assert!(empty.finalize().is_err());
+        });
+        assert!(empty.next(IoResult::Event(failed)).is_err());
     }
 }
