@@ -224,7 +224,7 @@ async fn set_name(
         coordinates,
     };
     let config = NodeNameConfig {
-        actor: actor(&state, &auth),
+        actor: actor(state, &auth),
         auth_context: auth,
         node_id,
         change,

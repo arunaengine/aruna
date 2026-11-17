@@ -160,7 +160,7 @@ async fn change_provider(
     .await?;
     let stored = drive(
         SetProviderOperation::new(SetProviderConfig {
-            actor: actor(&state, &auth),
+            actor: actor(state, &auth),
             auth_context: auth,
             change,
         }),

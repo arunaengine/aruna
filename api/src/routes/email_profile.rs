@@ -295,7 +295,7 @@ async fn change_profile(
     };
     let stored = drive(
         SetEmailOperation::new(SetEmailConfig {
-            actor: actor(&state, &auth),
+            actor: actor(state, &auth),
             auth_context: auth,
             vault_key: RealmVaultKey::derive(realm_signing_key),
             profile,

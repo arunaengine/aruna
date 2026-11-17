@@ -250,7 +250,7 @@ async fn remove_dataset(
 ) -> ServerResult<()> {
     let extras = PolicyRequestExtras::rest();
     let record = local_write_record(state, auth, dataset, extras).await?;
-    let actor = actor(&state, &auth);
+    let actor = actor(state, auth);
     let token = forwarded_auth_token(bearer)?;
     let ctx = state.get_ctx();
     route_metadata_delete(&ctx, actor, record.as_ref(), dataset, token)

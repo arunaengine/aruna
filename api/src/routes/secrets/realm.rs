@@ -77,7 +77,7 @@ async fn change(
         return Err(ServerError::Forbidden);
     };
     let input = RealmChange {
-        actor: actor(&state, &auth),
+        actor: actor(state, auth),
         vault_key: RealmVaultKey::derive(realm_signing_key),
         change,
         now_ms: unix_timestamp_millis(),
