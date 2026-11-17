@@ -8,7 +8,6 @@ use aruna_core::operation::Operation;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 
-
 /// A storage failure, with the event that was not expected.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("plugin run storage failed: {0}")]
@@ -350,7 +349,10 @@ impl Plan for ReadRows {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        let read = self.0.take().ok_or_else(|| StoreError("read twice".into()))?;
+        let read = self
+            .0
+            .take()
+            .ok_or_else(|| StoreError("read twice".into()))?;
         Ok(Turn::Ask(read))
     }
 
@@ -409,7 +411,10 @@ impl Plan for PageRows {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        let page = self.0.take().ok_or_else(|| StoreError("paged twice".into()))?;
+        let page = self
+            .0
+            .take()
+            .ok_or_else(|| StoreError("paged twice".into()))?;
         Ok(Turn::Ask(page))
     }
 
@@ -477,7 +482,10 @@ impl Plan for Change {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<()>, StoreError> {
-        let ask = self.0.take().ok_or_else(|| StoreError("no change".into()))?;
+        let ask = self
+            .0
+            .take()
+            .ok_or_else(|| StoreError("no change".into()))?;
         Ok(Turn::Ask(ask))
     }
 
@@ -523,7 +531,9 @@ fn empty_answer(ask: &Ask) -> Option<Answer> {
 
 fn answer(wait: Wait, event: StorageEvent) -> Result<Answer, StoreError> {
     match (wait, event) {
-        (Wait::Values(count), StorageEvent::BatchReadResult { values }) if values.len() == count => {
+        (Wait::Values(count), StorageEvent::BatchReadResult { values })
+            if values.len() == count =>
+        {
             Ok(Answer::Values(
                 (values.into_iter())
                     .map(|(_, value)| value.map(|value| value.to_vec()))

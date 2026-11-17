@@ -8,7 +8,10 @@ use aruna_plugins::broker::Intent;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, row, unexpected, values, Rows, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, encode, row,
+    unexpected, values,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentState {
@@ -86,7 +89,9 @@ impl Plan for BeginIntent {
             };
         }
         let [found] = values::<1>(answer)?;
-        let found = found.map(|bytes| decode::<IntentRecord>(&bytes)).transpose()?;
+        let found = found
+            .map(|bytes| decode::<IntentRecord>(&bytes))
+            .transpose()?;
         let (begun, state) = match found {
             None => (Begun::Fresh, IntentState::Pending),
             Some(record) if record.digest != self.intent.digest => {
@@ -248,7 +253,9 @@ pub fn undone_keys(rows: Rows) -> Result<Vec<(&'static str, Vec<u8>)>, StoreErro
 
 /// The keys of every intent among a run's `rows`.
 pub fn intent_keys(rows: Rows) -> Vec<(&'static str, Vec<u8>)> {
-    let keys = rows.into_iter().map(|(key, _)| (PLUGIN_INTENTS_KEYSPACE, key));
+    let keys = rows
+        .into_iter()
+        .map(|(key, _)| (PLUGIN_INTENTS_KEYSPACE, key));
     keys.collect()
 }
 
@@ -286,7 +293,10 @@ mod tests {
         assert!(matches!(begun(&third).await, Ok(Begun::Unknown(_))));
 
         let rows = vec![(b"k".to_vec(), Vec::new())];
-        assert_eq!(intent_keys(rows), [(PLUGIN_INTENTS_KEYSPACE, b"k".to_vec())]);
+        assert_eq!(
+            intent_keys(rows),
+            [(PLUGIN_INTENTS_KEYSPACE, b"k".to_vec())]
+        );
         let all = drive(scan_rows(intent_scan(run)), &ctx);
         let keys = intent_keys(all.await.unwrap());
         assert_eq!(keys.len(), 3);
@@ -322,9 +332,14 @@ mod tests {
         assert_eq!(changed, Turn::Finish(Begun::Changed));
         let again = plan.next(record(intent.digest, settled)).unwrap();
         assert_eq!(again, Turn::Finish(Begun::Settled("r".into())));
-        let earlier = plan.next(record(intent.digest, IntentState::Pending)).unwrap();
+        let earlier = plan
+            .next(record(intent.digest, IntentState::Pending))
+            .unwrap();
         assert!(matches!(earlier, Turn::Ask(Ask::Write(_))));
-        assert!(matches!(plan.next(Answer::Done), Ok(Turn::Finish(Begun::Unknown(_)))));
+        assert!(matches!(
+            plan.next(Answer::Done),
+            Ok(Turn::Finish(Begun::Unknown(_)))
+        ));
         assert!(plan.next(Answer::Page(Vec::new(), None)).is_err());
     }
 
@@ -337,7 +352,12 @@ mod tests {
         };
         let rows = vec![
             row(0, IntentState::Pending),
-            row(1, IntentState::Settled { reply: String::new() }),
+            row(
+                1,
+                IntentState::Settled {
+                    reply: String::new(),
+                },
+            ),
             row(2, IntentState::Resolved { done: false }),
         ];
         let reason = first_open(&rows).unwrap().unwrap();

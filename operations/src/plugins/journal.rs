@@ -9,7 +9,7 @@ use aruna_core::plugin_runs::{
 };
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, Turn, done, unexpected, StoreError};
+use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, StoreError, Turn, done, unexpected};
 
 /// Rows a journal page holds at most.
 pub const JOURNAL_PAGE: usize = 500;
@@ -36,7 +36,10 @@ impl Plan for JournalPage {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        let page = self.0.take().ok_or_else(|| StoreError("paged twice".into()))?;
+        let page = self
+            .0
+            .take()
+            .ok_or_else(|| StoreError("paged twice".into()))?;
         Ok(Turn::Ask(page))
     }
 
@@ -190,7 +193,9 @@ mod tests {
         }
         let now = 15 + JOURNAL_RETENTION_MS;
         assert_eq!(drive(prune_journal(now), &ctx).await.unwrap(), 1);
-        let (kept, _) = drive(journal_page(JOURNAL_ROW, None, 10), &ctx).await.unwrap();
+        let (kept, _) = drive(journal_page(JOURNAL_ROW, None, 10), &ctx)
+            .await
+            .unwrap();
         let times: Vec<u64> = kept.iter().map(|(_, row)| row.journaled_ms).collect();
         assert_eq!(times, [20, 10 + JOURNAL_RETENTION_MS]);
         // Pending rows are the matcher's; retention pruning leaves them.

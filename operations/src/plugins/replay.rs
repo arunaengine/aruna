@@ -22,7 +22,10 @@ use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
 use super::lifecycle::held_covers;
 use super::lifecycle::targets;
 use super::matcher::{Counting, Outbox, Target};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row as row_of, unexpected, values, write_rows, Rows, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode,
+    row as row_of, unexpected, values, write_rows,
+};
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
 
@@ -117,7 +120,11 @@ pub async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
                 .as_ref()
                 .is_some_and(|row| row.revision != next.revision)
             {
-                let coverage = row_of(PLUGIN_REPLAYS_KEYSPACE, row_key(COVERAGE_ROW, id), encode(&next)?);
+                let coverage = row_of(
+                    PLUGIN_REPLAYS_KEYSPACE,
+                    row_key(COVERAGE_ROW, id),
+                    encode(&next)?,
+                );
                 drive(write_rows(vec![coverage]), ctx).await?;
             }
             continue;
@@ -208,7 +215,8 @@ impl StartReplay {
         }
         if start.is_none() {
             let node = by.map_or_else(|| "unknown".to_string(), |node| node.to_string());
-            let note = format!("the clock of node {node} was not readable; replayed every kept event");
+            let note =
+                format!("the clock of node {node} was not readable; replayed every kept event");
             next.note = Some(note);
         }
         let task = ReplayRow {
@@ -378,7 +386,10 @@ impl Plan for ReplayPage {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_REPLAYS_KEYSPACE, self.key.clone())])))
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_REPLAYS_KEYSPACE,
+            self.key.clone(),
+        )])))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
@@ -430,7 +441,10 @@ impl Plan for ReplayPage {
                     return Ok(Turn::Finish(outcome));
                 }
                 self.phase = PagePhase::Deleting(outcome);
-                Ok(Turn::Ask(Ask::Delete(vec![(PLUGIN_REPLAYS_KEYSPACE, self.key.clone())])))
+                Ok(Turn::Ask(Ask::Delete(vec![(
+                    PLUGIN_REPLAYS_KEYSPACE,
+                    self.key.clone(),
+                )])))
             }
             PagePhase::Deleting(outcome) => {
                 done(answer)?;

@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 use super::ArtifactBytes;
 use super::artifacts::ArtifactError;
-use super::rows::{self, Row, Scan, read_rows, row, sync_all, writes, StoreError};
+use super::rows::{self, Row, Scan, StoreError, read_rows, row, sync_all, writes};
 use crate::driver::{DriverContext, drive};
 
 /// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.
@@ -438,8 +438,13 @@ async fn apply(
     rows: Vec<(Vec<u8>, Vec<u8>)>,
     keys: Vec<Vec<u8>>,
 ) -> Result<(), ArtifactError> {
-    let deletes = keys.into_iter().map(|key| (PLUGIN_ARTIFACT_KEYSPACE, key)).collect();
-    drive(writes(artifact_rows(rows), deletes), ctx).await.map_err(stored)
+    let deletes = keys
+        .into_iter()
+        .map(|key| (PLUGIN_ARTIFACT_KEYSPACE, key))
+        .collect();
+    drive(writes(artifact_rows(rows), deletes), ctx)
+        .await
+        .map_err(stored)
 }
 
 /// The rows below `prefix`, keyed by digest, that decode; others are left for a later sweep.
@@ -467,17 +472,23 @@ async fn write_rows(
     ctx: &DriverContext,
     rows: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<(), ArtifactError> {
-    drive(rows::write_rows(artifact_rows(rows)), ctx).await.map_err(stored)
+    drive(rows::write_rows(artifact_rows(rows)), ctx)
+        .await
+        .map_err(stored)
 }
 
 async fn delete_rows(ctx: &DriverContext, keys: Vec<Vec<u8>>) -> Result<(), ArtifactError> {
-    let keys = keys.into_iter().map(|key| (PLUGIN_ARTIFACT_KEYSPACE, key)).collect();
+    let keys = keys
+        .into_iter()
+        .map(|key| (PLUGIN_ARTIFACT_KEYSPACE, key))
+        .collect();
     drive(rows::delete_rows(keys), ctx).await.map_err(stored)
 }
 
 fn artifact_rows(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<Row> {
     let rows = rows.into_iter();
-    rows.map(|(key, value)| row(PLUGIN_ARTIFACT_KEYSPACE, key, value)).collect()
+    rows.map(|(key, value)| row(PLUGIN_ARTIFACT_KEYSPACE, key, value))
+        .collect()
 }
 
 fn stored(error: StoreError) -> ArtifactError {

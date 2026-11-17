@@ -10,7 +10,9 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 use super::decide::{GapCount, Verdict, WaitingRow, judge, seen_row};
 use super::forward::Outcome;
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, scan_rows, StoreError, decode};
+use super::rows::{
+    Answer, Ask, Plan, Row, RowsOperation, Scan, StoreError, Turn, decode, done, scan_rows,
+};
 use super::runs::{ADMISSIONS, Admission, RunError};
 use crate::driver::{DriverContext, drive};
 
@@ -22,7 +24,11 @@ pub async fn recheck_waiting(
     now_ms: u64,
 ) -> Result<usize, StoreError> {
     let _admitting = ADMISSIONS.lock().await;
-    let rows = drive(scan_rows(Scan::new(PLUGIN_WAITING_KEYSPACE, Vec::new())), ctx).await?;
+    let rows = drive(
+        scan_rows(Scan::new(PLUGIN_WAITING_KEYSPACE, Vec::new())),
+        ctx,
+    )
+    .await?;
     let mut left = 0;
     for (key, value) in rows {
         let waiting: WaitingRow = decode(&value)?;

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, Turn, done, Rows, StoreError, decode};
+use super::rows::{Answer, Ask, Plan, Rows, RowsOperation, Scan, StoreError, Turn, decode, done};
 
 /// How a row's install stands in the realm config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +143,10 @@ impl SweepEvents {
             Table::Creates => {
                 let keys = (rows.into_iter())
                     .filter(|(key, _)| self.standing(install_at(key, 0)) != Standing::Kept);
-                vec![keys.map(|(key, _)| (PLUGIN_CREATES_KEYSPACE, key)).collect()]
+                vec![
+                    keys.map(|(key, _)| (PLUGIN_CREATES_KEYSPACE, key))
+                        .collect(),
+                ]
             }
         }
     }

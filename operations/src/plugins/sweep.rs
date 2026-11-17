@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::account::read_row;
-use super::rows::{Answer, Ask, Plan, RowsOperation, Turn, unexpected, StoreError};
+use super::rows::{Answer, Ask, Plan, RowsOperation, StoreError, Turn, unexpected};
 use crate::driver::{DriverContext, drive};
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
 
@@ -39,7 +39,9 @@ pub async fn sweep_orphans(
     config: &RealmConfigDocument,
     now_ms: u64,
 ) -> Result<usize, String> {
-    let accounts = drive(plugin_accounts(), ctx).await.map_err(|error| error.0)?;
+    let accounts = drive(plugin_accounts(), ctx)
+        .await
+        .map_err(|error| error.0)?;
     let mut due = Vec::new();
     {
         let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

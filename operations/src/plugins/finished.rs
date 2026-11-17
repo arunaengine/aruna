@@ -14,7 +14,9 @@ use ulid::Ulid;
 
 use super::dispatch::event_run;
 use super::intents::{intent_scan, undone_keys};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, scan_rows, values, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, decode, done, encode, row, scan_rows, values,
+};
 use super::runs::{ADMISSIONS, Admission, RunError, audit_rows, read_run};
 use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_scan, work_state};
 use crate::driver::{DriverContext, drive};
@@ -194,7 +196,10 @@ impl Plan for RetryRun {
     type Error = RunError;
 
     fn first(&mut self) -> Result<Turn<PluginRun>, RunError> {
-        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_RUNS_KEYSPACE, self.key.clone())])))
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_RUNS_KEYSPACE,
+            self.key.clone(),
+        )])))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<PluginRun>, RunError> {
@@ -295,7 +300,6 @@ impl Plan for DropCompletion {
     }
 }
 
-
 /// The event a `job_finished` run gets: the job's id, the object path it wrote or read, and
 /// how it ended.
 fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> SourceEvent {
@@ -316,7 +320,6 @@ fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> Source
         actor: None,
     }
 }
-
 
 #[cfg(test)]
 #[path = "finished_tests.rs"]

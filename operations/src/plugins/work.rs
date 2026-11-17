@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::marks::{Mark, mark_row};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, unexpected, values, Rows, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode, row,
+    unexpected, values,
+};
 
 /// The row of a work under its key.
 fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {
@@ -356,7 +359,9 @@ impl WorkLookup {
             return Ok(Found::Ask(Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, value)])));
         };
         let row: WorkRow = decode(&value)?;
-        Ok(Found::Row((row.work_id == self.work_id).then_some((key, row))))
+        Ok(Found::Row(
+            (row.work_id == self.work_id).then_some((key, row)),
+        ))
     }
 }
 
@@ -522,7 +527,10 @@ impl Plan for UpdateWork {
             Found::Row(None) => return Ok(Turn::Finish(None)),
             Found::Row(Some(found)) => found,
         };
-        let change = self.change.take().ok_or_else(|| StoreError("changed twice".into()))?;
+        let change = self
+            .change
+            .take()
+            .ok_or_else(|| StoreError("changed twice".into()))?;
         change.apply(&mut row);
         let write = vec![row_of(key, &row)?];
         self.written = Some(Box::new(row));
@@ -768,7 +776,10 @@ impl Plan for ListWork {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        let page = self.page.take().ok_or_else(|| StoreError("listed twice".into()))?;
+        let page = self
+            .page
+            .take()
+            .ok_or_else(|| StoreError("listed twice".into()))?;
         Ok(Turn::Ask(page))
     }
 

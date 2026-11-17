@@ -10,7 +10,10 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, AuditIndex, a
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, unexpected, values, StoreError, decode};
+use super::rows::{
+    Answer, Ask, Plan, Row, RowsOperation, Scan, StoreError, Turn, decode, done, row, unexpected,
+    values,
+};
 
 /// How long a node keeps the audit rows of the secret uses it served, like finished runs.
 pub const USE_AUDIT_RETENTION: u64 = 30 * 24 * 3600 * 1000;
@@ -87,7 +90,8 @@ impl Plan for PruneUses {
                     }
                     checked = Some(key);
                 }
-                let cursor = checked.map(|key| row(PLUGIN_HOOKS_KEYSPACE, AUDIT_CURSOR.to_vec(), key));
+                let cursor =
+                    checked.map(|key| row(PLUGIN_HOOKS_KEYSPACE, AUDIT_CURSOR.to_vec(), key));
                 let outcome = (count, !young && next.is_some());
                 self.phase = UsesPhase::Deleting(cursor.into_iter().collect(), outcome);
                 Ok(Turn::Ask(Ask::Delete(dropped)))
@@ -184,7 +188,8 @@ impl Plan for PruneHooks {
                     .collect();
                 let more = old.len() == total && next.is_some();
                 self.pruned += old.len();
-                let ids = (old.iter()).filter_map(|key| Some([&[HOOK_ROW][..], key.get(9..)?].concat()));
+                let ids =
+                    (old.iter()).filter_map(|key| Some([&[HOOK_ROW][..], key.get(9..)?].concat()));
                 let mut keys: Vec<_> = ids.map(|key| (PLUGIN_HOOKS_KEYSPACE, key)).collect();
                 keys.extend(old.into_iter().map(|key| (PLUGIN_HOOKS_KEYSPACE, key)));
                 self.phase = HooksPhase::DeletingOld(more);

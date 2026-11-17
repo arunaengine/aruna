@@ -13,7 +13,10 @@ use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use super::intents::{first_open, intent_keys, intent_scan, resolved_rows};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, Writes, done, row, unexpected, values, writes, Rows, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, Writes, decode, done,
+    encode, row, unexpected, values, writes,
+};
 use super::work::{WorkRow, work_scan};
 
 /// Serializes admissions on this node, so no install passes its queue bound.
@@ -66,8 +69,16 @@ impl Admission {
         }
         let (install_id, run_id) = (self.run.install_id, self.run.run_id);
         Ok(Some(vec![
-            row(PLUGIN_QUEUE_KEYSPACE, queue_key(install_id, run_id), Vec::new()),
-            row(PLUGIN_RUNS_KEYSPACE, run_key(install_id, run_id), encode(&*self.run)?),
+            row(
+                PLUGIN_QUEUE_KEYSPACE,
+                queue_key(install_id, run_id),
+                Vec::new(),
+            ),
+            row(
+                PLUGIN_RUNS_KEYSPACE,
+                run_key(install_id, run_id),
+                encode(&*self.run)?,
+            ),
         ]))
     }
 }
@@ -452,7 +463,9 @@ pub fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
 
 /// The rows of an admin audit record.
 pub fn audit_rows(audit: &AdminAuditRecord) -> Result<Vec<Row>, StoreError> {
-    audit.entries().map_err(|error| StoreError(error.to_string()))
+    audit
+        .entries()
+        .map_err(|error| StoreError(error.to_string()))
 }
 
 #[cfg(test)]

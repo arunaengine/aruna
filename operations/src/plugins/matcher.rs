@@ -5,19 +5,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use aruna_core::UserId;
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_runs::{
-    ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW,
-    SourceEvent, SourceKind, gap_key, outbox_key, source_key,
+    ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
+    SourceKind, gap_key, outbox_key, source_key,
 };
 use aruna_core::types::GroupId;
-use aruna_core::UserId;
 use aruna_plugins::trigger::TriggerKind;
 use ulid::Ulid;
 
 use super::grants::covers;
 use super::journal::JOURNAL_PAGE;
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row as row_of, unexpected, Rows, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Row, Rows, RowsOperation, StoreError, Turn, decode, done, encode,
+    row as row_of, unexpected,
+};
 
 /// An active install with event triggers, as the matcher sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,8 +59,6 @@ pub fn event_trigger(kind: SourceKind) -> TriggerKind {
         SourceKind::JobFinished => TriggerKind::JobFinished,
     }
 }
-
-
 
 /// One page of pending rows in one transaction, matched with at most `bound` forward rows per
 /// install: the forward rows and gaps of the targets each row matches, and the pending rows
@@ -108,7 +109,10 @@ impl MatchPage {
             done.push((EVENT_JOURNAL_KEYSPACE, key.clone()));
             let event = SourceEvent::from_bytes(value);
             if !self.keep {
-                done.push((EVENT_JOURNAL_KEYSPACE, [&[JOURNAL_ROW][..], &key[1..]].concat()));
+                done.push((
+                    EVENT_JOURNAL_KEYSPACE,
+                    [&[JOURNAL_ROW][..], &key[1..]].concat(),
+                ));
                 let source = event.ok().map(|event| source_key(&event.source));
                 done.extend(source.map(|key| (EVENT_JOURNAL_KEYSPACE, key)));
                 continue;
@@ -292,7 +296,8 @@ impl Outbox {
                     queued_ms: self.now_ms,
                 };
                 let key = outbox_key(install_id, key);
-                self.forward.push(row_of(PLUGIN_OUTBOX_KEYSPACE, key, encode(&row)?));
+                self.forward
+                    .push(row_of(PLUGIN_OUTBOX_KEYSPACE, key, encode(&row)?));
                 self.queued.insert(install_id, count + 1);
                 return Ok(());
             }
@@ -320,13 +325,18 @@ impl Outbox {
         (from_ms, to_ms): (u64, u64),
     ) {
         let key = gap_key(install_id, kind, reason);
-        self.gaps.push((key, kind, reason, Lost::Range(from_ms, to_ms)));
+        self.gaps
+            .push((key, kind, reason, Lost::Range(from_ms, to_ms)));
     }
 
     /// The read of every gap row the outbox counts in, each once.
     pub(crate) fn gap_ask(&self) -> Ask {
         let keys: BTreeSet<_> = self.gaps.iter().map(|(key, ..)| key.clone()).collect();
-        Ask::Read(keys.into_iter().map(|key| (PLUGIN_GAPS_KEYSPACE, key)).collect())
+        Ask::Read(
+            keys.into_iter()
+                .map(|key| (PLUGIN_GAPS_KEYSPACE, key))
+                .collect(),
+        )
     }
 
     /// The forward rows and the counted gap rows, from the stored gap rows `values` that
@@ -335,16 +345,23 @@ impl Outbox {
         let keys: BTreeSet<_> = self.gaps.iter().map(|(key, ..)| key.clone()).collect();
         if keys.len() != values.len() {
             let counts = (values.len(), keys.len());
-            return Err(StoreError(format!("{} gap rows for {} keys", counts.0, counts.1)));
+            return Err(StoreError(format!(
+                "{} gap rows for {} keys",
+                counts.0, counts.1
+            )));
         }
         let mut stored = BTreeMap::new();
         for (key, value) in keys.into_iter().zip(values) {
-            stored.insert(key, value.map(|bytes| decode::<GapRow>(&bytes)).transpose()?);
+            stored.insert(
+                key,
+                value.map(|bytes| decode::<GapRow>(&bytes)).transpose()?,
+            );
         }
         let mut gaps: BTreeMap<Vec<u8>, GapRow> = BTreeMap::new();
         for (key, kind, reason, lost) in self.gaps {
             let kept = stored.get_mut(&key).and_then(Option::take);
-            let row = (gaps.entry(key)).or_insert_with(|| kept.unwrap_or(GapRow::new(kind, reason)));
+            let row =
+                (gaps.entry(key)).or_insert_with(|| kept.unwrap_or(GapRow::new(kind, reason)));
             match lost {
                 Lost::Event(anchor_ms) => row.add(anchor_ms),
                 Lost::Range(from_ms, to_ms) => row.add_range(from_ms, to_ms),

@@ -25,10 +25,13 @@ use super::account::prerequisites_held;
 use super::artifacts::local_config;
 use super::check::{RunScope, check_call};
 use super::dispatch::event_run;
-use super::matcher::event_trigger;
 use super::forward::{Decisions, EventBatch, Outcome};
+use super::matcher::event_trigger;
 use super::replay::{COVERAGE_ROW, CoverageRow, row_key};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row as row_of, unexpected, values, Rows, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode,
+    row as row_of, unexpected, values,
+};
 use super::runs::{ADMISSIONS, Admission, RunError};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
@@ -137,7 +140,10 @@ impl Plan for SeenOutcome {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_SEEN_KEYSPACE, self.0.clone())])))
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_SEEN_KEYSPACE,
+            self.0.clone(),
+        )])))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
@@ -205,7 +211,11 @@ enum DecidePhase {
 }
 
 impl DecideEvent {
-    fn decided(&mut self, outcome: Outcome, mut rows: Vec<Row>) -> Result<Turn<Outcome>, StoreError> {
+    fn decided(
+        &mut self,
+        outcome: Outcome,
+        mut rows: Vec<Row>,
+    ) -> Result<Turn<Outcome>, StoreError> {
         rows.push(seen_row(&self.row, &outcome, self.now_ms)?);
         self.phase = DecidePhase::Writing(outcome);
         Ok(Turn::Ask(Ask::Write(rows)))
@@ -302,7 +312,11 @@ impl GapCount {
         };
         gap.add(self.anchor_ms);
         self.counted = true;
-        Ok(Some(row_of(PLUGIN_GAPS_KEYSPACE, self.key.clone(), encode(&gap)?)))
+        Ok(Some(row_of(
+            PLUGIN_GAPS_KEYSPACE,
+            self.key.clone(),
+            encode(&gap)?,
+        )))
     }
 }
 
@@ -373,7 +387,11 @@ impl Plan for PruneSeen {
 }
 
 /// The event's dedup record with its outcome.
-pub(crate) fn seen_row(row: &ForwardRow, outcome: &Outcome, now_ms: u64) -> Result<Row, StoreError> {
+pub(crate) fn seen_row(
+    row: &ForwardRow,
+    outcome: &Outcome,
+    now_ms: u64,
+) -> Result<Row, StoreError> {
     let key = seen_key(row.install_id, row.event.kind, &row.event.source);
     let record = SeenRow {
         outcome: outcome.clone(),
@@ -471,8 +489,16 @@ impl Hold {
             return Ok(Slot::Full);
         }
         Ok(Slot::Taken(vec![
-            row_of(PLUGIN_QUEUE_KEYSPACE, self.key.clone(), WAITING_ROW.to_vec()),
-            row_of(PLUGIN_WAITING_KEYSPACE, self.key.clone(), std::mem::take(&mut self.waiting)),
+            row_of(
+                PLUGIN_QUEUE_KEYSPACE,
+                self.key.clone(),
+                WAITING_ROW.to_vec(),
+            ),
+            row_of(
+                PLUGIN_WAITING_KEYSPACE,
+                self.key.clone(),
+                std::mem::take(&mut self.waiting),
+            ),
         ]))
     }
 }
@@ -516,7 +542,8 @@ impl Plan for KeepReports {
             return Err(unexpected(answer));
         };
         let (mut acked, mut writes) = (Vec::new(), Vec::new());
-        for ((install_id, report), kept) in std::mem::take(&mut self.reports).into_iter().zip(kept) {
+        for ((install_id, report), kept) in std::mem::take(&mut self.reports).into_iter().zip(kept)
+        {
             let kept = kept.map(|bytes| decode::<GapRow>(&bytes)).transpose()?;
             let sequence = kept.as_ref().map_or(0, |kept| kept.sequence);
             let (kind, reason) = (report.kind, report.reason);
@@ -603,7 +630,10 @@ impl Plan for EventDelivery {
                 };
                 self.delivery.gaps = gap_totals(self.install_id, gaps)?;
                 let coverage = row_key(COVERAGE_ROW, self.install_id);
-                Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_REPLAYS_KEYSPACE, coverage)])))
+                Ok(Turn::Ask(Ask::Read(vec![(
+                    PLUGIN_REPLAYS_KEYSPACE,
+                    coverage,
+                )])))
             }
             DeliveryPhase::Coverage => {
                 let [coverage] = values::<1>(answer)?;

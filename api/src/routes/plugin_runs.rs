@@ -1312,8 +1312,8 @@ mod tests {
         };
         use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
         use aruna_core::structured_id::{BucketId, PlacementHandle};
-        use aruna_operations::jobs::store::insert_job;
         use aruna_operations::driver::drive;
+        use aruna_operations::jobs::store::insert_job;
         use aruna_operations::plugins::work::{
             Identity, WorkChange, WorkRow, reserve, update_work,
         };
@@ -1403,9 +1403,12 @@ mod tests {
         );
         record.state = JobState::Running;
         insert_job(&ctx.storage_handle, &record).await.unwrap();
-        drive(update_work((install_id, work.work_id), WorkChange::Dispatched(job)), &ctx)
-            .await
-            .unwrap();
+        drive(
+            update_work((install_id, work.work_id), WorkChange::Dispatched(job)),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let path = format!("/api/v1/plugin-installs/{install_id}/work");
         let list_as = |user: UserId, limit: Option<usize>| {
             let state = state.clone();

@@ -23,7 +23,7 @@ use super::install::{pick_version, read_config, read_manifest};
 use super::rate::take_hook;
 use super::receiver::lost_reason;
 use super::release::{ReleaseKeys, ReleaseRequest};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row, values, encode};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, encode, row, values};
 use super::runs::{ADMISSIONS, Admission, RunError};
 use crate::driver::{DriverContext, drive};
 
@@ -176,7 +176,10 @@ impl Plan for AdmitHook {
 
     fn first(&mut self) -> Result<Turn<bool>, RunError> {
         match &self.delivery {
-            Some((key, _)) => Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_HOOKS_KEYSPACE, key.clone())]))),
+            Some((key, _)) => Ok(Turn::Ask(Ask::Read(vec![(
+                PLUGIN_HOOKS_KEYSPACE,
+                key.clone(),
+            )]))),
             None => {
                 self.phase = HookPhase::Admitting;
                 Ok(Turn::Ask(self.admission.ask()))

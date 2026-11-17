@@ -30,16 +30,14 @@ use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
 use crate::driver::drive;
 use crate::effect_adapters::routing::{gate_context, routing_snapshot};
 use crate::plugins::broker::local_object;
+use crate::plugins::broker::unmarked;
 use crate::plugins::broker::whole_text;
 use crate::plugins::check::{authorize_access, authorize_call, matching};
 use crate::plugins::grants::InstallScope;
 use crate::plugins::install::{pick_version, read_manifest};
-use crate::plugins::broker::unmarked;
 use crate::plugins::outgoing::{outgoing, release_into};
 use crate::plugins::release::ReleaseKeys;
-use crate::plugins::work::{
-    Send, WorkChange, WorkRow, begin_send, decided, retried, update_work,
-};
+use crate::plugins::work::{Send, WorkChange, WorkRow, begin_send, decided, retried, update_work};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};

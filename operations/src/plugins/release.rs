@@ -218,7 +218,9 @@ impl Audit<'_> {
         };
         let record = AdminAuditRecord::for_use(self.install, secret, used);
         let unavailable = |error: String| ReleaseError::Unavailable(error);
-        let rows = record.entries().map_err(|error| unavailable(error.to_string()))?;
+        let rows = record
+            .entries()
+            .map_err(|error| unavailable(error.to_string()))?;
         let written = drive(write_rows(rows), self.ctx).await;
         written.map_err(|error| unavailable(error.to_string()))
     }

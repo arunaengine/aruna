@@ -16,7 +16,7 @@ use aruna_plugins::permission::Permission;
 use ulid::Ulid;
 
 use super::account::read_user;
-use super::grants::{covers, InstallScope, accesses, parse_grants, patterns_for};
+use super::grants::{InstallScope, accesses, covers, parse_grants, patterns_for};
 use super::install::read_config;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;

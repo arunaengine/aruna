@@ -9,7 +9,9 @@ use aruna_core::plugin_installs::PluginInstall;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, RowsOperation, Turn, done, row, values, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, RowsOperation, StoreError, Turn, decode, done, encode, row, values,
+};
 use crate::metadata::forward::PinnedCreate;
 
 /// How the key row of a create was found.
@@ -75,7 +77,10 @@ fn create_key(install_id: Ulid, key: &str) -> Vec<u8> {
 
 /// Opens an attempt of `key` in one transaction, so concurrent calls adopt one document. A new key
 /// (or a former install's) stores `minted`; a refused one with no open attempt takes its arguments.
-pub fn claim_key((install, key): (&PluginInstall, &str), minted: PinnedCreate) -> RowsOperation<ClaimKey> {
+pub fn claim_key(
+    (install, key): (&PluginInstall, &str),
+    minted: PinnedCreate,
+) -> RowsOperation<ClaimKey> {
     RowsOperation::transaction(ClaimKey {
         row: create_key(install.install_id, key),
         account: install.account,
@@ -97,7 +102,10 @@ impl Plan for ClaimKey {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_CREATES_KEYSPACE, self.row.clone())])))
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_CREATES_KEYSPACE,
+            self.row.clone(),
+        )])))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
@@ -136,7 +144,10 @@ impl Plan for ClaimKey {
 
 /// Closes one attempt of `key` whose outcome is known: it committed, or it was refused without
 /// an effect, `rejected` when the refusal concerns its arguments.
-pub fn settle_key((install, key): (&PluginInstall, &str), rejected: bool) -> RowsOperation<SettleKey> {
+pub fn settle_key(
+    (install, key): (&PluginInstall, &str),
+    rejected: bool,
+) -> RowsOperation<SettleKey> {
     RowsOperation::transaction(SettleKey {
         row: create_key(install.install_id, key),
         account: install.account,
@@ -158,7 +169,10 @@ impl Plan for SettleKey {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<()>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_CREATES_KEYSPACE, self.row.clone())])))
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_CREATES_KEYSPACE,
+            self.row.clone(),
+        )])))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {

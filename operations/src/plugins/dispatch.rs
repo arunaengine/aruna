@@ -6,9 +6,7 @@
 use aruna_core::NodeId;
 use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::plugin_runs::{
-    MAX_INPUT, PluginRun, RunState, RunTrigger, SourceEvent, timer_key,
-};
+use aruna_core::plugin_runs::{MAX_INPUT, PluginRun, RunState, RunTrigger, SourceEvent, timer_key};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugins::trigger::{Trigger, TriggerKind};
@@ -235,7 +233,10 @@ impl Plan for EnqueueTimer {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<bool>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_RUNS_KEYSPACE, self.key.clone())])))
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_RUNS_KEYSPACE,
+            self.key.clone(),
+        )])))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
@@ -247,7 +248,8 @@ impl Plan for EnqueueTimer {
                     None => TimerRow::default(),
                 };
                 // Occurrences count from the last activation, so a pause is never replayed.
-                let base = (row.last_due_ms).max(self.install.active_since_ms.unwrap_or(self.now_ms));
+                let base =
+                    (row.last_due_ms).max(self.install.active_since_ms.unwrap_or(self.now_ms));
                 if self.now_ms < base.saturating_add(self.interval_ms) {
                     return Ok(Turn::Finish(false));
                 }
@@ -277,7 +279,11 @@ impl Plan for EnqueueTimer {
                 let mut row = row;
                 row.skipped += u64::from(!admitted);
                 let mut rows = rows;
-                rows.push(row_of(PLUGIN_RUNS_KEYSPACE, self.key.clone(), encode(&row)?));
+                rows.push(row_of(
+                    PLUGIN_RUNS_KEYSPACE,
+                    self.key.clone(),
+                    encode(&row)?,
+                ));
                 self.phase = TimerPhase::Writing(admitted);
                 Ok(Turn::Ask(Ask::Write(rows)))
             }
@@ -302,7 +308,10 @@ impl Plan for ReadTimer {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_RUNS_KEYSPACE, self.0.clone())])))
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_RUNS_KEYSPACE,
+            self.0.clone(),
+        )])))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
