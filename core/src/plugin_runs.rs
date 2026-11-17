@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::UserId;
+use crate::effects::{Effect, StorageEffect};
 use crate::errors::ConversionError;
 use crate::keyspaces::EVENT_JOURNAL_KEYSPACE;
 use crate::metadata::{MetadataEventPayload, MetadataEventRecord};
@@ -432,6 +433,30 @@ pub fn journal_entries(
         event.anchor_ms.to_be_bytes().to_vec().into(),
     ));
     Ok(entries)
+}
+
+/// The version write `effect` with the event's journal rows in the same batch. A single write
+/// becomes a batch, so its caller must accept `BatchWriteResult`.
+pub fn journaled(effect: Effect, event: &SourceEvent) -> Result<Effect, ConversionError> {
+    let rows = journal_entries(event)?;
+    match effect {
+        Effect::Storage(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id,
+        }) => Ok(Effect::Storage(StorageEffect::BatchWrite {
+            writes: [vec![(key_space, key, value)], rows].concat(),
+            txn_id,
+        })),
+        Effect::Storage(StorageEffect::BatchWrite { writes, txn_id }) => {
+            Ok(Effect::Storage(StorageEffect::BatchWrite {
+                writes: [writes, rows].concat(),
+                txn_id,
+            }))
+        }
+        other => Ok(other),
+    }
 }
 
 /// Forward rows of one install a node keeps at most; matching beyond records a gap.
