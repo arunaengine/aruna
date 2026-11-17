@@ -5,15 +5,14 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, VaultQuery};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::VaultQuery;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::VaultRecords;
 use aruna_core::structs::storage::holders::KeyLookup;
-use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
@@ -23,10 +22,8 @@ const KEY_LOOKUP_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LookupError {
-    #[error("unexpected event while looking up holder keys: {0}")]
-    UnexpectedEvent(String),
-    #[error("the key lookup did not finish")]
-    NotFinished,
+    #[error("could not look up holder keys: {0}")]
+    Io(#[from] IoError),
 }
 
 /// The key directory answer for each user. Any failed lookup counts as unavailable, never as
@@ -38,9 +35,9 @@ pub struct LookupKeysOperation {
     pending: VecDeque<UserId>,
     asked: Option<UserId>,
     lookups: BTreeMap<UserId, KeyLookup>,
-    error: Option<LookupError>,
-    finished: bool,
 }
+
+type Lookups = BTreeMap<UserId, KeyLookup>;
 
 impl LookupKeysOperation {
     pub fn new(
@@ -54,15 +51,12 @@ impl LookupKeysOperation {
             pending: users.into_iter().collect(),
             asked: None,
             lookups: BTreeMap::new(),
-            error: None,
-            finished: false,
         }
     }
 
-    fn ask_next(&mut self) -> Effects {
+    fn ask_next(&mut self) -> Next<Lookups> {
         let Some(user_id) = self.pending.pop_front() else {
-            self.finished = true;
-            return smallvec![];
+            return Next::Done(std::mem::take(&mut self.lookups));
         };
         self.asked = Some(user_id);
         let config = ReadVaultConfig {
@@ -73,54 +67,36 @@ impl LookupKeysOperation {
             deadline: KEY_LOOKUP_DEADLINE,
         };
         let read = ReadVaultOperation::new(config);
-        smallvec![Effect::SubOperation(boxed_suboperation(read, |result| {
+        Next::Call(IoCall::Child(boxed_suboperation(read, |result| {
             let lookup = match result {
                 Ok(VaultRecords::Keys(keys)) if keys.is_empty() => KeyLookup::Missing,
                 Ok(VaultRecords::Keys(keys)) => KeyLookup::Keys(keys),
                 Ok(VaultRecords::Heads(_)) | Err(_) => KeyLookup::Unavailable,
             };
             Event::SubOperation(SubOperationEvent::KeysLooked { lookup })
-        }))]
+        })))
     }
 }
 
-impl EffectOperation for LookupKeysOperation {
-    type Output = BTreeMap<UserId, KeyLookup>;
+impl Operation for LookupKeysOperation {
+    type Output = Lookups;
     type Error = LookupError;
 
-    fn start(&mut self) -> Effects {
-        self.ask_next()
+    fn first(&mut self) -> Result<Next<Lookups>, LookupError> {
+        Ok(self.ask_next())
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.asked.take(), event) {
-            (Some(user_id), Event::SubOperation(SubOperationEvent::KeysLooked { lookup }))
-                if !self.finished && self.error.is_none() =>
-            {
-                self.lookups.insert(user_id, lookup);
-                self.ask_next()
-            }
-            (_, event) => {
-                self.error = Some(LookupError::UnexpectedEvent(event.label().to_string()));
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.finished || self.error.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, LookupError> {
-        match (self.finished, self.error) {
-            (_, Some(error)) => Err(error),
-            (true, None) => Ok(self.lookups),
-            (false, None) => Err(LookupError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Lookups>, LookupError> {
+        let event = result.event()?;
+        let (Some(user_id), Event::SubOperation(SubOperationEvent::KeysLooked { lookup })) =
+            (self.asked.take(), event)
+        else {
+            let got = "an event other than the asked key lookup";
+            let expected = "SubOperationEvent::KeysLooked";
+            return Err(IoError::Unexpected { expected, got }.into());
+        };
+        self.lookups.insert(user_id, lookup);
+        Ok(self.ask_next())
     }
 }
 
@@ -129,9 +105,6 @@ mod tests {
     use super::*;
     use crate::testing::test_context;
     use crate::tests::s3::test_storage;
-    use aruna_core::operation_check::{
-        check_abort, rejects_events, rejects_finalize, sample_events,
-    };
     use ulid::Ulid;
 
     fn user(seed: u8) -> UserId {
@@ -142,8 +115,10 @@ mod tests {
         iroh::SecretKey::from_bytes(&[1; 32]).public()
     }
 
-    fn looked(lookup: KeyLookup) -> Event {
-        Event::SubOperation(SubOperationEvent::KeysLooked { lookup })
+    fn looked(lookup: KeyLookup) -> IoResult {
+        IoResult::Event(Box::new(Event::SubOperation(
+            SubOperationEvent::KeysLooked { lookup },
+        )))
     }
 
     #[test]
@@ -151,13 +126,14 @@ mod tests {
         let realm_id = RealmId::from_bytes([3; 32]);
         let mut operation = LookupKeysOperation::new(realm_id, node(), [user(1), user(2)]);
         assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::SubOperation(_)]
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        let next = operation.step(looked(KeyLookup::Missing));
-        assert!(matches!(next.as_slice(), [Effect::SubOperation(_)]));
-        assert!(operation.step(looked(KeyLookup::Unavailable)).is_empty());
-        let lookups = operation.finalize().unwrap();
+        let next = operation.next(looked(KeyLookup::Missing));
+        assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+        let Ok(Next::Done(lookups)) = operation.next(looked(KeyLookup::Unavailable)) else {
+            panic!("expected the lookups");
+        };
         assert_eq!(lookups.get(&user(1)), Some(&KeyLookup::Missing));
         assert_eq!(lookups.get(&user(2)), Some(&KeyLookup::Unavailable));
     }
@@ -165,33 +141,17 @@ mod tests {
     #[test]
     fn empty_finishes_immediately() {
         let mut operation = LookupKeysOperation::new(RealmId::from_bytes([3; 32]), node(), []);
-        assert!(operation.start().is_empty());
-        assert_eq!(operation.finalize(), Ok(BTreeMap::new()));
+        assert_eq!(operation.first(), Ok(Next::Done(BTreeMap::new())));
     }
 
     #[test]
-    fn rejects_other_events() {
-        let asking = || {
-            let mut operation =
-                LookupKeysOperation::new(RealmId::from_bytes([3; 32]), node(), [user(1)]);
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(asking, sample_events, |_| false);
-        assert_eq!(refused.len(), sample_events().len());
-        // An answer nobody asked for is refused too.
+    fn rejects_unasked_answer() {
+        // An answer nobody asked for is refused.
         let mut fresh = LookupKeysOperation::new(RealmId::from_bytes([3; 32]), node(), [user(1)]);
-        fresh.step(looked(KeyLookup::Missing));
-        assert!(fresh.is_complete());
-        assert!(fresh.finalize().is_err());
-    }
-
-    #[test]
-    fn abort_and_finalize() {
+        assert!(fresh.next(looked(KeyLookup::Missing)).is_err());
         let mut asking = LookupKeysOperation::new(RealmId::from_bytes([3; 32]), node(), [user(1)]);
-        asking.start();
-        check_abort(&mut asking, &[]);
-        rejects_finalize(asking);
+        let _ = asking.first();
+        assert!(asking.next(IoResult::Done).is_err());
     }
 
     #[tokio::test]

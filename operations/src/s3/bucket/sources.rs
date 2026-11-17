@@ -5,15 +5,13 @@
 
 // Nothing here reads the bucket's objects, so the cost never grows with the bucket.
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::{SyncMode, SyncRelationship, sync_relationship_prefix};
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -44,19 +42,17 @@ pub enum SourcesError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event while listing bucket sources: {0}")]
-    UnexpectedEvent(String),
-    #[error("the bucket source listing did not finish")]
-    NotFinished,
+    #[error("could not list bucket sources: {0}")]
+    Io(IoError),
 }
 
-#[derive(Debug, PartialEq)]
-enum SourcesState {
-    Init,
-    ReadSyncs,
-    ReadImports,
-    Finish,
-    Error,
+impl From<IoError> for SourcesError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 /// The incoming paths of `bucket`, owned by `group_id`, and whether every row was read.
@@ -64,10 +60,10 @@ enum SourcesState {
 pub struct BucketSourcesOperation {
     group_id: GroupId,
     bucket: String,
-    state: SourcesState,
+    /// Whether the sync rows were read and the import rows are next.
+    syncs_read: bool,
     sources: Vec<FileSource>,
     complete: bool,
-    error: Option<SourcesError>,
 }
 
 impl BucketSourcesOperation {
@@ -75,19 +71,13 @@ impl BucketSourcesOperation {
         Self {
             group_id,
             bucket: bucket.to_string(),
-            state: SourcesState::Init,
+            syncs_read: false,
             sources: Vec::new(),
             complete: true,
-            error: None,
         }
     }
 
-    fn syncs_read(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        all: bool,
-    ) -> Result<Effects, SourcesError> {
-        self.complete &= all;
+    fn sync_rows(&mut self, values: Vec<(Key, Value)>) -> Result<(), SourcesError> {
         for (_, value) in values {
             let relationship = SyncRelationship::from_bytes(&value)?;
             self.sources.push(FileSource::Sync {
@@ -96,19 +86,10 @@ impl BucketSourcesOperation {
                 mode: relationship.mode,
             });
         }
-        self.state = SourcesState::ReadImports;
-        Ok(smallvec![rows(
-            BACKEND_IMPORT_KEYSPACE,
-            self.group_id.to_bytes().to_vec()
-        )])
+        Ok(())
     }
 
-    fn imports_read(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        all: bool,
-    ) -> Result<Effects, SourcesError> {
-        self.complete &= all;
+    fn import_rows(&mut self, values: Vec<(Key, Value)>) -> Result<(), SourcesError> {
         for (_, value) in values {
             let import = BackendImport::from_bytes(&value)?;
             if import.bucket == self.bucket {
@@ -120,78 +101,42 @@ impl BucketSourcesOperation {
                 });
             }
         }
-        self.state = SourcesState::Finish;
-        Ok(smallvec![])
+        Ok(())
     }
 }
 
-impl EffectOperation for BucketSourcesOperation {
+impl Operation for BucketSourcesOperation {
     type Output = (Vec<FileSource>, bool);
     type Error = SourcesError;
 
-    fn start(&mut self) -> Effects {
-        self.state = SourcesState::ReadSyncs;
-        smallvec![rows(
-            RELATIONSHIP_IN_KEYSPACE,
-            sync_relationship_prefix(&self.bucket)
-        )]
+    fn first(&mut self) -> Result<Next<Self::Output>, SourcesError> {
+        let prefix = sync_relationship_prefix(&self.bucket);
+        Ok(Next::Call(rows(RELATIONSHIP_IN_KEYSPACE, prefix)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let result = match (&self.state, event) {
-            (
-                SourcesState::ReadSyncs | SourcesState::ReadImports,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => Err(error.into()),
-            (
-                SourcesState::ReadSyncs,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.syncs_read(values, next_start_after.is_none()),
-            (
-                SourcesState::ReadImports,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.imports_read(values, next_start_after.is_none()),
-            (_, event) => Err(SourcesError::UnexpectedEvent(event.label().to_string())),
-        };
-        result.unwrap_or_else(|error| {
-            self.state = SourcesState::Error;
-            self.error = Some(error);
-            smallvec![]
-        })
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SourcesState::Finish | SourcesState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, SourcesError> {
-        match (self.state, self.error) {
-            (SourcesState::Finish, _) => Ok((self.sources, self.complete)),
-            (_, Some(error)) => Err(error),
-            _ => Err(SourcesError::NotFinished),
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SourcesError> {
+        let (values, next) = result.page()?;
+        self.complete &= next.is_none();
+        if self.syncs_read {
+            self.import_rows(values)?;
+            let sources = std::mem::take(&mut self.sources);
+            return Ok(Next::Done((sources, self.complete)));
         }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        self.sync_rows(values)?;
+        self.syncs_read = true;
+        let prefix = self.group_id.to_bytes().to_vec();
+        Ok(Next::Call(rows(BACKEND_IMPORT_KEYSPACE, prefix)))
     }
 }
 
 /// One bounded read of the rows under `prefix`.
-fn rows(key_space: &str, prefix: Vec<u8>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: key_space.to_string(),
-        prefix: Some(prefix.into()),
-        start: None,
+fn rows(key_space: &str, prefix: Vec<u8>) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix: prefix.into(),
+        after: None,
         limit: MAX_ROWS,
-        txn_id: None,
-    })
+    }
 }
 
 #[cfg(test)]

@@ -97,9 +97,12 @@ fn tagged() -> HashMap<String, String> {
 
 fn run(page: FilePage, read: Result<CrateBytes, CrateReadError>) -> Result<ReleaseView, ViewError> {
     let mut operation = ReleaseViewOperation::new(config(page));
-    let effects = operation.start();
-    let [Effect::Net(NetEffect::Release(effect))] = effects.as_slice() else {
-        panic!("the crate is read first: {effects:?}");
+    let first = operation.first();
+    let Ok(Next::Call(IoCall::Effect(effect))) = &first else {
+        panic!("the crate is read first: {first:?}");
+    };
+    let Effect::Net(NetEffect::Release(effect)) = effect.as_ref() else {
+        panic!("the crate is read first: {first:?}");
     };
     let ReleaseEffect::ReadCrate(asked) = effect.as_ref() else {
         panic!("a crate read is asked");
@@ -109,9 +112,10 @@ fn run(page: FilePage, read: Result<CrateBytes, CrateReadError>) -> Result<Relea
         ("releases/6.0.crate.json", version(9))
     );
     let event = Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read)));
-    assert!(operation.step(event).is_empty());
-    assert!(operation.is_complete());
-    operation.finalize()
+    match operation.next(IoResult::Event(Box::new(event)))? {
+        Next::Done(view) => Ok(view),
+        other => panic!("the view finishes: {other:?}"),
+    }
 }
 
 fn read(bytes: Vec<u8>, metadata: HashMap<String, String>) -> Result<CrateBytes, CrateReadError> {
@@ -196,12 +200,9 @@ fn refuses_non_releases() {
     assert_eq!(failed, Err(ViewError::Unavailable("down".into())));
     // An event the operation does not wait for ends it with an error.
     let mut operation = ReleaseViewOperation::new(config(all()));
-    operation.start();
-    operation.step(Event::Net(NetEvent::Release(ReleaseEvent::Holder(Err(
-        "x".into(),
-    )))));
+    let holder = Event::Net(NetEvent::Release(ReleaseEvent::Holder(Err("x".into()))));
     assert!(matches!(
-        operation.finalize(),
-        Err(ViewError::UnexpectedEvent(_))
+        operation.next(IoResult::Event(Box::new(holder))),
+        Err(ViewError::Io(IoError::Unexpected { .. }))
     ));
 }

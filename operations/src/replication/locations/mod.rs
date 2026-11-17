@@ -7,6 +7,7 @@ mod queued;
 mod relationships;
 mod remote;
 
+use aruna_core::calls::IoError;
 use aruna_core::errors::{BlobError, ConversionError};
 use thiserror::Error;
 
@@ -33,6 +34,8 @@ pub enum LocationSummaryError {
     Unexpected { state: &'static str, event: String },
     #[error("peer did not answer before the request deadline")]
     Aborted,
+    #[error("could not read the locations: {0}")]
+    Io(#[from] IoError),
 }
 
 #[cfg(test)]

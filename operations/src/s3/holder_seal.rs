@@ -6,32 +6,49 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{BlobError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::vault::UserKeyRecord;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::holders::KeyLookup;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::Value;
+use thiserror::Error;
 
 use crate::s3::bucket::seal_missing::{SealMissingError, SealMissingInput, SealMissingOperation};
 
 const PAGE: usize = 256;
 
+#[derive(Debug, Error, PartialEq)]
+pub enum SealPublishedError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("could not seal copies for a new user key: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for SealPublishedError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum SealState {
-    Init,
     ScanSettings,
     ReadBucket,
     Seal,
-    Finish,
-    Error,
 }
+
+type Step = Result<Next<Vec<String>>, SealPublishedError>;
 
 /// Seals copies for the publisher of `record`; answers the buckets that sealed one. A locked
 /// bucket is skipped: its next unlock seals the missing copies.
@@ -41,11 +58,10 @@ pub struct SealPublishedOperation {
     node_id: NodeId,
     record: UserKeyRecord,
     state: SealState,
+    pages: PrefixPages,
     page: VecDeque<(String, BucketKeyRef)>,
     current: Option<String>,
-    next: Option<Key>,
     sealed: Vec<String>,
-    error: Option<StorageError>,
 }
 
 impl SealPublishedOperation {
@@ -54,64 +70,44 @@ impl SealPublishedOperation {
             realm_id,
             node_id,
             record,
-            state: SealState::Init,
+            state: SealState::ScanSettings,
+            pages: PrefixPages::new(BUCKET_ENCRYPTION_KEYSPACE, Vec::new(), PAGE),
             page: VecDeque::new(),
             current: None,
-            next: None,
             sealed: Vec::new(),
-            error: None,
         }
     }
 
-    fn scan(&mut self, start: Option<Key>) -> Effects {
-        self.state = SealState::ScanSettings;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(IterStart::After),
-            limit: PAGE,
-            txn_id: None,
-        })]
-    }
-
-    fn page_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn page_read(&mut self, result: IoResult) -> Step {
         // Rows that do not decode or name no active key are not this check's business.
-        self.page = values
-            .into_iter()
+        self.page = (self.pages.take(result)?.into_iter())
             .filter_map(|(key, value)| {
                 let bucket = String::from_utf8(key.to_vec()).ok()?;
                 let settings = BucketEncryption::from_bytes(&value).ok()?;
                 Some((bucket, settings.active_key()?))
             })
             .collect();
-        self.next = next;
-        self.next_bucket()
+        Ok(self.next_bucket())
     }
 
-    fn next_bucket(&mut self) -> Effects {
+    fn next_bucket(&mut self) -> Next<Vec<String>> {
         let Some((bucket, _)) = self.page.front() else {
-            return match self.next.take() {
-                Some(next) => self.scan(Some(next)),
-                None => {
-                    self.state = SealState::Finish;
-                    smallvec![]
-                }
-            };
+            if self.pages.done() {
+                return Next::Done(std::mem::take(&mut self.sealed));
+            }
+            self.state = SealState::ScanSettings;
+            return Next::Call(self.pages.call());
         };
         self.state = SealState::ReadBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
+        Next::Call(read_row(S3_BUCKET_KEYSPACE, bucket.as_bytes()))
     }
 
-    fn bucket_read(&mut self, value: Option<Value>) -> Effects {
+    fn bucket_read(&mut self, value: Option<Value>) -> Step {
         let Some((bucket, key)) = self.page.pop_front() else {
-            return self.fail(StorageError::ReadError("no bucket was read".to_string()));
+            return Err(StorageError::ReadError("no bucket was read".to_string()).into());
         };
         let Some(info) = value.and_then(|value| BucketInfo::from_bytes(&value).ok()) else {
-            return self.next_bucket();
+            return Ok(self.next_bucket());
         };
         let user_id = self.record.user_id;
         let input = SealMissingInput {
@@ -125,86 +121,51 @@ impl SealPublishedOperation {
         self.state = SealState::Seal;
         self.current = Some(bucket.clone());
         let seal = SealMissingOperation::new(input);
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            seal,
-            move |result| {
-                let sealed = match result {
-                    Ok(users) => users.contains(&user_id),
-                    Err(SealMissingError::Blob(BlobError::BucketKey(BucketKeyError::Locked(
-                        _,
-                    )))) => false,
-                    Err(error) => {
-                        tracing::warn!(%bucket, %error, "could not seal a copy for a new user key");
-                        false
-                    }
-                };
-                Event::SubOperation(SubOperationEvent::CopySealed { sealed })
-            }
-        ))]
-    }
-
-    fn fail(&mut self, error: StorageError) -> Effects {
-        self.state = SealState::Error;
-        self.error = Some(error);
-        smallvec![]
+        let child = boxed_suboperation(seal, move |result| {
+            let sealed = match result {
+                Ok(users) => users.contains(&user_id),
+                Err(SealMissingError::Blob(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(%bucket, %error, "could not seal a copy for a new user key");
+                    false
+                }
+            };
+            Event::SubOperation(SubOperationEvent::CopySealed { sealed })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 }
 
-impl EffectOperation for SealPublishedOperation {
+impl Operation for SealPublishedOperation {
     type Output = Vec<String>;
-    type Error = StorageError;
+    type Error = SealPublishedError;
 
-    fn start(&mut self) -> Effects {
-        self.scan(None)
+    fn first(&mut self) -> Step {
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (
-                SealState::ScanSettings | SealState::ReadBucket,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.fail(error),
-            (
-                SealState::ScanSettings,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.page_read(values, next_start_after),
-            (SealState::ReadBucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.bucket_read(value)
-            }
-            (SealState::Seal, Event::SubOperation(SubOperationEvent::CopySealed { sealed })) => {
-                if let Some(bucket) = self.current.take()
-                    && sealed
-                {
-                    self.sealed.push(bucket);
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            SealState::ScanSettings => self.page_read(result),
+            SealState::ReadBucket => self.bucket_read(result.value()?),
+            SealState::Seal => match result.event()? {
+                Event::SubOperation(SubOperationEvent::CopySealed { sealed }) => {
+                    if let Some(bucket) = self.current.take()
+                        && sealed
+                    {
+                        self.sealed.push(bucket);
+                    }
+                    Ok(self.next_bucket())
                 }
-                self.next_bucket()
-            }
-            (_, event) => self.fail(StorageError::ReadError(format!(
-                "unexpected event while sealing copies: {}",
-                event.label()
-            ))),
+                other => Err(IoError::Unexpected {
+                    expected: "SubOperationEvent::CopySealed",
+                    got: other.label(),
+                }
+                .into()),
+            },
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SealState::Finish | SealState::Error)
-    }
-
-    fn finalize(self) -> Result<Vec<String>, StorageError> {
-        match (self.state, self.error) {
-            (SealState::Finish, _) => Ok(self.sealed),
-            (_, Some(error)) => Err(error),
-            _ => Err(StorageError::ReadError(
-                "the copy seal did not finish".to_string(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -218,17 +179,17 @@ mod tests {
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
     use aruna_core::compute::SecretBytes;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, KEY_COPY_KEYSPACE};
     use aruna_core::node_vault::NodeVaultKey;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig};
     use aruna_core::structs::storage::encryption::{
         BlockCipher, BlockKeys, EncryptionMode, public_key_of,
     };
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -375,26 +336,25 @@ mod tests {
         SealPublishedOperation::new(realm_id, node_id, key_record(user, 9, node_id))
     }
 
-    fn scan_effect(start: Option<Key>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(IterStart::After),
+    fn scan_call(after: Option<Key>) -> Step {
+        Ok(Next::Call(IoCall::Page {
+            space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
             limit: PAGE,
-            txn_id: None,
-        })
+        }))
     }
 
-    fn settings_page(rows: Vec<(&str, BucketEncryption)>, next: Option<&str>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: (rows.into_iter())
+    fn settings_page(rows: Vec<(&str, BucketEncryption)>, next: Option<&str>) -> IoResult {
+        IoResult::Page {
+            rows: (rows.into_iter())
                 .map(|(bucket, settings)| {
                     let value = settings.to_bytes().unwrap();
                     (bucket.as_bytes().to_vec().into(), value.into())
                 })
                 .collect(),
-            next_start_after: next.map(|key| key.as_bytes().to_vec().into()),
-        })
+            next: next.map(|key| key.as_bytes().to_vec().into()),
+        }
     }
 
     fn encrypted() -> BucketEncryption {
@@ -410,6 +370,7 @@ mod tests {
     fn skips_unsealable_buckets() {
         // A plain bucket is never read; a bucket without a record is skipped.
         let mut operation = operation();
+        assert_eq!(operation.first(), scan_call(None));
         let page = settings_page(
             vec![
                 ("plain", BucketEncryption::default()),
@@ -417,80 +378,24 @@ mod tests {
             ],
             Some("gone"),
         );
-        let read_gone = Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: b"gone".to_vec().into(),
-            txn_id: None,
-        });
-        let missing = Event::Storage(StorageEvent::ReadResult {
-            key: b"gone".to_vec().into(),
-            value: None,
-        });
+        let read_gone = read_row(S3_BUCKET_KEYSPACE, b"gone".as_slice());
+        assert_eq!(operation.next(page), Ok(Next::Call(read_gone)));
+        let missing = IoResult::Values(vec![None]);
+        let after = Some(Key::from(b"gone".to_vec()));
+        assert_eq!(operation.next(missing), scan_call(after));
         let last = settings_page(Vec::new(), None);
-        let steps = vec![
-            (page, vec![read_gone]),
-            (missing, vec![scan_effect(Some(b"gone".to_vec().into()))]),
-            (last, vec![]),
-        ];
-        check_trace(&mut operation, &[scan_effect(None)], steps);
-        assert_eq!(operation.finalize(), Ok(Vec::new()));
+        assert_eq!(operation.next(last), Ok(Next::Done(Vec::new())));
     }
 
     #[test]
-    fn storage_errors_fail() {
-        let timeout = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
+    fn unexpected_results_fail() {
+        let error = SealPublishedError::from(IoError::Storage(StorageError::Timeout));
+        assert_eq!(error, SealPublishedError::Storage(StorageError::Timeout));
         let mut scanning = operation();
-        scanning.start();
-        scanning.step(timeout());
-        assert_eq!(scanning.finalize(), Err(StorageError::Timeout));
-        let mut reading = operation();
-        reading.start();
-        reading.step(settings_page(vec![("b", encrypted())], None));
-        reading.step(timeout());
-        assert_eq!(reading.finalize(), Err(StorageError::Timeout));
-    }
-
-    #[test]
-    fn rejects_unexpected_events() {
-        let scanning = || {
-            let mut operation = operation();
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(scanning, sample_events, |event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-            )
-        });
-        assert!(!refused.is_empty());
-        let reading = || {
-            let mut operation = scanning();
-            operation.step(settings_page(vec![("b", encrypted())], None));
-            operation
-        };
-        let refused = rejects_events(reading, sample_events, |event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        });
-        assert!(!refused.is_empty());
-    }
-
-    #[test]
-    fn abort_and_finalize() {
-        // Reads and sub-operations only, so no phase holds anything to clean up.
-        let mut fresh = operation();
-        check_abort(&mut fresh, &[]);
-        rejects_finalize(fresh);
-        let mut scanning = operation();
-        scanning.start();
-        check_abort(&mut scanning, &[]);
-        rejects_finalize(scanning);
+        let _ = scanning.first();
+        assert!(matches!(
+            scanning.next(IoResult::Done),
+            Err(SealPublishedError::Io(IoError::Unexpected { .. }))
+        ));
     }
 }

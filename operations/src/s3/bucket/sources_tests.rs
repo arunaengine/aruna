@@ -5,9 +5,6 @@
 use std::time::SystemTime;
 
 use aruna_core::UserId;
-use aruna_core::operation_check::{
-    check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-};
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
@@ -36,21 +33,24 @@ fn import(bucket: &str, seed: u64) -> BackendImport {
     }
 }
 
-fn page(values: Vec<Vec<u8>>, more: bool) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values: (values.into_iter())
+fn page(values: Vec<Vec<u8>>, more: bool) -> IoResult {
+    IoResult::Page {
+        rows: (values.into_iter())
             .map(|value| (Vec::new().into(), value.into()))
             .collect(),
-        next_start_after: more.then(|| b"next".to_vec().into()),
-    })
+        next: more.then(|| b"next".to_vec().into()),
+    }
 }
 
-fn syncs() -> Effect {
-    rows(RELATIONSHIP_IN_KEYSPACE, sync_relationship_prefix("b"))
+fn syncs() -> Next<(Vec<FileSource>, bool)> {
+    Next::Call(rows(
+        RELATIONSHIP_IN_KEYSPACE,
+        sync_relationship_prefix("b"),
+    ))
 }
 
-fn imports() -> Effect {
-    rows(BACKEND_IMPORT_KEYSPACE, group().to_bytes().to_vec())
+fn imports() -> Next<(Vec<FileSource>, bool)> {
+    Next::Call(rows(BACKEND_IMPORT_KEYSPACE, group().to_bytes().to_vec()))
 }
 
 #[test]
@@ -61,13 +61,12 @@ fn lists_bucket_imports() {
         import("b", 1).to_bytes().unwrap(),
         import("other", 2).to_bytes().unwrap(),
     ];
-    let steps = vec![
-        (page(Vec::new(), false), vec![imports()]),
-        (page(rows, true), vec![]),
-    ];
-    check_trace(&mut operation, &[syncs()], steps);
+    assert_eq!(operation.first(), Ok(syncs()));
+    assert_eq!(operation.next(page(Vec::new(), false)), Ok(imports()));
+    let Ok(Next::Done((sources, complete))) = operation.next(page(rows, true)) else {
+        panic!("expected the sources");
+    };
     let wanted = import("b", 1);
-    let (sources, complete) = operation.finalize().unwrap();
     assert_eq!(
         sources,
         [FileSource::Storage {
@@ -83,58 +82,16 @@ fn lists_bucket_imports() {
 #[test]
 fn errors_fail() {
     let mut storage = BucketSourcesOperation::new(group(), "b");
-    storage.start();
-    storage.step(page(Vec::new(), false));
-    let failed = Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    });
-    assert!(storage.step(failed).is_empty());
-    assert_eq!(
-        storage.finalize(),
-        Err(SourcesError::Storage(StorageError::Timeout))
-    );
+    let failed = SourcesError::from(IoError::Storage(StorageError::Timeout));
+    assert_eq!(failed, SourcesError::Storage(StorageError::Timeout));
+    assert!(matches!(
+        storage.next(IoResult::Done),
+        Err(SourcesError::Io(IoError::Unexpected { .. }))
+    ));
     // A row that does not decode fails the listing instead of hiding a source.
     let mut corrupt = BucketSourcesOperation::new(group(), "b");
-    corrupt.start();
-    assert!(corrupt.step(page(vec![vec![0xff]], false)).is_empty());
     assert!(matches!(
-        corrupt.finalize(),
+        corrupt.next(page(vec![vec![0xff]], false)),
         Err(SourcesError::Conversion(_))
     ));
-}
-
-#[test]
-fn rejects_unexpected_events() {
-    let reading = || {
-        let mut operation = BucketSourcesOperation::new(group(), "b");
-        operation.start();
-        operation
-    };
-    let iter_or_error = |event: &Event| {
-        matches!(
-            event,
-            Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-        )
-    };
-    assert!(!rejects_events(reading, sample_events, iter_or_error).is_empty());
-    let fresh = || BucketSourcesOperation::new(group(), "b");
-    let refused = rejects_events(fresh, sample_events, |_| false);
-    assert_eq!(refused.len(), sample_events().len());
-}
-
-#[test]
-fn abort_and_finalize() {
-    // Reads only, so no phase has cleanup.
-    let mut fresh = BucketSourcesOperation::new(group(), "b");
-    check_abort(&mut fresh, &[]);
-    rejects_finalize(fresh);
-    let mut syncs = BucketSourcesOperation::new(group(), "b");
-    syncs.start();
-    check_abort(&mut syncs, &[]);
-    rejects_finalize(syncs);
-    let mut imports = BucketSourcesOperation::new(group(), "b");
-    imports.start();
-    imports.step(page(Vec::new(), false));
-    check_abort(&mut imports, &[]);
-    rejects_finalize(imports);
 }

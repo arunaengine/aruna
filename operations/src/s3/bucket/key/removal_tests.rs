@@ -73,12 +73,12 @@ struct Case {
 const LOCKED: (EncryptionMode, u64, KeyState) = (EncryptionMode::VaultLocked, 2, KeyState::Active);
 
 /// Runs a removal by admin user(1) on a bucket of creator user(1) up to its delete batch.
-fn run(case: Case) -> (RemoveHolderOperation, Effects) {
+fn run(case: Case) -> (RemoveHolderOperation, Step) {
     run_by(case, true)
 }
 
 /// Runs a removal by user(1), who holds the group admin role in the transaction if `admin`.
-fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Effects) {
+fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Step) {
     let mut admins = case.admins.clone();
     if admin {
         admins.insert(user(1));
@@ -111,10 +111,8 @@ fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Effects) {
         lookups: BTreeMap::from(lookups),
         now_ms: 9,
     });
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
+    assert!(operation.transaction());
+    let _ = operation.first();
     let info = BucketInfo {
         group_id: Ulid::from_bytes([3; 16]),
         created_at: SystemTime::UNIX_EPOCH,
@@ -133,44 +131,46 @@ fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Effects) {
         ..Default::default()
     };
     let values = authority_rows(&info, Some(&settings), &admins);
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    let rows = |values: Vec<Vec<u8>>| {
-        Event::Storage(StorageEvent::IterResult {
-            values: values
-                .into_iter()
-                .map(|value| (Key::from(Vec::new()), value.into()))
-                .collect(),
-            next_start_after: None,
-        })
+    let values = values.into_iter().map(|(_, value)| value).collect();
+    let turn = operation.next(IoResult::Values(values));
+    if turn.is_err() {
+        return (operation, turn);
+    }
+    let rows = |values: Vec<Vec<u8>>| IoResult::Page {
+        rows: values
+            .into_iter()
+            .map(|value| (Key::from(Vec::new()), value.into()))
+            .collect(),
+        next: None,
     };
     let grants = case
         .grants
         .iter()
         .map(|grant| grant.to_bytes().unwrap())
         .collect();
-    operation.step(rows(grants));
+    let _ = operation.next(rows(grants));
     let copies: Vec<_> = case
         .copies
         .iter()
         .map(|copy| (Key::from(copy.key()), Value::from(copy.to_bytes().unwrap())))
         .collect();
-    operation.step(Event::Storage(StorageEvent::IterResult {
-        values: copies,
-        next_start_after: None,
-    }));
+    let _ = operation.next(IoResult::Page {
+        rows: copies,
+        next: None,
+    });
     let keys = case.keys.iter().map(|&(generation, state)| {
         let key = BucketKeyRef::new(BUCKET_ID, generation);
         let mut record = BucketKeyRecord::new(key, Ulid::generate(), [5; 32], 1);
         record.state = state;
         record.to_bytes().unwrap()
     });
-    let effects = operation.step(rows(keys.collect()));
-    (operation, effects)
+    let turn = operation.next(rows(keys.collect()));
+    (operation, turn)
 }
 
-fn deleted(effects: &Effects) -> Vec<String> {
-    let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice() else {
-        panic!("expected the delete batch, got {effects:?}");
+fn deleted(turn: &Step) -> Vec<String> {
+    let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+        panic!("expected the delete batch, got {turn:?}");
     };
     deletes.iter().map(|(space, _)| space.clone()).collect()
 }
@@ -189,35 +189,24 @@ fn removal_needs_confirmation() {
         mode: LOCKED.0,
         keys: vec![(LOCKED.1, LOCKED.2)],
     };
-    let (operation, effects) = run(case());
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(
-        operation.finalize(),
-        Err(RemovalError::RecoveryConfirmationRequired)
-    );
+    let (_, turn) = run(case());
+    assert_eq!(turn, Err(RemovalError::RecoveryConfirmationRequired));
 
-    let (mut operation, effects) = run(Case {
+    let (mut operation, turn) = run(Case {
         confirm: true,
         ..case()
     });
     // The grant and the user's copies of every generation go.
     assert_eq!(
-        deleted(&effects),
+        deleted(&turn),
         [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE, KEY_COPY_KEYSPACE]
     );
-    let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-        entries: Vec::new(),
-    }));
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space, value, ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected the audit record, got {effects:?}");
+    let turn = operation.next(IoResult::Done);
+    let Ok(Next::Call(IoCall::Write(writes))) = &turn else {
+        panic!("expected the audit record, got {turn:?}");
+    };
+    let [(key_space, _, value)] = writes.as_slice() else {
+        panic!("expected one audit record, got {turn:?}");
     };
     assert_eq!(key_space, BUCKET_AUDIT_KEYSPACE);
     let record = BucketAuditRecord::from_bytes(value).unwrap();
@@ -230,7 +219,7 @@ fn removal_needs_confirmation() {
 
 #[test]
 fn stale_revision_refused() {
-    let (operation, _) = run(Case {
+    let (_, turn) = run(Case {
         target: user(3),
         admins: BTreeSet::new(),
         grants: vec![grant(user(3))],
@@ -240,13 +229,13 @@ fn stale_revision_refused() {
         mode: LOCKED.0,
         keys: vec![(LOCKED.1, LOCKED.2)],
     });
-    assert_eq!(operation.finalize(), Err(RemovalError::StaleHolders));
+    assert_eq!(turn, Err(RemovalError::StaleHolders));
 }
 
 #[test]
 fn admin_keeps_copies() {
     // The explicit grant of a current admin goes, but the admin keeps their copies.
-    let (operation, effects) = run(Case {
+    let (operation, turn) = run(Case {
         target: user(2),
         admins: BTreeSet::from([user(2)]),
         grants: vec![grant(user(2))],
@@ -256,13 +245,13 @@ fn admin_keeps_copies() {
         mode: LOCKED.0,
         keys: vec![(LOCKED.1, LOCKED.2)],
     });
-    assert_eq!(deleted(&effects), [BUCKET_HOLDER_KEYSPACE]);
+    assert_eq!(deleted(&turn), [BUCKET_HOLDER_KEYSPACE]);
     assert!(matches!(
         operation.output,
-        Some(Ok(RemovalResult {
+        Some(RemovalResult {
             deleted_copies: 0,
             ..
-        }))
+        })
     ));
 }
 
@@ -279,17 +268,11 @@ fn retained_generation_protected() {
         mode: EncryptionMode::Off,
         keys: vec![(1, KeyState::Retiring), (2, KeyState::Retired)],
     };
-    let (operation, _) = run(case(false));
-    assert_eq!(
-        operation.finalize(),
-        Err(RemovalError::RecoveryConfirmationRequired)
-    );
-    let (operation, effects) = run(case(true));
-    assert_eq!(
-        deleted(&effects),
-        [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE]
-    );
-    let Some(Ok(result)) = &operation.output else {
+    let (_, turn) = run(case(false));
+    assert_eq!(turn, Err(RemovalError::RecoveryConfirmationRequired));
+    let (operation, turn) = run(case(true));
+    assert_eq!(deleted(&turn), [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE]);
+    let Some(result) = &operation.output else {
         panic!("expected a removal result");
     };
     assert_eq!(
@@ -313,17 +296,14 @@ fn weak_recovery_protected() {
             mode: LOCKED.0,
             keys: vec![(LOCKED.1, LOCKED.2)],
         };
-        let (operation, _) = run(case(false));
+        let (_, turn) = run(case(false));
         assert_eq!(
-            operation.finalize(),
+            turn,
             Err(RemovalError::RecoveryConfirmationRequired),
             "the last ready holder of {target:?} needs confirmation"
         );
-        let (_, effects) = run(case(true));
-        assert_eq!(
-            deleted(&effects),
-            [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE]
-        );
+        let (_, turn) = run(case(true));
+        assert_eq!(deleted(&turn), [BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE]);
     }
 }
 
@@ -340,6 +320,6 @@ fn revoked_remover_refused() {
         mode: LOCKED.0,
         keys: vec![(LOCKED.1, LOCKED.2)],
     };
-    let (operation, _) = run_by(case, false);
-    assert_eq!(operation.finalize(), Err(RemovalError::NotAdmin));
+    let (_, turn) = run_by(case, false);
+    assert_eq!(turn, Err(RemovalError::NotAdmin));
 }

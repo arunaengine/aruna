@@ -7,13 +7,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::{
     BUCKET_RELEASE_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_core::structs::identity::realm::RealmId;
@@ -33,9 +34,8 @@ use aruna_core::structs::storage::release::{
     MembershipQuery, RangeFiles, RangeMembers, ReleaseFile, ReleaseMembers,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::Key;
 use serde_json::Value;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -50,9 +50,16 @@ const ROW_PAGE: usize = 256;
 pub enum ReleaseError {
     #[error("release state unavailable: {0}")]
     Unavailable(String),
-    #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
 }
+
+/// Storage failures and unexpected answers leave the release state unknown.
+impl From<IoError> for ReleaseError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+type Step = Result<Next<MembersOutput>, ReleaseError>;
 
 impl From<ConversionError> for ReleaseError {
     fn from(error: ConversionError) -> Self {
@@ -149,13 +156,10 @@ pub struct MembersOutput {
 
 #[derive(Debug, PartialEq)]
 enum MembersState {
-    Init,
     ReadSet,
     Rows,
     Crate,
     Holder,
-    Finish,
-    Error,
 }
 
 /// Decides which releases pin the queried versions. Only a range's coordinator answers, since a
@@ -173,7 +177,6 @@ pub struct ReleaseMembersOperation {
     candidates: Vec<(Ulid, ReleasePointer)>,
     asked: Vec<(NodeId, Vec<Ulid>)>,
     output: MembersOutput,
-    error: Option<ReleaseError>,
 }
 
 impl ReleaseMembersOperation {
@@ -181,7 +184,7 @@ impl ReleaseMembersOperation {
         let answers = vec![ReleaseMembers::complete(); config.queries.len()];
         Self {
             config,
-            state: MembersState::Init,
+            state: MembersState::ReadSet,
             local: None,
             remote: Vec::new(),
             refused: Vec::new(),
@@ -193,28 +196,7 @@ impl ReleaseMembersOperation {
                 complete: true,
                 refused: Vec::new(),
             },
-            error: None,
         }
-    }
-
-    fn fail(&mut self, error: ReleaseError) -> Effects {
-        self.state = MembersState::Error;
-        self.error = Some(error);
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, got: Event) -> Effects {
-        let state = match self.state {
-            MembersState::ReadSet => "ReadSet",
-            MembersState::Rows => "Rows",
-            MembersState::Crate => "Crate",
-            MembersState::Holder => "Holder",
-            _ => "Other",
-        };
-        self.fail(ReleaseError::UnexpectedEvent {
-            state,
-            got: got.label().to_string(),
-        })
     }
 
     fn incomplete(&mut self) {
@@ -225,20 +207,19 @@ impl ReleaseMembersOperation {
             .for_each(|answer| answer.complete = false);
     }
 
-    fn read_rows(&mut self, start: Option<Key>) -> Effects {
+    fn read_rows(&mut self, after: Option<Key>) -> Next<MembersOutput> {
         self.state = MembersState::Rows;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BUCKET_RELEASE_KEYSPACE.to_string(),
-            prefix: Some(release_prefix(&self.config.bucket).into()),
-            start: start.map(IterStart::After),
+        Next::Call(IoCall::Page {
+            space: BUCKET_RELEASE_KEYSPACE.to_string(),
+            prefix: release_prefix(&self.config.bucket).into(),
+            after,
             limit: ROW_PAGE,
-            txn_id: None,
-        })]
+        })
     }
 
     /// Splits the set's ranges into the ones this node coordinates and the ones asked of their
     /// coordinator; a holder refuses what it does not coordinate.
-    fn plan(&mut self, view: &DistributionView, fence: &LocalFence) -> Effects {
+    fn plan(&mut self, view: &DistributionView, fence: &LocalFence) -> Next<MembersOutput> {
         let Some(member_id) =
             (self.config.info.distribution.as_ref()).map(|binding| binding.member_id)
         else {
@@ -269,28 +250,18 @@ impl ReleaseMembersOperation {
         self.read_rows(None)
     }
 
-    fn on_set(&mut self, values: Vec<(Key, Option<aruna_core::types::Value>)>) -> Effects {
-        let mut values = values.into_iter().map(|(_, value)| value);
+    fn on_set(&mut self, values: Vec<Option<aruna_core::types::Value>>) -> Step {
+        let mut values = values.into_iter();
         let (Some(Some(set)), fence) = (values.next(), values.next().flatten()) else {
             self.incomplete();
-            return self.finish();
+            return Ok(self.finish());
         };
-        let view = match DistributionView::from_bytes(set.as_ref()) {
-            Ok(view) => view,
-            Err(error) => return self.fail(error.into()),
-        };
-        let fence = match LocalFence::decode(fence.as_deref()) {
-            Ok(fence) => fence,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.plan(&view, &fence)
+        let view = DistributionView::from_bytes(set.as_ref())?;
+        let fence = LocalFence::decode(fence.as_deref())?;
+        Ok(self.plan(&view, &fence))
     }
 
-    fn on_rows(
-        &mut self,
-        values: Vec<(Key, aruna_core::types::Value)>,
-        next: Option<Key>,
-    ) -> Effects {
+    fn on_rows(&mut self, values: Vec<(Key, aruna_core::types::Value)>, next: Option<Key>) -> Step {
         let prefix_len = release_prefix(&self.config.bucket).len();
         for (key, value) in values {
             let Some(id) = key
@@ -299,10 +270,7 @@ impl ReleaseMembersOperation {
             else {
                 continue;
             };
-            let pointer = match ReleasePointer::from_bytes(value.as_ref()) {
-                Ok(pointer) => pointer,
-                Err(error) => return self.fail(error.into()),
-            };
+            let pointer = ReleasePointer::from_bytes(value.as_ref())?;
             let held = (self.local.as_ref())
                 .is_none_or(|ranges| ranges.iter().any(|range| range.contains(&pointer.key)));
             let wanted = self.config.queries.is_empty()
@@ -316,13 +284,13 @@ impl ReleaseMembersOperation {
                 self.candidates.push((Ulid::from_bytes(id), pointer));
             }
         }
-        match next {
+        Ok(match next {
             Some(next) => self.read_rows(Some(next)),
             None => self.next_crate(),
-        }
+        })
     }
 
-    fn next_crate(&mut self) -> Effects {
+    fn next_crate(&mut self) -> Next<MembersOutput> {
         let Some((version_id, pointer)) = self.candidates.last() else {
             return self.next_holder();
         };
@@ -340,14 +308,22 @@ impl ReleaseMembersOperation {
             realm_id: self.config.realm_id,
             node_id: self.config.node_id,
         };
-        let effect = ReleaseEffect::ReadCrate(Box::new(read));
-        smallvec![Effect::Net(NetEffect::Release(Box::new(effect)))]
+        release_call(ReleaseEffect::ReadCrate(Box::new(read)))
     }
 
-    fn on_crate(&mut self, read: Result<CrateBytes, CrateReadError>) -> Effects {
+    fn on_crate(&mut self, read: Result<CrateBytes, CrateReadError>) -> Step {
         let Some((version_id, pointer)) = self.candidates.pop() else {
-            return self.fail(ReleaseError::Unavailable("no crate was asked for".into()));
+            return Err(ReleaseError::Unavailable("no crate was asked for".into()));
         };
+        Ok(self.crate_read(version_id, pointer, read))
+    }
+
+    fn crate_read(
+        &mut self,
+        version_id: Ulid,
+        pointer: ReleasePointer,
+        read: Result<CrateBytes, CrateReadError>,
+    ) -> Next<MembersOutput> {
         let crate_json = match read {
             // A purged version, or one of an earlier bucket of the name, is no release.
             Err(CrateReadError::Missing) => return self.next_crate(),
@@ -416,7 +392,7 @@ impl ReleaseMembersOperation {
         }
     }
 
-    fn next_holder(&mut self) -> Effects {
+    fn next_holder(&mut self) -> Next<MembersOutput> {
         if self.remote.is_empty() {
             return self.finish();
         }
@@ -434,7 +410,7 @@ impl ReleaseMembersOperation {
         self.ask_holder(bearer)
     }
 
-    fn ask_holder(&mut self, bearer: String) -> Effects {
+    fn ask_holder(&mut self, bearer: String) -> Next<MembersOutput> {
         let Some((node_id, range_ids)) = self.asked.last().cloned() else {
             return self.finish();
         };
@@ -448,11 +424,10 @@ impl ReleaseMembersOperation {
                 queries: self.config.queries.clone(),
             },
         };
-        let effect = ReleaseEffect::Holder(request);
-        smallvec![Effect::Net(NetEffect::Release(Box::new(effect)))]
+        release_call(ReleaseEffect::Holder(request))
     }
 
-    fn on_holder(&mut self, answer: Result<HolderAnswer, String>) -> Effects {
+    fn on_holder(&mut self, answer: Result<HolderAnswer, String>) -> Next<MembersOutput> {
         self.asked.pop();
         match answer {
             Ok(HolderAnswer::Members(members))
@@ -478,83 +453,74 @@ impl ReleaseMembersOperation {
         }
     }
 
-    fn finish(&mut self) -> Effects {
+    fn finish(&mut self) -> Next<MembersOutput> {
         self.output.refused = std::mem::take(&mut self.refused);
-        self.state = MembersState::Finish;
-        smallvec![]
+        let complete = MembersOutput {
+            answers: Vec::new(),
+            releases: Vec::new(),
+            complete: true,
+            refused: Vec::new(),
+        };
+        Next::Done(std::mem::replace(&mut self.output, complete))
     }
 }
 
-impl EffectOperation for ReleaseMembersOperation {
+fn release_call(effect: ReleaseEffect) -> Next<MembersOutput> {
+    let effect = Effect::Net(NetEffect::Release(Box::new(effect)));
+    Next::Call(IoCall::Effect(Box::new(effect)))
+}
+
+impl Operation for ReleaseMembersOperation {
     type Output = MembersOutput;
     type Error = ReleaseError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Step {
         let Some(binding) = &self.config.info.distribution else {
             // An ordinary bucket has no ranges a holder could answer for.
             if let Some(ids) = self.config.ranges.clone() {
                 self.refused = ids;
-                return self.finish();
+                return Ok(self.finish());
             }
-            return self.read_rows(None);
+            return Ok(self.read_rows(None));
         };
         self.state = MembersState::ReadSet;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    DISTRIBUTION_KEYSPACE.to_string(),
-                    binding.set_id.to_bytes().to_vec().into(),
-                ),
-                (
-                    DISTRIBUTION_FENCE_KEYSPACE.to_string(),
-                    LocalFence::key(binding.set_id).into(),
-                ),
-            ],
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (_, Event::Storage(StorageEvent::Error { error })) => {
-                self.fail(ReleaseError::Unavailable(error.to_string()))
-            }
-            (MembersState::ReadSet, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.on_set(values)
-            }
+        Ok(Next::Call(IoCall::Read(vec![
             (
-                MembersState::Rows,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.on_rows(values, next_start_after),
-            (MembersState::Crate, Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read)))) => {
-                self.on_crate(read)
+                DISTRIBUTION_KEYSPACE.to_string(),
+                binding.set_id.to_bytes().to_vec().into(),
+            ),
+            (
+                DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+                LocalFence::key(binding.set_id).into(),
+            ),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            MembersState::ReadSet => self.on_set(result.values()?),
+            MembersState::Rows => {
+                let (values, next) = result.page()?;
+                self.on_rows(values, next)
             }
-            (MembersState::Holder, Event::Net(NetEvent::Release(ReleaseEvent::Holder(answer)))) => {
-                self.on_holder(answer)
-            }
-            (_, event) => self.unexpected(event),
+            MembersState::Crate | MembersState::Holder => match result.event()? {
+                Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read)))
+                    if self.state == MembersState::Crate =>
+                {
+                    self.on_crate(read)
+                }
+                Event::Net(NetEvent::Release(ReleaseEvent::Holder(answer)))
+                    if self.state == MembersState::Holder =>
+                {
+                    Ok(self.on_holder(answer))
+                }
+                other => Err(IoError::Unexpected {
+                    expected: "the release answer of the current step",
+                    got: other.label(),
+                }
+                .into()),
+            },
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, MembersState::Finish | MembersState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match (self.state, self.error) {
-            (MembersState::Finish, _) => Ok(self.output),
-            (_, Some(error)) => Err(error),
-            _ => Err(ReleaseError::Unavailable(
-                "release check did not finish".into(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
