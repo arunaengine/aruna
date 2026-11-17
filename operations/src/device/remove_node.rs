@@ -457,19 +457,7 @@ mod tests {
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-    use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn context(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -521,8 +509,7 @@ mod tests {
     async fn evicts_owned_device() {
         // The device leaves the stored membership, so it stops being an
         // admitted peer once the configuration is refreshed.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(
@@ -550,8 +537,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_foreign_device() {
         // A device owned by somebody else must look absent, not evictable.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let actor = actor(realm_id);
         let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
@@ -575,8 +561,7 @@ mod tests {
     async fn admin_evicts_foreign() {
         // A realm admin reaches a device it does not own, and the owner path is
         // still refused for the same device.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let actor = actor(realm_id);
         let other = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
@@ -605,8 +590,7 @@ mod tests {
     async fn admin_spares_infrastructure() {
         // The admin scope widens ownership, not membership: a server node is not
         // a device and stays in the configuration.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let actor = actor(realm_id);
         let mut document = realm_with_device(realm_id, &actor, actor.user_id);
@@ -633,8 +617,7 @@ mod tests {
     async fn refuses_server_node() {
         // Peers reject a realm-config event whose origin is not management, so
         // the eviction must not be published from a server node either.
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let actor = actor(realm_id);
         let mut document = realm_with_device(realm_id, &actor, actor.user_id);
@@ -661,8 +644,7 @@ mod tests {
     async fn removal_refuses_publisher() {
         // A set's publisher is never removed with a possibly stale cutoff.
         use aruna_core::structs::storage::distribution::{DistributionRevision, publisher_key};
-        let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let (_dir, ctx) = crate::tests::device::context().await;
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(

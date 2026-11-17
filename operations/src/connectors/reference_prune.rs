@@ -514,20 +514,8 @@ mod tests {
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
     use aruna_core::structs::storage::blob::VersionKey;
-    use aruna_storage::StorageHandle;
     use std::collections::HashMap;
     use std::time::SystemTime;
-
-    fn context(storage_handle: StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
 
     async fn write_rows(context: &DriverContext, writes: Vec<(KeySpace, Key, Value)>) {
         let event = context
@@ -617,7 +605,7 @@ mod tests {
     async fn background_prunes_stale() {
         let dir = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = context(storage);
+        let context = crate::distribution::test_store::context(&storage);
         let connector_id = Ulid::from_bytes([2; 16]);
         let mut writes: Vec<_> = (0..PRUNE_PAGE + 5)
             .map(|index| {

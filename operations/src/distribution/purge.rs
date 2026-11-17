@@ -781,18 +781,7 @@ pub(super) async fn batch_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::test_store::open;
-
-    fn context(storage_handle: aruna_storage::storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
+    use crate::distribution::test_store::{context, open};
 
     fn row(set_id: Ulid, seed: u8) -> Vec<u8> {
         let mut key = set_id.to_bytes().to_vec();
@@ -807,7 +796,7 @@ mod tests {
         use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
         use aruna_core::structs::storage::distribution::fence::RangeFence;
         let (_dir, handle) = open();
-        let context = context(handle);
+        let context = context(&handle);
         let (set_id, other) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
         for seed in 0..4 {
             for id in [set_id, other] {
@@ -907,7 +896,7 @@ mod tests {
         use crate::distribution::split::{SplitConfig, SplitOperation};
         use crate::distribution::test_store::{apply, install, range, write as update};
         let (_dir, handle) = open();
-        let context = context(handle.clone());
+        let context = context(&handle);
         let set_id = Ulid::from_bytes([5; 16]);
         let ids = [1, 2, 3].map(|seed| Ulid::from_bytes([seed; 16]));
         install(&handle, set_id, &[range(1, "", None)]).await;
@@ -968,7 +957,7 @@ mod tests {
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
         use aruna_core::structs::storage::blob::BucketInfo;
         let (_dir, handle) = open();
-        let context = context(handle);
+        let context = context(&handle);
         let set_id = Ulid::from_bytes([1; 16]);
         write(&context, INVENTORY_KEYSPACE, row(set_id, 1), vec![1])
             .await
@@ -1066,7 +1055,7 @@ mod tests {
         // A page takes the rows no version delete took off the range's counters, so what is
         // left of a range being purged stays counted exactly.
         let (_dir, handle) = open();
-        let context = context(handle.clone());
+        let context = context(&handle);
         let (target, charged) = purged_spire(&handle, &context).await;
 
         let rows = page(&context, INVENTORY_KEYSPACE, &target, None)
@@ -1095,7 +1084,7 @@ mod tests {
         };
         use aruna_core::structs::storage::usage::dirty_group_key;
         let (_dir, handle) = open();
-        let context = context(handle.clone());
+        let context = context(&handle);
         let (target, charged) = purged_spire(&handle, &context).await;
         let version_id = Ulid::from_bytes([1; 16]);
         let version = BlobVersion::deleted(
@@ -1154,7 +1143,7 @@ mod tests {
     async fn clears_search_rows() {
         // Content index, search feed and search index rows leave with the set.
         let (_dir, handle) = open();
-        let context = context(handle);
+        let context = context(&handle);
         let set_id = Ulid::from_bytes([1; 16]);
         let key = account_key(set_id, Ulid::from_bytes([3; 16]));
         let spaces = [
