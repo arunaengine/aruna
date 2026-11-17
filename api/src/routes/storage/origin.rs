@@ -693,7 +693,7 @@ pub(crate) async fn version_answer(
             "the version is not on the node the read was directed at".to_string(),
         )),
         W3idIdentifier::VersionedObject(arn) => {
-            let path = lookup::query_path("/data/origin", &[("version", version)]);
+            let path = relay::query_path("/data/origin", &[("version", version)]);
             node_read(state, arn.node_id, &path, bearer.as_ref(), deadline)
                 .await
                 .map(Json)

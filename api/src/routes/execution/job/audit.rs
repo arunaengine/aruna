@@ -370,7 +370,10 @@ pub async fn get_job_audit(
             scope: scope.to_string(),
             records,
             conflicts,
-            next_cursor: page.next.as_ref().map(aruna_core::cursor::encode),
+            next_cursor: page
+                .next
+                .as_ref()
+                .map(|cursor| aruna_core::cursor::encode(cursor.as_slice())),
             projection_digest: hex32(&report.digest),
             responder_node_id: report.responder.map(|node| node.to_string()),
             partial: report.partial,

@@ -13,7 +13,6 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::token_grant;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
