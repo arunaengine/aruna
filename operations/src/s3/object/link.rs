@@ -20,13 +20,14 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::distribution::delegate::DelegationInput;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION, SourceReadError, authorize_read};
+use crate::jobs::source_read::{SourceReadError, authorize_read};
 use crate::jobs::workflow::input_view::ViewStream;
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::staging::native_source::delegated_read;
 use crate::staging::reference::{ReferenceWrite, write_reference_version};
 use aruna_blob::native::body_stream;
+use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LinkError {
