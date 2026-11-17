@@ -1229,7 +1229,7 @@ pub(crate) fn map_bucket_error(error: GetBucketError) -> CallToolResult {
             expected,
             received,
         } => internal_error(format!(
-            "unexpected bucket lookup event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected bucket lookup event in {state:?}: expected {expected}, got {received}"
         )),
         GetBucketError::Incomplete => internal_error("bucket lookup failed"),
     }
@@ -1269,7 +1269,7 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
             expected,
             received,
         } => internal_error(format!(
-            "unexpected object read event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected object read event in {state:?}: expected {expected}, got {received}"
         )),
         GetObjectError::NoTransactionFound => internal_error("object read transaction is missing"),
         GetObjectError::UsageError(error) => internal_error(error),
@@ -1314,7 +1314,7 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
             expected,
             received,
         } => internal_error(format!(
-            "unexpected object head event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected object head event in {state:?}: expected {expected}, got {received}"
         )),
         HeadObjectError::NoTransactionFound => internal_error("object head transaction is missing"),
         HeadObjectError::ResolveReferenceError(error) => internal_error(error),
