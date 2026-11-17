@@ -25,7 +25,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::route_read;
 use crate::driver::drive;
-use crate::jobs::export::zip_entry;
+use crate::jobs::export::archive::zip_entry;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, get_object_routed};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};

@@ -78,8 +78,8 @@ use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget
 use aruna_core::jobs::WaitTarget;
 use aruna_core::structs::identity::auth::AuthContext;
 
-mod archive;
-pub(crate) use archive::*;
+pub(crate) mod archive;
+use archive::*;
 
 const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
 const REPORT_PATH: &str = aruna_core::repository::rules::CRATE_FILES[1];

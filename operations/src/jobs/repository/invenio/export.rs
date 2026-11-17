@@ -29,7 +29,8 @@ use super::verify::{
 };
 use crate::harvest::create_connector::INVENIO_COMMUNITY;
 use crate::jobs::executor::JobContext;
-use crate::jobs::export::{ExportCheckpoint, persist_checkpoint};
+use crate::jobs::export::ExportCheckpoint;
+use crate::jobs::export::archive::persist_checkpoint;
 use crate::jobs::import::archive::{ArchiveCompression, ArchiveEntry};
 use crate::jobs::repository::check::{inspect_artifact, unmet, uploads};
 use crate::jobs::repository::push::{guard, record_draft};

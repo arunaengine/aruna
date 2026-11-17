@@ -11,7 +11,7 @@ pub mod upload;
 
 use upload::{UploadClaimError, claim_rocrate_upload, delete_rocrate_upload};
 
-use crate::jobs::export::persist_checkpoint;
+use crate::jobs::export::archive::persist_checkpoint;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::pin::Pin;

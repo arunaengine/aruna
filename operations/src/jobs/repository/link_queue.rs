@@ -243,9 +243,10 @@ async fn settle_stale(
     queued: &Value,
 ) -> Result<Option<u64>, LinkError> {
     // A push that finished remotely but failed to record it still counts as pushed.
-    let checkpoint = crate::jobs::export::stored_checkpoint(&context.storage_handle, job_id)
-        .await
-        .map_err(LinkError::Unexpected)?;
+    let checkpoint =
+        crate::jobs::export::archive::stored_checkpoint(&context.storage_handle, job_id)
+            .await
+            .map_err(LinkError::Unexpected)?;
     let pushed = checkpoint
         .as_ref()
         .and_then(|checkpoint| checkpoint.pushed_outcome());
