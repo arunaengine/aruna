@@ -10,6 +10,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{HoldScope, Operation, SubOperation};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
@@ -27,6 +28,7 @@ use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::effect_adapters;
 use crate::metadata::MetadataHandle;
+use crate::recorder;
 
 pub use effect_adapters::routing::{
     GateContextError, RoutingInputsError, backend_used_bytes, bucket_snapshot, gate_context,
@@ -453,16 +455,30 @@ trait Drive: Send {
     }
 }
 
+/// The runner's clock for one event delivery, recording the event when the run is recorded.
+fn delivery(record: Option<u64>, event: &Event) -> u64 {
+    let now = unix_timestamp_millis();
+    if let Some(run) = record {
+        recorder::event(run, now, event);
+    }
+    now
+}
+
 /// Parent adapter: the operation borrows, while typed finalization stays in the
-/// parent entry points.
-struct ParentRun<'a, O: Operation>(&'a mut O);
+/// parent entry points. The second field is the run's record number when recording is on.
+struct ParentRun<'a, O: Operation>(&'a mut O, Option<u64>);
 
 impl<O: Operation> Drive for ParentRun<'_, O> {
     fn start(&mut self) -> Effects {
+        let now = unix_timestamp_millis();
+        self.1 = recorder::begin(type_name::<O>(), now, || format!("{:?}", self.0));
+        self.0.stamp(now);
         self.0.start()
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        let now = delivery(self.1, &event);
+        self.0.stamp(now);
         self.0.step(event)
     }
 
@@ -480,15 +496,21 @@ impl<O: Operation> Drive for ParentRun<'_, O> {
 }
 
 /// Suboperation adapter: a boxed child yields an event from `finalize` instead
-/// of a typed result.
-struct SubRun<'a>(&'a mut dyn SubOperation);
+/// of a typed result. The second field is the run's record number when recording is on.
+struct SubRun<'a>(&'a mut dyn SubOperation, Option<u64>);
 
 impl Drive for SubRun<'_> {
     fn start(&mut self) -> Effects {
+        let now = unix_timestamp_millis();
+        let name = type_name_of_val(&*self.0);
+        self.1 = recorder::begin(name, now, || format!("{:?}", self.0));
+        self.0.stamp(now);
         self.0.start()
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        let now = delivery(self.1, &event);
+        self.0.stamp(now);
         self.0.step(event)
     }
 
@@ -919,7 +941,7 @@ pub(crate) fn drive_suboperation<'a>(
                 depth,
                 "Starting suboperation"
             );
-            let mut run = SubRun(operation.as_mut());
+            let mut run = SubRun(operation.as_mut(), None);
             let mut state = drive_effects(
                 &mut run,
                 context,
@@ -931,6 +953,7 @@ pub(crate) fn drive_suboperation<'a>(
             )
             .await;
 
+            let record = run.1;
             abort_leaked_transaction(&mut state.tracker, context, depth, state.cleanup_deadline)
                 .await;
             trace!(
@@ -939,11 +962,22 @@ pub(crate) fn drive_suboperation<'a>(
                 depth,
                 "Completed suboperation"
             );
-            operation.finalize()
+            let event = operation.finalize();
+            if let Some(run) = record {
+                recorder::end(run, unix_timestamp_millis(), || format!("{event:?}"));
+            }
+            event
         }
         .instrument(span)
         .await
     })
+}
+
+/// Records the outcome of a recorded run.
+fn record_end<T: std::fmt::Debug, E: std::fmt::Debug>(record: Option<u64>, result: &Result<T, E>) {
+    if let Some(run) = record {
+        recorder::end(run, unix_timestamp_millis(), || format!("{result:?}"));
+    }
 }
 
 /// Waits for the backend hold of `scope`; the run keeps it until it returns or is dropped. A
@@ -979,7 +1013,7 @@ pub async fn drive_until<O: Operation>(
         let _ = operation.abort();
         return operation.finalize();
     };
-    let mut run = ParentRun(&mut operation);
+    let mut run = ParentRun(&mut operation, None);
     let mut state = drive_effects(
         &mut run,
         context,
@@ -990,6 +1024,7 @@ pub async fn drive_until<O: Operation>(
         Some(type_name::<O>()),
     )
     .await;
+    let record = run.1;
     if !operation.is_complete() {
         // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
         // tracker resolve any transaction they name.
@@ -1003,6 +1038,7 @@ pub async fn drive_until<O: Operation>(
     )
     .await;
     let result = operation.finalize();
+    record_end(record, &result);
     if let Err(error) = &result {
         if O::expected_error(error) {
             debug!(
@@ -1045,7 +1081,7 @@ pub async fn drive<O: Operation>(
     );
 
     let _hold = take_hold(context, operation.hold_scope()).await;
-    let mut run = ParentRun(&mut operation);
+    let mut run = ParentRun(&mut operation, None);
     // Heap the effect loop: an adapter may drive another operation inline, and
     // nested effect-loop futures otherwise stack up in one caller's future.
     let mut state = Box::pin(drive_effects(
@@ -1058,8 +1094,10 @@ pub async fn drive<O: Operation>(
         None,
     ))
     .await;
+    let record = run.1;
     abort_leaked_transaction(&mut state.tracker, context, 0, None).await;
     let result = operation.finalize();
+    record_end(record, &result);
     match &result {
         Ok(_) => trace!(
             event = "operation.completed",
@@ -2809,7 +2847,7 @@ mod test {
             closed: false,
         };
         let end = run_window(
-            &mut ParentRun(&mut operation),
+            &mut ParentRun(&mut operation, None),
             &mut run,
             &mut Vec::new(),
             GroupEnd::Expired,
@@ -3256,5 +3294,86 @@ mod test {
         let sleeper = Sleeper { after, woke: false };
         assert_eq!(drive_until(sleeper, &context, deadline).await, Err(()));
         assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    /// Waits one second and reports whether the runner stamped a time on it.
+    #[derive(Debug, Default, PartialEq)]
+    struct Echo {
+        stamped: Option<u64>,
+        woke: bool,
+    }
+
+    impl Operation for Echo {
+        type Output = bool;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Delay(Duration::from_secs(1))]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            self.woke = matches!(event, Event::Delayed);
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.woke
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self.stamped.is_some())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn stamp(&mut self, now_ms: u64) {
+            self.stamped = Some(now_ms);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recording_keeps_order() {
+        use crate::recorder::{Entry, RecordLimits};
+        let limits = RecordLimits {
+            total_bytes: 1 << 20,
+            entry_bytes: 4096,
+        };
+        crate::recorder::enable(limits);
+        let result = drive(Echo::default(), &bare_context()).await;
+        crate::recorder::disable();
+        assert_eq!(
+            result,
+            Ok(true),
+            "the runner stamps the time on the operation"
+        );
+        // Other tests may record at the same time, so only this run's records count.
+        let records = crate::recorder::take().records;
+        let run = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                Entry::Started { operation, .. } if operation.ends_with("::Echo") => {
+                    Some(record.run)
+                }
+                _ => None,
+            })
+            .expect("the run was recorded");
+        let entries: Vec<&Entry> = records
+            .iter()
+            .filter(|record| record.run == run)
+            .map(|record| &record.entry)
+            .collect();
+        assert!(matches!(
+            entries.as_slice(),
+            [
+                Entry::Started { .. },
+                Entry::Event {
+                    label: "Event::Delayed",
+                    ..
+                },
+                Entry::Ended { .. },
+            ]
+        ));
     }
 }

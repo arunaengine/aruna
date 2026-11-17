@@ -43,6 +43,10 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
         false
     }
 
+    /// The runner's clock in Unix milliseconds, given right before `start` and each `step`.
+    /// An operation that needs the time keeps it here instead of reading a clock; tests forge it.
+    fn stamp(&mut self, _now_ms: u64) {}
+
     /// The backend scope this operation holds from before its first effect until it ends, so
     /// no two operations with the same scope overlap. Only a top-level drive takes it.
     fn hold_scope(&self) -> Option<HoldScope> {
@@ -81,6 +85,8 @@ pub trait SubOperation: Send + std::fmt::Debug {
     fn is_complete(&self) -> bool;
     fn finalize(self: Box<Self>) -> Event;
     fn abort(&mut self) -> Effects;
+    /// See [`Operation::stamp`].
+    fn stamp(&mut self, _now_ms: u64) {}
     fn as_any(&self) -> &dyn Any;
     fn eq_dyn(&self, other: &dyn SubOperation) -> bool;
 }
@@ -181,6 +187,12 @@ where
             .as_mut()
             .expect("suboperation must be present in abort")
             .abort()
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        if let Some(operation) = self.operation.as_mut() {
+            operation.stamp(now_ms);
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -101,6 +101,9 @@ pub trait Procedure: Send + std::fmt::Debug + PartialEq {
     /// The next call after `result`, or the outcome.
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error>;
 
+    /// See [`Operation::stamp`].
+    fn stamp(&mut self, _now_ms: u64) {}
+
     /// See [`Operation::hold_scope`].
     fn hold_scope(&self) -> Option<HoldScope> {
         None
@@ -345,6 +348,10 @@ impl<P: Procedure> Operation for ProcedureOperation<P> {
             State::Committing(_) | State::Finished(_) => smallvec![],
             _ => self.fail(ProcedureError::Aborted),
         }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.procedure.stamp(now_ms);
     }
 
     fn hold_scope(&self) -> Option<HoldScope> {
