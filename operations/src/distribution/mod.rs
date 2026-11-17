@@ -13,6 +13,7 @@ pub mod feed_walks;
 pub mod forward;
 pub mod guard;
 pub mod handoff;
+pub mod held;
 pub(crate) mod imports;
 pub mod index_feed;
 pub mod inventory;

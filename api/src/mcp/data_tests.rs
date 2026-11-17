@@ -276,7 +276,7 @@ fn put_errors_mapped() {
 // A version held only by other members is this node's failure to read, never a missing key.
 #[test]
 fn held_read_internal() {
-    let held = aruna_operations::distribution::pull::HeldElsewhere {
+    let held = aruna_operations::distribution::held::HeldElsewhere {
         set_id: ulid::Ulid::from_bytes([4; 16]),
         version_id: ulid::Ulid::from_bytes([5; 16]),
         identity: [6; 32],

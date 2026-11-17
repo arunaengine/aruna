@@ -4,7 +4,7 @@
 
 pub mod sealed;
 
-use crate::distribution::pull::record_only;
+use crate::distribution::held::record_only;
 use crate::driver::{
     DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
     routing_snapshot,

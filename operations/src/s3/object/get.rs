@@ -11,10 +11,10 @@ use crate::blob::promote::{
 use crate::blob::records::blob_location_read;
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::distribution::pull::{
+use crate::distribution::held::{
     HeldElsewhere, PullRequest, kept_location, kept_reads, kept_source_location, kept_source_reads,
-    pinned_blob, pull_through,
 };
+use crate::distribution::pull::{pinned_blob, pull_through};
 use crate::distribution::source_keep::{SourceKeep, keep_first};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
