@@ -19,15 +19,15 @@ use aruna_core::structs::storage::blob::VersionKey;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
 
-use super::executor::{JobContext, JobRunOutcome};
-use super::key_wake::version_wait;
+use super::account::read_user;
+use super::broker::local_object;
+use super::broker::unmarked;
+use super::check::{check_identity, copy_grants};
+use super::install::read_config;
+use super::work::{WorkRow, read_work};
 use crate::driver::drive;
-use crate::plugins::account::read_user;
-use crate::plugins::broker::local_object;
-use crate::plugins::broker::unmarked;
-use crate::plugins::check::{check_identity, copy_grants};
-use crate::plugins::install::read_config;
-use crate::plugins::work::{WorkRow, read_work};
+use crate::jobs::executor::{JobContext, JobRunOutcome};
+use crate::jobs::key_wake::version_wait;
 
 use super::transfers::{Download, Upload, download_work, upload_work};
 use crate::s3::object::copy::{

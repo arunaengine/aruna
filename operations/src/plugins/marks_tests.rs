@@ -8,10 +8,10 @@ use aruna_core::structs::execution::job::PluginWorkSpec;
 
 use super::*;
 use crate::driver::DriverContext;
-use crate::jobs::plugin_work::tests::ready_copy;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::jobs::retire_work;
+use crate::plugins::plugin_work::tests::ready_copy;
 use crate::plugins::rows::values_result;
 use crate::plugins::rows::write_rows;
 use crate::plugins::work::tests::edit_work;

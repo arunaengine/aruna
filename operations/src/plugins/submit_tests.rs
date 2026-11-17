@@ -7,9 +7,9 @@ use aruna_core::plugin_installs::PluginInstall;
 
 use super::*;
 use crate::driver::DriverContext;
-use crate::jobs::plugin_work::tests::copier;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::plugin_work::tests::copier;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::test::seed_bucket;
