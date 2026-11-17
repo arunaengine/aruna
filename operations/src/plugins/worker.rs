@@ -43,7 +43,7 @@ use super::decide::{
 };
 use super::dispatch::enqueue_timers;
 use super::dispatch::event_run;
-use super::finished::notify_work;
+use super::finished::{NotifyWork, finished_event};
 use super::forward::{
     Backoff, REQUEST_BYTES, Requests, apply, dataset_facts, drop_rows, expire_rows, next_install,
     receiver_requests,
@@ -74,7 +74,7 @@ use super::runs::{
     unfinished,
 };
 use super::waiting::SettleWaiting;
-use super::work::prune_work;
+use super::work::{WorkRow, WorkState, prune_work, work_scan};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::dot_applied;
 use crate::metadata::protocol::MetadataReadError;
@@ -838,6 +838,56 @@ pub(crate) async fn unreadable(ctx: &DriverContext, row: &ForwardRow) -> Result<
         (_, None) => facts.logged && facts.materialized(|id| id == event_id),
     };
     Ok(!applied && !facts.deleted)
+}
+
+/// Admits a `job_finished` run for every settled work whose starting run succeeded and marks the
+/// work notified in the same transaction; a manifest without the trigger is notified without a
+/// run. Answers how many works were notified.
+pub(crate) async fn notify_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<usize, RunError> {
+    let rows = drive(scan_rows(work_scan()), ctx).await?;
+    let mut notified = 0;
+    for (key, value) in rows {
+        let row: WorkRow = decode(&value)?;
+        if row.state != WorkState::Settled || row.notified {
+            continue;
+        }
+        let Some(install) = (config.installs.iter()).find(|install| {
+            key.get(1..17) == Some(&install.install_id.to_bytes()[..])
+                && install.account == row.account
+                && install.receiver == local
+                && install.state != InstallState::Removing
+        }) else {
+            continue;
+        };
+        let run = match drive(read_run(install.install_id, row.run_id), ctx).await {
+            Ok(run) => Some(run),
+            // Runs stay while a completion waits; one that is gone anyway cannot be retried.
+            Err(RunError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        if run.is_some_and(|run| run.state != RunState::Succeeded) {
+            continue;
+        }
+        let event = finished_event(install, &row, now_ms);
+        let finished = event_run(config, install, &event, now_ms);
+        let _admitting = ADMISSIONS.lock().await;
+        let notify = NotifyWork::new(install.install_id, row.work_id, finished);
+        match drive(RowsOperation::transaction(notify), ctx).await {
+            Ok(true) => notified += 1,
+            Ok(false) => {}
+            // A full queue takes the completion at a later pass.
+            Err(RunError::Full(_)) => {}
+            Err(error) => {
+                warn!(%error, work = %row.work_id, "Could not deliver a finished plugin job")
+            }
+        }
+    }
+    Ok(notified)
 }
 
 /// Decides each waiting event that is ready or expired; returns how many left the waiting set.

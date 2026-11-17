@@ -5,12 +5,15 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::plugin_installs::{PluginInstall, SecretBinding};
-use aruna_core::plugin_runs::PluginRun;
+use aruna_core::plugin_installs::{InstallState, PluginInstall, SecretBinding};
+use aruna_core::plugin_runs::{HookRequest, PluginRun, RunTrigger};
 use serde_json::json;
 
 use super::*;
+use crate::driver::drive;
 use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hook_secret, keys};
+use crate::plugins::dispatch::{admit_hook, checks_authorization};
+use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::outbound::tests::leaks;
 use crate::plugins::runs::list_runs;
@@ -156,7 +159,6 @@ async fn refusals_start_nothing() {
 
 /// Writes the node secret `hook-key` of kind `header` on this node, checking `checked`.
 async fn node_secret(fixture: &Fixture, checked: &str, round: u64) {
-    use crate::driver::drive;
     use crate::secrets::SecretChange;
     use crate::secrets::node::{NodeChange, NodeSecretOperation};
     use aruna_core::compute::Secret;

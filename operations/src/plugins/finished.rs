@@ -3,73 +3,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunState, SourceEvent, SourceKind, run_key};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use tracing::warn;
 use ulid::Ulid;
 
-use super::dispatch::event_run;
 use super::intents::{intent_scan, undone_keys};
 use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, decode, done, encode, row, scan_rows, values,
+    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, decode, done, encode, row, values,
 };
-use super::runs::{ADMISSIONS, Admission, RunError, audit_rows, read_run};
-use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_scan, work_state};
-use crate::driver::{DriverContext, drive};
-
-/// Admits a `job_finished` run for every settled work whose starting run succeeded and marks the
-/// work notified in the same transaction; a manifest without the trigger is notified without a
-/// run. Answers how many works were notified.
-pub(crate) async fn notify_work(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
-    now_ms: u64,
-) -> Result<usize, RunError> {
-    let rows = drive(scan_rows(work_scan()), ctx).await?;
-    let mut notified = 0;
-    for (key, value) in rows {
-        let row: WorkRow = decode(&value)?;
-        if row.state != WorkState::Settled || row.notified {
-            continue;
-        }
-        let Some(install) = (config.installs.iter()).find(|install| {
-            key.get(1..17) == Some(&install.install_id.to_bytes()[..])
-                && install.account == row.account
-                && install.receiver == local
-                && install.state != InstallState::Removing
-        }) else {
-            continue;
-        };
-        let run = match drive(read_run(install.install_id, row.run_id), ctx).await {
-            Ok(run) => Some(run),
-            // Runs stay while a completion waits; one that is gone anyway cannot be retried.
-            Err(RunError::NotFound) => None,
-            Err(error) => return Err(error),
-        };
-        if run.is_some_and(|run| run.state != RunState::Succeeded) {
-            continue;
-        }
-        let event = finished_event(install, &row, now_ms);
-        let finished = event_run(config, install, &event, now_ms);
-        let _admitting = ADMISSIONS.lock().await;
-        let notify = NotifyWork::new(install.install_id, row.work_id, finished);
-        match drive(RowsOperation::transaction(notify), ctx).await {
-            Ok(true) => notified += 1,
-            Ok(false) => {}
-            // A full queue takes the completion at a later pass.
-            Err(RunError::Full(_)) => {}
-            Err(error) => {
-                warn!(%error, work = %row.work_id, "Could not deliver a finished plugin job")
-            }
-        }
-    }
-    Ok(notified)
-}
+use super::runs::{Admission, RunError, audit_rows};
+use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_state};
 
 /// Marks a settled work notified, with the `job_finished` run it starts admitted in the same
 /// transaction; `false` when the work is gone or notified already. The caller holds `ADMISSIONS`.
@@ -252,17 +197,6 @@ impl Plan for RetryRun {
     }
 }
 
-/// Queues a failed or cancelled run again under the admission lock; see [`retry_run`].
-pub async fn run_again(
-    ctx: &DriverContext,
-    ids: (Ulid, Ulid),
-    audit: &AdminAuditRecord,
-    now_ms: u64,
-) -> Result<PluginRun, RunError> {
-    let _admitting = ADMISSIONS.lock().await;
-    drive(retry_run(ids, audit, now_ms)?, ctx).await
-}
-
 /// Marks the held end of job `work_id` delivered without a run; the audit row commits with it.
 pub fn drop_completion(
     (install_id, work_id): (Ulid, Ulid),
@@ -313,7 +247,7 @@ impl Plan for DropCompletion {
 
 /// The event a `job_finished` run gets: the job's id, the object path it wrote or read, and
 /// how it ended.
-fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> SourceEvent {
+pub(crate) fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64) -> SourceEvent {
     let path = match row.kind {
         WorkKind::Copy | WorkKind::Download => row.target.clone(),
         WorkKind::Upload => row.source.clone(),
