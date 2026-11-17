@@ -222,7 +222,7 @@ impl CreateDocumentOperation {
     /// A create a non-holder forwarded here. The document's bucket is its blind
     /// hash rather than this node's pick, so every holder the forwarder may try
     /// stamps the same bucket.
-    pub fn new_forwarded(config: CreateDocumentConfig) -> Self {
+    pub(crate) fn new_forwarded(config: CreateDocumentConfig) -> Self {
         let mut operation = Self::new(config);
         operation.forwarded = true;
         operation
@@ -805,7 +805,7 @@ pub async fn create_metadata_document(
 
 /// Mints from a local held bucket and a pre-provisioned binding.
 /// Missing holdership or bindings fail closed for routed handling.
-pub async fn mint_local_id(
+pub(crate) async fn mint_local_id(
     context: &DriverContext,
     config: &CreateDocumentConfig,
 ) -> Result<MetaResourceId, CreateDocumentError> {

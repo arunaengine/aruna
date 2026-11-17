@@ -25,7 +25,7 @@ pub enum CheckpointError {
 
 /// Checks the document's current window after an event materialized here and writes a
 /// checkpoint when it is due. Nodes that are not origins of the document never write one.
-pub async fn after_materialization(
+pub(crate) async fn after_materialization(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Result<(), CheckpointError> {

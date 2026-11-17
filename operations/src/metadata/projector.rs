@@ -143,7 +143,7 @@ pub async fn schedule_projection_drain(
     }
 }
 
-pub async fn restore_projection_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_projection_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
@@ -377,7 +377,7 @@ async fn read_create_event(
     Ok(event)
 }
 
-pub async fn project_create_event(
+pub(crate) async fn project_create_event(
     context: &DriverContext,
     event: MetadataEventRecord,
     local_node_id: Option<NodeId>,
@@ -1105,7 +1105,7 @@ async fn read_realm_config(
 /// The document's registry row, published on the registry class's own
 /// everywhere-bound topic rather than the replica-capped bucket topic, so every
 /// node learns the routing mapping. `None` without config or a holder; replay re-plans.
-pub fn registry_outbox_record(
+pub(crate) fn registry_outbox_record(
     event: &MetadataEventRecord,
     realm_config: Option<&RealmConfigDocument>,
     allow_genesis: bool,
@@ -1151,7 +1151,7 @@ pub fn registry_outbox_record(
     })
 }
 
-pub fn create_outbox_record(
+pub(crate) fn create_outbox_record(
     event: &MetadataEventRecord,
     message: Option<&str>,
     realm_config: Option<&RealmConfigDocument>,

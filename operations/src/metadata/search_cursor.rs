@@ -174,7 +174,7 @@ impl From<CursorEnvelopeError> for SearchCursorError {
 }
 
 impl SignedCursor<SearchCursorPayload> {
-    pub fn new_signed(
+    pub(crate) fn new_signed(
         fingerprint: [u8; 32],
         watermark: SearchWatermark,
         resume: Vec<(NodeId, u32)>,
@@ -214,7 +214,7 @@ impl SignedCursor<SearchCursorPayload> {
         .map_err(SearchCursorError::from)
     }
 
-    pub fn resume_positions(&self) -> HashMap<NodeId, u32> {
+    pub(crate) fn resume_positions(&self) -> HashMap<NodeId, u32> {
         self.payload
             .resume
             .iter()
@@ -229,7 +229,7 @@ impl SignedCursor<SearchCursorPayload> {
 
 /// Binds a cursor to the query that produced it. Recomputed on every continuation
 /// request; a mismatch rejects the cursor. The query string itself is not stored.
-pub fn query_fingerprint(
+pub(crate) fn query_fingerprint(
     query: &str,
     graph_iris: Option<&[String]>,
     mode: Option<ApiQueryMode>,
@@ -301,7 +301,7 @@ pub struct SearchPage {
 /// Deduplicate hits on `(graph_iri, subject_iri)`, keeping the highest score
 /// (smallest `document_id` on ties) and any title, snippet or subject types;
 /// final order is craqle's: score descending, then a hash of graph and subject.
-pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
+pub(crate) fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
     let mut deduped: HashMap<(String, String), MetadataSearchHit> = HashMap::new();
     for hit in hits {
         let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
@@ -463,7 +463,7 @@ pub fn paginate(
 
 /// Per-node fetch depth: resume position plus one page, defaulting unknown nodes to
 /// the deepest known resume so a newly seen node is not asked too shallow.
-pub fn resume_fetch_limit(
+pub(crate) fn resume_fetch_limit(
     resume: &HashMap<NodeId, u32>,
     node_id: NodeId,
     page_size: usize,

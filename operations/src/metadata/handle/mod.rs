@@ -43,15 +43,13 @@ use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
 
 mod effects;
-pub(crate) use self::effects::metadata_read_error;
-pub use self::effects::{
-    export_rocrate_jsonld, export_rocrate_page, export_summary_jsonld, send_metadata_effect,
-};
-pub use self::lifecycle::{
-    list_cached_group, list_cached_records, list_group_records, prune_if_deleted, warm_caches,
-};
+pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
+pub(crate) use self::effects::{export_rocrate_page, export_summary_jsonld, metadata_read_error};
+pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
+pub(crate) use self::lifecycle::{list_group_records, prune_if_deleted};
 pub use self::query::query_authorized_local;
-pub use self::search::{search_authorized_local, search_local_filtered};
+pub use self::search::search_authorized_local;
+pub(crate) use self::search::search_local_filtered;
 pub(crate) use self::transport::transport_message_kind;
 mod ingress;
 mod lifecycle;
@@ -477,7 +475,7 @@ impl MetadataHandle {
     }
 
     /// The search indexes of the distributed bucket ranges this node holds.
-    pub fn range_indexes(&self) -> Arc<RangeIndexes> {
+    pub(crate) fn range_indexes(&self) -> Arc<RangeIndexes> {
         self.inner.range_indexes.clone()
     }
 
@@ -550,7 +548,7 @@ impl MetadataHandle {
             .upsert_at(std::slice::from_ref(&record), Some(generation));
     }
 
-    pub fn remove_cached_record(&self, document_id: Ulid) {
+    pub(crate) fn remove_cached_record(&self, document_id: Ulid) {
         self.inner
             .visibility_cache
             .remove_registry_record(document_id);

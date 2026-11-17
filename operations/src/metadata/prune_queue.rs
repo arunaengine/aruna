@@ -79,11 +79,11 @@ impl From<MetadataQueueError> for MetadataGraphError {
     }
 }
 
-pub fn new_prune_job(graph_iri: String, due_at_ms: u64) -> GraphPruneRecord {
+pub(crate) fn new_prune_job(graph_iri: String, due_at_ms: u64) -> GraphPruneRecord {
     GraphPruneRecord::new(graph_iri, due_at_ms)
 }
 
-pub fn write_prune_effect(
+pub(crate) fn write_prune_effect(
     record: &GraphPruneRecord,
     txn_id: Option<Ulid>,
 ) -> Result<Effect, ConversionError> {
@@ -96,14 +96,14 @@ pub fn write_prune_effect(
     }))
 }
 
-pub fn schedule_prune_drain() -> Effect {
+pub(crate) fn schedule_prune_drain() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainPruneQueue,
         after: Duration::ZERO,
     })
 }
 
-pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     match next_prune_timer(storage).await {
         Ok(None) => {}
         Ok(Some(after)) => {
@@ -121,7 +121,7 @@ pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHand
     }
 }
 
-pub async fn next_prune_timer(
+pub(crate) async fn next_prune_timer(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, MetadataGraphError> {
     let now_ms = unix_timestamp_millis();
@@ -243,7 +243,7 @@ pub async fn process_prune_batch(
     })
 }
 
-pub async fn enqueue_prune_job(
+pub(crate) async fn enqueue_prune_job(
     context: &DriverContext,
     graph_iri: String,
 ) -> Result<(), MetadataGraphError> {

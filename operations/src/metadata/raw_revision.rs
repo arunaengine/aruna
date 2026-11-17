@@ -132,7 +132,7 @@ pub enum RawReadError {
     InconsistentLog(String),
 }
 
-pub async fn load_raw_view(
+pub(crate) async fn load_raw_view(
     context: &DriverContext,
     document_id: Ulid,
     txn_id: Option<TxnId>,

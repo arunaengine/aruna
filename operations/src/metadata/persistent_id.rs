@@ -57,7 +57,7 @@ pub enum PersistentIdError {
     PlacementFenced,
 }
 
-pub fn read_mapping_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub(crate) fn read_mapping_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: ID_MAPPING_KEYSPACE.to_string(),
         key: ByteView::from(persistent_id_key(document_id)),
@@ -65,7 +65,9 @@ pub fn read_mapping_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     })
 }
 
-pub fn parse_mapping_read(event: Event) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
+pub(crate) fn parse_mapping_read(
+    event: Event,
+) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
     match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
             .map(|bytes| {
@@ -138,7 +140,7 @@ pub async fn mint_persistent_id(
 }
 
 /// Adds external identifiers on this node's row; callers route to the PID authority first.
-pub async fn add_secondary_ids(
+pub(crate) async fn add_secondary_ids(
     ctx: &DriverContext,
     realm_id: RealmId,
     document_id: Ulid,
@@ -167,7 +169,7 @@ pub async fn add_secondary_ids(
 /// Record a terminal provider failure on the same intent. Projection absence
 /// must never call this path; the mint handler uses the non-terminal Processing
 /// transition above for that condition.
-pub async fn fail_persistent_id(
+pub(crate) async fn fail_persistent_id(
     ctx: &DriverContext,
     realm_id: RealmId,
     document_id: Ulid,
@@ -228,7 +230,7 @@ pub async fn fail_persistent_id(
 /// Exceptional administrator-only withdrawal. Authorization is enforced at
 /// both routing hops; the transition stores the actor and required reason and
 /// writes the generic metadata audit row in the same transaction.
-pub async fn admin_withdraw_pid(
+pub(crate) async fn admin_withdraw_pid(
     ctx: &DriverContext,
     realm_id: RealmId,
     document_id: Ulid,
@@ -318,7 +320,7 @@ pub(crate) async fn mapping_route(
 
 /// The route for a caller that already holds the realm config, such as the delete
 /// transaction that writes the tombstone alongside the registry row it removes.
-pub fn mapping_route_for(
+pub(crate) fn mapping_route_for(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     document_id: Ulid,
@@ -334,7 +336,7 @@ pub fn mapping_route_for(
     })
 }
 
-pub fn mapping_placement(
+pub(crate) fn mapping_placement(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     document_id: Ulid,
@@ -352,7 +354,10 @@ fn transition_actor(route: &Option<MappingRoute>) -> aruna_core::NodeId {
         .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public())
 }
 
-pub fn mapping_revision(route: &Option<MappingRoute>, occurred_at_ms: u64) -> PersistentIdRevision {
+pub(crate) fn mapping_revision(
+    route: &Option<MappingRoute>,
+    occurred_at_ms: u64,
+) -> PersistentIdRevision {
     PersistentIdRevision {
         event_id: Ulid::generate(),
         actor: transition_actor(route),
@@ -443,7 +448,7 @@ async fn admin_withdraw_txn(
 
 /// Deletion transition shared with the document delete. It is composed into the
 /// transaction that removes the registry row; an absent mapping stays absent.
-pub fn tombstone_transition(
+pub(crate) fn tombstone_transition(
     existing: Option<&PersistentIdMapping>,
     route: &Option<MappingRoute>,
     document_id: Ulid,
@@ -465,7 +470,7 @@ pub type TransitionEntry = (String, ByteView, ByteView);
 
 /// Row, identifier index, sync sidecar, shard-manifest entry and outbox publish, so an accepted
 /// transition is either fully durable and replicated or not taken.
-pub fn transition_entries(
+pub(crate) fn transition_entries(
     route: &Option<MappingRoute>,
     mapping: &PersistentIdMapping,
 ) -> Result<Vec<TransitionEntry>, PersistentIdError> {

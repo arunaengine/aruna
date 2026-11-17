@@ -324,7 +324,9 @@ pub async fn lookup_local(
 }
 
 /// Merges answers from several nodes: one entry per document, `Published` first, then by id.
-pub fn merge_matches(answers: impl IntoIterator<Item = IdentifierMatch>) -> Vec<IdentifierMatch> {
+pub(crate) fn merge_matches(
+    answers: impl IntoIterator<Item = IdentifierMatch>,
+) -> Vec<IdentifierMatch> {
     let mut merged: Vec<IdentifierMatch> = Vec::new();
     for answer in answers {
         match merged

@@ -40,7 +40,7 @@ pub const LIST_METADATA_SIZE: usize = 128;
 // actor round trips low (the data volume is small, the trips dominate).
 pub const FILL_PAGE_SIZE: usize = 8192;
 
-pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Key {
+pub(crate) fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(48);
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes.extend_from_slice(&document_id.to_bytes());
@@ -48,7 +48,11 @@ pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) 
     ByteView::from(bytes)
 }
 
-pub fn read_registry_effect(group_id: GroupId, document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub(crate) fn read_registry_effect(
+    group_id: GroupId,
+    document_id: Ulid,
+    txn_id: Option<TxnId>,
+) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_INDEX_KEYSPACE.to_string(),
         key: metadata_registry_key(group_id, document_id),
@@ -56,7 +60,7 @@ pub fn read_registry_effect(group_id: GroupId, document_id: Ulid, txn_id: Option
     })
 }
 
-pub fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub(crate) fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
@@ -64,7 +68,7 @@ pub fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effec
     })
 }
 
-pub fn read_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub(crate) fn read_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: MATERIALIZATION_STATUS_KEYSPACE.to_string(),
         key: materialization_status_key(document_id),
@@ -72,7 +76,7 @@ pub fn read_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     })
 }
 
-pub fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
+pub(crate) fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
         key: graph_lifecycle_key(graph_iri),
@@ -80,7 +84,7 @@ pub fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
     })
 }
 
-pub fn write_registry_effect(
+pub(crate) fn write_registry_effect(
     record: &MetadataRegistryRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
@@ -92,7 +96,7 @@ pub fn write_registry_effect(
     }))
 }
 
-pub fn delete_registry_effect(
+pub(crate) fn delete_registry_effect(
     group_id: GroupId,
     document_id: Ulid,
     txn_id: Option<TxnId>,
@@ -104,7 +108,7 @@ pub fn delete_registry_effect(
     })
 }
 
-pub fn delete_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub(crate) fn delete_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Delete {
         key_space: DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
@@ -112,7 +116,7 @@ pub fn delete_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     })
 }
 
-pub fn iter_registry_effect(
+pub(crate) fn iter_registry_effect(
     group_id: GroupId,
     start_after: Option<Key>,
     txn_id: Option<TxnId>,
@@ -152,7 +156,7 @@ pub fn write_document_lifecycle(
     }))
 }
 
-pub fn write_lifecycle_revision(
+pub(crate) fn write_lifecycle_revision(
     record: &MetadataLifecycleRecord,
     delete_actor: NodeId,
     placement: aruna_core::structs::placement::record::PlacementRef,
@@ -171,7 +175,7 @@ pub fn write_lifecycle_revision(
     }))
 }
 
-pub fn delete_holders_effect(
+pub(crate) fn delete_holders_effect(
     group_id: GroupId,
     document_id: Ulid,
     txn_id: Option<TxnId>,
@@ -185,7 +189,7 @@ pub fn delete_holders_effect(
 
 // DEFERRED (#280 audit trail): these audit records back the generic audit read endpoint;
 // the causal-event contract is the deferred remainder.
-pub fn write_audit_effect(
+pub(crate) fn write_audit_effect(
     record: &MetadataAuditRecord,
     audit_id: Ulid,
     txn_id: Option<TxnId>,
@@ -198,7 +202,7 @@ pub fn write_audit_effect(
     }))
 }
 
-pub fn write_create_effect(
+pub(crate) fn write_create_effect(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
@@ -264,7 +268,7 @@ fn outbox_lifecycle_upsert(
     Ok(Some((lifecycle, *change)))
 }
 
-pub fn create_materialization_entries(
+pub(crate) fn create_materialization_entries(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
@@ -279,7 +283,7 @@ pub fn create_materialization_entries(
     Ok(writes)
 }
 
-pub fn event_projection_entries(
+pub(crate) fn event_projection_entries(
     event: &MetadataEventRecord,
     audit: &MetadataAuditRecord,
     outbox: Option<&DocumentOutboxRecord>,
@@ -299,7 +303,7 @@ pub fn event_projection_entries(
     Ok(writes)
 }
 
-pub fn parse_registry_read(
+pub(crate) fn parse_registry_read(
     event: Event,
 ) -> Result<Option<MetadataRegistryRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
@@ -307,7 +311,7 @@ pub fn parse_registry_read(
     })
 }
 
-pub fn parse_status_read(
+pub(crate) fn parse_status_read(
     event: Event,
 ) -> Result<Option<MaterializationStatusRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
@@ -315,7 +319,7 @@ pub fn parse_status_read(
     })
 }
 
-pub fn parse_lifecycle_read(
+pub(crate) fn parse_lifecycle_read(
     event: Event,
 ) -> Result<Option<GraphLifecycleRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
@@ -323,7 +327,7 @@ pub fn parse_lifecycle_read(
     })
 }
 
-pub fn parse_registry_iter(
+pub(crate) fn parse_registry_iter(
     event: Event,
 ) -> Result<(Vec<MetadataRegistryRecord>, Option<Key>), StorageReadError> {
     parse_storage_iter(event, |bytes| {
@@ -331,7 +335,7 @@ pub fn parse_registry_iter(
     })
 }
 
-pub fn empty_effects() -> Effects {
+pub(crate) fn empty_effects() -> Effects {
     smallvec![]
 }
 

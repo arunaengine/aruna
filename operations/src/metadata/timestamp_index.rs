@@ -42,7 +42,7 @@ pub struct UpdatedRecordsPage {
 /// Enumerate registry records whose `updated_at_ms` is in `[from_ms, until_ms]`,
 /// ascending, up to `limit` records, local realm only. Keys are validated
 /// against the current record; stale keys are skipped, never under-listing.
-pub async fn enumerate_updated(
+pub(crate) async fn enumerate_updated(
     context: &DriverContext,
     from_ms: u64,
     until_ms: u64,
@@ -113,7 +113,7 @@ pub struct SweepPass {
 /// Deletes index keys whose record moved to a newer datestamp or was deleted.
 /// Racing a concurrent write is benign: the writer re-adds the current key,
 /// and readers validate every key against the record regardless.
-pub async fn sweep_stale_keys(
+pub(crate) async fn sweep_stale_keys(
     context: &DriverContext,
     after: Option<Key>,
 ) -> Result<SweepPass, StorageReadError> {
@@ -181,7 +181,7 @@ async fn sweep_bounded(
 
 /// Runs the sweep on the shutdown supervisor, resuming from the previous pass so
 /// no single pass walks the whole index.
-pub fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
+pub(crate) fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
     let token = shutdown.token();
     shutdown.spawn(async move {
         let mut cursor = None;
@@ -210,7 +210,7 @@ fn iter_effect(start: IterStart) -> Effect {
 
 /// Untransacted batch delete of index keys in one keyspace, returning how many
 /// were dropped.
-pub async fn delete_index_keys(
+pub(crate) async fn delete_index_keys(
     context: &DriverContext,
     keyspace: &str,
     keys: Vec<Key>,

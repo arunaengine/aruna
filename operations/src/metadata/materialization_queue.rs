@@ -216,7 +216,7 @@ impl From<MetadataIriError> for MetadataMaterializationError {
     }
 }
 
-pub fn schedule_materialization() -> Effect {
+pub(crate) fn schedule_materialization() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainMaterializationQueue,
         after: Duration::ZERO,
@@ -237,7 +237,10 @@ pub fn new_pending_status(
     MaterializationStatusRecord::pending(event, updated_at_ms)
 }
 
-pub async fn restore_materialization_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_materialization_timer(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+) {
     match next_timer_after(storage).await {
         Ok(None) => {}
         Ok(Some(after)) => {
@@ -255,7 +258,7 @@ pub async fn restore_materialization_timer(storage: &StorageHandle, task_handle:
     }
 }
 
-pub async fn next_timer_after(
+pub(crate) async fn next_timer_after(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, MetadataMaterializationError> {
     let now_ms = unix_timestamp_millis();
@@ -912,7 +915,7 @@ async fn read_dead_letter(
 /// Returns due dead letters to the queue and clears their terminal status, so a
 /// node converges once the cause clears. Dead letters the document has moved
 /// past are dropped instead. Returns the number of jobs requeued.
-pub async fn requeue_dead_letters(
+pub(crate) async fn requeue_dead_letters(
     storage: &StorageHandle,
 ) -> Result<usize, MetadataMaterializationError> {
     let now_ms = unix_timestamp_millis();
@@ -1883,7 +1886,7 @@ async fn mark_capture(
 
 /// Whether a job of the document published a Git snapshot whose graph is not stored yet. The
 /// job's finish batch stores the graph and removes the row together; a dependency wait has none.
-pub async fn capture_pending(
+pub(crate) async fn capture_pending(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> Result<bool, MetadataMaterializationError> {

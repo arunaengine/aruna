@@ -246,7 +246,7 @@ impl UpdateDocumentOperation {
 
     /// Refuses the update unless it is planned against the graph at `version`, so a change
     /// computed from an older graph never removes values that arrived since.
-    pub fn with_expected_graph(mut self, version: String) -> Self {
+    pub(crate) fn with_expected_graph(mut self, version: String) -> Self {
         self.expected_graph = Some(version);
         self
     }

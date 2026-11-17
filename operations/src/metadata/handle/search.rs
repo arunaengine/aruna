@@ -702,7 +702,7 @@ pub async fn search_authorized_local(
 
 /// Searches the local graphs `auth_context` may read that name `object_iri` by `predicate_iri`.
 #[allow(clippy::too_many_arguments)]
-pub async fn search_local_filtered(
+pub(crate) async fn search_local_filtered(
     context: &DriverContext,
     auth_context: Option<AuthContext>,
     graph_iris: Option<Vec<String>>,

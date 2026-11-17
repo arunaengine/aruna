@@ -245,7 +245,7 @@ pub async fn export_rocrate_jsonld(
 }
 
 /// The summary JSON-LD of one graph.
-pub async fn export_summary_jsonld(
+pub(crate) async fn export_summary_jsonld(
     context: &DriverContext,
     graph_iri: String,
 ) -> Result<String, MetadataError> {
@@ -260,7 +260,7 @@ pub async fn export_summary_jsonld(
 }
 
 /// One page of a graph's RO-Crate JSON-LD.
-pub async fn export_rocrate_page(
+pub(crate) async fn export_rocrate_page(
     context: &DriverContext,
     graph_iri: String,
     limit: usize,

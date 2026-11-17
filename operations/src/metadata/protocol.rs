@@ -891,7 +891,7 @@ pub enum WriteAuthError {
     Forbidden,
 }
 
-pub async fn write_message(
+pub(crate) async fn write_message(
     stream: &mut BiStream,
     message: &MetadataTransportMessage,
 ) -> Result<(), String> {

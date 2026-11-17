@@ -536,7 +536,7 @@ fn fold_visible(digest: &mut [u8; 32], updated_at_ms: u64, document_id: Ulid) {
 /// One bounded step of index maintenance. A cycle writes a new generation only
 /// once the visible set differs, so a steady-state pass rewrites nothing; every
 /// mutation is gated on `token` and a persisted cursor keeps the walk bounded.
-pub async fn visibility_pass(
+pub(crate) async fn visibility_pass(
     context: &DriverContext,
     token: &CancellationToken,
 ) -> Result<PassOutcome, VisibilityError> {
@@ -765,7 +765,7 @@ async fn write_index_keys(
 /// Keeps the index current on the shutdown supervisor, one bounded pass per tick.
 /// Changed visibility is picked up next cycle; until then the reader's per-record
 /// re-check keeps a newly-hidden record from being served.
-pub fn spawn_visibility_index(context: Arc<DriverContext>, shutdown: &Shutdown) {
+pub(crate) fn spawn_visibility_index(context: Arc<DriverContext>, shutdown: &Shutdown) {
     let token = shutdown.token();
     shutdown.spawn(async move {
         loop {

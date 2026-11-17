@@ -579,7 +579,7 @@ impl MetadataHandle {
             triple_count = field::Empty,
         )
         )]
-    pub async fn query_remote_graphs(
+    pub(crate) async fn query_remote_graphs(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -657,7 +657,7 @@ impl MetadataHandle {
         )
     )]
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_remote_graphs(
+    pub(crate) async fn search_remote_graphs(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -673,7 +673,7 @@ impl MetadataHandle {
     }
 
     /// Asks one node which readable documents its reverse index lists for the identifier.
-    pub async fn request_data_links(
+    pub(crate) async fn request_data_links(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -696,7 +696,7 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn request_set_preview(
+    pub(crate) async fn request_set_preview(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -716,7 +716,7 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn request_staging_spec(
+    pub(crate) async fn request_staging_spec(
         &self,
         node_id: NodeId,
         transfer_id: Ulid,
@@ -766,7 +766,7 @@ impl MetadataHandle {
     }
 
     /// The current revision of a realm vault entry from the management node `node_id`.
-    pub async fn request_realm_secret(
+    pub(crate) async fn request_realm_secret(
         &self,
         node_id: NodeId,
         reference: aruna_core::realm_vault::RealmSecretRef,
@@ -786,7 +786,7 @@ impl MetadataHandle {
 
     /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
     /// it holds the whole, checked artifact.
-    pub async fn request_store_artifact(
+    pub(crate) async fn request_store_artifact(
         &self,
         node_id: NodeId,
         chunk: crate::plugins::copies::Chunk,
@@ -802,7 +802,7 @@ impl MetadataHandle {
     }
 
     /// One chunk of a published plugin artifact from the management node `node_id`, unchecked.
-    pub async fn request_artifact(
+    pub(crate) async fn request_artifact(
         &self,
         node_id: NodeId,
         digest: String,
@@ -819,7 +819,7 @@ impl MetadataHandle {
     }
 
     /// The clock of the infrastructure node `node_id`, in Unix milliseconds.
-    pub async fn request_clock(&self, node_id: NodeId) -> Result<u64, MetadataReadError> {
+    pub(crate) async fn request_clock(&self, node_id: NodeId) -> Result<u64, MetadataReadError> {
         let request = MetadataTransportMessage::ProbeClock;
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
             .await
@@ -831,7 +831,7 @@ impl MetadataHandle {
     }
 
     /// Hands matched plugin events to the install's receiver `node_id` and returns its decisions.
-    pub async fn request_forward(
+    pub(crate) async fn request_forward(
         &self,
         node_id: NodeId,
         batch: crate::plugins::forward::EventBatch,
@@ -848,7 +848,7 @@ impl MetadataHandle {
 
     /// Whether the node `node_id` holds the node secret `name` with `kind`, and the header the
     /// secret checks.
-    pub async fn request_node_check(
+    pub(crate) async fn request_node_check(
         &self,
         node_id: NodeId,
         name: aruna_core::secrets::SecretName,
@@ -863,7 +863,7 @@ impl MetadataHandle {
     }
 
     /// The secret bound to a plugin install's slot, released by the management node `node_id`.
-    pub async fn request_release(
+    pub(crate) async fn request_release(
         &self,
         node_id: NodeId,
         request: crate::plugins::release::ReleaseRequest,
@@ -878,7 +878,7 @@ impl MetadataHandle {
     }
 
     /// The sealed secret of a setting document, opened by the management node `node_id`.
-    pub async fn request_open(
+    pub(crate) async fn request_open(
         &self,
         node_id: NodeId,
         target: aruna_core::document::DocumentTarget,
@@ -895,7 +895,7 @@ impl MetadataHandle {
     }
 
     /// One input page of a job family from `node_id`; `None` when it does not keep it.
-    pub async fn request_input_page(
+    pub(crate) async fn request_input_page(
         &self,
         node_id: NodeId,
         submission: aruna_core::structs::execution::job::SubmissionId,
@@ -913,7 +913,7 @@ impl MetadataHandle {
     }
 
     /// Sends a reference page to a member; an error leaves its outcome unknown.
-    pub async fn request_reference_page(
+    pub(crate) async fn request_reference_page(
         &self,
         node_id: NodeId,
         page: crate::replication::page::ReferencePage,
@@ -931,7 +931,7 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn request_identifier_lookup(
+    pub(crate) async fn request_identifier_lookup(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -999,7 +999,7 @@ impl MetadataHandle {
             hit_count = field::Empty,
         )
     )]
-    pub async fn request_bucket_search(
+    pub(crate) async fn request_bucket_search(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1055,7 +1055,7 @@ impl MetadataHandle {
         )
     )]
     #[allow(clippy::too_many_arguments)]
-    pub async fn request_object_search(
+    pub(crate) async fn request_object_search(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1099,7 +1099,7 @@ impl MetadataHandle {
         result
     }
 
-    pub async fn request_sync_create(
+    pub(crate) async fn request_sync_create(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1133,7 +1133,7 @@ impl MetadataHandle {
         }
     }
 
-    pub async fn request_sync_delete(
+    pub(crate) async fn request_sync_delete(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1164,7 +1164,7 @@ impl MetadataHandle {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_remote_filtered(
+    pub(crate) async fn search_remote_filtered(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
@@ -1236,7 +1236,7 @@ impl MetadataHandle {
         result
     }
 
-    pub async fn request_remote_preflight(
+    pub(crate) async fn request_remote_preflight(
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,

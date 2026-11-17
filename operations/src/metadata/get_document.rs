@@ -98,7 +98,7 @@ pub async fn load_document_record(
     parse_registry_read(event)
 }
 
-pub async fn record_materialized_read(
+pub(crate) async fn record_materialized_read(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Result<bool, StorageReadError> {

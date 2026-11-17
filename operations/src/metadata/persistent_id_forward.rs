@@ -171,7 +171,7 @@ pub async fn mint_pid_routed(
 /// Queue the PID mint job on the document's authority. The job store is
 /// node-local, so a document-scoped dedup row only deduplicates when one node
 /// owns it; alternating ingress nodes would otherwise open a job each.
-pub async fn submit_pid_routed(
+pub(crate) async fn submit_pid_routed(
     context: &Arc<DriverContext>,
     document_id: Ulid,
     minted_by: UserId,
@@ -383,7 +383,7 @@ pub async fn read_pid_routed(
 
 /// Store a terminal provider failure on the authority. Only the internal mint
 /// worker calls this; HTTP callers have no transition that can forge failures.
-pub async fn fail_pid_routed(
+pub(crate) async fn fail_pid_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
     document_id: Ulid,

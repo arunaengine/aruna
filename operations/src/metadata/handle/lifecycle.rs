@@ -415,7 +415,7 @@ impl MetadataVisibilityCache {
 }
 
 /// Removes the local copy of `graph_iri` when its lifecycle record says it is deleted.
-pub async fn prune_if_deleted(
+pub(crate) async fn prune_if_deleted(
     context: &DriverContext,
     graph_iri: String,
 ) -> Result<bool, MetadataError> {
@@ -446,7 +446,7 @@ pub async fn prune_if_deleted(
 
 impl MetadataHandle {
     /// Applies document sync updates from peers; returns how many graphs changed.
-    pub async fn reconcile_document_sync(
+    pub(crate) async fn reconcile_document_sync(
         &self,
         context: &DriverContext,
     ) -> Result<usize, MetadataError> {
@@ -466,7 +466,7 @@ impl MetadataHandle {
     }
 
     /// Removes the local copy of every deleted graph; returns how many were removed.
-    pub async fn prune_deleted_graphs(
+    pub(crate) async fn prune_deleted_graphs(
         &self,
         context: &DriverContext,
     ) -> Result<usize, MetadataError> {
@@ -749,7 +749,7 @@ pub(super) fn records_for_group(
 }
 
 /// The live registry records of one group, at most `limit` of them.
-pub async fn list_group_records(
+pub(crate) async fn list_group_records(
     context: &DriverContext,
     group_id: GroupId,
     limit: usize,

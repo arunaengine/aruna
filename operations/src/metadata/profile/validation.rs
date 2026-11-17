@@ -150,7 +150,7 @@ pub fn profile_public_iri(profile_id: Ulid) -> String {
     format!("{PROFILE_PUBLIC_PREFIX}{profile_id}")
 }
 
-pub fn equivalent_profile_iris(iri: &str) -> Vec<String> {
+pub(crate) fn equivalent_profile_iris(iri: &str) -> Vec<String> {
     profile_from_iri(iri).map_or_else(
         || vec![iri.to_string()],
         |profile_id| vec![profile_public_iri(profile_id)],
@@ -194,7 +194,7 @@ pub(crate) fn batch_adds_profile(batch: &MetadataBatch) -> bool {
     })
 }
 
-pub async fn validate_submission(
+pub(crate) async fn validate_submission(
     context: &DriverContext,
     document_id: Ulid,
     group_id: GroupId,
@@ -575,7 +575,7 @@ fn profiled_status(
     }
 }
 
-pub fn not_profiled_status(document_id: Ulid) -> ProfileValidationStatus {
+pub(crate) fn not_profiled_status(document_id: Ulid) -> ProfileValidationStatus {
     ProfileValidationStatus {
         document_id,
         dataset_revision: Ulid::nil(),
@@ -592,7 +592,7 @@ pub fn not_profiled_status(document_id: Ulid) -> ProfileValidationStatus {
     }
 }
 
-pub fn stale_status(document_id: Ulid, reason: &str) -> ProfileValidationStatus {
+pub(crate) fn stale_status(document_id: Ulid, reason: &str) -> ProfileValidationStatus {
     ProfileValidationStatus {
         document_id,
         dataset_revision: Ulid::nil(),
