@@ -572,13 +572,13 @@ pub(crate) async fn find_dedup_job(
     dedup_key: &[u8],
 ) -> Result<Option<(JobId, [u8; 32])>, SubmitJobError> {
     let Some((job_id, digest)) =
-        find_dedup_plan(&context.storage_handle, created_by, dedup_key, None)
+        find_dedup_plan(&context, created_by, dedup_key, None)
             .await
             .map_err(SubmitJobError::UnexpectedEvent)?
     else {
         return Ok(None);
     };
-    let record = read_job_record(&context.storage_handle, job_id, None)
+    let record = read_job_record(&context, job_id, None)
         .await
         .map_err(SubmitJobError::UnexpectedEvent)?;
     Ok(record.map(|_| (job_id, digest)))
@@ -645,7 +645,7 @@ async fn read_crate_obligation(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<RunCrateStatus>, String> {
-    read_crate_status(&context.storage_handle, job_id).await
+    read_crate_status(context, job_id).await
 }
 
 /// Node-local listing: returns only jobs owned by the serving node (every job
@@ -658,7 +658,7 @@ pub async fn list_owned_jobs(
     limit: usize,
     filter: impl Fn(&JobRecord) -> bool,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    list_user_jobs(&context.storage_handle, user_id, cursor, limit, filter).await
+    list_user_jobs(context, user_id, cursor, limit, filter).await
 }
 
 /// Removes the caller's finished run from this node's lists; see [`delete_finished_run`].
@@ -667,11 +667,10 @@ pub async fn delete_owned_run(
     auth: &AuthContext,
     job_id: JobId,
 ) -> Result<RunDelete, JobMutationError> {
-    let storage = &context.storage_handle;
     let mut outcome = delete_recorded(context, auth, job_id).await?;
     // A queued job is cancelled first; one that never ran settles at once and goes with it.
     if let RunDelete::Unfinished(JobState::Queued | JobState::AwaitingKey) = outcome {
-        let cancelled = set_cancel_requested(storage, job_id, unix_timestamp_millis()).await?;
+        let cancelled = set_cancel_requested(context, job_id, unix_timestamp_millis()).await?;
         if let CancelRequestOutcome::Cancelled(_) = cancelled {
             outcome = delete_recorded(context, auth, job_id).await?;
         }
@@ -680,7 +679,7 @@ pub async fn delete_owned_run(
     if outcome == RunDelete::Deleted
         && let Some(task_handle) = context.task_handle.as_ref()
     {
-        super::prune::restore_prune_timer(&context.storage_handle, task_handle).await;
+        super::prune::restore_prune_timer(context, task_handle).await;
     }
     Ok(outcome)
 }
@@ -692,8 +691,7 @@ async fn delete_recorded(
     auth: &AuthContext,
     job_id: JobId,
 ) -> Result<RunDelete, JobMutationError> {
-    let storage = &context.storage_handle;
-    let read = |job_id| read_job_record(storage, job_id, None);
+    let read = |job_id| read_job_record(context, job_id, None);
     let record = read(job_id).await.map_err(JobMutationError::Storage)?;
     let deletable = record.is_some_and(|record| {
         record.created_by == auth.user_id
@@ -707,7 +705,7 @@ async fn delete_recorded(
     if recorded && let Err(error) = cancel::publish_deletion(context, auth, job_id).await {
         return Ok(RunDelete::Unrecorded(error.to_string()));
     }
-    delete_finished_run(storage, auth.user_id, job_id, recorded).await
+    delete_finished_run(context, auth.user_id, job_id, recorded).await
 }
 
 pub async fn read_owned_job(
@@ -716,7 +714,7 @@ pub async fn read_owned_job(
     job_id: JobId,
 ) -> Result<Option<JobRecord>, String> {
     Ok(
-        match read_job_record(&context.storage_handle, job_id, None).await? {
+        match read_job_record(context, job_id, None).await? {
             Some(record) if record.created_by == user_id && !record.payload.is_internal() => {
                 Some(record)
             }
@@ -854,7 +852,7 @@ pub(crate) async fn local_status(
         .map(|status| status.to_public_json());
     let mut job = JobStatusView::from(&record);
     if record.state == JobState::AwaitingKey {
-        job.awaiting_keys = read_key_waits(&context.storage_handle, job_id)
+        job.awaiting_keys = read_key_waits(context, job_id)
             .await
             .map_err(JobRouteError::Internal)?;
     }
@@ -885,7 +883,7 @@ async fn linked_push_job(
     auth: &AuthContext,
     job_id: JobId,
 ) -> Result<Option<JobRecord>, String> {
-    let Some(mut record) = read_job_record(&context.storage_handle, job_id, None).await? else {
+    let Some(mut record) = read_job_record(context, job_id, None).await? else {
         return Ok(None);
     };
     let JobPayload::ExportRoCrate(spec) = &record.payload else {
@@ -932,7 +930,7 @@ async fn joined_pid_job(
     auth: &AuthContext,
     job_id: JobId,
 ) -> Result<Option<JobRecord>, String> {
-    let Some(mut record) = read_job_record(&context.storage_handle, job_id, None).await? else {
+    let Some(mut record) = read_job_record(context, job_id, None).await? else {
         return Ok(None);
     };
     let JobPayload::MintPersistentId(spec) = &record.payload else {
@@ -1076,7 +1074,7 @@ async fn report_page(
     }
     let limit = limit.clamp(1, usize::from(REPORT_MAX_ROWS));
     let (rows, next_key) =
-        list_job_entries(&context.storage_handle, job_id, last_key, limit).await?;
+        list_job_entries(context, job_id, last_key, limit).await?;
     Ok(JobReportLookup::Ready {
         job: JobReportView {
             job_id: record.job_id,
@@ -1102,7 +1100,7 @@ pub async fn read_session_reason(
         return None;
     }
     let (rows, _) = list_job_entries(
-        &context.storage_handle,
+        context,
         job_id,
         None,
         crate::jobs::SESSION_REPORT_ROWS,
@@ -1236,7 +1234,7 @@ pub async fn read_owned_artifact(
 ) -> Result<ArtifactLookup, String> {
     let Some(record) = read_owned_job(context, user_id, job_id).await? else {
         return Ok(
-            match read_artifact_tombstone(&context.storage_handle, job_id, now_ms).await? {
+            match read_artifact_tombstone(context, job_id, now_ms).await? {
                 Some(owner) if owner == user_id => ArtifactLookup::Gone,
                 _ => ArtifactLookup::NotFound,
             },
@@ -1451,7 +1449,7 @@ pub async fn cancel_owned_job(
     // The job may be pruned between the ownership read and here; treat that as a 404
     // rather than a 500.
     let outcome = match set_cancel_requested(
-        &context.storage_handle,
+        context,
         job_id,
         unix_timestamp_millis(),
     )
@@ -1945,7 +1943,7 @@ mod tests {
         );
         record.state = JobState::Succeeded;
         record.finished_at_ms = Some(1);
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
         let found = lookup_job_dedup(&context, owner, "key", payload.plan_digest())
             .await
@@ -1987,7 +1985,7 @@ mod tests {
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let job_id = JobId::from_bytes([3u8; 16]);
-        preserve_artifact_tombstone(&storage, job_id, owner, 10)
+        preserve_artifact_tombstone(&context, job_id, owner, 10)
             .await
             .unwrap();
 
@@ -2062,7 +2060,7 @@ mod tests {
         record.finished_at_ms = Some(1);
         record.retention_ms = 1;
         record.report_digest = Some([7u8; 32]);
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
         assert!(matches!(
             read_owned_report(&context, owner, job_id, None, None, 1).await,
@@ -2103,7 +2101,7 @@ mod tests {
             ),
         ] {
             let record = JobRecord::new(job_id, payload, owner, node_id(), 1_000, 1_000, None);
-            insert_job(&storage, &record).await.unwrap();
+            insert_job(&context, &record).await.unwrap();
 
             assert!(
                 read_owned_job(&context, owner, job_id)
@@ -2117,7 +2115,7 @@ mod tests {
                     .unwrap(),
                 CancelJobOutcome::NotFound
             ));
-            let stored = read_job_record(&storage, job_id, None)
+            let stored = read_job_record(&context, job_id, None)
                 .await
                 .unwrap()
                 .unwrap();

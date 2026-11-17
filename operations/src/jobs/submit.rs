@@ -1052,7 +1052,7 @@ mod tests {
 
     /// Points the import of `spec` at upload `[seed; 16]` and stores it unclaimed until `expires`.
     async fn seed_upload(
-        storage: &StorageHandle,
+        context: &DriverContext,
         spec: &mut SubmitJobSpec,
         seed: u8,
         expires: u64,
@@ -1064,7 +1064,7 @@ mod tests {
         import.source = ImportRoCrateSource::Upload { upload_id };
         let record =
             crate::jobs::import::upload::tests::upload_record(spec.created_by, upload_id, expires);
-        crate::jobs::import::upload_store::write_rocrate_upload(storage, &record)
+        crate::jobs::import::upload_store::write_rocrate_upload(context, &record)
             .await
             .unwrap();
         upload_id
@@ -1086,8 +1086,8 @@ mod tests {
         assert_eq!(first.payload.plan_digest(), second.payload.plan_digest());
     }
 
-    async fn count_keyspace(storage: &StorageHandle, key_space: &str) -> usize {
-        crate::storage_read::iter_prefix_page(storage, key_space, None, None, 64, None)
+    async fn count_keyspace(context: &DriverContext, key_space: &str) -> usize {
+        crate::storage_read::iter_prefix_page(&context.storage_handle, key_space, None, None, 64, None)
             .await
             .expect("scan")
             .0
@@ -1107,7 +1107,7 @@ mod tests {
         };
 
         let result = drive(operation(submission), &ctx).await.unwrap();
-        let record = read_job_record(&storage, result.job_id, None)
+        let record = read_job_record(&ctx, result.job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -1125,7 +1125,7 @@ mod tests {
         submission.retention_ms = 42;
 
         let result = drive(operation(submission), &ctx).await.unwrap();
-        let record = read_job_record(&storage, result.job_id, None)
+        let record = read_job_record(&ctx, result.job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -1154,9 +1154,8 @@ mod tests {
         assert_eq!(second.job_id, first.job_id);
     }
 
-    async fn write_raw(storage: &StorageHandle, key_space: &str, key: ByteView, value: ByteView) {
-        match storage
-            .send_storage_effect(StorageEffect::Write {
+    async fn write_raw(context: &DriverContext, key_space: &str, key: ByteView, value: ByteView) {
+        match context.storage_handle.send_storage_effect(StorageEffect::Write {
                 key_space: key_space.to_string(),
                 key,
                 value,
@@ -1198,7 +1197,7 @@ mod tests {
 
         let key = source_key(source.group_id, source.source_id);
         let value = ByteView::from(source.to_bytes().unwrap());
-        write_raw(&storage, HARVEST_SOURCE_KEYSPACE, key.clone(), value).await;
+        write_raw(&ctx, HARVEST_SOURCE_KEYSPACE, key.clone(), value).await;
         let first = drive(operation(run()), &ctx).await.unwrap();
         let event = storage
             .send_storage_effect(StorageEffect::Read {
@@ -1219,7 +1218,7 @@ mod tests {
         // While the first run is queued, a second run of the source is refused.
         let second = drive(operation(run()), &ctx).await;
         assert_eq!(second, Err(SubmitJobError::SourceRunning));
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
     }
 
     #[tokio::test]
@@ -1263,7 +1262,7 @@ mod tests {
         assert_eq!(missing, Err(SubmitJobError::ImportMissing));
 
         let value = ByteView::from(rule.to_bytes().unwrap());
-        write_raw(&storage, BACKEND_IMPORT_KEYSPACE, rule.key(), value).await;
+        write_raw(&ctx, BACKEND_IMPORT_KEYSPACE, rule.key(), value).await;
         let first = drive(operation(run()), &ctx).await.unwrap();
         let rule_key = rule.key();
         let stored = |storage: StorageHandle| {
@@ -1292,7 +1291,7 @@ mod tests {
         // While the first run is queued, a second start is refused and records nothing.
         let second = drive(operation(run()), &ctx).await;
         assert_eq!(second, Err(SubmitJobError::ImportRunning));
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
         assert_eq!(stored(storage).await.last_job, Some(first.job_id));
     }
 
@@ -1307,14 +1306,14 @@ mod tests {
             .expect("submit succeeds");
         assert!(result.created);
 
-        let record = read_job_record(&storage, result.job_id, None)
+        let record = read_job_record(&ctx, result.job_id, None)
             .await
             .unwrap()
             .expect("job persisted");
         assert_eq!(record.state, JobState::Queued);
-        assert_eq!(count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await, 1);
-        assert_eq!(count_keyspace(&storage, JOB_INDEX_KEYSPACE).await, 1);
-        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 0);
+        assert_eq!(count_keyspace(&ctx, SCHEDULE_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await, 0);
     }
 
     #[tokio::test]
@@ -1327,7 +1326,7 @@ mod tests {
             .await
             .unwrap();
         assert!(first.created);
-        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await, 1);
 
         let second = drive(operation(spec(Some(b"k".to_vec()))), &ctx)
             .await
@@ -1335,7 +1334,7 @@ mod tests {
         assert!(!second.created);
         assert_eq!(second.job_id, first.job_id);
         // No duplicate record created.
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
     }
 
     #[tokio::test]
@@ -1344,7 +1343,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let mut first = rocrate_spec(1, None);
-        seed_upload(&storage, &mut first, 3, u64::MAX).await;
+        seed_upload(&ctx, &mut first, 3, u64::MAX).await;
         let first = drive(operation(first), &ctx).await.unwrap();
 
         assert_eq!(
@@ -1353,22 +1352,22 @@ mod tests {
         );
 
         let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
-            crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
+            crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 
         let mut third = rocrate_spec(1, None);
-        seed_upload(&storage, &mut third, 6, u64::MAX).await;
+        seed_upload(&ctx, &mut third, 6, u64::MAX).await;
         assert!(drive(operation(third), &ctx).await.unwrap().created);
     }
 
@@ -1380,14 +1379,14 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
-        let upload_id = seed_upload(&storage, &mut first, 3, 2_000).await;
+        let upload_id = seed_upload(&ctx, &mut first, 3, 2_000).await;
         let created = drive(operation(first.clone()), &ctx).await.unwrap();
         let stored =
-            crate::jobs::import::upload_store::read_rocrate_upload(&storage, upload_id).await;
+            crate::jobs::import::upload_store::read_rocrate_upload(&ctx, upload_id).await;
         assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
         let owner = first.created_by;
         let reclaimed = crate::jobs::import::upload_store::claim_rocrate_upload(
-            &storage,
+            &ctx,
             upload_id,
             owner,
             created.job_id,
@@ -1400,11 +1399,11 @@ mod tests {
         let claimed = Err(SubmitJobError::Upload(UploadClaimError::AlreadyClaimed));
         assert_eq!(drive(operation(other), &ctx).await, claimed);
         let mut late = rocrate_spec(4, Some(b"late".to_vec()));
-        seed_upload(&storage, &mut late, 6, 1_000).await;
+        seed_upload(&ctx, &mut late, 6, 1_000).await;
         let expired = Err(SubmitJobError::Upload(UploadClaimError::Expired));
         assert_eq!(drive(operation(late), &ctx).await, expired);
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
-        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await, 1);
     }
 
     #[tokio::test]
@@ -1413,7 +1412,7 @@ mod tests {
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let ctx = context(storage.clone());
         let mut submission = rocrate_spec(1, Some(b"import".to_vec()));
-        seed_upload(&storage, &mut submission, 3, u64::MAX).await;
+        seed_upload(&ctx, &mut submission, 3, u64::MAX).await;
         let first = drive(operation(submission.clone()), &ctx).await.unwrap();
         let second = drive(operation(submission.clone()), &ctx).await.unwrap();
 
@@ -1422,17 +1421,17 @@ mod tests {
         assert_eq!(second.job_id, first.job_id);
 
         let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
-            crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
+            crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 
@@ -1458,7 +1457,7 @@ mod tests {
         assert!(first.created);
         assert!(second.created);
         assert_ne!(second.job_id, first.job_id);
-        assert_eq!(count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await, 2);
+        assert_eq!(count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await, 2);
     }
 
     // Same idempotency key + a different plan is a JobPlanConflict, not a silent reuse.
@@ -1491,7 +1490,7 @@ mod tests {
             }
         );
         // The original job is untouched and no second record was written.
-        assert_eq!(count_keyspace(&storage, JOB_KEYSPACE).await, 1);
+        assert_eq!(count_keyspace(&ctx, JOB_KEYSPACE).await, 1);
     }
 
     // Perf budget: a non-dedup submit is one atomic batch write of <=4 keys plus a
@@ -1511,10 +1510,10 @@ mod tests {
             "submit performs exactly one storage request"
         );
 
-        let keys = count_keyspace(&storage, JOB_KEYSPACE).await
-            + count_keyspace(&storage, SCHEDULE_INDEX_KEYSPACE).await
-            + count_keyspace(&storage, JOB_INDEX_KEYSPACE).await
-            + count_keyspace(&storage, DEDUP_INDEX_KEYSPACE).await;
+        let keys = count_keyspace(&ctx, JOB_KEYSPACE).await
+            + count_keyspace(&ctx, SCHEDULE_INDEX_KEYSPACE).await
+            + count_keyspace(&ctx, JOB_INDEX_KEYSPACE).await
+            + count_keyspace(&ctx, DEDUP_INDEX_KEYSPACE).await;
         assert!(keys <= 4, "submit writes at most four keys, got {keys}");
     }
 
@@ -1529,7 +1528,7 @@ mod tests {
         let created_by = submission.created_by;
         let digest = submission.payload.plan_digest();
         write_raw(
-            &storage,
+            &ctx,
             DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, digest)),
@@ -1540,7 +1539,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1558,7 +1557,7 @@ mod tests {
         let submission = spec(Some(b"k".to_vec()));
         let created_by = submission.created_by;
         write_raw(
-            &storage,
+            &ctx,
             DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, [0xAB; 32])),
@@ -1571,7 +1570,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1589,14 +1588,14 @@ mod tests {
         let created_by = submission.created_by;
         let digest = submission.payload.plan_digest();
         write_raw(
-            &storage,
+            &ctx,
             JOB_KEYSPACE,
             job_record_key(ghost),
             ByteView::from(vec![1, 2, 3]),
         )
         .await;
         write_raw(
-            &storage,
+            &ctx,
             DEDUP_INDEX_KEYSPACE,
             dedup_index_key(created_by, b"k"),
             ByteView::from(encode_dedup_value(ghost, digest)),
@@ -1607,7 +1606,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&ctx, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1624,18 +1623,18 @@ mod tests {
             .await
             .unwrap();
         // Take the job through claim + terminal so the dedup entry is cleared.
-        crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
+        crate::jobs::store::state::claim_job(&ctx, first.job_id, node_id(3), 2_000)
             .await
             .unwrap();
-        let claimed = read_job_record(&storage, first.job_id, None)
+        let claimed = read_job_record(&ctx, first.job_id, None)
             .await
             .unwrap()
             .unwrap();
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&ctx, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&ctx, first.job_id, token, 2_200)
             .await
             .unwrap();
 
