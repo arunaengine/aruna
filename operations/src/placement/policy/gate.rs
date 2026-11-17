@@ -25,6 +25,7 @@ use super::cache::PolicyCacheStats;
 use super::foreign_owner;
 use super::read::ReadPolicyError;
 use super::resolve::{ResolvePolicyConfig, ResolvePolicyOperation};
+use crate::storage_read::{StorageReadError, parse_storage_read};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyGateConfig {
@@ -189,6 +190,82 @@ pub struct GateContext {
     /// False while this node revalidates its inventory. Only a governed write
     /// is stopped by it; an ungoverned one never consults the gate.
     pub admitting: bool,
+}
+
+/// Why a caller could not build a destination gate. An admission stop is not
+/// one: the gate is built either way and `write_gate` refuses a governed write.
+#[derive(Debug, Error, PartialEq)]
+pub enum GateContextError {
+    #[error("node placement subject unavailable: {0}")]
+    NodeSubject(#[source] StorageReadError),
+    #[error("the gate context read never completed")]
+    Incomplete,
+}
+
+/// The destination this node evaluates governed writes and serves against. `None` means no
+/// subject was ever advertised, failing governed operations closed; a node revalidating
+/// inventory reports `admitting: false` to stop governed writes.
+#[derive(Debug, PartialEq)]
+pub struct GateOperation {
+    realm_id: RealmId,
+    now_ms: u64,
+    started: bool,
+    output: Option<Result<Option<GateContext>, GateContextError>>,
+}
+
+impl GateOperation {
+    pub fn new(realm_id: RealmId, now_ms: u64) -> Self {
+        Self {
+            realm_id,
+            now_ms,
+            started: false,
+            output: None,
+        }
+    }
+}
+
+impl Operation for GateOperation {
+    type Output = Option<GateContext>;
+    type Error = GateContextError;
+
+    fn start(&mut self) -> Effects {
+        self.started = true;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+            key: NODE_SUBJECT_KEY.to_vec().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if !self.started || self.output.is_some() {
+            self.output = Some(Err(GateContextError::Incomplete));
+            return smallvec![];
+        }
+        let record = parse_storage_read(event, NodeSubjectRecord::from_bytes);
+        self.output = Some(match record {
+            Ok(record) => Ok(record.map(|record| GateContext {
+                realm_id: self.realm_id,
+                admitting: !record.serving_blocked && !record.policy_draining,
+                subject: record.subject,
+                now_ms: self.now_ms,
+            })),
+            Err(error) => Err(GateContextError::NodeSubject(error)),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Option<GateContext>, GateContextError> {
+        self.output.unwrap_or(Err(GateContextError::Incomplete))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -748,5 +825,107 @@ mod pure_tests {
                 (key, Some(auth_value)),
             ],
         })
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
+
+    fn subject_read() -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
+            key: NODE_SUBJECT_KEY.to_vec().into(),
+            txn_id: None,
+        })
+    }
+
+    fn stored(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: NODE_SUBJECT_KEY.to_vec().into(),
+            value: value.map(Into::into),
+        })
+    }
+
+    fn record(blocked: bool) -> NodeSubjectRecord {
+        let mut record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .expect("subject is valid");
+        record.serving_blocked = blocked;
+        record
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    #[test]
+    fn blocked_subject_reads() {
+        // A blocked node still reports its subject; only the gate stops a governed write.
+        let mut operation = GateOperation::new(realm(), 7);
+        let bytes = record(true).to_bytes().unwrap();
+        check_trace(&mut operation, &[subject_read()], vec![(stored(Some(bytes)), vec![])]);
+        let gate = operation.finalize().unwrap().expect("subject is advertised");
+        assert!(!gate.admitting);
+        assert_eq!((gate.realm_id, gate.now_ms), (realm(), 7));
+        assert_eq!(gate.subject, record(true).subject);
+
+        let mut open = GateOperation::new(realm(), 7);
+        let bytes = record(false).to_bytes().unwrap();
+        check_trace(&mut open, &[subject_read()], vec![(stored(Some(bytes)), vec![])]);
+        assert!(open.finalize().unwrap().unwrap().admitting);
+    }
+
+    #[test]
+    fn missing_subject_none() {
+        // A node that never advertised a subject has no gate at all.
+        let mut operation = GateOperation::new(realm(), 0);
+        check_trace(&mut operation, &[subject_read()], vec![(stored(None), vec![])]);
+        assert_eq!(operation.finalize(), Ok(None));
+    }
+
+    #[test]
+    fn read_failures_error() {
+        // A storage error or an undecodable record fails instead of reading as absent.
+        let error = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        for event in [error, stored(Some(vec![0xff; 4]))] {
+            let mut operation = GateOperation::new(realm(), 0);
+            operation.start();
+            assert!(operation.step(event).is_empty());
+            assert!(matches!(
+                operation.finalize(),
+                Err(GateContextError::NodeSubject(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unstarted_events() {
+        // Before `start`, every event is refused without effects.
+        let make = || GateOperation::new(realm(), 0);
+        for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
+            assert!(effects.is_empty(), "{label} emitted effects");
+            assert_eq!(error, GateContextError::Incomplete, "{label}");
+        }
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        // The single read needs no cleanup, and an early finalize fails.
+        let mut operation = GateOperation::new(realm(), 0);
+        operation.start();
+        assert!(operation.abort().is_empty());
+        rejects_finalize(operation);
     }
 }
