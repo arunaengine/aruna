@@ -28,6 +28,7 @@ pub mod purge;
 pub mod rebuild;
 pub mod refill;
 mod refresh;
+pub mod replica_shares;
 pub mod resolve;
 pub mod roots;
 pub mod routing;

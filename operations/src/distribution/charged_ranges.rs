@@ -148,7 +148,7 @@ impl ChargedRangesOperation {
     }
 }
 
-fn unexpected(event: &Event) -> UsageError {
+pub(super) fn unexpected(event: &Event) -> UsageError {
     StorageError::ReadError(format!("unexpected answer {}", event.label())).into()
 }
 
