@@ -294,4 +294,19 @@ mod tests {
         assert_eq!(keys.len(), expected);
         assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1 + expected));
     }
+
+    #[test]
+    fn page_skips_unreadable() {
+        let mut plan = JournalPage(None);
+        assert!(plan.first().is_err());
+        let rows = vec![(b"j1".to_vec(), Vec::new())];
+        let next = Some(b"j1".to_vec());
+        let Turn::Finish((events, after)) = plan.next(Answer::Page(rows, next.clone())).unwrap()
+        else {
+            panic!("a page answers its readable rows");
+        };
+        assert!(events.is_empty());
+        assert_eq!(after, next);
+        assert!(plan.next(Answer::Done).is_err());
+    }
 }
