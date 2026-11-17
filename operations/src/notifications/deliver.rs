@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::IoError;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -26,6 +27,8 @@ pub enum DeliverError {
     UnexpectedEvent(String),
     #[error("the notification delivery did not finish")]
     NotFinished,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 /// Who delivers and where the records land.
