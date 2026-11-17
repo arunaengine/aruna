@@ -14,7 +14,6 @@ use aruna_core::compute::quota::{
 };
 use aruna_core::document::{DocumentChange, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
@@ -37,7 +36,7 @@ use aruna_core::structs::storage::node_info::{
 use aruna_core::structs::storage::routing::BackendCatalog;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
@@ -54,7 +53,6 @@ use crate::node::info_write::{InfoChange, InfoWriteOperation};
 use crate::placement::{build_view, held_buckets};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
-use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
@@ -74,13 +72,13 @@ pub async fn seed_info_document(
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
-    let stored = node_info_row(&ctx.storage_handle, node_id, None).await?;
+    let stored = node_info_row(&ctx.storage_handle, node_id).await?;
     let epoch = next_epoch(ctx, realm_id, stored.as_ref(), now).await?;
     let reservation = reservation_snapshot(ctx, epoch).await?;
     // The published drain is the operator's durable flag or a departure, never
     // a value carried forward from the previous document.
     let leaving = stored.as_ref().is_some_and(|old| old.leaving);
-    let compute_draining = leaving || operator_drain(ctx, None).await?;
+    let compute_draining = leaving || operator_drain(ctx).await?;
     let document = NodeInfoDocument {
         node_id,
         executors: advertised_executors(ctx, &config, node_id, &reservation.reserved, now).await?,
@@ -432,7 +430,7 @@ pub(crate) async fn refresh_info_heartbeat(
     sequence: u64,
     jobs: Option<RunningJobs>,
 ) -> Result<(), String> {
-    let Some(document) = node_info_row(&ctx.storage_handle, node_id, None).await? else {
+    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
         return Ok(());
     };
     let now = unix_timestamp_millis();
@@ -465,7 +463,7 @@ pub(crate) async fn refresh_info_heartbeat(
     publish_info(ctx, node_id, realm_id, true).await?;
     let (Some(net_handle), Some(stored)) = (
         ctx.net_handle.as_ref(),
-        node_info_row(&ctx.storage_handle, node_id, None).await?,
+        node_info_row(&ctx.storage_handle, node_id).await?,
     ) else {
         return Ok(());
     };
@@ -559,12 +557,12 @@ pub(crate) async fn set_departure_state(
     realm_id: RealmId,
     departing: bool,
 ) -> Result<bool, String> {
-    let Some(document) = node_info_row(&ctx.storage_handle, node_id, None).await? else {
+    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
         return Ok(false);
     };
     // An operator drain outlives a placement observation: returning to the
     // placement map must not undrain a node somebody drained deliberately.
-    let draining = departing || operator_drain(ctx, None).await?;
+    let draining = departing || operator_drain(ctx).await?;
     if document.leaving == departing && document.compute_draining == draining {
         return Ok(false);
     }
@@ -604,11 +602,11 @@ pub async fn set_operator_drain(
     realm_id: RealmId,
     draining: bool,
 ) -> Result<bool, String> {
-    if operator_drain(ctx, None).await? == draining {
+    if operator_drain(ctx).await? == draining {
         return Ok(false);
     }
     write_operator_drain(ctx, draining).await?;
-    let Some(document) = node_info_row(&ctx.storage_handle, node_id, None).await? else {
+    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
         warn!(
             operator_draining = draining,
             "Operator compute drain recorded before this node advertises"
@@ -639,13 +637,13 @@ pub async fn set_operator_drain(
     Ok(true)
 }
 
-async fn operator_drain(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<bool, String> {
+async fn operator_drain(ctx: &DriverContext) -> Result<bool, String> {
     match ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
             key: Key::from(OPERATOR_DRAIN_KEY.to_vec()),
-            txn_id,
+            txn_id: None,
         })
         .await
     {
@@ -883,14 +881,6 @@ pub(crate) async fn write_info_document(
     storage: &StorageHandle,
     document: &NodeInfoDocument,
 ) -> Result<(), String> {
-    write_info_row(storage, document, None).await
-}
-
-async fn write_info_row(
-    storage: &StorageHandle,
-    document: &NodeInfoDocument,
-    txn_id: Option<TxnId>,
-) -> Result<(), String> {
     // `to_bytes` validates, so a locally built advertisement that broke its own
     // bounds never reaches storage or the shared realm topic.
     let value = Value::from(document.to_bytes().map_err(|error| error.to_string())?);
@@ -899,7 +889,7 @@ async fn write_info_row(
             key_space: NODE_INFO_KEYSPACE.to_string(),
             key: Key::from(node_info_key(document.node_id)),
             value,
-            txn_id,
+            txn_id: None,
         })
         .await
     {
@@ -912,13 +902,12 @@ async fn write_info_row(
 async fn node_info_row(
     storage: &StorageHandle,
     node_id: NodeId,
-    txn_id: Option<TxnId>,
 ) -> Result<Option<NodeInfoDocument>, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: NODE_INFO_KEYSPACE.to_string(),
             key: Key::from(node_info_key(node_id)),
-            txn_id,
+            txn_id: None,
         })
         .await
     {
@@ -1116,7 +1105,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("seeded node info document");
@@ -1157,7 +1146,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            node_info_row(&ctx.storage_handle, local, None)
+            node_info_row(&ctx.storage_handle, local)
                 .await
                 .unwrap()
                 .is_some()
@@ -1194,7 +1183,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("seeded node info document");
@@ -1240,7 +1229,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("node info document persisted");
@@ -1297,7 +1286,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = node_info_row(&ctx.storage_handle, local, None)
+        let first = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1312,7 +1301,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let second = node_info_row(&ctx.storage_handle, local, None)
+        let second = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1355,7 +1344,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            node_info_row(&ctx.storage_handle, local, None)
+            node_info_row(&ctx.storage_handle, local)
                 .await
                 .unwrap()
                 .is_none()
@@ -1667,7 +1656,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("document");
@@ -1817,7 +1806,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before = node_info_row(&ctx.storage_handle, local, None)
+        let before = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1828,7 +1817,7 @@ mod tests {
                 .unwrap()
         );
 
-        let after = node_info_row(&ctx.storage_handle, local, None)
+        let after = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1904,7 +1893,7 @@ mod tests {
             .await
             .expect("observation completes");
 
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("document");
@@ -1936,7 +1925,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, true)
             .await
             .unwrap();
-        let departed = node_info_row(&ctx.storage_handle, local, None)
+        let departed = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1947,7 +1936,7 @@ mod tests {
                 .unwrap()
         );
 
-        let rejoined = node_info_row(&ctx.storage_handle, local, None)
+        let rejoined = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1982,7 +1971,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let drained = node_info_row(&ctx.storage_handle, local, None)
+        let drained = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1995,7 +1984,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, false)
             .await
             .unwrap();
-        let observed = node_info_row(&ctx.storage_handle, local, None)
+        let observed = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2007,7 +1996,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let released = node_info_row(&ctx.storage_handle, local, None)
+        let released = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2083,7 +2072,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let drained = node_info_row(&ctx.storage_handle, local, None)
+        let drained = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2093,7 +2082,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let released = node_info_row(&ctx.storage_handle, local, None)
+        let released = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2127,7 +2116,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2158,7 +2147,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2186,7 +2175,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let seeded = node_info_row(&ctx.storage_handle, local, None)
+        let seeded = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2198,7 +2187,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2218,7 +2207,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 4, None)
             .await
             .unwrap();
-        let stored = node_info_row(&ctx.storage_handle, local, None)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
