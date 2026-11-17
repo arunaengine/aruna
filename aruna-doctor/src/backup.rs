@@ -5,9 +5,9 @@
 
 use crate::error::CliError;
 use crate::storage::{ImportKeyspaceState, ensure_target_path};
-use aruna::backup::{GIT_KEYSPACE, PREFIXES};
 use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
 use aruna_core::structs::storage::broken::StorageCheck;
+use aruna_storage::snapshot::{GIT_KEYSPACE, PREFIXES};
 use aruna_storage::snapshot::{SnapshotError, SnapshotReader, SnapshotRecord, SnapshotStats};
 use craqle::{CraqleNode, CraqleOptions, SearchStorage};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, PersistMode, Readable};
@@ -16,7 +16,7 @@ use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use {
-    aruna::backup::BACKUP_SOCKET,
+    aruna_storage::snapshot::BACKUP_SOCKET,
     std::fs::OpenOptions,
     std::io::{BufWriter, Write},
     std::os::unix::fs::OpenOptionsExt,
@@ -247,8 +247,9 @@ fn write_git(root: &Path, key: &[u8], value: &[u8]) -> Result<(), SnapshotError>
 #[cfg(test)]
 mod tests {
     use super::restore_backup;
-    use aruna::backup::{BackupSources, GIT_KEYSPACE, write_backup};
+    use aruna::backup::{BackupSources, write_backup};
     use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
+    use aruna_storage::snapshot::GIT_KEYSPACE;
     use aruna_storage::snapshot::SnapshotWriter;
     use craqle::CraqleNode;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
