@@ -906,13 +906,14 @@ impl MetadataHandle {
             record @ (MetadataTransportMessage::ForwardJobRecord { .. }
             | MetadataTransportMessage::ForwardRecordPage { .. }) => {
                 Box::pin(async {
-                    crate::jobs::records::serve_job_record(context, peer, record).await
+                    crate::jobs::records::transport::serve_job_record(context, peer, record).await
                 })
                 .await
             }
             MetadataTransportMessage::ForwardLaunchOffer { launch } => {
                 Box::pin(async {
-                    crate::jobs::records::serve_launch_offer(context, peer, *launch).await
+                    crate::jobs::records::transport::serve_launch_offer(context, peer, *launch)
+                        .await
                 })
                 .await
             }

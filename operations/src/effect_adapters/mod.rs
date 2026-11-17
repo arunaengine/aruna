@@ -94,10 +94,16 @@ pub(crate) async fn dispatch_effect_until(
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
         Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(
-            Box::pin(crate::jobs::records::dispatch_record(context, *record)).await,
+            Box::pin(crate::jobs::records::transport::dispatch_record(
+                context, *record,
+            ))
+            .await,
         )),
         Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
-            Box::pin(crate::jobs::records::dispatch_offer(context, *offer)).await,
+            Box::pin(crate::jobs::records::transport::dispatch_offer(
+                context, *offer,
+            ))
+            .await,
         )),
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Metadata(metadata_effect) => {

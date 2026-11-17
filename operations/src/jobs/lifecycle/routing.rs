@@ -16,11 +16,12 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::ids::{session_of, workspace_of};
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::jobs::JobRouteError;
+use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::{
-    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
+use crate::jobs::records::project::{
+    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
+use crate::jobs::route::JobRouteError;
 use crate::jobs::service::{RoutedJobStatus, read_owned_job};
 
 /// Why a partial projection answers nothing: it reduced only part of its

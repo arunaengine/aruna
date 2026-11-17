@@ -30,14 +30,6 @@ pub mod target;
 pub mod updates;
 pub mod witness;
 
-pub use admit::{AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission};
-pub use ids::{RequestIdentity, SubmissionRequest};
-pub use ingress::{AcceptedSubmission, submit_external_job};
-pub use report::{
-    AuditPaging, AuditRange, FamilyReport, MAX_AUDIT_PAGE, PagingError, PlanEstimate,
-    audit_endpoints, family_audit, family_report,
-};
-
 /// Why one lifecycle round did not complete. An availability failure is never
 /// reported as a refusal of the request itself.
 #[derive(Debug, PartialEq, Error)]

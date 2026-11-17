@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::jobs::lifecycle::{
+use aruna_operations::jobs::lifecycle::report::{
     AuditPaging, AuditRange, audit_endpoints, family_audit, family_report,
 };
 use axum::extract::{Path, Query, State};
@@ -388,7 +388,7 @@ pub async fn get_job_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_operations::jobs::lifecycle::MAX_AUDIT_PAGE;
+    use aruna_operations::jobs::lifecycle::report::MAX_AUDIT_PAGE;
 
     fn query(cursor: Option<&str>, limit: Option<usize>) -> AuditQuery {
         AuditQuery {

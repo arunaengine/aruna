@@ -34,9 +34,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::metadata::WritePeerError;
 
-pub(crate) use aruna_core::jobs::{
-    JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange,
-};
+use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange};
 
 impl From<&OwnedArtifact> for WireArtifact {
     fn from(owned: &OwnedArtifact) -> Self {
@@ -638,7 +636,7 @@ mod pure_tests {
     use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
     use ulid::Ulid;
 
-    use crate::jobs::service::JobKind;
+    use aruna_core::jobs::JobKind;
 
     fn user(realm_id: RealmId) -> UserId {
         UserId::new(Ulid::from_bytes([2u8; 16]), realm_id)

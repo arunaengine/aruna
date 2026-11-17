@@ -38,8 +38,6 @@ pub mod submit;
 mod transfers;
 pub mod workflow;
 
-pub use route::JobRouteError;
-
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
 pub const JOB_LEASE_MS: u64 = 60_000;
 /// Heartbeat interval (renew + progress flush); must stay well under the lease.

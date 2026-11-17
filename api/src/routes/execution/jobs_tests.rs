@@ -32,7 +32,7 @@ use aruna_operations::jobs::command::{
     ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
     WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::FamilyReport;
+use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,

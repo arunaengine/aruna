@@ -37,7 +37,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::REPORT_MAX_ROWS;
-use super::protocol::{JobRequest, JobResponse, WireRange, send_job_request};
+use super::protocol::send_job_request;
 use super::route::JobRouteError;
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
@@ -58,6 +58,7 @@ use crate::jobs::lifecycle::held::HeldReservations;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
+use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
 
 use super::lifecycle::alias::AliasFamilyOperation;
 use super::lifecycle::cancel::{self, cancel_family};
@@ -65,7 +66,7 @@ use super::lifecycle::ids::session_of;
 use super::lifecycle::routing::{family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
-pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
+use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
