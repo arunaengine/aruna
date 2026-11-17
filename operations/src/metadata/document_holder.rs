@@ -22,6 +22,7 @@ pub async fn choose_holder(
 ) -> Option<HolderCandidate> {
     let record = load_document_record(context, document_id).await.ok()??;
     let choice = HolderChoiceOperation::new(&record.holder_node_ids, now_ms);
-    pick(drive(choice, context).await.unwrap_or_default())
+    let candidates = drive(choice, context).await.unwrap_or_default();
+    pick(candidates, Ulid::generate().random())
         .filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
 }

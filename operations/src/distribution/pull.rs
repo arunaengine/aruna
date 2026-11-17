@@ -369,7 +369,8 @@ async fn member_of(
     // Replicas share the load by free download slots; the coordinator stays the fallback.
     if replicas > 1 {
         let choice = HolderChoiceOperation::new(&holders[..replicas], now_ms());
-        let chosen = pick(drive(choice, context).await.unwrap_or_default());
+        let candidates = drive(choice, context).await.unwrap_or_default();
+        let chosen = pick(candidates, Ulid::generate().random());
         let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
         match at {
             Some(at) => holders[..=at].rotate_right(1),

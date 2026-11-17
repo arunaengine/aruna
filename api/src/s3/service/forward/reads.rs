@@ -256,7 +256,8 @@ impl ArunaS3Service {
         let holders = key_holders(self.state.as_ref(), binding.set_id, key).await;
         let choice = HolderChoiceOperation::new(&holders, unix_timestamp_millis());
         let candidates = drive(choice, self.state.as_ref()).await.unwrap_or_default();
-        let node_id = pick(candidates).map_or(coordinator, |chosen| chosen.node_id);
+        let seed = Ulid::generate().random();
+        let node_id = pick(candidates, seed).map_or(coordinator, |chosen| chosen.node_id);
         let holder = Forward {
             set_id: binding.set_id,
             range_id,

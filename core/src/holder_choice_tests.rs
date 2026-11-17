@@ -98,17 +98,21 @@ fn slots(active: u32, refused: u32) -> Option<DownloadSlots> {
 #[test]
 fn free_slots_win() {
     // With exactly two candidates both are compared, whatever the shuffle order.
-    for _ in 0..16 {
+    for seed in 0..16 {
         assert_eq!(
-            pick(vec![holder(1, 10, 0), holder(2, 200, 0)]),
+            pick(vec![holder(1, 10, 0), holder(2, 200, 0)], seed),
             Some(holder(2, 200, 0))
         );
         assert_eq!(
-            pick(vec![holder(1, 10, 5), holder(2, 10, 9)]),
+            pick(vec![holder(1, 10, 5), holder(2, 10, 9)], seed),
             Some(holder(2, 10, 9))
         );
     }
-    assert_eq!(pick(Vec::new()), None);
+    assert_eq!(pick(Vec::new(), 3), None);
+    // The seed alone decides which two of more candidates are compared.
+    let three = || vec![holder(1, 10, 0), holder(2, 20, 0), holder(3, 30, 0)];
+    assert_eq!(pick(three(), 0), Some(holder(3, 30, 0)));
+    assert_eq!(pick(three(), 1), Some(holder(2, 20, 0)));
 }
 
 #[test]

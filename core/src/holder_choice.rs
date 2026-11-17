@@ -23,7 +23,6 @@ use crate::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
-use ulid::Ulid;
 
 /// A heartbeat older than this does not make a holder a candidate.
 pub(crate) const HEARTBEAT_STALE_MS: u64 = 180_000;
@@ -62,17 +61,19 @@ pub fn candidate(
     })
 }
 
-/// Power of two choices over two random candidates: more free slots wins, then more bandwidth.
-pub fn pick(mut candidates: Vec<HolderCandidate>) -> Option<HolderCandidate> {
-    let random = |len: usize| (Ulid::generate().random() % len as u128) as usize;
+/// Power of two choices over two candidates drawn with `seed`, which the caller supplies at
+/// random: more free slots wins, then more bandwidth.
+pub fn pick(mut candidates: Vec<HolderCandidate>, seed: u128) -> Option<HolderCandidate> {
     if candidates.is_empty() {
         return None;
     }
-    let first = candidates.swap_remove(random(candidates.len()));
+    let len = candidates.len() as u128;
+    let first = candidates.swap_remove((seed % len) as usize);
     if candidates.is_empty() {
         return Some(first);
     }
-    let second = candidates.swap_remove(random(candidates.len()));
+    let rest = candidates.len() as u128;
+    let second = candidates.swap_remove(((seed / len) % rest) as usize);
     Some(
         match (second.free_slots, second.bandwidth) > (first.free_slots, first.bandwidth) {
             true => second,
