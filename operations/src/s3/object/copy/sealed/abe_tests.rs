@@ -131,12 +131,15 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
 }
 
 /// Runs storage effects on `storage` and answers copy envelopes as an unlocked or locked node.
-async fn run<O: EffectOperation>(
-    mut operation: O,
+/// Runs an operation of either kind as the runner's effect machine against storage and a
+/// stand-in for the ABE crypto.
+async fn run<O: Runnable<K>, K>(
+    operation: O,
     storage: &StorageHandle,
     unlocked: Option<&Sealed>,
     race: Race,
 ) -> Result<O::Output, O::Error> {
+    let mut operation = operation.into_machine();
     let mut effects: Vec<Effect> = operation.start().into_iter().collect();
     while !operation.is_complete() {
         let effect = effects.remove(0);

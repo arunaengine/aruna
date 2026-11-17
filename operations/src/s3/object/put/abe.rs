@@ -11,7 +11,7 @@ use aruna_core::structs::storage::abe::{
     AbeError, AbeParameters, EnvelopeArchive, EnvelopePlan, ObjectEnvelope, envelope_charge,
 };
 use aruna_core::structs::storage::encryption::BucketKeyRef;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, TxnId, Value};
 
 impl PutObjectOperation {
     pub(super) fn read_abe(&mut self, fence: bool) -> Effects {
@@ -133,7 +133,10 @@ pub(crate) fn envelope_write(
         archive: ArchiveKey::of(location),
         location_key: location_key.unwrap_or_default(),
     };
-    envelope_rows(envelope, version, &archive, rows)
+    let (metadata, limit, txn_id) = rows;
+    let (writes, charge) = envelope_rows(envelope, version, &archive, (metadata, limit))?;
+    let write = StorageEffect::BatchWrite { writes, txn_id };
+    Ok((Effect::Storage(write), charge))
 }
 
 /// The write publishing `envelope` for `version` with its archive mapping, and its usage charge.
@@ -141,8 +144,8 @@ pub(crate) fn envelope_rows(
     envelope: &ObjectEnvelope,
     version: &VersionKey,
     archive: &EnvelopeArchive,
-    (metadata, limit, txn_id): (&HashMap<String, String>, u64, Option<TxnId>),
-) -> Result<(Effect, u64), AbeError> {
+    (metadata, limit): (&HashMap<String, String>, u64),
+) -> Result<(Vec<(KeySpace, Key, Value)>, u64), AbeError> {
     let version = version.to_bytes().map_err(|_| AbeError::Context)?;
     let id = envelope.context.write_id.to_bytes().to_vec();
     let bytes = envelope.to_bytes()?;
@@ -169,8 +172,5 @@ pub(crate) fn envelope_rows(
             archive_bytes.into(),
         ),
     ];
-    Ok((
-        Effect::Storage(StorageEffect::BatchWrite { writes, txn_id }),
-        charge,
-    ))
+    Ok((writes, charge))
 }

@@ -10,14 +10,16 @@ use crate::s3::usage::RowChange;
 use crate::s3::usage::UsageCounterUpdate;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::NodeId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::{
@@ -28,8 +30,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRef};
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use std::collections::HashMap;
 use tracing::warn;
 use ulid::Ulid;
@@ -50,28 +51,33 @@ pub enum CopyOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
-    Init,
     Read,
     Create,
-    Start,
     Check,
     Locate,
     Quota,
     Write,
     Delete,
     Usage,
-    Commit,
-    Done,
 }
 
-/// Envelopes one pending copy with the current epoch under the publication fence.
+type Step = Result<Next<CopyOutcome>, AbeError>;
+
+/// The values of a read as the keyed rows `parse_abe` takes.
+fn keyed(values: &[Option<Value>]) -> Vec<(Key, Option<Value>)> {
+    (values.iter())
+        .map(|value| (Key::from(Vec::new()), value.clone()))
+        .collect()
+}
+
+/// Envelopes one pending copy with the current epoch under the publication fence, in one
+/// transaction.
 #[derive(Debug, PartialEq)]
 pub struct CopyEnvelopeOperation {
     version: VersionKey,
     row: Vec<u8>,
     pending: PendingCopy,
     state: State,
-    txn: Option<TxnId>,
     envelope: Option<ObjectEnvelope>,
     /// Metadata, group and location key of the checked version, kept until it is published.
     stored: Option<(HashMap<String, String>, GroupId, Vec<u8>)>,
@@ -79,9 +85,8 @@ pub struct CopyEnvelopeOperation {
     /// Realm quota and origin; none leaves the group unlimited.
     quota: Option<(QuotaConfig, RealmId, NodeId)>,
     gate: Option<QuotaGate>,
-    /// The envelope write, held while the quota gate runs.
-    write: Option<Effect>,
-    output: Option<Result<CopyOutcome, AbeError>>,
+    /// The envelope rows, held while the quota gate runs.
+    writes: Vec<(KeySpace, Key, Value)>,
 }
 
 impl CopyEnvelopeOperation {
@@ -90,15 +95,13 @@ impl CopyEnvelopeOperation {
             version,
             row,
             pending,
-            state: State::Init,
-            txn: None,
+            state: State::Read,
             envelope: None,
             stored: None,
             usage: None,
             quota: None,
             gate: None,
-            write: None,
-            output: None,
+            writes: Vec::new(),
         }
     }
 
@@ -111,63 +114,76 @@ impl CopyEnvelopeOperation {
         self.pending.source.context.parameters.key
     }
 
-    fn finish(&mut self, output: Result<CopyOutcome, AbeError>) -> Effects {
-        self.state = State::Done;
-        self.output = Some(output);
-        self.abort()
+    fn admitted(&mut self, values: Vec<Option<Value>>) -> Step {
+        let (parameters, epoch) = parse_abe(&keyed(&values), self.key())?;
+        if self.pending.source.context.parameters != parameters {
+            return Err(AbeError::Parameters);
+        }
+        self.state = State::Create;
+        let copy = Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Copy {
+            source: self.pending.source.clone(),
+            epoch,
+            write_id: Ulid::generate(),
+            object_key: self.version.key.clone(),
+        })));
+        Ok(Next::Call(IoCall::Effect(Box::new(copy))))
     }
 
-    fn created(&mut self, event: BlobEvent) -> Effects {
+    fn created(&mut self, event: Event) -> Step {
+        let Event::Blob(event) = event else {
+            return Err(AbeError::Crypto);
+        };
         match event {
             BlobEvent::Abe(event) => match *event {
-                AbeEvent::Envelope(envelope) => {
-                    self.envelope = Some(envelope);
-                    self.state = State::Start;
-                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                        read: false
-                    })]
-                }
-                _ => self.finish(Err(AbeError::Context)),
+                AbeEvent::Envelope(envelope) => self.envelope = Some(envelope),
+                _ => return Err(AbeError::Context),
             },
             BlobEvent::Error(BlobError::Abe(AbeError::Required)) => {
-                self.finish(Ok(CopyOutcome::Locked))
+                return Ok(Next::Done(CopyOutcome::Locked));
             }
-            BlobEvent::Error(BlobError::Abe(error)) => self.finish(Err(error)),
-            _ => self.finish(Err(AbeError::Crypto)),
+            BlobEvent::Error(BlobError::Abe(error)) => return Err(error),
+            _ => return Err(AbeError::Crypto),
         }
+        let row = copy_row(self.key().bucket_id, &self.version).map_err(|_| AbeError::Context)?;
+        let version = self.version.to_bytes().map_err(|_| AbeError::Context)?;
+        let bucket = self.version.bucket.as_bytes().to_vec();
+        let mut reads = vec![
+            (ABE_COPY_KEYSPACE.to_string(), row.into()),
+            (BLOB_VERSIONS_KEYSPACE.to_string(), version.into()),
+            (S3_BUCKET_KEYSPACE.to_string(), bucket.clone().into()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
+        ];
+        reads.extend(abe_reads(self.key()));
+        self.state = State::Check;
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn checked(&mut self, values: &[(Key, Option<Value>)]) -> Effects {
+    fn checked(&mut self, values: Vec<Option<Value>>) -> Step {
+        let values = keyed(&values);
         let [
             (_, row),
             (_, version),
             (_, bucket),
             (_, settings),
             anchors @ ..,
-        ] = values
+        ] = values.as_slice()
         else {
-            return self.finish(Err(AbeError::Context));
+            return Err(AbeError::Context);
         };
         let version = version.as_deref().map(BlobVersion::from_bytes).transpose();
         let (Some(row), Ok(Some(version))) = (row, version) else {
-            return self.finish(Ok(CopyOutcome::Gone));
+            return Ok(Next::Done(CopyOutcome::Gone));
         };
         if row.as_ref() != self.row.as_slice() || version.is_deleted() {
-            return self.finish(Ok(CopyOutcome::Gone));
+            return Ok(Next::Done(CopyOutcome::Gone));
         }
-        let result = (|| {
-            let bucket = bucket.as_deref().ok_or(AbeError::Missing)?;
-            let bucket = BucketInfo::from_bytes(bucket).map_err(|_| AbeError::Context)?;
-            still_active(settings.as_deref(), self.key())?;
-            let (parameters, epoch) = parse_abe(anchors, self.key())?;
-            let envelope = self.envelope.as_ref().ok_or(AbeError::Context)?;
-            envelope.anchored(&parameters, epoch)?;
-            Ok(bucket.group_id)
-        })();
-        let group = match result {
-            Ok(group) => group,
-            Err(error) => return self.finish(Err(error)),
-        };
+        let bucket = bucket.as_deref().ok_or(AbeError::Missing)?;
+        let bucket = BucketInfo::from_bytes(bucket).map_err(|_| AbeError::Context)?;
+        still_active(settings.as_deref(), self.key())?;
+        let (parameters, epoch) = parse_abe(anchors, self.key())?;
+        let envelope = self.envelope.as_ref().ok_or(AbeError::Context)?;
+        envelope.anchored(&parameters, epoch)?;
+        let group = bucket.group_id;
         let location = version.location_key().map(|key| key.to_bytes());
         let pending = matches!(
             &version.state,
@@ -182,210 +198,122 @@ impl CopyEnvelopeOperation {
             (true, _) => self.publish(),
             (false, Some(key)) => {
                 self.state = State::Locate;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                    key: key.into(),
-                    txn_id: self.txn,
-                })]
+                Ok(Next::Call(read_row(BLOB_LOCATIONS_KEYSPACE, key)))
             }
-            (false, None) => self.finish(Err(AbeError::Context)),
+            (false, None) => Err(AbeError::Context),
         }
     }
 
     /// The materialized location must still be the pending source's archive and bucket key.
-    fn located(&mut self, value: Option<Value>) -> Effects {
+    fn located(&mut self, value: Option<Value>) -> Step {
         let location = value.as_deref().map(BackendLocation::from_bytes);
         let Some(Ok(location)) = location else {
-            return self.finish(Err(AbeError::Context));
+            return Err(AbeError::Context);
         };
         if ArchiveKey::of(&location) != self.pending.archive
             || location.format.bucket_key() != Some(self.key())
         {
-            return self.finish(Err(AbeError::Context));
+            return Err(AbeError::Context);
         }
         self.publish()
     }
 
-    fn publish(&mut self) -> Effects {
+    fn publish(&mut self) -> Step {
         let (Some((metadata, group, location_key)), Some(envelope)) =
             (self.stored.take(), self.envelope.as_ref())
         else {
-            return self.finish(Err(AbeError::Context));
+            return Err(AbeError::Context);
         };
         let archive = EnvelopeArchive {
             archive: self.pending.archive.clone(),
             location_key,
         };
         let limit = RoCrateLimits::default().metadata_bytes;
-        let rows = (&metadata, limit, self.txn);
-        match envelope_rows(envelope, &self.version, &archive, rows) {
-            Ok((effect, charge)) => {
-                // The envelope replaces the pending row and its charge.
-                let added = i128::from(charge) - self.row.len() as i128;
-                let delta = UsageDelta {
-                    logical_bytes: added,
-                    ..Default::default()
-                };
-                let usage = UsageCounterUpdate::for_group(group, delta);
-                self.usage = Some(usage.in_bucket(&self.version.bucket, RowChange::Kept));
-                let ceiling = self.quota.as_ref().and_then(|(quota, realm, node)| {
-                    let ceiling = quota.effective_group_ceiling(&group)?;
-                    Some((ceiling, *realm, *node))
-                });
-                let (Some(txn_id), Some((ceiling, realm, node)), true) =
-                    (self.txn, ceiling, added > 0)
-                else {
-                    self.state = State::Write;
-                    return smallvec![effect];
-                };
-                let mut gate = QuotaGate::new_for_realm(ceiling, added as u64, group, node, realm);
-                let effects = gate.start(txn_id);
-                self.gate = Some(gate);
-                self.write = Some(effect);
-                self.state = State::Quota;
-                effects
-            }
-            Err(error) => self.finish(Err(error)),
-        }
+        let (writes, charge) =
+            envelope_rows(envelope, &self.version, &archive, (&metadata, limit))?;
+        // The envelope replaces the pending row and its charge.
+        let added = i128::from(charge) - self.row.len() as i128;
+        let delta = UsageDelta {
+            logical_bytes: added,
+            ..Default::default()
+        };
+        let usage = UsageCounterUpdate::for_group(group, delta);
+        self.usage = Some(usage.in_bucket(&self.version.bucket, RowChange::Kept));
+        let ceiling = self.quota.as_ref().and_then(|(quota, realm, node)| {
+            let ceiling = quota.effective_group_ceiling(&group)?;
+            Some((ceiling, *realm, *node))
+        });
+        let (Some((ceiling, realm, node)), true) = (ceiling, added > 0) else {
+            self.state = State::Write;
+            return Ok(Next::Call(IoCall::Write(writes)));
+        };
+        let mut gate = QuotaGate::new_for_realm(ceiling, added as u64, group, node, realm);
+        let call = gate.start_calls();
+        self.gate = Some(gate);
+        self.writes = writes;
+        self.state = State::Quota;
+        Ok(Next::Call(call))
     }
 
     /// A positive replacement charge must fit the group quota.
-    fn quota_step(&mut self, event: Event) -> Effects {
-        let (Some(txn_id), Some(gate)) = (self.txn, self.gate.as_mut()) else {
-            return self.finish(Err(AbeError::Context));
-        };
-        match gate.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) if gate.is_exceeded() => self.finish(Err(AbeError::Limit)),
+    fn quota_step(&mut self, result: IoResult) -> Step {
+        let gate = self.gate.as_mut().ok_or(AbeError::Context)?;
+        match gate.step_calls(result) {
+            Ok(Some(call)) => Ok(Next::Call(call)),
+            Ok(None) if gate.is_exceeded() => Err(AbeError::Limit),
             Ok(None) => {
-                let Some(effect) = self.write.take() else {
-                    return self.finish(Err(AbeError::Context));
-                };
                 self.state = State::Write;
-                smallvec![effect]
+                Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
             }
-            Err(_) => self.finish(Err(AbeError::Unavailable)),
+            Err(_) => Err(AbeError::Unavailable),
+        }
+    }
+
+    fn usage_step(&mut self, result: IoResult) -> Step {
+        let usage = self.usage.as_mut().ok_or(AbeError::Context)?;
+        match usage.step_calls(result) {
+            Ok(Some(call)) => Ok(Next::Call(call.into_call())),
+            Ok(None) => Ok(Next::Done(CopyOutcome::Completed)),
+            Err(_) => Err(AbeError::Unavailable),
         }
     }
 }
 
-impl EffectOperation for CopyEnvelopeOperation {
+impl Operation for CopyEnvelopeOperation {
     type Output = CopyOutcome;
     type Error = AbeError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Read;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: abe_reads(self.key()),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Step {
+        Ok(Next::Call(IoCall::Read(abe_reads(self.key()))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (State::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let (parameters, epoch) = match parse_abe(&values, self.key()) {
-                    Ok(value) => value,
-                    Err(error) => return self.finish(Err(error)),
-                };
-                if self.pending.source.context.parameters != parameters {
-                    return self.finish(Err(AbeError::Parameters));
-                }
-                self.state = State::Create;
-                smallvec![Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Copy {
-                    source: self.pending.source.clone(),
-                    epoch,
-                    write_id: Ulid::generate(),
-                    object_key: self.version.key.clone(),
-                })))]
-            }
-            (State::Create, Event::Blob(event)) => self.created(event),
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn = Some(txn_id);
-                let (Ok(row), Ok(version)) = (
-                    copy_row(self.key().bucket_id, &self.version),
-                    self.version.to_bytes(),
-                ) else {
-                    return self.finish(Err(AbeError::Context));
-                };
-                let bucket = self.version.bucket.as_bytes().to_vec();
-                let mut reads = vec![
-                    (ABE_COPY_KEYSPACE.to_string(), row.into()),
-                    (BLOB_VERSIONS_KEYSPACE.to_string(), version.into()),
-                    (S3_BUCKET_KEYSPACE.to_string(), bucket.clone().into()),
-                    (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.into()),
-                ];
-                reads.extend(abe_reads(self.key()));
-                self.state = State::Check;
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: self.txn,
-                })]
-            }
-            (State::Check, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.checked(&values)
-            }
-            (State::Locate, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.located(value)
-            }
-            (State::Quota, event @ Event::Storage(_)) if self.gate.is_some() => {
-                self.quota_step(event)
-            }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let Ok(row) = copy_row(self.key().bucket_id, &self.version) else {
-                    return self.finish(Err(AbeError::Context));
-                };
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            State::Read => self.admitted(result.values()?),
+            State::Create => self.created(result.event()?),
+            State::Check => self.checked(result.values()?),
+            State::Locate => self.located(result.value()?),
+            State::Quota => self.quota_step(result),
+            State::Write => {
+                result.done()?;
+                let row =
+                    copy_row(self.key().bucket_id, &self.version).map_err(|_| AbeError::Context)?;
                 self.state = State::Delete;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: vec![(ABE_COPY_KEYSPACE.to_string(), row.into())],
-                    txn_id: self.txn,
-                })]
+                let delete = (ABE_COPY_KEYSPACE.to_string(), row.into());
+                Ok(Next::Call(IoCall::Delete(vec![delete])))
             }
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                let (Some(txn_id), Some(usage)) = (self.txn, self.usage.as_mut()) else {
-                    return self.finish(Err(AbeError::Context));
-                };
+            State::Delete => {
+                result.done()?;
+                let usage = self.usage.as_mut().ok_or(AbeError::Context)?;
                 self.state = State::Usage;
-                usage.start(txn_id)
+                Ok(Next::Call(usage.start_calls().into_call()))
             }
-            (State::Usage, event @ Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let (Some(txn_id), Some(usage)) = (self.txn, self.usage.as_mut()) else {
-                    return self.finish(Err(AbeError::Context));
-                };
-                match usage.step(event, txn_id) {
-                    Ok(Some(effects)) => effects,
-                    Ok(None) => {
-                        self.state = State::Commit;
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    Err(_) => self.finish(Err(AbeError::Unavailable)),
-                }
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { txn_id }))
-                if self.txn == Some(txn_id) =>
-            {
-                self.txn = None;
-                self.finish(Ok(CopyOutcome::Completed))
-            }
-            (_, Event::Storage(StorageEvent::Error { .. })) => {
-                self.finish(Err(AbeError::Unavailable))
-            }
-            _ => self.finish(Err(AbeError::Context)),
+            State::Usage => self.usage_step(result),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn finalize(self) -> Result<CopyOutcome, AbeError> {
-        self.output.unwrap_or(Err(AbeError::Context))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn.take().map_or_else(Effects::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
