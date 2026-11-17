@@ -2,44 +2,29 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::errors::ConversionError;
+use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use thiserror::Error;
 
-use super::publish_queue::{MAX_PUBLISH_ENTRIES, PublishEntry, scan_publish_queue};
+use super::publish_queue::{MAX_PUBLISH_ENTRIES, PUBLISH_PAGE_SIZE, PublishEntry};
 
+/// Outputs the queued drafts in creation order, stopping after the page that reaches
+/// [`MAX_PUBLISH_ENTRIES`].
 #[derive(Debug, PartialEq)]
 pub struct ListDraftsOperation {
+    pages: PrefixPages,
     entries: Vec<PublishEntry>,
-    state: ListDraftsState,
-    output: Option<Result<Vec<PublishEntry>, ListDraftsError>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ListDraftsState {
-    Init,
-    Scan,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ListDraftsError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("listing queued drafts did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
 }
 
 impl Default for ListDraftsOperation {
@@ -51,85 +36,29 @@ impl Default for ListDraftsOperation {
 impl ListDraftsOperation {
     pub fn new() -> Self {
         Self {
+            pages: PrefixPages::new(DEVICE_INTAKE_KEYSPACE, Vec::new(), PUBLISH_PAGE_SIZE),
             entries: Vec::new(),
-            state: ListDraftsState::Init,
-            output: None,
         }
     }
 }
 
-impl EffectOperation for ListDraftsOperation {
+impl Operation for ListDraftsOperation {
     type Output = Vec<PublishEntry>;
     type Error = ListDraftsError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ListDraftsState::Scan;
-        smallvec![scan_publish_queue(None, None)]
+    fn first(&mut self) -> Result<Next<Vec<PublishEntry>>, ListDraftsError> {
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, ListDraftsError::StorageError(error));
-            }
-            other => other,
-        };
-
-        match self.state {
-            ListDraftsState::Scan => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    return fail(
-                        self,
-                        ListDraftsError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "iter result",
-                            got,
-                        },
-                    );
-                };
-                for (_, bytes) in values {
-                    match PublishEntry::from_bytes(&bytes) {
-                        Ok(entry) => self.entries.push(entry),
-                        Err(error) => return fail(self, ListDraftsError::ConversionError(error)),
-                    }
-                }
-                match next_start_after {
-                    Some(cursor) if self.entries.len() < MAX_PUBLISH_ENTRIES => {
-                        smallvec![scan_publish_queue(Some(cursor), None)]
-                    }
-                    _ => {
-                        self.state = ListDraftsState::Finish;
-                        self.output = Some(Ok(std::mem::take(&mut self.entries)));
-                        smallvec![]
-                    }
-                }
-            }
-            ListDraftsState::Init | ListDraftsState::Finish | ListDraftsState::Error => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<PublishEntry>>, ListDraftsError> {
+        for (_, bytes) in self.pages.take(result)? {
+            self.entries.push(PublishEntry::from_bytes(&bytes)?);
         }
+        if self.pages.done() || self.entries.len() >= MAX_PUBLISH_ENTRIES {
+            return Ok(Next::Done(std::mem::take(&mut self.entries)));
+        }
+        Ok(Next::Call(self.pages.call()))
     }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ListDraftsState::Finish | ListDraftsState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ListDraftsError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-fn fail(operation: &mut ListDraftsOperation, error: ListDraftsError) -> Effects {
-    operation.state = ListDraftsState::Error;
-    operation.output = Some(Err(error));
-    smallvec![]
 }
 
 #[cfg(test)]
@@ -142,6 +71,48 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
+
+    // A full queue stops after the page that fills it, and a bad row fails.
+    #[test]
+    fn stops_when_full() {
+        use super::{DEVICE_INTAKE_KEYSPACE, ListDraftsError, MAX_PUBLISH_ENTRIES};
+        use crate::device::publish_queue::publish_entry;
+        use aruna_core::calls::{IoCall, IoResult, Next};
+        use aruna_core::operation::Operation;
+        let owner = UserId::local(Ulid::nil(), RealmId::from_bytes([3u8; 32]));
+        let entry = PublishEntry::new(
+            Ulid::nil(),
+            owner,
+            Ulid::nil(),
+            "/notes".to_string(),
+            false,
+            "{}".to_string(),
+        );
+        let (_, key, value) = publish_entry(&entry).unwrap();
+        let mut list = ListDraftsOperation::new();
+        let Ok(Next::Call(IoCall::Page { space, limit, .. })) = list.first() else {
+            panic!("expected a page call");
+        };
+        assert_eq!((space.as_str(), limit), (DEVICE_INTAKE_KEYSPACE, PUBLISH_PAGE_SIZE));
+        let full = IoResult::Page {
+            rows: vec![(key.clone(), value); MAX_PUBLISH_ENTRIES],
+            next: Some(key.clone()),
+        };
+        let Ok(Next::Done(listed)) = list.next(full) else {
+            panic!("expected the full queue");
+        };
+        assert_eq!(listed.len(), MAX_PUBLISH_ENTRIES);
+        let mut list = ListDraftsOperation::new();
+        list.first().unwrap();
+        let garbage = IoResult::Page {
+            rows: vec![(key, vec![0xFF].into())],
+            next: None,
+        };
+        assert!(matches!(
+            list.next(garbage),
+            Err(ListDraftsError::ConversionError(_))
+        ));
+    }
 
     #[tokio::test]
     async fn lists_queued_drafts() {

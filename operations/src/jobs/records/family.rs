@@ -3,16 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind,
 };
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 use thiserror::Error;
 
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE};
@@ -37,6 +35,16 @@ pub enum FamilyReadError {
     NotFinished,
 }
 
+impl From<IoError> for FamilyReadError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+            IoError::Storage(error) => Self::Storage(error.to_string()),
+            error => Self::Storage(error.to_string()),
+        }
+    }
+}
+
 /// Pages one family prefix to its end. A page error, an undecodable row, or a
 /// continuation past the bound fails the whole read instead of returning the
 /// part that happened to load.
@@ -45,8 +53,6 @@ pub struct LoadFamilyOperation {
     prefix: Key,
     limit: usize,
     records: Vec<JobRecordEnvelope>,
-    started: bool,
-    outcome: Option<Result<Vec<JobRecordEnvelope>, FamilyReadError>>,
 }
 
 impl LoadFamilyOperation {
@@ -67,94 +73,44 @@ impl LoadFamilyOperation {
             prefix,
             limit,
             records: Vec::new(),
-            started: false,
-            outcome: None,
         }
     }
 
-    fn page(&self, cursor: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
-            prefix: Some(self.prefix.clone()),
-            start: cursor.map(IterStart::After),
+    fn page<T>(&self, after: Option<Key>) -> Next<T> {
+        Next::Call(IoCall::Page {
+            space: FAMILY_RECORD_KEYSPACE.to_string(),
+            prefix: self.prefix.clone(),
+            after,
             limit: RECORD_PAGE_SIZE,
-            txn_id: None,
-        })]
-    }
-
-    fn finish(&mut self, outcome: Result<Vec<JobRecordEnvelope>, FamilyReadError>) -> Effects {
-        self.outcome = Some(outcome);
-        smallvec![]
-    }
-
-    fn keep(
-        &mut self,
-        values: Vec<(Key, aruna_core::types::Value)>,
-    ) -> Result<(), FamilyReadError> {
-        for (key, value) in values {
-            JobRecordKey::from_bytes(&key).map_err(|_| FamilyReadError::MalformedKey)?;
-            self.records.push(from_bytes::<JobRecordEnvelope>(&value)?);
-        }
-        Ok(())
+        })
     }
 }
 
-impl EffectOperation for LoadFamilyOperation {
+impl Operation for LoadFamilyOperation {
     type Output = Vec<JobRecordEnvelope>;
     type Error = FamilyReadError;
 
-    fn start(&mut self) -> Effects {
-        self.started = true;
-        self.page(None)
+    fn first(&mut self) -> Result<Next<Self::Output>, FamilyReadError> {
+        Ok(self.page(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if !self.started || self.outcome.is_some() {
-            return self.finish(Err(FamilyReadError::Storage(format!(
-                "unexpected storage event: {}",
-                event.label()
-            ))));
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, FamilyReadError> {
+        let IoResult::Page { rows, next } = result else {
+            return Err(FamilyReadError::Storage(
+                "unexpected answer to a family page".to_string(),
+            ));
+        };
+        for (key, value) in rows {
+            JobRecordKey::from_bytes(&key).map_err(|_| FamilyReadError::MalformedKey)?;
+            self.records.push(from_bytes::<JobRecordEnvelope>(&value)?);
         }
-        match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                if let Err(error) = self.keep(values) {
-                    return self.finish(Err(error));
-                }
-                match next_start_after {
-                    Some(_) if self.records.len() >= self.limit => {
-                        let loaded = self.records.len();
-                        self.finish(Err(FamilyReadError::LimitExceeded { loaded }))
-                    }
-                    Some(next) => self.page(Some(next)),
-                    None => {
-                        let records = std::mem::take(&mut self.records);
-                        self.finish(Ok(records))
-                    }
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.finish(Err(FamilyReadError::Storage(error.to_string())))
-            }
-            other => self.finish(Err(FamilyReadError::Storage(format!(
-                "unexpected storage event: {}",
-                other.label()
-            )))),
+        match next {
+            Some(_) if self.records.len() >= self.limit => Err(FamilyReadError::LimitExceeded {
+                loaded: self.records.len(),
+            }),
+            Some(after) => Ok(self.page(Some(after))),
+            None => Ok(Next::Done(std::mem::take(&mut self.records))),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.outcome.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(FamilyReadError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 

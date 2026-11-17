@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::IoError;
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
@@ -445,7 +446,7 @@ async fn requires_unrestricted_token() {
 #[test]
 fn maps_store_errors() {
     assert_eq!(
-        map_chat_error(ChatStoreError::NotFinished)
+        map_chat_error(ChatStoreError::Io(IoError::Unfinished))
             .into_response()
             .status(),
         StatusCode::INTERNAL_SERVER_ERROR

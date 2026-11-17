@@ -9,7 +9,7 @@ use aruna_core::compute::Secret;
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretKind, SecretSettings};
 
 use super::*;
-use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, keys, secret};
+use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, hold_keys, secret};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use aruna_core::plugins::Refusal;
@@ -90,19 +90,18 @@ async fn management_receiver() {
         target: Some(("POST".to_string(), format!("{ORIGIN}/api/records"))),
         ..request("api_key")
     };
-    let mut held = HeldSecrets::default();
-    let realm_keys = keys();
-    let local = (fixture.actor.node_id, &realm_keys);
-    let ask = |asked| ask_release(&fixture.ctx, &config, local, asked);
-    let (_, fields) = held.obtain(first, ask).await.unwrap();
-    assert_eq!(fields.get("token"), Some(TOKEN));
+    let local = fixture.actor.node_id;
     // Without the realm keys the node has nobody else to ask in this realm.
-    let none = ReleaseKeys::default();
     let asked = ReleaseRequest {
         install_id: install.install_id,
         target: Some(("POST".to_string(), format!("{ORIGIN}/api/records"))),
         ..request("api_key")
     };
-    let alone = ask_release(&fixture.ctx, &config, (fixture.actor.node_id, &none), asked).await;
+    let alone = ask_release(&fixture.ctx, &config, local, asked).await;
     assert!(matches!(alone, Err(ReleaseError::Unavailable(_))));
+    hold_keys(&fixture.ctx);
+    let mut held = HeldSecrets::default();
+    let ask = |asked| ask_release(&fixture.ctx, &config, local, asked);
+    let (_, fields) = held.obtain(first, ask).await.unwrap();
+    assert_eq!(fields.get("token"), Some(TOKEN));
 }

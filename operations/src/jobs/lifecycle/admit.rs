@@ -5,7 +5,8 @@
 
 use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -13,14 +14,14 @@ use aruna_core::keyspaces::{
     ADMISSION_QUOTA_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
     RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key, owner_index_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::rows::values;
+use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 
 use super::ids::workspace_of;
@@ -66,32 +67,28 @@ pub struct AdmittedSubmission {
     pub created: bool,
 }
 
+/// Reads the realm view outside any transaction; the claim scan, the quota and the writes run
+/// in one write transaction, which the runner opens at the first row call.
 #[derive(Debug, PartialEq)]
 pub struct AdmitSubmissionOperation {
     config: AdmitSubmissionConfig,
     view: Option<FamilyView>,
     claims: Vec<(JobFamilyId, SubmissionClaim)>,
-    cursor: Option<Key>,
     quota_revision: u64,
     cache: Option<ProjectionCache>,
     state: AdmitState,
-    outcome: Option<Result<AdmittedSubmission, LifecycleError>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmitState {
-    Init,
     ReadConfig,
-    Begin,
-    Scan { txn_id: TxnId },
-    ReadQuota { txn_id: TxnId },
-    ReadCache { txn_id: TxnId },
-    Write { txn_id: TxnId },
-    Commit { txn_id: TxnId },
-    Cancel { txn_id: TxnId },
-    Finish,
-    Error,
+    Scan,
+    ReadQuota,
+    ReadCache,
+    Write,
 }
+
+type Step = Result<Next<AdmittedSubmission>, LifecycleError>;
 
 impl AdmitSubmissionOperation {
     pub fn new(config: AdmitSubmissionConfig) -> Self {
@@ -99,11 +96,9 @@ impl AdmitSubmissionOperation {
             config,
             view: None,
             claims: Vec::new(),
-            cursor: None,
             quota_revision: 0,
             cache: None,
-            state: AdmitState::Init,
-            outcome: None,
+            state: AdmitState::ReadConfig,
         }
     }
 
@@ -114,41 +109,16 @@ impl AdmitSubmissionOperation {
         }
     }
 
-    fn txn(&self) -> Option<TxnId> {
-        match self.state {
-            AdmitState::Scan { txn_id }
-            | AdmitState::ReadQuota { txn_id }
-            | AdmitState::ReadCache { txn_id }
-            | AdmitState::Write { txn_id }
-            | AdmitState::Commit { txn_id }
-            | AdmitState::Cancel { txn_id } => Some(txn_id),
-            _ => None,
-        }
-    }
-
-    fn read_config(&mut self) -> Effects {
-        self.state = AdmitState::ReadConfig;
-        let config = DocumentTarget::RealmConfig {
-            realm_id: self.config.realm_id,
-        };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: config.storage_keyspace().to_string(),
-            key: config.storage_key(),
-            txn_id: None,
-        })]
-    }
-
     /// Claims of every request family under this submission, so a replay and an
     /// idempotency conflict are both decided from the same transaction scan.
-    fn scan(&mut self, txn_id: TxnId) -> Effects {
-        self.state = AdmitState::Scan { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
-            prefix: Some(submission_prefix(self.config.submission_id)),
-            start: self.cursor.clone().map(IterStart::After),
+    fn scan(&mut self, after: Option<Key>) -> Step {
+        self.state = AdmitState::Scan;
+        Ok(Next::Call(IoCall::Page {
+            space: FAMILY_RECORD_KEYSPACE.to_string(),
+            prefix: submission_prefix(self.config.submission_id),
+            after,
             limit: RECORD_PAGE_SIZE,
-            txn_id: Some(txn_id),
-        })]
+        }))
     }
 
     fn keep_claims(&mut self, values: Vec<(Key, Value)>) -> Result<(), LifecycleError> {
@@ -180,38 +150,35 @@ impl AdmitSubmissionOperation {
             .map(|(_, claim)| claim.job_id)
     }
 
-    fn decide(&mut self, txn_id: TxnId) -> Effects {
+    fn decide(&mut self) -> Step {
         if let Some(job_id) = self.canonical(self.family()) {
-            self.settle(job_id, false);
-            return self.cancel(txn_id);
+            return Ok(Next::Done(self.settle(job_id, false)));
         }
         if let Some(existing_job_id) = self.conflicting() {
-            self.outcome = Some(Err(LifecycleError::IdempotencyConflict { existing_job_id }));
-            return self.cancel(txn_id);
+            return Err(LifecycleError::IdempotencyConflict { existing_job_id });
         }
         if let Some(denied) = self.config.quota_refusal.take() {
-            self.outcome = Some(Err(LifecycleError::QuotaDenied(denied)));
-            return self.cancel(txn_id);
+            return Err(LifecycleError::QuotaDenied(denied));
         }
-        self.state = AdmitState::ReadQuota { txn_id };
         let JobFamilyRecord::Spec(spec) = &self.config.candidate.spec.envelope().record else {
-            self.outcome = Some(Err(LifecycleError::NotHolder));
-            return self.cancel(txn_id);
+            return Err(LifecycleError::NotHolder);
         };
-        smallvec![crate::groups::fence::read_group_record(
-            spec.group_id,
-            ADMISSION_QUOTA_KEYSPACE,
+        let quota = (
+            ADMISSION_QUOTA_KEYSPACE.to_string(),
             Key::from(spec.group_id.to_bytes().as_slice()),
-            txn_id,
-        )]
+        );
+        let fence = crate::groups::fence::group_fence_key(spec.group_id);
+        self.state = AdmitState::ReadQuota;
+        Ok(Next::Call(IoCall::Read(vec![quota, fence])))
     }
 
-    fn read_cache(&mut self, txn_id: TxnId, value: Option<Value>) -> Effects {
-        self.quota_revision = match value {
-            Some(value) => match from_bytes::<u64>(&value) {
-                Ok(revision) => revision,
-                Err(error) => return self.fail(error.into()),
-            },
+    /// Checks the group still accepts writes and that the quota revision is the one the
+    /// caller's check observed, then reads the projection cache.
+    fn read_cache(&mut self, result: IoResult) -> Step {
+        let [quota, fence] = values::<2>(result)?;
+        crate::groups::fence::check_group_write(fence.as_deref())?;
+        self.quota_revision = match quota {
+            Some(value) => from_bytes::<u64>(&value)?,
             None => 0,
         };
         if self
@@ -219,32 +186,13 @@ impl AdmitSubmissionOperation {
             .quota_revision
             .is_some_and(|expected| expected != self.quota_revision)
         {
-            self.outcome = Some(Err(StorageError::TransactionConflict.into()));
-            return self.cancel(txn_id);
+            return Err(StorageError::TransactionConflict.into());
         }
-        self.state = AdmitState::ReadCache { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: FAMILY_PROJECTION_KEYSPACE.to_string(),
-            key: family_prefix(&self.family()),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    /// Verifies the two records this node signed against its own local view,
-    /// then commits them, the alias row, and their replication entries together.
-    fn write(&mut self, txn_id: TxnId) -> Effects {
-        let writes = match self.batch_writes() {
-            Ok(writes) => writes,
-            Err(error) => {
-                self.outcome = Some(Err(error));
-                return self.cancel(txn_id);
-            }
-        };
-        self.state = AdmitState::Write { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+        self.state = AdmitState::ReadCache;
+        Ok(Next::Call(IoCall::Read(vec![(
+            FAMILY_PROJECTION_KEYSPACE.to_string(),
+            family_prefix(&self.family()),
+        )])))
     }
 
     fn batch_writes(&self) -> Result<Vec<(String, Key, Value)>, LifecycleError> {
@@ -313,41 +261,17 @@ impl AdmitSubmissionOperation {
         Ok(writes)
     }
 
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = AdmitState::Commit { txn_id };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn cancel(&mut self, txn_id: TxnId) -> Effects {
-        self.state = AdmitState::Cancel { txn_id };
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn settle(&mut self, job_id: JobId, created: bool) {
+    fn settle(&self, job_id: JobId, created: bool) -> AdmittedSubmission {
         debug!(job_id = %job_id, created, "Submission admission decided");
-        self.outcome = Some(Ok(AdmittedSubmission {
+        AdmittedSubmission {
             job_id,
             family: self.family(),
             created,
-        }));
+        }
     }
 
-    fn finish(&mut self) -> Effects {
-        self.state = match &self.outcome {
-            Some(Ok(_)) => AdmitState::Finish,
-            _ => AdmitState::Error,
-        };
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: LifecycleError) -> Effects {
-        self.outcome = Some(Err(error));
-        self.state = AdmitState::Error;
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(LifecycleError::unexpected(&self.state, expected, got))
+    fn unexpected(&self, expected: &'static str, got: &'static str) -> LifecycleError {
+        LifecycleError::unexpected(&self.state, expected, got)
     }
 }
 
@@ -367,117 +291,12 @@ fn authentic(verdict: RecordVerdict) -> Result<(), LifecycleError> {
     }
 }
 
-impl EffectOperation for AdmitSubmissionOperation {
+impl Operation for AdmitSubmissionOperation {
     type Output = AdmittedSubmission;
     type Error = LifecycleError;
 
-    fn start(&mut self) -> Effects {
-        self.read_config()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            AdmitState::ReadConfig => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    match stored_view(value, self.config.realm_id, self.family()) {
-                        Ok(view) => self.view = view,
-                        Err(error) => return self.fail(error),
-                    }
-                    if self.view.is_none() {
-                        return self.fail(LifecycleError::NotHolder);
-                    }
-                    self.state = AdmitState::Begin;
-                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                        read: false
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("realm config read", other.label()),
-            },
-            AdmitState::Begin => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => self.scan(txn_id),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start", other.label()),
-            },
-            AdmitState::Scan { txn_id } => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    if let Err(error) = self.keep_claims(values) {
-                        self.outcome = Some(Err(error));
-                        return self.cancel(txn_id);
-                    }
-                    match next_start_after {
-                        Some(cursor) => {
-                            self.cursor = Some(cursor);
-                            self.scan(txn_id)
-                        }
-                        None => self.decide(txn_id),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("submission scan", other.label()),
-            },
-            AdmitState::ReadQuota { txn_id } => {
-                match crate::groups::fence::parse_group_record(event) {
-                    Ok(value) => self.read_cache(txn_id, value),
-                    Err(error) => self.fail(error.into()),
-                }
-            }
-            AdmitState::ReadCache { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.cache = value
-                        .as_ref()
-                        .and_then(|value| ProjectionCache::decode(value));
-                    if value.is_some() && self.cache.is_none() {
-                        warn!("Job projection cache is unreadable");
-                    }
-                    self.write(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("projection cache read", other.label()),
-            },
-            AdmitState::Write { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    self.settle(self.config.candidate.job_id, true);
-                    self.commit(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("admission write", other.label()),
-            },
-            AdmitState::Commit { .. } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.finish(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction commit", other.label()),
-            },
-            AdmitState::Cancel { .. } => match event {
-                Event::Storage(StorageEvent::TransactionAborted { .. }) => self.finish(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction abort", other.label()),
-            },
-            AdmitState::Init | AdmitState::Finish | AdmitState::Error => {
-                self.unexpected("no event", event.label())
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, AdmitState::Finish | AdmitState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(LifecycleError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn() {
-            Some(txn_id) => {
-                self.state = AdmitState::Error;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => smallvec![],
-        }
+    fn transaction(&self) -> bool {
+        true
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -488,6 +307,64 @@ impl EffectOperation for AdmitSubmissionOperation {
                 | LifecycleError::RealmConfigMissing
                 | LifecycleError::Store(RecordStoreError::UnknownAlias)
         )
+    }
+
+    fn first(&mut self) -> Step {
+        let config = DocumentTarget::RealmConfig {
+            realm_id: self.config.realm_id,
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
+            StorageEffect::Read {
+                key_space: config.storage_keyspace().to_string(),
+                key: config.storage_key(),
+                txn_id: None,
+            },
+        )))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Step {
+        match (self.state, result) {
+            (AdmitState::ReadConfig, IoResult::Event(event)) => match *event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.view = stored_view(value, self.config.realm_id, self.family())?;
+                    if self.view.is_none() {
+                        return Err(LifecycleError::NotHolder);
+                    }
+                    self.scan(None)
+                }
+                Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+                other => Err(self.unexpected("realm config read", other.label())),
+            },
+            (AdmitState::Scan, IoResult::Page { rows, next }) => {
+                self.keep_claims(rows)?;
+                match next {
+                    Some(after) => self.scan(Some(after)),
+                    None => self.decide(),
+                }
+            }
+            (AdmitState::ReadQuota, result) => self.read_cache(result),
+            (AdmitState::ReadCache, result) => {
+                let [value] = values::<1>(result)?;
+                self.cache = value
+                    .as_ref()
+                    .and_then(|value| ProjectionCache::decode(value));
+                if value.is_some() && self.cache.is_none() {
+                    warn!("Job projection cache is unreadable");
+                }
+                // Verifies the two records this node signed against its own local view,
+                // then commits them, the alias row, and their replication entries together.
+                self.state = AdmitState::Write;
+                Ok(Next::Call(IoCall::Write(self.batch_writes()?)))
+            }
+            (AdmitState::Write, IoResult::Done) => Ok(Next::Done(
+                self.settle(self.config.candidate.job_id, true),
+            )),
+            (state, other) => Err(LifecycleError::unexpected(
+                &state,
+                "a result of this step",
+                other.label(),
+            )),
+        }
     }
 }
 
@@ -515,11 +392,10 @@ fn logical_record(spec: &LogicalJobSpec) -> JobRecord {
 mod pure_tests {
     use super::*;
     use crate::tests::records::{Family, REALM};
-    use aruna_core::operation_check::{rejects_events, sample_events};
 
-    // A state that expects no event must reject one instead of ignoring it.
+    // A result the current step cannot use fails the admission.
     #[test]
-    fn terminal_rejects_event() {
+    fn rejects_unfit_result() {
         let family = Family::new([1u8; 32]);
         let spec = family.spec();
         let job_id = spec.job_id;
@@ -527,28 +403,29 @@ mod pure_tests {
         let sign = |record| {
             JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
         };
-        let make = || {
-            AdmitSubmissionOperation::new(AdmitSubmissionConfig {
-                realm_id: REALM,
-                local_node_id: family.holder.public(),
-                submission_id: family.submission_id,
-                request_digest: family.request_digest,
-                candidate: Box::new(AdmissionCandidate {
-                    job_id,
-                    spec: sign(JobFamilyRecord::Spec(Box::new(spec.clone()))),
-                    claim: sign(JobFamilyRecord::Claim(claim.clone())),
-                }),
-                now_ms: 3_000,
-                quota_refusal: None,
-                quota_revision: None,
-            })
-        };
-        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(error, LifecycleError::UnexpectedEvent { .. }),
-                "{error:?}"
-            );
-        }
+        let mut operation = AdmitSubmissionOperation::new(AdmitSubmissionConfig {
+            realm_id: REALM,
+            local_node_id: family.holder.public(),
+            submission_id: family.submission_id,
+            request_digest: family.request_digest,
+            candidate: Box::new(AdmissionCandidate {
+                job_id,
+                spec: sign(JobFamilyRecord::Spec(Box::new(spec.clone()))),
+                claim: sign(JobFamilyRecord::Claim(claim.clone())),
+            }),
+            now_ms: 3_000,
+            quota_refusal: None,
+            quota_revision: None,
+        });
+        assert!(operation.transaction());
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(effect)))
+                if matches!(*effect, Effect::Storage(StorageEffect::Read { txn_id: None, .. }))
+        ));
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
     }
 }

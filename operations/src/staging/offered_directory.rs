@@ -144,7 +144,6 @@ impl From<ListOffersError> for OfferedDirectoryError {
         match error {
             ListOffersError::Storage(error) => OfferedDirectoryError::Storage(error),
             ListOffersError::Conversion(error) => OfferedDirectoryError::Conversion(error),
-            other => StorageError::ReadError(other.to_string()).into(),
         }
     }
 }

@@ -3,16 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::rows::done;
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::DEVICE_GRAPH_KEYSPACE;
 use aruna_core::metadata::{
     MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
 };
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::Effects;
+use aruna_core::operation::Operation;
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
@@ -21,19 +21,8 @@ use crate::metadata::protocol::GraphState;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum InstallError {
-    #[error("unexpected {0} while installing a graph state")]
-    UnexpectedEvent(&'static str),
-    #[error("installing a graph state did not finish")]
-    NotFinished,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InstallState {
-    Init,
-    Snapshot,
-    Size,
-    Row,
-    Finish,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 /// Installs `graph` into `replica`, synced at `now_ms`, and outputs whether the refreshed
@@ -44,8 +33,8 @@ pub struct InstallGraphOperation {
     graph: Option<GraphState>,
     now_ms: u64,
     graph_bytes: u64,
-    state: InstallState,
-    output: Option<Result<bool, InstallError>>,
+    /// Whether the snapshot is installed and the rows are being written.
+    installed: bool,
 }
 
 impl InstallGraphOperation {
@@ -55,15 +44,8 @@ impl InstallGraphOperation {
             graph: Some(graph),
             now_ms,
             graph_bytes: 0,
-            state: InstallState::Init,
-            output: None,
+            installed: false,
         }
-    }
-
-    fn finish(&mut self, output: Result<bool, InstallError>) -> Effects {
-        self.state = InstallState::Finish;
-        self.output = Some(output);
-        smallvec![]
     }
 
     /// Takes the holder's answer into the replica row, which is stored once the graph is in.
@@ -95,81 +77,49 @@ impl InstallGraphOperation {
         }
     }
 
-    fn store_row(&mut self) -> Effects {
-        let Ok((key_space, key, value)) = replica_entry(&self.replica) else {
-            warn!(document_id = %self.replica.document_id, "Failed to encode a device replica");
-            return self.finish(Ok(false));
+    /// The graph size row and the refreshed replica row, written together.
+    fn store_rows(&mut self) -> Next<bool> {
+        let document_id = self.replica.document_id;
+        let Ok(row) = replica_entry(&self.replica) else {
+            warn!(%document_id, "Failed to encode a device replica");
+            return Next::Done(false);
         };
-        self.state = InstallState::Row;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
-        })]
+        let size = (
+            DEVICE_GRAPH_KEYSPACE.to_string(),
+            replica_key(document_id),
+            ByteView::from(self.graph_bytes.to_be_bytes().to_vec()),
+        );
+        self.installed = true;
+        Next::Call(IoCall::Write(vec![size, row]))
     }
 }
 
-impl EffectOperation for InstallGraphOperation {
+impl Operation for InstallGraphOperation {
     type Output = bool;
     type Error = InstallError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<bool>, InstallError> {
         let Some(graph) = self.graph.take() else {
-            return self.finish(Ok(false));
+            return Ok(Next::Done(false));
         };
         let install = self.join(graph);
-        self.state = InstallState::Snapshot;
-        smallvec![Effect::Metadata(install)]
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(install)))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let document_id = self.replica.document_id;
-        match (self.state, event) {
-            (InstallState::Snapshot, Event::Metadata(MetadataEvent::SnapshotInstalled { .. })) => {
-                self.state = InstallState::Size;
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: DEVICE_GRAPH_KEYSPACE.to_string(),
-                    key: replica_key(document_id),
-                    value: ByteView::from(self.graph_bytes.to_be_bytes().to_vec()),
-                    txn_id: None,
-                })]
-            }
-            (InstallState::Snapshot, event @ Event::Metadata(_)) => {
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, InstallError> {
+        if self.installed {
+            done(result)?;
+            return Ok(Next::Done(true));
+        }
+        match result.event()? {
+            Event::Metadata(MetadataEvent::SnapshotInstalled { .. }) => Ok(self.store_rows()),
+            event => {
+                let document_id = self.replica.document_id;
                 let event = event.label();
                 warn!(%document_id, event, "Could not install a graph snapshot");
-                self.finish(Ok(false))
-            }
-            (InstallState::Size, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.store_row()
-            }
-            (InstallState::Size, Event::Storage(StorageEvent::Error { error })) => {
-                warn!(%document_id, error = %error, "Failed to record a graph size");
-                self.store_row()
-            }
-            (InstallState::Row, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.finish(Ok(true))
-            }
-            (InstallState::Row, Event::Storage(StorageEvent::Error { .. })) => {
-                self.finish(Ok(false))
-            }
-            (_, event) => {
-                let label = event.label();
-                self.finish(Err(InstallError::UnexpectedEvent(label)))
+                Ok(Next::Done(false))
             }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == InstallState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(InstallError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -184,10 +134,6 @@ fn local_is_ahead(local: &craqle::VectorClock, remote: &craqle::VectorClock) -> 
 mod tests {
     use super::*;
     use crate::device::replica::ReplicaOrigin;
-    use aruna_core::errors::StorageError;
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
     use craqle::{ActorId, GraphId, GraphReplicaSnapshot, VectorClock};
 
     fn replica() -> ReplicaRecord {
@@ -213,50 +159,28 @@ mod tests {
         }
     }
 
-    fn installed() -> Event {
-        Event::Metadata(MetadataEvent::SnapshotInstalled {
+    fn installed() -> IoResult {
+        IoResult::Event(Box::new(Event::Metadata(MetadataEvent::SnapshotInstalled {
             graph_iri: String::new(),
             applied: true,
-        })
+        })))
     }
 
-    fn written() -> Event {
-        Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        })
-    }
-
-    // The snapshot is installed, its size recorded and the refreshed row stored.
+    // The snapshot is installed, then its size and the refreshed row are written together.
     #[test]
     fn installs_and_stores() {
         let mut install = InstallGraphOperation::new(replica(), graph(1), 9);
         let mut joined = InstallGraphOperation::new(replica(), graph(1), 9);
         let snapshot = joined.join(graph(1));
-        let size = Effect::Storage(StorageEffect::Write {
-            key_space: DEVICE_GRAPH_KEYSPACE.to_string(),
-            key: replica_key(joined.replica.document_id),
-            value: joined.graph_bytes.to_be_bytes().to_vec().into(),
-            txn_id: None,
-        });
-        let (key_space, key, value) = replica_entry(&joined.replica).unwrap();
-        let row = Effect::Storage(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
-        });
-        check_trace(
-            &mut install,
-            &[Effect::Metadata(snapshot)],
-            vec![
-                (installed(), vec![size]),
-                (written(), vec![row]),
-                (written(), Vec::new()),
-            ],
+        let rows = joined.store_rows();
+        assert_eq!(
+            install.first(),
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(snapshot)))))
         );
+        assert_eq!(install.next(installed()), Ok(rows));
         assert_eq!(joined.replica.last_synced_ms, Some(9));
         assert_eq!(joined.replica.displayed_jsonld, "{}");
-        assert_eq!(install.finalize(), Ok(true));
+        assert_eq!(install.next(IoResult::Done), Ok(Next::Done(true)));
     }
 
     // Local edits ahead of the holder keep their render; a failed install stores nothing.
@@ -266,32 +190,15 @@ mod tests {
         ahead.local_clock.advance(ActorId::from_bytes([1u8; 32]), 2);
         ahead.displayed_jsonld = "local".to_string();
         let mut install = InstallGraphOperation::new(ahead, graph(1), 9);
-        install.start();
+        install.first().unwrap();
         assert_eq!(install.replica.displayed_jsonld, "local");
-        let refused = Event::Metadata(MetadataEvent::ValidationResult {
+        let refused = IoResult::Event(Box::new(Event::Metadata(MetadataEvent::ValidationResult {
             graph_iri: String::new(),
-        });
-        assert!(install.step(refused).is_empty());
-        assert_eq!(install.finalize(), Ok(false));
-
+        })));
+        assert_eq!(install.next(refused), Ok(Next::Done(false)));
         let mut install = InstallGraphOperation::new(replica(), graph(1), 9);
-        install.start();
-        install.step(installed());
-        install.step(written());
-        install.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(install.finalize(), Ok(false));
-    }
-
-    // Other events are refused; nothing is cleaned up and nothing finishes early.
-    #[test]
-    fn rejects_unexpected() {
-        let fresh = || InstallGraphOperation::new(replica(), graph(1), 9);
-        let all = sample_events().len();
-        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), all);
-        rejects_finalize(fresh());
-        assert!(fresh().abort().is_empty());
+        install.first().unwrap();
+        assert!(install.next(IoResult::Done).is_err());
     }
 
     #[test]

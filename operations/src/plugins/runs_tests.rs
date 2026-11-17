@@ -6,8 +6,8 @@
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::plugins::broker::call_intent;
+use crate::plugins::rows::{page_result, values_result};
 use crate::plugins::worker::prune_runs;
-use aruna_core::operation::EffectOperation;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};
@@ -312,11 +312,11 @@ async fn resolved_expire() {
 }
 
 /// A page answer of `count` queue rows.
-fn queue_page(count: usize) -> Answer {
+fn queue_page(count: usize) -> IoResult {
     let rows = (0..count)
         .map(|seq| (vec![seq as u8], Vec::new()))
         .collect();
-    Answer::Page(rows, None)
+    page_result(rows, None)
 }
 
 #[test]
@@ -324,7 +324,7 @@ fn admission_bound() {
     let install = Ulid::from_parts(1, 1);
     let run = queued(install, 1);
     let mut admission = Admission::new(run.clone());
-    let Ask::Page { space, prefix, .. } = admission.ask() else {
+    let IoCall::Page { space, prefix, .. } = admission.ask() else {
         panic!("an admission counts the install's queue");
     };
     assert_eq!(
@@ -357,7 +357,7 @@ fn admission_bound() {
         full.take(queue_page(RUNS_QUEUED)),
         Err(RunError::Full(RUNS_QUEUED))
     );
-    assert!(full.take(Answer::Done).is_err());
+    assert!(full.take(IoResult::Done).is_err());
 }
 
 #[test]
@@ -374,7 +374,10 @@ fn resolve_decisions() {
     );
     let ids = (install, waiting.run_id);
     let mut resolve = resolve_run(ids, false, &audit, 50).unwrap();
-    assert_eq!(resolve.start().len(), 1);
+    assert!(matches!(
+        resolve.first().unwrap(),
+        Next::Call(IoCall::Read(_))
+    ));
     let mut plan = ResolveRun {
         key: run_key(install, waiting.run_id),
         done: false,
@@ -384,20 +387,20 @@ fn resolve_decisions() {
         phase: ResolvePhase::Reading,
     };
     // A run that does not wait for a person is refused.
-    let running = Answer::Values(vec![Some(encode(&queued(install, 1)).unwrap())]);
+    let running = values_result(vec![Some(encode(&queued(install, 1)).unwrap())]);
     assert_eq!(plan.next(running), Err(RunError::NotWaiting("queued")));
     plan.phase = ResolvePhase::Reading;
     assert_eq!(
-        plan.next(Answer::Values(vec![None])),
+        plan.next(values_result(vec![None])),
         Err(RunError::NotFound)
     );
     plan.phase = ResolvePhase::Reading;
-    let stored = Answer::Values(vec![Some(encode(&waiting).unwrap())]);
+    let stored = values_result(vec![Some(encode(&waiting).unwrap())]);
     assert!(matches!(
         plan.next(stored).unwrap(),
-        Turn::Ask(Ask::Page { .. })
+        Next::Call(IoCall::Page { .. })
     ));
-    let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Page(Vec::new(), None)).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = plan.next(page_result(Vec::new(), None)).unwrap() else {
         panic!("the resolved run is written");
     };
     let saved: PluginRun = decode(&rows[0].2).unwrap();
@@ -405,14 +408,14 @@ fn resolve_decisions() {
         (saved.state, saved.finished_ms),
         (RunState::Failed, Some(50))
     );
-    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Done).unwrap() else {
+    let Next::Call(IoCall::Delete(keys)) = plan.next(IoResult::Done).unwrap() else {
         panic!("an ended run leaves the queue");
     };
     assert_eq!(
         keys,
         [(PLUGIN_QUEUE_KEYSPACE, queue_key(install, waiting.run_id))]
     );
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(saved));
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(saved));
 }
 
 #[test]
@@ -427,21 +430,21 @@ fn drop_deletes_intents() {
     let first = plan.first().unwrap();
     assert_eq!(
         first,
-        Turn::Ask(Ask::Delete(vec![(
+        Next::Call(delete_call(vec![(
             PLUGIN_RUNS_KEYSPACE,
             run_key(install, run.run_id)
         )]))
     );
     assert!(matches!(
-        plan.next(Answer::Done).unwrap(),
-        Turn::Ask(Ask::Page { .. })
+        plan.next(IoResult::Done).unwrap(),
+        Next::Call(IoCall::Page { .. })
     ));
     let intents = vec![(b"i1".to_vec(), Vec::new())];
-    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Page(intents, None)).unwrap() else {
+    let Next::Call(IoCall::Delete(keys)) = plan.next(page_result(intents, None)).unwrap() else {
         panic!("the run's intents are deleted");
     };
     assert_eq!(keys.len(), 1);
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(()));
 }
 
 #[test]
@@ -463,13 +466,13 @@ fn expired_runs_listed() {
     ];
     // The work rows hold no completion, so the ended run's intents are read next.
     assert!(matches!(
-        plan.next(Answer::Page(rows, None)).unwrap(),
-        Turn::Ask(Ask::Page { .. })
+        plan.next(page_result(rows, None)).unwrap(),
+        Next::Call(IoCall::Page { .. })
     ));
     assert!(matches!(
-        plan.next(Answer::Page(Vec::new(), None)).unwrap(),
-        Turn::Ask(Ask::Page { .. })
+        plan.next(page_result(Vec::new(), None)).unwrap(),
+        Next::Call(IoCall::Page { .. })
     ));
-    let done = plan.next(Answer::Page(Vec::new(), None)).unwrap();
-    assert_eq!(done, Turn::Finish(vec![(install, ended.run_id)]));
+    let done = plan.next(page_result(Vec::new(), None)).unwrap();
+    assert_eq!(done, Next::Done(vec![(install, ended.run_id)]));
 }

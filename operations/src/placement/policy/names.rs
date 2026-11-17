@@ -3,16 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 use std::collections::BTreeMap;
 use thiserror::Error;
 use ulid::Ulid;
@@ -37,12 +35,14 @@ pub enum PolicyNamesError {
     InvalidEvent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NamesState {
-    Init,
-    Read,
-    Finish,
-    Error,
+impl From<IoError> for PolicyNamesError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            _ => Self::InvalidEvent,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -50,8 +50,6 @@ pub struct PolicyNamesOperation {
     realm_id: RealmId,
     /// Deduplicated and bounded at construction.
     ids: Vec<Ulid>,
-    state: NamesState,
-    output: Option<Result<BTreeMap<Ulid, PolicyName>, PolicyNamesError>>,
 }
 
 impl PolicyNamesOperation {
@@ -60,36 +58,17 @@ impl PolicyNamesOperation {
         ids.sort_unstable();
         ids.dedup();
         ids.truncate(MAX_NAMED_REFS);
-        Self {
-            realm_id,
-            ids,
-            state: NamesState::Init,
-            output: None,
-        }
-    }
-
-    fn finish(&mut self, result: Result<BTreeMap<Ulid, PolicyName>, PolicyNamesError>) -> Effects {
-        self.state = match result.is_ok() {
-            true => NamesState::Finish,
-            false => NamesState::Error,
-        };
-        self.output = Some(result);
-        smallvec![]
+        Self { realm_id, ids }
     }
 }
 
-impl EffectOperation for PolicyNamesOperation {
+impl Operation for PolicyNamesOperation {
     type Output = BTreeMap<Ulid, PolicyName>;
     type Error = PolicyNamesError;
 
-    fn start(&mut self) -> Effects {
-        if self.ids.is_empty() {
-            return self.finish(Ok(BTreeMap::new()));
-        }
-        self.state = NamesState::Read;
-        let reads = self
-            .ids
-            .iter()
+    /// No refs is an empty read, which the runner answers without storage.
+    fn first(&mut self) -> Result<Next<Self::Output>, PolicyNamesError> {
+        let reads = (self.ids.iter())
             .map(|policy_id| {
                 let target = DocumentTarget::PlacementPolicy {
                     policy_id: *policy_id,
@@ -97,64 +76,35 @@ impl EffectOperation for PolicyNamesOperation {
                 (target.storage_keyspace().to_string(), target.storage_key())
             })
             .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            NamesState::Init => self.start(),
-            NamesState::Read => {
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    return self.finish(Err(PolicyNamesError::InvalidEvent));
-                };
-                let mut names = BTreeMap::new();
-                for (_, value) in values
-                    .into_iter()
-                    .flat_map(|(key, value)| value.map(|v| (key, v)))
-                {
-                    let document = match PlacementPolicyDocument::from_bytes(value.as_ref()) {
-                        Ok(document) => document,
-                        Err(error) => return self.finish(Err(error.into())),
-                    };
-                    // A row stored for another realm names nothing here.
-                    if document.realm_id != self.realm_id {
-                        continue;
-                    }
-                    names.insert(
-                        document.policy.policy_id,
-                        PolicyName {
-                            name: document.policy.name.clone(),
-                            owner_group_id: document.policy.owner_group_id,
-                        },
-                    );
-                }
-                self.finish(Ok(names))
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, PolicyNamesError> {
+        let IoResult::Values(values) = result else {
+            return Err(PolicyNamesError::InvalidEvent);
+        };
+        let mut names = BTreeMap::new();
+        for value in values.into_iter().flatten() {
+            let document = PlacementPolicyDocument::from_bytes(value.as_ref())?;
+            // A row stored for another realm names nothing here.
+            if document.realm_id != self.realm_id {
+                continue;
             }
-            NamesState::Finish | NamesState::Error => smallvec![],
+            let name = PolicyName {
+                name: document.policy.name.clone(),
+                owner_group_id: document.policy.owner_group_id,
+            };
+            names.insert(document.policy.policy_id, name);
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, NamesState::Finish | NamesState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PolicyNamesError::InvalidEvent))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(Next::Done(names))
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::{PolicyName, PolicyNamesOperation};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
     use ulid::Ulid;
@@ -195,20 +145,13 @@ mod pure_tests {
         let unknown = policy(2, None);
         let mut operation =
             PolicyNamesOperation::new(realm(), &[held.policy_ref(), unknown.policy_ref()]);
-        operation.start();
+        operation.first().unwrap();
 
         let document = crate::tests::policy::signed_document(realm(), &held, 1);
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    b"a".to_vec().into(),
-                    Some(document.to_bytes().expect("document encodes").into()),
-                ),
-                (b"b".to_vec().into(), None),
-            ],
-        }));
-
-        let names = operation.finalize().expect("lookup finishes");
+        let row = Some(document.to_bytes().expect("document encodes").into());
+        let Ok(Next::Done(names)) = operation.next(IoResult::Values(vec![row, None])) else {
+            panic!("expected the names");
+        };
         assert_eq!(
             names.get(&held.policy().policy_id),
             Some(&PolicyName {
@@ -222,26 +165,21 @@ mod pure_tests {
     #[test]
     fn empty_skips_read() {
         let mut operation = PolicyNamesOperation::new(realm(), &[]);
-        assert!(operation.start().is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(Default::default()));
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(Vec::new()))));
+        let names = operation.next(IoResult::Values(Vec::new()));
+        assert_eq!(names, Ok(Next::Done(Default::default())));
     }
 
     #[test]
     fn skips_foreign_realm() {
         let held = policy(1, None);
         let mut operation = PolicyNamesOperation::new(realm(), &[held.policy_ref()]);
-        operation.start();
+        operation.first().unwrap();
 
         let document =
             crate::tests::policy::signed_document(RealmId::from_bytes([9u8; 32]), &held, 1);
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(
-                b"a".to_vec().into(),
-                Some(document.to_bytes().expect("document encodes").into()),
-            )],
-        }));
-
-        assert!(operation.finalize().expect("lookup finishes").is_empty());
+        let row = Some(document.to_bytes().expect("document encodes").into());
+        let names = operation.next(IoResult::Values(vec![row]));
+        assert_eq!(names, Ok(Next::Done(Default::default())));
     }
 }

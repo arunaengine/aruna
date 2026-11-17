@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_tasks::wipe as device_wipe;
+use aruna_core::device_wipe;
 
 use crate::shutdown::{
     NodeShutdown, ShutdownOutcome, arm_signal_exit, shutdown_grace_env, wait_for_signal,
@@ -400,7 +400,11 @@ async fn run_node_owned(
     // the owner's wipe erases the roots here, and only a completed sequence may
     // reach the destructive purge.
     if let Some(wipe) = device_wipe.filter(|wipe| wipe.is_armed()) {
-        return Ok(decide_wipe(&wipe, shutdown_complete, device_wipe::purge));
+        return Ok(decide_wipe(
+            &wipe,
+            shutdown_complete,
+            aruna_tasks::wipe::purge,
+        ));
     }
 
     Ok(match (failure, shutdown_complete) {
@@ -1263,7 +1267,7 @@ mod tests {
         let wipe = device_wipe::DeviceWipe::new(vec![root.path().to_path_buf()], Vec::new());
 
         assert_eq!(
-            decide_wipe(&wipe, false, device_wipe::purge),
+            decide_wipe(&wipe, false, aruna_tasks::wipe::purge),
             ProcessOutcome::WipeIncomplete
         );
         assert!(
@@ -1272,7 +1276,7 @@ mod tests {
         );
 
         assert_eq!(
-            decide_wipe(&wipe, true, device_wipe::purge),
+            decide_wipe(&wipe, true, aruna_tasks::wipe::purge),
             ProcessOutcome::WipeComplete
         );
         assert!(

@@ -12,13 +12,13 @@ use aruna_api::https::listener::{CombinedListener, HttpsHandle};
 use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
+use aruna_core::device_wipe::DeviceWipe;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_operations::device::replica::{DEFAULT_CACHE_BYTES, set_cache_budget};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_tasks::shutdown::Shutdown;
-use aruna_tasks::wipe::DeviceWipe;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 

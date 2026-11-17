@@ -3,14 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_INTENTS_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::CallIntent;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::rows::{
-    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, encode, row,
-    unexpected, values,
+    Row, Rows, Scan, StoreError, decode, encode, read_call, row, unexpected, values,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,12 +57,12 @@ pub fn intent_key(run_id: Ulid, ordinal: u32) -> Vec<u8> {
 
 /// Looks up the call's intent and writes it as pending when it is new. A pending intent found
 /// here belongs to an earlier attempt, so it becomes unknown.
-pub fn begin(run_id: Ulid, intent: CallIntent) -> RowsOperation<BeginIntent> {
-    RowsOperation::transaction(BeginIntent {
+pub fn begin(run_id: Ulid, intent: CallIntent) -> BeginIntent {
+    BeginIntent {
         run_id,
         intent,
         begun: None,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -72,19 +73,23 @@ pub struct BeginIntent {
     begun: Option<Begun>,
 }
 
-impl Plan for BeginIntent {
+impl Operation for BeginIntent {
     type Output = Begun;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Begun>, StoreError> {
-        let key = intent_key(self.run_id, self.intent.ordinal);
-        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_INTENTS_KEYSPACE, key)])))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Begun>, StoreError> {
+    fn first(&mut self) -> Result<Next<Begun>, StoreError> {
+        let key = intent_key(self.run_id, self.intent.ordinal);
+        Ok(Next::Call(read_call(vec![(PLUGIN_INTENTS_KEYSPACE, key)])))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Begun>, StoreError> {
         if let Some(begun) = self.begun.take() {
             return match answer {
-                Answer::Done => Ok(Turn::Finish(begun)),
+                IoResult::Done => Ok(Next::Done(begun)),
                 other => Err(unexpected(other)),
             };
         }
@@ -95,16 +100,16 @@ impl Plan for BeginIntent {
         let (begun, state) = match found {
             None => (Begun::Fresh, IntentState::Pending),
             Some(record) if record.digest != self.intent.digest => {
-                return Ok(Turn::Finish(Begun::Changed));
+                return Ok(Next::Done(Begun::Changed));
             }
             Some(record) => match record.state {
-                IntentState::Settled { reply } => return Ok(Turn::Finish(Begun::Settled(reply))),
+                IntentState::Settled { reply } => return Ok(Next::Done(Begun::Settled(reply))),
                 IntentState::Unknown { reason } => {
-                    return Ok(Turn::Finish(Begun::Unknown(reason)));
+                    return Ok(Next::Done(Begun::Unknown(reason)));
                 }
                 IntentState::Resolved { .. } => {
                     let reason = "a person resolved this call".into();
-                    return Ok(Turn::Finish(Begun::Unknown(reason)));
+                    return Ok(Next::Done(Begun::Unknown(reason)));
                 }
                 IntentState::Pending => {
                     let reason = "an earlier attempt of this call did not finish".to_string();
@@ -117,30 +122,30 @@ impl Plan for BeginIntent {
         };
         self.begun = Some(begun);
         let row = intent_row(self.run_id, &self.intent, state)?;
-        Ok(Turn::Ask(Ask::Write(vec![row])))
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
 /// Whether an earlier attempt of the run already wrote this call's intent.
-pub fn written(run_id: Ulid, intent: &CallIntent) -> RowsOperation<IntentWritten> {
-    RowsOperation::direct(IntentWritten(intent_key(run_id, intent.ordinal)))
+pub fn written(run_id: Ulid, intent: &CallIntent) -> IntentWritten {
+    IntentWritten(intent_key(run_id, intent.ordinal))
 }
 
 #[derive(Debug, PartialEq)]
 pub struct IntentWritten(Vec<u8>);
 
-impl Plan for IntentWritten {
+impl Operation for IntentWritten {
     type Output = bool;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
+    fn first(&mut self) -> Result<Next<bool>, StoreError> {
         let read = vec![(PLUGIN_INTENTS_KEYSPACE, self.0.clone())];
-        Ok(Turn::Ask(Ask::Read(read)))
+        Ok(Next::Call(read_call(read)))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
         let [row] = values::<1>(answer)?;
-        Ok(Turn::Finish(row.is_some()))
+        Ok(Next::Done(row.is_some()))
     }
 }
 
@@ -186,25 +191,25 @@ pub(crate) fn intent_scan(run_id: Ulid) -> Scan {
 
 /// The first intent of the run that is pending or unknown, as the reason the run needs
 /// attention; every intent is inspected before a run ends.
-pub(crate) fn open_intent(run_id: Ulid) -> RowsOperation<OpenIntent> {
-    RowsOperation::direct(OpenIntent(intent_scan(run_id)))
+pub(crate) fn open_intent(run_id: Ulid) -> OpenIntent {
+    OpenIntent(intent_scan(run_id))
 }
 
 #[derive(Debug, PartialEq)]
 pub struct OpenIntent(Scan);
 
-impl Plan for OpenIntent {
+impl Operation for OpenIntent {
     type Output = Option<String>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(self.0.ask()))
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(self.0.ask()))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         match self.0.take(answer)? {
-            None => Ok(Turn::Ask(self.0.ask())),
-            Some(rows) => Ok(Turn::Finish(first_open(&rows)?)),
+            None => Ok(Next::Call(self.0.ask())),
+            Some(rows) => Ok(Next::Done(first_open(&rows)?)),
         }
     }
 }
@@ -273,6 +278,7 @@ mod tests {
     use crate::driver::drive;
     use crate::plugins::broker::call_intent;
     use crate::plugins::rows::{delete_rows, scan_rows, write_rows};
+    use crate::plugins::rows::{page_result, values_result};
     use crate::plugins::runs::tests::opened;
     use aruna_plugins::broker::Intent;
 
@@ -321,7 +327,7 @@ mod tests {
         let intent = call_intent(&Intent::new(0, &[b"patch a"]));
         let record = |digest, state| {
             let record = IntentRecord { digest, state };
-            Answer::Values(vec![Some(encode(&record).unwrap())])
+            values_result(vec![Some(encode(&record).unwrap())])
         };
         let mut plan = BeginIntent {
             run_id: run,
@@ -329,28 +335,28 @@ mod tests {
             begun: None,
         };
         let key = intent_key(run, 0);
-        let read = Ask::Read(vec![(PLUGIN_INTENTS_KEYSPACE, key)]);
-        assert_eq!(plan.first().unwrap(), Turn::Ask(read));
+        let read = read_call(vec![(PLUGIN_INTENTS_KEYSPACE, key)]);
+        assert_eq!(plan.first().unwrap(), Next::Call(read));
         let pending = intent_row(run, &intent, IntentState::Pending).unwrap();
         assert_eq!(
-            plan.next(Answer::Values(vec![None])).unwrap(),
-            Turn::Ask(Ask::Write(vec![pending]))
+            plan.next(values_result(vec![None])).unwrap(),
+            Next::Call(IoCall::Write(vec![pending]))
         );
-        assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(Begun::Fresh));
+        assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(Begun::Fresh));
         let settled = IntentState::Settled { reply: "r".into() };
         let changed = plan.next(record([9; 32], settled.clone())).unwrap();
-        assert_eq!(changed, Turn::Finish(Begun::Changed));
+        assert_eq!(changed, Next::Done(Begun::Changed));
         let again = plan.next(record(intent.digest, settled)).unwrap();
-        assert_eq!(again, Turn::Finish(Begun::Settled("r".into())));
+        assert_eq!(again, Next::Done(Begun::Settled("r".into())));
         let earlier = plan
             .next(record(intent.digest, IntentState::Pending))
             .unwrap();
-        assert!(matches!(earlier, Turn::Ask(Ask::Write(_))));
+        assert!(matches!(earlier, Next::Call(IoCall::Write(_))));
         assert!(matches!(
-            plan.next(Answer::Done),
-            Ok(Turn::Finish(Begun::Unknown(_)))
+            plan.next(IoResult::Done),
+            Ok(Next::Done(Begun::Unknown(_)))
         ));
-        assert!(plan.next(Answer::Page(Vec::new(), None)).is_err());
+        assert!(plan.next(page_result(Vec::new(), None)).is_err());
     }
 
     #[test]

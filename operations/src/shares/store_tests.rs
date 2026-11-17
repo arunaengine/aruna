@@ -22,8 +22,10 @@ fn context(dir: &tempfile::TempDir) -> DriverContext {
 }
 
 async fn save(context: &DriverContext, link: ShareLink) {
-    let Ok(aruna_core::effects::Effect::Storage(effect)) = save_effect(&link) else {
-        panic!("a link saves with one storage batch");
+    let writes = save_rows(&link).unwrap();
+    let effect = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
     };
     let event = context.storage_handle.send_storage_effect(effect).await;
     assert!(matches!(

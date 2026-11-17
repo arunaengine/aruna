@@ -5,16 +5,15 @@
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keys::realm_presence_key;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 
 const REALM_PRESENCE_TTL: Duration = Duration::from_secs(60);
@@ -30,19 +29,8 @@ pub struct AnnouncePresenceConfig {
 #[derive(Debug, PartialEq)]
 pub struct AnnouncePresenceOperation {
     config: AnnouncePresenceConfig,
-    state: AnnouncePresenceState,
     /// Set once the put was sent again after a failure.
     retried: bool,
-    output: Option<Result<(), AnnouncePresenceError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum AnnouncePresenceState {
-    Init,
-    PutPresence,
-    ScheduleRefresh,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -59,13 +47,24 @@ pub enum AnnouncePresenceError {
     },
 }
 
+impl From<IoError> for AnnouncePresenceError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "AnnouncePresence".to_string(),
+                expected,
+                got,
+            },
+            other => Self::PutFailed(DhtError::Other(other.to_string())),
+        }
+    }
+}
+
 impl AnnouncePresenceOperation {
     pub fn new(config: AnnouncePresenceConfig) -> Self {
         Self {
             config,
-            state: AnnouncePresenceState::Init,
             retried: false,
-            output: None,
         }
     }
 
@@ -73,105 +72,70 @@ impl AnnouncePresenceOperation {
         realm_presence_key(&self.config.realm_id)
     }
 
-    fn task_key(&self) -> TaskKey {
-        TaskKey::RealmPresence {
+    fn put_presence(&self) -> Next<()> {
+        Next::Call(IoCall::Effect(Effect::Net(NetEffect::Dht(
+            DhtEffect::Put {
+                key: self.presence_key(),
+                realm_id: self.config.realm_id,
+                value: self.config.node_id.as_bytes().to_vec(),
+                ttl: REALM_PRESENCE_TTL,
+            },
+        ))))
+    }
+
+    fn put_done(&mut self) -> Next<()> {
+        if !self.config.schedule_refresh {
+            return Next::Done(());
+        }
+        let key = TaskKey::RealmPresence {
             realm_id: self.config.realm_id,
             node_id: self.config.node_id,
-        }
-    }
-
-    fn put_presence(&mut self) -> Effects {
-        self.state = AnnouncePresenceState::PutPresence;
-        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
-            key: self.presence_key(),
-            realm_id: self.config.realm_id,
-            value: self.config.node_id.as_bytes().to_vec(),
-            ttl: REALM_PRESENCE_TTL,
-        }))]
-    }
-
-    fn finish_success(&mut self) -> Effects {
-        self.state = AnnouncePresenceState::Finish;
-        self.output = Some(Ok(()));
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: AnnouncePresenceError) -> Effects {
-        self.state = AnnouncePresenceState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(AnnouncePresenceError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+        };
+        let after = PRESENCE_REFRESH_AFTER;
+        Next::Call(IoCall::Effect(Effect::Task(TaskEffect::ResetTimer {
+            key,
+            after,
+        })))
     }
 }
 
-impl EffectOperation for AnnouncePresenceOperation {
+impl Operation for AnnouncePresenceOperation {
     type Output = ();
     type Error = AnnouncePresenceError;
 
-    fn start(&mut self) -> Effects {
-        self.put_presence()
+    fn first(&mut self) -> Result<Next<()>, AnnouncePresenceError> {
+        Ok(self.put_presence())
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            AnnouncePresenceState::PutPresence => match event {
-                Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => {
-                    if self.config.schedule_refresh {
-                        self.state = AnnouncePresenceState::ScheduleRefresh;
-                        smallvec![Effect::Task(TaskEffect::ResetTimer {
-                            key: self.task_key(),
-                            after: PRESENCE_REFRESH_AFTER,
-                        })]
-                    } else {
-                        self.finish_success()
-                    }
-                }
-                // A concurrent announce of this node, such as its refresh timer, can store a
-                // newer revision first; this put is then refused as stale. A second put gets a
-                // new revision and replaces it.
-                Event::Net(NetEvent::Dht(DhtEvent::Error { .. })) if !self.retried => {
-                    self.retried = true;
-                    self.put_presence()
-                }
-                Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => {
-                    self.fail(AnnouncePresenceError::PutFailed(error))
-                }
-                other => self.unexpected_event("dht put result", other.label()),
-            },
-            AnnouncePresenceState::ScheduleRefresh => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_success(),
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    self.fail(AnnouncePresenceError::ScheduleFailed(message))
-                }
-                other => self.unexpected_event("task scheduling result", other.label()),
-            },
-            AnnouncePresenceState::Finish
-            | AnnouncePresenceState::Error
-            | AnnouncePresenceState::Init => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, AnnouncePresenceError> {
+        let IoResult::Event(event) = result else {
+            return Err(AnnouncePresenceError::UnexpectedEvent {
+                state: "AnnouncePresence".to_string(),
+                expected: "dht put or task scheduling result",
+                got: result.label(),
+            });
+        };
+        match *event {
+            Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => Ok(self.put_done()),
+            // A concurrent announce of this node, such as its refresh timer, can store a newer
+            // revision first; this put is then refused as stale. A second put replaces it.
+            Event::Net(NetEvent::Dht(DhtEvent::Error { .. })) if !self.retried => {
+                self.retried = true;
+                Ok(self.put_presence())
+            }
+            Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => {
+                Err(AnnouncePresenceError::PutFailed(error))
+            }
+            Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(Next::Done(())),
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                Err(AnnouncePresenceError::ScheduleFailed(message))
+            }
+            other => Err(AnnouncePresenceError::UnexpectedEvent {
+                state: "AnnouncePresence".to_string(),
+                expected: "dht put or task scheduling result",
+                got: other.label(),
+            }),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            AnnouncePresenceState::Finish | AnnouncePresenceState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -179,79 +143,64 @@ impl EffectOperation for AnnouncePresenceOperation {
 mod pure_tests {
     use super::*;
 
+    fn operation(schedule_refresh: bool) -> AnnouncePresenceOperation {
+        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
+            realm_id: RealmId([1u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
+            schedule_refresh,
+        })
+    }
+
+    fn dht(event: DhtEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Net(NetEvent::Dht(event))))
+    }
+
+    fn boom() -> IoResult {
+        dht(DhtEvent::Error {
+            error: DhtError::Other("boom".to_string()),
+        })
+    }
+
     #[test]
     fn presence_ttl_sufficient() {
-        let realm_id = RealmId([1u8; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let mut op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-            realm_id,
-            node_id,
-            schedule_refresh: true,
-        });
-
-        let effects = op.start();
-
-        let [Effect::Net(NetEffect::Dht(DhtEffect::Put { ttl, .. }))] = effects.as_slice() else {
+        let mut op = operation(true);
+        let Ok(Next::Call(IoCall::Effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+            ttl, ..
+        }))))) = op.first()
+        else {
             panic!("expected one DHT put effect");
         };
-        assert!(*ttl > PRESENCE_REFRESH_AFTER);
-        assert!(*ttl > aruna_net::dht::constants::DRIVER_TICK_INTERVAL);
+        assert!(ttl > PRESENCE_REFRESH_AFTER);
+        assert!(ttl > aruna_net::dht::constants::DRIVER_TICK_INTERVAL);
     }
 
     #[test]
     fn dht_error_fails() {
-        let realm_id = RealmId([1u8; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let mut op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-            realm_id,
-            node_id,
-            schedule_refresh: true,
-        });
-
-        let effects = op.start();
-        assert_eq!(effects.len(), 1);
-
-        let effects = op.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
-            error: DhtError::Other("boom".to_string()),
-        })));
+        let mut op = operation(true);
+        let put = op.first();
+        assert_eq!(op.next(boom()), put);
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))]
-        ));
-        let effects = op.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
-            error: DhtError::Other("boom".to_string()),
-        })));
-        assert!(effects.is_empty());
-        assert!(matches!(
-            op.finalize(),
+            op.next(boom()),
             Err(AnnouncePresenceError::PutFailed(DhtError::Other(message))) if message == "boom"
         ));
     }
+
     #[test]
     fn stale_put_retries() {
         // A newer revision stored by a concurrent announce refuses this put once.
-        let realm_id = RealmId([1u8; 32]);
-        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let mut op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-            realm_id,
-            node_id,
-            schedule_refresh: false,
-        });
-        let first = op.start();
-
-        let effects = op.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
+        let mut op = operation(false);
+        let first = op.first();
+        let stale = dht(DhtEvent::Error {
             error: DhtError::StoreFailed(
                 "DHT error: invalid request: record version is stale or conflicting".to_string(),
             ),
-        })));
-        assert_eq!(effects, first);
-        op.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
+        });
+        assert_eq!(op.next(stale), first);
+        let done = dht(DhtEvent::PutComplete {
             key: op.presence_key(),
             remote_attempt_count: 0,
             remote_store_count: 0,
-        })));
-
-        assert!(op.is_complete());
-        assert_eq!(op.finalize(), Ok(()));
+        });
+        assert_eq!(op.next(done), Ok(Next::Done(())));
     }
 }

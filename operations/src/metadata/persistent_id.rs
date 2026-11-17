@@ -12,7 +12,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{PersistentIdFailure, PersistentIdMapping};
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive_retry};
 use crate::metadata::id_mapping::{
     MappingRoute, PersistentIdError, mapping_route_for, parse_mapping_read, read_mapping_effect,
 };
@@ -58,18 +58,14 @@ pub(crate) async fn add_secondary_ids(
     occurred_at_ms: u64,
 ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
     let route = mapping_route(ctx, realm_id, document_id).await?;
-    let result = crate::driver::drive(
-        crate::metadata::secondary_ids::AddIdentifiersOperation::new(
-            crate::metadata::secondary_ids::AddIdentifiersInput {
-                document_id,
-                identifiers,
-                route,
-                occurred_at_ms,
-            },
-        ),
-        ctx,
-    )
-    .await?;
+    let input = crate::metadata::secondary_ids::AddIdentifiersInput {
+        document_id,
+        identifiers,
+        route,
+        occurred_at_ms,
+    };
+    let build = || crate::metadata::secondary_ids::AddIdentifiersOperation::new(input.clone());
+    let result = drive_retry(build, ctx, &document_id.to_bytes()).await?;
     if result.1 {
         schedule_drain(ctx).await;
     }
@@ -116,8 +112,8 @@ async fn run_transition(
     document_id: Ulid,
     transition: PidTransition,
 ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
-    let operation = PidTransitionOperation::new(route, document_id, transition);
-    let outcome = drive(operation, ctx).await?;
+    let build = || PidTransitionOperation::new(route.clone(), document_id, transition.clone());
+    let outcome = drive_retry(build, ctx, &document_id.to_bytes()).await?;
     if outcome.committed {
         schedule_drain(ctx).await;
     }

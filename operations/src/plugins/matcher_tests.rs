@@ -11,6 +11,7 @@ use super::*;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::set_grants;
+use crate::plugins::rows::{page_result, values_result};
 use crate::plugins::store::Txn;
 use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{created, installed, scoped, synced};
@@ -285,7 +286,7 @@ fn outbox_counts_gaps() {
         (SourceKind::DataUploaded, GapReason::Pruned),
         (1, 3),
     );
-    let Ask::Read(reads) = outbox.gap_ask() else {
+    let read_call(reads) = outbox.gap_ask() else {
         panic!("gap rows are read once each");
     };
     assert_eq!(reads.len(), 3);
@@ -315,16 +316,16 @@ fn outbox_counts_gaps() {
 fn counting_pages() {
     let (first, second) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));
     let mut counting = Counting::new(BTreeSet::from([first, second]), 5);
-    let Some(Ask::Page { prefix, limit, .. }) = counting.ask() else {
+    let Some(IoCall::Page { prefix, limit, .. }) = counting.ask() else {
         panic!("each install's queue is counted");
     };
-    assert_eq!((prefix, limit), (first.to_bytes().to_vec(), 5));
+    assert_eq!((prefix.to_vec(), limit), (first.to_bytes().to_vec(), 5));
     counting
-        .take(Answer::Page(vec![(vec![1], Vec::new())], None))
+        .take(page_result(vec![(vec![1], Vec::new())], None))
         .unwrap();
-    counting.take(Answer::Page(Vec::new(), None)).unwrap();
+    counting.take(page_result(Vec::new(), None)).unwrap();
     assert_eq!(counting.ask(), None);
-    assert!(counting.take(Answer::Page(Vec::new(), None)).is_err());
+    assert!(counting.take(page_result(Vec::new(), None)).is_err());
     assert_eq!(
         counting.counted(),
         BTreeMap::from([(first, 1), (second, 0)])
@@ -340,25 +341,31 @@ fn user_pending_dropped() {
         bound: 2,
         phase: MatchPhase::Reading,
     };
-    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    assert!(matches!(
+        plan.first().unwrap(),
+        Next::Call(IoCall::Page { .. })
+    ));
     let event = plain_event(5);
     let pending = journal_key(PENDING_ROW, 5, Ulid::from_parts(3, 3));
     let rows = vec![(pending.clone(), event.to_bytes().unwrap())];
     // A user node keeps no journal: nothing to count, no gap to read.
     assert_eq!(
-        plan.next(Answer::Page(rows, None)).unwrap(),
-        Turn::Ask(Ask::Read(Vec::new()))
+        plan.next(page_result(rows, None)).unwrap(),
+        Next::Call(read_call(Vec::new()))
     );
-    let Turn::Ask(Ask::Write(written)) = plan.next(Answer::Values(Vec::new())).unwrap() else {
+    let Next::Call(IoCall::Write(written)) = plan.next(values_result(Vec::new())).unwrap() else {
         panic!("the page writes no forward row");
     };
     assert!(written.is_empty());
-    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Done).unwrap() else {
+    let Next::Call(IoCall::Delete(keys)) = plan.next(IoResult::Done).unwrap() else {
         panic!("the pending, kept and source rows go");
     };
     assert_eq!(keys.len(), 3);
-    assert_eq!(keys[0], (EVENT_JOURNAL_KEYSPACE, pending));
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1));
+    assert_eq!(
+        keys[0],
+        (EVENT_JOURNAL_KEYSPACE.to_string(), pending.into())
+    );
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(1));
     // An empty page reads nothing more.
     let mut empty = MatchPage {
         targets: Vec::new(),
@@ -368,7 +375,7 @@ fn user_pending_dropped() {
         phase: MatchPhase::Reading,
     };
     assert_eq!(
-        empty.next(Answer::Page(Vec::new(), None)).unwrap(),
-        Turn::Finish(0)
+        empty.next(page_result(Vec::new(), None)).unwrap(),
+        Next::Done(0)
     );
 }

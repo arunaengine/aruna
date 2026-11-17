@@ -5,17 +5,18 @@
 
 use std::sync::OnceLock;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::rows::{done, read_row};
+use aruna_core::effects::StorageEffect;
+use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{Effects, GroupId, Key, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -232,12 +233,20 @@ pub enum SelectionError {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RowState {
-    Init,
-    Read,
-    Write,
-    Finish,
+impl From<IoError> for SelectionError {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
+fn read_call(document_id: Ulid) -> IoCall {
+    read_row(DEVICE_REPLICA_KEYSPACE, replica_key(document_id))
+}
+
+/// The replica a read holds; an absent or undecodable row is none.
+fn read_replica_row(result: IoResult) -> Result<Option<ReplicaRecord>, IoError> {
+    let value = result.values()?.into_iter().next().flatten();
+    Ok(value.and_then(|bytes| ReplicaRecord::from_bytes(&bytes).ok()))
 }
 
 /// Stops keeping one document offline by dropping its replica row. The local graph is left in
@@ -246,84 +255,53 @@ enum RowState {
 #[derive(Debug, PartialEq)]
 pub struct DeselectDocumentOperation {
     document_id: Ulid,
-    state: RowState,
     replica: Option<ReplicaRecord>,
-    output: Option<Result<ReplicaRecord, SelectionError>>,
 }
 
 impl DeselectDocumentOperation {
     pub fn new(document_id: Ulid) -> Self {
         Self {
             document_id,
-            state: RowState::Init,
             replica: None,
-            output: None,
         }
-    }
-
-    fn finish(&mut self, output: Result<ReplicaRecord, SelectionError>) -> Effects {
-        self.state = RowState::Finish;
-        self.output = Some(output);
-        smallvec![]
     }
 }
 
-impl EffectOperation for DeselectDocumentOperation {
+impl Operation for DeselectDocumentOperation {
     type Output = ReplicaRecord;
     type Error = SelectionError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RowState::Read;
-        smallvec![Effect::Storage(replica_read(self.document_id))]
+    fn first(&mut self) -> Result<Next<ReplicaRecord>, SelectionError> {
+        Ok(Next::Call(read_call(self.document_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, &event) {
-            (
-                RowState::Read,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. }),
-            ) => match read_answer(&event) {
-                None => self.finish(Err(SelectionError::NotFound)),
-                Some(replica) if replica.pending_edits > 0 => {
-                    self.finish(Err(SelectionError::PendingEdits))
-                }
-                Some(replica) => {
-                    self.replica = Some(replica);
-                    self.state = RowState::Write;
-                    smallvec![Effect::Storage(replica_delete(self.document_id))]
-                }
-            },
-            (RowState::Write, Event::Storage(StorageEvent::DeleteResult { .. })) => {
-                let replica = self.replica.take().ok_or(SelectionError::Unavailable);
-                self.finish(replica.map(|replica| ReplicaRecord {
-                    selected: false,
-                    ..replica
-                }))
-            }
-            _ => self.finish(Err(SelectionError::Unavailable)),
+    fn next(&mut self, result: IoResult) -> Result<Next<ReplicaRecord>, SelectionError> {
+        if let Some(replica) = self.replica.take() {
+            done(result)?;
+            return Ok(Next::Done(ReplicaRecord {
+                selected: false,
+                ..replica
+            }));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == RowState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SelectionError::Unavailable))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        let replica = read_replica_row(result)?.ok_or(SelectionError::NotFound)?;
+        if replica.pending_edits > 0 {
+            return Err(SelectionError::PendingEdits);
+        }
+        self.replica = Some(replica);
+        let row = (
+            DEVICE_REPLICA_KEYSPACE.to_string(),
+            replica_key(self.document_id),
+        );
+        Ok(Next::Call(IoCall::Delete(vec![row])))
     }
 }
 
 /// Selects a document this device created, once the realm has accepted it, unless this device
-/// already holds a replica of it. A failed write is ignored and leaves the document untracked.
+/// already holds a replica of it.
 #[derive(Debug, PartialEq)]
 pub struct TrackCreatedOperation {
     replica: ReplicaRecord,
-    state: RowState,
-    output: Option<Result<(), SelectionError>>,
+    written: bool,
 }
 
 impl TrackCreatedOperation {
@@ -333,98 +311,48 @@ impl TrackCreatedOperation {
         replica.state = ReplicaState::LocalOnly;
         Self {
             replica,
-            state: RowState::Init,
-            output: None,
+            written: false,
         }
-    }
-
-    fn finish(&mut self, output: Result<(), SelectionError>) -> Effects {
-        self.state = RowState::Finish;
-        self.output = Some(output);
-        smallvec![]
     }
 }
 
-impl EffectOperation for TrackCreatedOperation {
+impl Operation for TrackCreatedOperation {
     type Output = ();
     type Error = SelectionError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RowState::Read;
-        smallvec![Effect::Storage(replica_read(self.replica.document_id))]
+    fn first(&mut self) -> Result<Next<()>, SelectionError> {
+        Ok(Next::Call(read_call(self.replica.document_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, &event) {
-            (
-                RowState::Read,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. }),
-            ) => {
-                if read_answer(&event).is_some() {
-                    return self.finish(Ok(()));
-                }
-                let Ok((key_space, key, value)) = replica_entry(&self.replica) else {
-                    warn!(document_id = %self.replica.document_id, "Failed to encode a device replica");
-                    return self.finish(Ok(()));
-                };
-                self.state = RowState::Write;
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space,
-                    key,
-                    value,
-                    txn_id: None,
-                })]
-            }
-            (
-                RowState::Write,
-                Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::Error { .. }),
-            ) => self.finish(Ok(())),
-            _ => self.finish(Err(SelectionError::Unavailable)),
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, SelectionError> {
+        if self.written {
+            done(result)?;
+            return Ok(Next::Done(()));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == RowState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SelectionError::Unavailable))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        if read_replica_row(result)?.is_some() {
+            return Ok(Next::Done(()));
+        }
+        let Ok(row) = replica_entry(&self.replica) else {
+            warn!(document_id = %self.replica.document_id, "Failed to encode a device replica");
+            return Ok(Next::Done(()));
+        };
+        self.written = true;
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ReplicaScanError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("unexpected {0} while scanning the device replicas")]
-    UnexpectedEvent(&'static str),
-    #[error("scanning the device replicas did not finish")]
-    NotFinished,
+    Io(#[from] IoError),
 }
 
-fn scan_page(key_space: &str, start_after: Option<Key>) -> Effects {
-    smallvec![Effect::Storage(StorageEffect::Iter {
-        key_space: key_space.to_string(),
-        prefix: None,
-        start: start_after.map(IterStart::After),
+fn scan_page(key_space: &str, after: Option<Key>) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix: Key::from(Vec::new()),
+        after,
         limit: REPLICA_PAGE_SIZE,
-        txn_id: None,
-    })]
-}
-
-/// The rows and the cursor of one scanned page.
-fn scanned_page(event: Event) -> Result<(Vec<(Key, Value)>, Option<Key>), ReplicaScanError> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after)),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        event => Err(ReplicaScanError::UnexpectedEvent(event.label())),
     }
 }
 
@@ -432,9 +360,7 @@ fn scanned_page(event: Event) -> Result<(Vec<(Key, Value)>, Option<Key>), Replic
 /// as a document this device does not hold.
 #[derive(Debug, Default, PartialEq)]
 pub struct ListReplicasOperation {
-    started: bool,
     replicas: Vec<ReplicaRecord>,
-    output: Option<Result<Vec<ReplicaRecord>, ReplicaScanError>>,
 }
 
 impl ListReplicasOperation {
@@ -443,51 +369,23 @@ impl ListReplicasOperation {
     }
 }
 
-impl EffectOperation for ListReplicasOperation {
+impl Operation for ListReplicasOperation {
     type Output = Vec<ReplicaRecord>;
     type Error = ReplicaScanError;
 
-    fn start(&mut self) -> Effects {
-        self.started = true;
-        scan_page(DEVICE_REPLICA_KEYSPACE, None)
+    fn first(&mut self) -> Result<Next<Self::Output>, ReplicaScanError> {
+        Ok(Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, None)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let page = match self.started {
-            true => scanned_page(event),
-            false => Err(ReplicaScanError::UnexpectedEvent(event.label())),
-        };
-        match page {
-            Ok((values, next)) => {
-                let decoded = values
-                    .into_iter()
-                    .filter_map(|(_, bytes)| ReplicaRecord::from_bytes(&bytes).ok());
-                self.replicas.extend(decoded);
-                match next {
-                    Some(next) => scan_page(DEVICE_REPLICA_KEYSPACE, Some(next)),
-                    None => {
-                        self.output = Some(Ok(std::mem::take(&mut self.replicas)));
-                        smallvec![]
-                    }
-                }
-            }
-            Err(error) => {
-                self.output = Some(Err(error));
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(ReplicaScanError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ReplicaScanError> {
+        let (rows, next) = result.page()?;
+        let decoded =
+            (rows.into_iter()).filter_map(|(_, bytes)| ReplicaRecord::from_bytes(&bytes).ok());
+        self.replicas.extend(decoded);
+        Ok(match next {
+            Some(next) => Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, Some(next))),
+            None => Next::Done(std::mem::take(&mut self.replicas)),
+        })
     }
 }
 
@@ -496,70 +394,47 @@ impl EffectOperation for ListReplicasOperation {
 #[derive(Debug, Default, PartialEq)]
 pub struct CacheUsageOperation {
     replicas: ListReplicasOperation,
+    /// The bytes counted so far, once the replica rows are counted.
     graphs: Option<u64>,
-    output: Option<Result<u64, ReplicaScanError>>,
 }
 
 impl CacheUsageOperation {
     pub fn new() -> Self {
         Self::default()
     }
-
-    fn finish(&mut self, output: Result<u64, ReplicaScanError>) -> Effects {
-        self.output = Some(output);
-        smallvec![]
-    }
 }
 
-impl EffectOperation for CacheUsageOperation {
+impl Operation for CacheUsageOperation {
     type Output = u64;
     type Error = ReplicaScanError;
 
-    fn start(&mut self) -> Effects {
-        self.replicas.start()
+    fn first(&mut self) -> Result<Next<u64>, ReplicaScanError> {
+        self.replicas
+            .first()
+            .map(|_| Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, None)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let Some(graphs) = self.graphs else {
-            let effects = self.replicas.step(event);
-            if !self.replicas.is_complete() {
-                return effects;
-            }
-            return match std::mem::take(&mut self.replicas).finalize() {
-                Ok(replicas) => {
+    fn next(&mut self, result: IoResult) -> Result<Next<u64>, ReplicaScanError> {
+        let Some(counted) = self.graphs else {
+            return Ok(match self.replicas.next(result)? {
+                Next::Done(replicas) => {
                     self.graphs = Some(replicas.iter().map(replica_size).sum());
-                    scan_page(DEVICE_GRAPH_KEYSPACE, None)
+                    Next::Call(scan_page(DEVICE_GRAPH_KEYSPACE, None))
                 }
-                Err(error) => self.finish(Err(error)),
-            };
+                Next::Call(call) => Next::Call(call),
+                Next::Wait => Next::Wait,
+            });
         };
-        match scanned_page(event) {
-            Ok((values, next)) => {
-                let sizes = values
-                    .iter()
-                    .filter_map(|(_, value)| <[u8; 8]>::try_from(value.as_ref()).ok())
-                    .map(u64::from_be_bytes);
-                let total = sizes.fold(graphs, u64::saturating_add);
-                self.graphs = Some(total);
-                match next {
-                    Some(next) => scan_page(DEVICE_GRAPH_KEYSPACE, Some(next)),
-                    None => self.finish(Ok(total)),
-                }
-            }
-            Err(error) => self.finish(Err(error)),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(ReplicaScanError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        let (rows, next) = result.page()?;
+        let sizes = (rows.iter())
+            .filter_map(|(_, value)| <[u8; 8]>::try_from(value.as_ref()).ok())
+            .map(u64::from_be_bytes);
+        let total = sizes.fold(counted, u64::saturating_add);
+        self.graphs = Some(total);
+        Ok(match next {
+            Some(next) => Next::Call(scan_page(DEVICE_GRAPH_KEYSPACE, Some(next))),
+            None => Next::Done(total),
+        })
     }
 }
 
@@ -591,9 +466,6 @@ pub fn mark_edited(replica: &mut ReplicaRecord, local_clock: VectorClock) {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
     use aruna_core::structs::identity::realm::RealmId;
 
     fn replica() -> ReplicaRecord {
@@ -684,11 +556,11 @@ mod pure_tests {
         assert_eq!(document_state(&replica, &[]), DocumentState::LocalOnly);
     }
 
-    fn page(values: Vec<(Key, Value)>, next: Option<&[u8]>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: next.map(|key| key.to_vec().into()),
-        })
+    fn page(values: Vec<(Key, Value)>, next: Option<&[u8]>) -> IoResult {
+        IoResult::Page {
+            rows: values,
+            next: next.map(|key| key.to_vec().into()),
+        }
     }
 
     fn row(replica: &ReplicaRecord) -> (Key, Value) {
@@ -701,19 +573,13 @@ mod pure_tests {
     fn lists_every_page() {
         let held = replica();
         let mut list = ListReplicasOperation::new();
+        let first = scan_page(DEVICE_REPLICA_KEYSPACE, None);
+        assert_eq!(list.first(), Ok(Next::Call(first)));
         let next = scan_page(DEVICE_REPLICA_KEYSPACE, Some(b"a".to_vec().into()));
-        check_trace(
-            &mut list,
-            &scan_page(DEVICE_REPLICA_KEYSPACE, None),
-            vec![
-                (page(vec![row(&held)], Some(b"a")), next.into_vec()),
-                (
-                    page(vec![(b"b".to_vec().into(), Vec::new().into())], None),
-                    Vec::new(),
-                ),
-            ],
-        );
-        assert_eq!(list.finalize(), Ok(vec![held]));
+        let first_page = page(vec![row(&held)], Some(b"a".as_slice()));
+        assert_eq!(list.next(first_page), Ok(Next::Call(next)));
+        let garbage = page(vec![(b"b".to_vec().into(), Vec::new().into())], None);
+        assert_eq!(list.next(garbage), Ok(Next::Done(vec![held])));
     }
 
     // Replica rows count by their size and graphs by their stored size, over all pages.
@@ -723,54 +589,40 @@ mod pure_tests {
         let graph = |size: u64| -> (Key, Value) {
             (b"g".to_vec().into(), size.to_be_bytes().to_vec().into())
         };
-        let graphs = scan_page(DEVICE_GRAPH_KEYSPACE, None);
-        let next = scan_page(DEVICE_GRAPH_KEYSPACE, Some(b"g".to_vec().into()));
         let mut usage = CacheUsageOperation::new();
-        check_trace(
-            &mut usage,
-            &scan_page(DEVICE_REPLICA_KEYSPACE, None),
-            vec![
-                (page(vec![row(&held)], None), graphs.into_vec()),
-                (page(vec![graph(4_000)], Some(b"g")), next.into_vec()),
-                (page(vec![graph(6)], None), Vec::new()),
-            ],
+        let replicas = scan_page(DEVICE_REPLICA_KEYSPACE, None);
+        assert_eq!(usage.first(), Ok(Next::Call(replicas)));
+        let graphs = scan_page(DEVICE_GRAPH_KEYSPACE, None);
+        assert_eq!(
+            usage.next(page(vec![row(&held)], None)),
+            Ok(Next::Call(graphs))
         );
-        assert_eq!(usage.finalize(), Ok(replica_size(&held) + 4_006));
+        let next = scan_page(DEVICE_GRAPH_KEYSPACE, Some(b"g".to_vec().into()));
+        let first = page(vec![graph(4_000)], Some(b"g".as_slice()));
+        assert_eq!(usage.next(first), Ok(Next::Call(next)));
+        let total = replica_size(&held) + 4_006;
+        assert_eq!(
+            usage.next(page(vec![graph(6)], None)),
+            Ok(Next::Done(total))
+        );
     }
 
-    // A failed scan fails both operations; other events are refused and nothing finishes early.
+    // A result that answers no page fails the scan.
     #[test]
     fn scan_failures_fail() {
-        let error = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
         let mut list = ListReplicasOperation::new();
-        list.start();
-        list.step(error());
-        assert_eq!(list.finalize(), Err(StorageError::Timeout.into()));
+        list.first().unwrap();
+        assert!(list.next(IoResult::Done).is_err());
         let mut usage = CacheUsageOperation::new();
-        usage.start();
-        usage.step(page(Vec::new(), None));
-        usage.step(error());
-        assert_eq!(usage.finalize(), Err(StorageError::Timeout.into()));
-
-        let all = sample_events().len();
-        let lists = rejects_events(ListReplicasOperation::new, sample_events, |_| false);
-        let usages = rejects_events(CacheUsageOperation::new, sample_events, |_| false);
-        assert_eq!((lists.len(), usages.len()), (all, all));
-        rejects_finalize(ListReplicasOperation::new());
-        rejects_finalize(CacheUsageOperation::new());
-        assert!(ListReplicasOperation::new().abort().is_empty());
-        assert!(CacheUsageOperation::new().abort().is_empty());
+        usage.first().unwrap();
+        usage.next(page(Vec::new(), None)).unwrap();
+        assert!(usage.next(IoResult::Woke).is_err());
     }
 
-    fn stored(replica: Option<&ReplicaRecord>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: replica.map(|replica| replica.to_bytes().unwrap().into()),
-        })
+    fn stored(replica: Option<&ReplicaRecord>) -> IoResult {
+        IoResult::Values(vec![
+            replica.map(|replica| replica.to_bytes().unwrap().into()),
+        ])
     }
 
     // A deselected replica row is deleted and answered unselected; pending edits keep it.
@@ -779,93 +631,49 @@ mod pure_tests {
         let held = replica();
         let id = held.document_id;
         let mut deselect = DeselectDocumentOperation::new(id);
-        let deleted = Event::Storage(StorageEvent::DeleteResult {
-            key: replica_key(id),
-        });
-        check_trace(
-            &mut deselect,
-            &[Effect::Storage(replica_read(id))],
-            vec![
-                (
-                    stored(Some(&held)),
-                    vec![Effect::Storage(replica_delete(id))],
-                ),
-                (deleted, Vec::new()),
-            ],
-        );
+        assert_eq!(deselect.first(), Ok(Next::Call(read_call(id))));
+        let delete = IoCall::Delete(vec![(DEVICE_REPLICA_KEYSPACE.to_string(), replica_key(id))]);
+        assert_eq!(deselect.next(stored(Some(&held))), Ok(Next::Call(delete)));
         let unselected = ReplicaRecord {
             selected: false,
             ..held.clone()
         };
-        assert_eq!(deselect.finalize(), Ok(unselected));
+        assert_eq!(deselect.next(IoResult::Done), Ok(Next::Done(unselected)));
 
         let edited = ReplicaRecord {
             pending_edits: 1,
             ..held
         };
         let mut deselect = DeselectDocumentOperation::new(id);
-        deselect.start();
-        assert!(deselect.step(stored(Some(&edited))).is_empty());
-        assert_eq!(deselect.finalize(), Err(SelectionError::PendingEdits));
+        deselect.first().unwrap();
+        let refused = deselect.next(stored(Some(&edited)));
+        assert_eq!(refused, Err(SelectionError::PendingEdits));
         let mut deselect = DeselectDocumentOperation::new(id);
-        deselect.start();
-        deselect.step(stored(None));
-        assert_eq!(deselect.finalize(), Err(SelectionError::NotFound));
+        deselect.first().unwrap();
+        assert_eq!(deselect.next(stored(None)), Err(SelectionError::NotFound));
+        assert_eq!(
+            SelectionError::from(IoError::Conflict),
+            SelectionError::Unavailable
+        );
     }
 
     // A created document gets a local-only row, unless a replica row is already there.
     #[test]
     fn tracks_created_once() {
         let group_id = Ulid::from_bytes([1u8; 16]);
-        let make =
-            || TrackCreatedOperation::new(Ulid::from_bytes([2u8; 16]), group_id, "notes".into());
+        let id = Ulid::from_bytes([2u8; 16]);
+        let make = || TrackCreatedOperation::new(id, group_id, "notes".into());
         let mut expected = replica();
         expected.origin = ReplicaOrigin::Device;
         expected.state = ReplicaState::LocalOnly;
-        let (key_space, key, value) = replica_entry(&expected).unwrap();
-        let write = Effect::Storage(StorageEffect::Write {
-            key_space,
-            key: key.clone(),
-            value,
-            txn_id: None,
-        });
         let mut track = make();
-        let read = [Effect::Storage(replica_read(expected.document_id))];
-        let written = Event::Storage(StorageEvent::WriteResult { key });
-        check_trace(
-            &mut track,
-            &read,
-            vec![(stored(None), vec![write]), (written, Vec::new())],
-        );
-        assert_eq!(track.finalize(), Ok(()));
+        assert_eq!(track.first(), Ok(Next::Call(read_call(id))));
+        let write = IoCall::Write(vec![replica_entry(&expected).unwrap()]);
+        assert_eq!(track.next(stored(None)), Ok(Next::Call(write)));
+        assert_eq!(track.next(IoResult::Done), Ok(Next::Done(())));
         let mut track = make();
-        check_trace(
-            &mut track,
-            &read,
-            vec![(stored(Some(&expected)), Vec::new())],
-        );
-        assert_eq!(track.finalize(), Ok(()));
-    }
-
-    // Other events fail both operations with an unavailable store; nothing finishes early.
-    #[test]
-    fn selection_rejects_unexpected() {
-        let id = Ulid::from_bytes([2u8; 16]);
-        let deselect = || DeselectDocumentOperation::new(id);
-        let track = || TrackCreatedOperation::new(id, Ulid::from_bytes([1u8; 16]), "notes".into());
-        let all = sample_events().len();
-        let refused = rejects_events(deselect, sample_events, |_| false);
-        assert!(
-            refused
-                .iter()
-                .all(|(_, _, error)| *error == SelectionError::Unavailable)
-        );
-        assert_eq!(refused.len(), all);
-        assert_eq!(rejects_events(track, sample_events, |_| false).len(), all);
-        rejects_finalize(deselect());
-        rejects_finalize(track());
-        assert!(deselect().abort().is_empty());
-        assert!(track().abort().is_empty());
+        track.first().unwrap();
+        assert_eq!(track.next(stored(Some(&expected))), Ok(Next::Done(())));
     }
 
     #[test]

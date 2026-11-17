@@ -3,10 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoResult, Next};
 use aruna_core::keyspaces::{
     PLUGIN_CREATES_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_QUEUE_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE,
     PLUGIN_WAITING_KEYSPACE,
 };
+use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, GapRow, RECEIVER_GAP};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -14,7 +16,7 @@ use std::collections::BTreeMap;
 
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, Rows, RowsOperation, Scan, StoreError, Turn, decode, done};
+use super::rows::{Rows, Scan, StoreError, decode, delete_call, done};
 
 /// How a row's install stands in the realm config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,10 +37,7 @@ fn install_at(key: &[u8], at: usize) -> Ulid {
 /// Deletes the rows this node no longer needs; returns how many. Replay and create key rows go
 /// once their install is absent or removing, as only this node wrote them; waiting and reported
 /// rows go only while it is removing, as a receiver may not have the install record yet.
-pub(crate) fn sweep_events(
-    config: &RealmConfigDocument,
-    now_ms: u64,
-) -> RowsOperation<SweepEvents> {
+pub(crate) fn sweep_events(config: &RealmConfigDocument, now_ms: u64) -> SweepEvents {
     let installs = (config.installs.iter())
         .map(|install| {
             let standing = match install.state == InstallState::Removing {
@@ -48,13 +47,13 @@ pub(crate) fn sweep_events(
             (install.install_id, standing)
         })
         .collect();
-    RowsOperation::direct(SweepEvents {
+    SweepEvents {
         installs,
         now_ms,
         phase: SweepPhase::Scanning(Table::Replays, Table::Replays.scan()),
         deletes: Vec::new(),
         dropped: 0,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -154,33 +153,33 @@ impl SweepEvents {
     }
 
     /// The next delete, or the next table once every delete was sent.
-    fn advance(&mut self, next: Option<Table>) -> Turn<usize> {
+    fn advance(&mut self, next: Option<Table>) -> Next<usize> {
         if let Some(keys) = self.deletes.pop() {
             self.phase = SweepPhase::Deleting(next);
-            return Turn::Ask(Ask::Delete(keys));
+            return Next::Call(delete_call(keys));
         }
         let Some(table) = next else {
-            return Turn::Finish(self.dropped);
+            return Next::Done(self.dropped);
         };
         let scan = table.scan();
         let ask = scan.ask();
         self.phase = SweepPhase::Scanning(table, scan);
-        Turn::Ask(ask)
+        Next::Call(ask)
     }
 }
 
-impl Plan for SweepEvents {
+impl Operation for SweepEvents {
     type Output = usize;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
         match &self.phase {
-            SweepPhase::Scanning(_, scan) => Ok(Turn::Ask(scan.ask())),
+            SweepPhase::Scanning(_, scan) => Ok(Next::Call(scan.ask())),
             SweepPhase::Deleting(_) => Err(StoreError("swept twice".into())),
         }
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
         match std::mem::replace(&mut self.phase, SweepPhase::Deleting(None)) {
             SweepPhase::Deleting(next) => {
                 done(answer)?;
@@ -190,7 +189,7 @@ impl Plan for SweepEvents {
                 let Some(rows) = scan.take(answer)? else {
                     let ask = scan.ask();
                     self.phase = SweepPhase::Scanning(table, scan);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 let mut deletes = self.dropped(table, rows);
                 self.dropped += deletes.last().map_or(0, Vec::len);

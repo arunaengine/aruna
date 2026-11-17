@@ -9,14 +9,17 @@ use super::fanout_types::{
 use super::fanout_types::{fanout_bearer, metadata_node_call, pattern_contains_service};
 use super::field;
 
+use super::super::handle::QUERY_MAX_BYTES;
+use super::preflight::discover_realm_nodes;
 use super::{
     ApiQueryMode, BucketPage, BucketSearchExecution, BucketSearchRequest,
-    DISTRIBUTED_QUERY_DEADLINE, DriverContext, HashSet, Instant, MetadataApiError,
-    MetadataReadError, NodeId, QUERY_FANOUT_LIMIT, QUERY_MAX_BYTES, QUERY_MAX_NODES,
-    QUERY_MAX_ROWS, RealmId, SearchBucketsInput, Span, debug_span, deduplicate_fanout_nodes,
-    discover_realm_nodes, map_read_error, query_fingerprint, record_elapsed_ms,
-    search_local_buckets, select_fanout_nodes, short_display_id, stream, warn,
+    DISTRIBUTED_QUERY_DEADLINE, HashSet, Instant, MetadataApiError, MetadataReadError, NodeId,
+    QUERY_FANOUT_LIMIT, QUERY_MAX_NODES, QUERY_MAX_ROWS, RealmId, SearchBucketsInput, Span,
+    debug_span, deduplicate_fanout_nodes, map_read_error, query_fingerprint, record_elapsed_ms,
+    select_fanout_nodes, short_display_id, stream, warn,
 };
+use crate::driver::DriverContext;
+use crate::s3::bucket::local_search::search_local_buckets;
 
 use super::bucket_page::{NodePosition, decode_cursor, encode_cursor, merge_pages, retired_nodes};
 use super::distributed::record_bucket_result;

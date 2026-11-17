@@ -2,131 +2,53 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::errors::ConversionError;
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::publish_queue::{PublishEntry, read_publish_entry};
+use super::publish_queue::{PublishEntry, read_entry};
 
 #[derive(Debug, PartialEq)]
 pub struct InspectDraftOperation {
     draft_id: Ulid,
-    state: InspectDraftState,
-    output: Option<Result<PublishEntry, InspectDraftError>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum InspectDraftState {
-    Init,
-    ReadEntry,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum InspectDraftError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("queued draft not found")]
     NotFound,
-    #[error("inspecting the queued draft did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
 }
 
 impl InspectDraftOperation {
     pub fn new(draft_id: Ulid) -> Self {
-        Self {
-            draft_id,
-            state: InspectDraftState::Init,
-            output: None,
-        }
+        Self { draft_id }
     }
 }
 
-impl EffectOperation for InspectDraftOperation {
+impl Operation for InspectDraftOperation {
     type Output = PublishEntry;
     type Error = InspectDraftError;
 
-    fn start(&mut self) -> Effects {
-        self.state = InspectDraftState::ReadEntry;
-        smallvec![read_publish_entry(self.draft_id, None)]
+    fn first(&mut self) -> Result<Next<PublishEntry>, InspectDraftError> {
+        Ok(Next::Call(read_entry(self.draft_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, InspectDraftError::StorageError(error));
-            }
-            other => other,
-        };
-
-        match self.state {
-            InspectDraftState::ReadEntry => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return fail(
-                        self,
-                        InspectDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "read result",
-                            got,
-                        },
-                    );
-                };
-                let Some(bytes) = value else {
-                    return fail(self, InspectDraftError::NotFound);
-                };
-                match PublishEntry::from_bytes(&bytes) {
-                    Ok(entry) => {
-                        self.state = InspectDraftState::Finish;
-                        self.output = Some(Ok(entry));
-                        smallvec![]
-                    }
-                    Err(error) => fail(self, InspectDraftError::ConversionError(error)),
-                }
-            }
-            InspectDraftState::Init | InspectDraftState::Finish | InspectDraftState::Error => {
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            InspectDraftState::Finish | InspectDraftState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(InspectDraftError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<PublishEntry>, InspectDraftError> {
+        let [value] = values::<1>(result)?;
+        let bytes = value.ok_or(InspectDraftError::NotFound)?;
+        Ok(Next::Done(PublishEntry::from_bytes(&bytes)?))
     }
 
     fn expected_error(error: &Self::Error) -> bool {
         matches!(error, InspectDraftError::NotFound)
     }
-}
-
-fn fail(operation: &mut InspectDraftOperation, error: InspectDraftError) -> Effects {
-    operation.state = InspectDraftState::Error;
-    operation.output = Some(Err(error));
-    smallvec![]
 }
 
 #[cfg(test)]
@@ -139,6 +61,25 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use ulid::Ulid;
+
+    // A missing row is not found, a row that does not decode fails.
+    #[test]
+    fn missing_or_garbage_fails() {
+        use aruna_core::calls::{IoResult, Next};
+        use aruna_core::operation::Operation;
+        let mut inspect = InspectDraftOperation::new(Ulid::nil());
+        assert_eq!(
+            inspect.first(),
+            Ok(Next::Call(crate::device::publish_queue::read_entry(Ulid::nil())))
+        );
+        let missing = inspect.next(IoResult::Values(vec![None]));
+        assert_eq!(missing, Err(InspectDraftError::NotFound));
+        let garbage = IoResult::Values(vec![Some(vec![0xFF].into())]);
+        assert!(matches!(
+            inspect.next(garbage),
+            Err(InspectDraftError::ConversionError(_))
+        ));
+    }
 
     #[tokio::test]
     async fn reads_queued_draft() {

@@ -3,87 +3,61 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::{
     NotificationRecord, NotificationRequest, NotificationTransportMessage,
 };
 use aruna_core::structs::execution::notification_watch::WatchSubscription;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
+
+use crate::notifications::unexpected;
 
 /// Why a holder gave no answer; the text is the transport's.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("{0}")]
 pub struct RemoteError(pub String);
 
-#[derive(Debug, PartialEq)]
-enum RequestState {
-    Ready(Box<NotificationRequest>),
-    Sent,
-    Done(Result<NotificationTransportMessage, RemoteError>),
+impl From<IoError> for RemoteError {
+    fn from(error: IoError) -> Self {
+        RemoteError(error.to_string())
+    }
 }
 
 /// One request frame to the notification holder `node` and its answer frame.
 #[derive(Debug, PartialEq)]
 pub struct HolderRequestOperation {
-    state: RequestState,
+    request: Option<Box<NotificationRequest>>,
 }
 
 impl HolderRequestOperation {
     pub fn new(node: NodeId, message: NotificationTransportMessage) -> Self {
         Self {
-            state: RequestState::Ready(Box::new(NotificationRequest { node, message })),
+            request: Some(Box::new(NotificationRequest { node, message })),
         }
     }
 }
 
-impl EffectOperation for HolderRequestOperation {
+impl Operation for HolderRequestOperation {
     type Output = NotificationTransportMessage;
     type Error = RemoteError;
 
-    fn start(&mut self) -> Effects {
-        match std::mem::replace(&mut self.state, RequestState::Sent) {
-            RequestState::Ready(request) => {
-                smallvec![Effect::Net(NetEffect::Notification(request))]
-            }
-            other => {
-                self.state = other;
-                smallvec![]
-            }
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let request = self.request.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::Effect(Effect::Net(
+            NetEffect::Notification(request),
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        match result {
+            IoResult::Event(Event::Net(NetEvent::Notification(answer))) => answer
+                .map(|answer| Next::Done(*answer))
+                .map_err(RemoteError),
+            other => Err(unexpected("NetEvent::Notification", &other).into()),
         }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let answer = match (&self.state, event) {
-            (RequestState::Sent, Event::Net(NetEvent::Notification(answer))) => {
-                answer.map(|answer| *answer).map_err(RemoteError)
-            }
-            (_, other) => Err(RemoteError(format!(
-                "unexpected notification event: {other:?}"
-            ))),
-        };
-        self.state = RequestState::Done(answer);
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RequestState::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            RequestState::Done(answer) => answer,
-            _ => Err(RemoteError(
-                "the notification request did not finish".to_string(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -161,13 +135,10 @@ pub(crate) fn events_delivered(answer: Answer) -> Result<u32, String> {
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::user;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
 
     fn list() -> NotificationTransportMessage {
         NotificationTransportMessage::UnreadCount {
@@ -176,25 +147,25 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn request_trace() {
+    fn request_calls() {
         let mut request = HolderRequestOperation::new(node_id(2), list());
         let sent = NotificationRequest {
             node: node_id(2),
             message: list(),
         };
+        assert_eq!(
+            request.first(),
+            Ok(Next::Call(IoCall::Effect(Effect::Net(
+                NetEffect::Notification(Box::new(sent))
+            ))))
+        );
         let answer = NotificationTransportMessage::UnreadCountResult {
             count: 3,
             capped: false,
         };
-        check_trace(
-            &mut request,
-            &[Effect::Net(NetEffect::Notification(Box::new(sent)))],
-            vec![(
-                Event::Net(NetEvent::Notification(Ok(Box::new(answer.clone())))),
-                vec![],
-            )],
-        );
-        assert_eq!(unread_counted(request.finalize()), Ok((3, false)));
+        let event = Event::Net(NetEvent::Notification(Ok(Box::new(answer.clone()))));
+        assert_eq!(request.next(IoResult::Event(event)), Ok(Next::Done(answer)));
+        assert!(request.first().is_err(), "the request is sent once");
     }
 
     #[test]
@@ -208,26 +179,22 @@ mod state_machine_tests {
             marked_read(wrong),
             Err("unexpected notification response".to_string())
         );
+        let counted = Ok(NotificationTransportMessage::UnreadCountResult {
+            count: 3,
+            capped: false,
+        });
+        assert_eq!(unread_counted(counted), Ok((3, false)));
     }
 
     #[test]
-    fn unexpected_events_fail() {
-        let make = || {
-            let mut request = HolderRequestOperation::new(node_id(2), list());
-            request.start();
-            request
-        };
-        assert_eq!(
-            rejects_events(make, sample_events, |_| false).len(),
-            sample_events().len()
-        );
-    }
-
-    #[test]
-    fn abort_and_finalize() {
+    fn other_results_fail() {
         let mut request = HolderRequestOperation::new(node_id(2), list());
-        request.start();
-        check_abort(&mut request, &[]);
-        rejects_finalize(request);
+        request.first().unwrap();
+        let failed = Event::Net(NetEvent::Notification(Err("closed".to_string())));
+        assert_eq!(
+            request.next(IoResult::Event(failed)),
+            Err(RemoteError("closed".to_string()))
+        );
+        assert!(request.next(IoResult::Done).is_err());
     }
 }

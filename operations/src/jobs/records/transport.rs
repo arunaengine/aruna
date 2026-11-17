@@ -1,4 +1,4 @@
-//! Sends and serves job record and launch offer messages between realm nodes.
+//! Serves job record and launch offer messages from other realm nodes.
 //! A relaying peer is authenticated on its own and is never treated as the record author.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -6,20 +6,14 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{
-    FetchCursor, JobRecordEffect, JobRecordFrame, LaunchFrame, LaunchOfferEffect, PageLimit,
-};
-use aruna_core::events::{
-    JobRecordEvent, JobRecordPage, JobRecordRejection, LaunchDecline, LaunchOfferEvent,
-};
+use aruna_core::effects::{JobRecordFrame, LaunchFrame};
+use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
-    PhysicalExecutionState, SubmissionId,
+    PhysicalExecutionState,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
-use futures_util::future::join_all;
-use tokio::time::timeout_at;
 use tracing::warn;
 
 use super::admit::Admission;
@@ -32,229 +26,6 @@ use crate::metadata::transport_message_kind;
 use crate::realm::load_config::load_realm_config;
 use aruna_core::placement::holds_placement;
 use aruna_core::structs::execution::job::record_rows::PendingNeed;
-
-/// Publishes one record to the family holders, or reads a bounded page back.
-pub async fn dispatch_record(context: &DriverContext, effect: JobRecordEffect) -> JobRecordEvent {
-    match effect {
-        JobRecordEffect::Publish {
-            placement,
-            holders,
-            record,
-            deadline,
-            ..
-        } => {
-            let request = MetadataTransportMessage::ForwardJobRecord {
-                placement,
-                record: Box::new(record.as_ref().clone()),
-            };
-            publish_record(context, holders.as_slice(), request, deadline).await
-        }
-        JobRecordEffect::Fetch {
-            placement,
-            holders,
-            submission_id,
-            request_digest,
-            cursor,
-            limit,
-            deadline,
-            ..
-        } => {
-            fetch_records(
-                context,
-                holders.as_slice(),
-                PageRequest {
-                    placement,
-                    submission_id,
-                    request_digest,
-                    cursor,
-                    limit,
-                },
-                deadline,
-            )
-            .await
-        }
-    }
-}
-
-struct PageRequest {
-    placement: PlacementRef,
-    submission_id: SubmissionId,
-    request_digest: Option<[u8; 32]>,
-    cursor: Option<FetchCursor>,
-    limit: PageLimit,
-}
-
-/// Asks every holder concurrently. A holder that is not a holder of the family
-/// may simply be stale, so the next drain can resolve the current set again.
-async fn publish_record(
-    context: &DriverContext,
-    holders: &[NodeId],
-    request: MetadataTransportMessage,
-    deadline: std::time::Duration,
-) -> JobRecordEvent {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return JobRecordEvent::Unavailable("metadata transport unavailable".to_string());
-    };
-    let deadline = tokio::time::Instant::now() + deadline;
-    let replies = join_all(holders.iter().map(|holder| async {
-        let reply = timeout_at(
-            deadline,
-            metadata.request_forwarded_write(*holder, request.clone()),
-        )
-        .await;
-        (*holder, reply)
-    }))
-    .await;
-    let mut published = Vec::new();
-    let mut rejected = None;
-    for (holder, reply) in replies {
-        let reply = match reply {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(error)) => {
-                warn!(peer = %holder, error = %error, "Job record publish failed");
-                continue;
-            }
-            Err(_) => continue,
-        };
-        match reply {
-            MetadataTransportMessage::ForwardedJobRecord { result: Ok(()) } => {
-                published.push(holder);
-            }
-            MetadataTransportMessage::ForwardedJobRecord {
-                result: Err(JobRecordRejection::NotHolder),
-            }
-            | MetadataTransportMessage::ForwardedWriteUnavailable => {}
-            MetadataTransportMessage::ForwardedJobRecord {
-                result: Err(reason),
-            } => {
-                rejected.get_or_insert((holder, reason));
-            }
-            other => warn!(
-                peer = %holder,
-                reply = transport_message_kind(&other),
-                "Unexpected job record publish reply"
-            ),
-        }
-    }
-    match published.as_slice() {
-        [holder] => JobRecordEvent::Published { holder: *holder },
-        [] => rejected.map_or_else(
-            || JobRecordEvent::Unavailable("no job family holder accepted the record".to_string()),
-            |(holder, reason)| JobRecordEvent::Rejected { holder, reason },
-        ),
-        _ => JobRecordEvent::PublishedMany { holders: published },
-    }
-}
-
-async fn fetch_records(
-    context: &DriverContext,
-    holders: &[NodeId],
-    request: PageRequest,
-    deadline: std::time::Duration,
-) -> JobRecordEvent {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return JobRecordEvent::Unavailable("metadata transport unavailable".to_string());
-    };
-    let deadline = tokio::time::Instant::now() + deadline;
-    for holder in holders {
-        let message = MetadataTransportMessage::ForwardRecordPage {
-            placement: request.placement,
-            submission_id: request.submission_id,
-            request_digest: request.request_digest,
-            cursor: request.cursor.clone(),
-            limit: request.limit,
-        };
-        let reply =
-            match timeout_at(deadline, metadata.request_forwarded_write(*holder, message)).await {
-                Ok(Ok(reply)) => reply,
-                Ok(Err(error)) => {
-                    warn!(peer = %holder, error = %error, "Job record fetch failed");
-                    continue;
-                }
-                Err(_) => break,
-            };
-        match reply {
-            MetadataTransportMessage::ForwardedRecordPage {
-                result: Ok(JobPageReply { page, next }),
-            } => {
-                return JobRecordEvent::Fetched {
-                    holder: *holder,
-                    records: page,
-                    next_cursor: next,
-                };
-            }
-            MetadataTransportMessage::ForwardedRecordPage {
-                result: Err(reason),
-            } => {
-                warn!(peer = %holder, reason = ?reason, "Job record holder refused the fetch");
-            }
-            MetadataTransportMessage::ForwardedWriteUnavailable => continue,
-            other => warn!(
-                peer = %holder,
-                reply = transport_message_kind(&other),
-                "Unexpected job record fetch reply"
-            ),
-        }
-    }
-    JobRecordEvent::Unavailable("no job family holder answered".to_string())
-}
-
-/// Offers one bounded launch to its target. An unreachable or not-yet-admitting
-/// target is `Unavailable`: it may still have accepted the launch.
-pub async fn dispatch_offer(
-    context: &DriverContext,
-    effect: LaunchOfferEffect,
-) -> LaunchOfferEvent {
-    let target = effect.target.node_id;
-    // No transport dials the node it starts from, so a launch this witness
-    // planned onto itself is admitted in process instead.
-    if context
-        .net_handle
-        .as_ref()
-        .is_some_and(|net| net.node_id() == target)
-    {
-        return admit_locally(context, target, *effect.launch).await;
-    }
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return LaunchOfferEvent::Unavailable("metadata transport unavailable".to_string());
-    };
-    let message = MetadataTransportMessage::ForwardLaunchOffer {
-        launch: Box::new(effect.launch.as_ref().clone()),
-    };
-    let deadline = tokio::time::Instant::now() + effect.deadline;
-    match timeout_at(deadline, metadata.request_forwarded_write(target, message)).await {
-        Ok(Ok(MetadataTransportMessage::ForwardedLaunchOffer {
-            result: Ok(receipt),
-        })) => LaunchOfferEvent::Accepted { target, receipt },
-        Ok(Ok(MetadataTransportMessage::ForwardedLaunchOffer {
-            result: Err(reason),
-        })) => LaunchOfferEvent::Declined { target, reason },
-        Ok(Ok(other)) => LaunchOfferEvent::Unavailable(format!(
-            "target answered a launch offer with {}",
-            transport_message_kind(&other)
-        )),
-        Ok(Err(error)) => LaunchOfferEvent::Unavailable(error.to_string()),
-        Err(_) => LaunchOfferEvent::Unavailable("launch offer deadline elapsed".to_string()),
-    }
-}
-
-/// Admits a self-targeted launch here. The decision is the same one an inbound
-/// offer gets; only the round trip is skipped.
-async fn admit_locally(
-    context: &DriverContext,
-    target: NodeId,
-    launch: LaunchFrame,
-) -> LaunchOfferEvent {
-    let context = Arc::new(context.clone());
-    match crate::jobs::lifecycle::target::admit_launch(&context, launch).await {
-        Some(Ok(receipt)) => LaunchOfferEvent::Accepted {
-            target,
-            receipt: Box::new(receipt),
-        },
-        Some(Err(reason)) => LaunchOfferEvent::Declined { target, reason },
-        None => LaunchOfferEvent::Unavailable("local launch admission undecided".to_string()),
-    }
-}
 
 /// Serves one inbound record publish or page request from an authenticated peer.
 pub async fn serve_job_record(

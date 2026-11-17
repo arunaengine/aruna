@@ -5,23 +5,24 @@
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification_watch::{
     INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, WATCH_DIRTY_PREFIX, WatchEventKind, WatchEventMask,
     WatchInterestDigest, WatchInterestEntry, interest_dirty_key, interest_node_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, Key, KeySpace, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
+
+use crate::notifications::unexpected;
 
 /// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
 /// fires this long after the first dirty write, collapsing a run of watch CRUD
@@ -72,34 +73,20 @@ pub(crate) fn catchall_digest(node_id: NodeId) -> WatchInterestDigest {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum InterestError {
-    #[error(transparent)]
-    Storage(#[from] StorageError),
     #[error("{0}")]
     Encode(String),
-    #[error("unexpected event in the watch interest step: {0}")]
-    UnexpectedEvent(String),
-    #[error("the watch interest step did not finish")]
-    NotFinished,
-}
-
-fn unexpected(event: Event) -> InterestError {
-    match event {
-        Event::Storage(StorageEvent::Error { error }) => InterestError::Storage(error),
-        other => InterestError::UnexpectedEvent(format!("{other:?}")),
-    }
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 #[derive(Debug, Default, PartialEq)]
 enum InterestState {
     #[default]
-    Init,
     Mark,
     Scan,
     Read,
     Write,
     Schedule(bool),
-    Done(bool),
-    Failed(InterestError),
 }
 
 /// The step on this node's watch interest a caller asks for.
@@ -145,247 +132,159 @@ impl InterestOperation {
     fn new(step: InterestStep) -> Self {
         Self {
             step,
-            state: InterestState::Init,
+            state: InterestState::Mark,
         }
     }
 
-    fn schedule(&mut self, changed: bool) -> Effects {
+    fn schedule(&mut self, changed: bool) -> Next<bool> {
         self.state = InterestState::Schedule(changed);
-        smallvec![schedule_publish_effect()]
-    }
-
-    fn done(&mut self, changed: bool) -> Effects {
-        self.state = InterestState::Done(changed);
-        smallvec![]
+        Next::Call(IoCall::Effect(schedule_publish_effect()))
     }
 }
 
-impl EffectOperation for InterestOperation {
+impl Operation for InterestOperation {
     type Output = bool;
     type Error = InterestError;
 
-    fn start(&mut self) -> Effects {
-        match self.step {
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let call = match self.step {
             InterestStep::Mark(realm_id) => {
-                let (key_space, key, value) = dirty_marker_write(realm_id);
                 self.state = InterestState::Mark;
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space,
-                    key,
-                    value,
-                    txn_id: None,
-                })]
+                IoCall::Write(vec![dirty_marker_write(realm_id)])
             }
-            InterestStep::Publish => self.schedule(true),
+            InterestStep::Publish => return Ok(self.schedule(true)),
             InterestStep::Restore => {
                 self.state = InterestState::Scan;
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-                    prefix: Some(Key::from(WATCH_DIRTY_PREFIX.to_vec())),
-                    start: None,
+                IoCall::Page {
+                    space: WATCH_INTEREST_KEYSPACE.to_string(),
+                    prefix: Key::from(WATCH_DIRTY_PREFIX.to_vec()),
+                    after: None,
                     limit: 1,
-                    txn_id: None,
-                })]
+                }
             }
             InterestStep::Ensure(realm_id, node_id) => {
                 self.state = InterestState::Read;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-                    key: Key::from(interest_node_key(realm_id, node_id)),
-                    txn_id: None,
-                })]
+                let key = Key::from(interest_node_key(realm_id, node_id));
+                IoCall::Read(vec![(WATCH_INTEREST_KEYSPACE.to_string(), key)])
             }
-        }
+        };
+        Ok(Next::Call(call))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::take(&mut self.state), event) {
-            (InterestState::Mark, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.schedule(true)
-            }
-            (InterestState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                match values.is_empty() {
-                    true => self.done(false),
-                    false => self.schedule(true),
-                }
-            }
-            (InterestState::Read, Event::Storage(StorageEvent::ReadResult { key, value })) => {
-                let InterestStep::Ensure(_, node_id) = self.step else {
-                    return self.done(false);
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        match (std::mem::take(&mut self.state), result) {
+            (InterestState::Mark, IoResult::Done) => Ok(self.schedule(true)),
+            (InterestState::Scan, IoResult::Page { rows, .. }) => match rows.is_empty() {
+                true => Ok(Next::Done(false)),
+                false => Ok(self.schedule(true)),
+            },
+            (InterestState::Read, IoResult::Values(values)) => {
+                let InterestStep::Ensure(realm_id, node_id) = self.step else {
+                    return Ok(Next::Done(false));
                 };
-                if value.is_some() {
-                    return self.done(false);
+                if values.into_iter().flatten().next().is_some() {
+                    return Ok(Next::Done(false));
                 }
                 let digest = WatchInterestDigest {
                     node_id,
                     entries: Vec::new(),
                 };
-                match digest.to_bytes() {
-                    Ok(bytes) => {
-                        self.state = InterestState::Write;
-                        smallvec![Effect::Storage(StorageEffect::Write {
-                            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-                            key,
-                            value: Value::from(bytes),
-                            txn_id: None,
-                        })]
-                    }
-                    Err(error) => {
-                        self.state =
-                            InterestState::Failed(InterestError::Encode(error.to_string()));
-                        smallvec![]
-                    }
-                }
+                let bytes = digest
+                    .to_bytes()
+                    .map_err(|error| InterestError::Encode(error.to_string()))?;
+                self.state = InterestState::Write;
+                let key = Key::from(interest_node_key(realm_id, node_id));
+                let row = (WATCH_INTEREST_KEYSPACE.to_string(), key, Value::from(bytes));
+                Ok(Next::Call(IoCall::Write(vec![row])))
             }
-            (InterestState::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.done(true)
-            }
-            (InterestState::Schedule(changed), Event::Task(task)) => {
+            (InterestState::Write, IoResult::Done) => Ok(Next::Done(true)),
+            (InterestState::Schedule(changed), IoResult::Event(Event::Task(task))) => {
                 if let TaskEvent::Error { message, .. } = task {
                     warn!(%message, "Failed to schedule watch interest publish");
                 }
-                self.done(changed)
+                Ok(Next::Done(changed))
             }
-            (_, event) => {
-                self.state = InterestState::Failed(unexpected(event));
-                smallvec![]
-            }
+            (_, other) => Err(unexpected("a watch interest result", &other).into()),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            InterestState::Done(_) | InterestState::Failed(_)
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            InterestState::Done(changed) => Ok(changed),
-            InterestState::Failed(error) => Err(error),
-            _ => Err(InterestError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
 
     const REALM: RealmId = RealmId([3; 32]);
 
-    fn scheduled() -> Event {
-        Event::Task(TaskEvent::TimerScheduled {
+    fn scheduled() -> IoResult {
+        IoResult::Event(Event::Task(TaskEvent::TimerScheduled {
             key: TaskKey::PublishWatchInterest,
             after: WATCH_PUBLISH_DEBOUNCE,
-        })
+        }))
     }
 
     #[test]
     fn ensure_writes_once() {
         let key = Key::from(interest_node_key(REALM, node_id(1)));
+        let space = WATCH_INTEREST_KEYSPACE.to_string();
         let mut ensure = InterestOperation::ensure(REALM, node_id(1));
+        assert_eq!(
+            ensure.first(),
+            Ok(Next::Call(IoCall::Read(vec![(space.clone(), key.clone())])))
+        );
         let digest = WatchInterestDigest {
             node_id: node_id(1),
             entries: Vec::new(),
         };
-        check_trace(
-            &mut ensure,
-            &[Effect::Storage(StorageEffect::Read {
-                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-                key: key.clone(),
-                txn_id: None,
-            })],
-            vec![
-                (
-                    Event::Storage(StorageEvent::ReadResult {
-                        key: key.clone(),
-                        value: None,
-                    }),
-                    vec![Effect::Storage(StorageEffect::Write {
-                        key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-                        key: key.clone(),
-                        value: Value::from(digest.to_bytes().unwrap()),
-                        txn_id: None,
-                    })],
-                ),
-                (Event::Storage(StorageEvent::WriteResult { key }), vec![]),
-            ],
+        let row = (space, key, Value::from(digest.to_bytes().unwrap()));
+        assert_eq!(
+            ensure.next(IoResult::Values(vec![None])),
+            Ok(Next::Call(IoCall::Write(vec![row])))
         );
-        assert_eq!(ensure.finalize(), Ok(true));
+        assert_eq!(ensure.next(IoResult::Done), Ok(Next::Done(true)));
     }
 
     #[test]
     fn existing_digest_kept() {
         let mut ensure = InterestOperation::ensure(REALM, node_id(1));
-        ensure.start();
-        let kept = ensure.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(vec![1]),
-            value: Some(Value::from(vec![1])),
-        }));
-        assert!(kept.is_empty());
-        assert_eq!(ensure.finalize(), Ok(false));
+        ensure.first().unwrap();
+        let kept = ensure.next(IoResult::Values(vec![Some(Value::from(vec![1]))]));
+        assert_eq!(kept, Ok(Next::Done(false)));
     }
 
     #[test]
     fn mark_then_publish() {
         let mut mark = InterestOperation::mark(REALM);
-        assert!(matches!(
-            mark.start().as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
-        ));
-        let publish = mark.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(vec![1]),
-        }));
-        assert_eq!(publish.as_slice(), [schedule_publish_effect()]);
-        mark.step(scheduled());
-        assert_eq!(mark.finalize(), Ok(true));
+        assert!(matches!(mark.first(), Ok(Next::Call(IoCall::Write(rows))) if rows.len() == 1));
+        assert_eq!(
+            mark.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Effect(schedule_publish_effect())))
+        );
+        assert_eq!(mark.next(scheduled()), Ok(Next::Done(true)));
     }
 
     #[test]
     fn restore_needs_marker() {
         let mut restore = InterestOperation::restore();
-        restore.start();
-        restore.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        assert_eq!(restore.finalize(), Ok(false));
+        restore.first().unwrap();
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(restore.next(empty), Ok(Next::Done(false)));
         let mut failed = InterestOperation::publish();
-        failed.start();
-        failed.step(Event::Task(TaskEvent::Error {
+        failed.first().unwrap();
+        let error = Event::Task(TaskEvent::Error {
             key: None,
             message: "closed".to_string(),
-        }));
-        assert_eq!(failed.finalize(), Ok(true));
+        });
+        assert_eq!(failed.next(IoResult::Event(error)), Ok(Next::Done(true)));
     }
 
     #[test]
-    fn unexpected_events_fail() {
-        let make = || {
-            let mut mark = InterestOperation::mark(REALM);
-            mark.start();
-            mark
-        };
-        let expected =
-            |event: &Event| matches!(event, Event::Storage(StorageEvent::WriteResult { .. }));
-        assert!(!rejects_events(make, sample_events, expected).is_empty());
-    }
-
-    #[test]
-    fn abort_and_finalize() {
+    fn other_results_fail() {
         let mut mark = InterestOperation::mark(REALM);
-        mark.start();
-        check_abort(&mut mark, &[]);
-        rejects_finalize(mark);
+        mark.first().unwrap();
+        assert!(matches!(mark.next(scheduled()), Err(InterestError::Io(_))));
     }
 }

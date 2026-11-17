@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::fanout::run_metadata_fanout;
+use super::preflight::discover_realm_nodes;
 use super::search_types::{
     MetadataSearchExecution, MetadataSearchRequest, ObjectCursor, ObjectCursorPartition,
     ObjectCursorPayload, ObjectExecution, ObjectPartitionCoverage, ObjectPartitionState,
@@ -9,14 +11,16 @@ use super::search_types::{
 };
 use super::{
     ApiQueryMode, AuthContext, BlobHeadKey, CursorEnvelopeError, DISTRIBUTED_QUERY_DEADLINE,
-    DriverContext, HashMap, HashSet, MetadataApiError, MetadataFanoutOperation,
-    MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataReadError, NodeId,
-    ObjectKeyMatch, QUERY_MAX_NODES, RealmId, RealmNodeDiscovery, SearchCursor, SearchCursorError,
-    SearchNodePage, SearchObjectsInput, SignedCursor, SystemTime, deduplicate_fanout_nodes,
-    discover_realm_nodes, fanout_bearer, load_realm_config, map_read_error, metadata_node_call,
-    object_search_fingerprint, query_fingerprint, record_object_result, run_metadata_fanout,
-    search_local_objects, select_fanout_nodes,
+    HashMap, HashSet, MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope,
+    MetadataFanoutStats, MetadataNodeCall, MetadataReadError, NodeId, ObjectKeyMatch,
+    QUERY_MAX_NODES, RealmId, RealmNodeDiscovery, SearchCursor, SearchCursorError, SearchNodePage,
+    SearchObjectsInput, SignedCursor, SystemTime, deduplicate_fanout_nodes, fanout_bearer,
+    map_read_error, metadata_node_call, object_search_fingerprint, query_fingerprint,
+    record_object_result, select_fanout_nodes,
 };
+use crate::driver::DriverContext;
+use crate::realm::load_config::load_realm_config;
+use crate::s3::object::search_scan::search_local_objects;
 
 use super::distributed::run_search_distributed;
 use crate::distribution::feed_walks::IndexProgress;

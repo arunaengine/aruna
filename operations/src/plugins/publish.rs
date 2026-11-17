@@ -3,44 +3,42 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{
-    Event, GroupEvent, GroupResult, NetEvent, StorageEvent, SubOperationEvent,
-};
+use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::placement::target_placement_ref;
 use aruna_core::plugins::{ArtifactStore, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
-use smallvec::smallvec;
-use std::collections::BTreeSet;
 use thiserror::Error;
 use tracing::{info, warn};
 
 use super::artifacts::{ArtifactError, managers};
 use super::copies::{chunk_count, chunk_of, store_local};
 use super::copies_needed;
+use super::install::wake_drain;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{
-    new_identified_record, outbox_write_entry, schedule_drain_effect,
-};
-use aruna_core::placement::target_placement_ref;
+use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
 
 #[derive(Debug, Error)]
 pub enum PublishError {
@@ -127,6 +125,7 @@ pub async fn publish_plugin(
         copies,
     });
     let published = drive(write, ctx).await?;
+    wake_drain(ctx).await;
     info!(name = %published.name, version = %published.version, digest = %published.digest, stored, "Published a plugin version");
     Ok(published)
 }
@@ -155,7 +154,6 @@ pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Vec<u8
         artifact,
         members: Vec::new(),
         confirmed: BTreeSet::new(),
-        state: CopyState::Created,
     }
 }
 
@@ -167,22 +165,14 @@ pub struct CopyArtifact {
     /// The node and chunk of each window member, by member index.
     members: Vec<(NodeId, u32)>,
     confirmed: BTreeSet<NodeId>,
-    state: CopyState,
-}
-
-#[derive(Debug, PartialEq)]
-enum CopyState {
-    Created,
-    Copying,
-    Finished(Result<(), CopyError>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CopyError {
-    #[error("unexpected event while copying an artifact: {got}")]
+    #[error("unexpected answer while copying an artifact: {got}")]
     Unexpected { got: &'static str },
-    #[error("the artifact copy did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Call(#[from] IoError),
 }
 
 impl CopyArtifact {
@@ -194,91 +184,70 @@ impl CopyArtifact {
         Effect::Net(NetEffect::ArtifactStore(Box::new(store)))
     }
 
-    fn fail(&mut self, got: &'static str) -> Effects {
-        self.state = CopyState::Finished(Err(CopyError::Unexpected { got }));
-        smallvec![]
-    }
-
-    /// The next chunk for the node of window member `index`, or its outcome.
-    fn member(&mut self, index: usize, result: GroupResult) -> Effects {
+    /// The next chunk for the node of window member `index`, or nothing more for that node.
+    fn member(
+        &mut self,
+        index: usize,
+        result: GroupResult,
+    ) -> Result<Next<BTreeSet<NodeId>>, CopyError> {
         let Some(&(node_id, chunk)) = self.members.get(index) else {
-            return self.fail("GroupEvent::Member");
+            let got = "GroupEvent::Member";
+            return Err(CopyError::Unexpected { got });
         };
         let stored = match result {
             GroupResult::Done(event) => match *event {
                 Event::Net(NetEvent::ArtifactStored(stored)) => stored,
-                other => return self.fail(other.label()),
+                other => return Err(CopyError::Unexpected { got: other.label() }),
             },
             GroupResult::Unfinished | GroupResult::Refused => Err("not run".to_string()),
         };
         match stored {
             Ok(_) if chunk + 1 < chunk_count(self.artifact.len() as u64) => {
-                smallvec![self.send(node_id, chunk + 1)]
+                let next = self.send(node_id, chunk + 1);
+                return Ok(Next::Call(IoCall::Effect(Box::new(next))));
             }
-            Ok(complete) => {
-                if complete {
-                    self.confirmed.insert(node_id);
-                }
-                smallvec![]
+            Ok(true) => {
+                self.confirmed.insert(node_id);
             }
+            Ok(false) => {}
             Err(error) => {
                 warn!(%node_id, %error, "A management node did not store a plugin artifact");
-                smallvec![]
             }
         }
+        Ok(Next::Wait)
     }
 }
 
-impl EffectOperation for CopyArtifact {
+/// Chunks already sent when the copy stops stay as an unfinished copy, which the copy sweep
+/// removes.
+impl Operation for CopyArtifact {
     type Output = BTreeSet<NodeId>;
     type Error = CopyError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<Self::Output>, CopyError> {
         let peers = std::mem::take(&mut self.peers);
         if peers.is_empty() || self.artifact.is_empty() {
-            self.state = CopyState::Finished(Ok(()));
-            return smallvec![];
+            return Ok(Next::Done(BTreeSet::new()));
         }
         let limit = peers.len();
         let members = peers.into_iter().map(|node| self.send(node, 0)).collect();
-        self.state = CopyState::Copying;
+        let form = GroupForm::Window;
         let group = EffectGroup {
             members,
             limit,
-            form: GroupForm::Window,
+            form,
         };
-        smallvec![Effect::Group(group)]
+        Ok(Next::Call(IoCall::Group(group)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state != CopyState::Copying {
-            return self.fail(event.label());
-        }
-        match event {
-            Event::Group(GroupEvent::Member { index, result }) => self.member(index, result),
-            Event::Group(GroupEvent::Closed) => {
-                self.state = CopyState::Finished(Ok(()));
-                smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CopyError> {
+        match result {
+            IoResult::Group(GroupEvent::Member { index, result }) => self.member(index, result),
+            IoResult::Group(GroupEvent::Closed) => {
+                Ok(Next::Done(std::mem::take(&mut self.confirmed)))
             }
-            other => self.fail(other.label()),
+            other => Err(CopyError::Unexpected { got: other.label() }),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, CopyState::Finished(_))
-    }
-
-    fn finalize(self) -> Result<BTreeSet<NodeId>, CopyError> {
-        match self.state {
-            CopyState::Finished(Ok(())) => Ok(self.confirmed),
-            CopyState::Finished(Err(error)) => Err(error),
-            _ => Err(CopyError::NotFinished),
-        }
-    }
-
-    /// Chunks already sent stay as an unfinished copy, which the copy sweep removes.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -292,28 +261,22 @@ pub struct PublishEntryConfig {
     pub copies: BTreeSet<aruna_core::NodeId>,
 }
 
-/// Writes one published plugin version into the realm config. An identical entry is kept;
-/// another digest for the same version is refused.
+/// Writes one published plugin version into the realm config in one transaction, after the
+/// caller's realm admin check. An identical entry is kept; another digest for the same version
+/// is refused. [`publish_plugin`] wakes the outbox drain after the commit.
 #[derive(Debug, PartialEq)]
 pub struct PublishEntryOperation {
     config: PublishEntryConfig,
-    txn_id: Option<TxnId>,
-    state: EntryState,
-    output: Option<Result<PublishedPlugin, EntryError>>,
+    phase: EntryPhase,
+    output: Option<PublishedPlugin>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum EntryState {
-    Init,
+#[derive(Debug, PartialEq)]
+enum EntryPhase {
     Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteState { stale: Vec<(KeySpace, Key)> },
+    Read,
+    Write { stale: Vec<(KeySpace, Key)> },
     DeleteConflicts,
-    CommitTransaction,
-    ScheduleSyncDrain,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -336,24 +299,26 @@ pub enum EntryError {
         "{stored} of {needed} needed current management nodes stored the artifact; nothing was published"
     )]
     TooFewCopies { stored: usize, needed: usize },
-    #[error("missing active transaction")]
-    MissingTransaction,
-    #[error("operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
+    #[error(transparent)]
+    Call(IoError),
+}
+
+/// A lost transaction stays a storage conflict, so callers can tell it from other failures.
+impl From<IoError> for EntryError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Call(other),
+        }
+    }
 }
 
 impl PublishEntryOperation {
     pub fn new(config: PublishEntryConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            state: EntryState::Init,
+            phase: EntryPhase::Auth,
             output: None,
         }
     }
@@ -370,31 +335,43 @@ impl PublishEntryOperation {
         }
     }
 
-    fn emit_read(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = EntryState::ReadCurrent;
+    fn authorized(&mut self, result: IoResult) -> Result<IoCall, EntryError> {
+        let event = match result {
+            IoResult::Event(event) => *event,
+            other => return Err(unexpected(other.label())),
+        };
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
+            return Err(unexpected(event.label()));
+        };
+        match allowed {
+            Ok(true) => {}
+            Ok(false) => return Err(EntryError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => return Err(error.into()),
+            Err(error) => {
+                warn!(%error, "Plugin publish authorization check failed");
+                return Err(EntryError::Unauthorized);
+            }
+        }
+        self.phase = EntryPhase::Read;
         let document = self.document();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key()
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&self.admin_target())
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        Ok(IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&self.admin_target()),
+            ),
+        ]))
     }
 
-    fn emit_write(
+    /// The write of the new entry, or `None` when an earlier attempt already published it.
+    fn write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, EntryError> {
-        let txn_id = self.txn_id.ok_or(EntryError::MissingTransaction)?;
+    ) -> Result<Option<IoCall>, EntryError> {
         let document_value = document_value.ok_or(EntryError::ConfigMissing)?;
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         if !is_management(&document, self.config.actor.node_id) {
@@ -418,12 +395,8 @@ impl PublishEntryOperation {
             .find(|entry| entry.name == plugin.name && entry.version == plugin.version);
         match existing {
             Some(entry) if entry.digest == plugin.digest => {
-                // Already published by an earlier attempt: nothing to write.
-                self.output = Some(Ok(entry));
-                self.state = EntryState::CommitTransaction;
-                return Ok(smallvec![Effect::Storage(
-                    StorageEffect::CommitTransaction { txn_id }
-                )]);
+                self.output = Some(entry);
+                return Ok(None);
             }
             Some(_) => return Err(EntryError::VersionTaken(plugin.version)),
             None => {}
@@ -462,171 +435,74 @@ impl PublishEntryOperation {
             outbox_write_entry(&record).map_err(ConversionError::from)?,
         ];
         writes.extend(conflict_write_entries(&reducer_state)?);
-        self.output = Some(Ok(plugin));
-        self.state = EntryState::WriteState {
+        self.output = Some(plugin);
+        self.phase = EntryPhase::Write {
             stale: stale_conflict_deletes(previous.as_ref(), Some(&reducer_state)),
         };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        Ok(Some(IoCall::Write(writes)))
     }
 
-    fn emit_commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(EntryError::MissingTransaction);
-        };
-        self.state = EntryState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: EntryError) -> Effects {
-        let cleanup = self.abort();
-        self.state = EntryState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(EntryError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn finish(&mut self) -> Result<Next<PublishedPlugin>, EntryError> {
+        let output = self.output.take();
+        output
+            .map(Next::Done)
+            .ok_or(EntryError::Call(IoError::Unfinished))
     }
 }
 
-impl EffectOperation for PublishEntryOperation {
+impl Operation for PublishEntryOperation {
     type Output = PublishedPlugin;
     type Error = EntryError;
 
-    fn start(&mut self) -> Effects {
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, EntryError> {
         if self.config.auth_context.realm_id != self.config.actor.realm_id {
-            return self.fail(EntryError::Unauthorized);
+            return Err(EntryError::Unauthorized);
         }
-        self.state = EntryState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: policy_admin_path(self.config.actor.realm_id),
-                required_permission: Permission::WRITE,
-            }),
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path: policy_admin_path(self.config.actor.realm_id),
+            required_permission: Permission::WRITE,
+        });
+        Ok(Next::Call(IoCall::Child(boxed_suboperation(
+            check,
             |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
-            EntryState::Auth => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => {
-                            self.state = EntryState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
-                        Ok(false) => self.fail(EntryError::Unauthorized),
-                        Err(AuthorizationError::StorageError(error)) => self.fail(error.into()),
-                        Err(error) => {
-                            warn!(%error, "Plugin publish authorization check failed");
-                            self.fail(EntryError::Unauthorized)
-                        }
-                    }
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, EntryError> {
+        match std::mem::replace(&mut self.phase, EntryPhase::DeleteConflicts) {
+            EntryPhase::Auth => Ok(Next::Call(self.authorized(result)?)),
+            EntryPhase::Read => {
+                let [document, state] = values::<2>(result)?;
+                match self.write(document, state)? {
+                    Some(write) => Ok(Next::Call(write)),
+                    None => self.finish(),
                 }
-                other => self.unexpected("authorization result", other.label()),
-            },
-            EntryState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read(txn_id)
+            }
+            EntryPhase::Write { stale } => {
+                done(result)?;
+                match stale.is_empty() {
+                    true => self.finish(),
+                    false => Ok(Next::Call(IoCall::Delete(stale))),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start result", other.label()),
-            },
-            EntryState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document), (_, state)] = values.as_slice() else {
-                        return self.unexpected(
-                            "realm config and reducer state",
-                            "StorageEvent::BatchReadResult",
-                        );
-                    };
-                    match self.emit_write(document.clone(), state.clone()) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch read result", other.label()),
-            },
-            EntryState::WriteState { stale } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) if stale.is_empty() => {
-                    self.emit_commit()
-                }
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(EntryError::MissingTransaction);
-                    };
-                    self.state = EntryState::DeleteConflicts;
-                    smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: stale,
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch write result", other.label()),
-            },
-            EntryState::DeleteConflicts => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch delete result", other.label()),
-            },
-            EntryState::CommitTransaction => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = EntryState::ScheduleSyncDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected("transaction commit result", other.label()),
-            },
-            EntryState::ScheduleSyncDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = EntryState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule the outbox drain; the durable outbox stays retryable");
-                    self.state = EntryState::Finish;
-                    smallvec![]
-                }
-                other => self.unexpected("outbox drain timer schedule", other.label()),
-            },
-            EntryState::Finish | EntryState::Error | EntryState::Init => smallvec![],
+            }
+            EntryPhase::DeleteConflicts => {
+                done(result)?;
+                self.finish()
+            }
         }
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, EntryState::Finish | EntryState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !self.is_complete() {
-            return Err(EntryError::NotFinished);
-        }
-        self.output.unwrap_or(Err(EntryError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
+fn unexpected(got: &'static str) -> EntryError {
+    EntryError::Call(IoError::Unexpected {
+        expected: "an authorization result",
+        got,
+    })
 }
 
 #[cfg(test)]

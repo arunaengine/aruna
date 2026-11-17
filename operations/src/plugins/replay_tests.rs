@@ -9,6 +9,7 @@ use crate::plugins::journal::JOURNAL_PAGE;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::rows::decode;
+use crate::plugins::rows::values_result;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{
@@ -293,11 +294,11 @@ async fn pruned_journal() {
 #[test]
 fn replay_rows_read() {
     let mut plan = ReplayRows(Ulid::from_parts(2, 2));
-    let Turn::Ask(Ask::Read(keys)) = plan.first().unwrap() else {
+    let Next::Call(IoCall::Read(keys)) = plan.first().unwrap() else {
         panic!("the replay rows are read together");
     };
     assert_eq!(keys.len(), 2);
-    let answer = plan.next(Answer::Values(vec![None, None])).unwrap();
-    assert_eq!(answer, Turn::Finish((None, None)));
-    assert!(plan.next(Answer::Values(vec![None])).is_err());
+    let answer = plan.next(values_result(vec![None, None])).unwrap();
+    assert_eq!(answer, Next::Done((None, None)));
+    assert!(plan.next(values_result(vec![None])).is_err());
 }

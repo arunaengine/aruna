@@ -4,17 +4,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::handle_allocation::HandleAllocationCursor;
 use aruna_core::structs::placement::record::HandleRange;
 use aruna_core::structured_id::PlacementHandle;
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -57,13 +56,14 @@ pub enum HandleAllocationError {
     StrategyNotFound(Ulid),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandleAllocationState {
-    Init,
-    ReadCursor,
-    WriteCursor,
-    Finish,
-    Error,
+impl From<IoError> for HandleAllocationError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::UnexpectedStorageEvent(other.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -72,8 +72,8 @@ pub(crate) struct AllocateHandleOperation {
     node_id: NodeId,
     ranges: Vec<HandleRange>,
     allocated_at_ms: u64,
-    state: HandleAllocationState,
-    output: Option<Result<AllocatedHandle, HandleAllocationError>>,
+    /// The handle drawn, held until its cursor is stored.
+    allocated: Option<AllocatedHandle>,
 }
 
 impl AllocateHandleOperation {
@@ -88,103 +88,86 @@ impl AllocateHandleOperation {
             node_id,
             ranges,
             allocated_at_ms,
-            state: HandleAllocationState::Init,
-            output: None,
+            allocated: None,
         }
     }
 
-    fn fail(&mut self, error: HandleAllocationError) -> Effects {
-        self.state = HandleAllocationState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, event: Event) -> Effects {
-        self.fail(HandleAllocationError::UnexpectedStorageEvent(
-            event.label().to_string(),
-        ))
+    /// Draws the next handle from the stored cursor and writes the advanced cursor.
+    fn allocate(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<AllocatedHandle>, HandleAllocationError> {
+        let [value] = values::<1>(result)?;
+        let mut cursor = match value {
+            Some(bytes) => postcard::from_bytes(&bytes).map_err(ConversionError::from)?,
+            None => HandleAllocationCursor::new(),
+        };
+        let Some((handle, allocator_range_id)) = cursor.allocate(&self.ranges) else {
+            let node = self.node_id;
+            return Err(HandleAllocationError::PlacementHandleExhausted { node });
+        };
+        let value = postcard::to_allocvec(&cursor).map_err(ConversionError::from)?;
+        self.allocated = Some(AllocatedHandle {
+            handle,
+            allocator_range_id,
+            allocated_by: self.node_id,
+            allocated_at_ms: self.allocated_at_ms,
+        });
+        let key = allocation_cursor_key(&self.realm_id);
+        let row = (NODE_STATE_KEYSPACE.to_string(), key, value.into());
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
-impl EffectOperation for AllocateHandleOperation {
+impl Operation for AllocateHandleOperation {
     type Output = AllocatedHandle;
     type Error = HandleAllocationError;
 
-    fn start(&mut self) -> Effects {
-        self.state = HandleAllocationState::ReadCursor;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: allocation_cursor_key(&self.realm_id),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<AllocatedHandle>, HandleAllocationError> {
+        let key = allocation_cursor_key(&self.realm_id);
+        Ok(Next::Call(read_row(NODE_STATE_KEYSPACE, key)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            HandleAllocationState::ReadCursor => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let mut cursor = match value {
-                        Some(bytes) => match postcard::from_bytes(&bytes) {
-                            Ok(cursor) => cursor,
-                            Err(error) => return self.fail(ConversionError::from(error).into()),
-                        },
-                        None => HandleAllocationCursor::new(),
-                    };
-                    let Some((handle, allocator_range_id)) = cursor.allocate(&self.ranges) else {
-                        return self.fail(HandleAllocationError::PlacementHandleExhausted {
-                            node: self.node_id,
-                        });
-                    };
-                    let value = match postcard::to_allocvec(&cursor) {
-                        Ok(value) => value,
-                        Err(error) => return self.fail(ConversionError::from(error).into()),
-                    };
-                    self.output = Some(Ok(AllocatedHandle {
-                        handle,
-                        allocator_range_id,
-                        allocated_by: self.node_id,
-                        allocated_at_ms: self.allocated_at_ms,
-                    }));
-                    self.state = HandleAllocationState::WriteCursor;
-                    smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: NODE_STATE_KEYSPACE.to_string(),
-                        key: allocation_cursor_key(&self.realm_id),
-                        value: value.into(),
-                        txn_id: None,
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected(other),
-            },
-            HandleAllocationState::WriteCursor => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    self.state = HandleAllocationState::Finish;
-                    smallvec![]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected(other),
-            },
-            HandleAllocationState::Init => self.unexpected(event),
-            HandleAllocationState::Finish | HandleAllocationState::Error => self.unexpected(event),
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<AllocatedHandle>, HandleAllocationError> {
+        let Some(allocated) = self.allocated else {
+            return self.allocate(result);
+        };
+        done(result)?;
+        Ok(Next::Done(allocated))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operation(end: u32) -> AllocateHandleOperation {
+        let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let range = HandleRange {
+            range_id: Ulid::from_bytes([4; 16]),
+            owner: node_id,
+            start: 3,
+            end,
+        };
+        AllocateHandleOperation::new(RealmId::from_bytes([1; 32]), node_id, vec![range], 9)
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            HandleAllocationState::Finish | HandleAllocationState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or_else(|| {
-            Err(HandleAllocationError::UnexpectedStorageEvent(
-                "handle allocation finalized before completion".to_string(),
-            ))
-        })
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    #[test]
+    fn stores_cursor_first() {
+        // The handle is returned only after the advanced cursor is written.
+        let mut allocate = operation(6);
+        allocate.first().unwrap();
+        let write = allocate.next(IoResult::Values(vec![None]));
+        assert!(matches!(write, Ok(Next::Call(IoCall::Write(_)))));
+        let Ok(Next::Done(allocated)) = allocate.next(IoResult::Done) else {
+            panic!("expected the handle");
+        };
+        assert_eq!(allocated.handle, PlacementHandle::new(4).unwrap());
+        let mut empty = operation(4);
+        empty.first().unwrap();
+        assert!(matches!(
+            empty.next(IoResult::Values(vec![None])),
+            Err(HandleAllocationError::PlacementHandleExhausted { .. })
+        ));
     }
 }
