@@ -54,7 +54,7 @@ use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
 use crate::blob::holders::RefreshHoldersOperation;
-use crate::blob::reclaim::{
+use crate::blob::reclaim_sweep::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
 };
 use crate::device::drain::{

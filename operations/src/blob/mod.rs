@@ -14,6 +14,7 @@ pub mod permission_paths;
 pub(crate) mod promote;
 pub mod purge;
 pub mod reclaim;
+pub mod reclaim_sweep;
 pub mod records;
 pub(crate) mod release;
 pub(crate) mod trail;
