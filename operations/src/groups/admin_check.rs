@@ -2,13 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::Effect;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 
 use crate::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation, authorization_event,
@@ -22,22 +21,13 @@ pub fn realm_groups_path(auth: &AuthContext) -> String {
     format!("/{}/admin/groups", auth.realm_id)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AdminCheckState {
-    Init,
-    GroupAdmin,
-    RealmAdmin,
-    Finish,
-}
-
 /// Group admins pass through the service account check, so service accounts and federated
 /// callers never administer a group; everyone else needs WRITE on the realm groups path.
 #[derive(Debug, PartialEq)]
 pub struct AdminCheckOperation {
     auth_context: AuthContext,
     group_id: GroupId,
-    state: AdminCheckState,
-    output: Option<Result<bool, AuthorizationError>>,
+    realm_asked: bool,
 }
 
 impl AdminCheckOperation {
@@ -45,76 +35,119 @@ impl AdminCheckOperation {
         Self {
             auth_context,
             group_id,
-            state: AdminCheckState::Init,
-            output: None,
+            realm_asked: false,
         }
-    }
-
-    fn finish(&mut self, result: Result<bool, AuthorizationError>) -> Effects {
-        self.state = AdminCheckState::Finish;
-        self.output = Some(result);
-        smallvec![]
     }
 }
 
-impl EffectOperation for AdminCheckOperation {
+impl Operation for AdminCheckOperation {
     type Output = bool;
     type Error = AuthorizationError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<bool>, AuthorizationError> {
         if self.auth_context.user_id.realm_id != self.auth_context.realm_id {
-            return self.finish(Ok(false));
+            return Ok(Next::Done(false));
         }
-        self.state = AdminCheckState::GroupAdmin;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            ServiceCheckOperation::new(ServiceCheckConfig {
-                auth_context: self.auth_context.clone(),
-                group_id: self.group_id,
-                target: None,
-            }),
+        let check = ServiceCheckOperation::new(ServiceCheckConfig {
+            auth_context: self.auth_context.clone(),
+            group_id: self.group_id,
+            target: None,
+        });
+        Ok(Next::Call(IoCall::Child(boxed_suboperation(
+            check,
             |result| authorization_event(ServiceCheckError::allowed(result)),
-        ))]
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            let error = AuthorizationError::UnexpectedEvent {
-                state: format!("{:?}", self.state),
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, AuthorizationError> {
+        let IoResult::Event(Event::SubOperation(SubOperationEvent::AuthorizationResult {
+            allowed,
+        })) = result
+        else {
+            return Err(AuthorizationError::UnexpectedEvent {
+                state: "AdminCheck".to_string(),
                 expected: "authorization result",
-                got: event.label().to_string(),
-            };
-            return self.finish(Err(error));
+                got: "another result".to_string(),
+            });
         };
-        match (&self.state, allowed) {
-            (AdminCheckState::GroupAdmin, Ok(false)) => {
-                self.state = AdminCheckState::RealmAdmin;
-                smallvec![Effect::SubOperation(boxed_suboperation(
-                    CheckPermissionsOperation::new(CheckPermissionsConfig {
-                        auth_context: self.auth_context.clone(),
-                        path: realm_groups_path(&self.auth_context),
-                        required_permission: Permission::WRITE,
-                    }),
-                    authorization_event,
-                ))]
-            }
-            (AdminCheckState::GroupAdmin | AdminCheckState::RealmAdmin, allowed) => {
-                self.finish(allowed)
-            }
-            (AdminCheckState::Init | AdminCheckState::Finish, _) => {
-                self.finish(Err(AuthorizationError::NotFinished))
-            }
+        if allowed == Ok(false) && !self.realm_asked {
+            self.realm_asked = true;
+            let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: self.auth_context.clone(),
+                path: realm_groups_path(&self.auth_context),
+                required_permission: Permission::WRITE,
+            });
+            let child = boxed_suboperation(check, authorization_event);
+            return Ok(Next::Call(IoCall::Child(child)));
+        }
+        allowed.map(Next::Done)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    fn auth(user_realm: u8) -> AuthContext {
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        AuthContext {
+            user_id: UserId::local(
+                Ulid::from_bytes([4u8; 16]),
+                RealmId::from_bytes([user_realm; 32]),
+            ),
+            realm_id,
+            path_restrictions: None,
+            session: None,
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == AdminCheckState::Finish
+    fn answer(allowed: Result<bool, AuthorizationError>) -> IoResult {
+        IoResult::Event(authorization_event(allowed))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(AuthorizationError::NotFinished))
+    #[test]
+    fn foreign_caller_refused() {
+        // A caller of another realm never administers a group, and nothing is asked.
+        let mut operation = AdminCheckOperation::new(auth(5), Ulid::from_bytes([1u8; 16]));
+        assert_eq!(operation.first(), Ok(Next::Done(false)));
     }
 
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    #[test]
+    fn realm_admin_after_group() {
+        // A caller who is no group admin is asked about the realm groups path once.
+        let mut operation = AdminCheckOperation::new(auth(3), Ulid::from_bytes([1u8; 16]));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert!(matches!(
+            operation.next(answer(Ok(false))),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(operation.next(answer(Ok(false))), Ok(Next::Done(false)));
+        let mut operation = AdminCheckOperation::new(auth(3), Ulid::from_bytes([1u8; 16]));
+        operation.first().unwrap();
+        assert_eq!(operation.next(answer(Ok(true))), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn check_failures_end() {
+        // A failed check or an answer that is not one ends the decision with an error.
+        let mut operation = AdminCheckOperation::new(auth(3), Ulid::from_bytes([1u8; 16]));
+        operation.first().unwrap();
+        let failed = Err(AuthorizationError::DocNotFound);
+        assert_eq!(
+            operation.next(answer(failed)),
+            Err(AuthorizationError::DocNotFound)
+        );
+        let mut operation = AdminCheckOperation::new(auth(3), Ulid::from_bytes([1u8; 16]));
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(AuthorizationError::UnexpectedEvent { .. })
+        ));
     }
 }

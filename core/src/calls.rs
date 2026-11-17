@@ -90,6 +90,23 @@ pub enum IoError {
     Unfinished,
 }
 
+/// A runner failure as an authorization error: storage faults stay storage errors, a conflict
+/// stays the storage conflict, so the conflict check finds it.
+impl From<IoError> for crate::errors::AuthorizationError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "call".to_string(),
+                expected,
+                got: got.to_string(),
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+        }
+    }
+}
+
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
 /// storage calls in one write transaction when the operation asks for one, commits its outcome
 /// and aborts on an error.
