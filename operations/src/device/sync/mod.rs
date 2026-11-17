@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod actions;
+pub mod download;
 pub mod folders;
 pub mod materialize;
 pub mod outbox;
 pub(crate) mod pull;
 pub mod reconcile;
+pub mod remove;
 pub mod repository;
 pub(crate) mod rows;
 
@@ -34,8 +36,8 @@ use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
 
+use download::apply_downloads;
 use folders::{list_folders, store_progress};
-use materialize::apply_downloads;
 use reconcile::{ReconcileError, ReconcileFolderOperation, ReconcileInput, ReconcilePlan};
 use repository::SYNC_PAGE_SIZE;
 
