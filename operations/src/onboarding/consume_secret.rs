@@ -2,15 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
+use aruna_core::types::Value;
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -31,30 +30,12 @@ pub struct ConsumeSecretOutput {
     pub consumed_now: bool,
 }
 
+/// Claims the secret for one node in one write transaction; a repeat by the same node succeeds
+/// without a write.
 #[derive(Debug, PartialEq)]
 pub struct ConsumeSecretOperation {
     input: ConsumeSecretInput,
-    state: ConsumeSecretState,
-    output: Option<Result<ConsumeSecretOutput, ConsumeSecretError>>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum ConsumeSecretState {
-    Init,
-    StartTransaction,
-    ReadRecords {
-        txn_id: TxnId,
-    },
-    WriteConsumed {
-        txn_id: TxnId,
-        record: OnboardingSecretRecord,
-    },
-    CommitTransaction {
-        record: OnboardingSecretRecord,
-        consumed_now: bool,
-    },
-    Finish,
-    Error,
+    claimed: Option<OnboardingSecretRecord>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -81,275 +62,130 @@ pub enum ConsumeSecretError {
     },
 }
 
+impl From<IoError> for ConsumeSecretError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ConsumeSecret".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type ConsumeTurn = Result<Next<ConsumeSecretOutput>, ConsumeSecretError>;
+
 impl ConsumeSecretOperation {
     pub fn new(input: ConsumeSecretInput) -> Self {
         Self {
             input,
-            state: ConsumeSecretState::Init,
-            output: None,
+            claimed: None,
         }
+    }
+
+    /// Whether the stored state still lets this node finish its claim after the secret expired.
+    fn held_by_node(&self, state: &OnboardingSecretState) -> bool {
+        let node = &self.input.node_id;
+        match state {
+            OnboardingSecretState::Reserved {
+                node_id,
+                expires_at,
+            } => node_id == node && *expires_at >= self.input.now,
+            OnboardingSecretState::Finalizing { node_id }
+            | OnboardingSecretState::Consumed { node_id } => node_id == node,
+            OnboardingSecretState::Available => false,
+        }
+    }
+
+    fn claim(&mut self, record_value: Option<Value>, state_value: Option<Value>) -> ConsumeTurn {
+        let value = record_value.ok_or(ConsumeSecretError::NotFound)?;
+        let mut record: OnboardingSecretRecord =
+            postcard::from_bytes(&value).map_err(ConversionError::from)?;
+        let expired = record.expires_at < self.input.now;
+        if expired {
+            let state = resolve_secret_state(&record, state_value.as_ref())?;
+            if !self.held_by_node(&state) {
+                return Err(ConsumeSecretError::Expired);
+            }
+        }
+        if record.secret_hash != self.input.secret_hash {
+            return Err(ConsumeSecretError::InvalidSecret);
+        }
+        let node = &self.input.node_id;
+        match resolve_secret_state(&record, state_value.as_ref())? {
+            OnboardingSecretState::Available => {}
+            OnboardingSecretState::Reserved { node_id, .. } if node_id == *node => {}
+            OnboardingSecretState::Finalizing { node_id } if node_id == *node => {}
+            OnboardingSecretState::Consumed { node_id } if node_id == *node => {
+                record.claimed_node_id = Some(node.clone());
+                return Ok(Next::Done(ConsumeSecretOutput {
+                    record,
+                    consumed_now: false,
+                }));
+            }
+            OnboardingSecretState::Reserved { .. }
+            | OnboardingSecretState::Finalizing { .. }
+            | OnboardingSecretState::Consumed { .. } => {
+                return Err(ConsumeSecretError::AlreadyClaimed);
+            }
+        }
+
+        record.claimed_node_id = Some(node.clone());
+        let value = postcard::to_allocvec(&record).map_err(ConversionError::from)?;
+        let state_entry = secret_state_entry(
+            self.input.enrollment_id,
+            OnboardingSecretState::Consumed {
+                node_id: node.clone(),
+            },
+        )?;
+        self.claimed = Some(record);
+        Ok(Next::Call(IoCall::Write(vec![
+            (
+                ONBOARDING_KEYSPACE.to_string(),
+                secret_record_key(self.input.enrollment_id),
+                ByteView::from(value),
+            ),
+            state_entry,
+        ])))
     }
 }
 
-impl EffectOperation for ConsumeSecretOperation {
+impl Operation for ConsumeSecretOperation {
     type Output = ConsumeSecretOutput;
     type Error = ConsumeSecretError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ConsumeSecretState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, ConsumeSecretError::StorageError(error));
-            }
-            other => other,
+    fn first(&mut self) -> ConsumeTurn {
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                ONBOARDING_KEYSPACE.to_string(),
+                secret_record_key(self.input.enrollment_id),
+            ),
+            (
+                ONBOARDING_KEYSPACE.to_string(),
+                secret_state_key(self.input.enrollment_id),
+            ),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> ConsumeTurn {
+        let Some(record) = self.claimed.take() else {
+            let [record, state] = values::<2>(result)?;
+            return self.claim(record, state);
         };
-
-        match &self.state {
-            ConsumeSecretState::StartTransaction => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return fail(
-                        self,
-                        ConsumeSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction started",
-                            got,
-                        },
-                    );
-                };
-
-                self.state = ConsumeSecretState::ReadRecords { txn_id };
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            ONBOARDING_KEYSPACE.to_string(),
-                            secret_record_key(self.input.enrollment_id),
-                        ),
-                        (
-                            ONBOARDING_KEYSPACE.to_string(),
-                            secret_state_key(self.input.enrollment_id),
-                        ),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
-            }
-            ConsumeSecretState::ReadRecords { txn_id } => {
-                let txn_id = txn_id.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    return fail(
-                        self,
-                        ConsumeSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "batch read result",
-                            got,
-                        },
-                    );
-                };
-                let [(_, record_value), (_, state_value)] = values.as_slice() else {
-                    return fail(
-                        self,
-                        ConsumeSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "record and state batch read result",
-                            got: "a batch of another length",
-                        },
-                    );
-                };
-
-                let Some(value) = record_value else {
-                    return fail(self, ConsumeSecretError::NotFound);
-                };
-                let mut record: OnboardingSecretRecord = match postcard::from_bytes(value) {
-                    Ok(record) => record,
-                    Err(error) => {
-                        return fail(self, ConsumeSecretError::ConversionError(error.into()));
-                    }
-                };
-
-                let resolved_state = if record.expires_at < self.input.now {
-                    let state = match resolve_secret_state(&record, state_value.as_ref()) {
-                        Ok(state) => state,
-                        Err(error) => {
-                            return fail(self, ConsumeSecretError::ConversionError(error));
-                        }
-                    };
-                    if !matches!(
-                        state,
-                        OnboardingSecretState::Reserved { ref node_id, expires_at }
-                            if node_id == &self.input.node_id && expires_at >= self.input.now
-                    ) && !matches!(
-                        state,
-                        OnboardingSecretState::Finalizing { ref node_id }
-                            if node_id == &self.input.node_id
-                    ) && !matches!(
-                        state,
-                        OnboardingSecretState::Consumed { ref node_id }
-                            if node_id == &self.input.node_id
-                    ) {
-                        return fail(self, ConsumeSecretError::Expired);
-                    }
-                    Some(state)
-                } else {
-                    None
-                };
-                if record.secret_hash != self.input.secret_hash {
-                    return fail(self, ConsumeSecretError::InvalidSecret);
-                }
-                let state = match resolved_state {
-                    Some(state) => state,
-                    None => match resolve_secret_state(&record, state_value.as_ref()) {
-                        Ok(state) => state,
-                        Err(error) => {
-                            return fail(self, ConsumeSecretError::ConversionError(error));
-                        }
-                    },
-                };
-                match state {
-                    OnboardingSecretState::Available => {}
-                    OnboardingSecretState::Reserved { node_id, .. }
-                        if node_id == self.input.node_id => {}
-                    OnboardingSecretState::Finalizing { node_id }
-                        if node_id == self.input.node_id => {}
-                    OnboardingSecretState::Consumed { node_id }
-                        if node_id == self.input.node_id =>
-                    {
-                        record.claimed_node_id = Some(self.input.node_id.clone());
-                        self.state = ConsumeSecretState::CommitTransaction {
-                            record: record.clone(),
-                            consumed_now: false,
-                        };
-                        return smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                            txn_id,
-                        })];
-                    }
-                    OnboardingSecretState::Reserved { .. }
-                    | OnboardingSecretState::Finalizing { .. }
-                    | OnboardingSecretState::Consumed { .. } => {
-                        return fail(self, ConsumeSecretError::AlreadyClaimed);
-                    }
-                }
-
-                record.claimed_node_id = Some(self.input.node_id.clone());
-                let value = match postcard::to_allocvec(&record) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return fail(self, ConsumeSecretError::ConversionError(error.into()));
-                    }
-                };
-                self.state = ConsumeSecretState::WriteConsumed {
-                    txn_id,
-                    record: record.clone(),
-                };
-                let state_entry = match secret_state_entry(
-                    self.input.enrollment_id,
-                    OnboardingSecretState::Consumed {
-                        node_id: self.input.node_id.clone(),
-                    },
-                ) {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        return fail(self, ConsumeSecretError::ConversionError(error));
-                    }
-                };
-
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes: vec![
-                        (
-                            ONBOARDING_KEYSPACE.to_string(),
-                            secret_record_key(self.input.enrollment_id),
-                            ByteView::from(value),
-                        ),
-                        state_entry,
-                    ],
-                    txn_id: Some(txn_id),
-                })]
-            }
-            ConsumeSecretState::WriteConsumed { txn_id, record } => {
-                let txn_id = txn_id.clone();
-                let record = record.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-                    return fail(
-                        self,
-                        ConsumeSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "batch write result",
-                            got,
-                        },
-                    );
-                };
-
-                self.state = ConsumeSecretState::CommitTransaction {
-                    record: record.clone(),
-                    consumed_now: true,
-                };
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            ConsumeSecretState::CommitTransaction {
-                record,
-                consumed_now,
-            } => {
-                let record = record.clone();
-                let consumed_now = consumed_now.clone();
-                let got = event.label();
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return fail(
-                        self,
-                        ConsumeSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction committed",
-                            got,
-                        },
-                    );
-                };
-
-                self.state = ConsumeSecretState::Finish;
-                self.output = Some(Ok(ConsumeSecretOutput {
-                    record,
-                    consumed_now,
-                }));
-                smallvec![]
-            }
-            ConsumeSecretState::Init | ConsumeSecretState::Finish | ConsumeSecretState::Error => {
-                smallvec![]
-            }
-        }
+        done(result)?;
+        Ok(Next::Done(ConsumeSecretOutput {
+            record,
+            consumed_now: true,
+        }))
     }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ConsumeSecretState::Finish | ConsumeSecretState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ConsumeSecretError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            ConsumeSecretState::ReadRecords { txn_id }
-            | ConsumeSecretState::WriteConsumed { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
-        }
-    }
-}
-
-fn fail(operation: &mut ConsumeSecretOperation, error: ConsumeSecretError) -> Effects {
-    let cleanup = operation.abort();
-    operation.state = ConsumeSecretState::Error;
-    operation.output = Some(Err(error));
-    cleanup
 }
 
 #[cfg(test)]
