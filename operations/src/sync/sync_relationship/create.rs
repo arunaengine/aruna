@@ -297,3 +297,259 @@ fn not_s3_arn() -> SyncRelationshipError {
     ConversionError::FromStrError("sync relationship endpoint is not an S3 ARN".to_string()).into()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::super::tests::relationship;
+    use super::*;
+    use crate::sync::mirror_repair::mirror_delete_entry;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use ulid::Ulid;
+
+    const TXN: TxnId = Ulid(21);
+
+    fn subject() -> SyncRelationship {
+        relationship(1, "source-a", "target-a")
+    }
+
+    fn start_effect() -> Effect {
+        Effect::Storage(StorageEffect::StartTransaction { read: false })
+    }
+
+    fn started() -> Event {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN })
+    }
+
+    fn scan(start_after: Option<Key>) -> Effect {
+        iter_effect(
+            SyncRelationshipDirection::Outgoing,
+            Some("source-a"),
+            start_after,
+            Some(TXN),
+        )
+    }
+
+    fn page(values: Vec<(Key, Value)>, next: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: next,
+        })
+    }
+
+    fn claim_read() -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: repair_key(&subject()),
+            txn_id: Some(TXN),
+        })
+    }
+
+    /// The staged reconcile record, as `MirrorRecordOperation::stage` writes it.
+    fn staged() -> Value {
+        let delete = mirror_delete_entry(&subject()).unwrap().2;
+        let mut record = SyncMirrorRecord::from_bytes(&repair_key(&subject()), &delete).unwrap();
+        record.intent = SyncMirrorIntent::Reconcile;
+        ByteView::from(postcard::to_allocvec(&record).unwrap())
+    }
+
+    fn read(value: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value,
+        })
+    }
+
+    fn written() -> Event {
+        Event::Storage(StorageEvent::WriteResult {
+            key: Vec::<u8>::new().into(),
+        })
+    }
+
+    fn commit() -> Effect {
+        Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })
+    }
+
+    fn abort() -> Effect {
+        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
+    }
+
+    fn conflict() -> Event {
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        })
+    }
+
+    fn scanning() -> CreateRelationshipOperation {
+        let mut operation = CreateRelationshipOperation::new(subject());
+        operation.start();
+        operation.step(started());
+        operation
+    }
+
+    #[test]
+    fn creates_relationship() {
+        let row = storage_key(SyncRelationshipDirection::Outgoing, &subject()).unwrap();
+        let other = relationship(2, "source-a", "target-b");
+        let other_row = (
+            storage_key(SyncRelationshipDirection::Outgoing, &other).unwrap(),
+            ByteView::from(other.to_bytes().unwrap()),
+        );
+        let mut operation = CreateRelationshipOperation::new(subject());
+        check_trace(
+            &mut operation,
+            &[start_effect()],
+            vec![
+                (started(), vec![scan(None)]),
+                (
+                    page(vec![other_row.clone()], Some(other_row.0.clone())),
+                    vec![scan(Some(other_row.0))],
+                ),
+                (page(Vec::new(), None), vec![claim_read()]),
+                (
+                    read(Some(staged())),
+                    vec![Effect::Storage(StorageEffect::Write {
+                        key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+                        key: repair_key(&subject()),
+                        value: staged(),
+                        txn_id: Some(TXN),
+                    })],
+                ),
+                (
+                    written(),
+                    vec![Effect::Storage(StorageEffect::Write {
+                        key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                        key: row,
+                        value: ByteView::from(subject().to_bytes().unwrap()),
+                        txn_id: Some(TXN),
+                    })],
+                ),
+                (written(), vec![commit()]),
+                (
+                    Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN }),
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(subject()));
+    }
+
+    #[test]
+    fn activation_skips_scan() {
+        let mut operation = CreateRelationshipOperation::activate(subject());
+        assert_eq!(operation.start().as_slice(), &[start_effect()]);
+        assert_eq!(operation.step(started()).as_slice(), &[claim_read()]);
+    }
+
+    #[test]
+    fn refuses_duplicates() {
+        let twin = relationship(2, "source-a", "target-a");
+        let twin_row = (
+            storage_key(SyncRelationshipDirection::Outgoing, &twin).unwrap(),
+            ByteView::from(twin.to_bytes().unwrap()),
+        );
+        let mut duplicate = scanning();
+        assert_eq!(
+            duplicate.step(page(vec![twin_row], None)).as_slice(),
+            &[abort()]
+        );
+        assert_eq!(duplicate.finalize(), Err(SyncRelationshipError::Duplicate));
+
+        let mut stub = twin.clone();
+        stub.state = SyncState::Detached;
+        let stub_row = (
+            storage_key(SyncRelationshipDirection::Outgoing, &stub).unwrap(),
+            ByteView::from(stub.to_bytes().unwrap()),
+        );
+        let mut detached = scanning();
+        assert_eq!(
+            detached.step(page(vec![stub_row], None)).as_slice(),
+            &[claim_read()]
+        );
+
+        let mut rolled_back = scanning();
+        rolled_back.step(page(Vec::new(), None));
+        assert_eq!(rolled_back.step(read(None)).as_slice(), &[abort()]);
+        assert_eq!(
+            rolled_back.finalize(),
+            Err(SyncRelationshipError::RolledBack)
+        );
+
+        let deleting = mirror_delete_entry(&subject()).unwrap().2;
+        let mut claimed = scanning();
+        claimed.step(page(Vec::new(), None));
+        assert_eq!(claimed.step(read(Some(deleting))).as_slice(), &[abort()]);
+        assert_eq!(claimed.finalize(), Err(SyncRelationshipError::RolledBack));
+    }
+
+    #[test]
+    fn conflicts_retry() {
+        let mut operation = CreateRelationshipOperation::activate(subject());
+        operation.start();
+        assert_eq!(operation.step(conflict()).as_slice(), &[start_effect()]);
+        operation.step(started());
+        operation.step(read(Some(staged())));
+        operation.step(written());
+        operation.step(written());
+        assert_eq!(operation.step(conflict()).as_slice(), &[start_effect()]);
+        assert_eq!(operation.step(conflict()).as_slice(), &[] as &[Effect]);
+        assert_eq!(
+            operation.finalize(),
+            Err(SyncRelationshipError::Storage(
+                StorageError::TransactionConflict
+            ))
+        );
+    }
+
+    #[test]
+    fn errors_abort_transaction() {
+        let mut operation = scanning();
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert_eq!(operation.step(failed).as_slice(), &[abort()]);
+        assert_eq!(
+            operation.finalize(),
+            Err(SyncRelationshipError::Storage(StorageError::Timeout))
+        );
+        let mut corrupt = scanning();
+        let bad = page(vec![(vec![1].into(), vec![0xff].into())], None);
+        assert_eq!(corrupt.step(bad).as_slice(), &[abort()]);
+        assert!(matches!(
+            corrupt.finalize(),
+            Err(SyncRelationshipError::Conversion(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_foreign_events() {
+        let refusals = rejects_events(scanning, sample_events, |event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
+            )
+        });
+        assert!(!refusals.is_empty());
+        for (label, effects, error) in refusals {
+            assert_eq!(effects.as_slice(), &[abort()], "{label}");
+            assert!(
+                matches!(error, SyncRelationshipError::UnexpectedEvent { .. }),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        rejects_finalize(CreateRelationshipOperation::new(subject()));
+        rejects_finalize(scanning());
+        let mut fresh = CreateRelationshipOperation::new(subject());
+        check_abort(&mut fresh, &[]);
+        let mut operation = scanning();
+        check_abort(&mut operation, &[abort()]);
+        assert_eq!(
+            operation.finalize(),
+            Err(SyncRelationshipError::NotFinished)
+        );
+    }
+}

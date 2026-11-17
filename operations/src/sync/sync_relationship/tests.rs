@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::sync::mirror_repair::stage_mirror_reconcile;
+use crate::sync::mirror_repair::{MirrorRecordOperation, SyncMirrorIntent};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::operation::Operation;
 use aruna_core::operation_check::{rejects_events, sample_events};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
@@ -13,6 +15,7 @@ use aruna_core::{NodeId, UserId};
 use aruna_storage::storage::FjallStorage;
 use std::time::SystemTime;
 use tempfile::{TempDir, tempdir};
+use ulid::Ulid;
 
 fn test_context() -> (TempDir, DriverContext) {
     let tempdir = tempdir().unwrap();
@@ -32,14 +35,13 @@ fn test_node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn relationship(id: u8, source: &str, target: &str) -> SyncRelationship {
+pub(super) fn relationship(id: u8, source: &str, target: &str) -> SyncRelationship {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let mut id_bytes = [0u8; 16];
     id_bytes[15] = id;
     SyncRelationship {
         id: Ulid::from_bytes(id_bytes),
-        source: ArunaArn::s3_object_prefix(realm_id, test_node(2), source, "selected/")
-            .unwrap(),
+        source: ArunaArn::s3_object_prefix(realm_id, test_node(2), source, "selected/").unwrap(),
         target: ArunaArn::s3_object_prefix(realm_id, test_node(3), target, "replica/").unwrap(),
         mode: SyncMode::Continuous,
         reference_handling: Default::default(),
@@ -60,10 +62,7 @@ async fn outgoing_crud() {
 
     assert_eq!(
         drive(
-            StoreRelationshipOperation::new(
-                first.clone(),
-                SyncRelationshipDirection::Outgoing,
-            ),
+            StoreRelationshipOperation::new(first.clone(), SyncRelationshipDirection::Outgoing,),
             &context,
         )
         .await
@@ -185,12 +184,15 @@ async fn create_is_atomic() {
         let target = format!("target-{attempt}");
         let first = relationship(attempt * 2 + 1, &source, &target);
         let second = relationship(attempt * 2 + 2, &source, &target);
-        stage_mirror_reconcile(&context, &first).await.unwrap();
-        stage_mirror_reconcile(&context, &second).await.unwrap();
+        for relationship in [&first, &second] {
+            let stage =
+                MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Reconcile);
+            drive(stage, &context).await.unwrap();
+        }
 
         let (first_result, second_result) = tokio::join!(
-            create_sync_relationship(&context, first),
-            create_sync_relationship(&context, second),
+            drive(CreateRelationshipOperation::new(first), &context),
+            drive(CreateRelationshipOperation::new(second), &context),
         );
         assert!(matches!(
             (&first_result, &second_result),
@@ -224,10 +226,8 @@ fn terminal_rejects_event() {
     };
     let record = relationship(1, "source-a", "target-a");
     let store = || {
-        let mut store = StoreRelationshipOperation::new(
-            record.clone(),
-            SyncRelationshipDirection::Outgoing,
-        );
+        let mut store =
+            StoreRelationshipOperation::new(record.clone(), SyncRelationshipDirection::Outgoing);
         store.start();
         store.step(Event::Storage(StorageEvent::WriteResult {
             key: Vec::<u8>::new().into(),
@@ -239,16 +239,14 @@ fn terminal_rejects_event() {
         assert!(
             matches!(
                 error,
-                SyncRelationshipError::UnexpectedEvent { .. }
-                    | SyncRelationshipError::Storage(_)
+                SyncRelationshipError::UnexpectedEvent { .. } | SyncRelationshipError::Storage(_)
             ),
             "{error:?}"
         );
     }
 
     let list = || {
-        let mut list =
-            ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None);
+        let mut list = ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None);
         list.start();
         list.step(page());
         list
@@ -258,16 +256,14 @@ fn terminal_rejects_event() {
         assert!(
             matches!(
                 error,
-                SyncRelationshipError::UnexpectedEvent { .. }
-                    | SyncRelationshipError::Storage(_)
+                SyncRelationshipError::UnexpectedEvent { .. } | SyncRelationshipError::Storage(_)
             ),
             "{error:?}"
         );
     }
 
     let get = || {
-        let mut get =
-            GetRelationshipOperation::new(record.id, SyncRelationshipDirection::Outgoing);
+        let mut get = GetRelationshipOperation::new(record.id, SyncRelationshipDirection::Outgoing);
         get.start();
         get.step(page());
         get
@@ -277,18 +273,15 @@ fn terminal_rejects_event() {
         assert!(
             matches!(
                 error,
-                SyncRelationshipError::UnexpectedEvent { .. }
-                    | SyncRelationshipError::Storage(_)
+                SyncRelationshipError::UnexpectedEvent { .. } | SyncRelationshipError::Storage(_)
             ),
             "{error:?}"
         );
     }
 
     let delete = || {
-        let mut delete = DeleteRelationshipOperation::new(
-            record.clone(),
-            SyncRelationshipDirection::Outgoing,
-        );
+        let mut delete =
+            DeleteRelationshipOperation::new(record.clone(), SyncRelationshipDirection::Outgoing);
         delete.start();
         delete.step(stray());
         delete
@@ -298,8 +291,7 @@ fn terminal_rejects_event() {
         assert!(
             matches!(
                 error,
-                SyncRelationshipError::UnexpectedEvent { .. }
-                    | SyncRelationshipError::Storage(_)
+                SyncRelationshipError::UnexpectedEvent { .. } | SyncRelationshipError::Storage(_)
             ),
             "{error:?}"
         );
