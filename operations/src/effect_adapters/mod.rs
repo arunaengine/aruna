@@ -170,6 +170,10 @@ pub(crate) async fn dispatch_effect_until(
             );
             Event::Stream()
         }
+        Effect::Delay(after) => {
+            tokio::time::sleep(after).await;
+            Event::Delayed
+        }
         // The effect loop runs groups itself; a group never reaches a single dispatch.
         Effect::Group(group) => {
             warn!(depth, "Effect group reached a single dispatch");
@@ -199,7 +203,7 @@ pub(crate) async fn dispatch_effect_until(
     event
 }
 
-fn effect_kind(effect: &Effect) -> &'static str {
+pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
@@ -215,6 +219,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
         Effect::Outbound(_) => "outbound",
+        Effect::Delay(_) => "delay",
     }
 }
 

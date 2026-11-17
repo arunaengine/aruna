@@ -11,6 +11,7 @@ pub mod archive_path;
 pub mod audit;
 pub mod auth;
 pub mod backoff;
+pub mod calls;
 pub mod compute;
 pub mod crate_merge;
 pub mod credential_encryption;

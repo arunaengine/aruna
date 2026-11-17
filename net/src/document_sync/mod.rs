@@ -501,6 +501,11 @@ impl DocumentSyncService {
         self.db.clone()
     }
 
+    /// Waits for the reconcile lock and keeps it while the guard lives.
+    pub(crate) async fn hold_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.reconcile_lock).lock_owned().await
+    }
+
     pub async fn shutdown(&self) {
         self.net.shutdown().await;
         if let Err(error) = self.db.persist(fjall::PersistMode::SyncAll) {

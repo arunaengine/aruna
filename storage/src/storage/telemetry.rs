@@ -209,6 +209,7 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
         Effect::Outbound(_) => "outbound",
+        Effect::Delay(_) => "delay",
     }
 }
 

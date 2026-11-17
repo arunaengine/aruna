@@ -58,6 +58,12 @@ pub enum Event {
     Group(GroupEvent),
     Session(Box<crate::compute::session::SessionAnswer>),
     Outbound(OutboundEvent),
+    /// Answers `Effect::Delay` once its time passed.
+    Delayed,
+    /// The adapter of this effect kind did not answer within the runner's hang limit.
+    Hung {
+        effect: &'static str,
+    },
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -961,6 +967,8 @@ impl Event {
                     Closed
                 }
             ),
+            Event::Delayed => "Event::Delayed",
+            Event::Hung { .. } => "Event::Hung",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(

@@ -19,7 +19,7 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -744,7 +744,7 @@ fn runner_read(index: usize) -> Effect {
     })
 }
 
-impl Operation for ReadRows {
+impl EffectOperation for ReadRows {
     type Output = ();
     type Error = ();
 

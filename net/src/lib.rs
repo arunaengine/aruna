@@ -262,6 +262,12 @@ impl NetHandle {
         self.inner.document_sync.database()
     }
 
+    /// Waits until no document reconcile, shard membership change or eviction runs, and keeps
+    /// them out while the guard lives.
+    pub async fn hold_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.document_sync.hold_reconcile().await
+    }
+
     pub async fn sync_topic_peers(
         &self,
         topic_id: ::irokle::TopicId,
@@ -1122,6 +1128,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
         Effect::Outbound(_) => "outbound",
+        Effect::Delay(_) => "delay",
     }
 }
 pub(crate) fn unique_endpoint_addrs(
