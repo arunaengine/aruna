@@ -554,11 +554,15 @@ pub(super) async fn ensure_permission(
         path: path.clone(),
         required_permission: required_permission.clone(),
     };
-    let operation = match txn_id {
-        Some(txn_id) => CheckPermissionsOperation::new_with_txn(config, txn_id),
-        None => CheckPermissionsOperation::new(config),
+    let checked = async {
+        match txn_id {
+            Some(txn_id) => {
+                drive(CheckPermissionsOperation::new_with_txn(config, txn_id), context).await
+            }
+            None => drive(CheckPermissionsOperation::new(config), context).await,
+        }
     };
-    let allowed = aruna_core::telemetry::time_stage("permission", drive(operation, context))
+    let allowed = aruna_core::telemetry::time_stage("permission", checked)
         .await
         .map_err(|err| match err {
             AuthorizationError::InvalidRealmId

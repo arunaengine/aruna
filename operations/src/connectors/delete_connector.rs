@@ -167,8 +167,8 @@ impl Operation for DeleteSourceOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 }
 
@@ -368,7 +368,7 @@ mod tests {
             group_id,
             connector_id,
         });
-        assert!(operation.transaction());
+        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
         operation.first().unwrap();
         let read = operation.next(stored_connector(group_id, connector_id));
         assert!(matches!(read, Ok(Next::Call(IoCall::Effect(_)))));

@@ -316,8 +316,8 @@ impl Operation for PrunePageOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 }
 
@@ -399,7 +399,7 @@ mod tests {
             ByteView::from(b"short".to_vec()),
             ByteView::from(Vec::new()),
         );
-        assert!(operation.transaction());
+        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
         let first = operation.first();
         assert!(matches!(
             &first,

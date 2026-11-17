@@ -211,8 +211,8 @@ impl Operation for RescheduleOperation {
     type Output = ();
     type Error = IoError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<()>, IoError> {
@@ -366,7 +366,7 @@ mod call_tests {
         let old_key = graph_prune_key(&failed).to_vec();
         let mut operation =
             RescheduleOperation::new(&[old_key.clone()], &failed, "down".into(), NOW_MS).unwrap();
-        assert!(operation.transaction());
+        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
         let next_job = GraphPruneRecord {
             due_at_ms: NOW_MS + retry_delay_ms(1),
             attempts: 1,

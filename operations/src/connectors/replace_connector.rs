@@ -255,8 +255,8 @@ impl Operation for ReplaceSourceOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 }
 
@@ -427,7 +427,7 @@ mod tests {
             public_config: replacement.public_config.clone(),
             secret_config: connector_secret(connector_id, "bob").secret_config,
         });
-        assert!(operation.transaction());
+        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
         operation.first().unwrap();
         let stored = IoResult::Values(vec![Some(replacement.to_bytes().unwrap().into())]);
         let read = operation.next(stored);
