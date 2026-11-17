@@ -12,7 +12,9 @@ use aruna_core::NodeId;
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::{LogLine, PluginRun};
+use aruna_core::plugin_runs::{
+    CallIntent, LogLine, PluginRun, StateRefusal, StateRemoval, StateWrite,
+};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
 use aruna_core::structs::execution::job::UploadForm;
@@ -53,7 +55,7 @@ use super::rate::take_call;
 use super::release::ReleaseKeys;
 use super::release::node_keys;
 use super::rows::{delete_rows, write_rows};
-use super::state::{PutError, check_key, put_state, read_state, remove_state};
+use super::state::{MAX_STATE_KEY, PutError, put_state, read_state, remove_state};
 use super::submit::{
     CopyRequest, DownloadRequest, UploadRequest, start_copy, start_download, start_upload,
 };
@@ -264,7 +266,7 @@ impl RunBroker {
                 .await?;
         }
         let run_id = self.scope.run.run_id;
-        let earlier = drive(written(run_id, &change.intent), &self.ctx).await;
+        let earlier = drive(written(run_id, &call_intent(&change.intent)), &self.ctx).await;
         if !earlier.map_err(|error| unavailable(error.0))? {
             same_revision(record.last_event_id, expected)?;
         }
@@ -500,7 +502,7 @@ impl RunBroker {
         let run_id = self.scope.run.run_id;
         match outcome {
             Ok(reply) => {
-                let settled = settled_row(run_id, intent, reply.clone());
+                let settled = settled_row(run_id, &call_intent(intent), reply.clone());
                 let written = match settled {
                     Ok(row) => drive(write_rows(vec![row]), &self.ctx).await,
                     Err(error) => Err(error),
@@ -520,7 +522,8 @@ impl RunBroker {
 
     /// Removes the intent of a call that ended without an effect, so it may be made again.
     async fn clear(&self, intent: &Intent) -> Result<(), HostError> {
-        let clear = delete_rows(vec![intent_row_key(self.scope.run.run_id, intent)]);
+        let call = call_intent(intent);
+        let clear = delete_rows(vec![intent_row_key(self.scope.run.run_id, &call)]);
         (drive(clear, &self.ctx).await).map_err(|error| unavailable(error.0))
     }
 
@@ -532,14 +535,14 @@ impl RunBroker {
     /// Marks a call whose effect may have happened without a recorded reply; a failure leaves the
     /// intent pending, which a later attempt reads as unknown as well.
     async fn mark_unknown(&self, intent: &Intent, reason: &str) {
-        if let Ok(row) = unknown_row(self.scope.run.run_id, intent, reason) {
+        if let Ok(row) = unknown_row(self.scope.run.run_id, &call_intent(intent), reason) {
             let _ = drive(write_rows(vec![row]), &self.ctx).await;
         }
     }
 
     /// The intent's earlier outcome, or `None` when the effect may be dispatched now.
     async fn begun(&self, intent: &Intent) -> Result<Option<String>, HostError> {
-        let begun = drive(begin(self.scope.run.run_id, intent.clone()), &self.ctx).await;
+        let begun = drive(begin(self.scope.run.run_id, call_intent(intent)), &self.ctx).await;
         match begun.map_err(|error| unavailable(error.0))? {
             Begun::Fresh => Ok(None),
             Begun::Settled(reply) => Ok(Some(reply)),
@@ -648,6 +651,33 @@ impl RunBroker {
             }
         }
         Ok(visible)
+    }
+}
+
+/// The core intent of a guest call.
+pub(crate) fn call_intent(intent: &Intent) -> CallIntent {
+    CallIntent {
+        ordinal: intent.ordinal,
+        digest: intent.digest,
+    }
+}
+
+/// The guest error kind of a refused state write.
+fn refused_kind(refusal: StateRefusal) -> ErrorKind {
+    match refusal {
+        StateRefusal::Limit => ErrorKind::Limit,
+        StateRefusal::Conflict => ErrorKind::Conflict,
+    }
+}
+
+/// A key the guest may use: not empty, within its bound.
+fn check_key(key: &str) -> Result<(), HostError> {
+    match key.is_empty() || key.len() > MAX_STATE_KEY {
+        true => Err(HostError::new(
+            ErrorKind::Invalid,
+            "a state key has 1 to 256 bytes",
+        )),
+        false => Ok(()),
     }
 }
 
@@ -867,7 +897,7 @@ impl Broker for RunBroker {
         let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
         // A new call starts only from the copy it expects; an earlier attempt's intent decides.
         let run_id = self.scope.run.run_id;
-        let earlier = drive(written(run_id, &patch.intent), &self.ctx).await;
+        let earlier = drive(written(run_id, &call_intent(&patch.intent)), &self.ctx).await;
         if !earlier.map_err(|error| unavailable(error.0))? {
             same_revision(record.last_event_id, expected)?;
         }
@@ -1257,7 +1287,11 @@ impl Broker for RunBroker {
         check_key(key)?;
         let install = self.admitted(None).await?;
         let entry = drive(read_state(install.install_id, key), &self.ctx).await;
-        entry.map_err(|error| unavailable(error.0))
+        let entry = entry.map_err(|error| unavailable(error.0))?;
+        Ok(entry.map(|entry| Entry {
+            version: entry.version,
+            value: entry.value,
+        }))
     }
 
     async fn state_put(&self, _cx: &CallContext, put: StatePut) -> Result<u64, HostError> {
@@ -1270,11 +1304,17 @@ impl Broker for RunBroker {
         }
         let run_id = self.scope.run.run_id;
         let intent = put.intent.clone();
-        match drive(put_state(run_id, install.install_id, put), &self.ctx).await {
+        let write = StateWrite {
+            key: put.key,
+            value: put.value,
+            expected: put.expected,
+            intent: call_intent(&intent),
+        };
+        match drive(put_state(run_id, install.install_id, write), &self.ctx).await {
             Ok(version) => Ok(version),
-            Err(PutError::Refused(message, kind)) => {
+            Err(PutError::Refused(message, refusal)) => {
                 self.clear(&intent).await?;
-                Err(HostError::new(kind, message))
+                Err(HostError::new(refused_kind(refusal), message))
             }
             Err(PutError::Store(error)) => Err(self.unknown(&intent, &error.0).await),
         }
@@ -1288,11 +1328,16 @@ impl Broker for RunBroker {
         }
         let run_id = self.scope.run.run_id;
         let intent = remove.intent.clone();
-        match drive(remove_state(run_id, install.install_id, remove), &self.ctx).await {
+        let removal = StateRemoval {
+            key: remove.key,
+            expected: remove.expected,
+            intent: call_intent(&intent),
+        };
+        match drive(remove_state(run_id, install.install_id, removal), &self.ctx).await {
             Ok(()) => Ok(()),
-            Err(PutError::Refused(message, kind)) => {
+            Err(PutError::Refused(message, refusal)) => {
                 self.clear(&intent).await?;
-                Err(HostError::new(kind, message))
+                Err(HostError::new(refused_kind(refusal), message))
             }
             Err(PutError::Store(error)) => Err(self.unknown(&intent, &error.0).await),
         }

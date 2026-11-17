@@ -485,6 +485,47 @@ pub struct Decisions {
     pub gaps: Vec<(Ulid, SourceKind, GapReason, u64)>,
 }
 
+/// One host call of a run: its ordinal and a digest of its arguments, so a rerun of the run is
+/// checked to ask for the same thing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallIntent {
+    pub ordinal: u32,
+    pub digest: [u8; 32],
+}
+
+/// A compare-and-swap write of a private state value; `expected: None` writes a new value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateWrite {
+    pub key: String,
+    pub value: Vec<u8>,
+    pub expected: Option<u64>,
+    pub intent: CallIntent,
+}
+
+/// A version-checked removal of a private state value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateRemoval {
+    pub key: String,
+    pub expected: u64,
+    pub intent: CallIntent,
+}
+
+/// A private state value and the version it was written at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateEntry {
+    pub version: u64,
+    pub value: Vec<u8>,
+}
+
+/// Why a state write changed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateRefusal {
+    /// The value or the install's state would grow past its bound.
+    Limit,
+    /// The stored version is not the expected one.
+    Conflict,
+}
+
 /// Forward rows of one install a node keeps at most; matching beyond records a gap.
 pub const EVENTS_QUEUED: usize = 10_000;
 /// How long a forward row is sent before it is dropped as a gap.

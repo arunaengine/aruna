@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::keyspaces::PLUGIN_STATE_KEYSPACE;
-use aruna_plugins::broker::{Entry, ErrorKind, HostError, StatePut, StateRemove};
+use aruna_core::plugin_runs::{StateEntry, StateRefusal, StateRemoval, StateWrite};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -34,7 +34,7 @@ struct StateRow {
 #[derive(Debug, thiserror::Error)]
 pub enum PutError {
     #[error("{0}")]
-    Refused(String, ErrorKind),
+    Refused(String, StateRefusal),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -58,17 +58,6 @@ fn version_key(install_id: Ulid) -> Vec<u8> {
     row
 }
 
-/// A key the guest may use: not empty, within its bound.
-pub fn check_key(key: &str) -> Result<(), HostError> {
-    match key.is_empty() || key.len() > MAX_STATE_KEY {
-        true => Err(HostError::new(
-            ErrorKind::Invalid,
-            "a state key has 1 to 256 bytes",
-        )),
-        false => Ok(()),
-    }
-}
-
 /// Reads the install's value at `key`.
 pub(crate) fn read_state(install_id: Ulid, key: &str) -> RowsOperation<ReadState> {
     RowsOperation::direct(ReadState {
@@ -82,7 +71,7 @@ pub struct ReadState {
 }
 
 impl Plan for ReadState {
-    type Output = Option<Entry>;
+    type Output = Option<StateEntry>;
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
@@ -95,7 +84,7 @@ impl Plan for ReadState {
     fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
         let [row] = values::<1>(answer)?;
         let row = row.map(|bytes| decode::<StateRow>(&bytes)).transpose()?;
-        Ok(Turn::Finish(row.map(|row| Entry {
+        Ok(Turn::Finish(row.map(|row| StateEntry {
             version: row.version,
             value: row.value,
         })))
@@ -105,7 +94,11 @@ impl Plan for ReadState {
 /// Writes the value if the stored version is still `expected` (`None`: no value yet) and the
 /// install stays within its bytes, and settles the call's intent with the new version. Versions
 /// never repeat within an install, so one read before a removal never matches a later value.
-pub(crate) fn put_state(run_id: Ulid, install_id: Ulid, put: StatePut) -> RowsOperation<PutState> {
+pub(crate) fn put_state(
+    run_id: Ulid,
+    install_id: Ulid,
+    put: StateWrite,
+) -> RowsOperation<PutState> {
     RowsOperation::transaction(PutState {
         run_id,
         install_id,
@@ -118,7 +111,7 @@ pub(crate) fn put_state(run_id: Ulid, install_id: Ulid, put: StatePut) -> RowsOp
 pub struct PutState {
     run_id: Ulid,
     install_id: Ulid,
-    put: StatePut,
+    put: StateWrite,
     /// The new version once its rows are sent.
     written: Option<u64>,
 }
@@ -130,7 +123,7 @@ impl Plan for PutState {
     fn first(&mut self) -> Result<Turn<u64>, PutError> {
         if self.put.value.len() > MAX_STATE_VALUE {
             let message = "a state value has at most 256 KiB".to_string();
-            return Err(PutError::Refused(message, ErrorKind::Limit));
+            return Err(PutError::Refused(message, StateRefusal::Limit));
         }
         Ok(Turn::Ask(Ask::Read(vec![
             (
@@ -156,7 +149,7 @@ impl Plan for PutState {
         let version = current.as_ref().map(|row| row.version);
         if version != self.put.expected {
             let message = format!("the value is at version {version:?}");
-            return Err(PutError::Refused(message, ErrorKind::Conflict));
+            return Err(PutError::Refused(message, StateRefusal::Conflict));
         }
         let total = total.map_or(Ok(0), |bytes| decode::<u64>(&bytes))?;
         let size = |value: &[u8]| (self.put.key.len() + value.len()) as u64;
@@ -164,7 +157,7 @@ impl Plan for PutState {
         let total = (total.saturating_sub(old)).saturating_add(size(&self.put.value));
         if total > MAX_STATE_BYTES {
             let message = "the install's state would exceed 16 MiB".to_string();
-            return Err(PutError::Refused(message, ErrorKind::Limit));
+            return Err(PutError::Refused(message, StateRefusal::Limit));
         }
         let last = last.map_or(Ok(0), |bytes| decode::<u64>(&bytes))?;
         let next = last.max(version.unwrap_or_default()) + 1;
@@ -201,7 +194,7 @@ impl Plan for PutState {
 pub(crate) fn remove_state(
     run_id: Ulid,
     install_id: Ulid,
-    remove: StateRemove,
+    remove: StateRemoval,
 ) -> RowsOperation<RemoveState> {
     RowsOperation::transaction(RemoveState {
         run_id,
@@ -215,7 +208,7 @@ pub(crate) fn remove_state(
 pub struct RemoveState {
     run_id: Ulid,
     install_id: Ulid,
-    remove: StateRemove,
+    remove: StateRemoval,
     phase: RemovePhase,
 }
 
@@ -253,7 +246,7 @@ impl Plan for RemoveState {
                     .transpose()?;
                 let Some(stored) = current.filter(|row| row.version == self.remove.expected) else {
                     let message = format!("the value is not at version {}", self.remove.expected);
-                    return Err(PutError::Refused(message, ErrorKind::Conflict));
+                    return Err(PutError::Refused(message, StateRefusal::Conflict));
                 };
                 let total = total.map_or(Ok(0), |bytes| decode::<u64>(&bytes))?;
                 let freed = (self.remove.key.len() + stored.value.len()) as u64;
@@ -277,16 +270,17 @@ impl Plan for RemoveState {
 mod tests {
     use super::*;
     use crate::driver::drive;
+    use crate::plugins::broker::call_intent;
     use crate::plugins::intents::{Begun, begin};
     use crate::plugins::runs::tests::opened;
     use aruna_plugins::broker::Intent;
 
-    fn put(key: &str, value: &[u8], expected: Option<u64>, ordinal: u32) -> StatePut {
-        StatePut {
+    fn put(key: &str, value: &[u8], expected: Option<u64>, ordinal: u32) -> StateWrite {
+        StateWrite {
             key: key.into(),
             value: value.to_vec(),
             expected,
-            intent: Intent::new(ordinal, &[key.as_bytes(), value]),
+            intent: call_intent(&Intent::new(ordinal, &[key.as_bytes(), value])),
         }
     }
 
@@ -312,7 +306,7 @@ mod tests {
         let stale = drive(put_state(run, install, put("cursor", b"b", None, 1)), &ctx).await;
         assert!(matches!(
             stale,
-            Err(PutError::Refused(_, ErrorKind::Conflict))
+            Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
         assert_eq!(
             drive(
@@ -346,13 +340,15 @@ mod tests {
             .unwrap();
         }
         let full = drive(put_state(run, install, put("last", &big, None, 900)), &ctx).await;
-        assert!(matches!(full, Err(PutError::Refused(_, ErrorKind::Limit))));
+        assert!(matches!(
+            full,
+            Err(PutError::Refused(_, StateRefusal::Limit))
+        ));
         assert!(
             drive(put_state(run, other, put("last", &big, None, 901)), &ctx)
                 .await
                 .is_ok()
         );
-        assert!(check_key("").is_err() && check_key(&"k".repeat(257)).is_err());
     }
 
     #[tokio::test]
@@ -363,10 +359,10 @@ mod tests {
         let first = drive(put_state(run, install, put("k", b"a", None, 1)), &ctx)
             .await
             .unwrap();
-        let remove = StateRemove {
+        let remove = StateRemoval {
             key: "k".into(),
             expected: first,
-            intent: Intent::new(2, &[b"k"]),
+            intent: call_intent(&Intent::new(2, &[b"k"])),
         };
         drive(remove_state(run, install, remove.clone()), &ctx)
             .await
@@ -383,16 +379,16 @@ mod tests {
         .await;
         assert!(matches!(
             stale,
-            Err(PutError::Refused(_, ErrorKind::Conflict))
+            Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
-        let old = StateRemove {
-            intent: Intent::new(5, &[b"k"]),
+        let old = StateRemoval {
+            intent: call_intent(&Intent::new(5, &[b"k"])),
             ..remove
         };
         let refused = drive(remove_state(run, install, old.clone()), &ctx).await;
         assert!(matches!(
             refused,
-            Err(PutError::Refused(_, ErrorKind::Conflict))
+            Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
     }
 
@@ -413,16 +409,19 @@ mod tests {
             .unwrap();
         }
         let full = drive(put_state(run, install, put("last", &big, None, 900)), &ctx).await;
-        assert!(matches!(full, Err(PutError::Refused(_, ErrorKind::Limit))));
-        let remove = |expected, ordinal| StateRemove {
+        assert!(matches!(
+            full,
+            Err(PutError::Refused(_, StateRefusal::Limit))
+        ));
+        let remove = |expected, ordinal| StateRemoval {
             key: "k1".into(),
             expected,
-            intent: Intent::new(ordinal, &[b"k1"]),
+            intent: call_intent(&Intent::new(ordinal, &[b"k1"])),
         };
         let stale = drive(remove_state(run, install, remove(2, 901)), &ctx).await;
         assert!(matches!(
             stale,
-            Err(PutError::Refused(_, ErrorKind::Conflict))
+            Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
         drive(remove_state(run, install, remove(1, 902)), &ctx)
             .await
@@ -437,7 +436,7 @@ mod tests {
         let again = drive(remove_state(run, install, remove(1, 903)), &ctx).await;
         assert!(matches!(
             again,
-            Err(PutError::Refused(_, ErrorKind::Conflict))
+            Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
         assert!(
             drive(put_state(run, install, put("last", &big, None, 904)), &ctx)
@@ -479,7 +478,7 @@ mod tests {
         let conflict = plan.next(answer(2, 4, 2));
         assert!(matches!(
             conflict,
-            Err(PutError::Refused(_, ErrorKind::Conflict))
+            Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
         // The stored version writes the value, the bytes, the version and the settled intent.
         let Turn::Ask(Ask::Write(rows)) = plan.next(answer(3, 4, 7)).unwrap() else {
@@ -497,7 +496,7 @@ mod tests {
         };
         assert!(matches!(
             big.first(),
-            Err(PutError::Refused(_, ErrorKind::Limit))
+            Err(PutError::Refused(_, StateRefusal::Limit))
         ));
         assert!(matches!(
             plan.next(Answer::Page(Vec::new(), None)),
@@ -508,10 +507,10 @@ mod tests {
     #[test]
     fn remove_decisions() {
         let (run, install) = (Ulid::from_parts(9, 1), Ulid::from_parts(1, 1));
-        let remove = StateRemove {
+        let remove = StateRemoval {
             key: "k".into(),
             expected: 3,
-            intent: Intent::new(1, &[b"k"]),
+            intent: call_intent(&Intent::new(1, &[b"k"])),
         };
         let mut plan = RemoveState {
             run_id: run,
@@ -542,7 +541,7 @@ mod tests {
         let missing = absent.next(Answer::Values(vec![None, None]));
         assert!(matches!(
             missing,
-            Err(PutError::Refused(_, ErrorKind::Conflict))
+            Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
     }
 }

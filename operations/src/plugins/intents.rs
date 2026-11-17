@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::keyspaces::PLUGIN_INTENTS_KEYSPACE;
-use aruna_plugins::broker::Intent;
+use aruna_core::plugin_runs::CallIntent;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -56,7 +56,7 @@ pub fn intent_key(run_id: Ulid, ordinal: u32) -> Vec<u8> {
 
 /// Looks up the call's intent and writes it as pending when it is new. A pending intent found
 /// here belongs to an earlier attempt, so it becomes unknown.
-pub fn begin(run_id: Ulid, intent: Intent) -> RowsOperation<BeginIntent> {
+pub fn begin(run_id: Ulid, intent: CallIntent) -> RowsOperation<BeginIntent> {
     RowsOperation::transaction(BeginIntent {
         run_id,
         intent,
@@ -67,7 +67,7 @@ pub fn begin(run_id: Ulid, intent: Intent) -> RowsOperation<BeginIntent> {
 #[derive(Debug, PartialEq)]
 pub struct BeginIntent {
     run_id: Ulid,
-    intent: Intent,
+    intent: CallIntent,
     /// The outcome once its intent row is sent.
     begun: Option<Begun>,
 }
@@ -122,7 +122,7 @@ impl Plan for BeginIntent {
 }
 
 /// Whether an earlier attempt of the run already wrote this call's intent.
-pub fn written(run_id: Ulid, intent: &Intent) -> RowsOperation<IntentWritten> {
+pub fn written(run_id: Ulid, intent: &CallIntent) -> RowsOperation<IntentWritten> {
     RowsOperation::direct(IntentWritten(intent_key(run_id, intent.ordinal)))
 }
 
@@ -145,24 +145,32 @@ impl Plan for IntentWritten {
 }
 
 /// The intent row that records the call's reply, written with the call's effect where it has one.
-pub(crate) fn settled_row(run_id: Ulid, intent: &Intent, reply: String) -> Result<Row, StoreError> {
+pub(crate) fn settled_row(
+    run_id: Ulid,
+    intent: &CallIntent,
+    reply: String,
+) -> Result<Row, StoreError> {
     intent_row(run_id, intent, IntentState::Settled { reply })
 }
 
 /// The intent row of a call whose effect may have happened without a recorded reply.
-pub(crate) fn unknown_row(run_id: Ulid, intent: &Intent, reason: &str) -> Result<Row, StoreError> {
+pub(crate) fn unknown_row(
+    run_id: Ulid,
+    intent: &CallIntent,
+    reason: &str,
+) -> Result<Row, StoreError> {
     let reason = reason.to_string();
     intent_row(run_id, intent, IntentState::Unknown { reason })
 }
 
 /// The key of a call's intent, removed when the call ended without an effect so it may be made
 /// again.
-pub(crate) fn intent_row_key(run_id: Ulid, intent: &Intent) -> (&'static str, Vec<u8>) {
+pub(crate) fn intent_row_key(run_id: Ulid, intent: &CallIntent) -> (&'static str, Vec<u8>) {
     let key = intent_key(run_id, intent.ordinal);
     (PLUGIN_INTENTS_KEYSPACE, key)
 }
 
-fn intent_row(run_id: Ulid, intent: &Intent, state: IntentState) -> Result<Row, StoreError> {
+fn intent_row(run_id: Ulid, intent: &CallIntent, state: IntentState) -> Result<Row, StoreError> {
     let record = IntentRecord {
         digest: intent.digest,
         state,
@@ -263,8 +271,10 @@ pub(crate) fn intent_keys(rows: Rows) -> Vec<(&'static str, Vec<u8>)> {
 mod tests {
     use super::*;
     use crate::driver::drive;
+    use crate::plugins::broker::call_intent;
     use crate::plugins::rows::{delete_rows, scan_rows, write_rows};
     use crate::plugins::runs::tests::opened;
+    use aruna_plugins::broker::Intent;
 
     #[tokio::test]
     async fn intent_outcomes() {
@@ -272,10 +282,10 @@ mod tests {
         let run = Ulid::from_parts(5, 1);
         let first = Intent::new(0, &[b"patch a"]);
         let second = Intent::new(1, &[b"patch b"]);
-        let begun = async |intent: &Intent| drive(begin(run, intent.clone()), &ctx).await;
+        let begun = async |intent: &Intent| drive(begin(run, call_intent(intent)), &ctx).await;
         let open = async || drive(open_intent(run), &ctx).await.unwrap();
         assert_eq!(begun(&first).await.unwrap(), Begun::Fresh);
-        let settled = settled_row(run, &first, "r2".into()).unwrap();
+        let settled = settled_row(run, &call_intent(&first), "r2".into()).unwrap();
         drive(write_rows(vec![settled]), &ctx).await.unwrap();
         assert_eq!(open().await, None);
         assert_eq!(begun(&first).await.unwrap(), Begun::Settled("r2".into()));
@@ -288,7 +298,7 @@ mod tests {
         assert!(matches!(begun(&second).await, Ok(Begun::Unknown(_))));
         assert!(matches!(begun(&second).await, Ok(Begun::Unknown(_))));
         let third = Intent::new(2, &[b"put"]);
-        let unknown = unknown_row(run, &third, "timed out").unwrap();
+        let unknown = unknown_row(run, &call_intent(&third), "timed out").unwrap();
         drive(write_rows(vec![unknown]), &ctx).await.unwrap();
         assert!(matches!(begun(&third).await, Ok(Begun::Unknown(_))));
 
@@ -308,7 +318,7 @@ mod tests {
     #[test]
     fn begin_decisions() {
         let run = Ulid::from_parts(5, 1);
-        let intent = Intent::new(0, &[b"patch a"]);
+        let intent = call_intent(&Intent::new(0, &[b"patch a"]));
         let record = |digest, state| {
             let record = IntentRecord { digest, state };
             Answer::Values(vec![Some(encode(&record).unwrap())])
@@ -347,7 +357,8 @@ mod tests {
     fn resolutions() {
         let run = Ulid::from_parts(5, 1);
         let row = |ordinal, state| {
-            let (_, key, value) = intent_row(run, &Intent::new(ordinal, &[]), state).unwrap();
+            let (_, key, value) =
+                intent_row(run, &call_intent(&Intent::new(ordinal, &[])), state).unwrap();
             (key.to_vec(), value.to_vec())
         };
         let rows = vec![
