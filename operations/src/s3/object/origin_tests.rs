@@ -169,7 +169,7 @@ async fn connector_name_read() {
         source_version: None,
         digests: Default::default(),
     };
-    let binding = crate::staging::descriptor::build_source_binding(
+    let binding = crate::connectors::descriptor::build_source_binding(
         StagingStrategy::Reference,
         &connector,
         &observed,

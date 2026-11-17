@@ -485,9 +485,9 @@ async fn serving_pin(context: &DriverContext, source: VersionSourceBinding) -> S
     };
     let event = context
         .storage_handle
-        .send_storage_effect(crate::staging::root_record::read_root(digest, None))
+        .send_storage_effect(crate::connectors::root_record::read_root(digest, None))
         .await;
-    let root = crate::staging::root_record::parse_root(event)
+    let root = crate::connectors::root_record::parse_root(event)
         .ok()
         .flatten();
     let full = root.and_then(|root| RootEntry::hydrate(&source, &root).ok().flatten());
@@ -2452,7 +2452,7 @@ mod tests {
             mirrors: Vec::new(),
         };
         let (compact, root) = RootEntry::compact(&full).unwrap().unwrap();
-        let (key_space, key, value) = crate::staging::root_record::root_write(&root).unwrap();
+        let (key_space, key, value) = crate::connectors::root_record::root_write(&root).unwrap();
         let write = aruna_core::effects::StorageEffect::Write {
             key_space,
             key,

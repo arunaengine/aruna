@@ -11,6 +11,7 @@ use crate::blob::managed_copy::{
 };
 use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::NATIVE_SET_ID;
+use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{RecordReadError, parse_read};
@@ -23,7 +24,6 @@ use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectMetadata, ReferenceAdvance, ReplicationMode, SyncOrigin,
     VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
 };
-use crate::staging::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};

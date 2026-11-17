@@ -16,10 +16,10 @@ use ulid::Ulid;
 use super::ItemFailure;
 use super::walk::{PageFailure, access_rules, connector_permission_path, record_failure};
 use crate::auth::permission_rules::PermissionRules;
+use crate::connectors::descriptor::build_source_descriptor;
 use crate::connectors::get_connector::{GetSourceError, GetSourceInput, GetSourceOperation};
 use crate::driver::drive;
 use crate::jobs::executor::JobContext;
-use crate::staging::descriptor::build_source_descriptor;
 use crate::staging::page::rows::PageEntry;
 
 /// Adds the further sources of each entry. An entry whose further source is invalid or not

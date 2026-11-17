@@ -24,10 +24,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use super::{PAGE_BYTES, PAGE_RECORDS};
+use crate::connectors::root_record::{hydrated, named_root};
 use crate::replication::protocol::VersionReplicationManifest;
 use crate::replication::queue::BlobJobRecord;
 use crate::replication::version_replication::ReplicateScopeTarget;
-use crate::staging::root_record::{hydrated, named_root};
 
 /// What a page does with one queued job.
 #[derive(Clone, Debug, PartialEq)]

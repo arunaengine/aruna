@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
+use crate::connectors::descriptor::{build_source_binding, build_source_descriptor};
 use crate::connectors::repository::{
     StorageReadError, connector_reference_write, parse_secret_read, read_secret_effect,
     source_connector_key,
@@ -20,7 +21,6 @@ use crate::node::usage_stats::{
 };
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
 use crate::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };

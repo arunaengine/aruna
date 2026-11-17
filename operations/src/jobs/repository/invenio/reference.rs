@@ -18,10 +18,10 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::connect;
+use crate::connectors::descriptor::build_source_binding;
 use crate::driver::drive;
 use crate::jobs::executor::JobContext;
 use crate::jobs::repository::{TransferError, interruptible};
-use crate::staging::descriptor::build_source_binding;
 use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
 
 pub(crate) async fn write_reference(
