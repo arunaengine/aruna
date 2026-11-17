@@ -275,32 +275,12 @@ pub fn read_publish_entry(draft_id: Ulid, txn_id: Option<TxnId>) -> Effect {
 #[cfg(test)]
 mod pure_tests {
     use super::{PublishEntry, PublishState, publish_key};
+    use crate::tests::device::record;
     use aruna_core::UserId;
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use craqle::VectorClock;
     use ulid::Ulid;
-
-    fn record() -> MetadataRegistryRecord {
-        let document_id = Ulid::from_bytes([2u8; 16]);
-        MetadataRegistryRecord {
-            realm_id: RealmId::from_bytes([3u8; 32]),
-            group_id: Ulid::from_bytes([1u8; 16]),
-            document_id,
-            document_path: "notes".to_string(),
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-            public: false,
-            permission_path: "/notes".to_string(),
-            placement: PlacementRef::NIL,
-            holder_node_ids: Vec::new(),
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            establishing_event_id: Ulid::from_bytes([4u8; 16]),
-            last_event_id: Ulid::from_bytes([5u8; 16]),
-        }
-    }
 
     fn batch() -> MetadataBatch {
         MetadataBatch {
