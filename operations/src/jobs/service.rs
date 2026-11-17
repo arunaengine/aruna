@@ -1448,7 +1448,7 @@ pub async fn read_artifact_range(
             Ok(ArtifactRead { blob, stream_size })
         }
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        event => Err(format!("unexpected hidden artifact read event: {event:?}")),
+        event => Err(format!("unexpected hidden artifact read event: {}", event.label())),
     }
 }
 

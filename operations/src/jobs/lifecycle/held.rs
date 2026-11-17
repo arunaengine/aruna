@@ -110,7 +110,7 @@ impl Operation for HeldReservations {
             (state, event) => self.finish(Err(LifecycleError::UnexpectedEvent {
                 state: format!("{state:?}"),
                 expected: "reservation page",
-                got: format!("{event:?}"),
+                got: event.label(),
             })),
         }
     }

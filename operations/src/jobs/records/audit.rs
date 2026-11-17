@@ -112,7 +112,7 @@ impl FamilyAuditOperation {
         smallvec![]
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(RecordStoreError::UnexpectedEvent {
             state,
@@ -160,7 +160,7 @@ impl Operation for FamilyAuditOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record page", format!("{other:?}")),
+                other => self.unexpected("record page", other.label()),
             },
             AuditState::Conflicts => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
@@ -173,10 +173,10 @@ impl Operation for FamilyAuditOperation {
                 // Conflict evidence is diagnostic: a failed read must not deny
                 // the audit page itself.
                 Event::Storage(StorageEvent::Error { .. }) => self.settle(Vec::new()),
-                other => self.unexpected("conflict page", format!("{other:?}")),
+                other => self.unexpected("conflict page", other.label()),
             },
             AuditState::Init | AuditState::Finish | AuditState::Error => {
-                self.unexpected("no event in a terminal state", format!("{event:?}"))
+                self.unexpected("no event in a terminal state", event.label())
             }
         }
     }

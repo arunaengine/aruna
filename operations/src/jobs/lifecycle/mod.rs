@@ -77,7 +77,7 @@ pub enum LifecycleError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 

@@ -82,7 +82,7 @@ pub(crate) async fn queue_rows(
     {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => return Err(LinkError::Unexpected(other.label().to_string())),
     };
     let mut rows = Vec::new();
     for ((link_id, document_id), (_, existing)) in candidates.into_iter().zip(queued) {
@@ -123,7 +123,7 @@ async fn scan_queue(
             next_start_after,
         }) => Ok((values, next_start_after)),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 
@@ -426,7 +426,7 @@ async fn settle_entry(
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => return Err(LinkError::Unexpected(other.label().to_string())),
     };
     let result = settle_in(storage, link_id, queued, retry_at, txn_id).await;
     if result.is_err() {
@@ -458,7 +458,7 @@ async fn settle_in(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => return Err(LinkError::Unexpected(other.label().to_string())),
     };
     let unchanged = current.as_ref() == Some(queued);
     let entry = |bytes: &Value| postcard::from_bytes::<LinkQueueEntry>(bytes).ok();
@@ -489,7 +489,7 @@ async fn settle_in(
         Event::Storage(StorageEvent::TransactionAborted { .. }) if aborting => return Ok(()),
         Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::WriteResult { .. }) => {}
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => return Err(LinkError::Unexpected(other.label().to_string())),
     }
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
@@ -497,7 +497,7 @@ async fn settle_in(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 
@@ -512,7 +512,7 @@ async fn delete_entry(storage: &StorageHandle, key: Key) -> Result<(), LinkError
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 
@@ -528,7 +528,7 @@ async fn write_row(storage: &StorageHandle, row: (String, Key, Value)) -> Result
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 

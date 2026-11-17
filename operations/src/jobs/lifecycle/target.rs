@@ -910,7 +910,7 @@ impl Operation for FetchFamilyOperation {
             other => Err(LifecycleError::UnexpectedEvent {
                 state: "Fetch".to_string(),
                 expected: "job record page",
-                got: format!("{other:?}"),
+                got: other.label(),
             }),
         });
         smallvec![]

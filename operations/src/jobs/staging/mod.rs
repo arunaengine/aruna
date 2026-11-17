@@ -347,7 +347,7 @@ pub(crate) async fn seed_checkpoint(
         aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::WriteResult {
             ..
         }) => Ok(()),
-        other => Err(format!("staging checkpoint not seeded: {other:?}")),
+        other => Err(format!("staging checkpoint not seeded: {}", other.label())),
     }
 }
 

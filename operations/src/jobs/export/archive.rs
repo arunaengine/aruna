@@ -952,7 +952,7 @@ pub(super) async fn assemble_export(
             Err(ExportFailure::Retryable(error.to_string()))
         }
         (event, _) => Err(ExportFailure::Retryable(format!(
-            "unexpected hidden artifact event: {event:?}"
+            "unexpected hidden artifact event: {}", event.label()
         ))),
     }
 }

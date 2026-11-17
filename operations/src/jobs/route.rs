@@ -140,7 +140,7 @@ impl Operation for JobRouteOperation {
                     self.finish(Err(JobRouteError::Unavailable(error.to_string())))
                 }
                 other => self.finish(Err(JobRouteError::Unavailable(format!(
-                    "unexpected event while loading realm config: {other:?}"
+                    "unexpected event while loading realm config: {}", other.label()
                 )))),
             },
             RouteState::AwaitResponse => match event {
@@ -152,7 +152,7 @@ impl Operation for JobRouteOperation {
                         "job owner unreachable: {message}"
                     )))),
                 other => self.finish(Err(JobRouteError::Unavailable(format!(
-                    "unexpected event while awaiting job response: {other:?}"
+                    "unexpected event while awaiting job response: {}", other.label()
                 )))),
             },
             RouteState::Done => smallvec![],

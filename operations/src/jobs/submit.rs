@@ -682,7 +682,7 @@ impl Operation for SubmitJobOperation {
                     self.read_dedup(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::GroupFence { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -697,7 +697,7 @@ impl Operation for SubmitJobOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadDedup { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult {
@@ -716,7 +716,7 @@ impl Operation for SubmitJobOperation {
                     self.check_active(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::VerifyDedup {
                 txn_id,
@@ -740,7 +740,7 @@ impl Operation for SubmitJobOperation {
                     self.check_active(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::CheckActive { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
@@ -752,7 +752,7 @@ impl Operation for SubmitJobOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ClaimUpload { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -767,42 +767,42 @@ impl Operation for SubmitJobOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadImport { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.import_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::CheckImportRun { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.import_run_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadSource { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.source_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::CheckSourceRun { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.source_run_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadBucket { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.bucket_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadRecord {
                 txn_id,
@@ -813,7 +813,7 @@ impl Operation for SubmitJobOperation {
                     self.record_read(txn_id, (set_id, member_id), value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::WriteJob { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => match txn_id {
@@ -824,7 +824,7 @@ impl Operation for SubmitJobOperation {
                     None => self.after_write(),
                 },
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::CommitTransaction { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.after_write(),
@@ -832,7 +832,7 @@ impl Operation for SubmitJobOperation {
                     error: StorageError::TransactionConflict,
                 }) => self.start_transaction(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ScheduleDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_created(),
@@ -846,7 +846,7 @@ impl Operation for SubmitJobOperation {
                 }
             },
             SubmitState::Finish | SubmitState::Error => {
-                self.fail(SubmitJobError::UnexpectedEvent(format!("{event:?}")))
+                self.fail(SubmitJobError::UnexpectedEvent(event.label().to_string()))
             }
         }
     }

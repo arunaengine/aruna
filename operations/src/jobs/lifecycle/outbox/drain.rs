@@ -81,7 +81,7 @@ impl DrainOutboxOperation {
         self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
             state: phase.to_string(),
             expected: "event of the current drain phase",
-            got: format!("{event:?}"),
+            got: event.label(),
         }));
         self.phase = Phase::Done;
         smallvec![]

@@ -592,7 +592,7 @@ async fn spool_source(
         }
         Event::Blob(BlobEvent::Error(error)) => Err(classify_blob(error)),
         other => Err(ImportFailure::Retryable(format!(
-            "unexpected hidden spool event: {other:?}"
+            "unexpected hidden spool event: {}", other.label()
         ))),
     }
 }
@@ -1871,7 +1871,7 @@ async fn read_report(
             Err(ImportFailure::Retryable(error.to_string()))
         }
         other => Err(ImportFailure::Retryable(format!(
-            "unexpected import report event: {other:?}"
+            "unexpected import report event: {}", other.label()
         ))),
     }
 }

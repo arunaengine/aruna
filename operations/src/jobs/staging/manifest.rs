@@ -251,7 +251,7 @@ pub(super) async fn manifest_digests(
     let values = match event {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected manifest read event: {other:?}")),
+        other => return Err(format!("unexpected manifest read event: {}", other.label())),
     };
     values
         .into_iter()

@@ -381,7 +381,7 @@ async fn list_page(
         .await
         .and_then(|event| match event {
             BlobEvent::ExternalListed { objects, next } => Ok((objects, next)),
-            other => Err(BlobError::ListError(format!("unexpected answer {other:?}"))),
+            other => Err(BlobError::ListError(format!("unexpected answer {}", other.label()))),
         })
 }
 
@@ -1066,7 +1066,7 @@ async fn page_intents(
             Event::Storage(StorageEvent::Error { error }) => {
                 return Err(ItemError::System(error.to_string()));
             }
-            other => return Err(ItemError::System(format!("unexpected answer {other:?}"))),
+            other => return Err(ItemError::System(format!("unexpected answer {}", other.label()))),
         };
         for (key, value) in values {
             let Some(path) = intent_path(&key) else {
@@ -1203,7 +1203,7 @@ async fn iterate(
             Event::Storage(StorageEvent::Error { error }) => {
                 return Err(ItemError::System(error.to_string()));
             }
-            other => return Err(ItemError::System(format!("unexpected answer {other:?}"))),
+            other => return Err(ItemError::System(format!("unexpected answer {}", other.label()))),
         }
     }
 }
@@ -1614,7 +1614,7 @@ async fn hash_object(
             Some(verified) => Ok((location, version, verified)),
             None => Err(ItemError::Changed),
         },
-        Ok(other) => Err(ItemError::System(format!("unexpected answer {other:?}"))),
+        Ok(other) => Err(ItemError::System(format!("unexpected answer {}", other.label()))),
         Err(error) => Err(hash_failure(error)),
     }
 }
@@ -1843,7 +1843,7 @@ async fn batch_read(
             Err(ItemError::System("short batch read".to_string()))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(ItemError::System(error.to_string())),
-        other => Err(ItemError::System(format!("unexpected answer {other:?}"))),
+        other => Err(ItemError::System(format!("unexpected answer {}", other.label()))),
     }
 }
 
@@ -1902,7 +1902,7 @@ async fn note_listing(
     note: Note<'_>,
 ) -> Result<bool, ItemError> {
     let storage = &context.storage_handle;
-    let unexpected = |event: Event| ItemError::System(format!("unexpected answer {event:?}"));
+    let unexpected = |event: Event| ItemError::System(format!("unexpected answer {}", event.label()));
     let started = StorageEffect::StartTransaction { read: false };
     let txn_id = match storage.send_storage_effect(started).await {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
@@ -2090,7 +2090,7 @@ impl Operation for BlobRequest {
             BlobEffect::ListExternal { .. } => Answer::Listed,
             BlobEffect::HashExternal { .. } => Answer::Hashed,
             other => {
-                let error = format!("not a listing or hashing request: {other:?}");
+                let error = format!("not a listing or hashing request: {}", other.label());
                 return self.finish(Err(BlobError::ReadError(error)));
             }
         };
@@ -2100,7 +2100,7 @@ impl Operation for BlobRequest {
 
     fn step(&mut self, event: Event) -> Effects {
         let RequestState::Sent(answer) = self.state else {
-            let error = format!("event outside a sent request: {event:?}");
+            let error = format!("event outside a sent request: {}", event.label());
             return self.finish(Err(BlobError::ReadError(error)));
         };
         match (answer, event) {
@@ -2110,7 +2110,7 @@ impl Operation for BlobRequest {
                 self.finish(Ok(event))
             }
             (_, other) => {
-                let error = format!("unexpected event {other:?}");
+                let error = format!("unexpected event {}", other.label());
                 self.finish(Err(BlobError::ReadError(error)))
             }
         }

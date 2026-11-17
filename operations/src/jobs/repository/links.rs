@@ -410,7 +410,7 @@ impl Operation for ChangeLinkOperation {
                 }
                 other => {
                     self.state = State::Done;
-                    self.output = Some(Err(LinkError::Unexpected(format!("{other:?}"))));
+                    self.output = Some(Err(LinkError::Unexpected(other.label().to_string())));
                     smallvec![]
                 }
             };
@@ -505,7 +505,7 @@ impl Operation for ChangeLinkOperation {
                 }
                 smallvec![]
             }
-            (_, other) => self.fail(LinkError::Unexpected(format!("{other:?}"))),
+            (_, other) => self.fail(LinkError::Unexpected(other.label().to_string())),
         }
     }
 
@@ -713,7 +713,7 @@ pub async fn list_links(
     )
     .await?;
     let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-        return Err(LinkError::Unexpected(format!("{event:?}")));
+        return Err(LinkError::Unexpected(event.label().to_string()));
     };
     Ok(links
         .into_iter()
@@ -746,7 +746,7 @@ pub(crate) async fn document_links(
             next_start_after,
         }) = event
         else {
-            return Err(LinkError::Unexpected(format!("{event:?}")));
+            return Err(LinkError::Unexpected(event.label().to_string()));
         };
         for (_, value) in values {
             links.push(RepositoryLink::from_bytes(&value)?);
@@ -776,7 +776,7 @@ pub async fn read_link(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
             .map(|bytes| RepositoryLink::from_bytes(&bytes))
             .transpose()?),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 
@@ -797,7 +797,7 @@ pub(crate) async fn read_secret(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
             .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
             .transpose()?),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 

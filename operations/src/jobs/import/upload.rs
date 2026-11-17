@@ -54,7 +54,7 @@ pub enum CreateRoCrateError {
     UnexpectedEvent {
         state: &'static str,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -190,7 +190,7 @@ impl CreateRoCrateOperation {
         let error = CreateRoCrateError::UnexpectedEvent {
             state: self.state_name(),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         };
         if self.hidden_key.is_some() {
             self.fail_with_cleanup(error)
@@ -501,7 +501,7 @@ pub async fn read_rocrate_upload(
             .map_err(|error| error.to_string()),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload read event: {other:?}")),
+        other => Err(format!("unexpected upload read event: {}", other.label())),
     }
 }
 
@@ -528,7 +528,7 @@ pub async fn write_rocrate_upload(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload write event: {other:?}")),
+        other => Err(format!("unexpected upload write event: {}", other.label())),
     }
 }
 
@@ -590,7 +590,7 @@ pub async fn delete_rocrate_upload(
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload delete event: {other:?}")),
+        other => Err(format!("unexpected upload delete event: {}", other.label())),
     }
 }
 
@@ -621,7 +621,7 @@ async fn claim_in_txn(
         }
         other => {
             return Err(UploadClaimError::Storage(format!(
-                "unexpected upload claim read event: {other:?}"
+                "unexpected upload claim read event: {}", other.label()
             )));
         }
     };
@@ -647,7 +647,7 @@ async fn claim_in_txn(
             Err(UploadClaimError::Storage(error.to_string()))
         }
         other => Err(UploadClaimError::Storage(format!(
-            "unexpected upload claim write event: {other:?}"
+            "unexpected upload claim write event: {}", other.label()
         ))),
     }
 }
@@ -659,7 +659,7 @@ async fn start_txn(storage: &StorageHandle) -> Result<TxnId, String> {
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload transaction event: {other:?}")),
+        other => Err(format!("unexpected upload transaction event: {}", other.label())),
     }
 }
 

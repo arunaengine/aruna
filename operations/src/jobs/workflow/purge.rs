@@ -109,7 +109,7 @@ async fn run_fenced_purge(
             incarnation = read_incarnation(storage, spec.scope.bucket(), None)
                 .await
                 .map_err(|event| {
-                    JobError::retryable(format!("purge bucket read failed: {event:?}"))
+                    JobError::retryable(format!("purge bucket read failed: {}", event.label()))
                 })?;
             bucket_info = Some(info);
             true
@@ -290,7 +290,7 @@ async fn write_purge_audit(
         .to_bytes()
         .map_err(|error| JobError::retryable(format!("purge audit encode failed: {error}")))?;
     let storage = &ctx.driver.storage_handle;
-    let failed = |event: Event| JobError::retryable(format!("purge audit write failed: {event:?}"));
+    let failed = |event: Event| JobError::retryable(format!("purge audit write failed: {}", event.label()));
     let started = StorageEffect::StartTransaction { read: false };
     let txn_id = match storage.send_storage_effect(started).await {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
@@ -792,7 +792,7 @@ async fn drop_indexes(
     match ctx.driver.storage_handle.send_storage_effect(delete).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         other => {
-            let error = format!("purge could not drop copy indexes: {other:?}");
+            let error = format!("purge could not drop copy indexes: {}", other.label());
             Err(JobError::retryable(error).into())
         }
     }

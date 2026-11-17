@@ -99,7 +99,7 @@ async fn quota_revision(context: &DriverContext, group_id: GroupId) -> Result<u6
             .transpose()
             .map(Option::unwrap_or_default),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("quota revision read failed: {other:?}")),
+        other => Err(format!("quota revision read failed: {}", other.label())),
     }
 }
 

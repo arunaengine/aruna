@@ -1530,7 +1530,7 @@ async fn start_read_txn(ctx: &DriverContext) -> Result<TxnId, ExportFailure> {
             Err(ExportFailure::Retryable(error.to_string()))
         }
         event => Err(ExportFailure::Retryable(format!(
-            "unexpected storage transaction event: {event:?}"
+            "unexpected storage transaction event: {}", event.label()
         ))),
     }
 }
@@ -1549,7 +1549,7 @@ async fn commit_read_txn(ctx: &DriverContext, txn_id: TxnId) -> Result<(), Expor
         event => {
             abort_read_txn(ctx, txn_id).await;
             Err(ExportFailure::Retryable(format!(
-                "unexpected storage commit event: {event:?}"
+                "unexpected storage commit event: {}", event.label()
             )))
         }
     }
@@ -1694,7 +1694,7 @@ async fn storage_value(
             Err(ExportFailure::Retryable(error.to_string()))
         }
         event => Err(ExportFailure::Retryable(format!(
-            "unexpected storage read event: {event:?}"
+            "unexpected storage read event: {}", event.label()
         ))),
     }
 }
@@ -2097,7 +2097,7 @@ async fn open_local_txn(
         }
         Event::Blob(BlobEvent::Error(_)) => Ok(CandidateOpen::Status(OpenStatus::Offline)),
         event => Err(ExportFailure::Retryable(format!(
-            "unexpected local blob read event: {event:?}"
+            "unexpected local blob read event: {}", event.label()
         ))),
     }
 }
@@ -2128,7 +2128,7 @@ async fn read_admission(
             Ok(Err(key))
         }
         event => Err(ExportFailure::Retryable(format!(
-            "read admission failed: {event:?}"
+            "read admission failed: {}", event.label()
         ))),
     }
 }

@@ -244,7 +244,7 @@ impl Operation for ExecutionChainOperation {
             self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
                 state: "execution chain".to_string(),
                 expected: "storage page",
-                got: format!("{event:?}"),
+                got: event.label(),
             }));
             return smallvec![];
         }

@@ -55,7 +55,7 @@ impl Operation for AliasFamilyOperation {
     fn step(&mut self, event: Event) -> Effects {
         let outcome = match event {
             _ if !self.started || self.outcome.is_some() => Err(JobRouteError::Unavailable(
-                format!("unexpected storage event: {event:?}"),
+                format!("unexpected storage event: {}", event.label()),
             )),
             Event::Storage(StorageEvent::IterResult { values, .. }) => {
                 Ok(values.iter().filter_map(|(key, _)| alias_family(key)).min())
@@ -64,7 +64,7 @@ impl Operation for AliasFamilyOperation {
                 Err(JobRouteError::Unavailable(error.to_string()))
             }
             other => Err(JobRouteError::Unavailable(format!(
-                "unexpected storage event: {other:?}"
+                "unexpected storage event: {}", other.label()
             ))),
         };
         self.finish(outcome)

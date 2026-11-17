@@ -233,7 +233,7 @@ pub(crate) async fn read_row(
             Ok(value.map(|value| value.to_vec()))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        other => Err(format!("unexpected storage event: {}", other.label())),
     }
 }
 

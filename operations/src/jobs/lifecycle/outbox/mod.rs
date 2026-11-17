@@ -238,7 +238,7 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Read".to_string(),
                     expected: "outbox read result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Offer => match event {
@@ -277,7 +277,7 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Offer".to_string(),
                     expected: "job record publish result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Store => match event {
@@ -286,7 +286,7 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Store".to_string(),
                     expected: "outbox write result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Clear => match event {
@@ -295,14 +295,14 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Clear".to_string(),
                     expected: "outbox delete result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Init | PublishState::Finish | PublishState::Error => {
                 self.fail(LifecycleError::UnexpectedEvent {
                     state: format!("{:?}", self.state),
                     expected: "no event",
-                    got: format!("{event:?}"),
+                    got: event.label(),
                 })
             }
         }

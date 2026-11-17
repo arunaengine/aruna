@@ -111,7 +111,7 @@ impl Operation for LoadFamilyOperation {
     fn step(&mut self, event: Event) -> Effects {
         if !self.started || self.outcome.is_some() {
             return self.finish(Err(FamilyReadError::Storage(format!(
-                "unexpected storage event: {event:?}"
+                "unexpected storage event: {}", event.label()
             ))));
         }
         match event {
@@ -138,7 +138,7 @@ impl Operation for LoadFamilyOperation {
                 self.finish(Err(FamilyReadError::Storage(error.to_string())))
             }
             other => self.finish(Err(FamilyReadError::Storage(format!(
-                "unexpected storage event: {other:?}"
+                "unexpected storage event: {}", other.label()
             )))),
         }
     }

@@ -62,7 +62,7 @@ pub async fn store_pages(
     };
     match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(PageReadError::Storage(format!("{other:?}"))),
+        other => Err(PageReadError::Storage(other.label().to_string())),
     }
 }
 
@@ -79,7 +79,7 @@ pub async fn local_page(
     };
     let bytes = match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => return Err(PageReadError::Storage(format!("{other:?}"))),
+        other => return Err(PageReadError::Storage(other.label().to_string())),
     };
     let Some(bytes) = bytes else {
         return Ok(None);

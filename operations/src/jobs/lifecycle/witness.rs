@@ -1097,7 +1097,7 @@ async fn start_txn(context: &DriverContext) -> Result<TxnId, LifecycleError> {
         other => Err(LifecycleError::UnexpectedEvent {
             state: "start transaction".to_string(),
             expected: "transaction started",
-            got: format!("{other:?}"),
+            got: other.label(),
         }),
     }
 }
@@ -1113,7 +1113,7 @@ async fn commit_txn(context: &DriverContext, txn_id: TxnId) -> Result<(), Lifecy
         other => Err(LifecycleError::UnexpectedEvent {
             state: "commit transaction".to_string(),
             expected: "transaction committed",
-            got: format!("{other:?}"),
+            got: other.label(),
         }),
     }
 }
@@ -1147,7 +1147,7 @@ async fn read_row_txn<T: for<'a> Deserialize<'a>>(
         other => Err(LifecycleError::UnexpectedEvent {
             state: "read".to_string(),
             expected: "read result",
-            got: format!("{other:?}"),
+            got: other.label(),
         }),
     }
 }
@@ -1186,7 +1186,7 @@ async fn write_row_txn<T: Serialize>(
         other => Err(LifecycleError::UnexpectedEvent {
             state: "write".to_string(),
             expected: "write result",
-            got: format!("{other:?}"),
+            got: other.label(),
         }),
     }
 }
@@ -1245,7 +1245,7 @@ impl Operation for OfferLaunchOperation {
             self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
                 state: "Settled".to_string(),
                 expected: "no further event",
-                got: format!("{event:?}"),
+                got: event.label(),
             }));
             return smallvec![];
         }
@@ -1267,7 +1267,7 @@ impl Operation for OfferLaunchOperation {
             other => Err(LifecycleError::UnexpectedEvent {
                 state: "Offer".to_string(),
                 expected: "launch offer result",
-                got: format!("{other:?}"),
+                got: other.label(),
             }),
         });
         self.sent = false;
