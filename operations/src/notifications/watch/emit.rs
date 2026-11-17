@@ -181,7 +181,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::create_local_watch;
+    use crate::tests::notifications::create_local_watch;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

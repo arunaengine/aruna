@@ -1,55 +1,23 @@
-//! Creates, deletes and lists the durable watch subscriptions on the holder node.
+//! Creates and deletes the durable watch subscriptions on the holder node after the owner's
+//! READ check.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
-use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
-    WATCH_USER_CAP, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
-    watch_subscription_prefix,
+    WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::types::TxnId;
-use aruna_storage::StorageHandle;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::notifications::watch::authorization::evaluate_watch_creation;
-use crate::notifications::watch::digest::dirty_marker_write;
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
-    WatchReplication, WatchSubscriptionError, validated_subscription, watch_delete_replication,
-    watch_subscription_target, watch_upsert_replication,
+    WatchSubscriptionError, validated_subscription, watch_delete_replication,
+    watch_upsert_replication,
 };
-use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
-
-enum CreateFailure {
-    Cap,
-    Conflict,
-    Fatal(String),
-}
-
-pub async fn create_local_watch(
-    storage: &StorageHandle,
-    owner: UserId,
-    path_prefix: String,
-    event_mask: WatchEventMask,
-    now_ms: u64,
-) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let subscription = validated_subscription(
-        owner,
-        path_prefix,
-        event_mask,
-        now_ms,
-        WatchAuthorizationBinding::default(),
-    )?;
-    create_subscription(storage, subscription, None).await
-}
+use crate::notifications::watch::store::StoreWatchOperation;
 
 /// The one holder-side create path, used by both the local API arm and the holder
 /// RPC. A proxying peer's assertion is not authority, so the holder re-derives
@@ -89,145 +57,9 @@ pub async fn create_holder_watch(
         }
     }
     let replication = watch_upsert_replication(local_node_id, &subscription)?;
-    let subscription =
-        create_subscription(&context.storage_handle, subscription, Some(replication)).await?;
-    schedule_replication(context).await;
+    let store = StoreWatchOperation::create(subscription.clone(), Some(replication));
+    drive(store, context).await?;
     Ok(subscription)
-}
-
-async fn create_subscription(
-    storage: &StorageHandle,
-    subscription: WatchSubscription,
-    replication: Option<WatchReplication>,
-) -> Result<WatchSubscription, WatchSubscriptionError> {
-    match create_once(storage, &subscription, replication.as_ref()).await {
-        Ok(()) => Ok(subscription),
-        Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
-        Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
-        Err(CreateFailure::Conflict) => {
-            match create_once(storage, &subscription, replication.as_ref()).await {
-                Ok(()) => Ok(subscription),
-                Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
-                Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
-                Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
-                    "watch subscription create conflicted twice".to_string(),
-                )),
-            }
-        }
-    }
-}
-
-async fn create_once(
-    storage: &StorageHandle,
-    subscription: &WatchSubscription,
-    replication: Option<&WatchReplication>,
-) -> Result<(), CreateFailure> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-        other => {
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let existing = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            prefix: Some(watch_subscription_prefix(subscription.owner)),
-            start: None,
-            limit: WATCH_USER_CAP.saturating_add(1),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-    if existing.len() >= WATCH_USER_CAP {
-        abort_txn(storage, txn_id).await;
-        return Err(CreateFailure::Cap);
-    }
-
-    let subscription_write = match watch_write_entry(subscription) {
-        Ok(entry) => entry,
-        Err(error) => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(error.to_string()));
-        }
-    };
-    let mut writes = vec![subscription_write];
-    writes.push(dirty_marker_write(subscription.owner.realm_id));
-    if let Some(replication) = replication {
-        let target = watch_subscription_target(subscription.owner, subscription.watch_id);
-        let revision_entry = match sync_revision_entry(&target, &replication.revision) {
-            Ok(entry) => entry,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(CreateFailure::Fatal(error.to_string()));
-            }
-        };
-        let outbox_entry = match outbox_write_entry(&replication.outbox) {
-            Ok(entry) => entry,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(CreateFailure::Fatal(error.to_string()));
-            }
-        };
-        writes.push(revision_entry);
-        writes.push(outbox_entry);
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
-        other => Err(CreateFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-pub async fn delete_local_watch(
-    storage: &StorageHandle,
-    owner: UserId,
-    watch_id: Ulid,
-) -> Result<(), WatchSubscriptionError> {
-    delete_subscription(storage, owner, watch_id, None)
-        .await
-        .map(|_| ())
 }
 
 pub async fn delete_holder_watch(
@@ -238,193 +70,8 @@ pub async fn delete_holder_watch(
     now_ms: u64,
 ) -> Result<(), WatchSubscriptionError> {
     let replication = watch_delete_replication(local_node_id, owner, watch_id, now_ms);
-    let deleted =
-        delete_subscription(&context.storage_handle, owner, watch_id, Some(replication)).await?;
-    if deleted {
-        schedule_replication(context).await;
-    }
-    Ok(())
-}
-
-async fn delete_subscription(
-    storage: &StorageHandle,
-    owner: UserId,
-    watch_id: Ulid,
-    replication: Option<WatchReplication>,
-) -> Result<bool, WatchSubscriptionError> {
-    match delete_once(storage, owner, watch_id, replication.as_ref()).await {
-        Ok(deleted) => Ok(deleted),
-        Err(CreateFailure::Conflict) => {
-            match delete_once(storage, owner, watch_id, replication.as_ref()).await {
-                Ok(deleted) => Ok(deleted),
-                Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
-                    "watch subscription delete conflicted twice".to_string(),
-                )),
-                Err(other) => Err(delete_failure(other)),
-            }
-        }
-        Err(other) => Err(delete_failure(other)),
-    }
-}
-
-fn delete_failure(failure: CreateFailure) -> WatchSubscriptionError {
-    match failure {
-        CreateFailure::Fatal(error) => WatchSubscriptionError::Storage(error),
-        // A delete never checks the per-user cap, so this is unreachable; map it
-        // defensively rather than panicking.
-        CreateFailure::Cap => {
-            WatchSubscriptionError::Storage("unexpected cap failure on delete".to_string())
-        }
-        CreateFailure::Conflict => WatchSubscriptionError::Storage(
-            "watch subscription delete conflicted twice".to_string(),
-        ),
-    }
-}
-
-async fn delete_once(
-    storage: &StorageHandle,
-    owner: UserId,
-    watch_id: Ulid,
-    replication: Option<&WatchReplication>,
-) -> Result<bool, CreateFailure> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-        other => {
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let (_, subscription_key) = watch_delete_entry(owner, watch_id);
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            key: subscription_key,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            abort_txn(storage, txn_id).await;
-            return Ok(false);
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    let (key_space, key) = watch_delete_entry(owner, watch_id);
-    match storage
-        .send_storage_effect(StorageEffect::Delete {
-            key_space,
-            key,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    let mut writes = vec![dirty_marker_write(owner.realm_id)];
-    if let Some(replication) = replication {
-        let target = watch_subscription_target(owner, watch_id);
-        let revision_entry = match sync_revision_entry(&target, &replication.revision) {
-            Ok(entry) => entry,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(CreateFailure::Fatal(error.to_string()));
-            }
-        };
-        let outbox_entry = match outbox_write_entry(&replication.outbox) {
-            Ok(entry) => entry,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(CreateFailure::Fatal(error.to_string()));
-            }
-        };
-        writes.push(revision_entry);
-        writes.push(outbox_entry);
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
-        other => Err(CreateFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-async fn schedule_replication(context: &DriverContext) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        return;
-    };
-    let _ = task_handle.send_effect(schedule_drain_effect()).await;
-}
-
-fn classify(error: StorageError) -> CreateFailure {
-    if matches!(error, StorageError::TransactionConflict) {
-        CreateFailure::Conflict
-    } else {
-        CreateFailure::Fatal(error.to_string())
-    }
-}
-
-async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
-    let _ = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
-}
-
-async fn abort_and_classify(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    error: StorageError,
-) -> CreateFailure {
-    abort_txn(storage, txn_id).await;
-    classify(error)
+    let store = StoreWatchOperation::delete(owner, watch_id, Some(replication));
+    drive(store, context).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -435,7 +82,13 @@ mod tests {
         ListWatchesOperation, SUBSCRIPTION_PAGE_LIMIT, WatchScope,
     };
     use crate::notifications::watch::records::decode_stored_subscription;
+    use crate::tests::notifications::{create_local_watch, delete_local_watch};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::storage_entries::watch_write_entry;
+    use aruna_core::structs::execution::notification_watch::WATCH_USER_CAP;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_storage::StorageHandle;
 
     async fn list_scope(
         storage: &StorageHandle,

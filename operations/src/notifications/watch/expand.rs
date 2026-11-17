@@ -683,7 +683,8 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::{create_holder_watch, create_local_watch};
+    use crate::notifications::watch::subscriptions::create_holder_watch;
+    use crate::tests::notifications::create_local_watch;
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
         let dir = tempdir().expect("temp dir");

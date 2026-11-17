@@ -647,7 +647,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::{create_local_watch, delete_local_watch};
+    use crate::tests::notifications::{create_local_watch, delete_local_watch};
 
     fn test_ctx(root: &str) -> DriverContext {
         DriverContext {

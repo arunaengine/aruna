@@ -20,8 +20,8 @@ use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
-use crate::notifications::watch::subscriptions::create_local_watch;
 use crate::sync::incoming::initialize_incoming_fixture;
+use crate::tests::notifications::create_local_watch;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, WATCH_INTEREST_KEYSPACE,

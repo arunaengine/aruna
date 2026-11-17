@@ -19,7 +19,8 @@ use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
 use aruna_core::structs::execution::notification_watch::{
-    WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable, watch_resource_path,
+    WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable, WatchSubscription,
+    watch_resource_path,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -42,7 +43,7 @@ use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::notifications::watch::subscriptions::create_local_watch;
+use aruna_operations::notifications::watch::store::StoreWatchOperation;
 use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aruna_operations::s3::object::get::ObjectInfo;
 use aruna_operations::s3::object::list::ListContinuationToken;
@@ -620,15 +621,11 @@ async fn put_expands_watch() {
         watch_prefix.clone(),
     ));
     install_watch_authorization(&context, realm_id, net.node_id(), group_id, watcher).await;
-    create_local_watch(
-        &context.storage_handle,
-        watcher,
-        watch_prefix,
-        WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
-        0,
-    )
-    .await
-    .expect("watch subscription creates");
+    let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+    let subscription = WatchSubscription::new(watcher, watch_prefix, mask, 0);
+    drive(StoreWatchOperation::create(subscription, None), &context)
+        .await
+        .expect("watch subscription creates");
     let auth = AuthContext {
         user_id,
         realm_id,
