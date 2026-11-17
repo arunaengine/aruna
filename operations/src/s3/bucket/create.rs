@@ -332,17 +332,21 @@ mod mapped_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::effects::BlobEffect;
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::BlobError;
-    use aruna_core::events::BlobEvent;
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
     use aruna_core::structs::storage::backend_import::BackendImport;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
-    use aruna_core::types::{Key, TxnId};
+    use aruna_core::task::{TaskEvent, TaskKey};
+    use aruna_core::types::{Effects, TxnId};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
+
+    type Stepper = crate::stepper::Stepper<BucketInfo, CreateBucketError>;
 
     const GROUP: Ulid = Ulid::from_parts(1, 1);
     const BACKEND: Ulid = Ulid::from_parts(2, 2);
@@ -396,13 +400,6 @@ mod mapped_tests {
         routing.to_bytes().unwrap().into()
     }
 
-    fn read(value: Option<Value>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value,
-        })
-    }
-
     fn batch(values: Vec<Option<Value>>) -> Event {
         let values = values
             .into_iter()
@@ -429,16 +426,16 @@ mod mapped_tests {
     }
 
     /// Runs a mapped create up to the ensure of the provider bucket.
-    fn until_ensure(txn_id: TxnId) -> (CreateBucketOperation, Effects) {
+    fn until_ensure(txn_id: TxnId) -> (Stepper, Effects) {
         until_ensure_on(txn_id, storage())
     }
 
-    fn until_ensure_on(txn_id: TxnId, storage: Value) -> (CreateBucketOperation, Effects) {
-        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
-        operation.start();
+    fn until_ensure_on(txn_id: TxnId, storage: Value) -> (Stepper, Effects) {
+        let (mut operation, _) =
+            Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(batch(vec![None, None]));
-        operation.step(read(Some(routing())));
+        operation.step(batch(vec![Some(routing())]));
         operation.step(batch(vec![Some(storage.clone()), Some(group())]));
         operation.step(Event::Storage(StorageEvent::IterResult {
             values: Vec::new(),
@@ -521,10 +518,15 @@ mod mapped_tests {
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
         );
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
         }));
-        assert_eq!(operation.finalize(), Ok(info()));
+        assert_eq!(effects.as_slice(), [schedule_snapshot_publish()]);
+        operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::PublishUsageSnapshots,
+            after: std::time::Duration::ZERO,
+        }));
+        assert_eq!(operation.finish(), Ok(info()));
     }
 
     #[test]
@@ -546,30 +548,30 @@ mod mapped_tests {
         let template = storage_with(("bucket_template", "aruna-{group}-{bucket}"));
         let mut odd = Group::from_bytes(&group()).unwrap();
         odd.display_name = "lab/sub".to_string();
-        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
-        operation.start();
+        let (mut operation, _) =
+            Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
         operation.step(batch(vec![None, None]));
-        operation.step(read(Some(routing())));
+        operation.step(batch(vec![Some(routing())]));
         let odd = postcard::to_allocvec(&odd).unwrap().into();
         operation.step(batch(vec![Some(template.clone()), Some(odd)]));
         assert!(matches!(
-            operation.finalize(),
+            operation.finish(),
             Err(CreateBucketError::ProviderBucket(ImportRuleError::Invalid(
                 _
             )))
         ));
 
         // A provider bucket another rule uses is never linked again.
-        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
-        operation.start();
+        let (mut operation, _) =
+            Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
         operation.step(batch(vec![None, None]));
-        operation.step(read(Some(routing())));
+        operation.step(batch(vec![Some(routing())]));
         operation.step(batch(vec![Some(template), Some(group())]));
         let rule = BackendImport {
             import_id: Ulid::from_parts(5, 5),
@@ -593,7 +595,7 @@ mod mapped_tests {
             next_start_after: None,
         }));
         assert!(matches!(
-            operation.finalize(),
+            operation.finish(),
             Err(CreateBucketError::ProviderBucket(
                 ImportRuleError::Conflict(_)
             ))
@@ -612,7 +614,7 @@ mod mapped_tests {
         );
         assert!(operation.is_complete());
         assert!(matches!(
-            operation.finalize(),
+            operation.finish(),
             Err(CreateBucketError::ProviderBucket(ImportRuleError::Invalid(
                 _
             )))
@@ -621,8 +623,7 @@ mod mapped_tests {
 
     #[test]
     fn mirrors_skip_mapping() {
-        let mut operation = CreateBucketOperation::new("x".to_string(), info());
-        operation.start();
+        let (mut operation, _) = Stepper::new(CreateBucketOperation::new("x".to_string(), info()));
         let txn_id = TxnId::default();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(batch(vec![None, None]));
@@ -638,6 +639,8 @@ mod mapped_tests {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::storage::format::Compression;
     use aruna_storage::storage;
     use std::time::SystemTime;
