@@ -2,12 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PURGE_FILES_KEYSPACE;
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::operation::Operation;
+use aruna_core::types::Key;
 use ulid::Ulid;
 
 fn pause_key(job_id: Ulid) -> Key {
@@ -18,10 +16,17 @@ fn pause_key(job_id: Ulid) -> Key {
 pub enum PauseError {
     #[error("could not change the purge pause: {0}")]
     Storage(#[from] aruna_core::errors::StorageError),
-    #[error("unexpected event for the purge pause: {0}")]
-    UnexpectedEvent(String),
-    #[error("the purge pause did not finish")]
-    NotFinished,
+    #[error("unexpected answer for the purge pause: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for PauseError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 /// Pauses or resumes the purge `job_id` between its batches.
@@ -29,65 +34,30 @@ pub enum PauseError {
 pub struct PausePurgeOperation {
     job_id: Ulid,
     paused: bool,
-    output: Option<Result<(), PauseError>>,
 }
 
 impl PausePurgeOperation {
     pub fn new(job_id: Ulid, paused: bool) -> Self {
-        Self {
-            job_id,
-            paused,
-            output: None,
-        }
+        Self { job_id, paused }
     }
 }
 
-impl EffectOperation for PausePurgeOperation {
+impl Operation for PausePurgeOperation {
     type Output = ();
     type Error = PauseError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<()>, PauseError> {
         let key = pause_key(self.job_id);
-        let effect = match self.paused {
-            true => StorageEffect::Write {
-                key_space: PURGE_FILES_KEYSPACE.to_string(),
-                key,
-                value: Vec::new().into(),
-                txn_id: None,
-            },
-            false => StorageEffect::Delete {
-                key_space: PURGE_FILES_KEYSPACE.to_string(),
-                key,
-                txn_id: None,
-            },
-        };
-        smallvec![Effect::Storage(effect)]
+        let space = PURGE_FILES_KEYSPACE.to_string();
+        Ok(Next::Call(match self.paused {
+            true => IoCall::Write(vec![(space, key, Vec::new().into())]),
+            false => IoCall::Delete(vec![(space, key)]),
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(match (&self.output, event) {
-            (
-                None,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-                ),
-            ) => Ok(()),
-            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(PauseError::UnexpectedEvent(event.label().to_string())),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<(), PauseError> {
-        self.output.unwrap_or(Err(PauseError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, PauseError> {
+        result.done()?;
+        Ok(Next::Done(()))
     }
 }
 
@@ -95,49 +65,25 @@ impl EffectOperation for PausePurgeOperation {
 #[derive(Debug, PartialEq)]
 pub struct PausedOperation {
     job_id: Ulid,
-    output: Option<Result<bool, PauseError>>,
 }
 
 impl PausedOperation {
     pub fn new(job_id: Ulid) -> Self {
-        Self {
-            job_id,
-            output: None,
-        }
+        Self { job_id }
     }
 }
 
-impl EffectOperation for PausedOperation {
+impl Operation for PausedOperation {
     type Output = bool;
     type Error = PauseError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: PURGE_FILES_KEYSPACE.to_string(),
-            key: pause_key(self.job_id),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<bool>, PauseError> {
+        let read = (PURGE_FILES_KEYSPACE.to_string(), pause_key(self.job_id));
+        Ok(Next::Call(IoCall::Read(vec![read])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(match (&self.output, event) {
-            (None, Event::Storage(StorageEvent::ReadResult { value, .. })) => Ok(value.is_some()),
-            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(PauseError::UnexpectedEvent(event.label().to_string())),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<bool, PauseError> {
-        self.output.unwrap_or(Err(PauseError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, PauseError> {
+        Ok(Next::Done(result.value()?.is_some()))
     }
 }
 
@@ -147,47 +93,35 @@ mod tests {
 
     #[test]
     fn pause_marks_reads() {
-        use aruna_core::operation_check::{
-            check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-        };
         let job_id = Ulid::from_parts(5, 5);
+        let space = || PURGE_FILES_KEYSPACE.to_string();
         let mut pause = PausePurgeOperation::new(job_id, true);
-        let write = Effect::Storage(StorageEffect::Write {
-            key_space: PURGE_FILES_KEYSPACE.to_string(),
-            key: pause_key(job_id),
-            value: Vec::new().into(),
-            txn_id: None,
-        });
-        let written = Event::Storage(StorageEvent::WriteResult {
-            key: pause_key(job_id),
-        });
-        check_trace(&mut pause, &[write], vec![(written, vec![])]);
-        assert_eq!(pause.finalize(), Ok(()));
-        let mut read = PausedOperation::new(job_id);
-        read.start();
-        read.step(Event::Storage(StorageEvent::ReadResult {
-            key: pause_key(job_id),
-            value: Some(Vec::new().into()),
-        }));
-        assert_eq!(read.finalize(), Ok(true));
-        let failed = Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::Timeout,
-        });
+        let write = IoCall::Write(vec![(space(), pause_key(job_id), Vec::new().into())]);
+        assert_eq!(pause.first(), Ok(Next::Call(write)));
+        assert_eq!(pause.next(IoResult::Done), Ok(Next::Done(())));
         let mut resume = PausePurgeOperation::new(job_id, false);
-        resume.start();
-        resume.step(failed);
-        assert!(matches!(resume.finalize(), Err(PauseError::Storage(_))));
-        let reading = || {
-            let mut operation = PausedOperation::new(job_id);
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(reading, sample_events, |event| {
-            matches!(event, Event::Storage(StorageEvent::ReadResult { .. }))
-        });
-        assert_eq!(refused.len(), sample_events().len() - 1);
-        let mut open = reading();
-        check_abort(&mut open, &[]);
-        rejects_finalize(open);
+        let delete = IoCall::Delete(vec![(space(), pause_key(job_id))]);
+        assert_eq!(resume.first(), Ok(Next::Call(delete)));
+        let mut read = PausedOperation::new(job_id);
+        let call = IoCall::Read(vec![(space(), pause_key(job_id))]);
+        assert_eq!(read.first(), Ok(Next::Call(call)));
+        let marked = IoResult::Values(vec![Some(Vec::new().into())]);
+        assert_eq!(read.next(marked), Ok(Next::Done(true)));
+        assert_eq!(
+            read.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(false))
+        );
+    }
+
+    #[test]
+    fn pause_answer_errors() {
+        let mut pause = PausePurgeOperation::new(Ulid::from_parts(5, 5), true);
+        let wrong = pause.next(IoResult::Woke);
+        assert!(matches!(
+            wrong,
+            Err(PauseError::Io(IoError::Unexpected { .. }))
+        ));
+        let storage = PauseError::from(IoError::Storage(aruna_core::errors::StorageError::Timeout));
+        assert!(matches!(storage, PauseError::Storage(_)));
     }
 }
