@@ -15,7 +15,7 @@ use crate::document_sync::{
 };
 use crate::error::{NetError, Result};
 
-use super::validate::{validate_pid_mapping, validate_policy_document};
+use aruna_core::sync_checks::{validate_pid_mapping, validate_policy_document};
 
 pub(super) enum MetadataOutcome {
     Applied {

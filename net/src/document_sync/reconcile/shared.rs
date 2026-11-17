@@ -13,7 +13,7 @@ use crate::document_sync::storage::storage_read_from;
 use crate::document_sync::{DocumentSyncService, SyncRejection, node_to_peer};
 use crate::error::{NetError, Result};
 
-use super::validate::{
+use aruna_core::sync_checks::{
     validate_node_upsert, validate_register_upsert, validate_usage_upsert, validate_watch_delete,
     validate_watch_interest, validate_watch_upsert,
 };

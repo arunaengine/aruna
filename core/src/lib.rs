@@ -58,6 +58,7 @@ pub mod storage_entries;
 pub mod stream;
 pub mod structs;
 pub mod structured_id;
+pub mod sync_checks;
 pub mod task;
 pub mod telemetry;
 pub mod time;

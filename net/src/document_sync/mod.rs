@@ -60,10 +60,7 @@ use aruna_core::storage_entries::{
     stale_conflict_deletes, subject_index_key, subject_index_value, sync_revision_entry,
     sync_revision_key,
 };
-use aruna_core::structs::execution::notification_watch::{
-    INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest,
-    WatchSubscription, interest_dirty_key, interest_node_id, interest_realm_id,
-};
+use aruna_core::structs::execution::notification_watch::{WatchSubscription, interest_dirty_key};
 use aruna_core::structs::identity::auth::Role;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
 use aruna_core::structs::identity::realm::{
@@ -80,14 +77,16 @@ use aruna_core::structs::placement::record::{
     PoolAdmission, admit_band_pool, coordinator_spans,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::storage::node_info::{NodeInfoDocument, reserved_label};
-use aruna_core::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
+use aruna_core::structs::storage::node_info::reserved_label;
 use aruna_core::structs::{
-    PersistentIdKind, PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
-    QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
-    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
-    persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
-    secondary_index_deletes, secondary_index_entries,
+    PersistentIdMapping, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError,
+    SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage,
+    build_quarantine_entries, persistent_id_change, persistent_id_key, persistent_id_target,
+    quarantine_usage_entry, secondary_index_deletes, secondary_index_entries,
+};
+use aruna_core::sync_checks::{
+    node_info_supersedes, validate_node_upsert, validate_pid_mapping, validate_policy_document,
+    validate_usage_upsert, validate_watch_interest,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
