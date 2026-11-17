@@ -5,17 +5,17 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{EVENT_SIZE_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE};
 use aruna_core::metadata::{EVENT_LIMIT, EventSize};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::decode;
 use aruna_core::storage_entries::event_log_prefix;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
-use thiserror::Error;
+use aruna_core::types::{Key, Value};
 use ulid::Ulid;
+
+use crate::metadata::call_results::page_rows;
 
 /// Whether this holder should checkpoint once one origin has used `used` of its `share`:
 /// the first origin at half, any other origin at three quarters, so a missing first origin
@@ -26,81 +26,35 @@ pub fn due(used: (u64, u64), share: (u64, u64), first: bool) -> bool {
         || used.1.saturating_mul(of) >= share.1.saturating_mul(part)
 }
 
-#[derive(Debug, Error, PartialEq)]
-pub enum CheckpointWindowError {
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("an event size row does not decode: {0}")]
-    Decode(String),
-    #[error("unexpected event while {state}: got {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
-    #[error("the checkpoint window read did not finish")]
-    Unfinished,
-}
-
-#[derive(Debug, PartialEq)]
-enum WindowState {
-    Init,
-    ReadLast,
-    ReadSizes,
-    Done,
-}
-
-impl WindowState {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Init => "starting",
-            Self::ReadLast => "reading the last checkpoint",
-            Self::ReadSizes => "reading the event sizes",
-            Self::Done => "finished",
-        }
-    }
-}
-
-/// The most events and bytes any one node wrote since the document's last checkpoint.
+/// The most events and bytes any one node wrote since the document's last checkpoint: reads
+/// the last checkpoint key, then the event sizes from it on. Both reads go out as effects,
+/// since a page call can neither read the last row nor start at a key.
 #[derive(Debug, PartialEq)]
 pub struct CheckpointWindowOperation {
     document_id: Ulid,
-    state: WindowState,
-    output: Option<Result<(u64, u64), CheckpointWindowError>>,
+    sizes: bool,
 }
 
 impl CheckpointWindowOperation {
     pub fn new(document_id: Ulid) -> Self {
         Self {
             document_id,
-            state: WindowState::Init,
-            output: None,
+            sizes: false,
         }
     }
 
-    fn finish(&mut self, output: Result<(u64, u64), CheckpointWindowError>) -> Effects {
-        self.state = WindowState::Done;
-        self.output = Some(output);
-        smallvec![]
-    }
-
-    fn read_sizes(&mut self, start: Option<IterStart>) -> Effects {
-        self.state = WindowState::ReadSizes;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: EVENT_SIZE_KEYSPACE.to_string(),
-            prefix: Some(event_log_prefix(self.document_id)),
-            start,
-            limit: EVENT_LIMIT as usize,
-            txn_id: None,
-        })]
+    fn storage(effect: StorageEffect) -> Result<Next<(u64, u64)>, IoError> {
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
+            effect,
+        )))))
     }
 }
 
 // Size rows carry each event's origin and size, so no event is decoded here.
-fn busiest_origin(values: &[(Key, Value)]) -> Result<(u64, u64), CheckpointWindowError> {
+fn busiest_origin(values: &[(Key, Value)]) -> Result<(u64, u64), IoError> {
     let mut used: BTreeMap<NodeId, (u64, u64)> = BTreeMap::new();
     for (_, value) in values {
-        let size: EventSize = postcard::from_bytes(value)
-            .map_err(|error| CheckpointWindowError::Decode(error.to_string()))?;
+        let size: EventSize = decode(value)?;
         let entry = used.entry(size.node_id).or_default();
         entry.0 += 1;
         entry.1 += size.bytes;
@@ -110,68 +64,39 @@ fn busiest_origin(values: &[(Key, Value)]) -> Result<(u64, u64), CheckpointWindo
     }))
 }
 
-impl EffectOperation for CheckpointWindowOperation {
+impl Operation for CheckpointWindowOperation {
     type Output = (u64, u64);
-    type Error = CheckpointWindowError;
+    type Error = IoError;
 
-    fn start(&mut self) -> Effects {
-        self.state = WindowState::ReadLast;
-        smallvec![Effect::Storage(StorageEffect::Last {
+    fn first(&mut self) -> Result<Next<(u64, u64)>, IoError> {
+        Self::storage(StorageEffect::Last {
             key_space: METADATA_CHECKPOINT_KEYSPACE.to_string(),
             prefix: Some(event_log_prefix(self.document_id)),
             txn_id: None,
-        })]
+        })
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let reading = matches!(self.state, WindowState::ReadLast | WindowState::ReadSizes);
-        match event {
-            Event::Storage(StorageEvent::IterResult { values, .. })
-                if self.state == WindowState::ReadLast =>
-            {
-                let start = values.first().map(|(key, _)| IterStart::At(key.clone()));
-                self.read_sizes(start)
-            }
-            Event::Storage(StorageEvent::IterResult { values, .. })
-                if self.state == WindowState::ReadSizes =>
-            {
-                let used = busiest_origin(&values);
-                self.finish(used)
-            }
-            Event::Storage(StorageEvent::Error { error }) if reading => {
-                self.finish(Err(error.into()))
-            }
-            event => {
-                let error = CheckpointWindowError::UnexpectedEvent {
-                    state: self.state.name(),
-                    got: event.label(),
-                };
-                self.finish(Err(error))
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<(u64, u64)>, IoError> {
+        let (values, _) = page_rows(result)?;
+        if self.sizes {
+            return Ok(Next::Done(busiest_origin(&values)?));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == WindowState::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(CheckpointWindowError::Unfinished))
-    }
-
-    // Both reads run outside a transaction, so nothing is left to clean up.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        self.sizes = true;
+        Self::storage(StorageEffect::Iter {
+            key_space: EVENT_SIZE_KEYSPACE.to_string(),
+            prefix: Some(event_log_prefix(self.document_id)),
+            start: values.first().map(|(key, _)| IterStart::At(key.clone())),
+            limit: EVENT_LIMIT as usize,
+            txn_id: None,
+        })
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
 
     fn document() -> Ulid {
         Ulid::from_parts(7, 7)
@@ -186,23 +111,23 @@ mod state_machine_tests {
         (Vec::<u8>::new().into(), row.into())
     }
 
-    fn iter_result(values: Vec<(Key, Value)>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
+    fn iter_result(values: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after: None,
-        })
+        })))
     }
 
-    fn last_effect() -> Effect {
-        Effect::Storage(StorageEffect::Last {
+    fn last_call() -> Result<Next<(u64, u64)>, IoError> {
+        CheckpointWindowOperation::storage(StorageEffect::Last {
             key_space: METADATA_CHECKPOINT_KEYSPACE.to_string(),
             prefix: Some(event_log_prefix(document())),
             txn_id: None,
         })
     }
 
-    fn sizes_effect(start: Option<IterStart>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
+    fn sizes_call(start: Option<IterStart>) -> Result<Next<(u64, u64)>, IoError> {
+        CheckpointWindowOperation::storage(StorageEffect::Iter {
             key_space: EVENT_SIZE_KEYSPACE.to_string(),
             prefix: Some(event_log_prefix(document())),
             start,
@@ -227,57 +152,47 @@ mod state_machine_tests {
         // The size scan starts at the last checkpoint key and the busiest node wins per measure.
         let checkpoint: Key = vec![1, 2, 3].into();
         let mut operation = CheckpointWindowOperation::new(document());
-        check_trace(
-            &mut operation,
-            &[last_effect()],
-            vec![
-                (
-                    iter_result(vec![(checkpoint.clone(), Vec::<u8>::new().into())]),
-                    vec![sizes_effect(Some(IterStart::At(checkpoint)))],
-                ),
-                (
-                    iter_result(vec![
-                        size_row(node(1), 10),
-                        size_row(node(1), 10),
-                        size_row(node(2), 50),
-                    ]),
-                    vec![],
-                ),
-            ],
+        assert_eq!(operation.first(), last_call());
+        let last = iter_result(vec![(checkpoint.clone(), Vec::<u8>::new().into())]);
+        assert_eq!(
+            operation.next(last),
+            sizes_call(Some(IterStart::At(checkpoint)))
         );
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok((2, 50)));
+        let sizes = vec![
+            size_row(node(1), 10),
+            size_row(node(1), 10),
+            size_row(node(2), 50),
+        ];
+        assert_eq!(operation.next(iter_result(sizes)), Ok(Next::Done((2, 50))));
     }
 
     #[test]
     fn window_without_checkpoint() {
         let mut operation = CheckpointWindowOperation::new(document());
-        check_trace(
-            &mut operation,
-            &[last_effect()],
-            vec![
-                (iter_result(Vec::new()), vec![sizes_effect(None)]),
-                (iter_result(Vec::new()), vec![]),
-            ],
+        operation.first().unwrap();
+        assert_eq!(operation.next(iter_result(Vec::new())), sizes_call(None));
+        assert_eq!(
+            operation.next(iter_result(Vec::new())),
+            Ok(Next::Done((0, 0)))
         );
-        assert_eq!(operation.finalize(), Ok((0, 0)));
     }
 
     #[test]
     fn storage_errors_fail() {
+        let error = || {
+            IoResult::Event(Box::new(Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })))
+        };
         for read_sizes in [false, true] {
             let mut operation = CheckpointWindowOperation::new(document());
-            operation.start();
+            operation.first().unwrap();
             if read_sizes {
-                operation.step(iter_result(Vec::new()));
+                operation.next(iter_result(Vec::new())).unwrap();
             }
-            let effects = operation.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            }));
-            assert!(effects.is_empty());
             assert_eq!(
-                operation.finalize(),
-                Err(CheckpointWindowError::Storage(StorageError::Timeout))
+                operation.next(error()),
+                Err(IoError::Storage(StorageError::Timeout))
             );
         }
     }
@@ -285,65 +200,19 @@ mod state_machine_tests {
     #[test]
     fn broken_size_fails() {
         let mut operation = CheckpointWindowOperation::new(document());
-        operation.start();
-        operation.step(iter_result(Vec::new()));
-        operation.step(iter_result(vec![(
-            Vec::<u8>::new().into(),
-            vec![0xff].into(),
-        )]));
-        assert!(matches!(
-            operation.finalize(),
-            Err(CheckpointWindowError::Decode(_))
-        ));
+        operation.first().unwrap();
+        operation.next(iter_result(Vec::new())).unwrap();
+        let broken = iter_result(vec![(Vec::<u8>::new().into(), vec![0xff].into())]);
+        assert!(matches!(operation.next(broken), Err(IoError::Codec(_))));
     }
 
     #[test]
-    fn rejects_other_events() {
-        let reading = || {
-            let mut operation = CheckpointWindowOperation::new(document());
-            operation.start();
-            operation
-        };
-        let accepted = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
-            assert!(effects.is_empty());
-            assert!(matches!(
-                error,
-                CheckpointWindowError::UnexpectedEvent { .. }
-            ));
-        }
-        // A finished read accepts nothing more.
-        let mut done = CheckpointWindowOperation::new(document());
-        done.start();
-        done.step(iter_result(Vec::new()));
-        done.step(iter_result(Vec::new()));
-        done.step(iter_result(Vec::new()));
-        assert!(matches!(
-            done.finalize(),
-            Err(CheckpointWindowError::UnexpectedEvent { .. })
-        ));
-    }
-
-    #[test]
-    fn abort_cleans_nothing() {
+    fn rejects_other_results() {
         let mut operation = CheckpointWindowOperation::new(document());
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-        operation.step(iter_result(Vec::new()));
-        check_abort(&mut operation, &[]);
-    }
-
-    #[test]
-    fn finalize_needs_result() {
-        rejects_finalize(CheckpointWindowOperation::new(document()));
-        let mut reading = CheckpointWindowOperation::new(document());
-        reading.start();
-        rejects_finalize(reading);
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(IoError::Unexpected { .. })
+        ));
     }
 }
