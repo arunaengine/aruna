@@ -9,7 +9,7 @@ pub mod change;
 pub mod counts;
 pub mod create;
 pub mod delegate;
-mod feed_store;
+pub mod feed_walks;
 pub mod forward;
 pub mod guard;
 pub mod handoff;
