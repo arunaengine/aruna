@@ -882,8 +882,13 @@ impl MetadataHandle {
             }
             MetadataTransportMessage::ForwardAuditPage { request } => {
                 Box::pin(async {
-                    super::super::audit::serve_local_audit(context, peer, request, audit_deadline)
-                        .await
+                    super::super::audit_entry::serve_local_audit(
+                        context,
+                        peer,
+                        request,
+                        audit_deadline,
+                    )
+                    .await
                 })
                 .await
             }

@@ -10,9 +10,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
 use aruna_operations::forward::routing::is_user_origin;
 use aruna_operations::metadata::api::forwarded_bearer;
-use aruna_operations::metadata::audit::{
-    AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest, list_audit as gather_audit,
-};
+use aruna_operations::metadata::audit::{AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest};
+use aruna_operations::metadata::audit_entry::list_audit as gather_audit;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
