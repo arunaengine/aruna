@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
-use crate::metadata::protocol::MetadataReadError;
 use crate::driver::drive;
+use crate::metadata::protocol::MetadataReadError;
 use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::settings::SettingPeers;
 use aruna_core::UserId;

@@ -50,8 +50,16 @@ pub async fn write_frame(stream: &mut BiStream, bytes: &[u8]) -> Result<(), Stri
     }
     let write = async {
         let length = (bytes.len() as u32).to_be_bytes();
-        stream.0.write_all(&length).await.map_err(|error| error.to_string())?;
-        stream.0.write_all(bytes).await.map_err(|error| error.to_string())?;
+        stream
+            .0
+            .write_all(&length)
+            .await
+            .map_err(|error| error.to_string())?;
+        stream
+            .0
+            .write_all(bytes)
+            .await
+            .map_err(|error| error.to_string())?;
         stream.0.flush().await.map_err(|error| error.to_string())
     };
     timeout(NOTIFICATION_IO_TIMEOUT, write)
@@ -63,13 +71,21 @@ pub async fn write_frame(stream: &mut BiStream, bytes: &[u8]) -> Result<(), Stri
 pub async fn read_frame(stream: &mut BiStream) -> Result<Vec<u8>, String> {
     let read = async {
         let mut len_buf = [0u8; 4];
-        stream.1.read_exact(&mut len_buf).await.map_err(|error| error.to_string())?;
+        stream
+            .1
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|error| error.to_string())?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_NOTIFICATION_SIZE {
             return Err("notification frame exceeds maximum size".to_string());
         }
         let mut bytes = vec![0u8; len];
-        stream.1.read_exact(&mut bytes).await.map_err(|error| error.to_string())?;
+        stream
+            .1
+            .read_exact(&mut bytes)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(bytes)
     };
     timeout(NOTIFICATION_IO_TIMEOUT, read)

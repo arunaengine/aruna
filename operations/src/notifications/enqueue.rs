@@ -18,9 +18,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobSpec, mint_configured_job,
-};
+use crate::jobs::submit::{SubmitJobError, SubmitJobOperation, SubmitJobSpec, mint_configured_job};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnqueueError {
@@ -225,14 +223,18 @@ mod state_machine_tests {
         assert!(enqueue.start().is_empty());
         assert!(matches!(
             enqueue.finalize(),
-            Err(EnqueueError::Submit { channel: "webhook", .. })
+            Err(EnqueueError::Submit {
+                channel: "webhook",
+                ..
+            })
         ));
     }
 
     #[test]
     fn upload_submits_job() {
         let config = placed();
-        let mut enqueue = EnqueueDeliveriesOperation::new(node_id(1), Some(&config), &[upload()], 1_000);
+        let mut enqueue =
+            EnqueueDeliveriesOperation::new(node_id(1), Some(&config), &[upload()], 1_000);
         assert!(matches!(
             enqueue.start().as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]

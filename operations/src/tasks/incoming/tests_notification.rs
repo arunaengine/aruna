@@ -251,11 +251,7 @@ async fn drain_retries_queueing() {
 
     assert_eq!(read_inbox_records(&storage).await, vec![record.clone()]);
     let remaining = outbox_rows(&storage).await;
-    assert_eq!(
-        remaining.len(),
-        1,
-        "a failed queue keeps the outbox row"
-    );
+    assert_eq!(remaining.len(), 1, "a failed queue keeps the outbox row");
 
     config.seed_job_control(node_id, 0);
     write_realm_config(&storage, realm_id, &config, node_id).await;

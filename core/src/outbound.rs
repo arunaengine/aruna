@@ -22,8 +22,12 @@ pub enum OutboundEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundEvent {
     /// The status the receiver answered with.
-    Posted { result: Result<u16, OutboundError> },
-    MailSent { result: Result<(), OutboundError> },
+    Posted {
+        result: Result<u16, OutboundError>,
+    },
+    MailSent {
+        result: Result<(), OutboundError>,
+    },
 }
 
 /// A failure of one outbound call; its text never holds an address, a body or a credential.

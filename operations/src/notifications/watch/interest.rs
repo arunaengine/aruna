@@ -31,7 +31,6 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::notifications::protocol::DIRTY_REALM_CAP;
-use aruna_core::structs::execution::notification_watch::{INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP};
 use crate::notifications::watch::authorization::filter_authorized_subscriptions;
 use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::subscriptions::{
@@ -40,6 +39,7 @@ use crate::notifications::watch::subscriptions::{
 use crate::realm::get_config::GetConfigOperation;
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use aruna_core::structs::execution::notification_watch::{INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP};
 
 /// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
 /// fires this long after the first dirty write, collapsing a run of watch CRUD

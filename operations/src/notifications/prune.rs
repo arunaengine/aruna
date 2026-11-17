@@ -241,7 +241,12 @@ impl PruneNotificationsOperation {
         }
         let space = || NOTIFICATION_INBOX_KEYSPACE.to_string();
         let reads = (candidates.iter())
-            .flat_map(|row| [(space(), row.direct.clone()), (space(), row.transient.clone())])
+            .flat_map(|row| {
+                [
+                    (space(), row.direct.clone()),
+                    (space(), row.transient.clone()),
+                ]
+            })
             .collect();
         self.state = PruneState::IndexRows { candidates, scan };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -258,7 +263,8 @@ impl PruneNotificationsOperation {
     ) -> Effects {
         let exists = |at: usize| values.get(at).is_some_and(|(_, value)| value.is_some());
         for (at, row) in candidates.into_iter().enumerate() {
-            self.deletes.push((PRUNE_INDEX_KEYSPACE.to_string(), row.index));
+            self.deletes
+                .push((PRUNE_INDEX_KEYSPACE.to_string(), row.index));
             let inbox = if exists(at * 2) {
                 Some(row.direct)
             } else if exists(at * 2 + 1) {
@@ -268,7 +274,8 @@ impl PruneNotificationsOperation {
             };
             match inbox {
                 Some(key) => {
-                    self.deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
+                    self.deletes
+                        .push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
                     self.outcome.expired = self.outcome.expired.saturating_add(1);
                 }
                 None => warn!("Deleting orphan notification prune index row"),
@@ -326,7 +333,12 @@ impl PruneNotificationsOperation {
                     continue;
                 }
             };
-            let index = || (PRUNE_INDEX_KEYSPACE.to_string(), notification_prune_key(&record));
+            let index = || {
+                (
+                    PRUNE_INDEX_KEYSPACE.to_string(),
+                    notification_prune_key(&record),
+                )
+            };
             if record.expires_at_ms() <= self.now_ms {
                 deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
                 deletes.push(index());
@@ -390,7 +402,12 @@ impl PruneNotificationsOperation {
 
     /// Deletes only the deletion times still outlived when read again inside the transaction,
     /// so one a bucket deletion renewed meanwhile stays.
-    fn cutoff_read(&mut self, txn_id: TxnId, next: Option<Key>, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn cutoff_read(
+        &mut self,
+        txn_id: TxnId,
+        next: Option<Key>,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Effects {
         let deletes: Vec<(KeySpace, Key)> = (values.into_iter())
             .filter(|(_, value)| cutoff_expired(value.as_ref(), self.now_ms))
             .map(|(key, _)| (NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key))
@@ -644,11 +661,11 @@ mod tests {
     use crate::tests::notifications::{context, record, temp_storage, user};
     use aruna_core::UserId;
     use aruna_core::handle::Handle;
+    use aruna_core::storage_entries::{inbox_update_entry, inbox_write_entries};
     use aruna_core::time::unix_timestamp_millis;
     use aruna_storage::StorageHandle;
-    use aruna_tasks::TaskHandle;
-    use aruna_core::storage_entries::{inbox_update_entry, inbox_write_entries};
     use aruna_tasks::InboundTaskHandler;
+    use aruna_tasks::TaskHandle;
     use async_trait::async_trait;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -780,7 +797,9 @@ mod tests {
         let mut context = context(storage);
         context.task_handle = Some(task_handle.clone());
         let restore = RestorePruneOperation::new(unix_timestamp_millis());
-        drive(restore, &context).await.expect("restore arms the timer");
+        drive(restore, &context)
+            .await
+            .expect("restore arms the timer");
     }
 
     async fn iter_page(
@@ -1372,7 +1391,8 @@ mod state_machine_tests {
             operation.start();
             operation
         };
-        let expected = |event: &Event| matches!(event, Event::Storage(StorageEvent::IterResult { .. }));
+        let expected =
+            |event: &Event| matches!(event, Event::Storage(StorageEvent::IterResult { .. }));
         let refusals = rejects_events(make, sample_events, expected);
         assert!(!refusals.is_empty());
     }

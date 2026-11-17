@@ -8,8 +8,7 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{
-    HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail,
-    SmtpSettings,
+    HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail, SmtpSettings,
 };
 use aruna_core::structs::execution::webhook::{
     DELIVERY_HEADER, SIGNATURE_HEADER, WebhookDeliverySpec, sign_delivery,
@@ -66,7 +65,8 @@ impl SendOperation {
     /// A signed POST of the notification body; `now_s` is the signature time in seconds.
     pub fn webhook(spec: &WebhookDeliverySpec, url: &str, secret: &[u8], now_s: u64) -> Self {
         let Some(body) = spec.body() else {
-            let refused = SendError::Refused("only share upload notifications are delivered".into());
+            let refused =
+                SendError::Refused("only share upload notifications are delivered".into());
             return Self::done(Err(refused));
         };
         let body = match serde_json::to_vec(&body) {
@@ -77,7 +77,10 @@ impl SendOperation {
             url: url.to_string(),
             headers: vec![
                 ("content-type", "application/json".to_string()),
-                (DELIVERY_HEADER, spec.notification.notification_id.to_string()),
+                (
+                    DELIVERY_HEADER,
+                    spec.notification.notification_id.to_string(),
+                ),
                 (SIGNATURE_HEADER, sign_delivery(secret, now_s, &body)),
             ],
             body: body.into(),
@@ -167,7 +170,9 @@ impl Operation for SendOperation {
 mod state_machine_tests {
     use super::*;
     use crate::tests::notifications::user;
-    use aruna_core::operation_check::{check_abort, rejects_events, rejects_finalize, sample_events};
+    use aruna_core::operation_check::{
+        check_abort, rejects_events, rejects_finalize, sample_events,
+    };
     use aruna_core::structs::execution::notification::{
         NotificationClass, NotificationKind, NotificationRecord,
     };
@@ -210,7 +215,10 @@ mod state_machine_tests {
         assert_eq!(post.body.as_ref(), body.as_slice());
         assert_eq!(post.url, "https://hooks.example.org/a");
         assert_eq!(post.deadline, DELIVERY_DEADLINE);
-        assert!(post.headers.contains(&(SIGNATURE_HEADER, sign_delivery(&[9; 32], 7, &body))));
+        assert!(
+            post.headers
+                .contains(&(SIGNATURE_HEADER, sign_delivery(&[9; 32], 7, &body)))
+        );
         assert!(send.step(posted(Ok(204))).is_empty());
         assert_eq!(send.finalize(), Ok(Some(204)));
     }
@@ -261,7 +269,8 @@ mod state_machine_tests {
     #[test]
     fn unexpected_events_fail() {
         let make = || {
-            let mut send = SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
+            let mut send =
+                SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
             send.start();
             send
         };

@@ -91,11 +91,17 @@ impl DeliverBatchOperation {
     }
 
     /// The realm config with the peer checked against it.
-    fn authorized(&self, realm_id: RealmId, value: Option<&[u8]>) -> Result<RealmConfigDocument, String> {
+    fn authorized(
+        &self,
+        realm_id: RealmId,
+        value: Option<&[u8]>,
+    ) -> Result<RealmConfigDocument, String> {
         let peer = self.input.peer;
         let bytes = value.ok_or_else(|| format!("realm `{realm_id}` config unavailable"))?;
         let config = RealmConfigDocument::from_bytes(bytes).map_err(|error| error.to_string())?;
-        let eligible = config.sync_eligible_nodes().map_err(|error| error.to_string())?;
+        let eligible = config
+            .sync_eligible_nodes()
+            .map_err(|error| error.to_string())?;
         if !eligible.contains(&peer) {
             return Err(format!(
                 "notification peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
@@ -134,7 +140,10 @@ impl DeliverBatchOperation {
         let outcome = match upsert.finalize() {
             Ok(outcome) => outcome,
             Err(error) => {
-                return self.after_cleanup(cleanup, NotificationTransportMessage::Reject(error.to_string()));
+                return self.after_cleanup(
+                    cleanup,
+                    NotificationTransportMessage::Reject(error.to_string()),
+                );
             }
         };
         if outcome.recipients.is_empty() {
@@ -148,9 +157,15 @@ impl DeliverBatchOperation {
         smallvec![Effect::Net(NetEffect::WakeInbox(outcome.recipients))]
     }
 
-    fn run_enqueue(&mut self, config: &RealmConfigDocument, held: Vec<NotificationRecord>, written: usize) -> Effects {
+    fn run_enqueue(
+        &mut self,
+        config: &RealmConfigDocument,
+        held: Vec<NotificationRecord>,
+        written: usize,
+    ) -> Effects {
         let input = self.input;
-        let mut enqueue = EnqueueDeliveriesOperation::new(input.local, Some(config), &held, input.now_ms);
+        let mut enqueue =
+            EnqueueDeliveriesOperation::new(input.local, Some(config), &held, input.now_ms);
         let effects = enqueue.start();
         if enqueue.is_complete() {
             return self.enqueued(enqueue, written, effects);
@@ -159,7 +174,12 @@ impl DeliverBatchOperation {
         effects
     }
 
-    fn enqueued(&mut self, enqueue: EnqueueDeliveriesOperation, written: usize, cleanup: Effects) -> Effects {
+    fn enqueued(
+        &mut self,
+        enqueue: EnqueueDeliveriesOperation,
+        written: usize,
+        cleanup: Effects,
+    ) -> Effects {
         let answer = match enqueue.finalize() {
             Ok(()) => NotificationTransportMessage::DeliverAck {
                 written: written as u32,
@@ -206,9 +226,10 @@ impl Operation for DeliverBatchOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match (std::mem::take(&mut self.state), event) {
-            (DeliverState::Config { realm_id }, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.checked(realm_id, value.as_deref())
-            }
+            (
+                DeliverState::Config { realm_id },
+                Event::Storage(StorageEvent::ReadResult { value, .. }),
+            ) => self.checked(realm_id, value.as_deref()),
             (DeliverState::Config { .. }, Event::Storage(StorageEvent::Error { error })) => {
                 self.reject(error.to_string())
             }
@@ -220,9 +241,14 @@ impl Operation for DeliverBatchOperation {
                 self.state = DeliverState::Upsert(upsert, config);
                 effects
             }
-            (DeliverState::Wake { config, held, written }, Event::Net(NetEvent::InboxWoken)) => {
-                self.run_enqueue(&config, held, written)
-            }
+            (
+                DeliverState::Wake {
+                    config,
+                    held,
+                    written,
+                },
+                Event::Net(NetEvent::InboxWoken),
+            ) => self.run_enqueue(&config, held, written),
             (DeliverState::Enqueue(mut enqueue, written), event) => {
                 let effects = enqueue.step(event);
                 if enqueue.is_complete() {
@@ -232,12 +258,16 @@ impl Operation for DeliverBatchOperation {
                 effects
             }
             (DeliverState::Cleanup { left, answer }, _) if left > 1 => {
-                self.state = DeliverState::Cleanup { left: left - 1, answer };
+                self.state = DeliverState::Cleanup {
+                    left: left - 1,
+                    answer,
+                };
                 smallvec![]
             }
             (DeliverState::Cleanup { answer, .. }, _) => self.answer(answer),
             (_, event) => {
-                self.state = DeliverState::Failed(DeliverError::UnexpectedEvent(format!("{event:?}")));
+                self.state =
+                    DeliverState::Failed(DeliverError::UnexpectedEvent(format!("{event:?}")));
                 smallvec![]
             }
         }

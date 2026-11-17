@@ -203,7 +203,12 @@ impl DrainOutboxOperation {
         }
         let realms: Vec<RealmId> = realms.into_iter().collect();
         let reads = (realms.iter())
-            .map(|realm_id| (REALM_CONFIG_KEYSPACE.to_string(), Key::from(realm_id.as_bytes().to_vec())))
+            .map(|realm_id| {
+                (
+                    REALM_CONFIG_KEYSPACE.to_string(),
+                    Key::from(realm_id.as_bytes().to_vec()),
+                )
+            })
             .collect();
         self.state = DrainState::Configs { realms };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
@@ -458,7 +463,9 @@ impl Operation for DrainOutboxOperation {
             return self.done(Some(DELIVERY_RETRY_AFTER));
         }
         self.state = DrainState::Snapshot;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction { read: true })]
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: true
+        })]
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -495,7 +502,10 @@ impl Operation for DrainOutboxOperation {
             ) => self.configs_read(realms, values),
             (DrainState::Configs { realms }, Event::Storage(StorageEvent::Error { error })) => {
                 warn!(%error, "Failed to read realm config for notification drain");
-                let values = realms.iter().map(|_| (Key::from(Vec::new()), None)).collect();
+                let values = realms
+                    .iter()
+                    .map(|_| (Key::from(Vec::new()), None))
+                    .collect();
                 self.configs_read(realms, values)
             }
             (DrainState::Upsert(mut upsert), event) => {
@@ -506,9 +516,7 @@ impl Operation for DrainOutboxOperation {
                 }
                 self.upserted(*upsert, effects)
             }
-            (DrainState::Wake { held }, Event::Net(NetEvent::InboxWoken)) => {
-                self.run_enqueue(held)
-            }
+            (DrainState::Wake { held }, Event::Net(NetEvent::InboxWoken)) => self.run_enqueue(held),
             (DrainState::Enqueue(mut enqueue), event) => {
                 let effects = enqueue.step(event);
                 if !enqueue.is_complete() {
@@ -718,7 +726,10 @@ mod state_machine_tests {
             user_id: UserId::nil(realm_id),
             realm_id,
         };
-        (realm_id, Value::from(config.to_bytes(&actor).expect("config encodes")))
+        (
+            realm_id,
+            Value::from(config.to_bytes(&actor).expect("config encodes")),
+        )
     }
 
     fn page_read(start: Option<Key>) -> Effect {
@@ -756,7 +767,9 @@ mod state_machine_tests {
         };
         check_trace(
             &mut operation,
-            &[Effect::Storage(StorageEffect::StartTransaction { read: true })],
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: true,
+            })],
             vec![
                 (
                     Event::Storage(StorageEvent::TransactionStarted { txn_id: SNAPSHOT }),
@@ -850,7 +863,8 @@ mod state_machine_tests {
     fn expired_rows_dropped() {
         let notice = record(user(1, 2), NotificationClass::Direct, NOW_MS);
         let (key, value, _) = outbox_row(notice);
-        let mut operation = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS + OUTBOX_RETENTION_MS + 10_000);
+        let mut operation =
+            DrainOutboxOperation::new(Some(node_id(1)), NOW_MS + OUTBOX_RETENTION_MS + 10_000);
         operation.start();
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: SNAPSHOT,

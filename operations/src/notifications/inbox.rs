@@ -196,7 +196,9 @@ impl UpsertInboxOperation {
             None => {
                 self.txn_id = None;
                 self.state = UpsertState::Start;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction { read: false })]
+                smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                    read: false
+                })]
             }
         }
     }
@@ -243,8 +245,12 @@ impl UpsertInboxOperation {
     }
 
     fn read_cutoffs(&mut self) -> Effects {
-        let (purges, rest): (Vec<usize>, Vec<usize>) = (0..self.records.len())
-            .partition(|&at| matches!(self.records[at].kind, NotificationKind::BucketDeleted { .. }));
+        let (purges, rest): (Vec<usize>, Vec<usize>) = (0..self.records.len()).partition(|&at| {
+            matches!(
+                self.records[at].kind,
+                NotificationKind::BucketDeleted { .. }
+            )
+        });
         self.purges = purges;
         let mut checked = Vec::new();
         let mut reads = Vec::new();
@@ -303,7 +309,13 @@ impl UpsertInboxOperation {
         effects
     }
 
-    fn purge_page(&mut self, at: usize, scan: InboxScan, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn purge_page(
+        &mut self,
+        at: usize,
+        scan: InboxScan,
+        values: Vec<(Key, Value)>,
+        next: Option<Key>,
+    ) -> Effects {
         let purge = &self.records[self.purges[at]];
         let mut removed = 0;
         for (_, value) in values {
@@ -342,12 +354,19 @@ impl UpsertInboxOperation {
             return self.delete_rows();
         }
         let space = || NOTIFICATION_CUTOFF_KEYSPACE.to_string();
-        let reads = times.iter().map(|(key, _)| (space(), key.clone())).collect();
+        let reads = times
+            .iter()
+            .map(|(key, _)| (space(), key.clone()))
+            .collect();
         self.state = UpsertState::ReadTimes { times };
         self.batch_read(reads)
     }
 
-    fn write_times(&mut self, times: Vec<(Key, u64)>, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn write_times(
+        &mut self,
+        times: Vec<(Key, u64)>,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Effects {
         let mut writes = Vec::new();
         for ((key, time), (_, stored)) in times.into_iter().zip(values) {
             if stored_time(stored.as_ref()).is_none_or(|stored| stored < time) {
@@ -414,7 +433,11 @@ impl UpsertInboxOperation {
                 self.outcome.recipients.push(record.recipient);
             }
             if record.class == NotificationClass::Transient {
-                match self.counts.iter_mut().find(|(user, _)| *user == record.recipient) {
+                match self
+                    .counts
+                    .iter_mut()
+                    .find(|(user, _)| *user == record.recipient)
+                {
                     Some((_, added)) => *added += 1,
                     None => self.counts.push((record.recipient, 1)),
                 }
@@ -553,9 +576,10 @@ impl Operation for UpsertInboxOperation {
             (UpsertState::DeleteRows, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 self.read_existing()
             }
-            (UpsertState::ReadExisting, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.plan_writes(values)
-            }
+            (
+                UpsertState::ReadExisting,
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => self.plan_writes(values),
             (
                 UpsertState::Count { at, seen, scan },
                 Event::Storage(StorageEvent::IterResult {
@@ -570,7 +594,9 @@ impl Operation for UpsertInboxOperation {
             (UpsertState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. }))
             | (
                 UpsertState::Abort,
-                Event::Storage(StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. }),
+                Event::Storage(
+                    StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. },
+                ),
             ) => {
                 self.txn_id = None;
                 self.state = UpsertState::Done;
@@ -624,10 +650,10 @@ mod tests {
     use crate::driver::drive;
     use crate::tests::notifications::{context, record, temp_storage, user};
     use aruna_core::handle::Handle;
-    use aruna_storage::StorageHandle;
     use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
+    use aruna_storage::StorageHandle;
 
     async fn upsert_with_report(
         storage: &StorageHandle,
@@ -641,7 +667,9 @@ mod tests {
         storage: &StorageHandle,
         records: &[NotificationRecord],
     ) -> Result<usize, InboxError> {
-        upsert_with_report(storage, records).await.map(|outcome| outcome.written)
+        upsert_with_report(storage, records)
+            .await
+            .map(|outcome| outcome.written)
     }
 
     fn make_record() -> NotificationRecord {
@@ -968,7 +996,11 @@ mod state_machine_tests {
     }
 
     fn inbox_key(record: &NotificationRecord) -> Key {
-        notification_inbox_key(record.recipient, record.created_at_ms, record.notification_id)
+        notification_inbox_key(
+            record.recipient,
+            record.created_at_ms,
+            record.notification_id,
+        )
     }
 
     fn conflict() -> Event {
@@ -984,7 +1016,9 @@ mod state_machine_tests {
         let writes = inbox_write_entries(&record).unwrap();
         check_trace(
             &mut upsert,
-            &[Effect::Storage(StorageEffect::StartTransaction { read: false })],
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })],
             vec![
                 (
                     Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }),
@@ -1006,7 +1040,9 @@ mod state_machine_tests {
                     Event::Storage(StorageEvent::BatchWriteResult {
                         entries: Vec::new(),
                     }),
-                    vec![Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })],
+                    vec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: TXN,
+                    })],
                 ),
                 (
                     Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN }),
@@ -1026,15 +1062,21 @@ mod state_machine_tests {
         let record = notice();
         let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
         upsert.start();
-        upsert.step(Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        upsert.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TXN,
+        }));
         let effects = upsert.step(Event::Storage(StorageEvent::BatchReadResult {
             values: vec![(inbox_key(&record), Some(Value::from(vec![1])))],
         }));
         assert_eq!(
             effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })]
+            [Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: TXN
+            })]
         );
-        upsert.step(Event::Storage(StorageEvent::TransactionAborted { txn_id: TXN }));
+        upsert.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TXN,
+        }));
         let outcome = upsert.finalize().unwrap();
         assert_eq!((outcome.written, outcome.held.len()), (0, 1));
     }
@@ -1043,18 +1085,28 @@ mod state_machine_tests {
     fn conflict_runs_twice() {
         let mut upsert = UpsertInboxOperation::new(vec![notice()]);
         upsert.start();
-        upsert.step(Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        upsert.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TXN,
+        }));
         let abort = upsert.step(conflict());
         assert_eq!(
             abort.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })]
+            [Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: TXN
+            })]
         );
-        let again = upsert.step(Event::Storage(StorageEvent::TransactionAborted { txn_id: TXN }));
+        let again = upsert.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TXN,
+        }));
         assert_eq!(
             again.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { read: false })]
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
         );
-        upsert.step(Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        upsert.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TXN,
+        }));
         upsert.step(conflict());
         assert_eq!(upsert.finalize(), Err(InboxError::ConflictedTwice));
     }
@@ -1085,7 +1137,10 @@ mod state_machine_tests {
             upsert
         };
         let started = |event: &Event| {
-            matches!(event, Event::Storage(StorageEvent::TransactionStarted { .. }))
+            matches!(
+                event,
+                Event::Storage(StorageEvent::TransactionStarted { .. })
+            )
         };
         let refusals = rejects_events(make, sample_events, started);
         assert!(!refusals.is_empty());
@@ -1096,10 +1151,14 @@ mod state_machine_tests {
         let mut upsert = UpsertInboxOperation::new(vec![notice()]);
         upsert.start();
         check_abort(&mut upsert, &[]);
-        upsert.step(Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        upsert.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TXN,
+        }));
         check_abort(
             &mut upsert,
-            &[Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })],
+            &[Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: TXN,
+            })],
         );
         let mut within = UpsertInboxOperation::within(vec![notice()], TXN);
         within.start();

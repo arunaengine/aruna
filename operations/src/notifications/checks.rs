@@ -20,7 +20,10 @@ const MAX_FUTURE_SKEW: u64 = 5 * 60 * 1000;
 
 /// A restart or recovery notice speaks for the node that holds the bucket, so only that node
 /// may deliver it.
-pub(crate) fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -> Result<(), String> {
+pub(crate) fn verify_node_origin(
+    records: &[NotificationRecord],
+    peer: NodeId,
+) -> Result<(), String> {
     let foreign = records.iter().any(|record| match &record.kind {
         NotificationKind::BucketRestartLocked { node_id, .. }
         | NotificationKind::BucketRecoveryDegraded { node_id, .. }
@@ -35,7 +38,10 @@ pub(crate) fn verify_node_origin(records: &[NotificationRecord], peer: NodeId) -
     }
 }
 
-pub(crate) fn validate_inbound_batch(records: &[NotificationRecord], now_ms: u64) -> Result<(), String> {
+pub(crate) fn validate_inbound_batch(
+    records: &[NotificationRecord],
+    now_ms: u64,
+) -> Result<(), String> {
     if records.len() > OUTBOX_BATCH_SIZE {
         return Err(format!(
             "notification batch count {} exceeds cap {}",
@@ -67,7 +73,11 @@ pub(crate) fn validate_watch_events(
     Ok(())
 }
 
-pub(crate) fn validate_watch_event(event: &WatchEvent, realm_id: RealmId, now_ms: u64) -> Result<(), String> {
+pub(crate) fn validate_watch_event(
+    event: &WatchEvent,
+    realm_id: RealmId,
+    now_ms: u64,
+) -> Result<(), String> {
     if event.realm_id != realm_id {
         return Err("watch event realm mismatch".to_string());
     }
@@ -168,7 +178,10 @@ pub(crate) fn validate_watch_event(event: &WatchEvent, realm_id: RealmId, now_ms
     Ok(())
 }
 
-pub(crate) fn validate_inbound_record(record: &NotificationRecord, now_ms: u64) -> Result<(), String> {
+pub(crate) fn validate_inbound_record(
+    record: &NotificationRecord,
+    now_ms: u64,
+) -> Result<(), String> {
     if record.watch_authorization.is_some()
         || matches!(
             record.kind,
@@ -198,7 +211,10 @@ pub(crate) fn validate_inbound_record(record: &NotificationRecord, now_ms: u64) 
     validate_inbound_kind(&record.kind, record.recipient.realm_id)
 }
 
-pub(crate) fn validate_inbound_kind(kind: &NotificationKind, recipient_realm: RealmId) -> Result<(), String> {
+pub(crate) fn validate_inbound_kind(
+    kind: &NotificationKind,
+    recipient_realm: RealmId,
+) -> Result<(), String> {
     match kind {
         NotificationKind::GroupJoinRequested {
             group_id,
@@ -506,4 +522,3 @@ pub(crate) fn message_realm(message: &NotificationTransportMessage) -> Result<Re
         }
     }
 }
-

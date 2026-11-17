@@ -48,8 +48,7 @@ use super::store::{
 };
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
-    mint_job_id,
-    schedule_drain_effect,
+    mint_job_id, schedule_drain_effect,
 };
 use super::workflow::finalize::finalize_followups;
 use crate::auth::request_authorization::{AuthorizeError, authorize};

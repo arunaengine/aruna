@@ -14,6 +14,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::USER_KEYSPACE;
+use aruna_core::outbound::{OutgoingMail, SmtpSettings};
 use aruna_core::realm_vault::seal_setting;
 use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::email::{
@@ -28,7 +29,6 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
-use aruna_core::outbound::{OutgoingMail, SmtpSettings};
 use aruna_outbound::Backoffs;
 use lettre::Address;
 use thiserror::Error;
@@ -314,7 +314,10 @@ async fn send_email(
     }
     let settings = smtp_settings(ctx, config, profile).await?;
     let send = SendOperation::mail(profile.revision, Some(settings), mail);
-    drive(send, &ctx.driver).await.map(|_| ()).map_err(job_error)
+    drive(send, &ctx.driver)
+        .await
+        .map(|_| ())
+        .map_err(job_error)
 }
 
 /// A send failure as the job runtime takes it.

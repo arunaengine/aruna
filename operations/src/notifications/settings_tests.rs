@@ -230,7 +230,10 @@ async fn no_manager_waits() {
 fn backoff_shared_owner() {
     let backoffs = Backoffs::default();
     let other = UserId::local(Ulid::from_bytes([7u8; 16]), owner().realm_id);
-    assert_eq!(backoffs.fail(owner(), SettingChannel::Email, 1_000, next_delay), 31_000);
+    assert_eq!(
+        backoffs.fail(owner(), SettingChannel::Email, 1_000, next_delay),
+        31_000
+    );
     // Every notice of the owner and channel waits for the same end.
     assert_eq!(
         backoffs.until(owner(), SettingChannel::Email, 2_000),

@@ -3,10 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::drive;
 use crate::jobs::store::find_dedup_plan;
 use crate::metadata::api::load_realm_config;
-use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
-use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::checks::{
     validate_inbound_batch, validate_inbound_kind, validate_watch_event, verify_node_origin,
 };
@@ -14,8 +13,9 @@ use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, deliver_events_remote, list_remote,
     list_watches_remote, mark_read_remote, unread_count_remote,
 };
-use crate::driver::drive;
 use crate::notifications::inbox::UpsertInboxOperation;
+use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
+use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
 };
@@ -740,10 +740,14 @@ async fn empty_batch_rejected() {
     )
     .await;
 
-    let response = a.net.notification_request(b.net.node_id(), &NotificationTransportMessage::DeliverBatch { records: vec![] },
-    )
-    .await
-    .expect("request completes");
+    let response = a
+        .net
+        .notification_request(
+            b.net.node_id(),
+            &NotificationTransportMessage::DeliverBatch { records: vec![] },
+        )
+        .await
+        .expect("request completes");
     assert!(
         matches!(&response, NotificationTransportMessage::Reject(reason) if reason.contains("empty batch")),
         "unexpected response: {response:?}"
@@ -781,10 +785,14 @@ async fn user_peer_rejected() {
         "unexpected reject reason: {deliver_error}"
     );
 
-    let list = c.net.notification_request(b.net.node_id(), &NotificationTransportMessage::UnreadCount { recipient },
-    )
-    .await
-    .expect("request completes");
+    let list = c
+        .net
+        .notification_request(
+            b.net.node_id(),
+            &NotificationTransportMessage::UnreadCount { recipient },
+        )
+        .await
+        .expect("request completes");
     assert!(
         matches!(&list, NotificationTransportMessage::Reject(reason) if reason.contains("not a sync-eligible node")),
         "unexpected response: {list:?}"
@@ -1197,7 +1205,9 @@ async fn oversized_message_refused() {
         })
         .expect("encodes")
         .len();
-    let count = aruna_core::structs::execution::notification_transport::MAX_NOTIFICATION_SIZE / per_record.max(1) + 1_000;
+    let count = aruna_core::structs::execution::notification_transport::MAX_NOTIFICATION_SIZE
+        / per_record.max(1)
+        + 1_000;
     let records = vec![sample; count];
 
     let error = deliver_remote(&a.net, b.net.node_id(), records)
@@ -1928,10 +1938,14 @@ async fn invalid_events_rejected() {
     )
     .await;
 
-    let empty = a.net.notification_request(b.net.node_id(), &NotificationTransportMessage::DeliverWatchEvents { events: vec![] },
-    )
-    .await
-    .expect("request completes");
+    let empty = a
+        .net
+        .notification_request(
+            b.net.node_id(),
+            &NotificationTransportMessage::DeliverWatchEvents { events: vec![] },
+        )
+        .await
+        .expect("request completes");
     assert!(
         matches!(&empty, NotificationTransportMessage::Reject(reason) if reason.contains("empty batch")),
         "unexpected response: {empty:?}"

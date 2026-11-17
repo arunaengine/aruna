@@ -128,7 +128,10 @@ impl EmitNotificationsOperation {
     }
 
     fn handle_commit_transaction(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        if !matches!(event, Event::Storage(StorageEvent::TransactionCommitted { .. })) {
+        if !matches!(
+            event,
+            Event::Storage(StorageEvent::TransactionCommitted { .. })
+        ) {
             return self.drop_emission(event, Some(txn_id));
         }
         self.state = EmitNotificationsState::ScheduleDrain;
@@ -213,7 +216,6 @@ pub fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::Infallible;
     use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context_with_storage, record, user};
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
@@ -224,6 +226,7 @@ mod tests {
     use aruna_storage::storage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
+    use std::convert::Infallible;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;

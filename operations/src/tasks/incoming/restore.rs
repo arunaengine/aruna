@@ -89,7 +89,9 @@ async fn restore_notification_outbox(
     match drive(restore, &context).await {
         Ok(true) if shorten.is_none() => {
             let key = TaskKey::DrainNotificationOutbox;
-            let event = task_handle.schedule_idle_timer(key, DELIVERY_RETRY_AFTER).await;
+            let event = task_handle
+                .schedule_idle_timer(key, DELIVERY_RETRY_AFTER)
+                .await;
             if let TaskEvent::Error { message, .. } = event {
                 warn!(message = %message, "Failed to restore notification outbox timer");
             }

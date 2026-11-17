@@ -17,8 +17,8 @@ use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::{
     URL_BYTES, WebhookDeliverySpec, WebhookSubscription, valid_url,
 };
-use aruna_outbound::Backoffs;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_outbound::Backoffs;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -27,8 +27,8 @@ use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::notifications::email::{job_error, no_transport};
 use crate::notifications::send::SendOperation;
 use crate::notifications::settings::{
-    Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting,
-    managers, write_setting,
+    Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting, managers,
+    write_setting,
 };
 use crate::realm::get_config::GetConfigOperation;
 

@@ -23,10 +23,10 @@ pub async fn list_remote(
         .notification_request(
             holder,
             &NotificationTransportMessage::List {
-            recipient,
-            cursor,
-            limit,
-        },
+                recipient,
+                cursor,
+                limit,
+            },
         )
         .await?
     {
@@ -68,10 +68,10 @@ pub async fn mark_read_remote(
         .notification_request(
             holder,
             &NotificationTransportMessage::MarkRead {
-            recipient,
-            ids,
-            up_to_ms,
-        },
+                recipient,
+                ids,
+                up_to_ms,
+            },
         )
         .await?
     {
@@ -93,11 +93,11 @@ pub async fn create_watch_remote(
         .notification_request(
             holder,
             &NotificationTransportMessage::CreateWatch {
-            owner,
-            path_prefix,
-            event_mask,
-            authorization,
-        },
+                owner,
+                path_prefix,
+                event_mask,
+                authorization,
+            },
         )
         .await?
     {
@@ -150,10 +150,7 @@ pub async fn list_watches_remote(
     owner: UserId,
 ) -> Result<Vec<WatchSubscription>, String> {
     match net_handle
-        .notification_request(
-            holder,
-            &NotificationTransportMessage::ListWatches { owner },
-        )
+        .notification_request(holder, &NotificationTransportMessage::ListWatches { owner })
         .await?
     {
         NotificationTransportMessage::WatchList { subscriptions } => Ok(subscriptions),
