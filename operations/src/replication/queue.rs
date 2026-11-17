@@ -3430,4 +3430,45 @@ mod tests {
         assert_eq!(result.succeeded, 1);
         assert!(read_jobs(&storage).await.is_empty());
     }
+
+    #[test]
+    fn job_stats_pages() {
+        use aruna_core::operation_check::{
+            check_abort, rejects_events, rejects_finalize, sample_events,
+        };
+        let relationship = Ulid::from_parts(7, 7);
+        let row = |relationship_id, enqueued_at_ms| {
+            let mut record = BlobJobRecord::new(on_demand_input(), None, enqueued_at_ms);
+            record.relationship_id = relationship_id;
+            (
+                Key::from(b"row".to_vec()),
+                Value::from(record.to_bytes().unwrap()),
+            )
+        };
+        let mut operation = JobStatsOperation::new(relationship);
+        assert_eq!(operation.start().len(), 1);
+        let first = Event::Storage(StorageEvent::IterResult {
+            values: vec![row(Some(relationship), 30), row(None, 5)],
+            next_start_after: Some(b"row".to_vec().into()),
+        });
+        assert_eq!(operation.step(first).len(), 1);
+        let last = Event::Storage(StorageEvent::IterResult {
+            values: vec![row(Some(relationship), 20)],
+            next_start_after: None,
+        });
+        assert!(operation.step(last).is_empty());
+        assert_eq!(operation.finalize(), Ok((2, Some(20))));
+        let reading = || {
+            let mut operation = JobStatsOperation::new(relationship);
+            operation.start();
+            operation
+        };
+        let refused = rejects_events(reading, sample_events, |event| {
+            matches!(event, Event::Storage(StorageEvent::IterResult { .. }))
+        });
+        assert_eq!(refused.len(), sample_events().len() - 1);
+        let mut open = reading();
+        check_abort(&mut open, &[]);
+        rejects_finalize(open);
+    }
 }
