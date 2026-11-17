@@ -248,3 +248,183 @@ impl Operation for RawEventsOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::metadata::raw_revision::tests::test_event;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    fn event(seed: u64) -> MetadataEventRecord {
+        test_event(Ulid::from_parts(1, seed), seed)
+    }
+
+    fn document() -> Ulid {
+        event(1).record.document_id
+    }
+
+    fn key(event: &MetadataEventRecord) -> Key {
+        event_log_key(event.record.document_id, event.event_id)
+    }
+
+    fn row(event: &MetadataEventRecord) -> (Key, Value) {
+        (key(event), postcard::to_allocvec(event).unwrap().into())
+    }
+
+    fn page_effect(start: Option<Key>) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: EVENT_LOG_KEYSPACE.to_string(),
+            prefix: Some(event_log_prefix(document())),
+            start: start.map(IterStart::After),
+            limit: RAW_PAGE_SIZE,
+            txn_id: None,
+        })
+    }
+
+    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: rows,
+            next_start_after: next,
+        })
+    }
+
+    fn whole_log() -> RawEventsOperation {
+        RawEventsOperation::new(document(), None, None, None, RawLoadBudget::default())
+    }
+
+    fn reading() -> RawEventsOperation {
+        let mut operation = whole_log();
+        operation.start();
+        operation
+    }
+
+    #[test]
+    fn reads_to_end() {
+        let first = event(10);
+        let mut operation = whole_log();
+        check_trace(
+            &mut operation,
+            &[page_effect(None)],
+            vec![
+                (
+                    page(vec![row(&first)], Some(key(&first))),
+                    vec![page_effect(Some(key(&first)))],
+                ),
+                (page(Vec::new(), None), vec![]),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(vec![first]));
+    }
+
+    #[test]
+    fn cursor_stops_reading() {
+        // The read starts after `start_after` and keeps no event past the cursor.
+        let (start, next, late) = (event(10), event(11), event(12));
+        let mut operation = RawEventsOperation::new(
+            document(),
+            Some(start.event_id),
+            Some(next.event_id),
+            None,
+            RawLoadBudget::default(),
+        );
+        check_trace(
+            &mut operation,
+            &[page_effect(Some(key(&start)))],
+            vec![
+                (
+                    page(vec![row(&next)], Some(key(&next))),
+                    vec![page_effect(Some(key(&next)))],
+                ),
+                (page(vec![row(&late)], Some(key(&late))), vec![]),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(vec![next]));
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        let mut operation = reading();
+        let error = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert!(operation.step(error).is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(RawReadError::Storage(StorageError::Timeout))
+        );
+    }
+
+    #[test]
+    fn broken_pages_fail() {
+        let first = event(10);
+        let foreign_key = event_log_key(document(), Ulid::from_parts(2, 10));
+        let bad_bytes = (key(&first), Value::from(vec![0xff]));
+        let cases = [
+            (page(vec![bad_bytes], None), "conversion"),
+            (page(vec![(foreign_key, row(&first).1)], None), "log"),
+            (page(vec![row(&first), row(&event(11))], None), "limit"),
+            (page(Vec::new(), Some(key(&first))), "limit"),
+        ];
+        for (event, kind) in cases {
+            let mut operation = reading();
+            assert!(operation.step(event).is_empty());
+            let error = operation.finalize().unwrap_err();
+            let matched = match kind {
+                "conversion" => matches!(error, RawReadError::Conversion(_)),
+                "log" => matches!(error, RawReadError::InconsistentLog(_)),
+                _ => matches!(error, RawReadError::LimitExceeded(_)),
+            };
+            assert!(matched, "{kind}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn spent_budget_refuses() {
+        let spent = RawLoadBudget {
+            events: RAW_EVENT_LIMIT,
+            encoded_bytes: 0,
+        };
+        let mut operation = RawEventsOperation::new(document(), None, None, None, spent);
+        assert!(operation.start().is_empty());
+        assert!(matches!(
+            operation.finalize(),
+            Err(RawReadError::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert!(matches!(error, RawReadError::UnexpectedEvent(_)));
+        }
+        let mut idle = whole_log();
+        idle.step(page(Vec::new(), None));
+        assert!(matches!(
+            idle.finalize(),
+            Err(RawReadError::UnexpectedEvent(_))
+        ));
+    }
+
+    #[test]
+    fn abort_cleans_nothing() {
+        let mut operation = whole_log();
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(whole_log());
+        rejects_finalize(reading());
+    }
+}

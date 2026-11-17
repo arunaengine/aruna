@@ -559,7 +559,7 @@ async fn read_raw_event(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::metadata::raw_events::{RAW_EVENT_LIMIT, RAW_PAGE_SIZE};
     use aruna_core::storage_entries::create_event_entry;
@@ -569,7 +569,7 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
-    fn test_event(event_id: Ulid, updated_at_ms: u64) -> MetadataEventRecord {
+    pub(crate) fn test_event(event_id: Ulid, updated_at_ms: u64) -> MetadataEventRecord {
         let realm_id = RealmId::from_bytes([1; 32]);
         let group_id = Ulid::from_parts(1, 1);
         let document_id = Ulid::from_parts(1, 2);
