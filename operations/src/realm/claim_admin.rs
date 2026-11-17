@@ -113,7 +113,7 @@ pub enum ClaimInitialError {
     UnexpectedEvent {
         state: ClaimInitialState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -133,7 +133,7 @@ impl ClaimInitialOperation {
         cleanup_effects
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(ClaimInitialError::UnexpectedEvent {
             state: self.state.clone(),
             expected,
@@ -303,10 +303,9 @@ impl ClaimInitialOperation {
                 self.output = Some(Ok(ClaimInitialResult::Claimed(auth_doc)));
                 smallvec![]
             }
-            other => self.unexpected_event(
-                "admin document outbox drain timer schedule",
-                format!("{other:?}"),
-            ),
+            other => {
+                self.unexpected_event("admin document outbox drain timer schedule", other.label())
+            }
         }
     }
 }
@@ -337,7 +336,7 @@ impl Operation for ClaimInitialOperation {
 
         match self.state.clone() {
             ClaimInitialState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return self
                         .unexpected_event("Event::Storage(StorageEvent::TransactionStarted)", got);
@@ -345,7 +344,7 @@ impl Operation for ClaimInitialOperation {
                 self.emit_auth_read(txn_id)
             }
             ClaimInitialState::ReadAdminState { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return self
                         .unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
@@ -372,7 +371,7 @@ impl Operation for ClaimInitialOperation {
                 admin_outbox_written,
                 stale_conflict_deletes,
             } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return self
                         .unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
@@ -397,7 +396,7 @@ impl Operation for ClaimInitialOperation {
                 auth_doc,
                 admin_outbox_written,
             } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
                     return self
                         .unexpected_event("Event::Storage(StorageEvent::BatchDeleteResult)", got);
@@ -410,7 +409,7 @@ impl Operation for ClaimInitialOperation {
                 admin_outbox_written,
                 ..
             } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return self.unexpected_event(
                         "Event::Storage(StorageEvent::TransactionCommitted)",
@@ -429,7 +428,7 @@ impl Operation for ClaimInitialOperation {
                 self.handle_schedule(event, auth_doc)
             }
             ClaimInitialState::AbortTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
                     return self
                         .unexpected_event("Event::Storage(StorageEvent::TransactionAborted)", got);
@@ -439,7 +438,7 @@ impl Operation for ClaimInitialOperation {
                 smallvec![]
             }
             ClaimInitialState::AnnounceAuthDoc { auth_doc } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event
                 else {
                     return self.unexpected_event(

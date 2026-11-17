@@ -92,7 +92,7 @@ impl ListGroupOperation {
         &mut self,
         state: ListGroupState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
@@ -114,7 +114,7 @@ impl ListGroupOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 ListGroupState::StartTransaction,
@@ -129,7 +129,7 @@ impl ListGroupOperation {
     }
 
     fn handle_list_groups(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.unexpected_event(
                 ListGroupState::ListGroups,
@@ -148,7 +148,7 @@ impl ListGroupOperation {
     }
 
     fn handle_commit_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 ListGroupState::CommitTransaction,
@@ -190,7 +190,7 @@ pub enum ListGroupError {
     UnexpectedEvent {
         state: ListGroupState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
