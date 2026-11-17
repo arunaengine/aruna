@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::effects::IterStart;
 use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, DELETE_TRAIL_KEYSPACE};
 use aruna_core::structs::storage::blob::incarnation;
 use aruna_core::structs::storage::delete_audit::{
@@ -70,7 +69,7 @@ pub(crate) fn trail_ranges(
 
 /// The trail scan of one version transaction. Its range read makes a delete recorded meanwhile
 /// conflict with the commit, so the retried transaction reads it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrailScan {
     pub(crate) version_id: Ulid,
     pub(crate) after: Option<Key>,
@@ -95,23 +94,6 @@ impl TrailScan {
         }
     }
 
-    /// Reads the bucket's creation row in the transaction, so a recreation meanwhile conflicts.
-    pub(crate) fn creation_read(bucket: &str, txn_id: Option<Ulid>) -> Effect {
-        Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_CREATION_KEYSPACE.to_string(),
-            key: bucket.as_bytes().to_vec().into(),
-            txn_id,
-        })
-    }
-
-    /// Takes the creation row; `false` when the event is not that answer.
-    pub(crate) fn take_creation(&mut self, event: &Event) -> bool {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return false;
-        };
-        self.set_creation(value.as_deref())
-    }
-
     /// Takes the creation row's value; `false` once the incarnation is known.
     pub(crate) fn set_creation(&mut self, value: Option<&[u8]>) -> bool {
         let fresh = self.incarnation.is_none();
@@ -121,20 +103,9 @@ impl TrailScan {
         fresh
     }
 
-    /// Where a page of `prefix` starts. The original write needs only the deletes of its key
-    /// recorded since its version was created, as their audit ids are time ordered. A purge
-    /// is keyed by its job, which may predate the write, so all purges are read.
-    pub(crate) fn start(&self, prefix: &Key) -> Option<IterStart> {
-        if let Some(after) = &self.after {
-            return Some(IterStart::After(after.clone()));
-        }
-        let floor = Ulid::from_parts(self.version_id.timestamp_ms(), 0);
-        let at = [prefix.as_ref(), &floor.to_bytes()[..]].concat();
-        (self.writer && self.range == 0).then(|| IterStart::At(at.into()))
-    }
-
-    /// The key a page of `prefix` reads after, the page form of [`TrailScan::start`]: trail keys
-    /// are the prefix and an audit id, so the id just before the floor starts at the floor.
+    /// The key a page of `prefix` reads after. The original write needs only the deletes of
+    /// its key recorded since its version was created; trail keys are the prefix and an audit
+    /// id, so the id just before that floor starts the page at it. Purges are all read.
     pub(crate) fn after(&self, prefix: &Key) -> Option<Key> {
         if let Some(after) = &self.after {
             return Some(after.clone());
@@ -144,97 +115,69 @@ impl TrailScan {
         let before = Ulid(floor.checked_sub(1).filter(|_| first)?).to_bytes();
         Some([prefix.as_ref(), &before[..]].concat().into())
     }
-
-    /// A retried transaction reads the whole trail again.
-    pub(super) fn restart(&mut self) {
-        let writer = self.writer;
-        *self = Self::new(self.version_id);
-        self.writer = writer;
-    }
 }
 
 impl PutObjectOperation {
     /// The next page of the trail, or `None` once the whole trail is read.
-    pub(super) fn trail_page(&mut self, txn_id: Ulid) -> Option<Effects> {
+    pub(super) fn trail_page(&mut self) -> Option<Turn> {
         let scan = self.trail_scan.as_ref()?;
         let request = &self.config.request;
         let Some(incarnation) = scan.incarnation else {
-            let read = TrailScan::creation_read(&request.bucket, Some(txn_id));
-            self.state = PutObjectState::ReadTrail;
-            return Some(smallvec![read]);
+            let read = read_row(BUCKET_CREATION_KEYSPACE, request.bucket.as_bytes().to_vec());
+            return Some(self.call(PutObjectState::ReadTrail, read));
         };
         let bucket = (request.bucket.as_str(), incarnation);
         let ranges = trail_ranges(self.config.group_id, bucket, &request.key);
         let prefix = ranges.get(scan.range)?.clone();
-        self.state = PutObjectState::ReadTrail;
-        Some(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: DELETE_TRAIL_KEYSPACE.to_string(),
-            start: scan.start(&prefix),
-            prefix: Some(prefix),
+        let page = IoCall::Page {
+            space: DELETE_TRAIL_KEYSPACE.to_string(),
+            after: scan.after(&prefix),
+            prefix,
             limit: TRAIL_PAGE,
-            txn_id: Some(txn_id),
-        })])
+        };
+        Some(self.call(PutObjectState::ReadTrail, page))
     }
 
-    pub(super) fn trail_read(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        let Some(scan) = self.trail_scan.as_mut() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        if scan.take_creation(&event) {
+    pub(super) fn trail_read(&mut self, result: IoResult) -> Turn {
+        let scan = self.trail_scan.as_mut();
+        let scan = scan.ok_or(PutObjectError::InvalidOperationState)?;
+        if scan.incarnation.is_none() {
+            scan.set_creation(result.value()?.as_deref());
             return match scan.writer {
-                true => self.writer_trail(txn_id),
-                false => self.write_cleanup_row(txn_id),
+                true => self.writer_trail(),
+                false => self.write_cleanup_row(),
             };
         }
-        let (values, next) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
-            _ => return self.emit_error(PutObjectError::InvalidOperationState),
-        };
+        let (values, next) = result.page()?;
         let request = &self.config.request;
-        let Some(scan) = self.trail_scan.as_mut() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
         for (_, value) in values {
-            match BlobAuditRecord::from_bytes(&value) {
-                Ok(record) => {
-                    let id = scan.version_id;
-                    scan.trail = scan.trail.add(&record, &request.bucket, &request.key, id);
-                }
-                Err(error) => return self.emit_error(error.into()),
-            }
+            let record = BlobAuditRecord::from_bytes(&value)?;
+            let id = scan.version_id;
+            scan.trail = scan.trail.add(&record, &request.bucket, &request.key, id);
         }
         scan.range += usize::from(next.is_none());
         scan.after = next;
         let (trail, done, writer) = (scan.trail, scan.range >= 2, scan.writer);
         let headless = !writer && done && trail == Trail::Touched && !self.has_head();
         if trail == Trail::Removed || headless {
-            return self.emit_error(PutObjectError::HistoryDeleted);
+            return Err(PutObjectError::HistoryDeleted);
         }
         if writer {
-            return self.writer_trail(txn_id);
+            return self.writer_trail();
         }
-        self.write_cleanup_row(txn_id)
+        self.write_cleanup_row()
     }
 
     /// A listed write whose version an import registered and a user then deleted or purged
     /// must not publish it again, so its unregistered version reads the trail before the head.
-    pub(super) fn writer_trail(&mut self, txn_id: Ulid) -> Effects {
-        let Some(version_id) = self.version_id else {
-            return self.emit_error(PutObjectError::PutObjectFailed);
-        };
+    pub(super) fn writer_trail(&mut self) -> Turn {
+        let version_id = self.version_id.ok_or(PutObjectError::PutObjectFailed)?;
         let scan = self
             .trail_scan
             .get_or_insert_with(|| TrailScan::new(version_id));
         scan.writer = true;
-        if let Some(effects) = self.trail_page(txn_id) {
-            return effects;
+        if let Some(turn) = self.trail_page() {
+            return turn;
         }
         let existing = self.existing_pointer.clone();
         self.write_head(existing.as_ref(), version_id)

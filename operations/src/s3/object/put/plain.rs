@@ -5,6 +5,7 @@
 use super::fenced::{Fenced, FencedWrite};
 use super::*;
 use aruna_core::calls::IoCall;
+use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
@@ -19,7 +20,7 @@ use aruna_core::structs::storage::routing::PlainTarget;
 use aruna_core::types::{Key, Value};
 
 /// The path a write takes, the backend it resolved to and the backend version it got.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct PlainWrite {
     pub(super) target: PlainTarget,
     resolved: ResolvedBackend,
@@ -30,7 +31,7 @@ pub(super) struct PlainWrite {
 }
 
 /// Rows an import commits with its version; the rule must still exist in that transaction.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct ImportRows {
     import_id: Ulid,
     writes: Vec<(String, Key, Value)>,
@@ -67,14 +68,10 @@ impl PutObjectOperation {
 
     /// Nothing at a tenant path is ever deleted, so the write counts as adopted from here on.
     /// A same-name write first looks at the path; no lock is held.
-    pub(super) fn start_plain(
-        &mut self,
-        target: PlainTarget,
-        resolved: ResolvedBackend,
-    ) -> Effects {
+    pub(super) fn start_plain(&mut self, target: PlainTarget, resolved: ResolvedBackend) -> Turn {
         self.adopted = true;
         let (same_name, path) = (target.same_name, target.path.clone());
-        let owner = owner_read(&target);
+        let owner = owner_call(&target);
         self.plain = Some(PlainWrite {
             // Only a record proves a mapped path the key's own.
             owned: owner.is_none() && !target.mapped,
@@ -87,41 +84,32 @@ impl PutObjectOperation {
             return self.write_plain(path, false);
         }
         match owner {
-            Some(read) => {
-                self.state = PutObjectState::ReadPlainOwner;
-                smallvec![read]
-            }
+            Some(read) => self.call(PutObjectState::ReadPlainOwner, read),
             None => self.stat_plain(),
         }
     }
 
-    fn stat_plain(&mut self) -> Effects {
-        let Some(plain) = self.plain.as_ref() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
+    fn stat_plain(&mut self) -> Turn {
+        let plain = self.plain.as_ref();
+        let plain = plain.ok_or(PutObjectError::InvalidOperationState)?;
         let stat = BlobEffect::StatPlain {
             backend: plain.target.backend.clone(),
             path: plain.target.path.clone(),
         };
-        self.state = PutObjectState::StatPlain;
-        smallvec![Effect::Blob(stat)]
+        self.effect(PutObjectState::StatPlain, Effect::Blob(stat))
     }
 
-    pub(super) fn plain_owner(&mut self, event: Event) -> Effects {
-        let owned = owns_path(event, &self.config.request.key);
-        match (owned, self.plain.as_mut()) {
-            (Ok(owned), Some(plain)) => {
-                plain.owned = owned;
-                self.stat_plain()
-            }
-            (Err(error), _) => self.emit_error(PutObjectError::BlobWriteFailed(error)),
-            (_, None) => self.emit_error(PutObjectError::InvalidOperationState),
-        }
+    pub(super) fn plain_owner(&mut self, value: Option<Value>) -> Turn {
+        let owned = path_owned(value.as_deref(), &self.config.request.key);
+        let owned = owned.map_err(PutObjectError::BlobWriteFailed)?;
+        let plain = self.plain.as_mut();
+        plain.ok_or(PutObjectError::InvalidOperationState)?.owned = owned;
+        self.stat_plain()
     }
 
-    pub(super) fn plain_stat(&mut self, event: Event) -> Effects {
+    pub(super) fn plain_stat(&mut self, event: Event) -> Turn {
         let (Some(plain), Some(id)) = (self.plain.as_ref(), self.version_id) else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
+            return Err(PutObjectError::InvalidOperationState);
         };
         match event {
             Event::Blob(BlobEvent::PlainStat { exists, version }) => {
@@ -129,20 +117,17 @@ impl PutObjectOperation {
                 let (path, if_not_exists) = same_name_path(path, id, exists, replaces);
                 self.write_plain(path, if_not_exists)
             }
-            Event::Blob(BlobEvent::Error(error)) => {
-                self.emit_error(PutObjectError::BlobWriteFailed(error))
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
+            Event::Blob(BlobEvent::Error(error)) => Err(PutObjectError::BlobWriteFailed(error)),
+            _ => Err(PutObjectError::InvalidOperationState),
         }
     }
 
-    fn write_plain(&mut self, path: String, if_not_exists: bool) -> Effects {
+    fn write_plain(&mut self, path: String, if_not_exists: bool) -> Turn {
         let (Some(plain), Some(ulid)) = (self.plain.as_ref(), self.version_id) else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
+            return Err(PutObjectError::InvalidOperationState);
         };
-        let Some(blob) = self.config.request.body.take() else {
-            return self.emit_error(PutObjectError::MissingBody);
-        };
+        let blob = self.config.request.body.take();
+        let blob = blob.ok_or(PutObjectError::MissingBody)?;
         let intent = self.plain_intent();
         let import_id = plain.target.import_id;
         let keys = intent_keys(import_id, &path, ulid, if_not_exists);
@@ -158,23 +143,16 @@ impl PutObjectOperation {
             created_by: self.config.user_id,
             blob,
         });
-        self.state = PutObjectState::WriteBlob;
         let Some(intent) = intent else {
-            return smallvec![write];
+            return self.effect(PutObjectState::WriteBlob, write);
         };
-        let (rows, Some(rule)) = (intent_rows(&keys, &intent), self.rule_fence()) else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        match rows {
-            Ok(rows) => {
-                self.written_intent = keys;
-                self.pending_write = Some(smallvec![write]);
-                self.state = PutObjectState::WriteIntent;
-                let fence = self.fence.insert(FencedWrite::new(rule, rows));
-                fence.start()
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
+        let rule = self.rule_fence();
+        let rule = rule.ok_or(PutObjectError::InvalidOperationState)?;
+        let rows = intent_rows(&keys, &intent)?;
+        self.written_intent = keys;
+        self.pending_write = Some(write.into());
+        let fence = IoCall::child(FencedWrite::new(rule, rows));
+        self.call(PutObjectState::WriteIntent, fence)
     }
 
     /// Whether this is a plain write to the folder of an import rule.
@@ -197,7 +175,7 @@ impl PutObjectOperation {
 
     /// Records the hash of the written bytes in the intent of the path they reached. A lost
     /// record leaves the intent unproven, which an import reports instead of trusting.
-    pub(super) fn write_evidence(&mut self) -> Option<Effects> {
+    pub(super) fn write_evidence(&mut self) -> Option<Turn> {
         let mut intent = self
             .plain_intent()
             .filter(|_| !self.written_intent.is_empty())?;
@@ -211,90 +189,57 @@ impl PutObjectOperation {
         let (rows, rule) = (intent_rows(&[key], &intent), self.rule_fence()?);
         let rows = match rows {
             Ok(rows) => rows,
-            Err(error) => return Some(self.emit_error(error.into())),
+            Err(error) => return Some(Err(error.into())),
         };
-        self.state = PutObjectState::WriteEvidence;
-        Some(self.fence.insert(FencedWrite::new(rule, rows)).start())
+        let fence = IoCall::child(FencedWrite::new(rule, rows));
+        Some(self.call(PutObjectState::WriteEvidence, fence))
     }
 
     /// The hash is stored with a read of the rule; a removed rule gets none, and the write
     /// goes on as one without its rule.
-    pub(super) fn evidence_written(&mut self, event: Event) -> Effects {
-        let Some(fence) = self.fence.as_mut() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let effects = fence.step(event);
-        match fence.outcome().cloned() {
-            None => effects,
-            Some(Fenced::Written | Fenced::RuleGone) => self.start_transaction(),
-            Some(Fenced::Failed(Some(error))) => {
-                self.cleanup_failed_write(PutObjectError::StorageError(error))
+    pub(super) fn evidence_written(&mut self, result: IoResult) -> Turn {
+        match result.child::<Fenced, StorageError>()? {
+            Ok(Fenced::Written | Fenced::RuleGone) => self.start_publish(),
+            Ok(Fenced::Failed(error)) => {
+                Err(error.map_or(PutObjectError::InvalidOperationState, Into::into))
             }
-            Some(Fenced::Failed(None)) => self.emit_error(PutObjectError::InvalidOperationState),
+            Err(error) => Err(error.into()),
         }
     }
 
     /// Bytes move only once their identity is stored with a read of the rule and synced to
     /// disk; a removed rule stores nothing and refuses the write.
-    pub(super) fn intent_written(&mut self, event: Event) -> Effects {
-        if self.state == PutObjectState::SyncIntent {
-            return match (event, self.pending_write.take()) {
-                (Event::Storage(StorageEvent::SyncAllFinished), Some(write)) => {
-                    self.state = PutObjectState::WriteBlob;
-                    write
-                }
-                (Event::Storage(StorageEvent::Error { error }), _) => self.emit_error(error.into()),
-                _ => self.emit_error(PutObjectError::InvalidOperationState),
-            };
-        }
-        let Some(fence) = self.fence.as_mut() else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let effects = fence.step(event);
-        match fence.outcome().cloned() {
-            None => effects,
-            Some(Fenced::Written) => {
-                self.state = PutObjectState::SyncIntent;
-                smallvec![Effect::Storage(StorageEffect::SyncAll)]
-            }
-            Some(Fenced::RuleGone) => {
+    pub(super) fn intent_written(&mut self, result: IoResult) -> Turn {
+        match result.child::<Fenced, StorageError>()? {
+            Ok(Fenced::Written) => self.call(PutObjectState::SyncIntent, IoCall::Sync),
+            Ok(Fenced::RuleGone) => {
                 self.written_intent.clear();
-                self.emit_error(PutObjectError::ImportRemoved)
+                Err(PutObjectError::ImportRemoved)
             }
-            Some(Fenced::Failed(Some(error))) => self.emit_error(error.into()),
-            Some(Fenced::Failed(None)) => self.emit_error(PutObjectError::InvalidOperationState),
+            Ok(Fenced::Failed(error)) => {
+                Err(error.map_or(PutObjectError::InvalidOperationState, Into::into))
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
-    /// A refused conditional write moved no byte, so its intent must not claim the path.
-    pub(super) fn drop_intent(&mut self) -> Effects {
-        let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
+    pub(super) fn intent_synced(&mut self, result: IoResult) -> Turn {
+        result.done()?;
+        let write = self.pending_write.take();
+        let write = write.ok_or(PutObjectError::InvalidOperationState)?;
+        self.call(PutObjectState::WriteBlob, write)
+    }
+
+    /// A refused conditional write moved no byte, so its intent must not claim the path; the
+    /// write fails as taken once the intents are gone for good.
+    pub(super) fn drop_intent(&mut self) -> Turn {
         if self.written_intent.is_empty() {
-            return self.cleanup_failed_write(taken);
+            return Err(PutObjectError::BlobWriteFailed(BlobError::PathTaken));
         }
-        self.state = PutObjectState::DropIntent;
-        smallvec![intent_deletes(&self.written_intent)]
-    }
-
-    /// The write fails as taken only once its intents are gone for good; a failed delete or
-    /// sync keeps them and fails the write with that error instead.
-    pub(super) fn intent_dropped(&mut self, event: Event) -> Effects {
-        let syncing = self.state == PutObjectState::SyncDroppedIntent;
-        match event {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if !syncing => {
-                self.state = PutObjectState::SyncDroppedIntent;
-                smallvec![Effect::Storage(StorageEffect::SyncAll)]
-            }
-            Event::Storage(StorageEvent::SyncAllFinished) if syncing => {
-                self.written_intent.clear();
-                let taken = PutObjectError::BlobWriteFailed(BlobError::PathTaken);
-                self.cleanup_failed_write(taken)
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.cleanup_failed_write(PutObjectError::StorageError(error))
-            }
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
-        }
+        let space = IMPORT_INTENT_KEYSPACE.to_string();
+        let deletes = (self.written_intent.iter()).map(|key| (space.clone(), key.clone()));
+        let call = IoCall::Delete(deletes.collect());
+        self.call(PutObjectState::DropIntent, call)
     }
 
     /// Rows committed with the version only while the import rule `import_id` exists.
@@ -329,28 +274,12 @@ impl PutObjectOperation {
     }
 
     /// The import rows are written; the obsolete intents go in the same transaction.
-    pub(super) fn plain_written(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        let retiring = self.state == PutObjectState::RetireIntents;
-        let deletes = match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) if !retiring => {
-                self.retired_intents()
-            }
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) if retiring => Vec::new(),
-            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
-            _ => return self.emit_error(PutObjectError::InvalidOperationState),
-        };
-        if !deletes.is_empty() {
-            self.state = PutObjectState::RetireIntents;
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })];
+    pub(super) fn plain_written(&mut self) -> Turn {
+        let deletes = self.retired_intents();
+        if deletes.is_empty() {
+            return self.finish_publish();
         }
-        self.state = PutObjectState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.call(PutObjectState::RetireIntents, IoCall::Delete(deletes))
     }
 
     /// Refuses the version while the delete trail shows `version_id`, or the key without a
@@ -396,39 +325,26 @@ impl PutObjectOperation {
         Some(import_key(self.config.group_id, import_id))
     }
 
-    pub(super) fn plain_records(&mut self, txn_id: Ulid) -> Option<Effects> {
+    pub(super) fn plain_records(&mut self) -> Option<Turn> {
         // Which other rules read the written path is read in this transaction.
         if self.listed_write() && self.rule_exists.is_none() && !self.readers.done() {
-            self.state = PutObjectState::ReadReaders;
-            let page = self.readers.page(self.config.group_id, Some(txn_id));
-            return Some(smallvec![page]);
+            let page = self.readers.page_call(self.config.group_id);
+            return Some(self.call(PutObjectState::ReadReaders, page));
         }
         if self.rule_exists.is_none()
             && let Some(key) = self.rule_fence()
         {
-            self.state = PutObjectState::ReadImportRule;
+            let rule = (BACKEND_IMPORT_KEYSPACE.to_string(), key);
             let guards = self.fence_guards();
-            if !guards.is_empty() {
-                let rule = (BACKEND_IMPORT_KEYSPACE.to_string(), key);
-                let reads = guards
-                    .iter()
-                    .map(|(space, key, _)| (space.clone(), key.clone()));
-                return Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: std::iter::once(rule).chain(reads).collect(),
-                    txn_id: Some(txn_id),
-                })]);
-            }
-            return Some(smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-                key,
-                txn_id: Some(txn_id),
-            })]);
+            let guards = guards.into_iter().map(|(space, key, _)| (space, key));
+            let reads = std::iter::once(rule).chain(guards).collect();
+            return Some(self.call(PutObjectState::ReadImportRule, IoCall::Read(reads)));
         }
         if self.import_rows.is_some()
             && self.rule_exists == Some(true)
-            && let Some(effects) = self.trail_page(txn_id).or_else(|| self.rule_page(txn_id))
+            && let Some(turn) = self.trail_page().or_else(|| self.rule_page())
         {
-            return Some(effects);
+            return Some(turn);
         }
         let mut writes = Vec::new();
         // A deduplicated version reads the older location, so it needs no version row.
@@ -438,7 +354,7 @@ impl PutObjectOperation {
             .is_some_and(|(output, written)| output.ulid == written.ulid);
         if let Some(rows) = self.import_rows.as_ref() {
             if self.rule_exists != Some(true) {
-                return Some(self.emit_error(PutObjectError::ImportRemoved));
+                return Some(Err(PutObjectError::ImportRemoved));
             }
             let rows = rows.writes.iter();
             writes.extend(
@@ -461,11 +377,11 @@ impl PutObjectOperation {
             };
             match record.writes(self.rule_exists == Some(true)) {
                 Ok(rows) => writes.extend(rows),
-                Err(error) => return Some(self.emit_error(error.into())),
+                Err(error) => return Some(Err(error.into())),
             }
             match self.dedup_release().transpose() {
                 Ok(release) => writes.extend(release),
-                Err(error) => return Some(self.emit_error(error.into())),
+                Err(error) => return Some(Err(error.into())),
             }
         }
         if writes.is_empty() {
@@ -474,70 +390,45 @@ impl PutObjectOperation {
             if self.plain.is_none() || deletes.is_empty() {
                 return None;
             }
-            self.state = PutObjectState::RetireIntents;
-            return Some(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })]);
+            return Some(self.call(PutObjectState::RetireIntents, IoCall::Delete(deletes)));
         }
-        self.state = PutObjectState::WritePlainRecords;
-        Some(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        Some(self.call(PutObjectState::WritePlainRecords, IoCall::Write(writes)))
     }
 
-    pub(super) fn readers_read(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        let path = self
-            .get_written_location()
-            .map(|written| written.backend_path.clone());
+    pub(super) fn readers_read(&mut self, page: (Vec<(Key, Value)>, Option<Key>)) -> Turn {
+        let path = (self.get_written_location()).map(|written| written.backend_path.clone());
         let (Some(plain), Some(path)) = (self.plain.as_mut(), path) else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
+            return Err(PutObjectError::InvalidOperationState);
         };
         let target = (plain.target.import_id, &plain.target.backend, path.as_str());
-        match self.readers.read(event, target) {
-            Ok(Some(readers)) => {
+        let read = self.readers.read_page(page, target);
+        match read.map_err(|_| PutObjectError::InvalidOperationState)? {
+            Some(readers) => {
                 plain.target.shared = readers;
-                self.write_cleanup_row(txn_id)
+                self.write_cleanup_row()
             }
-            Ok(None) => smallvec![self.readers.page(self.config.group_id, Some(txn_id))],
-            Err(_) => self.emit_error(PutObjectError::InvalidOperationState),
+            None => {
+                let page = self.readers.page_call(self.config.group_id);
+                Ok(Next::Call(page))
+            }
         }
     }
 
-    pub(super) fn import_rule_read(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(PutObjectError::NoTransactionFound);
-        };
-        // Only the answer to the read that was sent counts.
+    pub(super) fn import_rule_read(&mut self, values: Vec<Option<Value>>) -> Turn {
         let guards = self.fence_guards();
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) if guards.is_empty() => {
-                self.rule_exists = Some(value.is_some());
-                self.write_cleanup_row(txn_id)
-            }
-            Event::Storage(StorageEvent::BatchReadResult { values }) if !guards.is_empty() => {
-                let Some(((_, rule), seen)) = values.split_first() else {
-                    return self.emit_error(PutObjectError::InvalidOperationState);
-                };
-                let expected = guards.iter().map(|(_, _, value)| value);
-                if seen.len() != guards.len() || !seen.iter().map(|(_, v)| v).eq(expected) {
-                    // Another rule recorded the written path, so the file there is its own.
-                    let error = match self.import_rows.is_some() {
-                        true => PutObjectError::HeadChanged,
-                        false => PutObjectError::BlobWriteFailed(BlobError::PathTaken),
-                    };
-                    return self.emit_error(error);
-                }
-                self.rule_exists = Some(rule.is_some());
-                self.write_cleanup_row(txn_id)
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        let Some((rule, seen)) = values.split_first() else {
+            return Err(PutObjectError::InvalidOperationState);
+        };
+        let expected = guards.iter().map(|(_, _, value)| value);
+        if seen.len() != guards.len() || !seen.iter().eq(expected) {
+            // Another rule recorded the written path, so the file there is its own.
+            return Err(match self.import_rows.is_some() {
+                true => PutObjectError::HeadChanged,
+                false => PutObjectError::BlobWriteFailed(BlobError::PathTaken),
+            });
         }
+        self.rule_exists = Some(rule.is_some());
+        self.write_cleanup_row()
     }
 }
 
