@@ -45,7 +45,6 @@ use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
 use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
-use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 struct PreparedReference {
     metadata: SourceMetadata,

@@ -709,6 +709,9 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         Effect::StagingSource(_) => limits.staging_source,
         Effect::Blob(_)
         | Effect::LocalFile(_)
+        | Effect::Index(_)
+        | Effect::Session(_)
+        | Effect::Outbound(_)
         | Effect::SubOperation(_)
         | Effect::Group(_)
         | Effect::Delay(_)

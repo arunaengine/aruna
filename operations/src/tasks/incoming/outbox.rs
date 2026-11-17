@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::node::summary_refresh::RefreshUsageOperation;
 
 impl DrainInvocation {
     pub(super) fn new(rotation: &OutboxRotation) -> Self {

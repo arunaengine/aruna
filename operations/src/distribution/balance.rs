@@ -20,7 +20,6 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::create::submit;
-use super::sign_statement;
 use crate::driver::{DriverContext, drive};
 use crate::s3::usage::LoadCountersOperation;
 use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;

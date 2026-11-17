@@ -38,7 +38,6 @@ use crate::replication::incoming::{IncomingVersionError, member_reference, same_
 use crate::replication::protocol::VersionReplicationManifest;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::UsageUpdateError;
-use crate::staging::root_record::{compact_version, root_write};
 
 /// Rows read ahead of the records: bucket, encryption, purge fence, record and member fence.
 pub(super) const GUARD_READS: usize = 5;

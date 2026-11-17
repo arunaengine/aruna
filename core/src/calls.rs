@@ -136,6 +136,9 @@ enum Family {
     Net,
     Metadata,
     Task,
+    Index,
+    Session,
+    Outbound,
 }
 
 impl Wait {
@@ -153,6 +156,9 @@ impl Wait {
             Self::Family(Family::Net) => "a net event",
             Self::Family(Family::Metadata) => "a metadata event",
             Self::Family(Family::Task) => "a task event",
+            Self::Family(Family::Index) => "an index event",
+            Self::Family(Family::Session) => "a session event",
+            Self::Family(Family::Outbound) => "an outbound event",
             Self::Child => "the child's event",
             Self::Group => "GroupEvent::Finished",
             Self::Window => "GroupEvent::Member or GroupEvent::Closed",
@@ -468,6 +474,9 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::Net(_) => Ok(Family::Net),
         Effect::Metadata(_) => Ok(Family::Metadata),
         Effect::Task(_) => Ok(Family::Task),
+        Effect::Index(_) => Ok(Family::Index),
+        Effect::Session(_) => Ok(Family::Session),
+        Effect::Outbound(_) => Ok(Family::Outbound),
         Effect::Storage(
             StorageEffect::StartTransaction { .. }
             | StorageEffect::CommitTransaction { .. }
@@ -492,6 +501,9 @@ fn event_family(event: &Event) -> Option<Family> {
         Event::Net(_) => Some(Family::Net),
         Event::Metadata(_) => Some(Family::Metadata),
         Event::Task(_) => Some(Family::Task),
+        Event::Index(_) => Some(Family::Index),
+        Event::Session(_) => Some(Family::Session),
+        Event::Outbound(_) => Some(Family::Outbound),
         Event::SubOperation(_)
         | Event::Search()
         | Event::Stream()

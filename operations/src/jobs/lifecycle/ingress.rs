@@ -61,7 +61,6 @@ use aruna_core::jobs::{InputResolveRequest, SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
 use aruna_core::structs::execution::job::record_rows::ProjectionCache;
-use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.

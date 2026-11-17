@@ -45,7 +45,7 @@ pub(crate) async fn preserve_artifact_tombstone(
             (
                 SCHEDULE_INDEX_KEYSPACE.to_string(),
                 job_prune_key(expires_at_ms, job_id),
-                empty_value(),
+                aruna_core::types::Value::from(Vec::<u8>::new()),
             ),
         ],
         None,

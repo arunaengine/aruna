@@ -30,7 +30,7 @@ use super::account::{
     read_user, teardown,
 };
 use super::bound::{BindError, BindPlace, bind_slots, vault_kind};
-use super::check::covers;
+use super::grants::covers;
 use super::grants::{
     GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
     parse_grants, patterns_for, role_paths, stored_grants, writes,

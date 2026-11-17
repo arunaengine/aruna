@@ -5,6 +5,7 @@
 
 use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use aruna_core::metadata::MetadataBatch;
+use aruna_core::metadata::is_rocrate_specification;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQuadOp;
 use aruna_core::metadata::ProfileValidationCompleteness;

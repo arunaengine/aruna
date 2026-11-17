@@ -65,7 +65,7 @@ pub async fn park_job(
                     (
                         KEY_WAIT_KEYSPACE.to_string(),
                         key_wait_key(wait.key, job_id),
-                        empty_value(),
+                        aruna_core::types::Value::from(Vec::<u8>::new()),
                     )
                 }));
                 batch_write(storage, writes, Some(txn_id))

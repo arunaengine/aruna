@@ -12,8 +12,6 @@ use crate::distribution::inventory::{
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::UsageUpdateError;
-use crate::staging::descriptor::build_source_binding;
-use crate::staging::root_record::{compact_version, root_write};
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};

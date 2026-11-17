@@ -22,7 +22,6 @@ use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_rea
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
-use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
 use crate::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
