@@ -9,8 +9,9 @@ use super::*;
 use crate::metadata::MetadataHandle;
 use crate::metadata::api::{DocumentQueryRequest, query_metadata_document};
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
+use crate::metadata::create_entry::create_metadata_document;
 use crate::metadata::materialization_queue::process_materialization_batch;
 use crate::metadata::projector::drain_projection_queue;
 use crate::plugins::install::tests::Fixture;

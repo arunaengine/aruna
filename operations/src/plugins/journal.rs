@@ -151,8 +151,8 @@ mod tests {
         // The accepting node journals a creation in its batch; its projection adds nothing.
         use crate::metadata::create_document::{
             CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
-            create_metadata_document,
         };
+        use crate::metadata::create_entry::create_metadata_document;
         let fixture = crate::plugins::install::tests::Fixture::new().await;
         let mut ctx = fixture.ctx.clone();
         let dir = tempfile::tempdir().unwrap();

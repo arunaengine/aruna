@@ -47,8 +47,9 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_job_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
+use crate::metadata::create_entry::mint_job_document;
 use crate::metadata::forward::write::route_metadata_create;
 use crate::metadata::record_reads::load_document_record;
 use crate::notifications::watch::emit::emit_metadata_created;

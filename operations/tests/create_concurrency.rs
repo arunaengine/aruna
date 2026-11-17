@@ -12,8 +12,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
+use aruna_operations::metadata::create_entry::create_metadata_document;
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
 

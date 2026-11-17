@@ -46,8 +46,8 @@ use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    mint_job_document,
 };
+use crate::metadata::create_entry::mint_job_document;
 use crate::metadata::forward::write::{
     route_metadata_create, route_metadata_delete, route_metadata_update,
 };

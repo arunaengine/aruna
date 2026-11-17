@@ -9,6 +9,7 @@ pub(crate) mod checkpoint;
 pub(crate) mod checkpoint_window;
 pub mod contact;
 pub mod create_document;
+pub mod create_entry;
 pub(crate) mod data_links;
 pub mod delete_document;
 pub mod device_pull;

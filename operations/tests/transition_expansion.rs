@@ -8,9 +8,9 @@ use aruna_core::StructuredId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
+use aruna_operations::metadata::create_entry::create_metadata_document;
 use aruna_operations::metadata::projector::replay_event_log;
 use ulid::Ulid;
 
