@@ -6,7 +6,7 @@
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, owner_delete_effect, read_version_effect};
-use crate::s3::usage::{QuotaGate, StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::blob::usage::{QuotaGate, StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};

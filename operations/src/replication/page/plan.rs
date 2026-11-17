@@ -32,11 +32,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
+use crate::blob::usage::UsageUpdateError;
 use crate::distribution::inventory::{AddedVersion, InventoryChange, entry_of, version_written};
 use crate::replication::incoming::{IncomingVersionError, member_reference, same_reference};
 use crate::replication::protocol::VersionReplicationManifest;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
-use crate::s3::usage::UsageUpdateError;
 use crate::staging::root_record::{compact_version, root_write};
 
 /// Rows read ahead of the records: bucket, encryption, purge fence, record and member fence.

@@ -1,4 +1,4 @@
-//! Builds the usage counter changes of storage writes and gates them on quota.
+//! Builds the usage counter changes of stored blob writes and gates them on quota.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

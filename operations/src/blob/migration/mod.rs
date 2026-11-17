@@ -13,6 +13,7 @@ pub mod rewrite;
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, read_version_effect};
+use crate::blob::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::routing_key;
 use crate::s3::bucket::key::rows::settings_read;
@@ -20,7 +21,6 @@ use crate::s3::object::put::fenced::{Fenced, FencedWrite};
 use crate::s3::object::put::{
     PlainRecord, intent_deletes, intent_rows, owner_read, owns_path, same_name_path,
 };
-use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};

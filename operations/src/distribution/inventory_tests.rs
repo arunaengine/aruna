@@ -531,7 +531,7 @@ async fn full_sample_evicts() {
 /// the second new key only in place of its largest entry.
 #[tokio::test]
 async fn counts_own_admissions() {
-    use crate::s3::usage::UsageCounterUpdate;
+    use crate::blob::usage::UsageCounterUpdate;
     use aruna_core::structs::storage::usage::UsageDelta;
 
     let (_dir, handle) = open();
@@ -575,7 +575,7 @@ async fn counts_own_admissions() {
 /// below it enters in its place although it ranks above the committed largest entry.
 #[tokio::test]
 async fn sees_staged_entry() {
-    use crate::s3::usage::UsageCounterUpdate;
+    use crate::blob::usage::UsageCounterUpdate;
     use aruna_core::structs::storage::usage::UsageDelta;
 
     let (_dir, handle) = open();

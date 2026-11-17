@@ -31,9 +31,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::blob::usage::{counted, rebuild_marker_read, schedule_snapshot_publish};
 use crate::distribution::usage::replica_shares;
 use crate::driver::{DriverContext, drive};
-use crate::s3::usage::{counted, rebuild_marker_read, schedule_snapshot_publish};
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
@@ -1039,9 +1039,9 @@ mod tests {
         shard_for_hash, usage_backend_key, usage_bucket_key,
     };
 
+    use crate::blob::usage::{QuotaGate, RowChange, StoredDelta, UsageCounterUpdate, counted};
     use crate::driver::{DriverContext, drive};
     use crate::s3::bucket::create::CreateBucketOperation;
-    use crate::s3::usage::{QuotaGate, RowChange, StoredDelta, UsageCounterUpdate, counted};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
         UPLOAD_KEYSPACE,

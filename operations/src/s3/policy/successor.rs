@@ -8,6 +8,9 @@ use crate::blob::managed_copy::{
     register_entry, scan_effect, validate_registration, version_scope,
 };
 use crate::blob::records::HeadAliasContext;
+use crate::blob::usage::{
+    QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
+};
 use crate::connectors::repository::connector_reference_write;
 use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
@@ -15,9 +18,6 @@ use crate::distribution::inventory::{
 };
 use crate::placement::policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::usage::{
-    QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
-};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};

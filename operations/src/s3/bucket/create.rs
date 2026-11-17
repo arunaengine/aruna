@@ -3,13 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::blob::usage::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use crate::groups::backends::backend_key;
 use crate::groups::imports::ImportRuleError;
 use crate::groups::imports::create::{CreateImportInput, CreateImportOperation};
 use crate::groups::storage_routing::routing_key;
-use crate::s3::usage::{
-    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
-};
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

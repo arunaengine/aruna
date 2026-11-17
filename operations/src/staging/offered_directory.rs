@@ -4,10 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
+use crate::blob::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::driver::{DriverContext, drive};
 use crate::plugins::journal::journaled;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
-use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};

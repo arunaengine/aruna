@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
+use crate::blob::usage::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use crate::connectors::repository::{
     StorageReadError, connector_reference_write, parse_secret_read, read_secret_effect,
     source_connector_key,
@@ -15,9 +18,6 @@ use crate::distribution::inventory::{
 use crate::driver::{DriverContext, drive};
 use crate::plugins::journal::journaled;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::usage::{
-    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
-};
 use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::tasks::task_persistence::persist_task_effect;

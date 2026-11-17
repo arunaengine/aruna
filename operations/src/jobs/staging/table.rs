@@ -33,6 +33,7 @@ use super::walk::{
 };
 use super::{ItemFailure, pinned_bucket, queue_key};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::blob::usage::QuotaGateError;
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
 use crate::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use crate::jobs::executor::JobContext;
@@ -47,7 +48,6 @@ use crate::s3::object::get::{
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::purge_fence::PurgeFenceError;
-use crate::s3::usage::QuotaGateError;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};

@@ -19,7 +19,7 @@ use super::plan::{
     previous_reads,
 };
 use super::{PageAnswer, ReferencePage};
-use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
+use crate::blob::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApplyState {

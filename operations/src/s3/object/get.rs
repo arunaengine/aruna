@@ -9,6 +9,7 @@ use crate::blob::promote::{
     PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
 };
 use crate::blob::records::blob_location_read;
+use crate::blob::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::pull::{
@@ -27,7 +28,6 @@ use crate::s3::object::lookup::{
 };
 use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use crate::s3::object::source::choice::{Candidate, choose_source};
-use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
