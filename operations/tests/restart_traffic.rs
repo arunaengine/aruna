@@ -14,7 +14,8 @@ use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::node::startup::{RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
+use aruna_operations::node::restore_plan::RESTORE_TOPIC_COUNT;
+use aruna_operations::node::startup::restore_shard_subscriptions;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };

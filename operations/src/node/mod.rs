@@ -9,6 +9,7 @@ pub mod node_info;
 pub mod realm_usage;
 mod rebuild_counts;
 pub mod recovery;
+pub mod restore_plan;
 pub mod startup;
 pub mod summary_refresh;
 pub mod usage_publish;
