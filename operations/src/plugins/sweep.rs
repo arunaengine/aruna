@@ -133,7 +133,7 @@ mod tests {
         else {
             panic!("a next key reads the next page");
         };
-        assert_eq!(after, Some(b"u1".to_vec()));
+        assert_eq!(after.map(|key| key.to_vec()), Some(b"u1".to_vec()));
         let Next::Done(accounts) = plan.next(page_result(Vec::new(), None)).unwrap() else {
             panic!("the last page ends the listing");
         };

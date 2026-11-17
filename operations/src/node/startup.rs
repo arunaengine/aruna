@@ -1382,10 +1382,7 @@ mod tests {
                     && status.pass_total(RecoveryOutcome::Partial) == partial
                 {
                     observed = partial;
-                    let progress = status
-                        .inner
-                        .last_progress_ms
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let progress = status.progress_ms();
                     let remaining = status.snapshot().topics_remaining;
                     if previous == Some((progress, remaining)) {
                         return (partial, progress, remaining);
@@ -1742,13 +1739,7 @@ mod tests {
         assert!(remaining > 0);
 
         wait_partial(&status, partial.saturating_add(3)).await;
-        assert_eq!(
-            status
-                .inner
-                .last_progress_ms
-                .load(std::sync::atomic::Ordering::Relaxed),
-            progress
-        );
+        assert_eq!(status.progress_ms(), progress);
         assert_eq!(status.snapshot().topics_remaining, remaining);
 
         finish_driver(cancelled, driver).await;

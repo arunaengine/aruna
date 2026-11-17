@@ -36,8 +36,6 @@ use super::read::device_raw_revision;
 use super::read::keep_status;
 use super::read::{AuthFailure, ReadDecision, reduce_holder_reads};
 
-use super::*;
-
 use crate::device::replica::ReplicaOrigin;
 use aruna_core::metadata::{ProfileValidationCompleteness, ProfileValidationState};
 use aruna_core::structs::placement::record::{METADATA_HANDLE, PlacementStrategy};

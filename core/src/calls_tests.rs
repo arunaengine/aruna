@@ -159,6 +159,7 @@ fn snapshot_joins_reads() {
     assert_eq!(effects.as_slice(), &[storage(read(Some(txn())))]);
 }
 
+#[test]
 fn storage_refusal_fails() {
     // A storage effect answered with a storage error fails the operation like a storage call.
     let read = StorageEffect::Read {

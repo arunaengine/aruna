@@ -244,7 +244,7 @@ pub(crate) mod call_tests {
     use aruna_core::events::{Event, StorageEvent};
 
     pub(crate) fn event(seed: u64) -> MetadataEventRecord {
-        test_event(Ulid::from_parts(1, seed), seed)
+        test_event(Ulid::from_parts(1, u128::from(seed)), seed)
     }
 
     fn document() -> Ulid {

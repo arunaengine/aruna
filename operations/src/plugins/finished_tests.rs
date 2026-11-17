@@ -13,6 +13,7 @@ use super::*;
 use crate::plugins::broker::call_intent;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::rows::values_result;
 use crate::plugins::runs::{list_runs, save_run};
 use crate::plugins::submit::start_copy;
 use crate::plugins::submit::tests::{path, ready, request, scope};
@@ -202,7 +203,7 @@ async fn retry_redoes_undone() {
     use crate::plugins::intents::{
         Begun, begin, intent_scan, resolved_rows, settled_row, unknown_row,
     };
-    use crate::plugins::rows::{scan_rows, values_result, write_rows};
+    use crate::plugins::rows::{scan_rows, write_rows};
     let fixture = Fixture::new().await;
     let install = finisher(&fixture).await;
     let mut run = scope(&fixture, &install).run;
