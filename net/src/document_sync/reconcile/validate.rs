@@ -3,10 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::user::validation::{
-    DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX,
-    SERVICE_GROUP_ATTRIBUTE,
-};
+use aruna_core::user::validation::{MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
 
 impl ConfigValidationCache {
     pub(in crate::document_sync) fn invalidate(&mut self) {
@@ -84,50 +81,6 @@ pub(in crate::document_sync) async fn read_realm_authorization(
     .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
-/// Whether this origin already holds the per-origin bound a local mint obeys.
-/// Replacing its own entry stays allowed; the flooding origin is rejected rather
-/// than trimmed, so a valid revocation is never discarded to make room.
-pub(in crate::document_sync) fn revocation_origin_full(
-    state: Option<&AdminDocumentState>,
-    event: &AdminDocumentEvent,
-    token_hash: &str,
-) -> bool {
-    let Some(state) = state else {
-        return false;
-    };
-    let index = state.revocation_index(state.revocation_floor.max(unix_timestamp_secs()));
-    index.origin(token_hash) != Some(event.origin_node_id)
-        && index.count(&event.origin_node_id) >= REVOCATIONS_PER_ORIGIN
-}
-
-pub(in crate::document_sync) fn revocation_origin_known(
-    config: Option<&RealmConfigDocument>,
-    state: Option<&AdminDocumentState>,
-    event: &AdminDocumentEvent,
-    realm_id: RealmId,
-) -> bool {
-    if config.is_some_and(|config| {
-        config.realm_id == realm_id && origin_may_publish(config, &event.origin_node_id)
-    }) {
-        return true;
-    }
-
-    let Some(state) = state else {
-        return false;
-    };
-    let path = config_node_path(&event.origin_node_id);
-    state
-        .user_subject_ids
-        .get(&path)
-        .is_some_and(|version| event.observed.observes(&version.dot))
-        || state.conflicts.get(&path).is_some_and(|conflict| {
-            conflict
-                .values
-                .iter()
-                .any(|value| event.observed.observes(&value.dot))
-        })
-}
-
 /// Whether the transport publisher of a relayed admin event is a realm node
 /// allowed to relay. User nodes are never relays, so they never appear here.
 pub(in crate::document_sync) async fn relay_publisher_allowed(
@@ -145,17 +98,6 @@ pub(in crate::document_sync) async fn relay_publisher_allowed(
         .filter(|node| node.kind.is_sync_eligible())
         .filter_map(|node| NodeId::from_str(&node.node_id).ok())
         .any(|node_id| publisher == ::irokle::actor_id_for(topic_id, node_to_peer(&node_id))))
-}
-
-/// Publisher capability by node kind: a User node never originates a realm
-/// administrative event, whichever node relayed it.
-pub(in crate::document_sync) fn origin_may_publish(
-    config: &RealmConfigDocument,
-    origin_node_id: &NodeId,
-) -> bool {
-    config
-        .node_kind(origin_node_id)
-        .is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
 /// Resolves the plan a report names (stored config first, reduced state as
@@ -677,45 +619,6 @@ pub(in crate::document_sync) async fn validate_user_authority(
     Ok(AdminEventValidation::Accepted)
 }
 
-/// The group whose administrators may apply this event to a service account: the owner named by
-/// the event creating a new account, else the stored owner for name and status changes.
-fn service_owner(
-    event: &AdminDocumentEvent,
-    previous_state: Option<&AdminDocumentState>,
-    current_user: Option<&User>,
-) -> Option<GroupId> {
-    let attributes = previous_state.map(AdminDocumentState::materialized_user_attributes);
-    let stored = current_user.and_then(User::service_group).or_else(|| {
-        attributes
-            .as_ref()
-            .and_then(|attributes| attributes.get(SERVICE_GROUP_ATTRIBUTE))
-            .and_then(|group| group.parse().ok())
-    });
-    match &event.op {
-        AdminDocumentOperation::UserAttributeSet { key, value }
-            if key == SERVICE_GROUP_ATTRIBUTE =>
-        {
-            let fresh =
-                current_user.is_none() && attributes.is_none_or(|attributes| attributes.is_empty());
-            fresh.then(|| value.parse().ok()).flatten()
-        }
-        // The install marker is set once, right after the owner, and never changed.
-        AdminDocumentOperation::UserAttributeSet { key, .. } if key == INSTALL_ATTRIBUTE => {
-            let marked = current_user.is_some_and(|user| user.install().is_some())
-                || (attributes.as_ref()).is_some_and(|map| map.contains_key(INSTALL_ATTRIBUTE));
-            stored.filter(|_| !marked)
-        }
-        AdminDocumentOperation::UserAttributeSet { key, .. }
-        | AdminDocumentOperation::UserAttributeRemoved { key }
-            if key == DEACTIVATED_ATTRIBUTE =>
-        {
-            stored
-        }
-        AdminDocumentOperation::UserNameSet { .. } => stored,
-        _ => None,
-    }
-}
-
 pub(in crate::document_sync) async fn validate_group_authority(
     storage: &StorageHandle,
     event: &AdminDocumentEvent,
@@ -981,19 +884,6 @@ pub(in crate::document_sync) async fn validate_group_authority(
     })
 }
 
-pub(in crate::document_sync) fn has_write_permission<'a>(
-    user_id: UserId,
-    path: &str,
-    roles: impl IntoIterator<Item = &'a Role>,
-) -> bool {
-    !user_id.is_nil()
-        && aruna_core::structs::placement::policy::document::holds_admin_write(
-            user_id,
-            path,
-            roles.into_iter(),
-        )
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::document_sync) enum AdminEventValidation {
     Accepted,
@@ -1204,40 +1094,4 @@ enum ReportParticipation {
     Participant,
     UnknownPlan,
     Foreign,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::identity::realm::RealmId;
-    use ulid::Ulid;
-
-    #[test]
-    fn marker_set_once() {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group = Ulid::from_parts(1, 9);
-        let user_id = UserId::local(Ulid::from_parts(1, 7), realm_id);
-        let actor = Actor {
-            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-            user_id: UserId::local(Ulid::from_parts(1, 3), realm_id),
-            realm_id,
-        };
-        let set = |key: &str, value: String| AdminDocumentOperation::UserAttributeSet {
-            key: key.to_string(),
-            value,
-        };
-        let mut state = AdminDocumentState::new(AdminDocumentTarget::User { user_id });
-        let owner = state.apply_operation(&actor, set(SERVICE_GROUP_ATTRIBUTE, group.to_string()));
-        assert_eq!(service_owner(&owner.unwrap(), None, None), Some(group));
-        let owned = state.clone();
-        let marker = state.apply_operation(&actor, set(INSTALL_ATTRIBUTE, "a".into()));
-        assert_eq!(
-            service_owner(&marker.unwrap(), Some(&owned), None),
-            Some(group)
-        );
-        let marked = state.clone();
-        let again = state.apply_operation(&actor, set(INSTALL_ATTRIBUTE, "b".into()));
-        assert_eq!(service_owner(&again.unwrap(), Some(&marked), None), None);
-    }
 }

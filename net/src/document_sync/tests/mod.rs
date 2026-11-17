@@ -19,8 +19,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataEventPayload;
 use aruna_core::reducer::{
-    CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH, USER_NAME_PATH,
-    group_user_path, realm_user_path, user_attribute_path,
+    CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH,
+    REVOCATIONS_PER_ORIGIN, USER_NAME_PATH, group_user_path, realm_user_path, user_attribute_path,
 };
 use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
