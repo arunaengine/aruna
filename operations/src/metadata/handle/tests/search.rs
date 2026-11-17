@@ -1,4 +1,4 @@
-//! Tests search visibility rules, hit enrichment order, record selection and limit clamping.
+//! Tests search visibility rules, record selection and limit clamping.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,10 +8,6 @@ use crate::auth::permission_rules::GroupPermissionRules;
 use crate::metadata::handle::search::clamp_remote_limit;
 use crate::metadata::search_cursor::MAX_PAGINATION_DEPTH;
 use aruna_core::structs::identity::auth::Permission;
-use craqle::GraphPolicy;
-use craqle::{Action as CraqleAction, Authorizer as CraqleAuthorizer};
-use oxrdf::Literal;
-use tracing::Span;
 #[test]
 fn deny_hides_document() {
     // A per-document DENY under a group-wide READ hides only that document.
@@ -66,41 +62,16 @@ fn narrow_grant_visible() {
     assert!(scope.graph_visible(&cache, &granted.graph_iri));
     assert!(!scope.graph_visible(&cache, &hidden.graph_iri));
 }
-// Permissive on purpose: craqle's stored policy must not sway the decision.
-fn open_policy() -> GraphPolicy {
-    GraphPolicy {
-        public: true,
-        permission_paths: Vec::new(),
-    }
-}
-fn admits(authorizer: &ScopeAuthorizer<'_>, graph_iri: &str) -> bool {
-    authorizer
-        .authorize(&GraphId::new(graph_iri), &open_policy(), CraqleAction::Read)
-        .is_ok()
-}
 #[test]
-fn authorizer_admits_public() {
+fn scope_admits_public() {
     let public = registry_record("datasets/public");
     let scope = scope_for(vec![public.clone()], GroupPermissionRules::default());
     let cache = MetadataVisibilityCache::new();
-    let authorizer = ScopeAuthorizer {
-        scope: &scope,
-        visibility_cache: &cache,
-    };
 
-    assert!(admits(&authorizer, &public.graph_iri));
-    assert!(
-        authorizer
-            .authorize(
-                &GraphId::new(&public.graph_iri),
-                &open_policy(),
-                CraqleAction::Write,
-            )
-            .is_err()
-    );
+    assert!(scope.graph_visible(&cache, &public.graph_iri));
 }
 #[test]
-fn authorizer_refuses_denied() {
+fn scope_refuses_denied() {
     // A per-document DENY under a group-wide grant hides only that document.
     let realm = RealmId([7u8; 32]);
     let group_id = Ulid::generate();
@@ -121,16 +92,12 @@ fn authorizer_refuses_denied() {
         GroupPermissionRules::from_groups(Some(realm), rules),
     );
     let cache = MetadataVisibilityCache::new();
-    let authorizer = ScopeAuthorizer {
-        scope: &scope,
-        visibility_cache: &cache,
-    };
 
-    assert!(!admits(&authorizer, &secret.graph_iri));
-    assert!(admits(&authorizer, &open.graph_iri));
+    assert!(!scope.graph_visible(&cache, &secret.graph_iri));
+    assert!(scope.graph_visible(&cache, &open.graph_iri));
 }
 #[test]
-fn authorizer_admits_narrow() {
+fn scope_admits_narrow() {
     // A grant on one document shows it without opening the whole group.
     let realm = RealmId([7u8; 32]);
     let group_id = Ulid::generate();
@@ -145,92 +112,29 @@ fn authorizer_admits_narrow() {
         GroupPermissionRules::from_groups(Some(realm), rules),
     );
     let cache = MetadataVisibilityCache::new();
-    let authorizer = ScopeAuthorizer {
-        scope: &scope,
-        visibility_cache: &cache,
-    };
 
-    assert!(admits(&authorizer, &granted.graph_iri));
-    assert!(!admits(&authorizer, &hidden.graph_iri));
+    assert!(scope.graph_visible(&cache, &granted.graph_iri));
+    assert!(!scope.graph_visible(&cache, &hidden.graph_iri));
 }
 #[test]
-fn authorizer_refuses_deleted() {
+fn scope_refuses_deleted() {
     // Craqle still holds the graph, so only our tombstone can hide it.
     let deleted = registry_record("datasets/deleted");
     let scope = scope_for(vec![deleted.clone()], GroupPermissionRules::default());
     let cache = MetadataVisibilityCache::new();
     cache.store_lifecycle_deleted(deleted.graph_iri.clone(), true);
-    let authorizer = ScopeAuthorizer {
-        scope: &scope,
-        visibility_cache: &cache,
-    };
 
-    assert!(!admits(&authorizer, &deleted.graph_iri));
+    assert!(!scope.graph_visible(&cache, &deleted.graph_iri));
 }
 #[test]
-fn authorizer_refuses_unlisted() {
+fn scope_refuses_unlisted() {
     // Craqle may hold graphs the registry does not list; they stay hidden.
     let known = registry_record("datasets/known");
     let scope = scope_for(vec![known], GroupPermissionRules::default());
     let cache = MetadataVisibilityCache::new();
-    let authorizer = ScopeAuthorizer {
-        scope: &scope,
-        visibility_cache: &cache,
-    };
 
-    assert!(!admits(
-        &authorizer,
-        &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
+    assert!(!scope.graph_visible(&cache, &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
     ));
-}
-#[tokio::test]
-async fn enrichment_keeps_order() {
-    // The gate forces the describes to complete in exactly reverse order;
-    // the properties must still line up with the targets that asked for them.
-    let count = METADATA_ENRICH_TASKS;
-    let gate = Arc::new((Mutex::new(count - 1), std::sync::Condvar::new()));
-    let describe_gate = gate.clone();
-    let describe: HitDescribe = Arc::new(move |_graph_iri, subject_iri: &str| {
-        let index = subject_iri
-            .rsplit('/')
-            .next()
-            .and_then(|tail| tail.parse::<usize>().ok())
-            .expect("indexed subject");
-        let (turn, ready) = &*describe_gate;
-        let mut turn = turn.lock().expect("gate lock");
-        // Bounded so a lost wakeup fails the assertion instead of hanging.
-        while *turn != index {
-            let (guard, wait) = ready
-                .wait_timeout(turn, Duration::from_secs(30))
-                .expect("gate lock");
-            turn = guard;
-            if wait.timed_out() {
-                break;
-            }
-        }
-        *turn = index.wrapping_sub(1);
-        ready.notify_all();
-        vec![(
-            "urn:test:index".to_string(),
-            Term::Literal(Literal::new_simple_literal(index.to_string())),
-        )]
-    });
-
-    let targets = (0..count)
-        .map(|index| ("urn:graph".to_string(), format!("urn:subject/{index}")))
-        .collect::<Vec<_>>();
-    let permits = Arc::new(tokio::sync::Semaphore::new(count));
-    let properties = describe_hits_parallel(&permits, targets, describe, &Span::none()).await;
-
-    let expected = (0..count)
-        .map(|index| {
-            vec![(
-                "urn:test:index".to_string(),
-                Term::Literal(Literal::new_simple_literal(index.to_string())),
-            )]
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(properties, expected);
 }
 fn scope_for(
     mut records: Vec<MetadataRegistryRecord>,

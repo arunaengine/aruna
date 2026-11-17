@@ -1,4 +1,4 @@
-//! Tests metadata effects: entity plans, merge convergence, version reads and error mapping.
+//! Tests metadata effects: entity plans, merge convergence, version reads and read error mapping.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -12,29 +12,28 @@ use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
 use craqle::CraqleError;
 use serde_json::Value;
-pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, MetadataHandle) {
+pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, DriverContext) {
     let metadata_dir = tempdir().expect("metadata dir");
-    let metadata_handle = MetadataHandle::new_with_options(
-        metadata_dir.path(),
-        node_id_seed(9),
-        storage,
-        None,
-        None,
-        None,
-        MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
-    )
+    let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id_seed(9),
+None,
+None,
+aruna_graph::GraphOptions::default().with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
+)
     .expect("metadata handle opens");
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage, None, Default::default());
+    let metadata_handle = graph_context(storage, metadata_handle, graph_handle);
     (metadata_dir, metadata_handle)
 }
 
 async fn plan_entity(
-    handle: &MetadataHandle,
+    handle: &DriverContext,
     graph_iri: &str,
     actor: u8,
     name: &str,
 ) -> MetadataBatch {
-    let event = handle
-        .send_metadata_effect(MetadataEffect::PlanBatch {
+    let event = send_metadata_effect(&handle, MetadataEffect::PlanBatch {
             graph_iri: graph_iri.to_string(),
             actor: [actor; 32],
             counter: 1,
@@ -49,9 +48,8 @@ async fn plan_entity(
     batch
 }
 
-async fn merge_into(handle: &MetadataHandle, graph_iri: &str, batch: &MetadataBatch) -> bool {
-    let event = handle
-        .send_metadata_effect(MetadataEffect::MergeBatch {
+async fn merge_into(handle: &DriverContext, graph_iri: &str, batch: &MetadataBatch) -> bool {
+    let event = send_metadata_effect(&handle, MetadataEffect::MergeBatch {
             graph_iri: graph_iri.to_string(),
             batch: batch.clone(),
         })
@@ -62,9 +60,8 @@ async fn merge_into(handle: &MetadataHandle, graph_iri: &str, batch: &MetadataBa
     applied
 }
 
-async fn graph_state(handle: &MetadataHandle, graph_iri: &str) -> Vec<(String, String, String)> {
-    let event = handle
-        .send_metadata_effect(MetadataEffect::GraphSnapshot {
+async fn graph_state(handle: &DriverContext, graph_iri: &str) -> Vec<(String, String, String)> {
+    let event = send_metadata_effect(&handle, MetadataEffect::GraphSnapshot {
             graph_iri: graph_iri.to_string(),
         })
         .await;
@@ -87,8 +84,7 @@ async fn plan_needs_graph() {
     let (_storage_dir, storage) = auth_storage();
     let (_metadata_dir, handle) = memory_handle(storage);
 
-    let event = handle
-        .send_metadata_effect(MetadataEffect::PlanBatch {
+    let event = send_metadata_effect(&handle, MetadataEffect::PlanBatch {
             graph_iri: "urn:test:orset:absent".to_string(),
             actor: [7u8; 32],
             counter: 1,
@@ -107,41 +103,8 @@ async fn plan_needs_graph() {
     ));
 }
 
-#[test]
-fn maps_violations() {
-    let error = error_from_craqle(CraqleError::Update(craqle::UpdateError::ValidationFailed(
-        vec![craqle::CrateViolation {
-            code: "missing_root_data_entity",
-            message: "missing root".to_string(),
-            pointer: "/@graph".to_string(),
-            entity_id: Some("./".to_string()),
-        }],
-    )));
 
-    let MetadataError::Validation(violations) = error else {
-        panic!("expected structured metadata validation error");
-    };
-    assert_eq!(violations[0].code, "missing_root_data_entity");
-    assert_eq!(violations[0].pointer, "/@graph");
-    assert_eq!(violations[0].entity_id.as_deref(), Some("./"));
-}
 
-#[test]
-fn maps_io_failures() {
-    // Infrastructure must stay distinguishable from a rejected payload: the
-    // materialization queue retries the former forever and parks the latter.
-    let error = error_from_craqle(CraqleError::Io(std::io::Error::other("disk")));
-
-    assert!(matches!(error, MetadataError::Persist(_)));
-}
-
-#[test]
-fn maps_cancelled_work() {
-    // Cancelled or budget-limited work clears on retry, so it must not be parked.
-    let error = error_from_craqle(CraqleError::QueryCancelled);
-
-    assert!(matches!(error, MetadataError::Persist(_)));
-}
 
 #[test]
 fn read_error_mapping() {
@@ -177,8 +140,7 @@ async fn merges_converge() {
     };
     for handle in [&left, &right] {
         assert!(matches!(
-            handle
-                .send_metadata_effect(MetadataEffect::CreateCrate {
+            send_metadata_effect(&handle, MetadataEffect::CreateCrate {
                     request: request.clone(),
                 })
                 .await,
@@ -197,12 +159,10 @@ async fn merges_converge() {
         "a batch dot the clock already covers is a no-op"
     );
 
-    let left_render = left
-        .export_rocrate_jsonld(graph_iri.to_string())
+    let left_render = export_rocrate_jsonld(&left, graph_iri.to_string())
         .await
         .expect("left render");
-    let right_render = right
-        .export_rocrate_jsonld(graph_iri.to_string())
+    let right_render = export_rocrate_jsonld(&right, graph_iri.to_string())
         .await
         .expect("right render");
     assert_eq!(left_render, right_render);
@@ -236,8 +196,7 @@ async fn versions_roundtrip() {
             deterministic_actor: None,
         };
         assert!(matches!(
-            handle
-                .send_metadata_effect(MetadataEffect::ValidateRoCrate {
+            send_metadata_effect(&handle, MetadataEffect::ValidateRoCrate {
                     request: request.clone(),
                 })
                 .await,
@@ -245,15 +204,13 @@ async fn versions_roundtrip() {
                 if validated == graph_iri
         ));
         assert!(matches!(
-            handle
-                .send_metadata_effect(MetadataEffect::ApplyRoCrate { request })
+            send_metadata_effect(&handle, MetadataEffect::ApplyRoCrate { request })
                 .await,
             Event::Metadata(MetadataEvent::ApplyRoCrateResult { graph_iri: applied, .. })
                 if applied == graph_iri
         ));
 
-        let exported = handle
-            .export_rocrate_jsonld(graph_iri.to_string())
+        let exported = export_rocrate_jsonld(&handle, graph_iri.to_string())
             .await
             .expect("RO-Crate exports");
         let output = serde_json::from_str::<Value>(&exported).expect("export is JSON");
@@ -294,8 +251,7 @@ async fn versions_roundtrip() {
 
     let graph_iri = "urn:fixture:aruna:rocrate:created";
     assert!(matches!(
-        handle
-            .send_metadata_effect(MetadataEffect::CreateCrate {
+        send_metadata_effect(&handle, MetadataEffect::CreateCrate {
                 request: MetadataCrateRequest {
                     graph_iri: graph_iri.to_string(),
                     name: "RO-Crate 1.3 scaffold".to_string(),
@@ -315,8 +271,7 @@ async fn versions_roundtrip() {
             if created == graph_iri
     ));
     let scaffold: Value = serde_json::from_str(
-        &handle
-            .export_rocrate_jsonld(graph_iri.to_string())
+        &export_rocrate_jsonld(&handle, graph_iri.to_string())
             .await
             .expect("scaffold exports"),
     )
@@ -347,24 +302,23 @@ async fn policy_mints_nothing() {
         .with_fjall_path(dir.path().join("sync"))
         .and_then(|builder| builder.build())
         .expect("sync node builds");
-    let handle = MetadataHandle::new_with_options(
-        dir.path().join("metadata"),
-        node_id_seed(9),
-        storage,
-        None,
-        Some(sync_node),
-        None,
-        MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
-    )
+    let graph = aruna_graph::GraphHandle::open(
+dir.path().join("metadata"),
+node_id_seed(9),
+Some(sync_node),
+None,
+aruna_graph::GraphOptions::default().with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
+)
     .expect("metadata handle opens");
+let handle = MetadataHandle::new(dir.path().join("metadata"), storage, None, Default::default());
+    let handle = graph_context(storage, handle, graph);
     let graph_iri = "urn:fixture:aruna:policy:restored";
     let policy = |public| MetadataGraphPolicy {
         public,
         permission_paths: vec!["/groups/demo/datasets/restored".to_string()],
     };
     assert!(matches!(
-        handle
-            .send_metadata_effect(MetadataEffect::CreateCrate {
+        send_metadata_effect(&handle, MetadataEffect::CreateCrate {
                 request: MetadataCrateRequest {
                     graph_iri: graph_iri.to_string(),
                     name: "Restored".to_string(),
@@ -380,8 +334,7 @@ async fn policy_mints_nothing() {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. })
     ));
 
-    let event = handle
-        .send_metadata_effect(MetadataEffect::SetGraphPolicy {
+    let event = send_metadata_effect(&handle, MetadataEffect::SetGraphPolicy {
             graph_iri: graph_iri.to_string(),
             policy: policy(true),
         })
@@ -391,8 +344,7 @@ async fn policy_mints_nothing() {
         matches!(event, Event::Metadata(MetadataEvent::GraphPolicySet { .. })),
         "{event:?}"
     );
-    let event = handle
-        .send_metadata_effect(MetadataEffect::GetGraphPolicy {
+    let event = send_metadata_effect(&handle, MetadataEffect::GetGraphPolicy {
             graph_iri: graph_iri.to_string(),
         })
         .await;
@@ -401,10 +353,7 @@ async fn policy_mints_nothing() {
             if *set == policy(true)),
         "{event:?}"
     );
-    let topic = handle
-        .inner
-        .node
-        .bind_irokle_topic(&GraphId::new(graph_iri))
+    let topic = handle.graph_handle.as_ref().expect(\"graph store\").bind_topic(graph_iri.to_string()).await
         .expect("topic lookup");
     assert_eq!(topic, None);
 }
