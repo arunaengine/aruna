@@ -13,12 +13,14 @@ use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_ST
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::usage::{
-    NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, UsageCounterError, UsageCounters, global_shard_keys, usage_group_key, usage_group_prefix,
+    NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, UsageCounterError, UsageCounters, usage_group_key, usage_group_prefix,
     usage_node_id, usage_summary_key,
 };
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
+
+use crate::s3::usage::{global_shard_read, global_sum};
 
 /// Snapshot rows one page reads.
 const PAGE_LIMIT: usize = 1_000;
@@ -171,13 +173,7 @@ impl RealmUsageOperation {
         };
         self.phase = Phase::Local;
         let effect = match scope {
-            RealmUsageScope::Global => StorageEffect::BatchRead {
-                reads: global_shard_keys()
-                    .into_iter()
-                    .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
-                    .collect(),
-                txn_id: None,
-            },
+            RealmUsageScope::Global => global_shard_read(None),
             RealmUsageScope::Group(group_id) => StorageEffect::Read {
                 key_space: USAGE_STATS_KEYSPACE.to_string(),
                 key: Key::from(usage_group_key(*group_id)),
@@ -191,11 +187,7 @@ impl RealmUsageOperation {
         let scope = self.scopes.get(self.totals.len());
         match (scope, event) {
             (Some(RealmUsageScope::Global), StorageEvent::BatchReadResult { values }) => {
-                let mut total = UsageCounters::default();
-                for bytes in values.into_iter().filter_map(|(_, value)| value) {
-                    total.add(&UsageCounters::from_bytes(bytes.as_ref())?)?;
-                }
-                Ok(total)
+                global_sum(values)
             }
             (Some(RealmUsageScope::Group(_)), StorageEvent::ReadResult { value, .. }) => value
                 .map(|bytes| UsageCounters::from_bytes(bytes.as_ref()))

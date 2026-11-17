@@ -819,7 +819,7 @@ impl LoadCountersOperation {
     fn handle_global_read(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                self.finish(sum_global_usage(values))
+                self.finish(global_sum(values))
             }
             Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
             other => self.unexpected_event("storage batch read result", other),
@@ -834,14 +834,7 @@ impl Operation for LoadCountersOperation {
     fn start(&mut self) -> Effects {
         if self.key.as_slice() == USAGE_GLOBAL_KEY {
             self.state = LoadCountersState::ReadGlobal;
-            let reads = global_shard_keys()
-                .into_iter()
-                .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
-                .collect::<Vec<_>>();
-            smallvec![Effect::Storage(StorageEffect::BatchRead {
-                reads,
-                txn_id: None,
-            })]
+            smallvec![Effect::Storage(global_shard_read(None))]
         } else {
             self.state = LoadCountersState::ReadCounter;
             smallvec![Effect::Storage(StorageEffect::Read {
@@ -878,17 +871,24 @@ impl Operation for LoadCountersOperation {
     }
 }
 
-fn sum_global_usage(values: Vec<(Key, Option<Value>)>) -> Result<UsageCounters, LoadCountersError> {
+/// One batch read of every global counter shard, inside `txn_id` when given.
+pub(crate) fn global_shard_read(txn_id: Option<TxnId>) -> StorageEffect {
+    let reads = global_shard_keys()
+        .into_iter()
+        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
+        .collect();
+    StorageEffect::BatchRead { reads, txn_id }
+}
+
+/// The node-wide counters: the sum of the shard rows [`global_shard_read`] returned.
+pub(crate) fn global_sum<E>(values: Vec<(Key, Option<Value>)>) -> Result<UsageCounters, E>
+where
+    E: From<ConversionError> + From<UsageCounterError>,
+{
     let mut total = UsageCounters::default();
-
-    for (_, value) in values {
-        let Some(bytes) = value else {
-            continue;
-        };
-        let counters = UsageCounters::from_bytes(bytes.as_ref())?;
-        total.add(&counters)?;
+    for bytes in values.into_iter().filter_map(|(_, value)| value) {
+        total.add(&UsageCounters::from_bytes(bytes.as_ref())?)?;
     }
-
     Ok(total)
 }
 

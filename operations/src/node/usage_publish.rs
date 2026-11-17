@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, USAGE_GROUP_PREFIX, UsageCounters, dirty_group_id, dirty_group_key, dirty_share_id,
-    global_shard_keys, usage_global_key, usage_group_id, usage_group_key, usage_node_id,
+    usage_global_key, usage_group_id, usage_group_key, usage_node_id,
     usage_snapshot_key,
 };
 use aruna_core::task::TaskEvent;
@@ -28,7 +28,9 @@ use tracing::warn;
 use crate::distribution::usage::replica_shares;
 use crate::driver::{DriverContext, drive};
 use crate::node::realm_usage::RealmUsageOperation;
-use crate::s3::usage::{dirty_rows, schedule_snapshot_publish};
+use crate::s3::usage::{
+    LoadCountersError, dirty_rows, global_shard_read, global_sum, schedule_snapshot_publish,
+};
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
@@ -69,24 +71,9 @@ pub(crate) async fn read_local_global(
     storage: &StorageHandle,
     txn_id: Option<TxnId>,
 ) -> Result<UsageCounters, String> {
-    let reads = global_shard_keys()
-        .into_iter()
-        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
-        .collect();
-    match storage
-        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
-        .await
-    {
+    match storage.send_storage_effect(global_shard_read(txn_id)).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            let mut total = UsageCounters::default();
-            for (_, value) in values {
-                if let Some(bytes) = value {
-                    let counters =
-                        UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string())?;
-                    total.add(&counters).map_err(|e| e.to_string())?;
-                }
-            }
-            Ok(total)
+            global_sum::<LoadCountersError>(values).map_err(|error| error.to_string())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected global read event: {other:?}")),
