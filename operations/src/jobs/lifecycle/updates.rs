@@ -25,7 +25,6 @@ use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
 };
 use crate::jobs::store::read_job_record;
-use crate::node::dashboard::notify_dashboard_change;
 
 /// The replicated identity of one physical execution, read back from the
 /// receipt that authorized it. Without it there is no distributed chain to
@@ -299,7 +298,7 @@ pub async fn publish_state(
             debug!(state = state.name(), "Execution update published");
             // A duplicate is a retry of a stored state; only a new record is a change.
             if matches!(outcome.admission, Admission::Authentic) {
-                notify_dashboard_change(context);
+                context.notify_dashboard_change();
             }
             // An infrastructure error ends this execution without deciding the
             // job, so the family must be planned again from here too.

@@ -21,7 +21,6 @@ use crate::metadata::projector::{
     PROJECTION_RETRY_AFTER, project_create_events, project_logged_events, schedule_projection_drain,
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
-use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_publish::refresh_usage_targets;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
@@ -965,7 +964,7 @@ async fn reconcile_inbound_topics(
     if applied == 0 {
         return true;
     }
-    let dashboard_changed = targets_change_dashboard(&targets.targets);
+    let dashboard_changed = targets.targets.iter().any(DocumentTarget::changes_dashboard);
     let metadata_graph_tombstones = targets.metadata_graph_tombstones.clone();
     let realm_config_changed = targets
         .targets
@@ -1002,7 +1001,7 @@ async fn reconcile_inbound_topics(
         "Inbound document sync reconcile summary"
     );
     if dashboard_changed {
-        notify_dashboard_change(context);
+        context.notify_dashboard_change();
     }
     true
 }

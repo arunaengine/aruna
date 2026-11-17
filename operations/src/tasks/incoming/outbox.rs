@@ -1191,8 +1191,8 @@ impl OperationsTaskHandler {
                 if let Err(error) = deleted {
                     warn!(task_id = ?retry_key, error = %error, "Failed to delete document sync outbox records");
                     outcome.retry_needed = true;
-                } else if targets_change_dashboard(&refresh_targets) {
-                    notify_dashboard_change(self.context.as_ref());
+                } else if refresh_targets.iter().any(DocumentTarget::changes_dashboard) {
+                    self.context.notify_dashboard_change();
                 }
             }
             Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {

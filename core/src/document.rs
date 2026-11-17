@@ -418,6 +418,19 @@ impl DocumentTarget {
         )
     }
 
+    /// Whether a change of this document can change what a dashboard shows. Usage snapshots
+    /// republish often and are left out; the dashboard polls usage on its own.
+    pub fn changes_dashboard(&self) -> bool {
+        self.is_admin_document()
+            || matches!(
+                self,
+                Self::MetadataRegistry { .. }
+                    | Self::MetadataCreateEvent { .. }
+                    | Self::MetadataDocumentLifecycle { .. }
+                    | Self::MetadataGraphLifecycle { .. }
+            )
+    }
+
     pub fn topic_id(&self) -> TopicId {
         match self {
             Self::Group { group_id } | Self::GroupAuthorization { group_id } => {

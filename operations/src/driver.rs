@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::effect_adapters;
@@ -73,6 +74,23 @@ impl DriverContext {
         context.storage_handle = context.storage_handle.bulk();
         context.metadata_handle = context.metadata_handle.as_ref().map(MetadataHandle::bulk);
         context
+    }
+
+    /// The dashboard epoch and a receiver of its change counter; `None` without a net transport.
+    pub fn subscribe_dashboard_changes(&self) -> Option<(String, watch::Receiver<u64>)> {
+        self.net_handle.as_ref().map(|net_handle| {
+            (
+                net_handle.dashboard_epoch().to_string(),
+                net_handle.subscribe_dashboard_changes(),
+            )
+        })
+    }
+
+    /// Tells dashboard subscribers that something they show changed.
+    pub fn notify_dashboard_change(&self) {
+        if let Some(net_handle) = self.net_handle.as_ref() {
+            net_handle.notify_dashboard_change();
+        }
     }
 
     /// One status snapshot of the net, blob and storage backends this context holds.
