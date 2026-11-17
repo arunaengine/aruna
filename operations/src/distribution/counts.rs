@@ -5,16 +5,14 @@
 // Every member node counts its own member bucket in its usage totals, so a realm or group sum of
 // node totals holds a distributed bucket once per member; these counts take that back out.
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::storage::distribution::{
     DistributionSnapshot, DistributionView, MemberState,
 };
-use aruna_core::types::{Effects, GroupId, Key};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 use thiserror::Error;
 
 /// At most this many distribution records are read by one scan of this node's records.
@@ -82,26 +80,13 @@ pub struct SetCountsOperation {
     group: Option<GroupId>,
     counts: SetCounts,
     seen: usize,
-    state: State,
-    output: Option<Result<SetCounts, CountsError>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum State {
-    Init,
-    Page,
-    Finish,
-    Error,
+    pages: PrefixPages,
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CountsError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("unexpected event while counting sets: {0}")]
-    UnexpectedEvent(&'static str),
-    #[error("counting sets did not finish")]
-    NotFinished,
+    Io(#[from] IoError),
 }
 
 impl SetCountsOperation {
@@ -113,89 +98,35 @@ impl SetCountsOperation {
                 ..SetCounts::default()
             },
             seen: 0,
-            state: State::Init,
-            output: None,
+            pages: PrefixPages::new(DISTRIBUTION_KEYSPACE, Vec::new(), PAGE),
         }
-    }
-
-    fn page(start: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: DISTRIBUTION_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(IterStart::After),
-            limit: PAGE,
-            txn_id: None,
-        })]
-    }
-
-    fn finish(&mut self, output: Result<SetCounts, CountsError>) -> Effects {
-        self.state = match output {
-            Ok(_) => State::Finish,
-            Err(_) => State::Error,
-        };
-        self.output = Some(output);
-        smallvec![]
     }
 }
 
-impl EffectOperation for SetCountsOperation {
+impl Operation for SetCountsOperation {
     type Output = SetCounts;
     type Error = CountsError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Page;
-        Self::page(None)
+    fn first(&mut self) -> Result<Next<SetCounts>, CountsError> {
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (
-                State::Page,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                self.seen += values.len();
-                // An unreadable record is skipped, as every reader of the records does.
-                let views = values
-                    .iter()
-                    .filter_map(|(_, value)| DistributionView::from_bytes(value).ok());
-                for view in views {
-                    let snapshot = view.snapshot();
-                    if self
-                        .group
-                        .is_none_or(|group| snapshot.config.owner_group == group)
-                    {
-                        self.counts.add(snapshot);
-                    }
-                }
-                match next_start_after {
-                    Some(next) if self.seen < MAX_SETS => Self::page(Some(next)),
-                    next => {
-                        self.counts.complete = next.is_none();
-                        let counts = self.counts;
-                        self.finish(Ok(counts))
-                    }
-                }
+    fn next(&mut self, result: IoResult) -> Result<Next<SetCounts>, CountsError> {
+        let values = self.pages.take(result)?;
+        self.seen += values.len();
+        // An unreadable record is skipped, as every reader of the records does.
+        let views = (values.iter()).filter_map(|(_, value)| DistributionView::from_bytes(value).ok());
+        for view in views {
+            let snapshot = view.snapshot();
+            if (self.group).is_none_or(|group| snapshot.config.owner_group == group) {
+                self.counts.add(snapshot);
             }
-            (State::Page, Event::Storage(StorageEvent::Error { error })) => {
-                self.finish(Err(error.into()))
-            }
-            (_, event) => self.finish(Err(CountsError::UnexpectedEvent(event.label()))),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Finish | State::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(CountsError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        if !self.pages.done() && self.seen < MAX_SETS {
+            return Ok(Next::Call(self.pages.call()));
+        }
+        self.counts.complete = self.pages.done();
+        Ok(Next::Done(self.counts))
     }
 }
 

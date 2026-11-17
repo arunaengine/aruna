@@ -5,7 +5,8 @@
 use super::*;
 use crate::distribution::test_record::{record, store_record};
 use crate::driver::{DriverContext, drive};
-use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
+use aruna_core::calls::IoCall;
+use aruna_core::types::{Key, Value};
 use aruna_core::structs::storage::distribution::snapshot::Deletion;
 
 #[test]
@@ -121,45 +122,36 @@ async fn reads_deleting_record() {
     assert_eq!((counts.deleting, counts.distinct(5)), (1, None));
 }
 
-fn page(start: Option<Key>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: DISTRIBUTION_KEYSPACE.to_string(),
-        prefix: None,
-        start: start.map(IterStart::After),
+fn page(after: Option<Key>) -> Next<SetCounts> {
+    Next::Call(IoCall::Page {
+        space: DISTRIBUTION_KEYSPACE.to_string(),
+        prefix: Key::from(Vec::new()),
+        after,
         limit: PAGE,
-        txn_id: None,
     })
 }
 
-fn rows(values: Vec<(Key, aruna_core::types::Value)>, next: Option<Key>) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values,
-        next_start_after: next,
-    })
+fn rows(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+    IoResult::Page { rows, next }
+}
+
+fn full() -> Vec<(Key, Value)> {
+    vec![(Key::from(vec![1]), Value::from(vec![0])); PAGE]
 }
 
 // Pages are read until the records end; undecodable records and other groups' sets are left out.
 #[test]
 fn pages_until_end() {
     let (snapshot, bytes) = record(true);
-    let owner = snapshot.config.owner_group;
-    let full: Vec<(Key, aruna_core::types::Value)> = (0..PAGE)
-        .map(|_| (Key::from(vec![1]), aruna_core::types::Value::from(vec![0])))
-        .collect();
+    let mut operation = SetCountsOperation::new(Some(snapshot.config.owner_group));
+    assert_eq!(operation.first(), Ok(page(None)));
     let next = Key::from(vec![2]);
-    let mut operation = SetCountsOperation::new(Some(owner));
-    check_trace(
-        &mut operation,
-        &[page(None)],
-        vec![
-            (rows(full, Some(next.clone())), vec![page(Some(next))]),
-            (
-                rows(vec![(Key::from(vec![3]), bytes.into())], None),
-                Vec::new(),
-            ),
-        ],
-    );
-    let counts = operation.finalize().unwrap();
+    let first = operation.next(rows(full(), Some(next.clone())));
+    assert_eq!(first, Ok(page(Some(next))));
+    let last = rows(vec![(Key::from(vec![3]), bytes.into())], None);
+    let Ok(Next::Done(counts)) = operation.next(last) else {
+        panic!("expected the counts");
+    };
     assert_eq!((counts.sets, counts.members, counts.complete), (1, 2, true));
 }
 
@@ -167,44 +159,24 @@ fn pages_until_end() {
 #[test]
 fn limit_marks_incomplete() {
     let mut operation = SetCountsOperation::new(None);
-    operation.start();
-    let mut effects = Effects::new();
+    operation.first().unwrap();
+    let mut last = None;
     for _ in 0..MAX_SETS / PAGE {
-        let full = (0..PAGE)
-            .map(|_| (Key::from(vec![1]), Key::from(vec![0])))
-            .collect();
-        effects = operation.step(rows(full, Some(Key::from(vec![2]))));
+        last = Some(operation.next(rows(full(), Some(Key::from(vec![2])))));
     }
-    assert!(effects.is_empty());
-    assert!(!operation.finalize().unwrap().complete);
+    let Some(Ok(Next::Done(counts))) = last else {
+        panic!("expected the counts");
+    };
+    assert!(!counts.complete);
 }
 
-// A failed read and events outside the page read end the count with an error.
+// A result other than a page ends the count with an error.
 #[test]
 fn rejects_unexpected() {
     let mut operation = SetCountsOperation::new(None);
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    }));
-    assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
-    let started = || {
-        let mut operation = SetCountsOperation::new(None);
-        operation.start();
-        operation
-    };
-    let refused = rejects_events(started, sample_events, |event| {
-        matches!(
-            event,
-            Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-        )
-    });
-    assert_eq!(refused.len(), sample_events().len() - 2);
-    let fresh = || SetCountsOperation::new(None);
-    assert_eq!(
-        rejects_events(fresh, sample_events, |_| false).len(),
-        sample_events().len()
-    );
-    assert!(started().abort().is_empty());
-    rejects_finalize(started());
+    operation.first().unwrap();
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Err(CountsError::Io(IoError::Unexpected { .. }))
+    ));
 }
