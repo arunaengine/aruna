@@ -10,7 +10,6 @@ mod reissue;
 mod requests;
 mod snapshot;
 
-use crate::driver::{DriverContext, drive_retry};
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQuery};
@@ -423,21 +422,6 @@ impl KeyOperation {
         self.state = State::Commit;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
-}
-/// Runs a key action, rerunning it from the start after a transaction conflict.
-pub async fn drive_key(
-    bucket: String,
-    auth: AuthContext,
-    node: NodeId,
-    action: KeyAction,
-    context: &DriverContext,
-) -> Result<KeyResult, KeyError> {
-    let seed = Ulid::generate().to_bytes();
-    let build = || {
-        let now = aruna_core::time::unix_timestamp_millis();
-        KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now)
-    };
-    drive_retry(build, context, &seed).await
 }
 impl Operation for KeyOperation {
     type Output = KeyResult;

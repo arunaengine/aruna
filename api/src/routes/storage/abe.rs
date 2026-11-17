@@ -11,9 +11,9 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_operations::abe::KeyError;
 use aruna_operations::abe::envelope::EnvelopeOperation;
-use aruna_operations::driver::drive;
+use aruna_operations::abe::{KeyAction, KeyError, KeyOperation, KeyResult};
+use aruna_operations::driver::{DriverContext, drive, drive_retry};
 use aruna_operations::s3::bucket::get::GetBucketOperation;
 use axum::extract::{Query, State};
 use axum::{Extension, Json};
@@ -65,6 +65,21 @@ fn abe_error(error: AbeError) -> ServerError {
         AbeError::Unavailable => return ServerError::ServiceUnavailable,
     };
     ServerError::Refused(status, code, error.to_string())
+}
+/// Runs a key action, rerunning it from the start after a transaction conflict.
+pub(crate) async fn drive_key(
+    bucket: String,
+    auth: AuthContext,
+    node: aruna_core::NodeId,
+    action: KeyAction,
+    context: &DriverContext,
+) -> Result<KeyResult, KeyError> {
+    let seed = Ulid::generate().to_bytes();
+    let build = || {
+        let now = aruna_core::time::unix_timestamp_millis();
+        KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now)
+    };
+    drive_retry(build, context, &seed).await
 }
 pub(crate) fn key_error(error: KeyError) -> ServerError {
     let message = error.to_string();

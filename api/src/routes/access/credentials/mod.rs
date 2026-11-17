@@ -11,7 +11,7 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path, never_expiry};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::abe::{KeyAction, KeyResult, drive_key};
+use aruna_operations::abe::{KeyAction, KeyResult};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation,
@@ -514,7 +514,16 @@ pub async fn create_s3_credentials(
                 public_key,
                 restrictions: access.path_restrictions.clone(),
             };
-            match drive_key(bucket, auth.clone(), node_id, action, &state.get_ctx()).await {
+            let ctx = state.get_ctx();
+            match crate::routes::storage::abe::drive_key(
+                bucket,
+                auth.clone(),
+                node_id,
+                action,
+                &ctx,
+            )
+            .await
+            {
                 Ok(KeyResult::Opened(ids)) => key_requests.extend(ids.iter().map(Ulid::to_string)),
                 Ok(_) => {}
                 Err(error) => {
