@@ -26,6 +26,13 @@ use crate::config::{Config, open_storage, resolve_config};
 use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
 
+/// How much event recording keeps in memory when `EVENT_RECORDING` is enabled.
+const RECORD_LIMITS: aruna_operations::recorder::RecordLimits =
+    aruna_operations::recorder::RecordLimits {
+        total_bytes: 64 << 20,
+        entry_bytes: 16 << 10,
+    };
+
 /// The node resources a running process owns. This is not the Tokio runtime.
 pub struct NodeResources {
     pub(crate) config: Config,
@@ -225,6 +232,9 @@ pub(crate) async fn acquire(
     // Parsing operator settings is pure; the store is the first owned
     // resource, established before identity and enrollment I/O.
     let settings = crate::settings::read_settings()?;
+    if settings.event_recording {
+        aruna_operations::recorder::enable(RECORD_LIMITS);
+    }
     let storage_handle = open_storage(&settings)?;
     // The node runtime always exists here; a missing one is a concrete startup
     // error, never a scheduler-less handle that only looks started.
