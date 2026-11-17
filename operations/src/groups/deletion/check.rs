@@ -14,10 +14,9 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::group_delete::{GroupDeleteAction, GroupDeletionError};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Effects, GroupId, TxnId};
-use futures_util::{StreamExt, stream};
 use smallvec::smallvec;
 
-use super::coordinator::{authorize, load_group, request_node, visible};
+use super::coordinator::{authorize, load_group, request_nodes, visible};
 use super::resources::EmptyCheck;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
@@ -208,27 +207,24 @@ pub async fn check_group(
         .map(|node| node.node_id.parse::<NodeId>())
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))?;
-    let auth = &auth;
-    let mut replies = stream::iter(nodes.into_iter().map(|node| async move {
-        let result = match node == local {
-            true => scan(context, auth, group_id, node).await,
-            false => request_node(
-                context,
-                node,
-                None,
-                GroupDeleteAction::Check {
-                    group_id,
-                    caller: Box::new(auth.clone()),
-                },
-            )
-            .await
-            .map(|_| ()),
-        };
-        (node, result)
-    }))
-    .buffer_unordered(4)
-    .collect::<Vec<_>>()
-    .await;
+    let mut replies = Vec::new();
+    if nodes.contains(&local) {
+        replies.push((local, scan(context, &auth, group_id, local).await));
+    }
+    let remote = nodes
+        .into_iter()
+        .filter(|node| *node != local)
+        .collect::<Vec<_>>();
+    let check = || GroupDeleteAction::Check {
+        group_id,
+        caller: Box::new(auth.clone()),
+    };
+    let answers = request_nodes(context, &remote, check).await;
+    replies.extend(
+        answers
+            .into_iter()
+            .map(|(node, reply)| (node, reply.map(|_| ()))),
+    );
     replies.sort_by_key(|(node, _)| *node);
     Ok(replies)
 }

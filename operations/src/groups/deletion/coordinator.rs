@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -19,13 +19,13 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, admin_documents::AdminDocumentEvent};
-use futures_util::{StreamExt, stream};
 use ulid::Ulid;
 
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{ForwardAuthError, authorize_write};
+use crate::forward::fetch::FanoutOperation;
 use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 
 use super::commit::CommitOperation;
@@ -266,26 +266,11 @@ pub async fn delete_group(
         cancel_plan(context, &plan).await?;
         return Err(blocked(context.as_ref(), &auth, group_id, net.node_id(), error).await);
     }
-    let replies = stream::iter(plan.nodes.iter().copied().map(|node| {
-        let plan = plan.clone();
-        async move {
-            (
-                node,
-                request_node(
-                    context,
-                    node,
-                    None,
-                    GroupDeleteAction::Prepare {
-                        plan: Box::new(plan),
-                    },
-                )
-                .await,
-            )
-        }
-    }))
-    .buffer_unordered(4)
-    .collect::<Vec<_>>()
-    .await;
+    let nodes = plan.nodes.iter().copied().collect::<Vec<_>>();
+    let prepare = || GroupDeleteAction::Prepare {
+        plan: Box::new(plan.clone()),
+    };
+    let replies = request_nodes(context, &nodes, prepare).await;
     let mut proofs = Vec::new();
     let mut failure = None;
     for (node, reply) in replies {
@@ -448,6 +433,73 @@ pub(crate) async fn sync_decision(context: &DriverContext) -> Result<(), GroupDe
         _ => Err(GroupDeletionError::Unavailable(
             "deletion decision was not persisted".into(),
         )),
+    }
+}
+
+/// Each answer bounds itself in the transport; this only stops a request that never ends.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Peers asked at once by one fan-out, as before the effect group.
+const FANOUT_LIMIT: usize = 4;
+
+/// Sends `action` to every node: this node runs it itself, all others are asked at once.
+pub(super) async fn request_nodes(
+    context: &Arc<DriverContext>,
+    nodes: &[NodeId],
+    action: impl Fn() -> GroupDeleteAction,
+) -> Vec<(NodeId, Result<Option<GroupDeleteProof>, GroupDeletionError>)> {
+    let local = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut replies = Vec::new();
+    if let Some(local) = local.filter(|local| nodes.contains(local)) {
+        replies.push((
+            local,
+            super::peer::apply_control(context, local, action()).await,
+        ));
+    }
+    let requests = (nodes.iter().copied())
+        .filter(|node| Some(*node) != local)
+        .map(|node| {
+            let message = MetadataTransportMessage::GroupDeletion {
+                auth_token: None,
+                action: action(),
+            };
+            (node, message)
+        })
+        .collect();
+    let fanout = FanoutOperation::new(requests, FANOUT_LIMIT, REQUEST_TIMEOUT);
+    let answers = match drive(fanout, context.as_ref()).await {
+        Ok(answers) => answers,
+        Err(error) => {
+            let unavailable = |node| {
+                (
+                    node,
+                    Err(GroupDeletionError::Unavailable(error.to_string())),
+                )
+            };
+            let remote = nodes.iter().copied().filter(|node| Some(*node) != local);
+            replies.extend(remote.map(unavailable));
+            return replies;
+        }
+    };
+    replies.extend(
+        answers
+            .into_iter()
+            .map(|(node, answer)| (node, deletion_reply(node, answer))),
+    );
+    replies
+}
+
+fn deletion_reply(
+    node: NodeId,
+    answer: Result<MetadataTransportMessage, String>,
+) -> Result<Option<GroupDeleteProof>, GroupDeletionError> {
+    match answer {
+        Ok(MetadataTransportMessage::GroupDeletionResult { result }) => result,
+        Ok(_) => Err(GroupDeletionError::Unavailable(format!(
+            "node {node} refused the deletion request"
+        ))),
+        Err(error) => Err(GroupDeletionError::Unavailable(format!(
+            "node {node}: {error}"
+        ))),
     }
 }
 
