@@ -1115,6 +1115,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Notification(_)) => "notification",
         Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",
+        Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",

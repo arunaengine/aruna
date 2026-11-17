@@ -528,6 +528,8 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// A local signal was passed on; nothing is read back.
+    Recorded,
 }
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
@@ -946,6 +948,7 @@ impl Event {
                     Notification,
                     InboxWoken,
                     Heartbeat,
+                    Recorded,
                 }
             ),
             Event::Metadata(event) => event.label(),

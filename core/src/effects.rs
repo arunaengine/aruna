@@ -789,6 +789,8 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
+    DashboardChanged,
 }
 
 /// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter
