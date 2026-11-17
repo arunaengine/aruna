@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use aruna_core::audit::{
     AUDIT_KEY_BYTES, AuditPageBatch, AuditPageEntry, AuditPageRequest, AuditPageResponse,
@@ -12,23 +13,22 @@ use aruna_core::audit::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::cursor;
-use aruna_core::effects::{AuditPageEffect, Effect, IterStart, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::effects::{
+    AuditPageEffect, Effect, EffectGroup, GroupForm, IterStart, NetEffect, StorageEffect,
+};
+use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditRecord;
-use aruna_core::types::{Effects, GroupId, Key, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use tokio::sync::Semaphore;
 use ulid::Ulid;
 
 use super::call_results::page_rows;
-use super::protocol::MetadataReadError;
-use crate::driver::{DriverContext, drive_until};
 use aruna_core::placement::selector::select_top_peers;
 
 pub const AUDIT_PAGE_LIMIT: usize = MAX_AUDIT_RECORDS;
@@ -248,12 +248,6 @@ impl Operation for LocalPageOperation {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum FanState {
-    Collecting,
-    Done,
-}
-
 fn remember_peer(peers: &mut BTreeSet<NodeId>, node: NodeId) {
     if peers.len() < MAX_AUDIT_PEERS {
         peers.insert(node);
@@ -316,9 +310,9 @@ where
     }
 }
 
-/// Gathers a group's audit trail across realm nodes as a sans-I/O operation: it
-/// scans the local keyspace and emits one audit-page request per peer, then
-/// merges the pages. Node selection is supplied by the caller.
+/// Gathers a group's audit trail across realm nodes as a sans-I/O operation: it scans the
+/// local keyspace and asks every selected peer in one group, then merges the pages. A member
+/// still running at the group's deadline marks its nodes missing. Node selection is the caller's.
 #[derive(Debug, PartialEq)]
 pub struct ListAuditOperation {
     realm_id: RealmId,
@@ -331,15 +325,12 @@ pub struct ListAuditOperation {
     limit: usize,
     auth_token: Option<AuthToken>,
     config_digest: [u8; 32],
-    state: FanState,
-    started: bool,
-    pending: usize,
-    local_done: bool,
+    wait: Option<Duration>,
     local_failed: bool,
-    responded: BTreeSet<NodeId>,
     batch: AuditPageBatch,
-    error: Option<ListAuditError>,
 }
+
+type AuditTurn = Result<Next<AuditAggregate>, ListAuditError>;
 
 impl ListAuditOperation {
     #[allow(clippy::too_many_arguments)]
@@ -391,15 +382,16 @@ impl ListAuditOperation {
             limit,
             auth_token,
             config_digest,
-            state: FanState::Collecting,
-            started: false,
-            pending: 0,
-            local_done: !include_local,
+            wait: None,
             local_failed: false,
-            responded: BTreeSet::new(),
             batch,
-            error: None,
         }
+    }
+
+    /// Answers within `wait`: the local page or the peer pages not read by then are missing.
+    pub fn within(mut self, wait: Duration) -> Self {
+        self.wait = Some(wait);
+        self
     }
 
     fn request(&self) -> AuditPageRequest {
@@ -421,191 +413,181 @@ impl ListAuditOperation {
         })))
     }
 
-    fn fail(&mut self, message: &str) -> Effects {
-        self.error = Some(ListAuditError::Storage(message.to_string()));
-        self.state = FanState::Done;
-        smallvec![]
-    }
-}
-
-impl EffectOperation for ListAuditOperation {
-    type Output = AuditAggregate;
-    type Error = ListAuditError;
-
-    fn start(&mut self) -> Effects {
-        if self.state != FanState::Collecting || self.started {
-            return self.fail("audit operation already started");
-        }
-        self.started = true;
-        if self.include_local && !self.local_done {
-            self.pending = 1;
-            return smallvec![audit_iter_effect(
-                self.group_id,
-                self.document_id,
-                &self.start_after,
-                self.limit
-            )];
-        }
-        if self.peers.is_empty() {
-            self.state = FanState::Done;
-            return smallvec![];
-        }
-        self.pending = 1;
-        smallvec![self.peers_effect()]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state != FanState::Collecting || self.pending != 1 {
-            return self.fail("audit event after aggregation completed");
-        }
-        match event {
+    fn local_result(&mut self, result: GroupResult) -> Result<(), ListAuditError> {
+        let event = match result {
+            GroupResult::Done(event) => *event,
+            GroupResult::Unfinished | GroupResult::Refused => {
+                self.local_failed = true;
+                self.batch.mark_missing(self.local_node);
+                return Ok(());
+            }
+        };
+        let (values, next_start_after) = match event {
             Event::Storage(StorageEvent::IterResult {
                 values,
                 next_start_after,
-            }) => {
-                if !self.include_local || self.local_done {
-                    return self.fail("duplicate local audit page");
-                }
-                match parse_audit_page(values, next_start_after, &self.request()) {
-                    Ok(page) => {
-                        if !page.records.is_empty() {
-                            let source = self.local_node;
-                            let mut local_batch = AuditPageBatch::with_limit(self.limit);
-                            if let Err(error) = local_batch.add_page(source, page, &self.request())
-                            {
-                                self.error = Some(ListAuditError::Storage(error.to_string()));
-                                self.state = FanState::Done;
-                                return smallvec![];
-                            }
-                            local_batch.completed_nodes.clear();
-                            self.batch.merge(local_batch);
-                        }
-                    }
-                    Err(error) => {
-                        self.error = Some(error);
-                        self.state = FanState::Done;
-                        return smallvec![];
-                    }
-                }
-                self.local_done = true;
-                self.pending = 0;
-                if !self.peers.is_empty() {
-                    self.pending = 1;
-                    return smallvec![self.peers_effect()];
-                }
-            }
+            }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => {
-                if !self.include_local || self.local_done {
-                    return self.fail("unexpected local audit error");
-                }
-                self.error = Some(ListAuditError::Storage(error.to_string()));
-                self.state = FanState::Done;
-                return smallvec![];
+                return Err(ListAuditError::Storage(error.to_string()));
             }
-            Event::Net(NetEvent::AuditPages(mut batch)) => {
-                if !self.local_done || self.peers.is_empty() {
-                    return self.fail("audit peers responded before local page");
-                }
-                if batch.completed_nodes.len() > MAX_AUDIT_PEERS
-                    || batch.missing_nodes.len() > MAX_AUDIT_PEERS
-                {
-                    return self.fail("audit peer response exceeds its bound");
-                }
-                let expected: BTreeSet<NodeId> = self.peers.iter().copied().collect();
-                let accounted: BTreeSet<NodeId> = batch
-                    .completed_nodes
-                    .union(&batch.missing_nodes)
-                    .copied()
-                    .collect();
-                if accounted.iter().any(|node| !expected.contains(node)) {
-                    return self.fail("unexpected audit peer response");
-                }
-                if batch.records.values().any(|candidate| {
-                    !batch.completed_nodes.contains(&candidate.source)
-                        || !expected.contains(&candidate.source)
-                }) {
-                    return self.fail("unexpected audit peer record");
-                }
-                for node in expected.difference(&accounted) {
-                    batch.mark_missing(*node);
-                }
-                self.responded.extend(batch.completed_nodes.iter().copied());
-                self.responded.extend(batch.missing_nodes.iter().copied());
-                self.batch.merge(batch);
-                self.pending = 0;
-            }
-            other => return self.fail(&format!("unexpected audit event {}", other.label())),
+            other => return Err(unexpected_event(other.label())),
+        };
+        let page = parse_audit_page(values, next_start_after, &self.request())?;
+        if page.records.is_empty() {
+            return Ok(());
         }
-        if self.pending == 0 {
-            self.state = FanState::Done;
-        }
-        smallvec![]
+        let mut local_batch = AuditPageBatch::with_limit(self.limit);
+        local_batch
+            .add_page(self.local_node, page, &self.request())
+            .map_err(|error| ListAuditError::Storage(error.to_string()))?;
+        local_batch.completed_nodes.clear();
+        self.batch.merge(local_batch);
+        Ok(())
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, FanState::Done)
+    fn peers_result(&mut self, result: GroupResult) -> Result<(), ListAuditError> {
+        let event = match result {
+            GroupResult::Done(event) => *event,
+            GroupResult::Unfinished | GroupResult::Refused => {
+                for node in &self.peers {
+                    self.batch.mark_missing(*node);
+                }
+                return Ok(());
+            }
+        };
+        let Event::Net(NetEvent::AuditPages(mut batch)) = event else {
+            return Err(unexpected_event(event.label()));
+        };
+        if batch.completed_nodes.len() > MAX_AUDIT_PEERS
+            || batch.missing_nodes.len() > MAX_AUDIT_PEERS
+        {
+            return Err(failure("audit peer response exceeds its bound"));
+        }
+        let expected: BTreeSet<NodeId> = self.peers.iter().copied().collect();
+        let accounted: BTreeSet<NodeId> = batch
+            .completed_nodes
+            .union(&batch.missing_nodes)
+            .copied()
+            .collect();
+        if accounted.iter().any(|node| !expected.contains(node)) {
+            return Err(failure("unexpected audit peer response"));
+        }
+        if batch.records.values().any(|candidate| {
+            !batch.completed_nodes.contains(&candidate.source)
+                || !expected.contains(&candidate.source)
+        }) {
+            return Err(failure("unexpected audit peer record"));
+        }
+        for node in expected.difference(&accounted) {
+            batch.mark_missing(*node);
+        }
+        self.batch.merge(batch);
+        Ok(())
     }
 
-    fn finalize(self) -> Result<AuditAggregate, ListAuditError> {
-        if let Some(error) = self.error {
-            return Err(error);
-        }
-        let records: Vec<MetadataAuditRecord> = self
-            .batch
+    fn aggregate(&mut self) -> AuditAggregate {
+        let batch = std::mem::take(&mut self.batch);
+        let records: Vec<MetadataAuditRecord> = batch
             .records
             .values()
             .take(self.limit)
             .map(|candidate| candidate.entry.record.clone())
             .collect();
-        let cutoff = if self.batch.records.len() > self.limit {
-            self.batch
+        let cutoff = if batch.records.len() > self.limit {
+            batch
                 .records
                 .keys()
                 .nth(self.limit.saturating_sub(1))
                 .cloned()
         } else {
-            self.batch.horizon.clone()
+            batch.horizon.clone()
         };
-        let missing: Vec<NodeId> = self.batch.missing_nodes.iter().copied().collect();
-        let partial = !missing.is_empty() || self.batch.missing_overflow > 0 || self.batch.conflict;
-        let partial = partial || self.local_failed;
-        Ok(AuditAggregate {
+        let missing: Vec<NodeId> = batch.missing_nodes.iter().copied().collect();
+        let partial = !missing.is_empty()
+            || batch.missing_overflow > 0
+            || batch.conflict
+            || self.local_failed;
+        let next_cursor = match partial {
+            true => None,
+            false => cutoff.map(|key| {
+                encode_cursor(
+                    self.realm_id,
+                    self.config_digest,
+                    self.group_id,
+                    self.document_id,
+                    key,
+                )
+            }),
+        };
+        AuditAggregate {
             records,
-            next_cursor: if partial {
-                None
-            } else {
-                cutoff.map(|key| {
-                    encode_cursor(
-                        self.realm_id,
-                        self.config_digest,
-                        self.group_id,
-                        self.document_id,
-                        key,
-                    )
-                })
-            },
+            next_cursor,
             partial,
             missing_nodes: missing,
-            missing_overflow: self.batch.missing_overflow,
-        })
+            missing_overflow: batch.missing_overflow,
+        }
+    }
+}
+
+fn failure(message: &str) -> ListAuditError {
+    ListAuditError::Storage(message.to_string())
+}
+
+fn unexpected_event(label: &str) -> ListAuditError {
+    ListAuditError::Storage(format!("unexpected audit event {label}"))
+}
+
+impl Operation for ListAuditOperation {
+    type Output = AuditAggregate;
+    type Error = ListAuditError;
+
+    fn first(&mut self) -> AuditTurn {
+        let mut members = Vec::new();
+        if self.include_local {
+            let local = audit_iter_effect(
+                self.group_id,
+                self.document_id,
+                &self.start_after,
+                self.limit,
+            );
+            members.push(local);
+        }
+        if !self.peers.is_empty() {
+            members.push(self.peers_effect());
+        }
+        if members.is_empty() {
+            return Ok(Next::Done(self.aggregate()));
+        }
+        let limit = members.len();
+        let form = GroupForm::All {
+            deadline: self.wait,
+        };
+        Ok(Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit,
+            form,
+        })))
     }
 
-    fn abort(&mut self) -> Effects {
-        if self.include_local && !self.local_done && !self.local_failed {
-            self.local_failed = true;
-            self.batch.mark_missing(self.local_node);
+    fn next(&mut self, result: IoResult) -> AuditTurn {
+        let IoResult::Group(GroupEvent::Finished { results }) = result else {
+            return Err(unexpected_event(result.label()));
+        };
+        let mut results = results.into_iter();
+        let mut member = || {
+            results
+                .next()
+                .ok_or_else(|| failure("audit group result missing"))
+        };
+        if self.include_local {
+            let local = member()?;
+            self.local_result(local)?;
         }
-        let pending: Vec<NodeId> = self
-            .peers
-            .iter()
-            .copied()
-            .filter(|node| !self.responded.contains(node))
-            .collect();
-        for node in pending {
-            self.batch.mark_missing(node);
+        if !self.peers.is_empty() {
+            let peers = member()?;
+            self.peers_result(peers)?;
         }
-        self.state = FanState::Done;
-        smallvec![]
+        Ok(Next::Done(self.aggregate()))
     }
 }
 
@@ -613,14 +595,13 @@ impl EffectOperation for ListAuditOperation {
 mod tests {
     use super::{
         AUDIT_CURSOR_CHARS, AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
-        AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditPageEntry,
-        AuditPageResponse, Effect, EffectOperation, Event, IoCall, IoResult, Key, ListAuditError,
-        ListAuditOperation, ListAuditRequest, LocalPageOperation, MAX_AUDIT_PEERS,
-        METADATA_AUDIT_KEYSPACE, NetEffect, NetEvent, Next, Operation, StorageEvent, audit_scope,
-        decode_cursor, encode_cursor, select_peers,
+        AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditAggregate,
+        AuditPageEntry, AuditPageResponse, Effect, Event, GroupEvent, GroupForm, GroupResult,
+        IoCall, IoResult, Key, ListAuditError, ListAuditOperation, ListAuditRequest,
+        LocalPageOperation, MAX_AUDIT_PEERS, METADATA_AUDIT_KEYSPACE, NetEffect, NetEvent, Next,
+        Operation, StorageEvent, Value, audit_scope, decode_cursor, encode_cursor, select_peers,
     };
     use crate::driver::DriverContext;
-    use crate::driver::drive_until;
     use crate::metadata::audit_entry::{audit_member, authorize_admin, list_audit};
     use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
@@ -717,6 +698,41 @@ mod tests {
         batch
     }
 
+    fn members(operation: &mut ListAuditOperation) -> Vec<Effect> {
+        let Ok(Next::Call(IoCall::Group(group))) = operation.first() else {
+            panic!("expected one audit group");
+        };
+        group.members
+    }
+
+    fn local_page(values: Vec<(Key, Value)>) -> GroupResult {
+        let page = StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        };
+        GroupResult::Done(Box::new(Event::Storage(page)))
+    }
+
+    fn empty_local() -> GroupResult {
+        local_page(Vec::new())
+    }
+
+    fn peer_pages(batch: AuditPageBatch) -> GroupResult {
+        GroupResult::Done(Box::new(Event::Net(NetEvent::AuditPages(batch))))
+    }
+
+    /// Runs the operation's one group with `results` and returns the aggregate.
+    fn aggregate(
+        operation: &mut ListAuditOperation,
+        results: Vec<GroupResult>,
+    ) -> Result<AuditAggregate, ListAuditError> {
+        operation.first()?;
+        match operation.next(IoResult::Group(GroupEvent::Finished { results }))? {
+            Next::Done(aggregate) => Ok(aggregate),
+            _ => panic!("expected the aggregate"),
+        }
+    }
+
     #[test]
     fn peers_share_effect() {
         // Every peer is asked in one adapter round: with one effect per peer the
@@ -726,43 +742,32 @@ mod tests {
             .collect();
         let mut peers = unique.clone();
         peers.insert(1, unique[0]);
-        let group_id = Ulid::from_bytes([3u8; 16]);
         let mut operation = ListAuditOperation::new(
             RealmId([0u8; 32]),
             unique[0],
             true,
-            group_id,
+            Ulid::from_bytes([3u8; 16]),
             None,
-            peers.clone(),
+            peers,
             None,
             10,
             None,
             [0u8; 32],
         );
-
-        let effects = operation.start();
-        assert_eq!(effects.len(), 1);
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        let Effect::Net(NetEffect::AuditPage(fan_out)) = &effects[0] else {
+        let members = members(&mut operation);
+        assert_eq!(members.len(), 2);
+        let Effect::Net(NetEffect::AuditPage(fan_out)) = &members[1] else {
             panic!("the peer fan-out must be a single net effect");
         };
         assert_eq!(
             fan_out.nodes.iter().copied().collect::<BTreeSet<_>>(),
             unique.iter().copied().collect::<BTreeSet<_>>()
         );
-        assert!(!operation.is_complete());
         let mut batch = AuditPageBatch::new();
         for node in &unique {
             batch.mark_missing(*node);
         }
-        operation.step(Event::Net(NetEvent::AuditPages(batch)));
-
-        assert!(operation.is_complete());
-        let aggregate = operation.finalize().unwrap();
+        let aggregate = aggregate(&mut operation, vec![empty_local(), peer_pages(batch)]).unwrap();
         assert!(aggregate.partial);
         assert_eq!(aggregate.missing_nodes.len(), unique.len());
         assert!(aggregate.records.is_empty());
@@ -830,45 +835,25 @@ mod tests {
         let peers: Vec<_> = (2u8..=u8::try_from(MAX_AUDIT_PEERS + 2).unwrap())
             .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
             .collect();
-        let mut local_operation = ListAuditOperation::new(
-            realm_id,
-            local,
-            true,
-            Ulid::from_bytes([2u8; 16]),
-            None,
-            peers.clone(),
-            None,
-            10,
-            None,
-            [0u8; 32],
-        );
-        local_operation.start();
-        let effects = local_operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        let Effect::Net(NetEffect::AuditPage(effect)) = &effects[0] else {
-            panic!("local page must precede peer fan-out");
-        };
-        assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS);
-
-        let mut remote_operation = ListAuditOperation::new(
-            realm_id,
-            local,
-            false,
-            Ulid::from_bytes([2u8; 16]),
-            None,
-            peers,
-            None,
-            10,
-            None,
-            [0u8; 32],
-        );
-        let effects = remote_operation.start();
-        let Effect::Net(NetEffect::AuditPage(effect)) = &effects[0] else {
-            panic!("remote page must fan out directly");
-        };
-        assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS);
+        for include_local in [true, false] {
+            let mut operation = ListAuditOperation::new(
+                realm_id,
+                local,
+                include_local,
+                Ulid::from_bytes([2u8; 16]),
+                None,
+                peers.clone(),
+                None,
+                10,
+                None,
+                [0u8; 32],
+            );
+            let members = members(&mut operation);
+            let Some(Effect::Net(NetEffect::AuditPage(effect))) = members.last() else {
+                panic!("the peer fan-out must be the last member");
+            };
+            assert_eq!(effect.nodes.len(), MAX_AUDIT_PEERS);
+        }
     }
 
     #[test]
@@ -892,19 +877,14 @@ mod tests {
             None,
             [0u8; 32],
         );
-        operation.start();
         let record = record(group, doc, realm_id);
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                metadata_audit_key(group, doc, Ulid::from_bytes([4u8; 16])),
-                postcard::to_allocvec(&record).unwrap().into(),
-            )],
-            next_start_after: None,
-        }));
+        let local_page = local_page(vec![(
+            metadata_audit_key(group, doc, Ulid::from_bytes([4u8; 16])),
+            postcard::to_allocvec(&record).unwrap().into(),
+        )]);
         let mut batch = AuditPageBatch::new();
         batch.completed_nodes.extend(peers);
-        operation.step(Event::Net(NetEvent::AuditPages(batch)));
-        let result = operation.finalize().unwrap();
+        let result = aggregate(&mut operation, vec![local_page, peer_pages(batch)]).unwrap();
         assert!(!result.partial);
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.missing_overflow, 0);
@@ -924,16 +904,22 @@ mod tests {
             usize::MAX,
             None,
             [0u8; 32],
-        );
-        let effects = operation.start();
-        let Effect::Storage(StorageEffect::Iter { limit, .. }) = &effects[0] else {
+        )
+        .within(Duration::from_secs(AUDIT_DEADLINE_SECS));
+        let Ok(Next::Call(IoCall::Group(group))) = operation.first() else {
+            panic!("expected one audit group");
+        };
+        let deadline = Some(Duration::from_secs(AUDIT_DEADLINE_SECS));
+        assert_eq!(group.form, GroupForm::All { deadline });
+        let [Effect::Storage(StorageEffect::Iter { limit, .. })] = group.members.as_slice() else {
             panic!("local page must use storage iteration");
         };
         assert_eq!(*limit, AUDIT_PAGE_LIMIT);
     }
 
     #[test]
-    fn local_abort_partial() {
+    fn unfinished_local_partial() {
+        // A local page still running at the deadline marks this node missing.
         let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let mut operation = ListAuditOperation::new(
             RealmId([1u8; 32]),
@@ -947,10 +933,7 @@ mod tests {
             None,
             [0u8; 32],
         );
-        operation.start();
-        operation.abort();
-        operation.abort();
-        let result = operation.finalize().unwrap();
+        let result = aggregate(&mut operation, vec![GroupResult::Unfinished]).unwrap();
         assert!(result.partial);
         assert!(result.next_cursor.is_none());
         assert_eq!(result.missing_nodes, vec![node]);
@@ -1022,44 +1005,6 @@ mod tests {
         drop(outbound);
     }
 
-    #[tokio::test]
-    async fn local_deadline() {
-        let directory = tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: FjallStorage::open(directory.path().to_str().unwrap()).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-        let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let operation = ListAuditOperation::new(
-            RealmId([1u8; 32]),
-            node,
-            true,
-            Ulid::from_bytes([2u8; 16]),
-            None,
-            Vec::new(),
-            None,
-            10,
-            None,
-            [0u8; 32],
-        );
-        let result = drive_until(
-            operation,
-            &context,
-            tokio::time::Instant::now() - Duration::from_secs(1),
-        )
-        .await
-        .unwrap();
-        assert!(result.partial);
-        assert!(result.next_cursor.is_none());
-        assert_eq!(result.missing_nodes, vec![node]);
-    }
-
     #[test]
     fn success_has_cursor() {
         let realm_id = RealmId([9u8; 32]);
@@ -1084,11 +1029,6 @@ mod tests {
             None,
             [0u8; 32],
         );
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
         let mut batch = AuditPageBatch::new();
         batch
             .add_page(
@@ -1105,9 +1045,7 @@ mod tests {
                 },
             )
             .unwrap();
-        operation.step(Event::Net(NetEvent::AuditPages(batch)));
-
-        let aggregate = operation.finalize().unwrap();
+        let aggregate = aggregate(&mut operation, vec![empty_local(), peer_pages(batch)]).unwrap();
         assert!(!aggregate.partial);
         assert!(aggregate.next_cursor.is_some());
     }
@@ -1132,16 +1070,9 @@ mod tests {
             [0u8; 32],
         );
 
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
         let mut batch = AuditPageBatch::new();
         batch.completed_nodes.insert(peers[0]);
-        operation.step(Event::Net(NetEvent::AuditPages(batch)));
-
-        let aggregate = operation.finalize().unwrap();
+        let aggregate = aggregate(&mut operation, vec![empty_local(), peer_pages(batch)]).unwrap();
         assert!(aggregate.partial);
         assert_eq!(aggregate.missing_nodes, vec![peers[1]]);
     }
@@ -1180,16 +1111,10 @@ mod tests {
             None,
             [0u8; 32],
         );
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
         let mut first_batch = batch(live, realm_id, group, Some(doc), live_page.clone());
         first_batch.mark_missing(missing);
-        operation.step(Event::Net(NetEvent::AuditPages(first_batch)));
-
-        let partial = operation.finalize().unwrap();
+        let results = vec![empty_local(), peer_pages(first_batch)];
+        let partial = aggregate(&mut operation, results).unwrap();
         assert!(partial.partial);
         assert!(partial.next_cursor.is_none());
 
@@ -1205,11 +1130,6 @@ mod tests {
             None,
             [0u8; 32],
         );
-        retry.start();
-        retry.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
         let mut retry_batch = batch(live, realm_id, group, Some(doc), live_page);
         retry_batch.merge(batch(
             missing,
@@ -1221,9 +1141,8 @@ mod tests {
                 next_start_after: None,
             },
         ));
-        retry.step(Event::Net(NetEvent::AuditPages(retry_batch)));
-
-        let recovered = retry.finalize().unwrap();
+        let results = vec![empty_local(), peer_pages(retry_batch)];
+        let recovered = aggregate(&mut retry, results).unwrap();
         assert_eq!(
             recovered
                 .records
@@ -1323,9 +1242,7 @@ mod tests {
             Some(AuthToken::bearer("test").unwrap()),
             [3u8; 32],
         );
-        operation.start();
-        operation.step(Event::Net(NetEvent::AuditPages(AuditPageBatch::new())));
-        let result = operation.finalize().unwrap();
+        let result = aggregate(&mut operation, vec![GroupResult::Unfinished]).unwrap();
         assert!(result.partial);
         assert!(result.next_cursor.is_none());
         assert!(result.missing_overflow > 0);
@@ -1333,8 +1250,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_peer_first() {
+    fn rejects_foreign_peer() {
         let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let stranger = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let mut operation = ListAuditOperation::new(
             RealmId([1u8; 32]),
             node,
@@ -1347,9 +1265,11 @@ mod tests {
             None,
             [0u8; 32],
         );
-        operation.start();
-        operation.step(Event::Net(NetEvent::AuditPages(AuditPageBatch::new())));
-        assert!(operation.finalize().is_err());
+        let mut batch = AuditPageBatch::new();
+        batch.completed_nodes.insert(stranger);
+        let results = vec![empty_local(), peer_pages(batch)];
+        assert!(aggregate(&mut operation, results).is_err());
+        assert!(operation.next(IoResult::Done).is_err());
     }
 
     #[test]
@@ -1404,9 +1324,8 @@ mod tests {
             None,
             [0u8; 32],
         );
-        let effects = operation.start();
         assert!(matches!(
-            effects.as_slice(),
+            members(&mut operation).as_slice(),
             [Effect::Net(NetEffect::AuditPage(_))]
         ));
     }
@@ -1573,19 +1492,8 @@ mod tests {
             None,
             [0u8; 32],
         );
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        operation.step(Event::Net(NetEvent::AuditPages(batch(
-            node,
-            realm_id,
-            group,
-            Some(doc),
-            page,
-        ))));
-        let aggregate = operation.finalize().unwrap();
+        let pages = peer_pages(batch(node, realm_id, group, Some(doc), page));
+        let aggregate = aggregate(&mut operation, vec![empty_local(), pages]).unwrap();
         assert_eq!(aggregate.records.len(), 2);
         assert!(aggregate.next_cursor.is_some());
     }
