@@ -7,8 +7,9 @@ use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
 use aruna_operations::abe::rekey::rekey_page;
+use aruna_operations::auth::epoch_due::EpochDueOperation;
 use aruna_operations::abe::{
-    EpochDueOperation, KeyAction, KeyResult, MemberKeysOperation, ReissueOperation, drive_key,
+    KeyAction, KeyResult, MemberKeysOperation, ReissueOperation, drive_key,
 };
 use axum::extract::Path;
 
