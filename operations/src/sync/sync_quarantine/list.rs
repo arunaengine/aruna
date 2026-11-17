@@ -57,7 +57,10 @@ impl Operation for ListQuarantineOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::replace(&mut self.state, ListState::Scanning), event) {
+        match (
+            std::mem::replace(&mut self.state, ListState::Scanning),
+            event,
+        ) {
             (
                 ListState::Scanning,
                 Event::Storage(StorageEvent::IterResult {

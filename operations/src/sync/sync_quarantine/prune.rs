@@ -376,7 +376,10 @@ mod tests {
             values: vec![(key(2), record_bytes(&record(2, false)))],
             next_start_after: None,
         });
-        assert_eq!(operation.step(unacknowledged).as_slice(), &[usage_read(None)]);
+        assert_eq!(
+            operation.step(unacknowledged).as_slice(),
+            &[usage_read(None)]
+        );
         operation.step(read_result(None));
         let result = operation.finalize().expect("prune finishes");
         assert_eq!((result.pruned, result.scanned), (0, 1));
@@ -391,7 +394,10 @@ mod tests {
             bytes: 300,
         };
         let mut operation = reading_rows();
-        assert_eq!(operation.step(rows(false)).as_slice(), &[usage_read(Some(TXN))]);
+        assert_eq!(
+            operation.step(rows(false)).as_slice(),
+            &[usage_read(Some(TXN))]
+        );
         assert_eq!(
             operation
                 .step(read_result(Some(usage_bytes(usage))))
@@ -444,7 +450,9 @@ mod tests {
 
     #[test]
     fn abort_and_finalize() {
-        rejects_finalize(PruneQuarantineOperation::new(QuarantinePageRequest::default()));
+        rejects_finalize(PruneQuarantineOperation::new(
+            QuarantinePageRequest::default(),
+        ));
         rejects_finalize(reading_rows());
         let mut operation = reading_rows();
         check_abort(&mut operation, &[abort()]);

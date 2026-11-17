@@ -26,7 +26,9 @@ use tracing::warn;
 use ulid::Ulid;
 
 pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
-    config.node_kind(&node_id).is_some_and(RealmNodeKind::is_sync_eligible)
+    config
+        .node_kind(&node_id)
+        .is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
 /// A User peer is owner-bound: it may forward only for the owner its realm

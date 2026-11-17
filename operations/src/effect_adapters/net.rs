@@ -27,7 +27,9 @@ pub(super) async fn dispatch_job_control(
 
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
     if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
-        return Event::Net(NetEvent::DocumentSync(reconcile_topics(context, topics).await));
+        return Event::Net(NetEvent::DocumentSync(
+            reconcile_topics(context, topics).await,
+        ));
     }
     if let Some(net_handle) = &context.net_handle {
         Box::pin(net_handle.send_effect(Effect::Net(effect))).await
@@ -46,7 +48,10 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
 }
 
 /// Reconciles through the handle, which also reloads realm peers after a realm config change.
-async fn reconcile_topics(context: &DriverContext, topics: Vec<irokle::TopicId>) -> DocumentNetEvent {
+async fn reconcile_topics(
+    context: &DriverContext,
+    topics: Vec<irokle::TopicId>,
+) -> DocumentNetEvent {
     let Some(net_handle) = &context.net_handle else {
         return DocumentNetEvent::Error {
             target: None,

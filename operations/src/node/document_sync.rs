@@ -12,7 +12,8 @@ use tracing::{debug, error, warn};
 
 use crate::driver::DriverContext;
 use crate::metadata::projector::{
-    MetadataProjectionError, PROJECTION_RETRY_AFTER, project_create_events, project_logged_events, schedule_projection_drain,
+    MetadataProjectionError, PROJECTION_RETRY_AFTER, project_create_events, project_logged_events,
+    schedule_projection_drain,
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
 

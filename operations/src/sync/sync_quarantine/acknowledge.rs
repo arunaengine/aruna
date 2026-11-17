@@ -297,7 +297,9 @@ mod tests {
         );
         let mut corrupt = reading_row();
         assert_eq!(
-            corrupt.step(read_result(Some(vec![0xff].into()))).as_slice(),
+            corrupt
+                .step(read_result(Some(vec![0xff].into())))
+                .as_slice(),
             &[abort()]
         );
         let mut committing = reading_row();

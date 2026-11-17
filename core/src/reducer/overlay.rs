@@ -7,14 +7,11 @@ use std::collections::HashMap;
 use super::*;
 use crate::document::DocumentTarget;
 use crate::structs::identity::auth::Role;
-use crate::structs::identity::realm::RealmAuthorizationDocument;
 use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
+use crate::structs::identity::realm::RealmAuthorizationDocument;
 use crate::structs::identity::user::User;
 
-pub fn overlay_group_state(
-    group: &mut Group,
-    reducer_state: &AdminDocumentState,
-) {
+pub fn overlay_group_state(group: &mut Group, reducer_state: &AdminDocumentState) {
     if !reducer_state.conflicts.contains_key(DISPLAY_NAME_PATH)
         && let Some(display_name) = reducer_state.materialized_group_name()
     {
@@ -60,10 +57,7 @@ fn group_metadata_conflicted(reducer_state: &AdminDocumentState) -> bool {
         || reducer_state.conflicts.contains_key(GROUP_OWNER_PATH)
 }
 
-pub fn materialized_group(
-    group_id: Ulid,
-    reducer_state: &AdminDocumentState,
-) -> Option<Group> {
+pub fn materialized_group(group_id: Ulid, reducer_state: &AdminDocumentState) -> Option<Group> {
     if group_metadata_conflicted(reducer_state) {
         return None;
     }
@@ -339,9 +333,7 @@ fn remove_oidc_provider(config: &mut RealmConfigDocument, provider_id: &str) {
         .retain(|provider| provider.id != provider_id);
 }
 
-pub fn reduced_admin_target(
-    target: &DocumentTarget,
-) -> Option<AdminDocumentTarget> {
+pub fn reduced_admin_target(target: &DocumentTarget) -> Option<AdminDocumentTarget> {
     match target {
         DocumentTarget::User { user_id } => Some(AdminDocumentTarget::User { user_id: *user_id }),
         DocumentTarget::Group { group_id } => Some(AdminDocumentTarget::Group {
@@ -383,7 +375,13 @@ pub fn materialize_group_authorization(
             let live = reducer_state
                 .materialized_group_roles()
                 .contains(&role.role_id);
-            if materialize_role(&mut auth_doc.roles, reducer_state, role, &group_role_path(&role.role_id), live) {
+            if materialize_role(
+                &mut auth_doc.roles,
+                reducer_state,
+                role,
+                &group_role_path(&role.role_id),
+                live,
+            ) {
                 overlay_group_role(auth_doc, reducer_state, role.role_id);
             }
         }
@@ -393,7 +391,13 @@ pub fn materialize_group_authorization(
         AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id }
         | AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id } => {
             let path = group_user_path(role_id, user_id);
-            materialize_assignment(&mut auth_doc.roles, reducer_state, &path, *role_id, *user_id);
+            materialize_assignment(
+                &mut auth_doc.roles,
+                reducer_state,
+                &path,
+                *role_id,
+                *user_id,
+            );
         }
         _ => {}
     }
@@ -410,14 +414,26 @@ pub fn materialize_realm_authorization(
             let live = reducer_state
                 .materialized_realm_roles()
                 .contains(&role.role_id);
-            if materialize_role(&mut auth_doc.roles, reducer_state, role, &realm_role_path(&role.role_id), live) {
+            if materialize_role(
+                &mut auth_doc.roles,
+                reducer_state,
+                role,
+                &realm_role_path(&role.role_id),
+                live,
+            ) {
                 overlay_realm_role(auth_doc, reducer_state, role.role_id);
             }
         }
         AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id }
         | AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => {
             let path = realm_user_path(role_id, user_id);
-            materialize_assignment(&mut auth_doc.roles, reducer_state, &path, *role_id, *user_id);
+            materialize_assignment(
+                &mut auth_doc.roles,
+                reducer_state,
+                &path,
+                *role_id,
+                *user_id,
+            );
         }
         _ => {}
     }

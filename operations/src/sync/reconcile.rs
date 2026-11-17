@@ -159,10 +159,12 @@ mod tests {
     #[test]
     fn net_errors_fail() {
         let mut operation = running();
-        operation.step(Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
-            target: None,
-            error: "topic missing".to_string(),
-        })));
+        operation.step(Event::Net(NetEvent::DocumentSync(
+            DocumentNetEvent::Error {
+                target: None,
+                error: "topic missing".to_string(),
+            },
+        )));
         assert_eq!(
             operation.finalize(),
             Err(ReconcileError::Net("topic missing".to_string()))
@@ -178,7 +180,10 @@ mod tests {
         assert_eq!(refusals.len(), sample_events().len());
         for (label, effects, error) in refusals {
             assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(matches!(error, ReconcileError::UnexpectedEvent(_)), "{label}");
+            assert!(
+                matches!(error, ReconcileError::UnexpectedEvent(_)),
+                "{label}"
+            );
         }
         let mut early = ReconcileTopicsOperation::new(topics());
         early.step(reconciled(Vec::new()));

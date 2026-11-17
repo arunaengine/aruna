@@ -15,7 +15,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::sync::outbox_record::{new_identified_record, schedule_drain_effect, write_outbox_effect};
+use crate::sync::outbox_record::{
+    new_identified_record, schedule_drain_effect, write_outbox_effect,
+};
 
 /// What a re-emit wrote. `complete` is false when a record could not be encoded or written,
 /// so the caller keeps its eviction journal; a failed drain schedule leaves it true.
@@ -312,7 +314,10 @@ mod tests {
         }));
         let outcome = operation.finalize().expect("re-emit finishes");
         assert!(outcome.complete);
-        assert_eq!(outcome.drain_error.as_deref(), Some("task handle unavailable"));
+        assert_eq!(
+            outcome.drain_error.as_deref(),
+            Some("task handle unavailable")
+        );
     }
 
     #[test]

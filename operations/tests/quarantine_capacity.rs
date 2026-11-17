@@ -188,7 +188,10 @@ async fn capacity_blocks_releases() {
     let local_node = iroh::SecretKey::from_bytes(&[31; 32]).public();
 
     let seeded = fill_store(&storage).await;
-    assert_eq!(list(&ctx, QuarantinePageRequest::default()).await.usage, seeded);
+    assert_eq!(
+        list(&ctx, QuarantinePageRequest::default()).await.usage,
+        seeded
+    );
 
     // A node info document that claims another node is a permanent reject.
     let target = DocumentTarget::NodeInfo {
@@ -234,12 +237,13 @@ async fn capacity_blocks_releases() {
     reset_cursor(&storage, topic_id.as_bytes()).await;
     service.reconcile_documents_event().await;
     assert!(
-        list(&ctx, topic_page()).await
-            .records
-            .is_empty(),
+        list(&ctx, topic_page()).await.records.is_empty(),
         "a full store must not write evidence"
     );
-    assert_eq!(list(&ctx, QuarantinePageRequest::default()).await.usage, seeded);
+    assert_eq!(
+        list(&ctx, QuarantinePageRequest::default()).await.usage,
+        seeded
+    );
 
     // Reclaim one slot: only acknowledged rows are prunable.
     let seeded_page = || QuarantinePageRequest {
@@ -249,13 +253,17 @@ async fn capacity_blocks_releases() {
     };
     let page = list(&ctx, seeded_page()).await;
     let oldest = page.records.first().expect("seeded evidence").storage_key();
-    let pruned = drive(PruneQuarantineOperation::new(seeded_page()), &ctx).await.unwrap();
+    let pruned = drive(PruneQuarantineOperation::new(seeded_page()), &ctx)
+        .await
+        .unwrap();
     assert_eq!(pruned.pruned, 0, "unacknowledged evidence is never pruned");
     drive(AcknowledgeQuarantineOperation::new(oldest), &ctx)
         .await
         .unwrap()
         .expect("row is acknowledged");
-    let pruned = drive(PruneQuarantineOperation::new(seeded_page()), &ctx).await.unwrap();
+    let pruned = drive(PruneQuarantineOperation::new(seeded_page()), &ctx)
+        .await
+        .unwrap();
     assert_eq!(pruned.pruned, 1);
     assert_eq!(pruned.usage.records, QUARANTINE_MAX_RECORDS - 1);
 
@@ -279,7 +287,10 @@ async fn capacity_blocks_releases() {
         Some(record)
     );
     assert_eq!(
-        list(&ctx, QuarantinePageRequest::default()).await.usage.records,
+        list(&ctx, QuarantinePageRequest::default())
+            .await
+            .usage
+            .records,
         QUARANTINE_MAX_RECORDS
     );
     assert!(
