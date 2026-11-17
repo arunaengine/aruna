@@ -1344,7 +1344,6 @@ const FILE_PAGE: usize = 100;
 /// Bytes of a create key at most.
 const MAX_KEY: usize = 256;
 
-/// The intent reply of a create: the document id and its establishing revision.
 /// Whether a failed create had no effect, or may have had one.
 fn create_outcome(error: CreateAuthorizedError) -> Outcome {
     let none = |kind, message: String| Outcome::None(HostError::new(kind, message));

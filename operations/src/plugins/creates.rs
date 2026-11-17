@@ -198,7 +198,7 @@ impl Plan for SettleKey {
     }
 }
 
-/// The stored reply of a create: its document id and establishing revision.
+/// The intent reply of a create: the document id and its establishing revision.
 pub(crate) fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
     format!("{document_id} {revision}")
 }
