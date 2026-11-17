@@ -768,3 +768,76 @@ fn sample_install(install_id: Ulid) -> PluginInstall {
         secrets: Default::default(),
     }
 }
+
+#[test]
+fn change_applies_once() {
+    let install_id = Ulid::from_parts(1, 1);
+    let row = WorkRow::reserved(&sample_install(install_id), WorkKind::Copy, Ulid::nil(), 1);
+    let mut plan = UpdateWork {
+        lookup: WorkLookup::new(install_id, row.work_id),
+        change: Some(WorkChange::Dispatched(job(1))),
+        written: None,
+    };
+    plan.first().unwrap();
+    let [by_index, by_key] = found(b"key", &row);
+    plan.next(by_index).unwrap();
+    let Turn::Ask(Ask::Write(rows)) = plan.next(by_key).unwrap() else {
+        panic!("the changed row is written");
+    };
+    let written: WorkRow = decode(&rows[0].2).unwrap();
+    assert_eq!(
+        (written.state, written.job),
+        (WorkState::Dispatched, Some(job(1)))
+    );
+    assert_eq!(
+        plan.next(Answer::Done).unwrap(),
+        Turn::Finish(Some(written))
+    );
+    // A gone row is not changed.
+    let mut gone = UpdateWork {
+        lookup: WorkLookup::new(install_id, row.work_id),
+        change: Some(WorkChange::Reopened),
+        written: None,
+    };
+    assert_eq!(
+        gone.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Finish(None)
+    );
+    // A later state keeps its job.
+    let mut settled = row.clone();
+    settled.state = WorkState::Settled;
+    WorkChange::Dispatched(job(2)).apply(&mut settled);
+    assert_eq!((settled.state, settled.job), (WorkState::Settled, None));
+}
+
+#[test]
+fn listed_by_index() {
+    let install_id = Ulid::from_parts(1, 1);
+    let row = WorkRow::reserved(&sample_install(install_id), WorkKind::Copy, Ulid::nil(), 1);
+    let mut plan = ListWork {
+        page: Some(Ask::Page {
+            space: PLUGIN_WORK_KEYSPACE,
+            prefix: Vec::new(),
+            after: None,
+            limit: 2,
+        }),
+        indexes: Vec::new(),
+        next: None,
+    };
+    plan.first().unwrap();
+    let index = index_key(install_id, row.work_id);
+    let other = index_key(install_id, Ulid::from_parts(9, 9));
+    let page = vec![(index.clone(), b"k1".to_vec()), (other, b"k2".to_vec())];
+    let Turn::Ask(Ask::Read(reads)) = plan.next(Answer::Page(page, Some(Vec::new()))).unwrap()
+    else {
+        panic!("the rows of the index page are read");
+    };
+    assert_eq!(reads.len(), 2);
+    // A row another work replaced under the key, and a gone one, are left out.
+    let values = vec![Some(encode(&row).unwrap()), Some(encode(&row).unwrap())];
+    let Turn::Finish((works, next)) = plan.next(Answer::Values(values)).unwrap() else {
+        panic!("the page ends the listing");
+    };
+    assert_eq!(works, [row]);
+    assert_eq!(next, Some(Ulid::from_parts(9, 9)));
+}
