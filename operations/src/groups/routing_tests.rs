@@ -6,12 +6,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
-use aruna_core::operation::EffectOperation;
-use aruna_core::operation_check::{rejects_events, rejects_finalize, sample_events};
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::format::Compression;
@@ -21,7 +20,7 @@ use aruna_core::structs::storage::routing::{
     resolve_backend,
 };
 use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_backend_keys};
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key};
 use ulid::Ulid;
 
 use super::*;
@@ -29,13 +28,23 @@ use crate::groups::backends::record_writes;
 
 type Rows = BTreeMap<(String, Vec<u8>), Vec<u8>>;
 
-/// Answers one storage read effect from `rows`, the way the storage backend would.
-fn answer(effect: &Effect, rows: &Rows) -> Event {
-    let Effect::Storage(effect) = effect else {
-        panic!("only storage effects are expected, got {effect:?}");
+/// Answers one storage read effect from `rows`, the way the storage backend would; a child
+/// operation runs to its end against the same rows.
+fn answer(effect: Effect, rows: &Rows) -> Event {
+    let effect = match effect {
+        Effect::Storage(effect) => effect,
+        Effect::SubOperation(mut child) => {
+            let mut effects = child.start().into_vec();
+            while !child.is_complete() {
+                let effect = effects.pop().expect("a running child waits on one effect");
+                effects = child.step(answer(effect, rows)).into_vec();
+            }
+            return child.finalize();
+        }
+        other => panic!("only storage effects are expected, got {other:?}"),
     };
     let row = |space: &str, key: &[u8]| rows.get(&(space.to_string(), key.to_vec())).cloned();
-    match effect {
+    match &effect {
         StorageEffect::Read { key_space, key, .. } => Event::Storage(StorageEvent::ReadResult {
             key: key.clone(),
             value: row(key_space, key).map(Into::into),
@@ -69,14 +78,15 @@ fn answer(effect: &Effect, rows: &Rows) -> Event {
 }
 
 /// Runs `operation` to its end against `rows`.
-fn run<O: EffectOperation>(mut operation: O, rows: &Rows) -> Result<O::Output, O::Error> {
+fn run<K, O: Runnable<K>>(operation: O, rows: &Rows) -> Result<O::Output, O::Error> {
+    let mut operation = operation.into_machine();
     let mut effects = operation.start().into_vec();
     while !operation.is_complete() {
         let effect = effects
             .pop()
             .expect("a running operation waits on one effect");
         assert!(effects.is_empty(), "one read at a time");
-        effects = operation.step(answer(&effect, rows)).into_vec();
+        effects = operation.step(answer(effect, rows)).into_vec();
     }
     operation.finalize()
 }
@@ -223,39 +233,27 @@ fn reads_bucket_rules() {
 }
 
 #[test]
-fn snapshot_effects_order() {
-    // Bucket read, the group's four reads, then one batch read of the capped backend's shards.
+fn snapshot_calls_order() {
+    // Bucket read, the group's inputs as a child, then one read of the capped backend's shards.
     let group_id = Ulid::from_parts(1, 1);
     let named = BucketRules::Named("b".to_string());
     let mut operation = SnapshotOperation::new(&capped(10), group_id, named);
-    let rows = Rows::new();
-    let mut inputs = GroupInputsOperation::new(group_id);
-    let read = |space: &str, key: &[u8]| {
-        Effect::Storage(StorageEffect::Read {
-            key_space: space.to_string(),
-            key: key.to_vec().into(),
-            txn_id: None,
-        })
-    };
-    // The snapshot runs the inputs operation inline, so it waits on the same effects in turn.
-    let bucket = read(S3_BUCKET_KEYSPACE, b"b");
+    let bucket = (S3_BUCKET_KEYSPACE.to_string(), Key::from(b"b".to_vec()));
     assert_eq!(
-        operation.start().into_vec(),
-        vec![read(S3_BUCKET_KEYSPACE, b"b")]
+        operation.first(),
+        Ok(Next::Call(IoCall::Read(vec![bucket])))
     );
-    let mut expected = inputs.start().into_vec();
-    let mut effects = operation.step(answer(&bucket, &rows)).into_vec();
-    while !inputs.is_complete() {
-        assert_eq!(effects, expected);
-        let event = answer(&expected[0], &rows);
-        expected = inputs.step(answer(&expected[0], &rows)).into_vec();
-        effects = operation.step(event).into_vec();
-    }
-    let usage = usage_read(&[("cold".to_string(), 10)]);
-    assert_eq!(effects, vec![usage_read(&[("cold".to_string(), 10)])]);
-    assert!(operation.step(answer(&usage, &rows)).is_empty());
-    assert!(operation.is_complete());
-    assert!(operation.finalize().is_ok());
+    let inputs = operation.next(IoResult::Values(vec![None]));
+    assert!(matches!(inputs, Ok(Next::Call(IoCall::Child(_)))));
+    let loaded = Ok::<_, GroupInputsError>(GroupRoutingInputs::default());
+    let usage = operation.next(IoResult::Child(ChildOutcome::new(loaded)));
+    assert_eq!(
+        usage,
+        Ok(Next::Call(usage_read(&[("cold".to_string(), 10)])))
+    );
+    let shards = usage_backend_keys(&BackendRef::Node("cold".to_string())).len();
+    let counters = operation.next(IoResult::Values(vec![None; shards]));
+    assert!(matches!(counters, Ok(Next::Done(_))));
 }
 
 #[test]
@@ -270,8 +268,7 @@ fn marks_full_backend() {
     assert_eq!(open.catalog, capped(11).catalog);
     // An uncapped node reads nothing at all.
     let mut operation = QuotaOperation::new(NodeRouting::default());
-    assert!(operation.start().is_empty());
-    assert_eq!(operation.finalize().unwrap(), NodeRouting::default());
+    assert_eq!(operation.first(), Ok(Next::Done(NodeRouting::default())));
 }
 
 #[test]
@@ -294,20 +291,14 @@ fn sums_backend_shards() {
 
 #[test]
 fn failures_end_operations() {
-    // A storage error, a corrupt bucket and a short batch each fail instead of routing.
-    let error = || {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        })
-    };
+    // A stray answer, a corrupt bucket and a short batch each fail instead of routing.
     let named = || BucketRules::Named("b".to_string());
     let mut operation = SnapshotOperation::new(&NodeRouting::default(), Ulid::nil(), named());
-    operation.start();
-    operation.step(error());
-    assert!(matches!(
-        operation.finalize(),
-        Err(RoutingInputsError::BucketRules(RecordReadError::Storage(_)))
-    ));
+    operation.first().unwrap();
+    assert_eq!(
+        operation.next(IoResult::Done),
+        Err(RoutingInputsError::BucketRules(RecordReadError::Unexpected))
+    );
 
     let mut rows = Rows::new();
     rows.insert(
@@ -321,64 +312,14 @@ fn failures_end_operations() {
     ));
 
     let mut quota = QuotaOperation::new(capped(10));
-    quota.start();
-    quota.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: Vec::new(),
-    }));
+    quota.first().unwrap();
     assert_eq!(
-        quota.finalize(),
+        quota.next(IoResult::Values(Vec::new())),
         Err(RoutingInputsError::BackendUsage(
             RecordReadError::Unexpected
         ))
     );
-    let shards = usage_backend_keys(&BackendRef::Node("cold".to_string())).len();
-    assert!(shards > 0);
-}
-
-#[test]
-fn rejects_unexpected_events() {
-    // Before `start` every event is refused, and refusals emit no further effects.
-    let named = || BucketRules::Named("b".to_string());
-    let make = || SnapshotOperation::new(&NodeRouting::default(), Ulid::nil(), named());
-    for (label, effects, _) in rejects_events(make, sample_events, |_| false) {
-        assert!(effects.is_empty(), "{label} emitted effects");
-    }
-    for (label, effects, _) in
-        rejects_events(|| QuotaOperation::new(capped(1)), sample_events, |_| false)
-    {
-        assert!(effects.is_empty(), "{label} emitted effects");
-    }
-    let make = || UsageOperation::new(BackendRef::node_default());
-    for (label, effects, _) in rejects_events(make, sample_events, |_| false) {
-        assert!(effects.is_empty(), "{label} emitted effects");
-    }
-    // A started snapshot waiting on its bucket read refuses a batch result.
-    let mut operation = make_started();
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: Vec::new(),
-    }));
-    assert!(operation.finalize().is_err());
-}
-
-fn make_started() -> SnapshotOperation {
-    let named = BucketRules::Named("b".to_string());
-    let mut operation = SnapshotOperation::new(&NodeRouting::default(), Ulid::nil(), named);
-    operation.start();
-    operation
-}
-
-#[test]
-fn abort_and_finalize() {
-    // Every phase is a plain read: abort has nothing to clean up, an early finalize fails.
-    let mut operation = make_started();
-    assert!(operation.abort().is_empty());
-    rejects_finalize(operation);
-    let mut quota = QuotaOperation::new(capped(1));
-    quota.start();
-    assert!(quota.abort().is_empty());
-    rejects_finalize(quota);
     let mut usage = UsageOperation::new(BackendRef::node_default());
-    usage.start();
-    assert!(usage.abort().is_empty());
-    rejects_finalize(usage);
+    usage.first().unwrap();
+    assert_eq!(usage.next(IoResult::Done), Err(RecordReadError::Unexpected));
 }
