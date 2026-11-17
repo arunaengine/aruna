@@ -2,19 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect, abort_effects};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
     EVENT_JOURNAL_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::replication_queue::{BlobJobRecord, ReplicateScopeTarget};
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
-use aruna_core::types::{Effects, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::Value;
 
 use super::queue::BlobQueueError;
 
@@ -32,17 +31,14 @@ pub(crate) enum BlobJobOutcome {
 
 #[derive(Debug, PartialEq)]
 enum RetireState {
-    Init,
-    StartTransaction,
     ReadJob,
     ReadRelationship,
     ReadBucket(Box<SyncRelationship>),
     DeleteJob(Option<SourceEvent>),
     WriteEvent,
-    Commit,
-    Finish,
-    Error,
 }
+
+type Step = Result<Next<()>, BlobQueueError>;
 
 /// Retires a processed job in one transaction: its row goes only while it still holds this job,
 /// so an enqueue that wrote the row again during the run keeps its own run. The plugin event of
@@ -54,9 +50,7 @@ pub(crate) struct RetireJobOperation {
     kind: Option<SourceKind>,
     now_ms: u64,
     delete: bool,
-    txn_id: Option<TxnId>,
     state: RetireState,
-    error: Option<BlobQueueError>,
 }
 
 impl RetireJobOperation {
@@ -77,28 +71,16 @@ impl RetireJobOperation {
             kind,
             now_ms,
             delete: false,
-            txn_id: None,
-            state: RetireState::Init,
-            error: None,
+            state: RetireState::ReadJob,
         }
     }
 
-    fn read(&mut self, state: RetireState, key_space: &str, key: Vec<u8>) -> Effects {
+    fn read(&mut self, state: RetireState, key_space: &str, key: Vec<u8>) -> Step {
         self.state = state;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(read_row(key_space, key)))
     }
 
-    fn fail(&mut self, error: BlobQueueError) -> Effects {
-        self.state = RetireState::Error;
-        self.error = Some(error);
-        abort_effects(&mut self.txn_id)
-    }
-
-    fn job_read(&mut self, value: Option<Value>) -> Effects {
+    fn job_read(&mut self, value: Option<Value>) -> Step {
         let stored = value.and_then(|value| BlobJobRecord::from_bytes(&value).ok());
         self.delete = stored.is_some_and(|stored| stored.job_id == self.job.job_id);
         match (self.kind, self.job.relationship_id) {
@@ -114,14 +96,11 @@ impl RetireJobOperation {
         }
     }
 
-    fn relationship_read(&mut self, value: Option<Value>) -> Effects {
+    fn relationship_read(&mut self, value: Option<Value>) -> Step {
         let Some(value) = value else {
             return self.delete_job(None);
         };
-        let relationship = match SyncRelationship::from_bytes(&value) {
-            Ok(relationship) => relationship,
-            Err(error) => return self.fail(error.into()),
-        };
+        let relationship = SyncRelationship::from_bytes(&value)?;
         let bucket = self.job.input.bucket.as_bytes().to_vec();
         let state = RetireState::ReadBucket(Box::new(relationship));
         self.read(state, S3_BUCKET_KEYSPACE, bucket)
@@ -129,7 +108,7 @@ impl RetireJobOperation {
 
     /// A completed job reports while the relationship exists and is not detached, a failed one
     /// only while it is enabled (a stopped one reports through its status); none without bucket.
-    fn bucket_read(&mut self, relationship: SyncRelationship, value: Option<Value>) -> Effects {
+    fn bucket_read(&mut self, relationship: SyncRelationship, value: Option<Value>) -> Step {
         let (Some(kind), Some(value)) = (self.kind, value) else {
             return self.delete_job(None);
         };
@@ -140,10 +119,7 @@ impl RetireJobOperation {
         if !reports {
             return self.delete_job(None);
         }
-        let group_id = match BucketInfo::from_bytes(&value) {
-            Ok(info) => info.group_id,
-            Err(error) => return self.fail(error.into()),
-        };
+        let group_id = BucketInfo::from_bytes(&value)?.group_id;
         let bucket = &self.job.input.bucket;
         let object = match &self.job.input.target {
             ReplicateScopeTarget::Version { key, .. } | ReplicateScopeTarget::Object { key } => key,
@@ -163,120 +139,60 @@ impl RetireJobOperation {
         self.delete_job(Some(event))
     }
 
-    fn delete_job(&mut self, event: Option<SourceEvent>) -> Effects {
+    fn delete_job(&mut self, event: Option<SourceEvent>) -> Step {
         if !self.delete {
             return self.write_event(event);
         }
         self.state = RetireState::DeleteJob(event);
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: vec![(
-                REPLICATION_JOB_KEYSPACE.to_string(),
-                self.key.clone().into()
-            )],
-            txn_id: self.txn_id,
-        })]
+        let row = (
+            REPLICATION_JOB_KEYSPACE.to_string(),
+            self.key.clone().into(),
+        );
+        Ok(Next::Call(IoCall::Delete(vec![row])))
     }
 
-    fn write_event(&mut self, event: Option<SourceEvent>) -> Effects {
+    fn write_event(&mut self, event: Option<SourceEvent>) -> Step {
         let Some(event) = event else {
-            return self.commit();
+            return Ok(Next::Done(()));
         };
-        let writes = match journal_entries(&event) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error.into()),
-        };
+        let writes = journal_entries(&event)?;
         self.state = RetireState::WriteEvent;
         let writes = (writes.into_iter())
             .map(|(_, key, value)| (EVENT_JOURNAL_KEYSPACE.to_string(), key, value))
             .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(BlobQueueError::UnexpectedEvent("no transaction".into()));
-        };
-        self.state = RetireState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
-impl EffectOperation for RetireJobOperation {
+impl Operation for RetireJobOperation {
     type Output = ();
     type Error = BlobQueueError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RetireState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Step {
+        let key = self.key.clone();
+        self.read(RetireState::ReadJob, REPLICATION_JOB_KEYSPACE, key)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (
-            std::mem::replace(&mut self.state, RetireState::Error),
-            event,
-        ) {
-            (RetireState::Commit, Event::Storage(StorageEvent::Error { error })) => {
-                // The failed commit closed the transaction.
-                self.txn_id = None;
-                self.fail(error.into())
+    fn next(&mut self, result: IoResult) -> Step {
+        match std::mem::replace(&mut self.state, RetireState::WriteEvent) {
+            RetireState::ReadJob => self.job_read(result.value()?),
+            RetireState::ReadRelationship => self.relationship_read(result.value()?),
+            RetireState::ReadBucket(relationship) => {
+                self.bucket_read(*relationship, result.value()?)
             }
-            (
-                RetireState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                let key = self.key.clone();
-                self.read(RetireState::ReadJob, REPLICATION_JOB_KEYSPACE, key)
+            RetireState::DeleteJob(event) => {
+                result.done()?;
+                self.write_event(event)
             }
-            (RetireState::ReadJob, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.job_read(value)
+            RetireState::WriteEvent => {
+                result.done()?;
+                Ok(Next::Done(()))
             }
-            (
-                RetireState::ReadRelationship,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => self.relationship_read(value),
-            (
-                RetireState::ReadBucket(relationship),
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => self.bucket_read(*relationship, value),
-            (
-                RetireState::DeleteJob(event),
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => self.write_event(event),
-            (RetireState::WriteEvent, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.commit()
-            }
-            (RetireState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = RetireState::Finish;
-                smallvec![]
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error.into()),
-            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(event.label().to_string())),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RetireState::Finish | RetireState::Error)
-    }
-
-    fn finalize(self) -> Result<(), BlobQueueError> {
-        match (self.state, self.error) {
-            (RetireState::Finish, _) => Ok(()),
-            (_, Some(error)) => Err(error),
-            _ => Err(BlobQueueError::UnexpectedEvent(
-                "retire did not finish".into(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
