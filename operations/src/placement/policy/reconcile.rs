@@ -2,11 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::{
     NODE_SUBJECT_KEY, NodeSubjectRecord, storage_subject,
@@ -191,48 +192,33 @@ impl EffectOperation for SubjectSyncOperation {
 
 /// Reads the subject record this node advertises, if it ever advertised one.
 #[derive(Debug, Default, PartialEq)]
-pub struct LocalSubjectOperation {
-    started: bool,
-    output: Option<Result<Option<NodeSubjectRecord>, SubjectScanError>>,
-}
+pub struct LocalSubjectOperation;
 
 impl LocalSubjectOperation {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 }
 
-impl EffectOperation for LocalSubjectOperation {
+impl Operation for LocalSubjectOperation {
     type Output = Option<NodeSubjectRecord>;
     type Error = SubjectScanError;
 
-    fn start(&mut self) -> Effects {
-        self.started = true;
-        smallvec![local_read()]
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let row = (
+            NODE_SUBJECT_KEYSPACE.to_string(),
+            Key::from(NODE_SUBJECT_KEY.to_vec()),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let started = std::mem::replace(&mut self.started, false);
-        self.output = Some(match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) if started => {
-                local_record(value)
-            }
-            _ => Err(SubjectScanError::InvalidEvent("ReadLocalSubject")),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(SubjectScanError::InvalidEvent("ReadLocalSubject")))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let IoResult::Values(values) = result else {
+            return Err(SubjectScanError::InvalidEvent("ReadLocalSubject"));
+        };
+        Ok(Next::Done(local_record(
+            values.into_iter().next().flatten(),
+        )?))
     }
 }
 

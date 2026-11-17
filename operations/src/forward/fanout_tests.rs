@@ -4,7 +4,6 @@
 
 use super::*;
 use aruna_core::events::PeerRequestError;
-use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -43,22 +42,21 @@ fn done(peer: NodeId, result: Result<Vec<u8>, PeerRequestError>) -> GroupResult 
 fn asks_at_once() {
     // Every peer is one member of one group; the answers come back in peer order.
     let mut operation = fanout();
-    let group = Effect::Group(EffectGroup {
+    let group = IoCall::Group(EffectGroup {
         members: vec![request(node(1), "one"), request(node(2), "two")],
         limit: 4,
         form: GroupForm::All { deadline: None },
     });
+    assert_eq!(operation.first(), Ok(Next::Call(group)));
     let answer = encode_message(&message("fine")).unwrap();
     let results = vec![
         done(node(1), Ok(answer)),
         done(node(2), Err(PeerRequestError::TimedOut)),
     ];
-    check_trace(
-        &mut operation,
-        &[group],
-        vec![(Event::Group(GroupEvent::Finished { results }), vec![])],
-    );
-    let answers = operation.finalize().unwrap();
+    let finished = IoResult::Group(GroupEvent::Finished { results });
+    let Ok(Next::Done(answers)) = operation.next(finished) else {
+        panic!("expected the answers");
+    };
     assert_eq!(answers[0], (node(1), Ok(message("fine"))));
     assert_eq!(answers[1].0, node(2));
     assert!(answers[1].1.is_err());
@@ -68,52 +66,36 @@ fn asks_at_once() {
 fn late_members_fail() {
     // A member cut off, refused, missing or answered by another peer is an error for that peer.
     let mut operation = fanout();
-    operation.start();
+    operation.first().unwrap();
     let results = vec![GroupResult::Unfinished, done(node(9), Ok(Vec::new()))];
-    operation.step(Event::Group(GroupEvent::Finished { results }));
-    let answers = operation.finalize().unwrap();
+    let Ok(Next::Done(answers)) = operation.next(IoResult::Group(GroupEvent::Finished { results }))
+    else {
+        panic!("expected the answers");
+    };
     assert!(answers.iter().all(|(_, answer)| answer.is_err()));
 
     let mut operation = fanout();
-    operation.start();
-    operation.step(Event::Group(GroupEvent::Finished {
-        results: vec![GroupResult::Refused],
-    }));
-    assert!(
-        operation
-            .finalize()
-            .unwrap()
-            .iter()
-            .all(|(_, answer)| answer.is_err())
-    );
+    operation.first().unwrap();
+    let results = vec![GroupResult::Refused];
+    let Ok(Next::Done(answers)) = operation.next(IoResult::Group(GroupEvent::Finished { results }))
+    else {
+        panic!("expected the answers");
+    };
+    assert!(answers.iter().all(|(_, answer)| answer.is_err()));
 }
 
 #[test]
 fn no_peers_empty() {
-    // Without peers the fan-out ends at start without a group.
+    // Without peers the fan-out ends at once without a group.
     let mut operation = FanoutOperation::new(Vec::new(), 4, Duration::from_secs(1));
-    assert!(operation.start().is_empty());
-    assert_eq!(operation.finalize(), Ok(Vec::new()));
+    assert_eq!(operation.first(), Ok(Next::Done(Vec::new())));
 }
 
 #[test]
-fn rejects_unexpected_events() {
-    // Before start every event is refused, and a started fan-out accepts only its group answer.
-    for (label, effects, error) in rejects_events(fanout, sample_events, |_| false) {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert_eq!(error, FetchError::Unexpected, "{label}");
-    }
+fn rejects_other_answers() {
+    // Only the group's final answer completes the fan-out.
     let mut operation = fanout();
-    operation.start();
-    operation.step(Event::Group(GroupEvent::Closed));
-    assert_eq!(operation.finalize(), Err(FetchError::Unexpected));
-}
-
-#[test]
-fn abort_and_finalize() {
-    // The fan-out only reads: abort has nothing to clean up, and an early finalize fails.
-    let mut operation = fanout();
-    operation.start();
-    assert!(operation.abort().is_empty());
-    rejects_finalize(operation);
+    operation.first().unwrap();
+    let closed = IoResult::Group(GroupEvent::Closed);
+    assert_eq!(operation.next(closed), Err(FetchError::Unexpected));
 }

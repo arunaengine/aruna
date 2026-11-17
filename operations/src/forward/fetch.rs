@@ -6,11 +6,12 @@
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
 use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -61,6 +62,8 @@ pub enum FetchError {
     Unfinished,
     #[error("unexpected event while waiting for a holder answer")]
     Unexpected,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 /// One request sent to each holder in turn until one answers with the record or refuses.
@@ -221,8 +224,6 @@ pub struct FanoutOperation {
     requests: Vec<(NodeId, Result<Vec<u8>, String>)>,
     limit: usize,
     timeout: Duration,
-    started: bool,
-    output: Option<Result<Vec<PeerAnswer>, FetchError>>,
 }
 
 impl FanoutOperation {
@@ -238,8 +239,6 @@ impl FanoutOperation {
             requests,
             limit,
             timeout,
-            started: false,
-            output: None,
         }
     }
 
@@ -276,12 +275,11 @@ fn read_answer(
     }
 }
 
-impl EffectOperation for FanoutOperation {
+impl Operation for FanoutOperation {
     type Output = Vec<PeerAnswer>;
     type Error = FetchError;
 
-    fn start(&mut self) -> Effects {
-        self.started = true;
+    fn first(&mut self) -> Result<Next<Vec<PeerAnswer>>, FetchError> {
         let members: Vec<Effect> = (self.requests.iter())
             .filter_map(|(peer, frame)| {
                 let frame = frame.as_ref().ok()?.clone();
@@ -295,38 +293,22 @@ impl EffectOperation for FanoutOperation {
             })
             .collect();
         if members.is_empty() {
-            self.output = Some(Ok(self.answers(Vec::new())));
-            return smallvec![];
+            return Ok(Next::Done(self.answers(Vec::new())));
         }
-        smallvec![Effect::Group(EffectGroup {
+        Ok(Next::Call(IoCall::Group(EffectGroup {
             members,
             limit: self.limit,
             form: GroupForm::All { deadline: None },
-        })]
+        })))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(match event {
-            Event::Group(GroupEvent::Finished { results })
-                if self.started && self.output.is_none() =>
-            {
-                Ok(self.answers(results))
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<PeerAnswer>>, FetchError> {
+        match result {
+            IoResult::Group(GroupEvent::Finished { results }) => {
+                Ok(Next::Done(self.answers(results)))
             }
             _ => Err(FetchError::Unexpected),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Vec<PeerAnswer>, FetchError> {
-        self.output.unwrap_or(Err(FetchError::Unfinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        }
     }
 }
 

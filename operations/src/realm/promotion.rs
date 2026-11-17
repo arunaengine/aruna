@@ -4,19 +4,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::types::{Effects, Value};
+use aruna_core::types::Value;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
-use smallvec::smallvec;
 
-use crate::document_repository::read_effect;
+use crate::document_repository::read_row;
 use crate::metadata::protocol::{MetadataReadError, RealmKeyPem};
 use crate::realm::mutate_placement::{is_management, node_kind};
 
@@ -33,14 +31,6 @@ pub enum PromotionRequest {
 /// promotion is ready; or why the request is refused.
 pub type PromotionAnswer = Result<bool, MetadataReadError>;
 
-#[derive(Debug, PartialEq)]
-enum ServeState {
-    Init,
-    Config,
-    Key,
-    Done,
-}
-
 /// Answers one promotion request of a peer, refusals included in the answer.
 #[derive(Debug, PartialEq)]
 pub struct ServePromotionOperation {
@@ -48,8 +38,7 @@ pub struct ServePromotionOperation {
     local: NodeId,
     peer: NodeId,
     request: PromotionRequest,
-    state: ServeState,
-    output: Option<Result<PromotionAnswer, MetadataReadError>>,
+    config_read: bool,
 }
 
 impl ServePromotionOperation {
@@ -59,105 +48,72 @@ impl ServePromotionOperation {
             local,
             peer,
             request,
-            state: ServeState::Init,
-            output: None,
+            config_read: false,
         }
     }
 
-    fn answer(&mut self, answer: PromotionAnswer) -> Effects {
-        self.state = ServeState::Done;
-        self.output = Some(Ok(answer));
-        smallvec![]
-    }
-
-    fn config(&mut self, value: Option<Value>) -> Effects {
+    fn config(&mut self, value: Option<Value>) -> Next<PromotionAnswer> {
         let config = value.and_then(|value| RealmConfigDocument::from_bytes(&value).ok());
         let Some(config) = config else {
-            return self.answer(Err(MetadataReadError::Unavailable));
+            return Next::Done(Err(MetadataReadError::Unavailable));
         };
-        match self.key_effect(&config) {
-            Ok(effect) => {
-                self.state = ServeState::Key;
-                smallvec![Effect::Storage(effect)]
+        match self.key_call(&config) {
+            Ok(call) => {
+                self.config_read = true;
+                Next::Call(call)
             }
-            Err(answer) => self.answer(answer),
+            Err(answer) => Next::Done(answer),
         }
     }
 
     /// The key row write or read the request needs, or the answer it gets without one.
-    fn key_effect(&self, config: &RealmConfigDocument) -> Result<StorageEffect, PromotionAnswer> {
+    fn key_call(&self, config: &RealmConfigDocument) -> Result<IoCall, PromotionAnswer> {
         let key = ByteView::from(PROMOTED_KEY_ROW);
         let key_space = NODE_STATE_KEYSPACE.to_string();
         match &self.request {
             PromotionRequest::HandKey(handed) => {
                 check_handoff(config, self.peer, self.local, self.realm_id, handed).map_err(Err)?;
-                Ok(StorageEffect::Write {
-                    key_space,
-                    key,
-                    value: ByteView::from(handed.0.as_bytes()),
-                    txn_id: None,
-                })
+                let value = ByteView::from(handed.0.as_bytes());
+                Ok(IoCall::Write(vec![(key_space, key, value)]))
             }
             PromotionRequest::Check if !is_management(config, self.peer) => {
                 Err(Err(MetadataReadError::Forbidden))
             }
             PromotionRequest::Check if !is_management(config, self.local) => Err(Ok(false)),
-            PromotionRequest::Check => Ok(StorageEffect::Read {
-                key_space,
-                key,
-                txn_id: None,
-            }),
+            PromotionRequest::Check => Ok(IoCall::Read(vec![(key_space, key)])),
         }
     }
 }
 
-impl EffectOperation for ServePromotionOperation {
+impl Operation for ServePromotionOperation {
     type Output = PromotionAnswer;
     type Error = MetadataReadError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ServeState::Config;
+    fn first(&mut self) -> Result<Next<PromotionAnswer>, MetadataReadError> {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
-        smallvec![read_effect(&config, None)]
+        Ok(Next::Call(IoCall::Read(vec![read_row(&config)])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let state = std::mem::replace(&mut self.state, ServeState::Done);
+    fn next(&mut self, result: IoResult) -> Result<Next<PromotionAnswer>, MetadataReadError> {
         let hand = matches!(self.request, PromotionRequest::HandKey(_));
-        match (state, hand, event) {
-            (ServeState::Config, _, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.config(value)
+        match (self.config_read, hand, result) {
+            (false, _, IoResult::Values(values)) => {
+                Ok(self.config(values.into_iter().next().flatten()))
             }
-            (ServeState::Key, true, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.answer(Ok(true))
+            (true, true, IoResult::Done) => Ok(Next::Done(Ok(true))),
+            (true, false, IoResult::Values(values)) => {
+                let held = values.into_iter().next().flatten().is_some();
+                Ok(Next::Done(Ok(held)))
             }
-            (ServeState::Key, false, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.answer(Ok(value.is_some()))
-            }
-            (
-                ServeState::Config | ServeState::Key,
-                _,
-                Event::Storage(StorageEvent::Error { .. }),
-            ) => self.answer(Err(MetadataReadError::Unavailable)),
-            _ => {
-                self.output = Some(Err(MetadataReadError::Unavailable));
-                smallvec![]
-            }
+            _ => Err(MetadataReadError::Unavailable),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<PromotionAnswer, MetadataReadError> {
-        self.output.unwrap_or(Err(MetadataReadError::Unavailable))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    /// A runner failure is answered as unavailable, never retried as a conflict.
+    fn is_conflict(_error: &MetadataReadError) -> bool {
+        false
     }
 }
 
