@@ -13,7 +13,7 @@ use super::{
     ARUNA_DATA_PREFIX, ApiQueryMode, Arc, AuthContext, AuthToken, BLOB_HEAD_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BTreeMap, BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, DISTRIBUTED_QUERY_DEADLINE, DriverContext, Event, GetBucketError,
-    GetBucketOperation, GetNodesOperation, HashMap, HashSet, IterStart, Key, MAX_PAGINATION_DEPTH,
+    GetBucketOperation, GetNodesOperation, HashMap, HashSet, Key, MAX_PAGINATION_DEPTH,
     MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats,
     MetadataNodeCall, MetadataReferenceEntry, MetadataReferencesRequest, MetadataRegistryRecord,
     MetadataSearchHit, NodeId, NodeSearchResult, Permission, REALM_DISCOVERY_TIMEOUT,
@@ -25,6 +25,7 @@ use super::{
     resume_fetch_limit, run_metadata_fanout, select_fanout_nodes, warn,
 };
 
+use super::prefix_scan::{PrefixScanError, PrefixScanOperation};
 use super::read::{ensure_permission, load_live_record};
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::search_cursor::tie_order;
@@ -226,11 +227,13 @@ pub(super) async fn resolve_preflight_versions(
         None => BlobHeadKey::bucket_prefix(bucket),
     }
     .map_err(|_| MetadataApiError::BadRequest)?;
-    let (heads, more) = scan_preflight_rows(
+    let (heads, more) = drive(
+        PrefixScanOperation::new(
+            BLOB_HEAD_KEYSPACE,
+            (prefix_key.into(), None),
+            MAX_TARGET_VERSIONS,
+        ),
         context,
-        BLOB_HEAD_KEYSPACE,
-        (prefix_key.into(), None),
-        MAX_TARGET_VERSIONS,
     )
     .await?;
     let mut versions = Vec::with_capacity(heads.len());
@@ -284,8 +287,11 @@ pub(super) async fn resolve_all_preflight(
     for range in ranges {
         let remaining = MAX_TARGET_VERSIONS - versions.len();
         let range = (range.into(), None);
-        let (rows, more) =
-            scan_preflight_rows(context, BLOB_VERSIONS_KEYSPACE, range, remaining).await?;
+        let (rows, more) = drive(
+            PrefixScanOperation::new(BLOB_VERSIONS_KEYSPACE, range, remaining),
+            context,
+        )
+        .await?;
         for (key, value) in rows {
             versions.push(decode_version(&key, &value)?);
         }
@@ -303,8 +309,11 @@ pub(super) async fn resolve_all_preflight(
         range.push(lead);
         let from = [range.as_slice(), &[8]].concat();
         let range = (range.into(), Some(from.into()));
-        let (rows, more) =
-            scan_preflight_rows(context, BLOB_VERSIONS_KEYSPACE, range, budget).await?;
+        let (rows, more) = drive(
+            PrefixScanOperation::new(BLOB_VERSIONS_KEYSPACE, range, budget),
+            context,
+        )
+        .await?;
         budget -= rows.len();
         for (key, value) in rows {
             let found = decode_version(&key, &value)?;
@@ -323,6 +332,12 @@ pub(super) async fn resolve_all_preflight(
     Ok((versions, true))
 }
 
+impl From<PrefixScanError> for MetadataApiError {
+    fn from(_: PrefixScanError) -> Self {
+        Self::ServiceUnavailable
+    }
+}
+
 fn decode_version(key: &Key, value: &Value) -> Result<(VersionKey, BlobVersion), MetadataApiError> {
     let version_key = VersionKey::from_bytes(key.as_ref())
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
@@ -332,49 +347,6 @@ fn decode_version(key: &Key, value: &Value) -> Result<(VersionKey, BlobVersion),
 }
 
 /// Reads at most `limit` rows under the prefix from `from` on; true reports that more rows exist.
-pub(super) async fn scan_preflight_rows(
-    context: &DriverContext,
-    key_space: &str,
-    (prefix, from): (Key, Option<Key>),
-    limit: usize,
-) -> Result<(Vec<(Key, Value)>, bool), MetadataApiError> {
-    let mut start = from.map(IterStart::At);
-    let mut rows = Vec::new();
-    loop {
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: key_space.to_string(),
-                prefix: Some(prefix.clone()),
-                start: start.take(),
-                limit: PREFLIGHT_PAGE_SIZE.min(limit + 1 - rows.len()),
-                txn_id: None,
-            })
-            .await;
-        match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                rows.extend(values);
-                if rows.len() > limit {
-                    rows.truncate(limit);
-                    return Ok((rows, true));
-                }
-                match next_start_after {
-                    Some(next) => start = Some(IterStart::After(next)),
-                    None => break,
-                }
-            }
-            Event::Storage(StorageEvent::Error { .. }) => {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-            _ => return Err(MetadataApiError::ServiceUnavailable),
-        }
-    }
-    Ok((rows, false))
-}
-
 pub(super) async fn read_preflight_row(
     context: &DriverContext,
     key_space: &str,
@@ -747,8 +719,6 @@ const PREFLIGHT_BUDGET: LinkBudget = LinkBudget {
     seeks: 16_384,
     rows: 262_144,
 };
-
-const PREFLIGHT_PAGE_SIZE: usize = 128;
 
 /// Version rows of keys of `MAX_KEY_LEN` bytes and more one purge preflight reads at most.
 const LONG_KEY_ROWS: usize = 1024;

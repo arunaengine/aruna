@@ -126,6 +126,7 @@ pub mod path;
 pub mod path_types;
 pub mod preflight;
 pub mod preflight_types;
+mod prefix_scan;
 pub mod read;
 pub mod read_types;
 pub mod search;
