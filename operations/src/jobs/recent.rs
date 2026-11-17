@@ -84,7 +84,9 @@ impl Operation for RecentJobsOperation {
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return self.finish(Err(error.into())),
             other => {
-                return self.finish(Err(RecentJobsError::UnexpectedEvent(other.label().to_string())));
+                return self.finish(Err(RecentJobsError::UnexpectedEvent(
+                    other.label().to_string(),
+                )));
             }
         };
         for (_, value) in values {

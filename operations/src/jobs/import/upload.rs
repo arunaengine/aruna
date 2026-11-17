@@ -621,7 +621,8 @@ async fn claim_in_txn(
         }
         other => {
             return Err(UploadClaimError::Storage(format!(
-                "unexpected upload claim read event: {}", other.label()
+                "unexpected upload claim read event: {}",
+                other.label()
             )));
         }
     };
@@ -647,7 +648,8 @@ async fn claim_in_txn(
             Err(UploadClaimError::Storage(error.to_string()))
         }
         other => Err(UploadClaimError::Storage(format!(
-            "unexpected upload claim write event: {}", other.label()
+            "unexpected upload claim write event: {}",
+            other.label()
         ))),
     }
 }
@@ -659,7 +661,10 @@ async fn start_txn(storage: &StorageHandle) -> Result<TxnId, String> {
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload transaction event: {}", other.label())),
+        other => Err(format!(
+            "unexpected upload transaction event: {}",
+            other.label()
+        )),
     }
 }
 

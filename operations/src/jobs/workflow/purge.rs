@@ -290,7 +290,8 @@ async fn write_purge_audit(
         .to_bytes()
         .map_err(|error| JobError::retryable(format!("purge audit encode failed: {error}")))?;
     let storage = &ctx.driver.storage_handle;
-    let failed = |event: Event| JobError::retryable(format!("purge audit write failed: {}", event.label()));
+    let failed =
+        |event: Event| JobError::retryable(format!("purge audit write failed: {}", event.label()));
     let started = StorageEffect::StartTransaction { read: false };
     let txn_id = match storage.send_storage_effect(started).await {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,

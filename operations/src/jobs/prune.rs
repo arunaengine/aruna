@@ -177,7 +177,8 @@ async fn delete_job_artifact(context: &DriverContext, record: &JobRecord) -> Res
         Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
         event => Err(format!(
-            "unexpected hidden artifact delete event: {}", event.label()
+            "unexpected hidden artifact delete event: {}",
+            event.label()
         )),
     }
 }

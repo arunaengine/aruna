@@ -64,7 +64,8 @@ impl Operation for AliasFamilyOperation {
                 Err(JobRouteError::Unavailable(error.to_string()))
             }
             other => Err(JobRouteError::Unavailable(format!(
-                "unexpected storage event: {}", other.label()
+                "unexpected storage event: {}",
+                other.label()
             ))),
         };
         self.finish(outcome)
