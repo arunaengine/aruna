@@ -9,6 +9,7 @@ use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::compute::quota::ComputeDepartureReport;
 use crate::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE};
 use crate::operation::Operation;
+use crate::rows::{done, values};
 use crate::structs::storage::node_info::{NodeInfoDocument, node_info_key};
 use crate::types::{Key, KeySpace, Value};
 use thiserror::Error;
@@ -312,6 +313,58 @@ impl Operation for DrainStateOperation {
     }
 }
 
+/// Sets or clears the operator drain flag. True when the flag changed; a matching flag writes
+/// nothing.
+#[derive(Debug, PartialEq)]
+pub struct SetDrainOperation {
+    draining: bool,
+    writing: bool,
+}
+
+impl SetDrainOperation {
+    pub fn new(draining: bool) -> Self {
+        Self {
+            draining,
+            writing: false,
+        }
+    }
+}
+
+fn drain_row() -> (KeySpace, Key) {
+    (
+        COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+        Key::from(OPERATOR_DRAIN_KEY.to_vec()),
+    )
+}
+
+impl Operation for SetDrainOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        Ok(Next::Call(IoCall::Read(vec![drain_row()])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        if self.writing {
+            return done(result).map(|()| Next::Done(true));
+        }
+        let [flag] = values::<1>(result)?;
+        if flag.is_some() == self.draining {
+            return Ok(Next::Done(false));
+        }
+        self.writing = true;
+        let call = match self.draining {
+            true => {
+                let (space, key) = drain_row();
+                IoCall::Write(vec![(space, key, Value::from(vec![1u8]))])
+            }
+            false => IoCall::Delete(vec![drain_row()]),
+        };
+        Ok(Next::Call(call))
+    }
+}
+
 #[cfg(test)]
 mod drain_tests {
     use ulid::Ulid;
@@ -358,5 +411,24 @@ mod drain_tests {
         let mut wrong = DrainStateOperation::new();
         let answer = wrong.next(IoResult::Done);
         assert!(matches!(answer, Err(DrainStateError::Io(_))));
+    }
+
+    #[test]
+    fn sets_flag_once() {
+        // A changed flag is written or deleted; a matching one ends without a write.
+        let flag = || IoResult::Values(vec![Some(Value::from(vec![1]))]);
+        let unset = || IoResult::Values(vec![None]);
+        let mut drain = SetDrainOperation::new(true);
+        assert_eq!(drain.first(), Ok(Next::Call(IoCall::Read(vec![drain_row()]))));
+        let (space, key) = drain_row();
+        let write = IoCall::Write(vec![(space, key, Value::from(vec![1]))]);
+        assert_eq!(drain.next(unset()), Ok(Next::Call(write)));
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(true)));
+        let mut release = SetDrainOperation::new(false);
+        let delete = IoCall::Delete(vec![drain_row()]);
+        assert_eq!(release.next(flag()), Ok(Next::Call(delete)));
+        assert_eq!(release.next(IoResult::Done), Ok(Next::Done(true)));
+        assert_eq!(SetDrainOperation::new(true).next(flag()), Ok(Next::Done(false)));
+        assert_eq!(SetDrainOperation::new(false).next(unset()), Ok(Next::Done(false)));
     }
 }

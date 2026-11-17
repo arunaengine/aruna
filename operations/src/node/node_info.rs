@@ -45,8 +45,8 @@ use crate::placement::policy::{
 };
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::usage::LoadCountersOperation;
-use aruna_core::node_state::{DrainStateOperation, ReadInfoOperation};
-use aruna_core::node_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
+use aruna_core::node_state::{DrainStateOperation, ReadInfoOperation, SetDrainOperation};
+use aruna_core::node_state::DEPARTURE_KEY;
 use aruna_core::placement::{build_view, held_buckets};
 use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
 
@@ -388,10 +388,12 @@ pub async fn set_operator_drain(
     realm_id: RealmId,
     draining: bool,
 ) -> Result<bool, String> {
-    if operator_drain(ctx).await? == draining {
+    let changed = drive(SetDrainOperation::new(draining), ctx)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !changed {
         return Ok(false);
     }
-    write_operator_drain(ctx, draining).await?;
     let Some(document) = node_info_row(ctx, node_id).await? else {
         warn!(
             operator_draining = draining,
@@ -428,29 +430,6 @@ async fn operator_drain(ctx: &DriverContext) -> Result<bool, String> {
         .await
         .map(|state| state.operator_draining)
         .map_err(|error| error.to_string())
-}
-
-async fn write_operator_drain(ctx: &DriverContext, draining: bool) -> Result<(), String> {
-    let key = Key::from(OPERATOR_DRAIN_KEY.to_vec());
-    let effect = match draining {
-        true => StorageEffect::Write {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key,
-            value: Value::from(vec![1u8]),
-            txn_id: None,
-        },
-        false => StorageEffect::Delete {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        },
-    };
-    match ctx.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. })
-        | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("operator drain write failed: {}", other.label())),
-    }
 }
 
 /// Records the executions this node still holds capacity for. Their
@@ -1818,7 +1797,7 @@ mod tests {
         .await
         .unwrap();
 
-        write_operator_drain(&ctx, true).await.unwrap();
+        drive(SetDrainOperation::new(true), &ctx).await.unwrap();
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
@@ -1828,7 +1807,7 @@ mod tests {
             .unwrap();
         assert!(drained.compute_draining && !drained.leaving);
 
-        write_operator_drain(&ctx, false).await.unwrap();
+        drive(SetDrainOperation::new(false), &ctx).await.unwrap();
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
