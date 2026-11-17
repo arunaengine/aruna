@@ -224,5 +224,6 @@ pub(super) fn storage_event_kind(event: &StorageEvent) -> &'static str {
         StorageEvent::IterResult { .. } => "iter_result",
         StorageEvent::VaultResult { .. } => "vault_result",
         StorageEvent::Error { .. } => "error",
+        StorageEvent::RealmOpened { .. } => "realm_opened",
     }
 }
