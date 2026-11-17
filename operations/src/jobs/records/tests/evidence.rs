@@ -6,7 +6,7 @@ use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::structs::execution::job::{
     JobFamilyRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState,
@@ -386,7 +386,7 @@ fn derives_exact_predecessors() {
 #[test]
 fn refuses_partial_scan() {
     // A failed evidence page must not admit the candidate from the rows that
-    // did load: the append fails and writes nothing.
+    // did load: the run fails, aborts its transaction and writes nothing.
     let family = Family::new([27u8; 32]);
     let spec = family.spec();
     let launch = family.launch(&spec, family.holder.public(), 0);
@@ -400,7 +400,8 @@ fn refuses_partial_scan() {
         local: None,
         origin: RecordOrigin::Local,
         now_ms: 3_000,
-    });
+    })
+    .into_machine();
     let config = family
         .config
         .to_bytes(&actor(family.holder.public()))
@@ -437,6 +438,10 @@ fn refuses_partial_scan() {
         error: StorageError::ReadError("boom".to_string()),
     })));
     assert!(operation.is_complete());
+    assert!(matches!(
+        effects.last(),
+        Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
+    ));
     assert!(
         !effects
             .iter()

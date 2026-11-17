@@ -2,15 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::errors::ConversionError;
 use aruna_core::jobs::RunningJobView;
 use aruna_core::keyspaces::JOB_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::execution::job::JobRecord;
-use aruna_core::types::{Effects, GroupId, Key};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -19,80 +18,40 @@ const PAGE: usize = 256;
 #[derive(Debug, Error, PartialEq)]
 pub enum RecentJobsError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("recent job count did not finish")]
-    NotFinished,
-    #[error("unexpected event: expected a job page, got {0}")]
-    UnexpectedEvent(String),
 }
 
 /// Pages through the job records; callers authorize before they show the counts.
 #[derive(Debug, PartialEq)]
 pub struct RecentJobsOperation {
     since_ms: u64,
+    pages: PrefixPages,
     counts: HashMap<GroupId, u64>,
-    done: bool,
-    output: Option<Result<HashMap<GroupId, u64>, RecentJobsError>>,
 }
 
 impl RecentJobsOperation {
     pub fn new(since_ms: u64) -> Self {
         Self {
             since_ms,
+            pages: PrefixPages::new(JOB_KEYSPACE, Vec::<u8>::new(), PAGE),
             counts: HashMap::new(),
-            done: false,
-            output: None,
         }
-    }
-
-    fn page(start: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(IterStart::After),
-            limit: PAGE,
-            txn_id: None,
-        })]
-    }
-
-    fn finish(&mut self, result: Result<HashMap<GroupId, u64>, RecentJobsError>) -> Effects {
-        self.done = true;
-        self.output = Some(result);
-        smallvec![]
     }
 }
 
-impl EffectOperation for RecentJobsOperation {
+impl Operation for RecentJobsOperation {
     type Output = HashMap<GroupId, u64>;
     type Error = RecentJobsError;
 
-    fn start(&mut self) -> Effects {
-        Self::page(None)
+    fn first(&mut self) -> Result<Next<Self::Output>, RecentJobsError> {
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.done {
-            return smallvec![];
-        }
-        let (values, next) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return self.finish(Err(error.into())),
-            other => {
-                return self.finish(Err(RecentJobsError::UnexpectedEvent(
-                    other.label().to_string(),
-                )));
-            }
-        };
-        for (_, value) in values {
-            let record = match JobRecord::from_bytes(&value) {
-                Ok(record) => record,
-                Err(error) => return self.finish(Err(error.into())),
-            };
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RecentJobsError> {
+        for (_, value) in self.pages.take(result)? {
+            let record = JobRecord::from_bytes(&value)?;
             let recent = record
                 .finished_at_ms
                 .is_some_and(|finished| finished >= self.since_ms);
@@ -101,24 +60,51 @@ impl EffectOperation for RecentJobsOperation {
                 *self.counts.entry(group).or_default() += 1;
             }
         }
-        match next {
-            Some(start) => Self::page(Some(start)),
-            None => {
-                let counts = std::mem::take(&mut self.counts);
-                self.finish(Ok(counts))
-            }
-        }
+        Ok(match self.pages.done() {
+            true => Next::Done(std::mem::take(&mut self.counts)),
+            false => Next::Call(self.pages.call()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::IoCall;
+    use aruna_core::types::{Key, Value};
+
+    fn page(after: Option<Key>) -> Next<HashMap<GroupId, u64>> {
+        Next::Call(IoCall::Page {
+            space: JOB_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
+            limit: PAGE,
+        })
     }
 
-    fn is_complete(&self) -> bool {
-        self.done
+    #[test]
+    fn reads_every_page() {
+        let mut operation = RecentJobsOperation::new(5);
+        assert_eq!(operation.first(), Ok(page(None)));
+        let next = Some(Key::from(vec![1]));
+        let first = IoResult::Page {
+            rows: Vec::new(),
+            next: next.clone(),
+        };
+        assert_eq!(operation.next(first), Ok(page(next)));
+        let last = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(operation.next(last), Ok(Next::Done(HashMap::new())));
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(RecentJobsError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    #[test]
+    fn rejects_corrupt_row() {
+        let mut operation = RecentJobsOperation::new(5);
+        operation.first().expect("first page");
+        let rows = vec![(Key::from(vec![1]), Value::from(&[0xff][..]))];
+        let result = operation.next(IoResult::Page { rows, next: None });
+        assert!(matches!(result, Err(RecentJobsError::Conversion(_))));
     }
 }

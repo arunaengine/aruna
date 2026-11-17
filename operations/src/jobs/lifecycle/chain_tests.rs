@@ -1,15 +1,13 @@
-//! State and event tests of the execution chain read.
+//! Call and result tests of the execution chain read.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::quota::JobReservationRecord;
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::operation_check::{check_abort, rejects_events, rejects_finalize, sample_events};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     EffectiveResources, ExecutionReceipt, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
-    PhysicalExecutionState,
+    JobRecordKind, PhysicalExecutionState,
 };
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
@@ -20,7 +18,6 @@ use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::tests::records::Family;
-use aruna_core::structs::execution::job::JobRecordKind;
 use aruna_core::structs::execution::job::record_keys::{alias_key, record_key};
 use aruna_core::structs::execution::job::record_rows::to_bytes;
 
@@ -63,14 +60,11 @@ fn reservation(receipt: &ExecutionReceipt) -> JobReservationRecord {
     }
 }
 
-fn page(values: Vec<(Key, Value)>) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values,
-        next_start_after: None,
-    })
+fn page(rows: Vec<(Key, Value)>) -> IoResult {
+    IoResult::Page { rows, next: None }
 }
 
-fn held(rows: &[JobReservationRecord]) -> Event {
+fn held(rows: &[JobReservationRecord]) -> IoResult {
     page(
         rows.iter()
             .map(|row| {
@@ -81,7 +75,7 @@ fn held(rows: &[JobReservationRecord]) -> Event {
     )
 }
 
-fn alias() -> Event {
+fn alias() -> IoResult {
     let family = fixture().family();
     page(vec![(
         alias_key(fixture().job_id, &family),
@@ -89,7 +83,7 @@ fn alias() -> Event {
     )])
 }
 
-fn receipts(records: &[JobRecordEnvelope]) -> Event {
+fn receipts(records: &[JobRecordEnvelope]) -> IoResult {
     page(
         records
             .iter()
@@ -102,10 +96,12 @@ fn receipts(records: &[JobRecordEnvelope]) -> Event {
     )
 }
 
-fn failed() -> Event {
-    Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    })
+/// The call a child read makes first.
+fn call_of<T>(next: Result<Next<T>, impl std::fmt::Debug>) -> IoCall {
+    match next.expect("child starts") {
+        Next::Call(call) => call,
+        _ => panic!("child makes a call first"),
+    }
 }
 
 fn expected(receipt: &ExecutionReceipt) -> ExecutionChain {
@@ -119,22 +115,30 @@ fn expected(receipt: &ExecutionReceipt) -> ExecutionChain {
     }
 }
 
+fn chain_call(next: Result<Next<Option<ExecutionChain>>, LifecycleError>) -> IoCall {
+    call_of(next)
+}
+
 #[test]
 fn resolves_job_chain() {
     let (records, receipt) = run();
     let mut chain = ExecutionChainOperation::of_job(physical());
-    assert_eq!(chain.start(), HeldReservations::of_job(physical()).start());
     assert_eq!(
-        chain.step(held(&[reservation(&receipt)])),
-        AliasFamilyOperation::new(fixture().job_id).start()
+        chain_call(chain.first()),
+        call_of(HeldReservations::of_job(physical()).first())
     );
     assert_eq!(
-        chain.step(alias()),
-        LoadFamilyOperation::kind(fixture().family(), JobRecordKind::Receipt).start()
+        chain_call(chain.next(held(&[reservation(&receipt)]))),
+        call_of(AliasFamilyOperation::new(fixture().job_id).first())
     );
-    assert!(chain.step(receipts(&records)).is_empty());
-    assert!(chain.is_complete());
-    assert_eq!(chain.finalize(), Ok(Some(expected(&receipt))));
+    assert_eq!(
+        chain_call(chain.next(alias())),
+        call_of(LoadFamilyOperation::kind(fixture().family(), JobRecordKind::Receipt).first())
+    );
+    assert_eq!(
+        chain.next(receipts(&records)),
+        Ok(Next::Done(Some(expected(&receipt))))
+    );
 }
 
 #[test]
@@ -142,117 +146,67 @@ fn resolves_execution_chain() {
     let (records, receipt) = run();
     let mut chain = ExecutionChainOperation::of_execution(fixture().job_id, receipt.execution_id);
     assert_eq!(
-        chain.start(),
-        AliasFamilyOperation::new(fixture().job_id).start()
+        chain_call(chain.first()),
+        call_of(AliasFamilyOperation::new(fixture().job_id).first())
     );
-    chain.step(alias());
-    chain.step(receipts(&records));
-    assert_eq!(chain.finalize(), Ok(Some(expected(&receipt))));
+    chain.next(alias()).expect("receipt read");
+    assert_eq!(
+        chain.next(receipts(&records)),
+        Ok(Next::Done(Some(expected(&receipt))))
+    );
 }
 
 #[test]
 fn skips_local_jobs() {
     // No reservation is a purely local job: no chain, no error.
     let mut chain = ExecutionChainOperation::of_job(physical());
-    chain.start();
-    assert!(chain.step(held(&[])).is_empty());
-    assert_eq!(chain.finalize(), Ok(None));
+    chain.first().expect("reservation read");
+    assert_eq!(chain.next(held(&[])), Ok(Next::Done(None)));
 }
 
 #[test]
 fn skips_other_attempts() {
     let (_, receipt) = run();
     let mut chain = ExecutionChainOperation::of_attempt(physical(), Ulid::from_bytes([9; 16]));
-    chain.start();
-    assert!(chain.step(held(&[reservation(&receipt)])).is_empty());
-    assert_eq!(chain.finalize(), Ok(None));
+    chain.first().expect("reservation read");
+    assert_eq!(
+        chain.next(held(&[reservation(&receipt)])),
+        Ok(Next::Done(None))
+    );
 }
 
 #[test]
 fn failures_give_none() {
     let (records, receipt) = run();
-    // A failed reservation, alias or receipt read leaves the chain unresolved.
+    // A corrupt reservation, no alias row, or a family without this execution's
+    // receipt leaves the chain unresolved.
     let mut chain = ExecutionChainOperation::of_job(physical());
-    chain.start();
-    chain.step(failed());
-    assert_eq!(chain.finalize(), Ok(None));
+    chain.first().expect("reservation read");
+    let corrupt = page(vec![(Key::from(&[1u8][..]), Value::from(&[0xffu8][..]))]);
+    assert_eq!(chain.next(corrupt), Ok(Next::Done(None)));
 
     let mut chain = ExecutionChainOperation::of_job(physical());
-    chain.start();
-    chain.step(held(&[reservation(&receipt)]));
-    chain.step(failed());
-    assert_eq!(chain.finalize(), Ok(None));
+    chain.first().expect("reservation read");
+    chain
+        .next(held(&[reservation(&receipt)]))
+        .expect("alias read");
+    assert_eq!(chain.next(page(Vec::new())), Ok(Next::Done(None)));
 
-    let mut chain = ExecutionChainOperation::of_job(physical());
-    chain.start();
-    chain.step(held(&[reservation(&receipt)]));
-    chain.step(page(Vec::new()));
-    assert_eq!(chain.finalize(), Ok(None));
-
-    let mut chain = ExecutionChainOperation::of_job(physical());
-    chain.start();
-    chain.step(held(&[reservation(&receipt)]));
-    chain.step(alias());
-    chain.step(failed());
-    assert_eq!(chain.finalize(), Ok(None));
-
-    // A family without this execution's receipt has no chain either.
     let mut chain =
         ExecutionChainOperation::of_execution(fixture().job_id, Ulid::from_bytes([3; 16]));
-    chain.start();
-    chain.step(alias());
-    chain.step(receipts(&records));
-    assert_eq!(chain.finalize(), Ok(None));
+    chain.first().expect("alias read");
+    chain.next(alias()).expect("receipt read");
+    assert_eq!(chain.next(receipts(&records)), Ok(Next::Done(None)));
 }
 
 #[test]
-fn rejects_unfit_events() {
-    let fits = |event: &Event| {
-        matches!(
-            event,
-            Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-        )
-    };
-    let started = || {
-        let mut chain = ExecutionChainOperation::of_job(physical());
-        chain.start();
-        chain
-    };
-    let refusals = rejects_events(started, sample_events, fits);
-    assert!(!refusals.is_empty());
-    for (label, effects, error) in refusals {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert!(
-            matches!(error, LifecycleError::UnexpectedEvent { .. }),
-            "{label} gave {error:?}"
-        );
-    }
-    let unstarted = || ExecutionChainOperation::of_job(physical());
-    assert_eq!(
-        rejects_events(unstarted, sample_events, |_| false).len(),
-        sample_events().len()
-    );
-    let mut done = started();
-    done.step(held(&[]));
-    done.step(held(&[]));
+fn rejects_unfit_result() {
+    let mut chain = ExecutionChainOperation::of_job(physical());
+    chain.first().expect("reservation read");
+    assert!(matches!(chain.next(IoResult::Done), Ok(Next::Done(None))));
+    // After the chain ended, any further result is refused.
     assert!(matches!(
-        done.finalize(),
+        chain.next(IoResult::Done),
         Err(LifecycleError::UnexpectedEvent { .. })
     ));
-}
-
-#[test]
-fn aborts_without_cleanup() {
-    check_abort(&mut ExecutionChainOperation::of_job(physical()), &[]);
-    let mut chain = ExecutionChainOperation::of_job(physical());
-    chain.start();
-    check_abort(&mut chain, &[]);
-}
-
-#[test]
-fn rejects_early_finalize() {
-    rejects_finalize(ExecutionChainOperation::of_job(physical()));
-    let mut chain = ExecutionChainOperation::of_job(physical());
-    chain.start();
-    rejects_finalize(chain);
 }

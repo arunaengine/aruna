@@ -2,16 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
-
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, JOB_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobPayload, JobRecord, JobRecordEnvelope, JobState, LogicalJobState, PhysicalExecutionState,
 };
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 
 use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
@@ -31,7 +30,6 @@ struct Run {
     writes: JobWrites,
     /// True when the run read local job rows to bridge the projection into.
     bridged: bool,
-    aborted: bool,
 }
 
 impl Run {
@@ -54,77 +52,60 @@ impl Run {
     }
 }
 
-/// Drives one projection against injected events: `rows` are the stored family
-/// records, `cache` the stored cache row, and `local` the job row every alias
-/// read answers with.
+/// Answers one projection's calls: `rows` are the stored family records, `cache` the stored
+/// cache row, and `local` the job row every alias read answers with.
 fn run(family: &Family, rows: &[(Key, Value)], cache: Option<Value>, local: Option<Value>) -> Run {
     let mut operation = ProjectFamilyOperation::new(ProjectFamilyConfig {
         family: FamilyRef::Family(family.family()),
         now_ms: 3_100,
         rebuild: false,
     });
-    let mut pending: VecDeque<Effect> = operation.start().into_iter().collect();
     let mut writes: JobWrites = Vec::new();
     let mut bridged = false;
-    let mut aborted = false;
     let mut offset = 0usize;
-    while let Some(effect) = pending.pop_front() {
-        let event = match effect {
-            Effect::Storage(StorageEffect::Read { key, .. }) => {
-                Event::Storage(StorageEvent::ReadResult {
-                    key,
-                    value: cache.clone(),
-                })
-            }
-            Effect::Storage(StorageEffect::StartTransaction { .. }) => {
-                Event::Storage(StorageEvent::TransactionStarted {
-                    txn_id: TxnId::from_bytes([1u8; 16]),
-                })
-            }
-            Effect::Storage(StorageEffect::Iter { limit, .. }) => {
-                let values: Vec<(Key, Value)> =
-                    rows.iter().skip(offset).take(limit).cloned().collect();
-                offset += values.len();
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after: None,
-                })
-            }
-            Effect::Storage(StorageEffect::BatchRead { reads, .. }) => {
-                bridged = true;
-                Event::Storage(StorageEvent::BatchReadResult {
-                    values: reads
-                        .into_iter()
-                        .map(|(_, key)| (key, local.clone()))
-                        .collect(),
-                })
-            }
-            Effect::Storage(StorageEffect::BatchWrite { writes: batch, .. }) => {
-                let entries = batch
-                    .iter()
-                    .map(|(key_space, key, _)| (key_space.clone(), key.clone()))
-                    .collect();
-                writes.extend(batch);
-                Event::Storage(StorageEvent::BatchWriteResult { entries })
-            }
-            Effect::Storage(StorageEffect::CommitTransaction { txn_id }) => {
-                Event::Storage(StorageEvent::TransactionCommitted { txn_id })
-            }
-            Effect::Storage(StorageEffect::AbortTransaction { txn_id }) => {
-                aborted = true;
-                Event::Storage(StorageEvent::TransactionAborted { txn_id })
-            }
-            other => panic!("unexpected effect: {other:?}"),
+    let mut turn = operation.first();
+    let outcome = loop {
+        let call = match turn {
+            Ok(Next::Call(call)) => call,
+            Ok(Next::Done(projected)) => break Ok(projected),
+            Ok(Next::Wait) => panic!("the projection never waits"),
+            Err(error) => break Err(error),
         };
-        if !operation.is_complete() {
-            pending.extend(operation.step(event));
-        }
-    }
+        let result = match call {
+            IoCall::Effect(effect) => match *effect {
+                Effect::Storage(StorageEffect::Read { key, .. }) => {
+                    IoResult::Event(Box::new(Event::Storage(StorageEvent::ReadResult {
+                        key,
+                        value: cache.clone(),
+                    })))
+                }
+                other => panic!("unexpected effect: {other:?}"),
+            },
+            IoCall::Page { limit, .. } => {
+                let page: Vec<(Key, Value)> =
+                    rows.iter().skip(offset).take(limit).cloned().collect();
+                offset += page.len();
+                IoResult::Page {
+                    rows: page,
+                    next: None,
+                }
+            }
+            IoCall::Read(reads) => {
+                bridged = true;
+                IoResult::Values(reads.iter().map(|_| local.clone()).collect())
+            }
+            IoCall::Write(batch) => {
+                writes.extend(batch);
+                IoResult::Done
+            }
+            other => panic!("unexpected call: {other:?}"),
+        };
+        turn = operation.next(result);
+    };
     Run {
-        outcome: operation.finalize(),
+        outcome,
         writes,
         bridged,
-        aborted,
     }
 }
 
@@ -226,8 +207,8 @@ fn full_projection_bridges() {
 
 #[test]
 fn malformed_row_errors() {
-    // A corrupt key or envelope aborts the rebuild instead of reducing a set
-    // that is silently short, leaving the cache and the job rows as they were.
+    // A corrupt key or envelope fails the rebuild instead of reducing a set
+    // that is silently short, so the runner rolls back and nothing is written.
     let family = Family::new([4u8; 32]);
     let records = family.run(1, 0, PhysicalExecutionState::Succeeded);
     let local = job_row(&family, JobState::Queued);
@@ -238,7 +219,6 @@ fn malformed_row_errors() {
     let corrupt = run(&family, &corrupt_key, None, Some(local.clone()));
     assert!(matches!(corrupt.outcome, Err(RecordStoreError::Record(_))));
     assert!(corrupt.writes.is_empty());
-    assert!(corrupt.aborted);
 
     let mut corrupt_value = rows(&records, records.len());
     let key = corrupt_value[0].0.clone();
@@ -249,7 +229,6 @@ fn malformed_row_errors() {
         Err(RecordStoreError::Conversion(_))
     ));
     assert!(corrupt.writes.is_empty());
-    assert!(corrupt.aborted);
 }
 
 #[test]
@@ -284,4 +263,25 @@ fn old_version_rebuilds() {
     let rebuilt = discarded.cache_row().expect("cache row written");
     assert_eq!(rebuilt.version, PROJECTION_CACHE_VERSION);
     assert_eq!(rebuilt.revision, 1);
+}
+
+#[test]
+fn reads_cache_outside() {
+    // The cache read is a plain storage effect, so a fresh cache opens no transaction.
+    let family = Family::new([6u8; 32]);
+    let mut operation = ProjectFamilyOperation::new(ProjectFamilyConfig {
+        family: FamilyRef::Family(family.family()),
+        now_ms: 3_100,
+        rebuild: false,
+    });
+    assert!(operation.transaction());
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Effect(effect)))
+            if matches!(*effect, Effect::Storage(StorageEffect::Read { txn_id: None, .. }))
+    ));
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Err(RecordStoreError::UnexpectedEvent { .. })
+    ));
 }
