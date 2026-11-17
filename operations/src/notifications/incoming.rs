@@ -22,7 +22,7 @@ use byteview::ByteView;
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, warn};
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_until};
 use crate::notifications::checks::{message_realm, validate_watch_events, verify_recipient_holder};
 use crate::notifications::dispatch::{list_on_holder, mark_on_holder, unread_on_holder};
 use crate::notifications::mark_read::MARK_MAX_IDS;
@@ -40,6 +40,10 @@ use crate::notifications::watch::records::{
 use crate::notifications::watch::subscriptions::{create_holder_watch, delete_holder_watch};
 
 const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn deliver_deadline() -> Instant {
+    Instant::now() + NOTIFICATION_AUTH_TIMEOUT
+}
 
 #[tracing::instrument(
     name = "notifications.incoming.stream",
@@ -77,7 +81,8 @@ pub async fn handle_notification_stream(
         frame: &frame,
     };
     let written = match peer_operation(input) {
-        Some(operation) => match drive(operation, context).await {
+        // The same bound the config read had before, so a slow store cannot hold the stream.
+        Some(operation) => match drive_until(operation, context, deliver_deadline()).await {
             Ok(answer) => write_frame(&mut stream, &answer).await,
             Err(error) => Err(error.to_string()),
         },
