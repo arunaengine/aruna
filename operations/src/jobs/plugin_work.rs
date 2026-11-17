@@ -91,7 +91,7 @@ async fn admit_work(
     let deferred = |message: String| JobRunOutcome::Deferred(JobError::retryable(message));
     let config = read_config(&ctx.driver, spec.realm_id).await;
     let config = config.map_err(|error| deferred(error.to_string()))?;
-    let row = read_work(&ctx.driver, spec.install_id, spec.work_id).await;
+    let row = drive(read_work(spec.install_id, spec.work_id), &ctx.driver).await;
     let row = row.map_err(|error| deferred(error.to_string()))?;
     let Some(row) = row else {
         return Err(permanent("the plugin work is no longer recorded"));

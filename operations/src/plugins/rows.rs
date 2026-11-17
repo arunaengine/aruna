@@ -318,6 +318,65 @@ impl Scan {
     }
 }
 
+/// Every row a scan reads, each page on its own.
+pub fn scan_rows(scan: Scan) -> RowsOperation<ScanRows> {
+    RowsOperation::direct(ScanRows(scan))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ScanRows(Scan);
+
+impl Plan for ScanRows {
+    type Output = Rows;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Rows>, StoreError> {
+        Ok(Turn::Ask(self.0.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Rows>, StoreError> {
+        Ok(match self.0.take(answer)? {
+            Some(rows) => Turn::Finish(rows),
+            None => Turn::Ask(self.0.ask()),
+        })
+    }
+}
+
+/// At most `limit` rows below `prefix` after the key `after`, and the key to continue after.
+pub fn page_rows(
+    space: &'static str,
+    prefix: Vec<u8>,
+    after: Option<Vec<u8>>,
+    limit: usize,
+) -> RowsOperation<PageRows> {
+    RowsOperation::direct(PageRows(Some(Ask::Page {
+        space,
+        prefix,
+        after,
+        limit,
+    })))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PageRows(Option<Ask>);
+
+impl Plan for PageRows {
+    type Output = (Rows, Option<Vec<u8>>);
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        let page = self.0.take().ok_or_else(|| StoreError("paged twice".into()))?;
+        Ok(Turn::Ask(page))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        match answer {
+            Answer::Page(rows, next) => Ok(Turn::Finish((rows, next))),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
 /// Writes rows, each batch on its own.
 pub fn write_rows(rows: Vec<Row>) -> RowsOperation<Change> {
     RowsOperation::direct(Change(Some(Ask::Write(rows))))
@@ -354,6 +413,14 @@ pub fn values<const N: usize>(answer: Answer) -> Result<[Option<Vec<u8>>; N], St
     match answer {
         Answer::Values(values) => <[_; N]>::try_from(values)
             .map_err(|values| StoreError(format!("{} values for {N} rows", values.len()))),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// Checks that a write or delete was answered.
+pub fn done(answer: Answer) -> Result<(), StoreError> {
+    match answer {
+        Answer::Done => Ok(()),
         other => Err(unexpected(other)),
     }
 }

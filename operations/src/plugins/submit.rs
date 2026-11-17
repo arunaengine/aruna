@@ -22,10 +22,10 @@ use super::grants::InstallScope;
 use super::marks::unmarked;
 use super::store::encode;
 use super::work::{
-    Identity, RequestContext, WorkError, WorkKind, WorkRow, WorkState, dedup_key, dispatched,
-    reserve, reserve_marked,
+    Identity, Reserve, RequestContext, WorkChange, WorkError, WorkKind, WorkRow, WorkState,
+    dedup_key, reserve, update_work,
 };
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{mint_local_job, submit_local_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobSpec};
 
@@ -75,7 +75,7 @@ pub async fn start_copy(
     proposed.source = Some(request.source.clone());
     proposed.target = Some(request.target.clone());
     proposed.version_id = Some(Ulid::generate());
-    let (row, _) = match reserve(ctx, (&install, &identity), proposed).await {
+    let (row, _) = match reserved(ctx, (&install, &identity), proposed, None).await {
         Ok(found) => found,
         Err(WorkError::Conflict) => {
             let message = "this call started a copy with other arguments";
@@ -151,7 +151,7 @@ pub async fn start_download(
     proposed.context = Some(request.context);
     proposed.version_id = Some(Ulid::generate());
     let marked = request.secret.then_some((bucket.as_str(), key.as_str()));
-    let (row, _) = match reserve_marked(ctx, (&install, &identity), proposed, marked).await {
+    let (row, _) = match reserved(ctx, (&install, &identity), proposed, marked).await {
         Ok(found) => found,
         Err(WorkError::Conflict) => {
             let message = "this call started a download with other arguments";
@@ -231,7 +231,7 @@ pub async fn start_upload(
     proposed.digest = digest(&[b"upload", &stable]);
     proposed.source = Some(request.source.clone());
     proposed.context = Some(request.context);
-    let (row, _) = match reserve(ctx, (&install, &identity), proposed).await {
+    let (row, _) = match reserved(ctx, (&install, &identity), proposed, None).await {
         Ok(found) => found,
         Err(WorkError::Conflict) => {
             let message = "this call started an upload with other arguments";
@@ -298,9 +298,20 @@ async fn submit(
     };
     let result = submit_local_job(ctx, submitted, job_id).await;
     let result = result.map_err(submit_error)?;
-    let recorded = dispatched(ctx, (install_id, work_id), result.job_id).await;
+    let change = WorkChange::Dispatched(result.job_id);
+    let recorded = drive(update_work((install_id, work_id), change), ctx).await;
     recorded.map_err(|error| unavailable(error.0))?;
     Ok(work_id)
+}
+
+/// Reserves the work's row; see [`reserve`].
+async fn reserved(
+    ctx: &DriverContext,
+    named: (&PluginInstall, &Identity),
+    proposed: WorkRow,
+    marked: Option<(&str, &str)>,
+) -> Result<(WorkRow, Reserve), WorkError> {
+    drive(reserve(named, proposed, marked)?, ctx).await
 }
 
 /// The work's row stays reserved after any refusal, so the same call submits again later.

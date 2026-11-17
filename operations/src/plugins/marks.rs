@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::check::unavailable;
-use super::store::{StoreError, Txn, decode, encode, transact};
-use super::work::{WorkKind, WorkState, read_in};
+use super::rows::{
+    Answer, Ask, Plan, Row, RowsOperation, Turn, done, page_rows, row, values,
+};
+use super::store::{StoreError, decode, encode};
+use super::work::{Found, WorkKind, WorkLookup, WorkState};
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
@@ -41,17 +44,32 @@ fn mark_key((bucket, key, version_id): Version<'_>) -> Result<Vec<u8>, StoreErro
     Ok([&[MARK_ROW][..], &encode(&(bucket, key, version_id))?].concat())
 }
 
-/// Marks `version` in `txn`, the transaction that reserves it, before any byte is written.
-pub async fn mark_in(txn: &Txn<'_>, version: Version<'_>, mark: &Mark) -> Result<(), StoreError> {
-    let row = vec![(mark_key(version)?, encode(mark)?)];
-    txn.write(PLUGIN_WORK_KEYSPACE, row).await
+/// The row that marks `version`, written in the transaction that reserves it, before any byte
+/// is written.
+pub fn mark_row(version: Version<'_>, mark: &Mark) -> Result<Row, StoreError> {
+    Ok(row(PLUGIN_WORK_KEYSPACE, mark_key(version)?, encode(mark)?))
 }
 
-pub async fn is_marked(ctx: &DriverContext, version: Version<'_>) -> Result<bool, StoreError> {
-    let row = Txn::direct(ctx)
-        .read(PLUGIN_WORK_KEYSPACE, &mark_key(version)?)
-        .await?;
-    Ok(row.is_some())
+pub fn is_marked(version: Version<'_>) -> Result<RowsOperation<IsMarked>, StoreError> {
+    Ok(RowsOperation::direct(IsMarked(mark_key(version)?)))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct IsMarked(Vec<u8>);
+
+impl Plan for IsMarked {
+    type Output = bool;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
+        let read = vec![(PLUGIN_WORK_KEYSPACE, self.0.clone())];
+        Ok(Turn::Ask(Ask::Read(read)))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
+        let [row] = values::<1>(answer)?;
+        Ok(Turn::Finish(row.is_some()))
+    }
 }
 
 /// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
@@ -74,7 +92,8 @@ pub async fn unmarked(
     let Some(resolved) = resolved else {
         return Ok(None);
     };
-    match is_marked(ctx, (bucket, key, resolved)).await {
+    let marked = is_marked((bucket, key, resolved)).map_err(|error| unavailable(error.0))?;
+    match drive(marked, ctx).await {
         Ok(false) => Ok(Some(resolved)),
         Ok(true) => Err(HostError::new(ErrorKind::Denied, MARKED)),
         Err(error) => Err(unavailable(error.0)),
@@ -87,14 +106,12 @@ pub async fn unmarked(
 pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
     let (mut dropped, mut after) = (0, None);
     loop {
-        let txn = Txn::direct(ctx);
-        let (rows, next) = txn
-            .page(PLUGIN_WORK_KEYSPACE, &[MARK_ROW], after, PAGE)
-            .await?;
-        for (key, value) in &rows {
-            let mark: Mark = decode(value)?;
+        let page = page_rows(PLUGIN_WORK_KEYSPACE, vec![MARK_ROW], after, PAGE);
+        let (rows, next) = drive(page, ctx).await?;
+        for (key, value) in rows {
+            let mark: Mark = decode(&value)?;
             let (bucket, object, version_id) = decode::<(String, String, Ulid)>(&key[1..])?;
-            if !ended(&Txn::direct(ctx), &mark).await? {
+            if !drive(MarkEnded::check(&mark, None), ctx).await? {
                 continue;
             }
             let head = HeadObjectInput {
@@ -107,14 +124,7 @@ pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
                 // Present, or not known now: the mark stays.
                 _ => continue,
             }
-            let gone = transact(ctx, async |txn: &Txn<'_>| {
-                if !ended(txn, &mark).await? {
-                    return Ok::<_, StoreError>(false);
-                }
-                txn.delete(PLUGIN_WORK_KEYSPACE, vec![key.clone()]).await?;
-                Ok(true)
-            });
-            dropped += usize::from(gone.await?);
+            dropped += usize::from(drive(MarkEnded::check(&mark, Some(key)), ctx).await?);
         }
         match next {
             Some(key) => after = Some(key),
@@ -123,10 +133,56 @@ pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
     }
 }
 
-/// Whether the mark's work can write no more: its row is settled or gone.
-async fn ended(txn: &Txn<'_>, mark: &Mark) -> Result<bool, StoreError> {
-    let row = read_in(txn, mark.install_id, mark.work_id).await?;
-    Ok(row.is_none_or(|(_, row)| row.state == WorkState::Settled))
+/// Whether the mark's work can write no more: its row is settled or gone. With the mark's key,
+/// the mark is deleted in the same transaction, so the delete conflicts with a settlement or
+/// reservation.
+#[derive(Debug, PartialEq)]
+pub struct MarkEnded {
+    lookup: WorkLookup,
+    key: Option<Vec<u8>>,
+    deleted: bool,
+}
+
+impl MarkEnded {
+    pub fn check(mark: &Mark, key: Option<Vec<u8>>) -> RowsOperation<MarkEnded> {
+        let lookup = WorkLookup::new(mark.install_id, mark.work_id);
+        let plan = MarkEnded {
+            lookup,
+            deleted: false,
+            key,
+        };
+        match plan.key.is_some() {
+            true => RowsOperation::transaction(plan),
+            false => RowsOperation::direct(plan),
+        }
+    }
+}
+
+impl Plan for MarkEnded {
+    type Output = bool;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
+        Ok(Turn::Ask(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
+        if self.deleted {
+            done(answer)?;
+            return Ok(Turn::Finish(true));
+        }
+        let ended = match self.lookup.take(answer)? {
+            Found::Ask(ask) => return Ok(Turn::Ask(ask)),
+            Found::Row(row) => row.is_none_or(|(_, row)| row.state == WorkState::Settled),
+        };
+        match (ended, self.key.take()) {
+            (true, Some(key)) => {
+                self.deleted = true;
+                Ok(Turn::Ask(Ask::Delete(vec![(PLUGIN_WORK_KEYSPACE, key)])))
+            }
+            (ended, _) => Ok(Turn::Finish(ended)),
+        }
+    }
 }
 
 fn absent(error: &HeadObjectError) -> bool {
