@@ -404,7 +404,9 @@ impl Operation for ReserveExecutionOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("transaction abort", other.label()),
             },
-            ReserveState::Init | ReserveState::Finish | ReserveState::Error => smallvec![],
+            ReserveState::Init | ReserveState::Finish | ReserveState::Error => {
+                self.unexpected("no event", event.label())
+            }
         }
     }
 
@@ -580,7 +582,10 @@ impl Operation for ReleaseExecutionOperation {
                     self.fail(error)
                 }
             },
-            ReleaseState::Init | ReleaseState::Finish | ReleaseState::Error => smallvec![],
+            ReleaseState::Init | ReleaseState::Finish | ReleaseState::Error => {
+                let error = self.unexpected("no event", event.label());
+                self.fail(error)
+            }
         }
     }
 

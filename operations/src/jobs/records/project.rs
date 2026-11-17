@@ -445,7 +445,9 @@ impl Operation for ProjectFamilyOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("transaction commit", other.label()),
             },
-            ProjectState::Init | ProjectState::Finish | ProjectState::Error => smallvec![],
+            ProjectState::Init | ProjectState::Finish | ProjectState::Error => {
+                self.unexpected("no event", event.label())
+            }
         }
     }
 

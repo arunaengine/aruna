@@ -598,7 +598,9 @@ impl Operation for AppendRecordOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected("transaction abort", other.label()),
             },
-            AppendState::Init | AppendState::Finish | AppendState::Error => smallvec![],
+            AppendState::Init | AppendState::Finish | AppendState::Error => {
+                self.unexpected("no event", event.label())
+            }
         }
     }
 
