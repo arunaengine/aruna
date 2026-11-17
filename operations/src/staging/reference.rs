@@ -841,12 +841,13 @@ fn source_metadata_matches(left: &SourceMetadata, right: &SourceMetadata) -> boo
 mod tests {
     use super::*;
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
-    use crate::driver::drive;
+    use crate::driver::{DriverContext, drive};
     use crate::node::usage_stats::RebuildStatsOperation;
     use crate::replication::queue::{LiveObligationRecord, live_obligation_key};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
+    use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE,
         REPLICATION_OBLIGATION_KEYSPACE, SOURCE_INDEX_KEYSPACE, USAGE_STATS_KEYSPACE,
@@ -870,6 +871,23 @@ mod tests {
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};
     use tokio::net::TcpListener;
+
+    async fn stage(
+        context: &DriverContext,
+        input: MaterializeReferenceInput,
+    ) -> Result<MaterializeReferenceResult, MaterializeReferenceError> {
+        let operation =
+            MaterializeReferenceOperation::new(input, SystemTime::now(), Ulid::generate());
+        drive(operation, context).await
+    }
+
+    async fn write_version(
+        context: &DriverContext,
+        write: ReferenceWrite,
+    ) -> Result<(Ulid, bool), MaterializeReferenceError> {
+        let operation = WriteReferenceOperation::new(write, SystemTime::now(), Ulid::generate());
+        drive(operation, context).await
+    }
 
     fn test_context() -> (TempDir, DriverContext) {
         let tempdir = tempdir().expect("tempdir must be created");
@@ -964,15 +982,78 @@ mod tests {
         ));
     }
 
-    async fn start_write_transaction(context: &DriverContext) -> TxnId {
-        match context
+    /// Writes a reference to `bucket-a` of `group_id` through the given connector and bucket guards.
+    async fn guarded(
+        context: &DriverContext,
+        group_id: Ulid,
+        connector_guard: Option<(SourceConnector, Option<[u8; 16]>)>,
+        expected_bucket: Option<BucketInfo>,
+    ) -> Result<(), MaterializeReferenceError> {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let metadata = SourceMetadata {
+            content_length: 1,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let resolved = connector();
+        let version_source = build_source_binding(
+            StagingStrategy::Reference,
+            &resolved,
+            &metadata,
+            "a".to_string(),
+            None,
+            Some(resolved.connector_id),
+        );
+        let write = ReferenceWrite {
+            job_id: None,
+            preassigned_version_id: None,
+            group_id,
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            bucket: "bucket-a".into(),
+            key: "object.txt".into(),
+            expected_bucket,
+            version_source,
+            metadata,
+            inherited_policies: Vec::new(),
+            connector_guard,
+            mirror_guards: Vec::new(),
+            restrictions: None,
+        };
+        write_version(context, write).await.map(|_| ())
+    }
+
+    /// Stores `bucket-a` for `group_id`, so only the guard under test can refuse the write.
+    async fn seed_bucket(context: &DriverContext, group_id: Ulid) {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let bucket = BucketInfo {
+            group_id,
+            created_at: SystemTime::UNIX_EPOCH,
+            created_by: aruna_core::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        let event = context
             .storage_handle
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            event => panic!("unexpected event: {event:?}"),
-        }
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: b"bucket-a".to_vec().into(),
+                value: bucket.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
     }
 
     fn assert_conflict(result: Result<(), MaterializeReferenceError>) {
@@ -1036,17 +1117,12 @@ mod tests {
         write_secret(&context, &resolved_secret).await;
 
         delete_connector(&context, &connector).await;
-        let txn_id = start_write_transaction(&context).await;
-
-        assert_conflict(
-            guard_connector_unchanged(
-                &context,
-                txn_id,
-                &connector,
-                Some(secret_fingerprint(&resolved_secret)),
-            )
-            .await,
+        seed_bucket(&context, connector.group_id).await;
+        let guard = (
+            connector.clone(),
+            Some(secret_fingerprint(&resolved_secret)),
         );
+        assert_conflict(guarded(&context, connector.group_id, Some(guard), None).await);
     }
 
     #[tokio::test]
@@ -1058,17 +1134,12 @@ mod tests {
         write_secret(&context, &resolved_secret).await;
 
         write_secret(&context, &secret("new-key")).await;
-        let txn_id = start_write_transaction(&context).await;
-
-        assert_conflict(
-            guard_connector_unchanged(
-                &context,
-                txn_id,
-                &connector,
-                Some(secret_fingerprint(&resolved_secret)),
-            )
-            .await,
+        seed_bucket(&context, connector.group_id).await;
+        let guard = (
+            connector.clone(),
+            Some(secret_fingerprint(&resolved_secret)),
         );
+        assert_conflict(guarded(&context, connector.group_id, Some(guard), None).await);
     }
 
     #[tokio::test]
@@ -1080,17 +1151,12 @@ mod tests {
         write_secret(&context, &resolved_secret).await;
 
         delete_secret(&context, connector.connector_id).await;
-        let txn_id = start_write_transaction(&context).await;
-
-        assert_conflict(
-            guard_connector_unchanged(
-                &context,
-                txn_id,
-                &connector,
-                Some(secret_fingerprint(&resolved_secret)),
-            )
-            .await,
+        seed_bucket(&context, connector.group_id).await;
+        let guard = (
+            connector.clone(),
+            Some(secret_fingerprint(&resolved_secret)),
         );
+        assert_conflict(guarded(&context, connector.group_id, Some(guard), None).await);
     }
 
     #[tokio::test]
@@ -1100,9 +1166,9 @@ mod tests {
         write_connector(&context, &connector).await;
 
         write_secret(&context, &secret("new-key")).await;
-        let txn_id = start_write_transaction(&context).await;
-
-        assert_conflict(guard_connector_unchanged(&context, txn_id, &connector, None).await);
+        seed_bucket(&context, connector.group_id).await;
+        let guard = (connector.clone(), None);
+        assert_conflict(guarded(&context, connector.group_id, Some(guard), None).await);
     }
 
     #[tokio::test]
@@ -1138,13 +1204,7 @@ mod tests {
             event,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
-        let txn_id = start_write_transaction(&context).await;
-
-        assert_conflict(
-            guard_expected_bucket(&context, txn_id, "bucket-a", group_id, Some(&expected))
-                .await
-                .map(|_| ()),
-        );
+        assert_conflict(guarded(&context, group_id, None, Some(expected)).await);
     }
 
     #[tokio::test]
@@ -1190,7 +1250,7 @@ mod tests {
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
 
-        let result = stage_reference_blob(
+        let result = stage(
             context,
             MaterializeReferenceInput {
                 job_id: None,
@@ -1294,7 +1354,7 @@ mod tests {
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
 
-        let result = stage_reference_blob(
+        let result = stage(
             context,
             MaterializeReferenceInput {
                 job_id: None,
@@ -1347,8 +1407,7 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
 
-        let txn_id = start_write_transaction(&context).await;
-        let result = guard_purge_fence(&context, txn_id, "bucket-a", "object.txt").await;
+        let result = guarded(&context, connector().group_id, None, None).await;
 
         assert_eq!(
             result,
@@ -1383,8 +1442,8 @@ mod tests {
             mirrors: Vec::new(),
         };
 
-        let first = stage_reference_blob(context, input.clone()).await.unwrap();
-        let second = stage_reference_blob(context, input).await.unwrap();
+        let first = stage(context, input.clone()).await.unwrap();
+        let second = stage(context, input).await.unwrap();
         server.abort();
         let _ = server.await;
 
@@ -1435,7 +1494,7 @@ mod tests {
             restrictions: None,
             mirrors: vec![(mirror, "mirror/file.txt".into())],
         };
-        let staged = stage_reference_blob(context, input("a.txt", mirror.clone()))
+        let staged = stage(context, input("a.txt", mirror.clone()))
             .await
             .unwrap();
         let added = &staged.version_source.mirrors[0];
@@ -1444,7 +1503,7 @@ mod tests {
         assert_eq!(added.descriptor.version_selector, None);
         let mut replaced = mirror.clone();
         replaced.name = "replaced".to_string();
-        let refused = stage_reference_blob(context, input("b.txt", replaced)).await;
+        let refused = stage(context, input("b.txt", replaced)).await;
         assert!(
             matches!(
                 refused,
@@ -1468,7 +1527,7 @@ mod tests {
         let bucket = create_test_bucket(context, group_id, user_id, "bucket-a").await;
         let (server, endpoint) = spawn_reference_server("ref-data").await;
         let connector = create_http_connector(context, group_id, &endpoint).await;
-        let original = stage_reference_blob(
+        let original = stage(
             context,
             MaterializeReferenceInput {
                 job_id: None,
@@ -1512,7 +1571,7 @@ mod tests {
             restrictions: None,
         };
         assert_eq!(
-            write_reference_version(context, input(8)).await.unwrap(),
+            write_version(context, input(8)).await.unwrap(),
             (planned, true)
         );
         assert_ne!(planned, original.version_id);
@@ -1534,10 +1593,10 @@ mod tests {
         let obligation = read_value(context, REPLICATION_OBLIGATION_KEYSPACE, key.to_vec()).await;
         assert!(obligation.is_some(), "the reference has no obligation");
         assert_eq!(
-            write_reference_version(context, input(8)).await.unwrap(),
+            write_version(context, input(8)).await.unwrap(),
             (planned, false)
         );
-        assert!(write_reference_version(context, input(9)).await.is_err());
+        assert!(write_version(context, input(9)).await.is_err());
         assert_eq!(
             read_usage_counters(context, usage_group_key(group_id))
                 .await
@@ -1606,7 +1665,7 @@ mod tests {
             restrictions: None,
             mirror_guards: Vec::new(),
         };
-        write_reference_version(context, write).await.unwrap();
+        write_version(context, write).await.unwrap();
 
         let usage = read_usage_counters(context, usage_group_key(offer.group_id)).await;
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
@@ -1614,6 +1673,107 @@ mod tests {
         assert_eq!(
             read_usage_counters(context, usage_group_key(offer.group_id)).await,
             usage
+        );
+    }
+    fn pure_write() -> WriteReferenceOperation {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let metadata = SourceMetadata {
+            content_length: 1,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let resolved = connector();
+        let version_source = build_source_binding(
+            StagingStrategy::Reference,
+            &resolved,
+            &metadata,
+            "a".to_string(),
+            None,
+            Some(resolved.connector_id),
+        );
+        let write = ReferenceWrite {
+            job_id: None,
+            preassigned_version_id: None,
+            group_id: resolved.group_id,
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([3; 16]), realm_id),
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            bucket: "bucket-a".into(),
+            key: "object.txt".into(),
+            expected_bucket: None,
+            version_source,
+            metadata,
+            inherited_policies: Vec::new(),
+            connector_guard: None,
+            mirror_guards: Vec::new(),
+            restrictions: None,
+        };
+        WriteReferenceOperation::new(write, SystemTime::UNIX_EPOCH, Ulid::from_bytes([5; 16]))
+    }
+
+    // The write opens its transaction, reads the purge fence in it and aborts on a missing bucket.
+    #[test]
+    fn missing_bucket_aborts() {
+        use aruna_core::operation_check::check_trace;
+        let txn_id = Ulid::from_bytes([9; 16]);
+        let mut operation = pure_write();
+        check_trace(
+            &mut operation,
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })],
+            vec![
+                (
+                    Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+                    vec![write_fence_read("bucket-a", Some(txn_id))],
+                ),
+                (
+                    Event::Storage(StorageEvent::ReadResult {
+                        key: Vec::new().into(),
+                        value: None,
+                    }),
+                    vec![Effect::Storage(StorageEffect::Read {
+                        key_space: S3_BUCKET_KEYSPACE.to_string(),
+                        key: b"bucket-a".to_vec().into(),
+                        txn_id: Some(txn_id),
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::ReadResult {
+                        key: Vec::new().into(),
+                        value: None,
+                    }),
+                    vec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+                ),
+                (
+                    Event::Storage(StorageEvent::TransactionAborted { txn_id }),
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_conflict(operation.finalize().map(|_| ()));
+    }
+
+    // Unstarted operations refuse every event, abort an open transaction and never finish early.
+    #[test]
+    fn rejects_unexpected() {
+        use aruna_core::operation_check::{rejects_events, rejects_finalize, sample_events};
+        let all = sample_events().len();
+        assert_eq!(
+            rejects_events(pure_write, sample_events, |_| false).len(),
+            all
+        );
+        rejects_finalize(pure_write());
+        let mut open = pure_write();
+        open.start();
+        let txn_id = Ulid::from_bytes([9; 16]);
+        open.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(
+            open.abort().as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         );
     }
 }
