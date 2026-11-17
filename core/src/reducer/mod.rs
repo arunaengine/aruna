@@ -50,6 +50,7 @@ mod snapshot;
 mod targets;
 
 pub use overlay::{
+    materialize_group_authorization, materialize_realm_authorization, materialize_user_operation,
     materialized_group, materialized_realm_config, needs_revocation_index, overlay_group_role,
     overlay_group_state, overlay_realm_config, overlay_realm_role, reduced_admin_target,
 };

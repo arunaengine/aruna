@@ -9,6 +9,7 @@ use crate::document::DocumentTarget;
 use crate::structs::identity::auth::Role;
 use crate::structs::identity::realm::RealmAuthorizationDocument;
 use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
+use crate::structs::identity::user::User;
 
 pub fn overlay_group_state(
     group: &mut Group,
@@ -357,4 +358,206 @@ pub fn reduced_admin_target(
         }),
         _ => None,
     }
+}
+
+/// Applies one replicated group authorization event to the stored document.
+pub fn materialize_group_authorization(
+    auth_doc: &mut GroupAuthorizationDocument,
+    reducer_state: &AdminDocumentState,
+    event: &AdminDocumentEvent,
+) {
+    match &event.op {
+        AdminDocumentOperation::GroupJoinDecided { decision } => {
+            for role_id in &decision.role_ids {
+                overlay_group_role(auth_doc, reducer_state, *role_id);
+            }
+        }
+        AdminDocumentOperation::GroupPoliciesSet { .. } => {
+            if !reducer_state.conflicts.contains_key(GROUP_POLICIES_PATH)
+                && let Some(policies) = reducer_state.materialized_group_policies()
+            {
+                auth_doc.policies = policies;
+            }
+        }
+        AdminDocumentOperation::GroupRoleCreated { role } => {
+            let live = reducer_state
+                .materialized_group_roles()
+                .contains(&role.role_id);
+            if materialize_role(&mut auth_doc.roles, reducer_state, role, &group_role_path(&role.role_id), live) {
+                overlay_group_role(auth_doc, reducer_state, role.role_id);
+            }
+        }
+        AdminDocumentOperation::GroupRoleRemoved { role_id } => {
+            auth_doc.roles.remove(role_id);
+        }
+        AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id } => {
+            let path = group_user_path(role_id, user_id);
+            materialize_assignment(&mut auth_doc.roles, reducer_state, &path, *role_id, *user_id);
+        }
+        _ => {}
+    }
+}
+
+/// Applies one replicated realm authorization event to the stored document.
+pub fn materialize_realm_authorization(
+    auth_doc: &mut RealmAuthorizationDocument,
+    reducer_state: &AdminDocumentState,
+    event: &AdminDocumentEvent,
+) {
+    match &event.op {
+        AdminDocumentOperation::RealmRoleCreated { role } => {
+            let live = reducer_state
+                .materialized_realm_roles()
+                .contains(&role.role_id);
+            if materialize_role(&mut auth_doc.roles, reducer_state, role, &realm_role_path(&role.role_id), live) {
+                overlay_realm_role(auth_doc, reducer_state, role.role_id);
+            }
+        }
+        AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => {
+            let path = realm_user_path(role_id, user_id);
+            materialize_assignment(&mut auth_doc.roles, reducer_state, &path, *role_id, *user_id);
+        }
+        _ => {}
+    }
+}
+
+// Writes a role definition while keeping its assignments; returns false when the role is
+// conflicted or no longer live, which removes it.
+fn materialize_role(
+    roles: &mut HashMap<RoleId, Role>,
+    reducer_state: &AdminDocumentState,
+    role: &AdminRoleDefinition,
+    role_path: &str,
+    live: bool,
+) -> bool {
+    if reducer_state.conflicts.contains_key(role_path) || !live {
+        roles.remove(&role.role_id);
+        return false;
+    }
+    let assigned_users = roles
+        .get(&role.role_id)
+        .map(|role| role.assigned_users.clone())
+        .unwrap_or_default();
+    roles.insert(
+        role.role_id,
+        Role {
+            role_id: role.role_id,
+            name: role.name.clone(),
+            permissions: role
+                .permissions
+                .iter()
+                .map(|(path, permission)| (path.clone(), permission.clone()))
+                .collect(),
+            assigned_users,
+        },
+    );
+    true
+}
+
+fn materialize_assignment(
+    roles: &mut HashMap<RoleId, Role>,
+    reducer_state: &AdminDocumentState,
+    path: &str,
+    role_id: RoleId,
+    user_id: UserId,
+) {
+    let Some(role) = roles.get_mut(&role_id) else {
+        return;
+    };
+    if reducer_state.conflicts.contains_key(path) {
+        role.assigned_users.remove(&user_id);
+        return;
+    }
+    let assigned = reducer_state
+        .user_subject_ids
+        .get(path)
+        .and_then(|version| version.value.as_deref())
+        .and_then(|value| UserId::from_string(value).ok())
+        .is_some_and(|materialized_user_id| materialized_user_id == user_id);
+    if assigned {
+        role.assigned_users.insert(user_id);
+    } else {
+        role.assigned_users.remove(&user_id);
+    }
+}
+
+pub fn materialize_user_operation(
+    user_id: UserId,
+    previous_user: Option<&User>,
+    reducer_state: &AdminDocumentState,
+    event: &AdminDocumentEvent,
+) -> User {
+    let mut user = previous_user.cloned().unwrap_or_else(|| User {
+        user_id,
+        name: String::new(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: Default::default(),
+    });
+
+    match &event.op {
+        AdminDocumentOperation::UserNameSet { .. } => {
+            if reducer_state.conflicts.contains_key(USER_NAME_PATH) {
+                user.name.clear();
+            } else if let Some(name) = reducer_state.materialized_user_name() {
+                user.name = name;
+            }
+        }
+        AdminDocumentOperation::SubjectIdAdded { subject_id }
+        | AdminDocumentOperation::SubjectIdRemoved { subject_id } => {
+            let path = user_subject_path(subject_id);
+            let materialized_subject_id = if reducer_state.conflicts.contains_key(&path) {
+                None
+            } else {
+                reducer_state
+                    .user_subject_ids
+                    .get(subject_id)
+                    .and_then(|version| version.value.clone())
+            };
+
+            user.subject_ids.retain(|candidate| candidate != subject_id);
+            if let Some(materialized_subject_id) = materialized_subject_id
+                && !user.subject_ids.contains(&materialized_subject_id)
+            {
+                user.subject_ids.push(materialized_subject_id);
+            }
+        }
+        AdminDocumentOperation::UserAliasAdded { alias }
+        | AdminDocumentOperation::UserAliasRemoved { alias } => {
+            if reducer_state.materialized_alias(alias) {
+                user.alias_user_ids.insert(*alias);
+            } else {
+                user.alias_user_ids.remove(alias);
+            }
+        }
+        AdminDocumentOperation::UserAttributeSet { key, .. }
+        | AdminDocumentOperation::UserAttributeRemoved { key } => {
+            let path = user_attribute_path(key);
+            if reducer_state.conflicts.contains_key(&path) {
+                if key.starts_with(crate::user::profile::VISIBILITY_PREFIX) {
+                    user.attributes.insert(key.clone(), "private".to_string());
+                } else {
+                    user.attributes.remove(key);
+                }
+            } else {
+                match reducer_state
+                    .user_attributes
+                    .get(key)
+                    .and_then(|version| version.value.clone())
+                {
+                    Some(value) => {
+                        user.attributes.insert(key.clone(), value);
+                    }
+                    None => {
+                        user.attributes.remove(key);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    user
 }

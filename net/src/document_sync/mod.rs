@@ -51,6 +51,7 @@ use aruna_core::reducer::{
     CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH, DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
     METADATA_REPLICATION_PATH, REALM_ID_PATH, REVOCATIONS_PER_ORIGIN, RevocationIndex,
     USER_NAME_PATH, config_node_path, decode_reducer_state, group_role_path, group_user_path,
+    materialize_group_authorization, materialize_realm_authorization, materialize_user_operation,
     materialized_group, materialized_realm_config, needs_revocation_index, overlay_group_role,
     overlay_group_state, overlay_placement, overlay_realm_config, overlay_realm_role,
     parse_config_node, parse_config_oidc, parse_group_assignment, parse_group_role,
