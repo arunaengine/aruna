@@ -72,7 +72,7 @@ impl DownloadGauge {
     pub fn try_acquire(&self) -> Option<SlotPermit> {
         let taken = self
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.max).then_some(active + 1)
             })
             .is_ok();
