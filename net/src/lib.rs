@@ -1091,6 +1091,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
         Effect::Net(NetEffect::Release(_)) => "release",
+        Effect::Net(NetEffect::Notification(_)) => "notification",
+        Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",
@@ -1100,6 +1102,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Outbound(_) => "outbound",
     }
 }
 pub(crate) fn unique_endpoint_addrs(

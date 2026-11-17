@@ -9,10 +9,7 @@ use aruna_core::compute::SecretBytes;
 use aruna_core::errors::ConversionError;
 use aruna_core::realm_vault::seal_setting;
 use aruna_core::register::RegisterStamp;
-use aruna_core::structs::execution::job::{
-    JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
-};
-use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
+use aruna_core::structs::execution::job::JobResultPayload;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::{
     URL_BYTES, WebhookDeliverySpec, WebhookSubscription, valid_url,
@@ -20,7 +17,6 @@ use aruna_core::structs::execution::webhook::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_outbound::Backoffs;
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};

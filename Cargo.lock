@@ -328,6 +328,7 @@ dependencies = [
  "aruna-kpabe",
  "aruna-net",
  "aruna-operations",
+ "aruna-outbound",
  "aruna-storage",
  "aruna-tasks",
  "aws-sdk-s3",
@@ -730,6 +731,7 @@ dependencies = [
  "aruna-compute",
  "aruna-core",
  "aruna-net",
+ "aruna-outbound",
  "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
@@ -787,6 +789,18 @@ dependencies = [
  "unicode-normalization",
  "url",
  "zip",
+]
+
+[[package]]
+name = "aruna-outbound"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-core",
+ "async-trait",
+ "lettre",
+ "reqwest 0.13.5",
+ "tokio",
+ "ulid 3.0.0",
 ]
 
 [[package]]

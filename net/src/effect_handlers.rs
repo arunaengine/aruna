@@ -246,7 +246,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::Notification(_) => NetEvent::Notification(Err(
             "notification requests must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::WakeInbox(_) => NetEvent::Error(NetError::InvalidEffect),
+        NetEffect::WakeInbox(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
     }
 }
 

@@ -202,13 +202,9 @@ async fn emit_onboarded_notification(realm_id: RealmId, node_id: NodeId, context
     if records.is_empty() {
         return;
     }
-    if let Err(never) = drive(
-        EmitNotificationsOperation::new(EmitNotificationsInput { records }),
-        context,
-    )
-    .await
-    {
-        match never {}
+    let emit = EmitNotificationsOperation::new(EmitNotificationsInput { records });
+    if let Err(error) = drive(emit, context).await {
+        warn!(%error, "Failed to emit onboarding notifications");
     }
 }
 

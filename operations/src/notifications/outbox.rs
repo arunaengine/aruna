@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
@@ -18,7 +17,7 @@ use aruna_core::structs::execution::notification::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -693,6 +692,7 @@ mod state_machine_tests {
     use crate::tests::locations::node_id;
     use crate::tests::notifications::{record, user};
     use aruna_core::UserId;
+    use aruna_core::errors::StorageError;
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
     };

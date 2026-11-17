@@ -20,10 +20,7 @@ use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::email::{
     EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, RealmEmailProfile,
 };
-use aruna_core::structs::execution::job::{
-    JobError, JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
-};
-use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::job::{JobError, JobResultPayload};
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
@@ -33,7 +30,6 @@ use aruna_outbound::Backoffs;
 use lettre::Address;
 use thiserror::Error;
 use tracing::warn;
-use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
