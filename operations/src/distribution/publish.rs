@@ -13,13 +13,13 @@ use aruna_core::admin_documents::{
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect, abort_effects};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent, SnapshotSignEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, NetEvent, SnapshotSignEvent, StorageEvent};
 use aruna_core::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_LIFECYCLE_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
     NODE_STATS_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::EffectOperation;
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{reducer_state_entry, reducer_state_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
@@ -38,7 +38,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -124,6 +124,8 @@ pub struct PublishOperation {
     next: Option<DistributionSnapshot>,
     /// The head revision an already applied activation answers with.
     current: Option<DistributionRevision>,
+    /// The admin check whose rows the acceptance transaction reads.
+    check: Option<CheckPermissionsConfig>,
     output: Option<Result<DistributionRevision, PublishError>>,
 }
 
@@ -163,6 +165,7 @@ impl PublishOperation {
             stored: Stored::default(),
             next: None,
             current: None,
+            check: None,
             output: None,
         }
     }
@@ -300,10 +303,28 @@ impl PublishOperation {
             path: group_admin_path(self.config.realm_id, owner),
             required_permission: Permission::WRITE,
         };
-        Ok(smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new_with_txn(check, txn_id),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))])
+        let reads = check.reads().map_err(|_| PublishError::Unauthorized)?;
+        self.check = Some(check);
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        })])
+    }
+
+    /// Accepts the request once the admin check allowed it; an already applied one replays.
+    fn authorized(&mut self, allowed: Result<bool, AuthorizationError>) -> Effects {
+        match allowed {
+            Ok(true) => match self.current {
+                Some(revision) => {
+                    self.output = Some(Ok(revision));
+                    self.abort_replay()
+                }
+                None => self.sign(),
+            },
+            Ok(false) => self.fail(PublishError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => self.fail(error.into()),
+            Err(_) => self.fail(PublishError::Unauthorized),
+        }
     }
 
     fn sign(&mut self) -> Effects {
@@ -478,21 +499,17 @@ impl EffectOperation for PublishOperation {
                 let decided = self.decide(values);
                 self.settle(decided)
             }
-            (
-                PublishState::Authorize,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => match allowed {
-                Ok(true) => match self.current {
-                    Some(revision) => {
-                        self.output = Some(Ok(revision));
-                        self.abort_replay()
-                    }
-                    None => self.sign(),
-                },
-                Ok(false) => self.fail(PublishError::Unauthorized),
-                Err(AuthorizationError::StorageError(error)) => self.fail(error.into()),
-                Err(_) => self.fail(PublishError::Unauthorized),
-            },
+            (PublishState::Authorize, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                let values = values.into_iter().map(|(_, value)| value).collect();
+                let allowed = match self.check.take() {
+                    Some(check) => check.allowed(values),
+                    None => Err(AuthorizationError::NotFinished),
+                };
+                self.authorized(allowed)
+            }
+            (PublishState::Authorize, Event::Storage(StorageEvent::Error { error })) => {
+                self.authorized(Err(error.into()))
+            }
             (PublishState::Sign, Event::Net(NetEvent::SnapshotSign(signed))) => match signed {
                 SnapshotSignEvent::Signed(signed) => {
                     let written = self.write(*signed);
