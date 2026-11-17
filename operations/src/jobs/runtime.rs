@@ -398,7 +398,17 @@ impl JobsRuntime {
     /// Whatever is still running then has its lease handed back, so a restart costs a
     /// job no attempt. Storage must outlive this call: releasing a lease writes.
     pub async fn shutdown(&self, storage: &StorageHandle, grace: Duration) -> JobShutdownReport {
-        let context = &crate::testing::test_context(storage.clone());
+        // Releasing a lease writes storage only, so the node's other planes stay out.
+        let context = &DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        };
         self.close_admission();
         let waiters: Vec<_> = {
             let state = self.state();
@@ -1198,10 +1208,7 @@ mod tests {
             .unwrap();
         assert_eq!(state, JobState::Succeeded);
 
-        let record = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(
             record.result,
             Some(JobResultPayload::Probe { completed_steps: 3 })
@@ -1289,10 +1296,7 @@ mod tests {
         )
         .await;
 
-        let stored = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(stored.state, JobState::Cancelled);
         assert!(matches!(
             storage
@@ -1334,10 +1338,7 @@ mod tests {
         )
         .await;
 
-        let stored = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(stored.state, JobState::Cancelled);
         assert!(!marker.exists(), "late cancellation must run cleanup");
     }
@@ -1477,10 +1478,7 @@ mod tests {
             .unwrap();
         assert_eq!(state, JobState::Succeeded);
 
-        let record = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert!(
             record.finished_at_ms.unwrap() >= t_before + 150,
             "finished_at must be set after the payload ran, not at start"
@@ -1510,10 +1508,7 @@ mod tests {
             "10k-step run must not scale with steps, got {delta}"
         );
 
-        let record = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.progress.current, 10_000);
     }
 
@@ -1533,10 +1528,7 @@ mod tests {
         // hand the lease back attempt-free, so only the sum is deterministic.
         assert_eq!(report.released + report.finished + report.skipped, 1);
 
-        let record = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Queued);
         assert_eq!(record.attempts, 0, "a shutdown is not a spent attempt");
         assert!(record.claim.is_none());
@@ -1554,10 +1546,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state, JobState::Succeeded);
-        let record = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.attempts, 0);
     }
 
@@ -1582,10 +1571,7 @@ mod tests {
             .await
             .expect("shutdown waits only for the producer barrier");
 
-        let record = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Queued);
         assert!(record.claim.is_none());
         assert_eq!(record.attempts, 0);
@@ -1663,10 +1649,7 @@ mod tests {
             wait_running(&ctx, job_id).await;
             runtime.shutdown(&storage, Duration::ZERO).await;
 
-            let record = read_job_record(&ctx, job_id, None)
-                .await
-                .unwrap()
-                .unwrap();
+            let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
             assert_eq!(record.state, JobState::Queued, "restart {restart}");
             assert_eq!(record.attempts, 0, "restart {restart}");
         }
@@ -1696,10 +1679,7 @@ mod tests {
         let report = runtime.shutdown(&storage, Duration::from_secs(10)).await;
         assert_eq!(report.finished, 1, "the probe winds down inside the grace");
 
-        let record = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Queued);
         assert_eq!(record.attempts, 0);
         assert!(marker.exists(), "cleanup must not run for an interruption");
@@ -1729,10 +1709,7 @@ mod tests {
         assert_eq!(report.released, 0);
         assert_eq!(report.skipped, 1);
 
-        let record = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Claimed);
         assert_eq!(record.claim.unwrap().holder_node_id, node_id(4));
     }
@@ -1758,10 +1735,7 @@ mod tests {
             crate::jobs::service::CancelJobOutcome::Requested(_)
         ));
 
-        let stored = read_job_record(&ctx, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(stored.state, JobState::Cancelled);
         assert!(stored.finished_at_ms.is_some());
         assert!(stored.claim.is_none());
@@ -1926,7 +1900,9 @@ mod tests {
         assert_eq!(exhausted.state, JobState::Indeterminate);
         assert!(exhausted.locally_exhausted);
 
-        let (rows, _) = list_job_entries(&ctx.driver, job_id, None, 10).await.unwrap();
+        let (rows, _) = list_job_entries(&ctx.driver, job_id, None, 10)
+            .await
+            .unwrap();
         assert!(rows.is_empty(), "panic must not write a failure report");
         assert_eq!(
             crate::jobs::import::upload_store::read_rocrate_upload(&ctx.driver, upload.upload_id)

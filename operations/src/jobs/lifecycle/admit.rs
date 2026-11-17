@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::document::DocumentTarget;
-use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -15,12 +15,12 @@ use aruna_core::keyspaces::{
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
     RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key, owner_index_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::rows::values;
 use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 
@@ -176,7 +176,7 @@ impl AdmitSubmissionOperation {
     /// caller's check observed, then reads the projection cache.
     fn read_cache(&mut self, result: IoResult) -> Step {
         let [quota, fence] = values::<2>(result)?;
-        crate::groups::fence::check_group_write(fence.as_deref())?;
+        aruna_core::structs::identity::group_delete::check_group_write(fence.as_deref())?;
         self.quota_revision = match quota {
             Some(value) => from_bytes::<u64>(&value)?,
             None => 0,
@@ -356,9 +356,9 @@ impl Operation for AdmitSubmissionOperation {
                 self.state = AdmitState::Write;
                 Ok(Next::Call(IoCall::Write(self.batch_writes()?)))
             }
-            (AdmitState::Write, IoResult::Done) => Ok(Next::Done(
-                self.settle(self.config.candidate.job_id, true),
-            )),
+            (AdmitState::Write, IoResult::Done) => {
+                Ok(Next::Done(self.settle(self.config.candidate.job_id, true)))
+            }
             (state, other) => Err(LifecycleError::unexpected(
                 &state,
                 "a result of this step",

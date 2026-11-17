@@ -6,11 +6,11 @@
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{JobRecordFrame, LaunchFrame};
+use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
-    PhysicalExecutionState,
+    PhysicalExecutionState, SubmissionId,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -26,6 +26,14 @@ use crate::metadata::transport_message_kind;
 use crate::realm::load_config::load_realm_config;
 use aruna_core::placement::holds_placement;
 use aruna_core::structs::execution::job::record_rows::PendingNeed;
+
+struct PageRequest {
+    placement: PlacementRef,
+    submission_id: SubmissionId,
+    request_digest: Option<[u8; 32]>,
+    cursor: Option<FetchCursor>,
+    limit: PageLimit,
+}
 
 /// Serves one inbound record publish or page request from an authenticated peer.
 pub async fn serve_job_record(

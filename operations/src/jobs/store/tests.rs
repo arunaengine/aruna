@@ -4,12 +4,13 @@
 
 use super::*;
 use aruna_core::UserId;
+use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail, ImportReportRow,
     ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
-    LEASE_INDEX_PREFIX, ReasonCode, RoCrateLimits, job_schedule_key, parse_schedule_key,
-    pid_dedup_key,
+    LEASE_INDEX_PREFIX, ReasonCode, RoCrateLimits, encode_dedup_value, job_schedule_key,
+    parse_schedule_key, pid_dedup_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -133,9 +134,16 @@ proptest::proptest! {
 }
 
 async fn schedule_keys(context: &DriverContext) -> Vec<Key> {
-    let (values, _) = iter_prefix_page(&context.storage_handle, SCHEDULE_INDEX_KEYSPACE, None, None, 64, None)
-        .await
-        .expect("scan schedule index");
+    let (values, _) = iter_prefix_page(
+        &context.storage_handle,
+        SCHEDULE_INDEX_KEYSPACE,
+        None,
+        None,
+        64,
+        None,
+    )
+    .await
+    .expect("scan schedule index");
     values.into_iter().map(|(key, _)| key).collect()
 }
 

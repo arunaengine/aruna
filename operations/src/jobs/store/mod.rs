@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::DriverContext;
 use aruna_core::UserId;
 use aruna_core::compute::{AttemptRef, FenceContext};
 use aruna_core::effects::StorageEffect;
@@ -13,14 +14,14 @@ use aruna_core::keyspaces::{
     ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE, DEDUP_INDEX_KEYSPACE,
     JOB_CLAIM_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, KEY_WAIT_KEYSPACE,
     LAUNCH_RECORD_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE,
-    SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
+    SCHEDULE_INDEX_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     AttemptControl, AttemptIntent, JobClaim, JobError, JobErrorKind, JobExecutionClass, JobId,
     JobPayload, JobProgress, JobRecord, JobRecordEnvelope, JobRecordError, JobResultPayload,
     JobState, JobTransitionError, LaunchRecord, RunCrateStatus, attempt_control_key,
-    cleanup_dedup_key, cleanup_job_id, crate_dedup_key, crate_job_id, encode_dedup_value,
-    job_entry_key, job_entry_prefix, job_owner_cursor, job_prune_key, job_record_key, job_wait_key,
+    cleanup_dedup_key, cleanup_job_id, crate_dedup_key, crate_job_id, job_entry_key,
+    job_entry_prefix, job_owner_cursor, job_prune_key, job_record_key, job_wait_key,
     owner_index_key, owner_index_prefix, parse_dedup_value, parse_entry_key, parse_owner_key,
     run_crate_key, validate_transition, workspace_credential_id,
 };
@@ -31,7 +32,6 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
-use crate::driver::DriverContext;
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,6 @@ pub mod state;
 use attempt::*;
 use key_wait::*;
 use query::*;
-use remote_wait::*;
 use state::*;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -354,7 +353,9 @@ pub(super) async fn read_state<T: DeserializeOwned>(
     key: Key,
     label: &str,
 ) -> Result<Option<T>, String> {
-    match context.storage_handle.send_storage_effect(StorageEffect::Read {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
             key_space: key_space.to_string(),
             key,
             txn_id: None,
@@ -665,7 +666,7 @@ async fn report_digest(
     let mut hasher = blake3::Hasher::new();
     loop {
         let (values, next) = iter_prefix_page(
-            storage,
+            &context.storage_handle,
             JOB_ENTRY_KEYSPACE,
             Some(prefix.clone()),
             start_after,

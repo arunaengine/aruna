@@ -357,13 +357,8 @@ impl ComputeReconciler {
         };
         if !self.runtime.upgrade().is_some_and(|runtime| {
             runtime.spawn_recovered(self.context.clone(), &record, supervisor)
-        }) && let Err(error) = handoff_external_attempt(
-            &self.context,
-            job_id,
-            token,
-            unix_timestamp_millis(),
-        )
-        .await
+        }) && let Err(error) =
+            handoff_external_attempt(&self.context, job_id, token, unix_timestamp_millis()).await
         {
             warn!(job_id = %job_id, error = %error, "Failed to hand off unregistered recovered attempt");
         }
@@ -393,7 +388,7 @@ pub(super) async fn resume_attempt(
     };
     if current.cancel_requested {
         let _ = with_execution_heartbeat(
-            context.clone(),
+            context.as_ref().clone(),
             job_id,
             token,
             cancel,
@@ -406,7 +401,7 @@ pub(super) async fn resume_attempt(
     }
     if matches!(phase, AttemptPhase::Submitted) {
         let resumed = with_execution_heartbeat(
-            context.clone(),
+            context.as_ref().clone(),
             job_id,
             token,
             cancel.clone(),
