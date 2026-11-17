@@ -3,18 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ASSISTANT_USAGE_KEYSPACE, CENTRAL_ASSISTANT_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, QuotaReached, charge,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -27,25 +24,13 @@ pub enum CentralStoreError {
     Stale,
     #[error("daily assistant limit reached")]
     QuotaReached(QuotaReached),
-    #[error("central assistant operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
+    #[error(transparent)]
+    Io(IoError),
 }
 
-fn unexpected(
-    state: &impl std::fmt::Debug,
-    expected: &'static str,
-    event: &Event,
-) -> CentralStoreError {
-    CentralStoreError::UnexpectedEvent {
-        state: format!("{state:?}"),
-        expected,
-        got: format!("{event:?}"),
+impl From<IoError> for CentralStoreError {
+    fn from(error: IoError) -> Self {
+        error.into_storage().map_or_else(Self::Io, Self::Storage)
     }
 }
 
@@ -55,6 +40,14 @@ fn central_key() -> Key {
 
 fn usage_key(user_id: UserId) -> Key {
     ByteView::from(user_id.to_storage_key())
+}
+
+fn central_row() -> (String, Key) {
+    (CENTRAL_ASSISTANT_KEYSPACE.to_string(), central_key())
+}
+
+fn usage_row(user_id: UserId) -> (String, Key) {
+    (ASSISTANT_USAGE_KEYSPACE.to_string(), usage_key(user_id))
 }
 
 fn decode_central(value: Option<&Value>) -> Result<Option<CentralAssistant>, ConversionError> {
@@ -72,87 +65,33 @@ fn decode_usage(value: Option<&Value>) -> Result<Option<AssistantUsage>, Convers
 /// The central provider, if set up, and the caller's usage row.
 pub type CentralRead = (Option<CentralAssistant>, Option<AssistantUsage>);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadState {
-    Init,
-    Read,
-    Finish,
-}
-
 /// Reads the central provider together with the caller's usage row.
 #[derive(Debug, PartialEq)]
 pub struct GetCentralOperation {
     user_id: UserId,
-    state: ReadState,
-    output: Option<Result<CentralRead, CentralStoreError>>,
 }
 
 impl GetCentralOperation {
     pub fn new(user_id: UserId) -> Self {
-        Self {
-            user_id,
-            state: ReadState::Init,
-            output: None,
-        }
+        Self { user_id }
     }
 }
 
-impl EffectOperation for GetCentralOperation {
+impl Operation for GetCentralOperation {
     type Output = CentralRead;
     type Error = CentralStoreError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ReadState::Read;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (CENTRAL_ASSISTANT_KEYSPACE.to_string(), central_key()),
-                (
-                    ASSISTANT_USAGE_KEYSPACE.to_string(),
-                    usage_key(self.user_id)
-                ),
-            ],
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<CentralRead>, CentralStoreError> {
+        let reads = vec![central_row(), usage_row(self.user_id)];
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let result = match (&self.state, &event) {
-            (ReadState::Read, Event::Storage(StorageEvent::BatchReadResult { values }))
-                if values.len() == 2 =>
-            {
-                decode_central(values[0].1.as_ref())
-                    .and_then(|central| Ok((central, decode_usage(values[1].1.as_ref())?)))
-                    .map_err(CentralStoreError::from)
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.clone().into()),
-            _ => Err(unexpected(&self.state, "central read", &event)),
-        };
-        self.output = Some(result);
-        self.state = ReadState::Finish;
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<CentralRead>, CentralStoreError> {
+        let values = result.values()?;
+        let central = decode_central(values[0].as_ref())?;
+        let usage = decode_usage(values[1].as_ref())?;
+        Ok(Next::Done((central, usage)))
     }
-
-    fn is_complete(&self) -> bool {
-        self.state == ReadState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(CentralStoreError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TxnState {
-    Init,
-    Start,
-    Read,
-    Write,
-    Commit,
-    Finish,
 }
 
 /// Replaces or removes the central provider when the stored row still equals `expected`.
@@ -160,9 +99,8 @@ enum TxnState {
 pub struct SetCentralOperation {
     next: Option<CentralAssistant>,
     expected: Option<CentralAssistant>,
-    txn_id: Option<TxnId>,
-    state: TxnState,
-    output: Option<Result<(), CentralStoreError>>,
+    /// Whether the change was sent and its answer ends the operation.
+    written: bool,
 }
 
 impl SetCentralOperation {
@@ -171,109 +109,38 @@ impl SetCentralOperation {
         Self {
             next,
             expected,
-            txn_id: None,
-            state: TxnState::Init,
-            output: None,
+            written: false,
         }
-    }
-
-    fn fail(&mut self, error: CentralStoreError) -> Effects {
-        let cleanup = self.abort();
-        self.output = Some(Err(error));
-        self.state = TxnState::Finish;
-        cleanup
-    }
-
-    fn handle_read(&mut self, value: Option<&Value>, txn_id: TxnId) -> Effects {
-        let current = match decode_central(value) {
-            Ok(current) => current,
-            Err(error) => return self.fail(error.into()),
-        };
-        if current != self.expected {
-            return self.fail(CentralStoreError::Stale);
-        }
-        let effect = match &self.next {
-            Some(next) => match next.to_bytes() {
-                Ok(bytes) => StorageEffect::Write {
-                    key_space: CENTRAL_ASSISTANT_KEYSPACE.to_string(),
-                    key: central_key(),
-                    value: bytes.into(),
-                    txn_id: Some(txn_id),
-                },
-                Err(error) => return self.fail(error.into()),
-            },
-            None => StorageEffect::Delete {
-                key_space: CENTRAL_ASSISTANT_KEYSPACE.to_string(),
-                key: central_key(),
-                txn_id: Some(txn_id),
-            },
-        };
-        self.state = TxnState::Write;
-        smallvec![Effect::Storage(effect)]
     }
 }
 
-impl EffectOperation for SetCentralOperation {
+impl Operation for SetCentralOperation {
     type Output = ();
     type Error = CentralStoreError;
 
-    fn start(&mut self) -> Effects {
-        self.state = TxnState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<()>, CentralStoreError> {
+        Ok(Next::Call(IoCall::Read(vec![central_row()])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, CentralStoreError> {
+        if self.written {
+            result.done()?;
+            return Ok(Next::Done(()));
         }
-        match (self.state, &event, self.txn_id) {
-            (TxnState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id }), _) => {
-                self.txn_id = Some(*txn_id);
-                self.state = TxnState::Read;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: CENTRAL_ASSISTANT_KEYSPACE.to_string(),
-                    key: central_key(),
-                    txn_id: Some(*txn_id),
-                })]
-            }
-            (TxnState::Read, Event::Storage(StorageEvent::ReadResult { value, .. }), Some(id)) => {
-                self.handle_read(value.as_ref(), id)
-            }
-            (
-                TxnState::Write,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-                ),
-                Some(txn_id),
-            ) => {
-                self.state = TxnState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (TxnState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. }), _) => {
-                self.txn_id = None;
-                self.output = Some(Ok(()));
-                self.state = TxnState::Finish;
-                smallvec![]
-            }
-            _ => {
-                let error = unexpected(&self.state, "central write step", &event);
-                self.fail(error)
-            }
+        if decode_central(result.value()?.as_ref())? != self.expected {
+            return Err(CentralStoreError::Stale);
         }
+        let (space, key) = central_row();
+        let call = match &self.next {
+            Some(next) => IoCall::Write(vec![(space, key, next.to_bytes()?.into())]),
+            None => IoCall::Delete(vec![(space, key)]),
+        };
+        self.written = true;
+        Ok(Next::Call(call))
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == TxnState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(CentralStoreError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
@@ -283,9 +150,8 @@ pub struct ChargeUsageOperation {
     user_id: UserId,
     today: u32,
     limit: Option<u32>,
-    txn_id: Option<TxnId>,
-    state: TxnState,
-    output: Option<Result<AssistantUsage, CentralStoreError>>,
+    /// The charged row once its write was sent.
+    charged: Option<AssistantUsage>,
 }
 
 impl ChargeUsageOperation {
@@ -294,100 +160,34 @@ impl ChargeUsageOperation {
             user_id,
             today,
             limit,
-            txn_id: None,
-            state: TxnState::Init,
-            output: None,
+            charged: None,
         }
-    }
-
-    fn fail(&mut self, error: CentralStoreError) -> Effects {
-        let cleanup = self.abort();
-        self.output = Some(Err(error));
-        self.state = TxnState::Finish;
-        cleanup
-    }
-
-    fn handle_read(&mut self, value: Option<&Value>, txn_id: TxnId) -> Effects {
-        let usage = match decode_usage(value) {
-            Ok(usage) => usage,
-            Err(error) => return self.fail(error.into()),
-        };
-        let next = match charge(usage, self.today, self.limit) {
-            Ok(next) => next,
-            Err(reached) => return self.fail(CentralStoreError::QuotaReached(reached)),
-        };
-        let bytes = match next.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.output = Some(Ok(next));
-        self.state = TxnState::Write;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: ASSISTANT_USAGE_KEYSPACE.to_string(),
-            key: usage_key(self.user_id),
-            value: bytes.into(),
-            txn_id: Some(txn_id),
-        })]
     }
 }
 
-impl EffectOperation for ChargeUsageOperation {
+impl Operation for ChargeUsageOperation {
     type Output = AssistantUsage;
     type Error = CentralStoreError;
 
-    fn start(&mut self) -> Effects {
-        self.state = TxnState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<AssistantUsage>, CentralStoreError> {
+        Ok(Next::Call(IoCall::Read(vec![usage_row(self.user_id)])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
+    fn next(&mut self, result: IoResult) -> Result<Next<AssistantUsage>, CentralStoreError> {
+        if let Some(charged) = self.charged.take() {
+            result.done()?;
+            return Ok(Next::Done(charged));
         }
-        match (self.state, &event, self.txn_id) {
-            (TxnState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id }), _) => {
-                self.txn_id = Some(*txn_id);
-                self.state = TxnState::Read;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: ASSISTANT_USAGE_KEYSPACE.to_string(),
-                    key: usage_key(self.user_id),
-                    txn_id: Some(*txn_id),
-                })]
-            }
-            (TxnState::Read, Event::Storage(StorageEvent::ReadResult { value, .. }), Some(id)) => {
-                self.handle_read(value.as_ref(), id)
-            }
-            (TxnState::Write, Event::Storage(StorageEvent::WriteResult { .. }), Some(txn_id)) => {
-                self.state = TxnState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (TxnState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. }), _) => {
-                self.txn_id = None;
-                self.state = TxnState::Finish;
-                smallvec![]
-            }
-            _ => {
-                let error = unexpected(&self.state, "usage charge step", &event);
-                self.fail(error)
-            }
-        }
+        let usage = decode_usage(result.value()?.as_ref())?;
+        let next = charge(usage, self.today, self.limit).map_err(CentralStoreError::QuotaReached)?;
+        let (space, key) = usage_row(self.user_id);
+        let call = IoCall::Write(vec![(space, key, next.to_bytes()?.into())]);
+        self.charged = Some(next);
+        Ok(Next::Call(call))
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == TxnState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match (self.state, self.output) {
-            (TxnState::Finish, Some(output)) => output,
-            _ => Err(CentralStoreError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
