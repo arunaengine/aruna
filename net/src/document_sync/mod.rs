@@ -25,12 +25,12 @@ use aruna_core::UserId;
 use aruna_core::admin_checks::{
     AdminOperationFamily, coalescible_config_op, config_mutation_allowed, family_matches_targets,
     foreign_actor_allowed, has_write_permission, origin_may_publish, revocation_origin_full,
-    revocation_origin_known, service_owner, validate_event_scope, validate_shape,
+    revocation_origin_known, service_owner, validate_config_actor, validate_config_target,
+    validate_event_scope, validate_revocation_snapshot, validate_shape,
 };
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
-use aruna_core::auth::valid_revocation_expiry;
 use aruna_core::deferred_topics::{
     DeferredRegistrationOutcome, DocumentSyncDependency, register_deferred_topic,
     remove_deferred_topic, satisfied_dependencies,

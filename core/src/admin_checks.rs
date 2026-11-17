@@ -680,6 +680,81 @@ pub fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
     )
 }
 
+/// The realm a realm-config operation addresses: the sync target, payload
+/// target, and document must all name the same realm.
+pub fn validate_config_target(
+    document_target: &DocumentTarget,
+    event: &AdminDocumentEvent,
+) -> Result<RealmId, String> {
+    let DocumentTarget::RealmConfig { realm_id } = document_target else {
+        return Err(
+            "realm config admin operation sync only supports realm config targets".to_string(),
+        );
+    };
+    let AdminDocumentTarget::RealmConfig {
+        realm_id: event_realm_id,
+    } = &event.target
+    else {
+        return Err("admin document operation payload target is not a realm config".to_string());
+    };
+    if event_realm_id != realm_id {
+        return Err(format!(
+            "replicated realm config admin operation target {realm_id} does not match payload realm id {event_realm_id}"
+        ));
+    }
+    Ok(*realm_id)
+}
+
+/// Whether a realm-config event's origin node and actor belong to the target
+/// realm.
+pub fn validate_config_actor(realm_id: RealmId, event: &AdminDocumentEvent) -> Result<(), String> {
+    // A federated user may only revoke its own token, which this realm issued.
+    let own_revocation = matches!(
+        &event.op,
+        AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. }
+            if *token_owner == event.actor.user_id && !token_owner.is_nil()
+    );
+    if event.origin_node_id != event.actor.node_id
+        || event.actor.realm_id != realm_id
+        || (event.actor.user_id.realm_id != realm_id && !own_revocation)
+    {
+        return Err(
+            "realm config event actor and origin do not match the target realm".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Re-checks a revocation against the transaction snapshot: the origin must
+/// already be onboarded and the payload valid under the snapshot clock.
+pub fn validate_revocation_snapshot(
+    previous_config: Option<&RealmConfigDocument>,
+    previous_state: Option<&AdminDocumentState>,
+    event: &AdminDocumentEvent,
+    realm_id: RealmId,
+    raw_now: u64,
+) -> Result<(), String> {
+    let valid = revocation_origin_known(previous_config, previous_state, event, realm_id);
+    if !valid {
+        return Err(
+            "revocation origin is not an onboarded realm node in the transaction snapshot"
+                .to_string(),
+        );
+    }
+    if let AdminDocumentOperation::ConfigTokenRevoked {
+        token_hash,
+        expires_at,
+        token_owner,
+    } = &event.op
+        && (!crate::auth::valid_token_hash(token_hash)
+            || !valid_revocation_expiry(*expires_at, raw_now)
+            || token_owner.is_nil())
+    {
+        return Err("replicated revocation has invalid hash, expiry, or owner".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

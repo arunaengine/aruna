@@ -9,6 +9,7 @@ use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::alpn::Alpn;
+use aruna_core::auth::valid_revocation_expiry;
 use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
 use aruna_core::deferred_topics::TOPICS_PER_DEPENDENCY;
 use aruna_core::document::{DocumentChangeKind, DocumentSyncRevision};
