@@ -84,8 +84,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
     PersistentIdMapping, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError,
     SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage,
-    build_quarantine_entries, persistent_id_change, persistent_id_key, persistent_id_target,
-    quarantine_usage_entry, secondary_index_deletes, secondary_index_entries,
+    SyncRejection, build_quarantine_entries, persistent_id_change, persistent_id_key,
+    persistent_id_target, quarantine_usage_entry, secondary_index_deletes, secondary_index_entries,
 };
 use aruna_core::sync_checks::{
     node_info_supersedes, published_by, validate_node_upsert, validate_pid_mapping,
@@ -160,42 +160,6 @@ struct PendingCreateApply {
     lifecycle_revision: Option<DocumentChange>,
     /// The author's commit message for the event's ARC snapshot.
     message: Option<String>,
-}
-
-/// A permanently rejected sync operation awaiting durable evidence. Evidence is
-/// materialized only as the cursor advances past it, so both land in one
-/// transaction; the identity is transport-derived, so undecodable payloads stay keyed.
-struct SyncRejection {
-    identity: SyncQuarantineIdentity,
-    evidence: SyncQuarantineEvidence,
-    reason: String,
-}
-
-impl SyncRejection {
-    fn new(
-        identity: SyncQuarantineIdentity,
-        event: DocumentEvent,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            identity,
-            evidence: SyncQuarantineEvidence::from_event(&event),
-            reason: reason.into(),
-        }
-    }
-
-    /// Evidence for a payload that could not be decoded into an event at all.
-    fn raw(identity: SyncQuarantineIdentity, bytes: Vec<u8>, reason: impl Into<String>) -> Self {
-        Self {
-            identity,
-            evidence: SyncQuarantineEvidence::raw(bytes),
-            reason: reason.into(),
-        }
-    }
-
-    fn topic_id(&self) -> ::irokle::TopicId {
-        self.identity.topic
-    }
 }
 
 struct DocumentEventBatch {
