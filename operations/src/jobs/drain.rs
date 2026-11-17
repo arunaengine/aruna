@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
-use aruna_storage::StorageHandle;
+use crate::driver::DriverContext;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use tracing::warn;
@@ -78,7 +78,7 @@ pub struct JobDrainResult {
 /// expired external attempt routes to `reconciler`. Only records owned by
 /// `owner_node_id` are claimed: a JobId executes on its immutable owner.
 pub async fn drain_job_batch(
-    storage: &StorageHandle,
+    context: &DriverContext,
     owner_node_id: NodeId,
     budget: JobClassBudget,
     reconciler: Option<&Arc<dyn ExternalReconciler>>,
@@ -86,13 +86,13 @@ pub async fn drain_job_batch(
     let now_ms = unix_timestamp_millis();
     let mut result = JobDrainResult::default();
 
-    claim_due_jobs(storage, owner_node_id, now_ms, budget, &mut result).await?;
+    claim_due_jobs(context, owner_node_id, now_ms, budget, &mut result).await?;
 
     if !result.retry_after_error {
         let mut start_after = None;
         for _ in 0..2 {
             match scan_ready(
-                storage,
+                context,
                 LEASE_INDEX_PREFIX,
                 now_ms,
                 DRAIN_BATCH_SIZE,
@@ -105,7 +105,7 @@ pub async fn drain_job_batch(
                     let reconciled_before = result.reconciled;
                     for (ts, job_id) in expired_leases {
                         match requeue_job(
-                            storage,
+                            context,
                             job_id,
                             None,
                             now_ms,
@@ -118,7 +118,7 @@ pub async fn drain_job_batch(
                             // terminalize a healthy container this node cannot even observe.
                             Ok(RequeueOutcome::NeedsReconcile(record)) => {
                                 if let Some(reconciler) = reconciler {
-                                    reconciler.reconcile_lost_attempt(storage, record).await;
+                                    reconciler.reconcile_lost_attempt(context, record).await;
                                 }
                                 result.reconciled = result.reconciled.saturating_add(1);
                             }
@@ -129,7 +129,7 @@ pub async fn drain_job_batch(
                             Ok(_) => result.swept = result.swept.saturating_add(1),
                             Err(JobMutationError::NotFound) => {
                                 if let Err(error) =
-                                    delete_schedule_row(storage, lease_index_key(ts, job_id)).await
+                                    delete_schedule_row(context, lease_index_key(ts, job_id)).await
                                 {
                                     warn!(error = %error, "Failed to drop orphaned job lease index row");
                                     result.retry_after_error = true;
@@ -163,7 +163,7 @@ pub async fn drain_job_batch(
         }
     }
 
-    match next_drain_delays(storage).await {
+    match next_drain_delays(context).await {
         Ok((due, lease)) => {
             result.next_due_after = min_delay(due, lease);
         }
@@ -179,7 +179,7 @@ pub async fn drain_job_batch(
 /// class is saturated is skipped without a write: claiming it would only release it
 /// again, churning storage while the drain re-arms at zero.
 async fn claim_due_jobs(
-    storage: &StorageHandle,
+    context: &DriverContext,
     owner_node_id: NodeId,
     now_ms: u64,
     mut budget: JobClassBudget,
@@ -192,7 +192,7 @@ async fn claim_due_jobs(
     let mut start_after = None;
     'pages: loop {
         let (values, next) = match iter_prefix_page(
-            storage,
+            &context.storage_handle,
             SCHEDULE_INDEX_KEYSPACE,
             Some(ByteView::from(DUE_INDEX_PREFIX.to_vec())),
             start_after.take(),
@@ -218,7 +218,7 @@ async fn claim_due_jobs(
                 Ok(parsed) => parsed,
                 Err(error) => {
                     warn!(error = %error, "Deleting malformed job due index row");
-                    if let Err(error) = delete_schedule_row(storage, key).await {
+                    if let Err(error) = delete_schedule_row(context, key).await {
                         warn!(error = %error, "Failed to drop malformed job due index row");
                         result.retry_after_error = true;
                         break 'pages;
@@ -230,12 +230,12 @@ async fn claim_due_jobs(
             if ts > now_ms {
                 break 'pages;
             }
-            let record = match read_job_record(storage, job_id, None).await {
+            let record = match read_job_record(context, job_id, None).await {
                 Ok(Some(record)) => record,
                 // Orphaned index row (record gone/quarantined): drop it so it cannot
                 // pin the drain timer at zero forever.
                 Ok(None) => {
-                    if let Err(error) = delete_schedule_row(storage, key).await {
+                    if let Err(error) = delete_schedule_row(context, key).await {
                         warn!(error = %error, "Failed to drop orphaned job due index row");
                         result.retry_after_error = true;
                         break 'pages;
@@ -252,7 +252,7 @@ async fn claim_due_jobs(
             // owner may run the job, so drop it rather than claim it or pin the timer.
             if record.owner_node_id != owner_node_id {
                 warn!(job_id = %job_id, owner = %record.owner_node_id, "Dropping due row for a foreign-owned job");
-                if let Err(error) = delete_schedule_row(storage, key).await {
+                if let Err(error) = delete_schedule_row(context, key).await {
                     warn!(error = %error, "Failed to drop foreign-owned job due row");
                     result.retry_after_error = true;
                     break 'pages;
@@ -264,7 +264,7 @@ async fn claim_due_jobs(
                 result.deferred_saturated = true;
                 continue;
             }
-            match claim_job(storage, job_id, owner_node_id, now_ms).await {
+            match claim_job(context, job_id, owner_node_id, now_ms).await {
                 Ok(ClaimOutcome::Claimed(record)) => {
                     budget.take(record.execution_class);
                     result.claimed.push(record);
@@ -278,7 +278,7 @@ async fn claim_due_jobs(
                 }
                 Ok(ClaimOutcome::NotEligible) => {}
                 Err(JobMutationError::NotFound) => {
-                    if let Err(error) = delete_schedule_row(storage, key).await {
+                    if let Err(error) = delete_schedule_row(context, key).await {
                         warn!(error = %error, "Failed to drop orphaned job due index row");
                         result.retry_after_error = true;
                         break 'pages;
@@ -301,9 +301,9 @@ async fn claim_due_jobs(
     Ok(())
 }
 
-async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), String> {
+async fn delete_schedule_row(context: &DriverContext, key: Key) -> Result<(), String> {
     batch_delete(
-        storage,
+        context,
         vec![(SCHEDULE_INDEX_KEYSPACE.to_string(), key)],
         None,
     )
@@ -313,12 +313,12 @@ async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), St
 /// Earliest `due/` and `lease/` heads as delays from now; lease delays observe the
 /// reconcile re-arm floor.
 async fn next_drain_delays(
-    storage: &StorageHandle,
+    context: &DriverContext,
 ) -> Result<(Option<Duration>, Option<Duration>), String> {
     let now_ms = unix_timestamp_millis();
     let delay = |ts: u64| Duration::from_millis(ts.saturating_sub(now_ms));
-    let due = first_schedule_entry(storage, DUE_INDEX_PREFIX).await?;
-    let lease = first_schedule_entry(storage, LEASE_INDEX_PREFIX).await?;
+    let due = first_schedule_entry(context, DUE_INDEX_PREFIX).await?;
+    let lease = first_schedule_entry(context, LEASE_INDEX_PREFIX).await?;
     // A reconciled attempt keeps its expired lease row, which would pin the lease
     // head at zero; floor only an already-due head, a future one fires on time.
     Ok((
@@ -343,14 +343,14 @@ fn min_delay(due: Option<Duration>, lease: Option<Duration>) -> Option<Duration>
 }
 
 /// Earliest `due/`/`lease/` head as a delay from now, with the lease re-arm floor.
-async fn next_drain_delay(storage: &StorageHandle) -> Result<Option<Duration>, String> {
-    let (due, lease) = next_drain_delays(storage).await?;
+async fn next_drain_delay(context: &DriverContext) -> Result<Option<Duration>, String> {
+    let (due, lease) = next_drain_delays(context).await?;
     Ok(min_delay(due, lease))
 }
 
 /// ShortenTimer restore (startup + re-arm loop); never pushes a deadline later.
-pub async fn restore_drain_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let after = match next_drain_delay(storage).await {
+pub async fn restore_drain_timer(context: &DriverContext, task_handle: &TaskHandle) {
+    let after = match next_drain_delay(context).await {
         Ok(Some(after)) => after,
         Ok(None) => return,
         Err(error) => {
@@ -370,7 +370,7 @@ pub async fn restore_drain_timer(storage: &StorageHandle, task_handle: &TaskHand
 }
 
 async fn scan_ready(
-    storage: &StorageHandle,
+    context: &DriverContext,
     prefix: &[u8],
     now_ms: u64,
     limit: usize,
@@ -380,7 +380,7 @@ async fn scan_ready(
         return Ok((Vec::new(), None, None));
     }
     let (values, next) = iter_prefix_page(
-        storage,
+        &context.storage_handle,
         SCHEDULE_INDEX_KEYSPACE,
         Some(ByteView::from(prefix.to_vec())),
         start_after,
@@ -403,7 +403,7 @@ async fn scan_ready(
             }
             Err(error) => {
                 warn!(error = %error, "Deleting malformed job schedule index row during scan");
-                delete_schedule_row(storage, key).await?;
+                delete_schedule_row(context, key).await?;
             }
         }
     }
@@ -434,7 +434,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExternalReconciler for RecordingReconciler {
-        async fn reconcile_lost_attempt(&self, _storage: &StorageHandle, record: JobRecord) {
+        async fn reconcile_lost_attempt(&self, _context: &DriverContext, record: JobRecord) {
             self.seen.lock().unwrap().push(record.job_id);
         }
     }
@@ -484,8 +484,9 @@ mod tests {
     async fn claims_within_capacity() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         for seq in 1..=3u128 {
-            insert_job(&storage, &queued_record(job_id(seq as u64), 1))
+            insert_job(&context, &queued_record(job_id(seq as u64), 1))
                 .await
                 .unwrap();
         }
@@ -494,7 +495,7 @@ mod tests {
             in_process: 2,
             external: 0,
         };
-        let result = drain_job_batch(&storage, node_id(7), budget, None)
+        let result = drain_job_batch(&context, node_id(7), budget, None)
             .await
             .unwrap();
         assert_eq!(result.claimed.len(), 2, "capacity caps claims");
@@ -508,12 +509,13 @@ mod tests {
         // index must not claim and release the external row it cannot run.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let external = job_id(1);
         let mut record = queued_record(external, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
         let internal = job_id(2);
-        insert_job(&storage, &queued_record(internal, 1))
+        insert_job(&context, &queued_record(internal, 1))
             .await
             .unwrap();
 
@@ -521,7 +523,7 @@ mod tests {
             in_process: 4,
             external: 0,
         };
-        let result = drain_job_batch(&storage, node_id(7), budget, None)
+        let result = drain_job_batch(&context, node_id(7), budget, None)
             .await
             .unwrap();
 
@@ -539,7 +541,7 @@ mod tests {
             "the skipped row must be reported"
         );
         assert_eq!(result.next_due_after, Some(Duration::ZERO));
-        let stored = read_job_record(&storage, external, None)
+        let stored = read_job_record(&context, external, None)
             .await
             .unwrap()
             .unwrap();
@@ -555,19 +557,20 @@ mod tests {
         // back off instead of re-arming the drain at zero.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let job_id = job_id(1);
-        insert_job(&storage, &queued_record(job_id, 1))
+        insert_job(&context, &queued_record(job_id, 1))
             .await
             .unwrap();
 
-        let result = drain_job_batch(&storage, node_id(3), JobClassBudget::default(), None)
+        let result = drain_job_batch(&context, node_id(3), JobClassBudget::default(), None)
             .await
             .unwrap();
 
         assert!(result.claimed.is_empty());
         assert!(result.deferred_saturated);
         assert_eq!(result.next_due_after, Some(Duration::ZERO));
-        let stored = read_job_record(&storage, job_id, None)
+        let stored = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -581,29 +584,31 @@ mod tests {
         // immutable owner may run a JobId, and the dead row must not pin the timer.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let foreign = job_id(1);
-        insert_job(&storage, &queued_record(foreign, 1))
+        insert_job(&context, &queued_record(foreign, 1))
             .await
             .unwrap();
 
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8), None)
             .await
             .unwrap();
 
         assert!(result.claimed.is_empty(), "no claim on a foreign owner");
-        let stored = read_job_record(&storage, foreign, None)
+        let stored = read_job_record(&context, foreign, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Queued, "the record is untouched");
         assert!(stored.claim.is_none());
-        assert_eq!(next_drain_delay(&storage).await.unwrap(), None);
+        assert_eq!(next_drain_delay(&context).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn expired_lease_requeued() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([4u8; 16]);
         let mut record = queued_record(job_id, 1);
         record.state = JobState::Running;
@@ -612,13 +617,13 @@ mod tests {
             claim_token: Ulid::generate(),
             lease_expires_ms: 1,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8), None)
             .await
             .unwrap();
         assert_eq!(result.swept, 1);
-        let requeued = read_job_record(&storage, job_id, None)
+        let requeued = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -633,6 +638,7 @@ mod tests {
     async fn external_lease_reconciled() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([0xE1; 16]);
         let mut record = queued_record(job_id, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
@@ -649,11 +655,11 @@ mod tests {
             claim_token: Ulid::generate(),
             lease_expires_ms: 1,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
         let recorder = Arc::new(RecordingReconciler::default());
         let reconciler: Arc<dyn ExternalReconciler> = recorder.clone();
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), Some(&reconciler))
+        let result = drain_job_batch(&context, node_id(3), budget_of(8), Some(&reconciler))
             .await
             .unwrap();
         assert_eq!(result.swept, 0, "external attempt is not swept");
@@ -664,7 +670,7 @@ mod tests {
             "reconciled row must not re-arm the drain at zero, got {after:?}"
         );
 
-        let stored = read_job_record(&storage, job_id, None)
+        let stored = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -679,6 +685,7 @@ mod tests {
     async fn future_lease_kept() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([5u8; 16]);
         let mut record = queued_record(job_id, 1);
         record.state = JobState::Running;
@@ -687,9 +694,9 @@ mod tests {
             claim_token: Ulid::generate(),
             lease_expires_ms: unix_timestamp_millis() + JOB_LEASE_MS,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8), None)
             .await
             .unwrap();
         assert_eq!(result.swept, 0);
@@ -700,9 +707,10 @@ mod tests {
     async fn restore_shortens_timer() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let due_far_out = unix_timestamp_millis() + 7_200_000;
         insert_job(
-            &storage,
+            &context,
             &queued_record(JobId::from_bytes([1u8; 16]), due_far_out),
         )
         .await
@@ -719,7 +727,7 @@ mod tests {
             panic!("expected timer scheduled");
         };
 
-        restore_drain_timer(&storage, &task_handle).await;
+        restore_drain_timer(&context, &task_handle).await;
 
         let Event::Task(TaskEvent::TimerScheduled { after, .. }) = task_handle
             .send_effect(Effect::Task(TaskEffect::ShortenTimer {
@@ -743,6 +751,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let orphan = JobId::from_bytes([9u8; 16]);
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -757,12 +766,12 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8), None)
             .await
             .unwrap();
         assert!(result.claimed.is_empty());
         // Self-healed: the orphan is gone and the drain timer stops returning zero.
-        assert_eq!(next_drain_delay(&storage).await.unwrap(), None);
+        assert_eq!(next_drain_delay(&context).await.unwrap(), None);
         let (rows, _) = iter_prefix_page(&storage, SCHEDULE_INDEX_KEYSPACE, None, None, 8, None)
             .await
             .unwrap();

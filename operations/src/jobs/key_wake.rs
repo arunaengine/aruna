@@ -57,7 +57,7 @@ pub async fn wake_unlocked(
     origin: (RealmId, NodeId),
     limits: &RoCrateLimits,
 ) -> Result<(usize, usize), KeyWakeError> {
-    let woken = wake_key_waits(&context.storage_handle, key, now_ms).await;
+    let woken = wake_key_waits(context, key, now_ms).await;
     // Remote waiters get owed wakes before promotion, so a corrupt archive never holds them back.
     let queued = super::remote_key::queue_wakes(context, key).await;
     super::remote_key::arm_delivery(context).await;
@@ -173,18 +173,17 @@ pub(crate) async fn version_wait(
     (node_id, group_id): (NodeId, Ulid),
     version: &VersionKey,
 ) -> Result<Option<KeyWait>, String> {
-    let storage = &context.storage_handle;
     let row_key = version.to_bytes().map_err(|error| error.to_string())?;
-    let Some(row) = read_row(storage, BLOB_VERSIONS_KEYSPACE, row_key).await? else {
+    let Some(row) = read_row(context, BLOB_VERSIONS_KEYSPACE, row_key).await? else {
         return Ok(None);
     };
     let state = BlobVersion::from_bytes(&row)
         .map_err(|error| error.to_string())?
         .state;
     let location = match (&state.location_key(), state.pending_archive(), &state) {
-        (Some(key), _, _) => read_row(storage, BLOB_LOCATIONS_KEYSPACE, key.to_bytes()).await?,
+        (Some(key), _, _) => read_row(context, BLOB_LOCATIONS_KEYSPACE, key.to_bytes()).await?,
         (None, Some(archive), _) => {
-            read_row(storage, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await?
+            read_row(context, PENDING_LOCATION_KEYSPACE, archive.to_bytes()).await?
         }
         (None, None, BlobVersionState::Reference { .. }) => None,
         (None, None, _) => return Ok(None),
@@ -200,7 +199,7 @@ pub(crate) async fn version_wait(
         Some(key) => Some(key),
         None => {
             let bucket = version.bucket.as_bytes().to_vec();
-            let settings = read_row(storage, BUCKET_ENCRYPTION_KEYSPACE, bucket).await?;
+            let settings = read_row(context, BUCKET_ENCRYPTION_KEYSPACE, bucket).await?;
             BucketEncryption::from_row(settings.as_deref())
                 .map_err(|error| error.to_string())?
                 .active_key()
@@ -221,7 +220,7 @@ pub(crate) async fn version_wait(
 }
 
 pub(crate) async fn read_row(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     key_space: &str,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, String> {
@@ -230,7 +229,7 @@ pub(crate) async fn read_row(
         key: key.into(),
         txn_id: None,
     };
-    match storage.send_storage_effect(effect).await {
+    match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => {
             Ok(value.map(|value| value.to_vec()))
         }
@@ -274,8 +273,7 @@ pub(crate) async fn park_locked(
         }
     };
     let keys: Vec<_> = waits.iter().map(|wait| wait.key).collect();
-    let storage = &context.storage_handle;
-    match park_job(storage, job_id, token, unix_timestamp_millis(), waits).await {
+    match park_job(context, job_id, token, unix_timestamp_millis(), waits).await {
         Ok(AwaitOutcome::Parked(_)) => {}
         Ok(AwaitOutcome::Skipped) => return false,
         Err(JobMutationError::TokenMismatch) => return true,
@@ -288,7 +286,7 @@ pub(crate) async fn park_locked(
     for key in keys {
         if key_unlocked(context, key).await
             && let Err(error) =
-                satisfy_key_wait(storage, job_id, key, unix_timestamp_millis()).await
+                satisfy_key_wait(context, job_id, key, unix_timestamp_millis()).await
         {
             warn!(job_id = %job_id, %error, "Failed to wake parked job");
         }
@@ -374,7 +372,6 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
-        let storage = &context.storage_handle;
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let job_id = JobId::from_bytes([5; 16]);
         let payload = JobPayload::Probe {
@@ -386,8 +383,8 @@ mod tests {
         };
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, node, 1_000, 1_000, None);
-        insert_job(storage, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, 2_000).await.unwrap()
+        insert_job(&context, &record).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node, 2_000).await.unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -399,7 +396,7 @@ mod tests {
             group_id: None,
             key,
         };
-        park_job(storage, job_id, token, 3_000, vec![wait])
+        park_job(&context, job_id, token, 3_000, vec![wait])
             .await
             .unwrap();
 
@@ -410,7 +407,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(woken, (1, 0));
-        let record = read_job_record(storage, job_id, None)
+        let record = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -617,7 +614,6 @@ mod tests {
 
         // The input copy is not converted yet; the locked bucket key still parks the job.
         let (_dir, context, node, key) = sealed_node(false).await;
-        let storage = &context.storage_handle;
         let job_id = JobId::from_bytes([5; 16]);
         let payload = JobPayload::Probe {
             steps: 1,
@@ -645,8 +641,8 @@ mod tests {
             grant: None,
             served_by: None,
         });
-        insert_job(storage, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, 2_000).await.unwrap()
+        insert_job(&context, &record).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node, 2_000).await.unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -663,13 +659,13 @@ mod tests {
         let locked = stage_error("sealed", "in", Some(BaoReadError::Refused(refusal)));
         assert!(park_on_lock(&context, &claimed, token, node, &locked).await);
 
-        let parked = read_job_record(storage, job_id, None)
+        let parked = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(parked.state, JobState::AwaitingKey);
         assert_eq!(parked.attempts, 0);
-        let waits = read_key_waits(storage, job_id).await.unwrap();
+        let waits = read_key_waits(&context, job_id).await.unwrap();
         assert_eq!(
             waits.iter().map(|wait| wait.key).collect::<Vec<_>>(),
             vec![key]
