@@ -417,14 +417,19 @@ async fn usage_counts_documents() {
     let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let node_id = iroh::SecretKey::generate().public();
     let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+        metadata_dir.path(),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )
     .unwrap();
-let metadata_handle = aruna_operations::metadata::MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
+    let metadata_handle = aruna_operations::metadata::MetadataHandle::new(
+        metadata_dir.path(),
+        storage_handle.clone(),
+        None,
+        Default::default(),
+    );
     let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let driver_ctx = Arc::new(DriverContext {

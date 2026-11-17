@@ -1193,12 +1193,15 @@ pub(crate) async fn dot_applied(
     if context.metadata_handle.is_none() {
         return Ok(true);
     }
-    match crate::metadata::send_metadata_effect(context, aruna_core::metadata::MetadataEffect::ContainsDot {
+    match crate::metadata::send_metadata_effect(
+        context,
+        aruna_core::metadata::MetadataEffect::ContainsDot {
             graph_iri: graph_iri.to_string(),
             actor: batch.actor,
             counter: batch.counter,
-        })
-        .await
+        },
+    )
+    .await
     {
         Event::Metadata(aruna_core::metadata::MetadataEvent::ContainsDotResult {
             contains,

@@ -31,7 +31,11 @@ pub async fn send_metadata_effect(context: &DriverContext, effect: MetadataEffec
 impl MetadataHandle {
     /// Runs one metadata effect on the graph store of `context`, after the graph fence
     /// and the deleted-graph check.
-    pub(crate) async fn run_effect(&self, context: &DriverContext, effect: MetadataEffect) -> Event {
+    pub(crate) async fn run_effect(
+        &self,
+        context: &DriverContext,
+        effect: MetadataEffect,
+    ) -> Event {
         let started = Instant::now();
         let event = run_effect(self, context, effect).await;
         aruna_core::telemetry::record_stage("craqle", started.elapsed());
@@ -68,8 +72,14 @@ async fn run_effect(
         _ => None,
     };
     if let MetadataEffect::DeleteGraph { graph_iri } = &effect {
-        metadata.inner.visibility_cache.remove_graph_records(graph_iri);
-        metadata.inner.visibility_cache.remove_lifecycle_entry(graph_iri);
+        metadata
+            .inner
+            .visibility_cache
+            .remove_graph_records(graph_iri);
+        metadata
+            .inner
+            .visibility_cache
+            .remove_lifecycle_entry(graph_iri);
     }
     if let Some(event) = deleted_event(context, &effect, graph_iri.as_deref()).await {
         return event;

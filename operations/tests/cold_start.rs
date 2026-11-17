@@ -111,7 +111,9 @@ async fn write_registry_records(
 }
 
 async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), BoxError> {
-    let event = aruna_operations::metadata::send_metadata_effect(handle, MetadataEffect::CreateCrate {
+    let event = aruna_operations::metadata::send_metadata_effect(
+        handle,
+        MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
                 graph_iri: graph_iri(index),
                 name: format!("Cold Start Dataset {index:05}"),
@@ -125,25 +127,24 @@ async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), 
                 durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor: None,
             },
-        })
-        .await;
+        },
+    )
+    .await;
     match event {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => Ok(()),
         other => Err(format!("create crate failed: {other:?}").into()),
     }
 }
 
-async fn timed_query(
-    handle: &DriverContext,
-    label: &str,
-) -> Result<std::time::Duration, BoxError> {
+async fn timed_query(handle: &DriverContext, label: &str) -> Result<std::time::Duration, BoxError> {
     let started = Instant::now();
-    let results = aruna_operations::metadata::query_authorized_local(handle, None,
-            None,
-            "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name } LIMIT 25"
-                .to_string(),
-        )
-        .await?;
+    let results = aruna_operations::metadata::query_authorized_local(
+        handle,
+        None,
+        None,
+        "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name } LIMIT 25".to_string(),
+    )
+    .await?;
     let elapsed = started.elapsed();
     let MetadataQueryResults::Solutions(rows) = results else {
         return Err("expected solutions".into());

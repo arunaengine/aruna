@@ -50,20 +50,18 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
     let metadata_dir = tempfile::tempdir()?;
     let storage = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
     let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-    let mut options =
-        aruna_graph::GraphOptions::default()
-            .with_search_storage(aruna_graph::MetadataSearchStorage::Memory);
+    let mut options = aruna_graph::GraphOptions::default()
+        .with_search_storage(aruna_graph::MetadataSearchStorage::Memory);
     if let Some(pool_size) = backend_pool_size {
         options = options.with_pool_size(pool_size);
     }
-    let graph = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-options,
-)?;
-let handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
+    let graph = aruna_graph::GraphHandle::open(metadata_dir.path(), node_id, None, None, options)?;
+    let handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage.clone(),
+        None,
+        Default::default(),
+    );
     // Policy loading fails closed without realm config and group documents.
     let group_id = Ulid::generate();
     let owner = aruna_core::UserId::nil(REALM);
@@ -200,7 +198,9 @@ async fn create_crate_graph(harness: &TestHarness, index: usize) -> Result<Strin
 }
 
 async fn create_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
-    let event = aruna_operations::metadata::send_metadata_effect(&harness.context, MetadataEffect::CreateCrate {
+    let event = aruna_operations::metadata::send_metadata_effect(
+        &harness.context,
+        MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
                 graph_iri: graph_iri.to_string(),
                 name: name.to_string(),
@@ -214,8 +214,9 @@ async fn create_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
                 durability: MetadataRequestDurability::Durable,
                 deterministic_actor: None,
             },
-        })
-        .await;
+        },
+    )
+    .await;
     match event {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => Ok(()),
         other => Err(format!("create crate failed: {other:?}").into()),
@@ -230,11 +231,13 @@ async fn query_names_as(
     harness: &TestHarness,
     auth: Option<AuthContext>,
 ) -> Result<Vec<String>, BoxError> {
-    let results = aruna_operations::metadata::query_authorized_local(&harness.context, auth,
-            None,
-            "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name }".to_string(),
-        )
-        .await?;
+    let results = aruna_operations::metadata::query_authorized_local(
+        &harness.context,
+        auth,
+        None,
+        "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name }".to_string(),
+    )
+    .await?;
     let MetadataQueryResults::Solutions(rows) = results else {
         return Err("expected solutions".into());
     };
@@ -412,8 +415,15 @@ async fn search_graph_iris(
     query: &str,
     limit: usize,
 ) -> Result<Vec<String>, BoxError> {
-    let hits = aruna_operations::metadata::search_authorized_local(&harness.context, auth, graph_iris, query.to_string(), limit, None)
-        .await?;
+    let hits = aruna_operations::metadata::search_authorized_local(
+        &harness.context,
+        auth,
+        graph_iris,
+        query.to_string(),
+        limit,
+        None,
+    )
+    .await?;
     Ok(hits.into_iter().map(|hit| hit.graph_iri).collect())
 }
 
@@ -489,7 +499,13 @@ async fn search_fills_limit() -> Result<(), BoxError> {
         write_deleted_lifecycle(&harness, deleted).await?;
     }
 
-    harness.context.graph_handle.as_ref().ok_or("graph store")?.flush_search_updates().await?;
+    harness
+        .context
+        .graph_handle
+        .as_ref()
+        .ok_or("graph store")?
+        .flush_search_updates()
+        .await?;
     let hits = search_graph_iris(&harness, None, None, marker, 2).await?;
 
     assert_eq!(hits.len(), 2, "search should fill the visible limit");
@@ -528,7 +544,13 @@ async fn graph_filter_first() -> Result<(), BoxError> {
     create_crate(&harness, &inside.graph_iri, &format!("inside {marker}")).await?;
     write_registry_records(&harness, &records).await?;
 
-    harness.context.graph_handle.as_ref().ok_or("graph store")?.flush_search_updates().await?;
+    harness
+        .context
+        .graph_handle
+        .as_ref()
+        .ok_or("graph store")?
+        .flush_search_updates()
+        .await?;
     let hits = search_graph_iris(
         &harness,
         None,
@@ -543,7 +565,9 @@ async fn graph_filter_first() -> Result<(), BoxError> {
 }
 
 async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
-    let event = aruna_operations::metadata::send_metadata_effect(&harness.context, MetadataEffect::CreateCrate {
+    let event = aruna_operations::metadata::send_metadata_effect(
+        &harness.context,
+        MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
                 graph_iri: graph_iri.to_string(),
                 name: name.to_string(),
@@ -557,8 +581,9 @@ async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
                 durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor: None,
             },
-        })
-        .await;
+        },
+    )
+    .await;
     match event {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => Ok(()),
         other => Err(format!("replay crate failed: {other:?}").into()),
@@ -608,12 +633,14 @@ async fn local_order_by() -> Result<(), BoxError> {
     }
     write_registry_records(&harness, &records).await?;
 
-    let results = aruna_operations::metadata::query_authorized_local(&harness.context, None,
-            None,
-            "SELECT ?name WHERE { ?s a schema:Dataset ; schema:name ?name } ORDER BY DESC(?name)"
-                .to_string(),
-        )
-        .await?;
+    let results = aruna_operations::metadata::query_authorized_local(
+        &harness.context,
+        None,
+        None,
+        "SELECT ?name WHERE { ?s a schema:Dataset ; schema:name ?name } ORDER BY DESC(?name)"
+            .to_string(),
+    )
+    .await?;
     let MetadataQueryResults::Solutions(rows) = results else {
         return Err("expected solutions".into());
     };
@@ -726,7 +753,13 @@ async fn lazy_matches_eager() -> Result<(), BoxError> {
     assert!(!contains_name(&outsider_names, "probe deleted"));
     assert!(!contains_name(&outsider_names, "probe unregistered"));
 
-    harness.context.graph_handle.as_ref().ok_or("graph store")?.flush_search_updates().await?;
+    harness
+        .context
+        .graph_handle
+        .as_ref()
+        .ok_or("graph store")?
+        .flush_search_updates()
+        .await?;
     let anonymous_hits = search_probe_graphs(&harness, None).await?;
     assert!(anonymous_hits.contains(&public_record.graph_iri));
     assert!(!anonymous_hits.contains(&private_record.graph_iri));

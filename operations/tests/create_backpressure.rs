@@ -45,13 +45,18 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
     )?;
     let node_id = iroh::SecretKey::generate().public();
     let graph_handle = aruna_graph::GraphHandle::open(
-temp_dir.path().join("metadata"),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)?;
-let metadata_handle = MetadataHandle::new(temp_dir.path().join("metadata"), storage.clone(), None, Default::default());
+        temp_dir.path().join("metadata"),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata_handle = MetadataHandle::new(
+        temp_dir.path().join("metadata"),
+        storage.clone(),
+        None,
+        Default::default(),
+    );
     let task_handle = with_drains.then(TaskHandle::new);
     let context = Arc::new(DriverContext {
         storage_handle: storage,

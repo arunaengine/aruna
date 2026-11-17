@@ -288,9 +288,7 @@ pub async fn process_graph_tombstones(
         if metadata_handle.is_none() {
             continue;
         }
-        match crate::metadata::prune_if_deleted(context, tombstone.graph_iri.clone())
-            .await
-        {
+        match crate::metadata::prune_if_deleted(context, tombstone.graph_iri.clone()).await {
             Ok(true) => result.pruned = result.pruned.saturating_add(1),
             Ok(false) => {}
             Err(error) => {
@@ -851,14 +849,19 @@ mod tests {
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+            metadata_dir.path(),
+            node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        )
         .expect("metadata handle opens");
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            storage.clone(),
+            None,
+            Default::default(),
+        );
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -913,14 +916,19 @@ let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), 
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+            metadata_dir.path(),
+            node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        )
         .expect("metadata handle opens");
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            storage.clone(),
+            None,
+            Default::default(),
+        );
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,

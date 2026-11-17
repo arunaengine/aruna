@@ -177,10 +177,8 @@ impl GraphHandle {
 
     /// Removes the local copy of one graph.
     pub async fn delete_graph(&self, graph_iri: String) -> Result<(), MetadataError> {
-        self.blocking(move |node| {
-            node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
-        })
-        .await
+        self.blocking(move |node| node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri)))
+            .await
     }
 
     /// The IRIs of every graph in the store.
@@ -190,7 +188,10 @@ impl GraphHandle {
             .await
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        Ok(graphs.iter().map(|graph| graph.as_str().to_string()).collect())
+        Ok(graphs
+            .iter()
+            .map(|graph| graph.as_str().to_string())
+            .collect())
     }
 
     /// The stored policy of every graph, by graph IRI.

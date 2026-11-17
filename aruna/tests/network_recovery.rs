@@ -136,19 +136,24 @@ async fn rejoin_peer(
     };
     let peer = NetHandle::new(config, context_storage.clone()).await?;
     let graph = match aruna_graph::GraphHandle::open(
-directory.path().join("metadata"),
-peer.node_id(),
-Some(peer.document_sync_node()),
-Some(peer.document_sync_database()),
-aruna_graph::GraphOptions::default(),
-) {
+        directory.path().join("metadata"),
+        peer.node_id(),
+        Some(peer.document_sync_node()),
+        Some(peer.document_sync_database()),
+        aruna_graph::GraphOptions::default(),
+    ) {
         Ok(metadata) => metadata,
         Err(error) => {
             peer.shutdown().await;
             return Err(error.into());
         }
     };
-let metadata = MetadataHandle::new(directory.path().join("metadata"), context_storage.clone(), Some(peer.clone()), Default::default());
+    let metadata = MetadataHandle::new(
+        directory.path().join("metadata"),
+        context_storage.clone(),
+        Some(peer.clone()),
+        Default::default(),
+    );
     let context = Arc::new(DriverContext {
         storage_handle: context_storage,
         net_handle: Some(peer.clone()),

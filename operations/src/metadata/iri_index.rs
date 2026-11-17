@@ -40,7 +40,6 @@ use super::repository::{
 const INDEX_PAGE_SIZE: usize = 128;
 const INDEX_BATCH_SIZE: usize = 128;
 
-
 /// Keeps the storage cause intact so callers can tell an overloaded backend
 /// apart from a genuine index or document problem.
 #[derive(Debug, Error)]

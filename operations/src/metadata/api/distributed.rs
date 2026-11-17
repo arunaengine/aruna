@@ -355,23 +355,27 @@ pub(super) async fn run_search_distributed(
                         crate::metadata::profile::validation::equivalent_profile_iris(&object_iri)
                     {
                         hits.extend(
-                            crate::metadata::search_local_filtered(&context, auth.clone(),
-                                    graph_iris.clone(),
-                                    query.clone(),
-                                    limit,
-                                    aruna_core::entity_patch::DCTERMS_CONFORMS_IRI.to_string(),
-                                    object_iri,
-                                    group_id,
-                                )
-                                .await
-                                .map_err(crate::metadata::handle::metadata_read_error)?,
+                            crate::metadata::search_local_filtered(
+                                &context,
+                                auth.clone(),
+                                graph_iris.clone(),
+                                query.clone(),
+                                limit,
+                                aruna_core::entity_patch::DCTERMS_CONFORMS_IRI.to_string(),
+                                object_iri,
+                                group_id,
+                            )
+                            .await
+                            .map_err(crate::metadata::handle::metadata_read_error)?,
                         );
                     }
                     merge_search_hits(hits).into_iter().take(limit).collect()
                 }
-                None => crate::metadata::search_authorized_local(&context, auth, graph_iris, query, limit, group_id)
-                    .await
-                    .map_err(crate::metadata::handle::metadata_read_error)?,
+                None => crate::metadata::search_authorized_local(
+                    &context, auth, graph_iris, query, limit, group_id,
+                )
+                .await
+                .map_err(crate::metadata::handle::metadata_read_error)?,
             };
             Ok((hits, limit))
         },

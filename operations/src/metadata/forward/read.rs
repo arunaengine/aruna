@@ -169,13 +169,15 @@ pub(super) async fn device_export(
             record,
         }),
         RoCrateExportView::Page => Ok(ExportMetadataResult::Page {
-            page: crate::metadata::export_rocrate_page(context, record.graph_iri.clone(),
-                    request.limit.unwrap_or(100).clamp(1, 1_000),
-                    request.offset,
-                    request.after.clone(),
-                )
-                .await
-                .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+            page: crate::metadata::export_rocrate_page(
+                context,
+                record.graph_iri.clone(),
+                request.limit.unwrap_or(100).clamp(1, 1_000),
+                request.offset,
+                request.after.clone(),
+            )
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?,
             record,
         }),
     }

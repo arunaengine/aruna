@@ -1023,13 +1023,18 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
     )
     .await?;
     let graph_handle = aruna_graph::GraphHandle::open(
-temp_dir.path().join("metadata"),
-net.node_id(),
-Some(net.document_sync_node()),
-Some(net.document_sync_database()),
-aruna_graph::GraphOptions::default(),
-)?;
-let metadata_handle = MetadataHandle::new(temp_dir.path().join("metadata"), storage.clone(), Some(net.clone()), Default::default());
+        temp_dir.path().join("metadata"),
+        net.node_id(),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata_handle = MetadataHandle::new(
+        temp_dir.path().join("metadata"),
+        storage.clone(),
+        Some(net.clone()),
+        Default::default(),
+    );
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
@@ -1585,13 +1590,18 @@ pub async fn spawn_node_with(
     .await?;
     let task_handle = TaskHandle::new();
     let graph_handle = aruna_graph::GraphHandle::open(
-dir.join("metadata"),
-net.node_id(),
-Some(net.document_sync_node()),
-Some(net.document_sync_database()),
-aruna_graph::GraphOptions::default(),
-)?;
-let metadata_handle = MetadataHandle::new(dir.join("metadata"), storage.clone(), Some(net.clone()), Default::default());
+        dir.join("metadata"),
+        net.node_id(),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata_handle = MetadataHandle::new(
+        dir.join("metadata"),
+        storage.clone(),
+        Some(net.clone()),
+        Default::default(),
+    );
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,

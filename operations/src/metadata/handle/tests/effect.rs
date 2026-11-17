@@ -15,14 +15,16 @@ use serde_json::Value;
 pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, DriverContext) {
     let metadata_dir = tempdir().expect("metadata dir");
     let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id_seed(9),
-None,
-None,
-aruna_graph::GraphOptions::default().with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
-)
+        metadata_dir.path(),
+        node_id_seed(9),
+        None,
+        None,
+        aruna_graph::GraphOptions::default()
+            .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
+    )
     .expect("metadata handle opens");
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage, None, Default::default());
+    let metadata_handle =
+        MetadataHandle::new(metadata_dir.path(), storage, None, Default::default());
     let metadata_handle = graph_context(storage, metadata_handle, graph_handle);
     (metadata_dir, metadata_handle)
 }
@@ -33,15 +35,18 @@ async fn plan_entity(
     actor: u8,
     name: &str,
 ) -> MetadataBatch {
-    let event = send_metadata_effect(&handle, MetadataEffect::PlanBatch {
+    let event = send_metadata_effect(
+        &handle,
+        MetadataEffect::PlanBatch {
             graph_iri: graph_iri.to_string(),
             actor: [actor; 32],
             counter: 1,
             source: MetadataBatchSource::UpsertContextualEntity {
                 jsonld: format!(r##"{{"@id":"#{name}","@type":"Person","name":"{name}"}}"##),
             },
-        })
-        .await;
+        },
+    )
+    .await;
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) = event else {
         panic!("expected a planned batch, got {event:?}");
     };
@@ -49,11 +54,14 @@ async fn plan_entity(
 }
 
 async fn merge_into(handle: &DriverContext, graph_iri: &str, batch: &MetadataBatch) -> bool {
-    let event = send_metadata_effect(&handle, MetadataEffect::MergeBatch {
+    let event = send_metadata_effect(
+        &handle,
+        MetadataEffect::MergeBatch {
             graph_iri: graph_iri.to_string(),
             batch: batch.clone(),
-        })
-        .await;
+        },
+    )
+    .await;
     let Event::Metadata(MetadataEvent::BatchMerged { applied, .. }) = event else {
         panic!("expected a merged batch, got {event:?}");
     };
@@ -61,10 +69,13 @@ async fn merge_into(handle: &DriverContext, graph_iri: &str, batch: &MetadataBat
 }
 
 async fn graph_state(handle: &DriverContext, graph_iri: &str) -> Vec<(String, String, String)> {
-    let event = send_metadata_effect(&handle, MetadataEffect::GraphSnapshot {
+    let event = send_metadata_effect(
+        &handle,
+        MetadataEffect::GraphSnapshot {
             graph_iri: graph_iri.to_string(),
-        })
-        .await;
+        },
+    )
+    .await;
     let Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) = event else {
         panic!("expected a graph snapshot, got {event:?}");
     };
@@ -84,15 +95,18 @@ async fn plan_needs_graph() {
     let (_storage_dir, storage) = auth_storage();
     let (_metadata_dir, handle) = memory_handle(storage);
 
-    let event = send_metadata_effect(&handle, MetadataEffect::PlanBatch {
+    let event = send_metadata_effect(
+        &handle,
+        MetadataEffect::PlanBatch {
             graph_iri: "urn:test:orset:absent".to_string(),
             actor: [7u8; 32],
             counter: 1,
             source: MetadataBatchSource::UpsertDataEntity {
                 jsonld: r#"{"@id":"./latest.txt","@type":"File","name":"latest.txt"}"#.to_string(),
             },
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert!(matches!(
         event,
@@ -102,9 +116,6 @@ async fn plan_needs_graph() {
         })
     ));
 }
-
-
-
 
 #[test]
 fn read_error_mapping() {
@@ -140,10 +151,13 @@ async fn merges_converge() {
     };
     for handle in [&left, &right] {
         assert!(matches!(
-            send_metadata_effect(&handle, MetadataEffect::CreateCrate {
+            send_metadata_effect(
+                &handle,
+                MetadataEffect::CreateCrate {
                     request: request.clone(),
-                })
-                .await,
+                }
+            )
+            .await,
             Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         ));
     }
@@ -303,14 +317,20 @@ async fn policy_mints_nothing() {
         .and_then(|builder| builder.build())
         .expect("sync node builds");
     let graph = aruna_graph::GraphHandle::open(
-dir.path().join("metadata"),
-node_id_seed(9),
-Some(sync_node),
-None,
-aruna_graph::GraphOptions::default().with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
-)
+        dir.path().join("metadata"),
+        node_id_seed(9),
+        Some(sync_node),
+        None,
+        aruna_graph::GraphOptions::default()
+            .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
+    )
     .expect("metadata handle opens");
-let handle = MetadataHandle::new(dir.path().join("metadata"), storage, None, Default::default());
+    let handle = MetadataHandle::new(
+        dir.path().join("metadata"),
+        storage,
+        None,
+        Default::default(),
+    );
     let handle = graph_context(storage, handle, graph);
     let graph_iri = "urn:fixture:aruna:policy:restored";
     let policy = |public| MetadataGraphPolicy {
@@ -318,7 +338,9 @@ let handle = MetadataHandle::new(dir.path().join("metadata"), storage, None, Def
         permission_paths: vec!["/groups/demo/datasets/restored".to_string()],
     };
     assert!(matches!(
-        send_metadata_effect(&handle, MetadataEffect::CreateCrate {
+        send_metadata_effect(
+            &handle,
+            MetadataEffect::CreateCrate {
                 request: MetadataCrateRequest {
                     graph_iri: graph_iri.to_string(),
                     name: "Restored".to_string(),
@@ -329,31 +351,43 @@ let handle = MetadataHandle::new(dir.path().join("metadata"), storage, None, Def
                     durability: MetadataRequestDurability::WalAlreadyDurable,
                     deterministic_actor: Some([7; 32]),
                 },
-            })
-            .await,
+            }
+        )
+        .await,
         Event::Metadata(MetadataEvent::CreateCrateResult { .. })
     ));
 
-    let event = send_metadata_effect(&handle, MetadataEffect::SetGraphPolicy {
+    let event = send_metadata_effect(
+        &handle,
+        MetadataEffect::SetGraphPolicy {
             graph_iri: graph_iri.to_string(),
             policy: policy(true),
-        })
-        .await;
+        },
+    )
+    .await;
 
     assert!(
         matches!(event, Event::Metadata(MetadataEvent::GraphPolicySet { .. })),
         "{event:?}"
     );
-    let event = send_metadata_effect(&handle, MetadataEffect::GetGraphPolicy {
+    let event = send_metadata_effect(
+        &handle,
+        MetadataEffect::GetGraphPolicy {
             graph_iri: graph_iri.to_string(),
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(
         matches!(&event, Event::Metadata(MetadataEvent::GraphPolicyResult { policy: set, .. })
             if *set == policy(true)),
         "{event:?}"
     );
-    let topic = handle.graph_handle.as_ref().expect(\"graph store\").bind_topic(graph_iri.to_string()).await
+    let topic = handle
+        .graph_handle
+        .as_ref()
+        .expect("graph store")
+        .bind_topic(graph_iri.to_string())
+        .await
         .expect("topic lookup");
     assert_eq!(topic, None);
 }

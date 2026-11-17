@@ -1398,13 +1398,13 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
     )
     .await?;
     let graph = aruna_graph::GraphHandle::open(
-&metadata_path,
-actor.node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)?;
-let metadata = MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
+        &metadata_path,
+        actor.node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata = MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),

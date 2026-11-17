@@ -17,10 +17,10 @@ use crate::driver::{
 };
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::projector::{
     PROJECTION_RETRY_AFTER, project_create_events, project_logged_events, schedule_projection_drain,
 };
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::prune_queue::process_graph_tombstones;
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::refresh_usage_targets;
@@ -595,14 +595,15 @@ async fn serve_metadata_stream(
     let process_started = Instant::now();
     let deadline = request.audit_deadline;
     let audit = request.audit.then_some(deadline);
-    let (response, response_body) = match peer_request(context, metadata, peer, request.message).await {
-        Ok(response) => (response, None),
-        Err(message) => {
-            metadata
-                .answer_request(context, peer, metadata_bytes, deadline, message)
-                .await
-        }
-    };
+    let (response, response_body) =
+        match peer_request(context, metadata, peer, request.message).await {
+            Ok(response) => (response, None),
+            Err(message) => {
+                metadata
+                    .answer_request(context, peer, metadata_bytes, deadline, message)
+                    .await
+            }
+        };
     record_elapsed_ms(&span, "process_ms", process_started);
     MetadataHandle::write_answer(stream, audit, &response, response_body).await?;
     drop(request.budget);
@@ -663,8 +664,7 @@ async fn peer_request(
             Ok(MetadataTransportMessage::ResolvedJobInputs { result })
         }
         MetadataTransportMessage::JobInputPage { submission, digest } => {
-            let page =
-                crate::jobs::records::pages::serve_page(context, peer, submission, digest);
+            let page = crate::jobs::records::pages::serve_page(context, peer, submission, digest);
             let page = Box::pin(page).await;
             Ok(MetadataTransportMessage::InputPageResult { page })
         }
@@ -1981,14 +1981,19 @@ mod tests {
             .await
             .unwrap();
             let graph_handle = aruna_graph::GraphHandle::open(
-dir.path().join("metadata"),
-net.node_id(),
-Some(net.document_sync_node()),
-Some(net.document_sync_database()),
-aruna_graph::GraphOptions::default(),
-)
+                dir.path().join("metadata"),
+                net.node_id(),
+                Some(net.document_sync_node()),
+                Some(net.document_sync_database()),
+                aruna_graph::GraphOptions::default(),
+            )
             .unwrap();
-let metadata_handle = MetadataHandle::new(dir.path().join("metadata"), storage.clone(), Some(net.clone()), Default::default());
+            let metadata_handle = MetadataHandle::new(
+                dir.path().join("metadata"),
+                storage.clone(),
+                Some(net.clone()),
+                Default::default(),
+            );
             let context = Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: Some(net.clone()),

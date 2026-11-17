@@ -481,11 +481,14 @@ async fn schedule_completed_syncs(
         return;
     }
     for sync in syncs {
-        match send_graph_effect(context, Effect::Metadata(MetadataEffect::SyncBestEffort {
+        match send_graph_effect(
+            context,
+            Effect::Metadata(MetadataEffect::SyncBestEffort {
                 graph_iri: sync.graph_iri.clone(),
                 peers: sync.peers,
-            }))
-            .await
+            }),
+        )
+        .await
         {
             Event::Metadata(MetadataEvent::GraphSyncScheduled { .. }) => {}
             Event::Metadata(MetadataEvent::Error { error, .. }) => {
@@ -867,7 +870,6 @@ fn requeue_after_ms(parks: u32) -> u64 {
     let delay = capped_backoff(base, cap, parks.saturating_sub(1), 0);
     u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
 }
-
 
 /// Runs one metadata effect on the graph store; any other effect is refused.
 async fn send_graph_effect(context: &DriverContext, effect: Effect) -> Event {
@@ -2181,12 +2183,11 @@ async fn materialize_create_event(
         .metadata_handle
         .as_ref()
         .ok_or(MetadataMaterializationError::MetadataHandleMissing)?;
-    match send_graph_effect(context, graph_materialization_effect(
-            event,
-            raw_plan.revision.as_ref(),
-            raw_plan.rebuild,
-        ))
-        .await
+    match send_graph_effect(
+        context,
+        graph_materialization_effect(event, raw_plan.revision.as_ref(), raw_plan.rebuild),
+    )
+    .await
     {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         | Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. })
@@ -2220,15 +2221,18 @@ async fn merge_batch_event(
         .ok_or(MetadataMaterializationError::MetadataHandleMissing)?;
     // A batch carries quads only, so the event's visibility is applied here the
     // way a crate replacement used to carry it.
-    match send_graph_effect(context, Effect::Metadata(MetadataEffect::SetGraphPolicy {
+    match send_graph_effect(
+        context,
+        Effect::Metadata(MetadataEffect::SetGraphPolicy {
             graph_iri: event.record.graph_iri.clone(),
             policy: MetadataGraphPolicy {
                 public: event.record.public,
                 permission_paths: vec![event.record.permission_path.clone()],
             }
             .normalized(),
-        }))
-        .await
+        }),
+    )
+    .await
     {
         Event::Metadata(MetadataEvent::GraphPolicySet { .. }) => {}
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
@@ -2248,10 +2252,13 @@ async fn merge_batch_event(
             )));
         }
     }
-    let render = match send_graph_effect(context, Effect::Metadata(MetadataEffect::ExportRoCrate {
+    let render = match send_graph_effect(
+        context,
+        Effect::Metadata(MetadataEffect::ExportRoCrate {
             graph_iri: event.record.graph_iri.clone(),
-        }))
-        .await
+        }),
+    )
+    .await
     {
         Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => jsonld,
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),

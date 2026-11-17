@@ -77,7 +77,6 @@ pub(crate) use self::read_types::metadata_read_request;
 use super::AuthToken;
 use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{QUERY_MAX_BYTES, REGISTRY_CANDIDATE_LIMIT};
-use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS};
 use super::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
     MetadataTransportMessage,
@@ -115,6 +114,7 @@ use crate::s3::object::search::{
     ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput,
 };
 use crate::s3::object::search_scan::search_local_objects;
+use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS};
 
 mod bucket_page;
 mod distributed;

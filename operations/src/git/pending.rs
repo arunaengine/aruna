@@ -85,10 +85,13 @@ async fn apply_one(
         .ok_or(GitError::Unavailable)?;
     let mut files = super::dataset::target(context, store, document, merge).await?;
     for _ in 0..8 {
-        let exported = crate::metadata::send_metadata_effect(context, MetadataEffect::ExportVersioned {
+        let exported = crate::metadata::send_metadata_effect(
+            context,
+            MetadataEffect::ExportVersioned {
                 graph_iri: document.graph_iri.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
         let MetadataEvent::VersionedExport {
             jsonld, version, ..
         } = (match exported {

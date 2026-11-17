@@ -44,13 +44,18 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
     )?;
     let node_id = iroh::SecretKey::generate().public();
     let graph_handle = aruna_graph::GraphHandle::open(
-temp_dir.path().join("metadata"),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)?;
-let metadata_handle = MetadataHandle::new(temp_dir.path().join("metadata"), storage.clone(), None, Default::default());
+        temp_dir.path().join("metadata"),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata_handle = MetadataHandle::new(
+        temp_dir.path().join("metadata"),
+        storage.clone(),
+        None,
+        Default::default(),
+    );
     let context = Arc::new(DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,

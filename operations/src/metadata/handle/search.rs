@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aruna_core::metadata::{MetadataError, MetadataSearchHit};
+use aruna_core::search_enrichment::{hit_snippet, hit_title, hit_types};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::search_enrichment::{hit_snippet, hit_title, hit_types};
 use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms, record_error};
 use aruna_core::types::GroupId;
 use aruna_graph::{GraphHandle, Properties, ReadScope};
@@ -219,8 +219,7 @@ async fn search_candidate_graphs(
 
     let authorization_started = Instant::now();
     let allowed_records =
-        select_authorized_records(&inner, auth_context, records, graph_iris, group_id)
-            .await?;
+        select_authorized_records(&inner, auth_context, records, graph_iris, group_id).await?;
     record_elapsed_ms(span, "authorization_ms", authorization_started);
     span.record("authorized_graphs", allowed_records.len() as u64);
 

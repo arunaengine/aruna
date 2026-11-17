@@ -19,11 +19,7 @@ const HIT_TYPE_MAX: usize = 8;
 
 /// Human-readable title for a search hit. Always returns a non-empty string,
 /// falling back through the schema name, the document path or subject IRI.
-pub fn hit_title(
-    properties: &[(String, Term)],
-    document_path: &str,
-    subject_iri: &str,
-) -> String {
+pub fn hit_title(properties: &[(String, Term)], document_path: &str, subject_iri: &str) -> String {
     if let Some(name) = first_literal(properties, SCHEMA_NAME) {
         let name = name.trim();
         if !name.is_empty() {

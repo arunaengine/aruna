@@ -5,9 +5,9 @@
 use aruna_core::structs::storage::format::Compression;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
 #[cfg(feature = "test-hooks")]
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

@@ -192,14 +192,19 @@ async fn setup() -> Fixture {
         realm_id: realm,
     };
     let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+        metadata_dir.path(),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )
     .unwrap();
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage_handle.clone(),
+        None,
+        Default::default(),
+    );
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,

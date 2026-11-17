@@ -2,9 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use craqle::{
-    CraqleError, CreateEntityRequest, GraphId, PatchEntityRequest, RoCrateError, vocab,
-};
+use craqle::{CraqleError, CreateEntityRequest, GraphId, PatchEntityRequest, RoCrateError, vocab};
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
 
@@ -138,9 +136,7 @@ fn property_named_node(property: &str) -> Result<NamedNode, CraqleError> {
         "datePublished" => Ok(vocab::schema_date_published()),
         "license" => Ok(vocab::schema_license()),
         "about" => Ok(vocab::schema_about()),
-        "conformsTo" => Ok(NamedNode::new_unchecked(
-            DCTERMS_CONFORMS_IRI,
-        )),
+        "conformsTo" => Ok(NamedNode::new_unchecked(DCTERMS_CONFORMS_IRI)),
         other if other.contains("://") => Ok(NamedNode::new_unchecked(other)),
         other if other.contains(':') => expand_compact_iri(other),
         other => Ok(NamedNode::new_unchecked(format!(

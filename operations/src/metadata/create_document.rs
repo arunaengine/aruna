@@ -2086,14 +2086,19 @@ mod tests {
         let metadata_storage =
             FjallStorage::open(temp.join("meta-store").to_str().unwrap()).unwrap();
         let graph_handle = aruna_graph::GraphHandle::open(
-temp.join("meta"),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+            temp.join("meta"),
+            node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        )
         .unwrap();
-let metadata_handle = MetadataHandle::new(temp.join("meta"), metadata_storage, None, Default::default());
+        let metadata_handle = MetadataHandle::new(
+            temp.join("meta"),
+            metadata_storage,
+            None,
+            Default::default(),
+        );
         Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

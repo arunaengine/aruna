@@ -71,10 +71,7 @@ impl ProfileShaclEngine {
     }
 
     /// Structural RO-Crate findings only, for a document with no Profile tag.
-    pub fn structural(
-        &self,
-        jsonld: &str,
-    ) -> Result<Vec<CrateViolation>, ProfileShaclError> {
+    pub fn structural(&self, jsonld: &str) -> Result<Vec<CrateViolation>, ProfileShaclError> {
         Ok(self.prepare(jsonld)?.structural_findings().to_vec())
     }
 

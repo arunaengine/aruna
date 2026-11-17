@@ -201,12 +201,16 @@ async fn plan_local(
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    match metadata.run_effect(context, MetadataEffect::PlanBatch {
-            graph_iri: record.graph_iri.clone(),
-            actor,
-            counter,
-            source: authored.clone(),
-        })
+    match metadata
+        .run_effect(
+            context,
+            MetadataEffect::PlanBatch {
+                graph_iri: record.graph_iri.clone(),
+                actor,
+                counter,
+                source: authored.clone(),
+            },
+        )
         .await
     {
         Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => Ok(batch),
@@ -234,10 +238,14 @@ async fn merge_local(
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    match metadata.run_effect(context, MetadataEffect::MergeBatch {
-            graph_iri: batch.graph_iri.clone(),
-            batch: batch.clone(),
-        })
+    match metadata
+        .run_effect(
+            context,
+            MetadataEffect::MergeBatch {
+                graph_iri: batch.graph_iri.clone(),
+                batch: batch.clone(),
+            },
+        )
         .await
     {
         Event::Metadata(MetadataEvent::BatchMerged { .. }) => Ok(()),
@@ -316,10 +324,14 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
         if !replays_edit(&entry) {
             continue;
         }
-        match metadata.run_effect(context, MetadataEffect::MergeBatch {
-                graph_iri: batch.graph_iri.clone(),
-                batch: (**batch).clone(),
-            })
+        match metadata
+            .run_effect(
+                context,
+                MetadataEffect::MergeBatch {
+                    graph_iri: batch.graph_iri.clone(),
+                    batch: (**batch).clone(),
+                },
+            )
             .await
         {
             Event::Metadata(MetadataEvent::BatchMerged { applied, .. }) => {
@@ -421,14 +433,20 @@ mod tests {
         )
         .unwrap();
         let graph = aruna_graph::GraphHandle::open(
-dir.path().join("metadata"),
-node(1),
-None,
-None,
-aruna_graph::GraphOptions::default().with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
-)
+            dir.path().join("metadata"),
+            node(1),
+            None,
+            None,
+            aruna_graph::GraphOptions::default()
+                .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
+        )
         .unwrap();
-let metadata = MetadataHandle::new(dir.path().join("metadata"), storage.clone(), None, Default::default());
+        let metadata = MetadataHandle::new(
+            dir.path().join("metadata"),
+            storage.clone(),
+            None,
+            Default::default(),
+        );
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -444,21 +462,24 @@ let metadata = MetadataHandle::new(dir.path().join("metadata"), storage.clone(),
                 .metadata_handle
                 .as_ref()
                 .unwrap()
-                .run_effect(&context, MetadataEffect::CreateCrate {
-                    request: MetadataCrateRequest {
-                        graph_iri: record.graph_iri.clone(),
-                        name: "Notes".to_string(),
-                        description: "Offline notes".to_string(),
-                        date_published: "2026-08-29".to_string(),
-                        license: None,
-                        policy: MetadataGraphPolicy {
-                            public: false,
-                            permission_paths: vec![record.permission_path.clone()],
+                .run_effect(
+                    &context,
+                    MetadataEffect::CreateCrate {
+                        request: MetadataCrateRequest {
+                            graph_iri: record.graph_iri.clone(),
+                            name: "Notes".to_string(),
+                            description: "Offline notes".to_string(),
+                            date_published: "2026-08-29".to_string(),
+                            license: None,
+                            policy: MetadataGraphPolicy {
+                                public: false,
+                                permission_paths: vec![record.permission_path.clone()],
+                            },
+                            durability: MetadataRequestDurability::Durable,
+                            deterministic_actor: Some([1u8; 32]),
                         },
-                        durability: MetadataRequestDurability::Durable,
-                        deterministic_actor: Some([1u8; 32]),
-                    },
-                })
+                    }
+                )
                 .await,
             Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         ));

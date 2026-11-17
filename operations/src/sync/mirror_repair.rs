@@ -33,13 +33,13 @@ use ulid::Ulid;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use aruna_core::metadata::AuthToken;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, StoreRelationshipOperation, SyncRelationshipDirection,
     SyncRelationshipError, remove_outgoing_relationship,
 };
 use crate::tasks::queue_backoff::retry_delay_ms;
+use aruna_core::metadata::AuthToken;
 
 const REPAIR_PAGE_SIZE: usize = 128;
 const REPAIR_BATCH_SIZE: usize = 64;

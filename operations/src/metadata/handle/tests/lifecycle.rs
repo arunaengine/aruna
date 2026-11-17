@@ -89,14 +89,20 @@ async fn tombstone_blocks_apply() {
     let (_storage_dir, storage) = auth_storage();
     let metadata_dir = tempdir().expect("metadata dir");
     let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id_seed(3),
-None,
-None,
-aruna_graph::GraphOptions::default().with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
-)
+        metadata_dir.path(),
+        node_id_seed(3),
+        None,
+        None,
+        aruna_graph::GraphOptions::default()
+            .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
+    )
     .expect("metadata handle opens");
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage.clone(),
+        None,
+        Default::default(),
+    );
     let metadata_handle = graph_context(storage.clone(), metadata_handle, graph_handle);
     let record = registry_record("datasets/fenced");
     let held = metadata_graph_fence(&record.graph_iri)
@@ -106,7 +112,9 @@ let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), 
     let graph_iri = record.graph_iri.clone();
     let task_handle = metadata_handle.clone();
     let task = tokio::spawn(async move {
-        send_metadata_effect(&task_handle, MetadataEffect::CreateCrate {
+        send_metadata_effect(
+            &task_handle,
+            MetadataEffect::CreateCrate {
                 request: MetadataCrateRequest {
                     graph_iri,
                     name: "fenced".to_string(),
@@ -120,8 +128,9 @@ let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), 
                     durability: MetadataRequestDurability::WalAlreadyDurable,
                     deterministic_actor: None,
                 },
-            })
-            .await
+            },
+        )
+        .await
     });
     tokio::task::yield_now().await;
 
@@ -156,7 +165,12 @@ let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), 
         }) if message.contains("deleted")
     ));
     assert!(
-        !metadata_handle.graph_handle.as_ref().expect(\"graph store\").contains_graph(record.graph_iri.clone()).await
+        !metadata_handle
+            .graph_handle
+            .as_ref()
+            .expect("graph store")
+            .contains_graph(record.graph_iri.clone())
+            .await
             .expect("graph probe succeeds")
     );
 }

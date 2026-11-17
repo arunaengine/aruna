@@ -37,6 +37,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_graph::GraphHandle;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
@@ -46,7 +47,6 @@ use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, insert_job, list_job_entries, read_job_record, transition_to_running,
 };
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_graph::GraphHandle;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
@@ -297,7 +297,13 @@ async fn build_node(
     let (metadata, graph) = if with_metadata {
         let metadata_path = root.path().join("metadata");
         std::fs::create_dir_all(&metadata_path)?;
-        let graph = GraphHandle::open(&metadata_path, net.node_id(), None, None, Default::default())?;
+        let graph = GraphHandle::open(
+            &metadata_path,
+            net.node_id(),
+            None,
+            None,
+            Default::default(),
+        )?;
         let metadata =
             MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
         (Some(metadata), Some(graph))

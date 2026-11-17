@@ -1075,14 +1075,19 @@ mod authorization_tests {
             realm_id,
         };
         let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+            metadata_dir.path(),
+            node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        )
         .unwrap();
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            storage_handle.clone(),
+            None,
+            Default::default(),
+        );
         let mut context = test_context(storage_handle);
         context.net_handle = Some(net);
         context.metadata_handle = Some(metadata_handle);

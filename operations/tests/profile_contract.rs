@@ -1347,8 +1347,11 @@ async fn graph_exists(
         aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(
             document_id,
         );
-    match aruna_operations::metadata::send_metadata_effect(&test.context, MetadataEffect::ContainsGraph { graph_iri })
-        .await
+    match aruna_operations::metadata::send_metadata_effect(
+        &test.context,
+        MetadataEffect::ContainsGraph { graph_iri },
+    )
+    .await
     {
         Event::Metadata(MetadataEvent::ContainsGraphResult { exists, .. }) => Ok(exists),
         other => Err(format!("unexpected graph existence result: {other:?}").into()),
@@ -1624,13 +1627,18 @@ async fn build_context(
     let realm_id = RealmId([77u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[77u8; 32]).public();
     let graph = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default().with_validation_disabled(validator_disabled),
-)?;
-let metadata = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
+        metadata_dir.path(),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default().with_validation_disabled(validator_disabled),
+    )?;
+    let metadata = MetadataHandle::new(
+        metadata_dir.path(),
+        storage.clone(),
+        None,
+        Default::default(),
+    );
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),

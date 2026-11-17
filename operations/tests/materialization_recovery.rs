@@ -23,12 +23,12 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::driver::DriverContext;
 use aruna_graph::GraphHandle;
-use aruna_operations::metadata::{MetadataHandle, send_metadata_effect};
+use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::materialization_queue::{
     new_materialization_job, new_pending_status, process_materialization_batch,
 };
+use aruna_operations::metadata::{MetadataHandle, send_metadata_effect};
 use aruna_storage::{FjallStorage, StorageHandle};
 use craqle::{
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateEntityRequest,
@@ -270,8 +270,7 @@ async fn retries_interrupted_apply() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let metadata_handle = test.context.as_ref();
-    match send_metadata_effect(metadata_handle, materialization_effect(&event)).await
-    {
+    match send_metadata_effect(metadata_handle, materialization_effect(&event)).await {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => {}
         other => return Err(format!("unexpected metadata event: {other:?}").into()),
     }
@@ -337,8 +336,7 @@ async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let document_id = Ulid::from_bytes([3u8; 16]);
     let create_event = create_event(&test, document_id, Ulid::from_parts(30, 1), "entity-replay");
     let metadata_handle = test.context.as_ref();
-    match send_metadata_effect(metadata_handle, materialization_effect(&create_event)).await
-    {
+    match send_metadata_effect(metadata_handle, materialization_effect(&create_event)).await {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => {}
         other => return Err(format!("unexpected metadata event: {other:?}").into()),
     }
@@ -367,8 +365,11 @@ async fn upsert_replay_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     );
     materialize_entity_upsert(metadata_handle, &patch_event).await?;
     let projected: serde_json::Value = serde_json::from_str(
-        &aruna_operations::metadata::export_rocrate_jsonld(metadata_handle, create_event.record.graph_iri.clone())
-            .await?,
+        &aruna_operations::metadata::export_rocrate_jsonld(
+            metadata_handle,
+            create_event.record.graph_iri.clone(),
+        )
+        .await?,
     )?;
     let entity = projected["@graph"]
         .as_array()
@@ -416,8 +417,7 @@ async fn materialize_entity_upsert(
     metadata_handle: &DriverContext,
     event: &MetadataEventRecord,
 ) -> Result<MetadataBatch, Box<dyn std::error::Error>> {
-    match send_metadata_effect(metadata_handle, materialization_effect(event)).await
-    {
+    match send_metadata_effect(metadata_handle, materialization_effect(event)).await {
         Event::Metadata(MetadataEvent::EntityUpsertResult { batch, .. }) => Ok(batch),
         other => Err(format!("unexpected metadata event: {other:?}").into()),
     }
@@ -508,27 +508,23 @@ fn materialization_effect(event: &MetadataEventRecord) -> MetadataEffect {
             },
         },
         MetadataEventPayload::RoCrate { jsonld }
-        | MetadataEventPayload::ReplaceRoCrate { jsonld } => {
-            MetadataEffect::ApplyRoCrate {
-                request: ApplyRoCrateRequest {
-                    graph_iri: event.record.graph_iri.clone(),
-                    jsonld: jsonld.clone(),
-                    policy,
-                    durability: MetadataRequestDurability::WalAlreadyDurable,
-                    deterministic_actor,
-                },
-            }
-        }
-        MetadataEventPayload::UpsertDataEntity { jsonld } => {
-            MetadataEffect::UpsertDataEntity {
-                request: UpsertEntityRequest {
-                    graph_iri: event.record.graph_iri.clone(),
-                    jsonld: jsonld.clone(),
-                    durability: MetadataRequestDurability::WalAlreadyDurable,
-                    deterministic_actor,
-                },
-            }
-        }
+        | MetadataEventPayload::ReplaceRoCrate { jsonld } => MetadataEffect::ApplyRoCrate {
+            request: ApplyRoCrateRequest {
+                graph_iri: event.record.graph_iri.clone(),
+                jsonld: jsonld.clone(),
+                policy,
+                durability: MetadataRequestDurability::WalAlreadyDurable,
+                deterministic_actor,
+            },
+        },
+        MetadataEventPayload::UpsertDataEntity { jsonld } => MetadataEffect::UpsertDataEntity {
+            request: UpsertEntityRequest {
+                graph_iri: event.record.graph_iri.clone(),
+                jsonld: jsonld.clone(),
+                durability: MetadataRequestDurability::WalAlreadyDurable,
+                deterministic_actor,
+            },
+        },
         MetadataEventPayload::UpsertContextualEntity { jsonld } => {
             MetadataEffect::UpsertContextualEntity {
                 request: UpsertEntityRequest {
@@ -539,12 +535,10 @@ fn materialization_effect(event: &MetadataEventRecord) -> MetadataEffect {
                 },
             }
         }
-        MetadataEventPayload::ApplyBatch { batch, .. } => {
-            MetadataEffect::MergeBatch {
-                graph_iri: event.record.graph_iri.clone(),
-                batch: batch.clone(),
-            }
-        }
+        MetadataEventPayload::ApplyBatch { batch, .. } => MetadataEffect::MergeBatch {
+            graph_iri: event.record.graph_iri.clone(),
+            batch: batch.clone(),
+        },
         MetadataEventPayload::Checkpoint { .. } => {
             unreachable!("recovery fixtures contain no checkpoints")
         }
@@ -629,7 +623,13 @@ async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::
                 None,
                 Default::default(),
             )),
-            Some(GraphHandle::open(dir.path(), node_id, None, None, Default::default())?),
+            Some(GraphHandle::open(
+                dir.path(),
+                node_id,
+                None,
+                None,
+                Default::default(),
+            )?),
         ),
         None => (None, None),
     };

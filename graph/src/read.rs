@@ -454,10 +454,22 @@ mod tests {
         };
         let graph = GraphId::new("urn:graph");
         let authorizer = scope.authorizer();
-        assert!(authorizer.authorize(&graph, &policy, CraqleAction::Read).is_ok());
-        assert!(authorizer.authorize(&graph, &policy, CraqleAction::Write).is_err());
+        assert!(
+            authorizer
+                .authorize(&graph, &policy, CraqleAction::Read)
+                .is_ok()
+        );
+        assert!(
+            authorizer
+                .authorize(&graph, &policy, CraqleAction::Write)
+                .is_err()
+        );
         let other = GraphId::new("urn:other");
-        assert!(authorizer.authorize(&other, &policy, CraqleAction::Read).is_err());
+        assert!(
+            authorizer
+                .authorize(&other, &policy, CraqleAction::Read)
+                .is_err()
+        );
     }
 
     #[tokio::test]

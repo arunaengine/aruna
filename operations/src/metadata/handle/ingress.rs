@@ -1041,9 +1041,12 @@ impl MetadataHandle {
 
     /// Reads one request frame from an inbound metadata stream under the shared frame budget
     /// and names it on the current span. Returns the deadline an audit request keeps.
-    pub(crate) async fn read_request(&self, stream: &mut BiStream) -> Result<InboundRequest, MetadataError> {
-        let audit_deadline =
-            tokio::time::Instant::now() + Duration::from_secs(super::super::audit::AUDIT_DEADLINE_SECS);
+    pub(crate) async fn read_request(
+        &self,
+        stream: &mut BiStream,
+    ) -> Result<InboundRequest, MetadataError> {
+        let audit_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(super::super::audit::AUDIT_DEADLINE_SECS);
         let (message, budget) = read_budget(&mut stream.1, &self.inner.inbound_frame_bytes).await?;
         Span::current().record("request", transport_message_kind(&message));
         let audit = matches!(&message, MetadataTransportMessage::ForwardAuditPage { .. });
@@ -1180,7 +1183,10 @@ impl MetadataHandle {
                     context, peer, *page,
                 ));
                 let answer = answer.await;
-                (MetadataTransportMessage::ReferencePageAnswer { answer }, None)
+                (
+                    MetadataTransportMessage::ReferencePageAnswer { answer },
+                    None,
+                )
             }
             MetadataTransportMessage::HandRealmKey { key } => {
                 let stored = crate::realm::promote_node::serve_realm_key(context, peer, key);

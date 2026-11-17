@@ -30,11 +30,13 @@ pub(crate) fn flush_sync_journal(
         result = field::Empty,
     );
     let started = Instant::now();
-    let result = span.in_scope(|| db.persist(if inner.sync_all {
-        fjall::PersistMode::SyncAll
-    } else {
-        fjall::PersistMode::Buffer
-    }));
+    let result = span.in_scope(|| {
+        db.persist(if inner.sync_all {
+            fjall::PersistMode::SyncAll
+        } else {
+            fjall::PersistMode::Buffer
+        })
+    });
     record_elapsed_ms(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {

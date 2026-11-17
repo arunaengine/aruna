@@ -158,13 +158,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = fixture.ctx.storage_handle.clone();
         let graph = aruna_graph::GraphHandle::open(
-dir.path().join("meta"),
-fixture.actor.node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-);
-let metadata = crate::metadata::MetadataHandle::new(dir.path().join("meta"), storage, None, Default::default());
+            dir.path().join("meta"),
+            fixture.actor.node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        );
+        let metadata = crate::metadata::MetadataHandle::new(
+            dir.path().join("meta"),
+            storage,
+            None,
+            Default::default(),
+        );
         ctx.metadata_handle = Some(metadata);
         ctx.graph_handle = Some(graph.unwrap());
         let ctx = std::sync::Arc::new(ctx);

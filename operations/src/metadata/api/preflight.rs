@@ -676,8 +676,7 @@ pub(super) async fn reference_document_title(
     let graph = context.graph_handle.as_ref()?;
     let properties = graph.describe_root(record.graph_iri.clone()).await;
     // Root subject "./" makes the fallback the document path, not the id tail.
-    let title =
-        aruna_core::search_enrichment::hit_title(&properties, &record.document_path, "./");
+    let title = aruna_core::search_enrichment::hit_title(&properties, &record.document_path, "./");
     (!title.is_empty()).then_some(title)
 }
 

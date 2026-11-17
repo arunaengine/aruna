@@ -29,11 +29,11 @@ use super::{
     VisibilityFillResult, handles, metadata_graph_fence,
 };
 use crate::driver::DriverContext;
-use crate::metadata::summary_cache::summary_cache;
 use crate::metadata::repository::{
     StorageReadError, iter_registry_effect, parse_lifecycle_read, parse_registry_iter,
     read_lifecycle_effect,
 };
+use crate::metadata::summary_cache::summary_cache;
 
 impl MetadataVisibilityCache {
     pub(super) fn new() -> Self {
@@ -414,7 +414,6 @@ impl MetadataVisibilityCache {
     }
 }
 
-
 /// Removes the local copy of `graph_iri` when its lifecycle record says it is deleted.
 pub async fn prune_if_deleted(
     context: &DriverContext,
@@ -430,7 +429,10 @@ pub async fn prune_if_deleted(
     if !graph_lifecycle_deleted(context.storage_handle.clone(), &graph_iri).await? {
         return Ok(false);
     }
-    metadata.inner.visibility_cache.remove_graph_records(&graph_iri);
+    metadata
+        .inner
+        .visibility_cache
+        .remove_graph_records(&graph_iri);
     metadata
         .inner
         .visibility_cache
@@ -464,7 +466,10 @@ impl MetadataHandle {
     }
 
     /// Removes the local copy of every deleted graph; returns how many were removed.
-    pub async fn prune_deleted_graphs(&self, context: &DriverContext) -> Result<usize, MetadataError> {
+    pub async fn prune_deleted_graphs(
+        &self,
+        context: &DriverContext,
+    ) -> Result<usize, MetadataError> {
         let graph = context
             .graph_handle
             .as_ref()

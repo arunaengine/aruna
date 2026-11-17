@@ -58,9 +58,9 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
+use aruna_graph::GraphHandle;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_graph::GraphHandle;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::{
@@ -122,7 +122,10 @@ async fn write_status(state: &ServerState, status: &MaterializationStatusRecord)
 }
 
 fn installed_graph_handle(context: &DriverContext) -> &GraphHandle {
-    context.graph_handle.as_ref().expect("graph handle installed")
+    context
+        .graph_handle
+        .as_ref()
+        .expect("graph handle installed")
 }
 
 #[tokio::test]
@@ -3195,14 +3198,19 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
     .await
     .unwrap();
     let graph_handle = aruna_graph::GraphHandle::open(
-node_dir.path().join("metadata"),
-net.node_id(),
-Some(net.document_sync_node()),
-Some(net.document_sync_database()),
-aruna_graph::GraphOptions::default(),
-)
+        node_dir.path().join("metadata"),
+        net.node_id(),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
+        aruna_graph::GraphOptions::default(),
+    )
     .unwrap();
-let metadata_handle = MetadataHandle::new(node_dir.path().join("metadata"), storage_handle.clone(), Some(net.clone()), Default::default());
+    let metadata_handle = MetadataHandle::new(
+        node_dir.path().join("metadata"),
+        storage_handle.clone(),
+        Some(net.clone()),
+        Default::default(),
+    );
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net.clone()),
@@ -4292,14 +4300,19 @@ pub(crate) async fn setup_state() -> TestState {
         realm_id,
     };
     let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+        metadata_dir.path(),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )
     .unwrap();
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage_handle.clone(),
+        None,
+        Default::default(),
+    );
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
     context.metadata_handle = Some(metadata_handle);
@@ -4380,14 +4393,19 @@ pub(crate) async fn setup_network_state() -> TestState {
         realm_id,
     };
     let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+        metadata_dir.path(),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )
     .unwrap();
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage_handle.clone(),
+        None,
+        Default::default(),
+    );
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
     context.net_handle = Some(net.clone());

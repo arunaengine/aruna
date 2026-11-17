@@ -983,13 +983,18 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone()).await?;
     let node_id = net_handle.node_id();
     let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)?;
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
+        metadata_dir.path(),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage_handle.clone(),
+        None,
+        Default::default(),
+    );
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), RealmId([5u8; 32])),
@@ -1022,13 +1027,18 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
     let realm_id = RealmId([6u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
     let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)?;
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
+        metadata_dir.path(),
+        node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage_handle.clone(),
+        None,
+        Default::default(),
+    );
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),

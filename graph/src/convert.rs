@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::entity_patch::craqle_patch_request;
 use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataCrateRequest, MetadataDot, MetadataError,
     MetadataGraphPolicy, MetadataQuadOp, MetadataRequestDurability, MetadataRoCratePage,
     MetadataValidationViolation, UpsertEntityRequest,
 };
-use aruna_core::entity_patch::craqle_patch_request;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleFjallPersistMode, CraqleNode,
     CraqleRequestDurability, CreateCrateRequest, DescribeRequest, Dot, GraphId, GraphPolicy,
@@ -63,7 +63,6 @@ pub(crate) fn upsert_contextual_entity(
     )
     .map(batch_from_craqle)
 }
-
 
 pub(crate) fn error_from_craqle(error: CraqleError) -> MetadataError {
     match error {

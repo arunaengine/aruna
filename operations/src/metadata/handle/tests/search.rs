@@ -133,7 +133,9 @@ fn scope_refuses_unlisted() {
     let scope = scope_for(vec![known], GroupPermissionRules::default());
     let cache = MetadataVisibilityCache::new();
 
-    assert!(!scope.graph_visible(&cache, &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
+    assert!(!scope.graph_visible(
+        &cache,
+        &MetadataRegistryRecord::graph_iri_for(Ulid::generate())
     ));
 }
 fn scope_for(

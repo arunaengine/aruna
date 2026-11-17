@@ -74,18 +74,15 @@ pub(super) async fn query_local_graphs(
         Some(graph_iris) => {
             let requested_graphs = graph_iris.iter().collect::<HashSet<_>>().len();
             let allowed =
-                select_authorized_graphs(&inner, auth_context, records, Some(graph_iris))
-                    .await?;
+                select_authorized_graphs(&inner, auth_context, records, Some(graph_iris)).await?;
             if allowed.len() != requested_graphs {
                 return Err(MetadataError::GraphNotFound);
             }
             LocalReadScope::Eager(allowed)
         }
-        None => {
-            LocalReadScope::Lazy(Arc::new(
-                resolve_visibility_scope(&inner, auth_context, records).await?,
-            ))
-        }
+        None => LocalReadScope::Lazy(Arc::new(
+            resolve_visibility_scope(&inner, auth_context, records).await?,
+        )),
     };
     record_elapsed_ms(&span, "authorization_ms", authorization_started);
     let lazy = match &scope {
@@ -222,5 +219,12 @@ pub async fn query_authorized_local(
     sparql: String,
 ) -> Result<MetadataQueryResults, MetadataError> {
     let (metadata, graph) = handles(context)?;
-    query_local_graphs(metadata.inner.clone(), graph, auth_context, graph_iris, sparql).await
+    query_local_graphs(
+        metadata.inner.clone(),
+        graph,
+        auth_context,
+        graph_iris,
+        sparql,
+    )
+    .await
 }

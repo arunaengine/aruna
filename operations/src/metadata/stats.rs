@@ -159,26 +159,22 @@ pub async fn count_group_purpose(
         .filter(|record| record.realm_id == realm_id && record.group_id == group_id)
         .collect::<Vec<_>>();
 
-    let classifications = stream::iter(records.into_iter().map(|record| {
-        async move {
-            if !record_materialized_read(context, &record)
-                .await
-                .map_err(|error| match error {
-                    StorageReadError::Storage(error) => {
-                        MetadataApiError::Internal(error.to_string())
-                    }
-                    StorageReadError::Conversion(error) => {
-                        MetadataApiError::Internal(error.to_string())
-                    }
-                })?
-            {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-            let summary = crate::metadata::export_summary_jsonld(context, record.graph_iri.clone())
-                .await
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            classify_root_summary(&summary, &record.graph_iri)
+    let classifications = stream::iter(records.into_iter().map(|record| async move {
+        if !record_materialized_read(context, &record)
+            .await
+            .map_err(|error| match error {
+                StorageReadError::Storage(error) => MetadataApiError::Internal(error.to_string()),
+                StorageReadError::Conversion(error) => {
+                    MetadataApiError::Internal(error.to_string())
+                }
+            })?
+        {
+            return Err(MetadataApiError::ServiceUnavailable);
         }
+        let summary = crate::metadata::export_summary_jsonld(context, record.graph_iri.clone())
+            .await
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        classify_root_summary(&summary, &record.graph_iri)
     }))
     .buffered(SUMMARY_FANOUT_LIMIT)
     .collect::<Vec<_>>()
@@ -355,14 +351,19 @@ mod tests {
             .expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let graph_handle = aruna_graph::GraphHandle::open(
-metadata_dir.path(),
-node_id,
-None,
-None,
-aruna_graph::GraphOptions::default(),
-)
+            metadata_dir.path(),
+            node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        )
         .expect("metadata handle opens");
-let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            storage.clone(),
+            None,
+            Default::default(),
+        );
         let context = Arc::new(DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
@@ -477,7 +478,9 @@ let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), 
                 root
             ]
         });
-        match crate::metadata::send_metadata_effect(&fixture.context, MetadataEffect::ApplyRoCrate {
+        match crate::metadata::send_metadata_effect(
+            &fixture.context,
+            MetadataEffect::ApplyRoCrate {
                 request: ApplyRoCrateRequest {
                     graph_iri: record.graph_iri.clone(),
                     jsonld: jsonld.to_string(),
@@ -488,8 +491,9 @@ let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), 
                     durability: MetadataRequestDurability::Durable,
                     deterministic_actor: None,
                 },
-            })
-            .await
+            },
+        )
+        .await
         {
             Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. }) => {}
             other => panic!("unexpected metadata event: {other:?}"),
