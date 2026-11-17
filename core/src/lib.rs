@@ -6,6 +6,7 @@
 
 pub mod admin_documents;
 pub mod alpn;
+pub mod archive_path;
 pub mod audit;
 pub mod auth;
 pub mod backoff;

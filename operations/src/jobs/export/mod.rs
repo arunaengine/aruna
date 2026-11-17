@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Component, Path};
 
 use crate::s3::object::get::leased;
+use aruna_core::archive_path::{KeyLayout, StorageKey, safe_zip_path, synthesized_path};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -26,7 +26,7 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
-    ensure_confined_path, object_permission_path,
+    object_permission_path,
 };
 use aruna_core::structs::storage::data::identity::{DataIdentity, content_id};
 use aruna_core::structs::storage::encryption::{
@@ -47,7 +47,6 @@ use oxttl::NQuadsParser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use ulid::Ulid;
-use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 use super::executor::{JobContext, JobRunOutcome};
@@ -205,14 +204,6 @@ impl ExportCheckpoint {
             files: self.repository_files.clone(),
         })
     }
-}
-
-/// The bucket and key an entity was authored against, used to lay the archive
-/// out like the source prefix instead of by content hash.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct StorageKey {
-    pub(crate) bucket: String,
-    pub(crate) key: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

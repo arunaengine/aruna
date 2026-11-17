@@ -409,20 +409,20 @@ pub(super) async fn linked(
         .iter()
         .filter(|linked| linked.path.is_none())
         .map(|linked| {
-            Some(crate::jobs::export::StorageKey {
+            Some(aruna_core::archive_path::StorageKey {
                 bucket: linked.object.bucket.clone(),
                 key: linked.object.key.clone(),
             })
         })
         .collect();
-    let layout = crate::jobs::export::KeyLayout::new(&sources);
+    let layout = aruna_core::archive_path::KeyLayout::new(&sources);
     for linked in linked.iter_mut().filter(|linked| linked.path.is_none()) {
-        let source = crate::jobs::export::StorageKey {
+        let source = aruna_core::archive_path::StorageKey {
             bucket: linked.object.bucket.clone(),
             key: linked.object.key.clone(),
         };
         linked.path = Some(layout.path(&source).unwrap_or_else(|| {
-            crate::jobs::export::synthesized_path(linked.object.blake3, &linked.entity)
+            aruna_core::archive_path::synthesized_path(linked.object.blake3, &linked.entity)
         }));
     }
     linked

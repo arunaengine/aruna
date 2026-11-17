@@ -616,6 +616,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "ulid 3.0.0",
+ "unicode-normalization",
  "url",
  "x25519-dalek",
  "zeroize",
