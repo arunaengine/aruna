@@ -176,6 +176,37 @@ impl IoResult {
             other => Err(unexpected(expected, other.label())),
         }
     }
+
+    fn other(&self, expected: &'static str) -> IoError {
+        IoError::Unexpected {
+            expected,
+            got: self.label(),
+        }
+    }
+
+    /// The values of a read, or the error naming the result that came instead.
+    pub fn values(self) -> Result<Vec<Option<Value>>, IoError> {
+        match self {
+            Self::Values(values) => Ok(values),
+            other => Err(other.other("IoResult::Values")),
+        }
+    }
+
+    /// The rows of a page and the key to continue after.
+    pub fn page(self) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+        match self {
+            Self::Page { rows, next } => Ok((rows, next)),
+            other => Err(other.other("IoResult::Page")),
+        }
+    }
+
+    /// The event that answered an effect or a child.
+    pub fn event(self) -> Result<Event, IoError> {
+        match self {
+            Self::Event(event) => Ok(*event),
+            other => Err(other.other("IoResult::Event")),
+        }
+    }
 }
 
 /// What an operation does next.
@@ -223,6 +254,18 @@ impl IoError {
             Self::Conflict => Ok(StorageError::TransactionConflict),
             Self::Storage(error) => Ok(error),
             other => Err(other),
+        }
+    }
+}
+
+impl From<IoError> for StorageError {
+    /// A storage failure as itself, a conflict as the transaction conflict, any other as a read
+    /// error naming it.
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => error,
+            IoError::Conflict => StorageError::TransactionConflict,
+            other => StorageError::ReadError(other.to_string()),
         }
     }
 }

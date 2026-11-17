@@ -5,14 +5,16 @@
 
 // Interval reads are bounded, so no key's whole history is read for a short page.
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, INVENTORY_KEYSPACE, PENDING_LOCATION_KEYSPACE,
     VERSION_INDEX_KEYSPACE, prefix_upper_bound,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobLocationKey, BlobVersion, BlobVersionState, VersionKey,
 };
@@ -20,8 +22,7 @@ use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, IndexEntry, Position, bound_position, head_position, index_key,
     prefix_interval,
 };
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -50,26 +51,25 @@ pub struct InventoryVersionsInput {
 #[derive(Debug, Error, PartialEq)]
 pub enum InventoryVersionsError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error("the version id marker names no version of the key marker")]
     Marker,
-    #[error("the version listing received an unexpected event: {0:?}")]
-    Unexpected(Box<Event>),
-    #[error("the version listing did not finish")]
-    NotFinished,
+    #[error("the version listing received an unexpected event: {0}")]
+    Unexpected(&'static str),
 }
 
+/// What the pending call reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
-    Init,
     ReadMarker,
     Scan,
     Versions,
     Locations,
-    Done,
 }
+
+type Step = Result<Next<ListVersionsResult>, InventoryVersionsError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Candidate {
@@ -94,14 +94,13 @@ pub struct InventoryVersionsOperation {
     rounds: usize,
     truncated: bool,
     versions: Vec<Option<BlobVersion>>,
-    output: Option<Result<ListVersionsResult, InventoryVersionsError>>,
 }
 
 impl InventoryVersionsOperation {
     pub fn new(input: InventoryVersionsInput) -> Self {
         Self {
             input,
-            state: State::Init,
+            state: State::Scan,
             start: Vec::new(),
             after: false,
             end: Vec::new(),
@@ -112,7 +111,6 @@ impl InventoryVersionsOperation {
             rounds: 0,
             truncated: false,
             versions: Vec::new(),
-            output: None,
         }
     }
 
@@ -145,7 +143,7 @@ impl InventoryVersionsOperation {
         prefix_upper_bound(&rows).unwrap_or(rows)
     }
 
-    fn begin(&mut self) -> Result<Effects, InventoryVersionsError> {
+    fn begin(&mut self) -> Step {
         if self.input.max_keys == 0 {
             return Ok(self.finish(Vec::new()));
         }
@@ -162,11 +160,8 @@ impl InventoryVersionsOperation {
         }
         if let (Some(_), Some(version_id)) = (&marker, self.input.version_id_marker) {
             self.state = State::ReadMarker;
-            return Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: VERSION_INDEX_KEYSPACE.to_string(),
-                key: index_key(self.input.set_id, version_id).into(),
-                txn_id: None,
-            })]);
+            let marker = index_key(self.input.set_id, version_id);
+            return Ok(Next::Call(read_row(VERSION_INDEX_KEYSPACE, marker)));
         }
         if let Some(marker) = marker {
             let delimited = (self.input.delimiter.as_deref())
@@ -183,7 +178,7 @@ impl InventoryVersionsOperation {
         Ok(self.scan())
     }
 
-    fn marker_read(&mut self, value: Option<Value>) -> Result<Effects, InventoryVersionsError> {
+    fn marker_read(&mut self, value: Option<Value>) -> Step {
         let entry = IndexEntry::from_bytes(&value.ok_or(InventoryVersionsError::Marker)?)?;
         let position = Position::decode(&entry.position)?;
         if Some(&position.key) != self.input.key_marker.as_ref() {
@@ -195,7 +190,7 @@ impl InventoryVersionsOperation {
         Ok(self.scan())
     }
 
-    fn scan(&mut self) -> Effects {
+    fn scan(&mut self) -> Next<ListVersionsResult> {
         if self.start >= self.end || self.rounds >= MAX_ROUNDS {
             self.truncated = self.start < self.end && self.last.is_some();
             return self.hydrate();
@@ -207,21 +202,18 @@ impl InventoryVersionsOperation {
             true => IterStart::After(self.start.clone().into()),
             false => IterStart::At(self.start.clone().into()),
         };
-        smallvec![Effect::Storage(StorageEffect::IterRange {
+        let range = StorageEffect::IterRange {
             key_space: INVENTORY_KEYSPACE.to_string(),
             start,
             end: IterEnd::Before(self.end.clone().into()),
             limit: remaining.saturating_mul(2).saturating_add(2),
             max_bytes: ROUND_BYTES,
             txn_id: None,
-        })]
+        };
+        Next::Call(IoCall::Effect(Box::new(Effect::Storage(range))))
     }
 
-    fn scanned(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        more: bool,
-    ) -> Result<Effects, InventoryVersionsError> {
+    fn scanned(&mut self, values: Vec<(Key, Value)>, more: bool) -> Step {
         for (row, value) in values {
             self.resume(row.to_vec(), true);
             let position = Position::decode(&row)?;
@@ -271,7 +263,7 @@ impl InventoryVersionsOperation {
         }
     }
 
-    fn hydrate(&mut self) -> Effects {
+    fn hydrate(&mut self) -> Next<ListVersionsResult> {
         if self.candidates.is_empty() {
             return self.finish(Vec::new());
         }
@@ -283,10 +275,7 @@ impl InventoryVersionsOperation {
             .map(|key| (BLOB_VERSIONS_KEYSPACE.to_string(), key.into()))
             .collect();
         self.state = State::Versions;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Next::Call(IoCall::Read(reads))
     }
 
     /// The location row a version's bytes are described by; governed copies stay undescribed.
@@ -315,13 +304,10 @@ impl InventoryVersionsOperation {
         }
     }
 
-    fn versions_read(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<Effects, InventoryVersionsError> {
+    fn versions_read(&mut self, values: Vec<Option<Value>>) -> Step {
         self.versions = values
             .into_iter()
-            .map(|(_, value)| {
+            .map(|value| {
                 value
                     .map(|value| BlobVersion::from_bytes(&value))
                     .transpose()
@@ -334,13 +320,10 @@ impl InventoryVersionsOperation {
             return Ok(self.items(Vec::new()));
         }
         self.state = State::Locations;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })])
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn items(&mut self, locations: Vec<(Key, Option<Value>)>) -> Effects {
+    fn items(&mut self, locations: Vec<Option<Value>>) -> Next<ListVersionsResult> {
         let mut locations = locations.into_iter();
         let mut items = Vec::new();
         let candidates = std::mem::take(&mut self.candidates);
@@ -353,7 +336,7 @@ impl InventoryVersionsOperation {
             let location = match Self::location_read(&version) {
                 Some(_) => locations
                     .next()
-                    .and_then(|(_, value)| value)
+                    .flatten()
                     .and_then(|value| BackendLocation::from_bytes(&value).ok()),
                 None => None,
             };
@@ -396,86 +379,47 @@ impl InventoryVersionsOperation {
         self.finish(items)
     }
 
-    fn finish(&mut self, items: Vec<ListVersionsItem>) -> Effects {
+    fn finish(&mut self, items: Vec<ListVersionsItem>) -> Next<ListVersionsResult> {
         let (next_key_marker, next_version_marker) = match (self.truncated, self.last.take()) {
             (true, Some((key, version_id))) => (Some(key), version_id),
             _ => (None, None),
         };
-        self.state = State::Done;
-        self.output = Some(Ok(ListVersionsResult {
+        Next::Done(ListVersionsResult {
             items,
             common_prefixes: std::mem::take(&mut self.prefixes),
             is_truncated: next_key_marker.is_some(),
             next_key_marker,
             next_version_marker,
-        }));
-        smallvec![]
+        })
     }
 
-    fn handle(&mut self, event: Event) -> Result<Effects, InventoryVersionsError> {
-        match (self.state, event) {
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (State::ReadMarker, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.marker_read(value)
-            }
-            (
-                State::Scan,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.scanned(values, next_start_after.is_some()),
-            (State::Versions, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.versions_read(values)
-            }
-            (State::Locations, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                Ok(self.items(values))
-            }
-            (_, event) => Err(InventoryVersionsError::Unexpected(Box::new(event))),
-        }
-    }
 }
 
-impl EffectOperation for InventoryVersionsOperation {
+impl Operation for InventoryVersionsOperation {
     type Output = ListVersionsResult;
     type Error = InventoryVersionsError;
 
-    fn start(&mut self) -> Effects {
-        match self.begin() {
-            Ok(effects) => effects,
-            Err(error) => {
-                self.state = State::Done;
-                self.output = Some(Err(error));
-                smallvec![]
+    fn first(&mut self) -> Step {
+        self.begin()
+    }
+
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            State::ReadMarker => {
+                let [value] = values::<1>(result)?;
+                self.marker_read(value)
             }
+            State::Scan => match result.event()? {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => self.scanned(values, next_start_after.is_some()),
+                Event::Storage(StorageEvent::Error { error }) => Err(IoError::Storage(error).into()),
+                other => Err(InventoryVersionsError::Unexpected(other.label())),
+            },
+            State::Versions => self.versions_read(result.values()?),
+            State::Locations => Ok(self.items(result.values()?)),
         }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Done {
-            return smallvec![];
-        }
-        match self.handle(event) {
-            Ok(effects) => effects,
-            Err(error) => {
-                self.state = State::Done;
-                self.output = Some(Err(error));
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn finalize(self) -> Result<ListVersionsResult, InventoryVersionsError> {
-        self.output
-            .unwrap_or(Err(InventoryVersionsError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 

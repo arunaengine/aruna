@@ -2,105 +2,54 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, StagingSourceEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CheckSourceState {
-    Init,
-    Check,
-    Finish,
-    Error,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CheckSourceError {
     #[error(transparent)]
+    Io(#[from] IoError),
+    #[error(transparent)]
     Staging(#[from] StagingSourceError),
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: CheckSourceState,
-        expected: &'static str,
-        got: &'static str,
-    },
-    #[error("Check staging source failed")]
-    CheckFailed,
+    #[error("unexpected staging answer {0}")]
+    UnexpectedEvent(&'static str),
 }
 
 #[derive(Debug, PartialEq)]
 pub struct CheckSourceOperation {
     access: ResolvedSourceAccess,
-    state: CheckSourceState,
-    output: Option<Result<(), CheckSourceError>>,
 }
 
 impl CheckSourceOperation {
     pub fn new(access: ResolvedSourceAccess) -> Self {
-        Self {
-            access,
-            state: CheckSourceState::Init,
-            output: None,
-        }
-    }
-
-    fn emit_error(&mut self, error: CheckSourceError) -> Effects {
-        self.state = CheckSourceState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+        Self { access }
     }
 }
 
-impl EffectOperation for CheckSourceOperation {
+impl Operation for CheckSourceOperation {
     type Output = ();
     type Error = CheckSourceError;
 
-    fn start(&mut self) -> Effects {
-        self.state = CheckSourceState::Check;
-        smallvec![Effect::StagingSource(StagingSourceEffect::Check {
+    fn first(&mut self) -> Result<Next<()>, CheckSourceError> {
+        let check = StagingSourceEffect::Check {
             access: self.access.clone(),
-        })]
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::StagingSource(
+            check,
+        )))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (CheckSourceState::Check, Event::StagingSource(StagingSourceEvent::CheckResult)) => {
-                self.state = CheckSourceState::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
-            (
-                CheckSourceState::Check,
-                Event::StagingSource(StagingSourceEvent::Error { error }),
-            ) => self.emit_error(error.into()),
-            (CheckSourceState::Finish, _) => smallvec![],
-            (CheckSourceState::Error, _) => self.abort(),
-            (_, event) => self.emit_error(CheckSourceError::UnexpectedEvent {
-                state: self.state.clone(),
-                expected: "Event::StagingSource(StagingSourceEvent::CheckResult)",
-                got: event.label(),
-            }),
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, CheckSourceError> {
+        match result.event()? {
+            Event::StagingSource(StagingSourceEvent::CheckResult) => Ok(Next::Done(())),
+            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
+            other => Err(CheckSourceError::UnexpectedEvent(other.label())),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CheckSourceState::Finish | CheckSourceState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CheckSourceError::CheckFailed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -119,58 +68,31 @@ mod pure_tests {
         }
     }
 
-    #[test]
-    fn check_emits_effect() {
-        let mut operation = CheckSourceOperation::new(sample_access());
-
-        let effects = operation.start();
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Check { .. })]
-        ));
+    fn answer(event: StagingSourceEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::StagingSource(event)))
     }
 
     #[test]
     fn check_finishes() {
         let mut operation = CheckSourceOperation::new(sample_access());
-        operation.start();
-
-        let effects = operation.step(Event::StagingSource(StagingSourceEvent::CheckResult));
-
-        assert!(effects.is_empty());
-        assert_eq!(operation.finalize(), Ok(()));
-    }
-
-    #[test]
-    fn check_rejects_event() {
-        let mut operation = CheckSourceOperation::new(sample_access());
-        operation.start();
-
-        let effects = operation.step(Event::Search());
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert!(matches!(
-            operation.finalize(),
-            Err(CheckSourceError::UnexpectedEvent { .. })
-        ));
+        let check = StagingSourceEffect::Check {
+            access: sample_access(),
+        };
+        let call = IoCall::Effect(Box::new(Effect::StagingSource(check)));
+        assert_eq!(operation.first(), Ok(Next::Call(call)));
+        let checked = answer(StagingSourceEvent::CheckResult);
+        assert_eq!(operation.next(checked), Ok(Next::Done(())));
     }
 
     #[test]
     fn check_exposes_error() {
         let mut operation = CheckSourceOperation::new(sample_access());
-        operation.start();
-
-        operation.step(Event::StagingSource(StagingSourceEvent::Error {
-            error: StagingSourceError::CheckError("unreachable".to_string()),
-        }));
-
+        operation.first().unwrap();
+        let error = || StagingSourceError::CheckError("unreachable".to_string());
+        let failed = answer(StagingSourceEvent::Error { error: error() });
         assert_eq!(
-            operation.finalize(),
-            Err(CheckSourceError::Staging(StagingSourceError::CheckError(
-                "unreachable".to_string()
-            )))
+            operation.next(failed),
+            Err(CheckSourceError::Staging(error()))
         );
     }
 }
