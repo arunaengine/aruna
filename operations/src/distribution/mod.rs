@@ -31,6 +31,7 @@ pub mod roots;
 pub mod routing;
 pub mod sharding;
 pub mod source_keep;
+pub mod source_plan;
 pub mod split;
 pub mod status;
 #[cfg(test)]

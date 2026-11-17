@@ -6,52 +6,32 @@
 // The whole object is read again, bound to its ETag or checked against its digests, and
 // published like any kept copy; else nothing is kept.
 
-use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent};
-use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
 use aruna_core::structs::checksum::unmatched_checksum;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
-use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
-use aruna_core::structs::storage::distribution::DistributionView;
+use aruna_core::structs::storage::blob::BlobVersionState;
 use aruna_core::structs::storage::distribution::on_use::{
     CACHE_CAPACITY_BYTES, FillClaim, KeptKind, PullPlan, claim_key,
 };
-use aruna_core::structs::storage::encryption::BucketEncryption;
-use aruna_core::types::GroupId;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::held::{HeldElsewhere, admitted};
 use super::keep::{ClaimFillOperation, Claimed, KeptCopy, PublishKeptOperation, Published};
-use super::pull::{drop_copy, drop_evicted, fill_slot, read_row, release};
+use super::pull::{drop_copy, drop_evicted, fill_slot, release};
+use super::source_plan::{KeepPlanOperation, Plan, SourceKeep};
 use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::s3::object::get::strong_validator;
 
-/// One reference a read served from its source.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SourceKeep {
-    pub bucket: String,
-    pub key: String,
-    pub version_id: Ulid,
-    /// The bucket's group, whose connector of the source root reads the bytes.
-    pub group_id: GroupId,
-    pub user_id: UserId,
-    /// The read asked for a byte range, so the member's range behaviour applies.
-    pub ranged: bool,
-}
-
 /// Keeps the reference's bytes per the member's strategy and range behaviour: before the read
 /// is served when it fills first (`true`), else in the background when a fill slot is free.
 pub async fn keep_first(context: &DriverContext, keep: SourceKeep) -> bool {
-    let plan = match plan(context, &keep).await {
+    let plan = match drive(KeepPlanOperation::new(keep.clone()), context).await {
         Ok(Some(plan)) => plan,
         Ok(None) => return false,
-        Err(reason) => {
-            warn!(reason, version_id = %keep.version_id, "A reference was not kept");
+        Err(error) => {
+            warn!(%error, version_id = %keep.version_id, "A reference was not kept");
             return false;
         }
     };
@@ -75,106 +55,6 @@ pub async fn keep_first(context: &DriverContext, keep: SourceKeep) -> bool {
         }
     });
     false
-}
-
-/// What a keeping member keeps of one reference version.
-struct Plan {
-    kind: KeptKind,
-    pull: PullPlan,
-    set_id: Ulid,
-    member_id: Ulid,
-    identity: [u8; 32],
-    version: BlobVersion,
-}
-
-/// Reads the version and this member's strategy; `None` when nothing is to be kept.
-async fn plan(context: &DriverContext, keep: &SourceKeep) -> Result<Option<Plan>, String> {
-    let fault = |error: &dyn std::fmt::Display| error.to_string();
-    let key = VersionKey::new(&keep.bucket, &keep.key, keep.version_id)
-        .to_bytes()
-        .map_err(|error| fault(&error))?;
-    let Some(version) = read_row(context, BLOB_VERSIONS_KEYSPACE, key)
-        .await
-        .map_err(|error| fault(&error))?
-    else {
-        return Ok(None);
-    };
-    let version = BlobVersion::from_bytes(&version).map_err(|error| fault(&error))?;
-    let BlobVersionState::Reference { source, .. } = &version.state else {
-        return Ok(None);
-    };
-    // Governed versions are served only from registered copies, never from kept ones.
-    if !version.placement_policies.is_empty() {
-        return Ok(None);
-    }
-    let Some(identity) = version
-        .identity
-        .filter(|_| HeldElsewhere::of(source, version.identity).is_none())
-    else {
-        return Ok(None);
-    };
-    let bucket = read_row(context, S3_BUCKET_KEYSPACE, keep.bucket.as_bytes().to_vec())
-        .await
-        .map_err(|error| fault(&error))?;
-    let Some(binding) = bucket
-        .as_deref()
-        .and_then(|bucket| BucketInfo::from_bytes(bucket).ok())
-        .and_then(|bucket| bucket.distribution)
-    else {
-        return Ok(None);
-    };
-    let settings = read_row(
-        context,
-        BUCKET_ENCRYPTION_KEYSPACE,
-        keep.bucket.as_bytes().to_vec(),
-    )
-    .await
-    .map_err(|error| fault(&error))?;
-    if BucketEncryption::from_row(settings.as_deref())
-        .map_err(|error| fault(&error))?
-        .active_key()
-        .is_some()
-    {
-        return Ok(None);
-    }
-    let Some(record) = read_row(
-        context,
-        DISTRIBUTION_KEYSPACE,
-        binding.set_id.to_bytes().to_vec(),
-    )
-    .await
-    .map_err(|error| fault(&error))?
-    else {
-        return Ok(None);
-    };
-    let view = DistributionView::from_bytes(&record).map_err(|error| fault(&error))?;
-    let snapshot = view.snapshot();
-    let Some(member) = snapshot.member(binding.member_id) else {
-        return Ok(None);
-    };
-    let behaviour = snapshot.config.range_behaviour(member);
-    // A passthrough range read keeps nothing, like a read through a holder.
-    let (kind, pull) = match PullPlan::choose(member.strategy, behaviour, keep.ranged, true) {
-        pull @ (PullPlan::FillFirst(kind) | PullPlan::ServeAndFill(kind)) => (kind, pull),
-        PullPlan::Stream | PullPlan::SpoolFirst => return Ok(None),
-    };
-    let size = match &version.state {
-        BlobVersionState::Reference {
-            cached_metadata, ..
-        } => cached_metadata.content_length,
-        _ => return Ok(None),
-    };
-    if !admitted(kind, size) {
-        return Ok(None);
-    }
-    Ok(Some(Plan {
-        kind,
-        pull,
-        set_id: binding.set_id,
-        member_id: binding.member_id,
-        identity,
-        version,
-    }))
 }
 
 /// Claims, reads, verifies and publishes one kept copy of a reference; `true` once kept.
