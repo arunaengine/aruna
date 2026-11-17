@@ -143,6 +143,7 @@ pub async fn create_confirmation(
         secret,
         node_capabilities: state.node_capabilities().clone(),
         now: unix_timestamp_secs(),
+        confirmation_id: ulid::Ulid::generate(),
     });
     let confirmation = drive(confirm, &state.get_ctx())
         .await

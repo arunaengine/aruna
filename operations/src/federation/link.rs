@@ -125,6 +125,8 @@ pub struct ConfirmLinkConfig {
     pub secret: Vec<u8>,
     pub node_capabilities: NodeCapabilities,
     pub now: u64,
+    /// The id of the confirmation, minted by the caller.
+    pub confirmation_id: Ulid,
 }
 
 /// Signs a short-lived confirmation for linking the foreign login to the caller's account.
@@ -172,7 +174,7 @@ impl ConfirmLinkOperation {
             foreign_issued_at: handoff.issued_at,
             issued_at: config.now,
             expires_at: config.now.saturating_add(MAX_LINK_SECS),
-            confirmation_id: Ulid::generate(),
+            confirmation_id: config.confirmation_id,
         };
         Ok(Signed::sign(confirmation, &config.node_capabilities)?)
     }
@@ -728,6 +730,7 @@ mod tests {
             secret: SECRET.to_vec(),
             node_capabilities: capabilities(),
             now,
+            confirmation_id: Ulid::from_parts(now, 1),
         })
     }
 

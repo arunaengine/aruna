@@ -400,6 +400,7 @@ pub async fn create_intent(
         nonce: request.nonce.to_ascii_lowercase(),
         node_capabilities: state.node_capabilities().clone(),
         now: unix_timestamp_secs(),
+        intent_id: ulid::Ulid::generate(),
     });
     let signed = drive(issue, &context).await.map_err(admission_refused)?;
     Ok(Json(signed))
