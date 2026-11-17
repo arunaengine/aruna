@@ -4,11 +4,27 @@
 
 use super::*;
 
+use super::distributed_types::{
+    MetadataQueryForm, aggregate_query_results, query_form, query_select_limit,
+};
 use super::export::raw_identity_matches;
+use super::export::{export_metadata_rocrate, get_visible_document};
+use super::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
+};
 use super::fanout::ensure_query_form;
+use super::list::list_visible_documents;
+use super::list_types::{ListVisibleRequest, ListVisibleResult, MetadataListOrder};
+use super::path::local_path_candidates;
 use super::path::{reduce_path_response, select_forward_peers, validate_path_resolution};
+use super::path_types::MetadataLookupResult;
 use super::path_types::sanitize_path_winner;
+use super::preflight_types::{
+    MetadataIndexState, MetadataNodeFreshness, MetadataResolvedTarget, MetadataStorageOperation,
+    ReferenceRequest, ReferenceTarget,
+};
 use super::read::ensure_permission;
+use super::search_types::SearchQueryRequest;
 
 use std::collections::BTreeMap;
 

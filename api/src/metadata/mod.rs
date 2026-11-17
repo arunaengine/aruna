@@ -22,11 +22,15 @@ use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::git::snapshot::unreadable_file;
-use aruna_operations::metadata::api::{
-    ApiQueryMode, ExportMetadataResult, ListVisibleRequest, MetadataApiError, MetadataFanoutStats,
-    MetadataListOrder, MetadataReferenceEntry, MetadataReferencesExecution,
-    RoCrateExportView as OperationMetadataRoCrateExportView, forwarded_bearer,
-    list_visible_documents as run_list_visible_metadata_documents,
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::export_types::{
+    ExportMetadataResult, RoCrateExportView as OperationMetadataRoCrateExportView,
+};
+use aruna_operations::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
+use aruna_operations::metadata::api::list::list_visible_documents as run_list_visible_metadata_documents;
+use aruna_operations::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
+use aruna_operations::metadata::api::read_types::{
+    ApiQueryMode, MetadataReferenceEntry, MetadataReferencesExecution,
 };
 use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
 use aruna_operations::metadata::forward::write::{

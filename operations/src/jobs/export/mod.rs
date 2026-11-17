@@ -70,8 +70,9 @@ use crate::blob::managed_copy::{
 use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolvePathsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::AuthToken;
-use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
 use crate::metadata::forward::read::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};

@@ -12,7 +12,8 @@ use byteview::ByteView;
 use futures_util::TryStreamExt;
 
 use crate::driver::DriverContext;
-use crate::metadata::api::{MetadataApiError, can_read_record};
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::read::can_read_record;
 use crate::metadata::persistent_id::read_mapping;
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::secondary_ids::IdentifierMatch;

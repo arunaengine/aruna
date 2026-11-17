@@ -509,7 +509,9 @@ pub(super) async fn local_pid_resolution(
             Err(MetadataApiError::ServiceUnavailable)
         };
     };
-    if crate::metadata::api::can_read_record(context.as_ref(), realm_id, None, &record).await? {
+    if crate::metadata::api::read::can_read_record(context.as_ref(), realm_id, None, &record)
+        .await?
+    {
         Ok(PersistentIdResolution::Redirect)
     } else {
         Ok(PersistentIdResolution::Missing)

@@ -13,11 +13,12 @@ use crate::metadata::{
     map_references_response,
 };
 use crate::server::state::ServerState;
-use aruna_operations::metadata::api::{
-    MetadataReferencesRequest, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
-    ReferenceTarget, references_metadata as run_references_metadata,
-    references_preflight as run_references_preflight,
+use aruna_operations::metadata::api::preflight::references_preflight as run_references_preflight;
+use aruna_operations::metadata::api::preflight_types::{
+    MetadataStorageOperation, ReferenceExecution, ReferenceRequest, ReferenceTarget,
 };
+use aruna_operations::metadata::api::read::references_metadata as run_references_metadata;
+use aruna_operations::metadata::api::read_types::MetadataReferencesRequest;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

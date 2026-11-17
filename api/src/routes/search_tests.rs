@@ -939,12 +939,14 @@ fn search_maps_partiality() {
         }],
         next_cursor: Some("opaque".to_string()),
         as_of: SystemTime::UNIX_EPOCH,
-        partitions: vec![aruna_operations::metadata::api::ObjectPartitionCoverage {
-            node_id: healthy,
-            observed_at: SystemTime::UNIX_EPOCH,
-            truncated: true,
-        }],
-        fanout_stats: aruna_operations::metadata::api::MetadataFanoutStats {
+        partitions: vec![
+            aruna_operations::metadata::api::search_types::ObjectPartitionCoverage {
+                node_id: healthy,
+                observed_at: SystemTime::UNIX_EPOCH,
+                truncated: true,
+            },
+        ],
+        fanout_stats: aruna_operations::metadata::api::fanout_types::MetadataFanoutStats {
             nodes_queried: 2,
             nodes_failed: 1,
             failed_partitions: vec![failed],
@@ -984,7 +986,7 @@ fn passes_documents_truncated() {
         hits: Vec::new(),
         next_cursor: None,
         truncated: true,
-        fanout_stats: aruna_operations::metadata::api::MetadataFanoutStats {
+        fanout_stats: aruna_operations::metadata::api::fanout_types::MetadataFanoutStats {
             nodes_queried: 1,
             nodes_failed: 0,
             failed_partitions: Vec::new(),

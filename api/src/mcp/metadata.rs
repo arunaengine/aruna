@@ -11,11 +11,15 @@ use super::{
 use crate::lookup::actor;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::metadata::api::{
-    DocumentQueryRequest, ExportMetadataRequest, MetadataQueryRequest, MetadataReferencesRequest,
-    MetadataSearchRequest, RoCrateExportView, query_metadata, query_metadata_document,
-    references_metadata, search_metadata,
+use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
+use aruna_operations::metadata::api::read::{
+    query_metadata, query_metadata_document, references_metadata,
 };
+use aruna_operations::metadata::api::read_types::{
+    DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
+};
+use aruna_operations::metadata::api::search::search_metadata;
+use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::read::export_rocrate_routed;
 use aruna_operations::metadata::forward::write::route_metadata_update;

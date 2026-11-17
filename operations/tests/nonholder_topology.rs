@@ -31,10 +31,12 @@ use aruna_operations::jobs::service::{
 use aruna_operations::jobs::store::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
 use aruna_operations::metadata::AuthToken;
-use aruna_operations::metadata::api::{
-    ApiQueryMode, DocumentQueryRequest, ExportMetadataRequest, ExportMetadataResult,
-    MetadataApiError, RoCrateExportView, query_metadata_document,
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
+use aruna_operations::metadata::api::read::query_metadata_document;
+use aruna_operations::metadata::api::read_types::{ApiQueryMode, DocumentQueryRequest};
 use aruna_operations::metadata::create_document::{
     CreateDocumentOperation, CreateDocumentPayload, mint_forward_document, mint_local_document,
     resolve_metadata_id,

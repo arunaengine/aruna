@@ -24,8 +24,9 @@ use ulid::Ulid;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::DriverContext;
 use crate::metadata::AuthToken;
-use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
 use crate::metadata::forward::read::export_rocrate_routed;
 

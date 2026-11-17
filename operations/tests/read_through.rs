@@ -11,7 +11,7 @@ use aruna_operations::device::drain::drain_publish_queue;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::device::replica::read_replica;
 use aruna_operations::device::selection::select_document;
-use aruna_operations::metadata::api::{
+use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, GetVisibleRequest, RoCrateExportView,
 };
 use aruna_operations::metadata::create_document::mint_local_document;

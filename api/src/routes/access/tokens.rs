@@ -16,7 +16,7 @@ use aruna_operations::auth::revoke_token::{
 };
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::is_user_origin;
-use aruna_operations::metadata::api::forwarded_bearer;
+use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};

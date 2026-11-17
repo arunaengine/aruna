@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::metadata::MetadataHandle;
-use crate::metadata::api::{DocumentQueryRequest, query_metadata_document};
+use crate::metadata::api::read::query_metadata_document;
+use crate::metadata::api::read_types::DocumentQueryRequest;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };

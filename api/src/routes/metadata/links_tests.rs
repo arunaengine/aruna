@@ -301,7 +301,7 @@ async fn parts_resolve_buckets() {
 #[tokio::test]
 async fn confirms_hidden_dataset() {
     // Only the named dataset a caller may not read is confirmed, by id and without its metadata.
-    use aruna_operations::metadata::api::links_local;
+    use aruna_operations::metadata::api::links::links_local;
     let test = setup_state().await;
     store_bucket(&test, BUCKET).await;
     let raw = folder(&test, "raw/");

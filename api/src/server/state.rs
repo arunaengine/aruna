@@ -604,7 +604,7 @@ impl ServerState {
     }
 
     pub async fn load_realm_nodes(&self) -> Vec<NodeId> {
-        aruna_operations::metadata::api::load_realm_nodes(
+        aruna_operations::metadata::api::preflight::load_realm_nodes(
             self.driver_ctx.as_ref(),
             self.identity.realm_id,
             self.identity.node_id,

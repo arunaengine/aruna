@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::api::ApiQueryMode;
+use super::api::read_types::ApiQueryMode;
 
 pub const SEARCH_PAGE_SIZE: usize = 25;
 pub const SEARCH_MAX_PAGE: usize = 100;

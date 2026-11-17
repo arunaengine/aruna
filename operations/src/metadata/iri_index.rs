@@ -295,7 +295,7 @@ pub(crate) async fn lookup_iri_references(
                 records.push(record);
             }
         }
-        let live = super::api::filter_live_records(storage, &records)
+        let live = super::api::read::filter_live_records(storage, &records)
             .await
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
         let postings = page.documents.into_values().flatten().collect();
@@ -414,7 +414,7 @@ async fn rebuild_page(
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
     let storage = &context.storage_handle;
-    let registry_records = super::api::filter_live_records(storage, records)
+    let registry_records = super::api::read::filter_live_records(storage, records)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     let mut written = 0usize;

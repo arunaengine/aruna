@@ -431,7 +431,7 @@ impl MetadataHandle {
                                 .ok()
                                 .flatten()
                                 .and_then(|document| document.urls.s3);
-                                super::super::api::references_preflight_local(
+                                super::super::api::preflight::references_preflight_local(
                                     context.as_ref(),
                                     *net.realm_id(),
                                     net.node_id(),
@@ -689,7 +689,7 @@ impl MetadataHandle {
                                 {
                                     Err(MetadataReadError::Unavailable)
                                 } else {
-                                    let result = super::super::api::local_path_candidates(
+                                    let result = super::super::api::path::local_path_candidates(
                                         context.as_ref(),
                                         realm_id,
                                         group_id,
@@ -739,10 +739,10 @@ impl MetadataHandle {
                                 {
                                     Err(MetadataReadError::Unavailable)
                                 } else {
-                                    let result = super::super::api::resolve_local_path(
+                                    let result = super::super::api::path::resolve_local_path(
                                         context.as_ref(),
                                         realm_id,
-                                        super::super::api::MetadataLookupRequest {
+                                        super::super::api::path_types::MetadataLookupRequest {
                                             group_id,
                                             document_path,
                                             auth,
@@ -1088,7 +1088,7 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::api::links_local(
+                        Some(net_handle) => crate::metadata::api::links::links_local(
                             context.as_ref(),
                             *net_handle.realm_id(),
                             auth.as_ref(),
@@ -1129,7 +1129,7 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::api::set_preview_local(
+                        Some(net_handle) => crate::metadata::api::links::set_preview_local(
                             context.as_ref(),
                             *net_handle.realm_id(),
                             auth.as_ref(),

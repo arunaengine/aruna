@@ -6,7 +6,7 @@
 // Every metadata node answers from its own postings within one budget; results merge by
 // document id and say whether they are complete.
 
-pub(super) mod types;
+pub mod types;
 
 use self::types::{
     LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,

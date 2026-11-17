@@ -14,10 +14,14 @@ use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
-use aruna_operations::metadata::api::{
+use aruna_operations::metadata::api::fanout::search_buckets_distributed;
+use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
+use aruna_operations::metadata::api::search::{
+    search_metadata as run_search_metadata, search_objects,
+};
+use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectExecution, ObjectQueryMode, SearchQueryRequest, forwarded_bearer,
-    search_buckets_distributed, search_metadata as run_search_metadata, search_objects,
+    ObjectExecution, ObjectQueryMode, SearchQueryRequest,
 };
 use aruna_operations::s3::bucket::metadata::dataset_description;
 use aruna_operations::s3::object::search::ObjectKeyMatch;

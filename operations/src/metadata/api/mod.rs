@@ -42,17 +42,15 @@ use thiserror::Error;
 use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
-pub use self::distributed_types::{aggregate_query_results, query_form, query_select_limit};
 use self::distributed_types::{
     object_search_fingerprint, record_object_result, record_preflight_node,
 };
 use self::export::export_summary_jsonld;
-pub use self::export::{export_metadata_rocrate, get_visible_document};
-pub(crate) use self::export_types::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
+
 use self::fanout::run_metadata_fanout;
-pub use self::fanout::{lookup_identifier_distributed, search_buckets_distributed};
-pub use self::fanout_types::forwarded_bearer;
-pub(crate) use self::fanout_types::pattern_contains_service;
+
+use self::fanout_types::forwarded_bearer;
+
 use self::fanout_types::{MetadataFanoutOperation, MetadataNodeCall};
 use self::fanout_types::{fanout_bearer, metadata_node_call, query_union_safe};
 use self::list::{load_group_records, load_pending_records};
@@ -62,18 +60,16 @@ use self::list_types::{
     effective_list_limit,
 };
 use self::list_types::{check_policy_limit, merge_pending_records};
-pub(crate) use self::path::local_path_candidates;
+
 use self::path_types::select_fanout_nodes;
-pub use self::path_types::{deduplicate_fanout_nodes, replica_query_nodes};
-pub use self::preflight::load_realm_nodes;
-pub(crate) use self::preflight::{discover_realm_nodes, references_preflight_local};
+use self::path_types::{deduplicate_fanout_nodes, replica_query_nodes};
+
+use self::preflight::discover_realm_nodes;
 use self::preflight::{reference_document_title, resolve_graph_reference};
 use self::read::ensure_record_materialized;
-pub(crate) use self::read::{
-    can_read_record, ensure_record_readable, filter_live_records, load_live_record,
-};
-pub use self::read::{query_metadata, query_metadata_document, references_metadata};
-pub(crate) use self::read_types::metadata_read_request;
+use self::read::{can_read_record, ensure_record_readable, filter_live_records, load_live_record};
+
+use self::read_types::metadata_read_request;
 use super::AuthToken;
 use super::forward::read::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{QUERY_MAX_BYTES, REGISTRY_CANDIDATE_LIMIT};
@@ -118,66 +114,40 @@ use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS};
 
 mod bucket_page;
 mod distributed;
-mod distributed_types;
-mod export;
-mod export_types;
-mod fanout;
-mod fanout_types;
+pub mod distributed_types;
+pub mod export;
+pub mod export_types;
+pub mod fanout;
+pub mod fanout_types;
 mod join;
-mod links;
-mod list;
-mod list_types;
-mod path;
-mod path_types;
-mod preflight;
-mod preflight_types;
-mod read;
-mod read_types;
-mod search;
-mod search_types;
+pub mod links;
+pub mod list;
+pub mod list_types;
+pub mod path;
+pub mod path_types;
+pub mod preflight;
+pub mod preflight_types;
+pub mod read;
+pub mod read_types;
+pub mod search;
+pub mod search_types;
 
-pub use self::distributed_types::MetadataQueryForm;
-pub use self::export_types::{
-    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
-};
 use self::fanout_types::MetadataFanoutScope;
-pub use self::fanout_types::MetadataFanoutStats;
-pub(crate) use self::fanout_types::RealmNodeDiscovery;
-pub use self::links::types::{
-    LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
-    PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, merge_pages, merge_previews,
+use self::fanout_types::MetadataFanoutStats;
+use self::fanout_types::RealmNodeDiscovery;
+use self::links::types::{
+    LinkDocument, LinkHit, LinkNodePage, SetPreviewPage, merge_pages, merge_previews,
 };
-pub use self::links::{
-    file_queries, links_distributed, links_local, part_of, resolve_part, set_preview_distributed,
-    set_preview_local,
-};
-pub use self::list::list_visible_documents;
-pub use self::list_types::{
-    ListVisibleRequest, ListVisibleResult, ListedMetadataDocument, MetadataListOrder,
-};
-pub use self::path::lookup_metadata_path;
-pub(crate) use self::path::resolve_local_path;
+
 #[cfg(test)]
 use self::path_types::PathShardView;
-pub use self::path_types::{MetadataLookupRequest, MetadataLookupResult};
-pub use self::preflight::references_preflight;
-pub use self::preflight_types::{
-    MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
-    MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,
-    ReferenceExecution, ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
-    ReferenceRequest, ReferenceTarget, ReferenceTargetExecution,
-};
+
+use self::preflight_types::ReferenceNodeExecution;
 #[cfg(test)]
 use self::preflight_types::{authorized_realm_nodes, preflight_fingerprint};
-pub use self::read_types::{
-    ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
-    MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
-};
-pub use self::search::{search_metadata, search_objects};
-pub use self::search_types::{
-    BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectExecution, ObjectPartitionCoverage, ObjectQueryMode, SearchQueryRequest,
-};
+use self::read_types::{ApiQueryMode, MetadataReferenceEntry, MetadataReferencesRequest};
+
+use self::search_types::{BucketSearchExecution, BucketSearchRequest, ObjectQueryMode};
 #[cfg(test)]
 use self::search_types::{ObjectCursor, ObjectPartitionState, PendingBucket};
 

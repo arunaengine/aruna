@@ -347,9 +347,10 @@ pub(super) async fn list_visible_graphs(
         .ok_or_else(|| {
             MetadataError::Backend("metadata registry snapshot unavailable".to_string())
         })?;
-    let records = super::super::api::filter_live_records(&inner.storage_handle, records.as_ref())
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let records =
+        super::super::api::read::filter_live_records(&inner.storage_handle, records.as_ref())
+            .await
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
     Ok(records.into_iter().map(|record| record.graph_iri).collect())
 }
 
@@ -629,7 +630,7 @@ pub(super) async fn resolve_visibility_scope(
                     .get(&(record.realm_id, record.group_id))
                     .is_some_and(|evaluator| {
                         evaluator
-                            .evaluate(&crate::metadata::api::metadata_read_request(
+                            .evaluate(&crate::metadata::api::read_types::metadata_read_request(
                                 &record.permission_path,
                                 policy_auth,
                             ))

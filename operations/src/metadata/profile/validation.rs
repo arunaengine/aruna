@@ -27,7 +27,7 @@ use super::rules::{
     objects, profile_tags, stale_status, submission_profile_tag,
 };
 use crate::driver::DriverContext;
-use crate::metadata::api::ExportMetadataResult;
+use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 use crate::metadata::forward::read::export_profile_routed;
 use crate::metadata::raw_revision::load_raw_revision;

@@ -194,7 +194,7 @@ pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError>
             ));
         }
     };
-    if super::super::api::pattern_contains_service(pattern) {
+    if super::super::api::fanout_types::pattern_contains_service(pattern) {
         return Err(MetadataError::InvalidInput(
             "SERVICE is not supported in metadata queries".to_string(),
         ));

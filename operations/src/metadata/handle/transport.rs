@@ -113,8 +113,10 @@ pub(super) async fn send_export_request(
     inner: &MetadataInner,
     node_id: NodeId,
     message: MetadataTransportMessage,
-) -> Result<Result<super::super::api::ExportMetadataResult, MetadataReadError>, MetadataRequestError>
-{
+) -> Result<
+    Result<super::super::api::export_types::ExportMetadataResult, MetadataReadError>,
+    MetadataRequestError,
+> {
     let metadata_bytes = match &message {
         MetadataTransportMessage::ForwardExportDocument { metadata_bytes, .. } => *metadata_bytes,
         // The channel carries one Profile document; the holder caps the body.
@@ -559,7 +561,7 @@ impl MetadataHandle {
         node_id: NodeId,
         message: MetadataTransportMessage,
     ) -> Result<
-        Result<super::super::api::ExportMetadataResult, MetadataReadError>,
+        Result<super::super::api::export_types::ExportMetadataResult, MetadataReadError>,
         MetadataRequestError,
     > {
         send_export_request(&self.inner, node_id, message).await
@@ -677,8 +679,8 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        request: crate::metadata::api::LinkNodeRequest,
-    ) -> Result<crate::metadata::api::LinkNodePage, MetadataReadError> {
+        request: crate::metadata::api::links::types::LinkNodeRequest,
+    ) -> Result<crate::metadata::api::links::types::LinkNodePage, MetadataReadError> {
         match send_remote_request(
             &self.inner,
             &Span::current(),
@@ -701,7 +703,7 @@ impl MetadataHandle {
         node_id: NodeId,
         auth_token: Option<AuthToken>,
         (set_id, limit): (Ulid, usize),
-    ) -> Result<crate::metadata::api::SetPreviewPage, MetadataReadError> {
+    ) -> Result<crate::metadata::api::links::types::SetPreviewPage, MetadataReadError> {
         let request = MetadataTransportMessage::SetPreview {
             auth_token,
             set_id,
@@ -1240,8 +1242,8 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         auth_token: Option<AuthToken>,
-        request: super::super::api::ReferenceNodeRequest,
-    ) -> Result<super::super::api::ReferenceNodeExecution, MetadataReadError> {
+        request: super::super::api::preflight_types::ReferenceNodeRequest,
+    ) -> Result<super::super::api::preflight_types::ReferenceNodeExecution, MetadataReadError> {
         match send_remote_request(
             &self.inner,
             &Span::current(),

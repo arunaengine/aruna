@@ -60,10 +60,12 @@ use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
-use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, ListVisibleRequest,
-    MetadataApiError, MetadataListOrder, RoCrateExportView, list_visible_documents,
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
+use crate::metadata::api::list::list_visible_documents;
+use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
 use crate::metadata::forward::read::{export_rocrate_routed, get_metadata_routed};
 use crate::metadata::forward::write::{

@@ -22,10 +22,12 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::{
-    ApiQueryMode, MetadataApiError, MetadataQueryRequest, MetadataSearchRequest, load_realm_nodes,
-    query_metadata as run_query_metadata, search_metadata as run_search_metadata,
-};
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::preflight::load_realm_nodes;
+use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
+use aruna_operations::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
+use aruna_operations::metadata::api::search::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -2334,7 +2336,7 @@ async fn search_cluster_page(
     query: &str,
     limit: usize,
     cursor: Option<String>,
-) -> aruna_operations::metadata::api::MetadataSearchExecution {
+) -> aruna_operations::metadata::api::search_types::MetadataSearchExecution {
     let coordinator = cluster.coordinator();
     let ctx = coordinator.state.get_ctx();
     let target_nodes = cluster
@@ -2455,7 +2457,7 @@ async fn search_cluster_group(
     cluster: &SearchPaginationCluster,
     query: &str,
     group_id: Option<Ulid>,
-) -> aruna_operations::metadata::api::MetadataSearchExecution {
+) -> aruna_operations::metadata::api::search_types::MetadataSearchExecution {
     let coordinator = cluster.coordinator();
     let ctx = coordinator.state.get_ctx();
     let target_nodes = cluster

@@ -15,9 +15,10 @@ use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::metadata::api::{
-    BucketSearchRequest, ObjectQueryMode, SearchQueryRequest, search_buckets_distributed,
-    search_objects,
+use aruna_operations::metadata::api::fanout::search_buckets_distributed;
+use aruna_operations::metadata::api::search::search_objects;
+use aruna_operations::metadata::api::search_types::{
+    BucketSearchRequest, ObjectQueryMode, SearchQueryRequest,
 };
 use aruna_operations::s3::object::search::ObjectKeyMatch;
 use ulid::Ulid;

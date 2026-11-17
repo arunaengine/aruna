@@ -14,8 +14,9 @@ use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content,
 use aruna_operations::distribution::routing::bound_view;
 use aruna_operations::distribution::status::read_view;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
 use aruna_operations::metadata::forward::read::export_rocrate_here;
 use aruna_operations::shares::dataset::{

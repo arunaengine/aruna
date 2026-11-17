@@ -7,9 +7,11 @@ use std::sync::Arc;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
-use aruna_operations::metadata::api::{
-    LINKS_MAX_LIMIT, LinkDocument, LinkNodeRequest, LinkPage, LinkQuery, file_queries,
-    links_distributed, part_of, resolve_part,
+use aruna_operations::metadata::api::links::types::{
+    LINKS_MAX_LIMIT, LinkDocument, LinkNodeRequest, LinkPage, LinkQuery,
+};
+use aruna_operations::metadata::api::links::{
+    file_queries, links_distributed, part_of, resolve_part,
 };
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
