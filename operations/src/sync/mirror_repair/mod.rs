@@ -21,13 +21,11 @@ pub use status::StoreStatusOperation;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::structs::SyncRelationship;
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -55,12 +53,13 @@ pub struct SyncMirrorRecord {
 }
 
 impl SyncMirrorRecord {
-    fn new(relationship: SyncRelationship, intent: SyncMirrorIntent) -> Self {
+    /// A fresh record staged at `now_ms`: a delete is due at once, a reconcile after the grace.
+    fn new(relationship: SyncRelationship, intent: SyncMirrorIntent, now_ms: u64) -> Self {
         let due_at_ms = match intent {
             SyncMirrorIntent::Reconcile => {
-                unix_timestamp_millis().saturating_add(RECONCILE_GRACE.as_millis() as u64)
+                now_ms.saturating_add(RECONCILE_GRACE.as_millis() as u64)
             }
-            SyncMirrorIntent::Delete => unix_timestamp_millis(),
+            SyncMirrorIntent::Delete => now_ms,
         };
         Self {
             relationship,
@@ -108,28 +107,28 @@ pub enum SyncMirrorError {
     Relationship(#[from] SyncRelationshipError),
     #[error("{0}")]
     Mirror(String),
-    #[error("unexpected storage event: {0:?}")]
-    Unexpected(Event),
-    #[error("sync mirror operation did not finish")]
-    Unfinished,
+    #[error(transparent)]
+    Io(IoError),
 }
 
-impl SyncMirrorError {
-    /// The error for an event a phase did not expect; storage errors keep their kind.
-    fn from_event(event: Event) -> Self {
-        match event {
-            Event::Storage(StorageEvent::Error { error }) => error.into(),
-            other => Self::Unexpected(other),
+impl From<IoError> for SyncMirrorError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
         }
     }
 }
 
+/// The row that stages a mirror delete for `relationship` at `now_ms`.
 pub fn mirror_delete_entry(
     relationship: &SyncRelationship,
+    now_ms: u64,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
     repair_entry(SyncMirrorRecord::new(
         relationship.clone(),
         SyncMirrorIntent::Delete,
+        now_ms,
     ))
 }
 
@@ -147,19 +146,34 @@ fn repair_key(relationship: &SyncRelationship) -> Key {
     ByteView::from(relationship.id.to_bytes().to_vec())
 }
 
-fn repair_read(key: &Key, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id,
-    })
+fn repair_read(key: &Key) -> IoCall {
+    IoCall::Read(vec![(MIRROR_REPAIR_KEYSPACE.to_string(), key.clone())])
 }
 
-fn outgoing_read(key: &Key, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id,
+fn outgoing_read(key: &Key) -> IoCall {
+    IoCall::Read(vec![(RELATIONSHIP_OUT_KEYSPACE.to_string(), key.clone())])
+}
+
+/// The one value a single-row read answered.
+fn one_value(result: IoResult) -> Result<Option<Value>, SyncMirrorError> {
+    match result {
+        IoResult::Values(mut values) if values.len() == 1 => Ok(values.pop().flatten()),
+        other => Err(unexpected("IoResult::Values", &other)),
+    }
+}
+
+/// Checks that a write or delete finished.
+fn finished(result: IoResult) -> Result<(), SyncMirrorError> {
+    match result {
+        IoResult::Done => Ok(()),
+        other => Err(unexpected("IoResult::Done", &other)),
+    }
+}
+
+fn unexpected(expected: &'static str, result: &IoResult) -> SyncMirrorError {
+    SyncMirrorError::Io(IoError::Unexpected {
+        expected,
+        got: result.label(),
     })
 }
 

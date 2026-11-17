@@ -43,6 +43,7 @@ use thiserror::Error;
 
 use crate::notifications::outbox_record::schedule_drain_effect;
 use crate::sync::mirror_repair::mirror_delete_entry;
+use aruna_core::time::unix_timestamp_millis;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteBucketState {
@@ -404,7 +405,7 @@ impl DeleteBucketOperation {
             let writes = match self
                 .relationships
                 .iter()
-                .map(mirror_delete_entry)
+                .map(|relationship| mirror_delete_entry(relationship, unix_timestamp_millis()))
                 .collect::<Result<Vec<_>, _>>()
             {
                 Ok(writes) => writes,
