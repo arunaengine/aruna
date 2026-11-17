@@ -20,7 +20,7 @@ use ulid::Ulid;
 use super::account::{Identity, guard_of, teardown};
 use super::bound::{BindError, BindPlace, bind_slots};
 use super::grants::{
-    Grants, carry_grants, check_supported, covers, narrow_grants, parse_grants, patterns_for,
+    Grants, carry_grants, check_supported, held_covers, narrow_grants, parse_grants, patterns_for,
     stored_grants,
 };
 use super::install::{
@@ -318,15 +318,6 @@ fn widen(
             extends: current.revision,
         });
     }
-}
-
-/// Whether a held pattern reaches every path of `pattern`: a subtree only by a subtree.
-pub(crate) fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
-    let (base, subtree) = match pattern.strip_suffix("/**") {
-        Some(base) => (base, true),
-        None => (pattern, false),
-    };
-    (held.iter()).any(|q| (!subtree || q.ends_with("/**")) && covers(q, base))
 }
 
 async fn commit(

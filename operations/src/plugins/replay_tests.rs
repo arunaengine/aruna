@@ -4,16 +4,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::plugins::clock::ClockReading;
 use crate::plugins::journal::JOURNAL_PAGE;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::rows::decode;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::match_journal;
-use crate::plugins::worker::run_replays;
 use crate::plugins::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced,
 };
+use crate::plugins::worker::{plan_replays, run_replays};
 use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
 use aruna_core::plugin_installs::Widening;
 use aruna_core::plugin_runs::{GapRow, gap_key};

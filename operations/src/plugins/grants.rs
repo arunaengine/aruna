@@ -182,6 +182,15 @@ pub fn covers(pattern: &str, target: &str) -> bool {
     }
 }
 
+/// Whether a held pattern reaches every path of `pattern`: a subtree only by a subtree.
+pub(crate) fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
+    let (base, subtree) = match pattern.strip_suffix("/**") {
+        Some(base) => (base, true),
+        None => (pattern, false),
+    };
+    (held.iter()).any(|q| (!subtree || q.ends_with("/**")) && covers(q, base))
+}
+
 /// Whether `pattern` names `root/**` or a path or subtree below `root`: clean segments, and
 /// `**` only as the last one.
 pub fn within(pattern: &str, root: &str) -> bool {

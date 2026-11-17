@@ -11,23 +11,18 @@ use aruna_core::plugin_runs::{
     EVENTS_QUEUED, GapReason, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
     SourceKind, journal_key,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_plugins::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
-use super::lifecycle::held_covers;
-use super::lifecycle::targets;
+use super::grants::held_covers;
 use super::matcher::{Counting, Outbox, Target};
 use super::rows::{
     Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode,
-    row as row_of, unexpected, values, write_rows,
+    row as row_of, unexpected, values,
 };
-use crate::driver::{DriverContext, drive};
-use crate::realm::mutate_placement::node_kind;
 
 pub(crate) const COVERAGE_ROW: u8 = b'c';
 const REPLAY_ROW: u8 = b'r';
@@ -62,7 +57,7 @@ pub(crate) fn row_key(kind: u8, install_id: Ulid) -> Vec<u8> {
 
 /// The coverage this node held before, the boundary the grown part starts at, and the node
 /// whose clock it uses; `None` when nothing grew since the coverage row.
-fn growth(
+pub(crate) fn growth(
     install: &PluginInstall,
     row: Option<&CoverageRow>,
     coverage: &Coverage,
@@ -87,62 +82,8 @@ fn growth(
     }
 }
 
-/// Starts a replay for each active install whose coverage grew here since its coverage row;
-/// `probe` reads another node's clock. Returns how many replays started.
-pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
-    now_ms: u64,
-    probe: impl Fn(NodeId) -> F,
-) -> Result<usize, StoreError> {
-    if matches!(node_kind(config, local), Some(RealmNodeKind::User { .. })) {
-        return Ok(0);
-    }
-    let mut started = 0;
-    for target in targets(config) {
-        let id = target.install_id;
-        let Some(install) = config.installs.iter().find(|i| i.install_id == id) else {
-            continue;
-        };
-        let (row, task) = drive(replay_rows(id), ctx).await?;
-        let next = CoverageRow {
-            revision: install.revision,
-            active_since_ms: install.active_since_ms,
-            coverage: target.coverage.clone(),
-            note: None,
-        };
-        if task.is_some_and(|task| task.next.revision == next.revision) {
-            continue;
-        }
-        let Some((old, boundary, by)) = growth(install, row.as_ref(), &target.coverage) else {
-            if row
-                .as_ref()
-                .is_some_and(|row| row.revision != next.revision)
-            {
-                let coverage = row_of(
-                    PLUGIN_REPLAYS_KEYSPACE,
-                    row_key(COVERAGE_ROW, id),
-                    encode(&next)?,
-                );
-                drive(write_rows(vec![coverage]), ctx).await?;
-            }
-            continue;
-        };
-        let start = match by {
-            Some(node) if node == local => Some(boundary.saturating_sub(SKEW_MARGIN_MS)),
-            Some(node) => local_start(boundary, probe(node).await),
-            None => None,
-        };
-        let replay = StartReplay::new(target, (next, old), (start, by), now_ms);
-        drive(RowsOperation::direct(replay), ctx).await?;
-        started += 1;
-    }
-    Ok(started)
-}
-
 /// The coverage row and the replay row of an install.
-fn replay_rows(install_id: Ulid) -> RowsOperation<ReplayRows> {
+pub(crate) fn replay_rows(install_id: Ulid) -> RowsOperation<ReplayRows> {
     RowsOperation::direct(ReplayRows(install_id))
 }
 
@@ -186,7 +127,7 @@ enum StartPhase {
 }
 
 impl StartReplay {
-    fn new(
+    pub(crate) fn new(
         target: Target,
         (mut next, old): (CoverageRow, Coverage),
         (start, by): (Option<u64>, Option<NodeId>),

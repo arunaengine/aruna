@@ -5,47 +5,14 @@
 
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_WAITING_KEYSPACE};
-use aruna_core::plugin_runs::{GapReason, WAITING_EXPIRY_MS};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::plugin_runs::GapReason;
 
-use super::decide::{GapCount, Verdict, WaitingRow, judge, seen_row};
+use super::decide::{GapCount, Verdict, WaitingRow, seen_row};
 use super::rows::{
     Answer, Ask, Plan, Row, RowsOperation, Scan, StoreError, Turn, decode, done, scan_rows,
 };
-use super::runs::{ADMISSIONS, Admission, RunError};
-use crate::driver::{DriverContext, drive};
+use super::runs::{Admission, RunError};
 use aruna_core::plugin_runs::Outcome;
-
-/// Decides each waiting event that is ready or expired; returns how many left the waiting set.
-pub(crate) async fn recheck_waiting(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
-    now_ms: u64,
-) -> Result<usize, StoreError> {
-    let _admitting = ADMISSIONS.lock().await;
-    let rows = drive(
-        scan_rows(Scan::new(PLUGIN_WAITING_KEYSPACE, Vec::new())),
-        ctx,
-    )
-    .await?;
-    let mut left = 0;
-    for (key, value) in rows {
-        let waiting: WaitingRow = decode(&value)?;
-        let expired = now_ms > waiting.received_ms.saturating_add(WAITING_EXPIRY_MS);
-        let verdict = match expired {
-            true => None,
-            false => match judge(ctx, config, local, &waiting.row, now_ms).await? {
-                Verdict::Unready | Verdict::Unavailable => continue,
-                verdict => Some(verdict),
-            },
-        };
-        let settle = SettleWaiting::new(key, waiting, verdict, (local, now_ms));
-        drive(RowsOperation::transaction(settle), ctx).await?;
-        left += 1;
-    }
-    Ok(left)
-}
 
 /// Frees a waiting event's slot and decides it in one transaction, so the slot never counts
 /// twice: a ready run takes the slot, a denial is recorded, an expired event is counted as a gap.
