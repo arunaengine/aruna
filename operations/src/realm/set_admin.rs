@@ -7,26 +7,26 @@ use std::collections::HashSet;
 
 use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget, roles_narrowed};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::epoch_due::DueMarks;
 use crate::realm::assign_role::should_seed_role;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
@@ -45,32 +45,6 @@ pub struct SetAdminConfig {
     pub user_id: UserId,
     /// `true` grants the role, `false` removes it.
     pub admin: bool,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct SetAdminOperation {
-    config: SetAdminConfig,
-    txn_id: Option<TxnId>,
-    attempts: usize,
-    state: SetAdminState,
-    narrowed: bool,
-    output: Option<Result<HashSet<UserId>, SetAdminError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SetAdminState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteDocument {
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteConflicts,
-    CommitTransaction,
-    ScheduleDrain,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -93,8 +67,6 @@ pub enum SetAdminError {
     NotManagementNode,
     #[error("the realm keeps at least one realm administrator")]
     LastAdmin,
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]
@@ -105,35 +77,126 @@ pub enum SetAdminError {
     },
 }
 
+impl From<IoError> for SetAdminError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "SetAdmin".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
+/// Checks the caller, then grants or removes the role in a write transaction that reruns after a
+/// lost conflict, since a background config write can win its commit.
+#[derive(Debug, PartialEq)]
+pub struct SetAdminOperation {
+    config: SetAdminConfig,
+    authorized: bool,
+}
+
 impl SetAdminOperation {
     pub fn new(config: SetAdminConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            attempts: 0,
-            state: SetAdminState::Init,
-            narrowed: false,
-            output: None,
+            authorized: false,
         }
     }
 
-    fn emit_read(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = SetAdminState::ReadCurrent;
+    fn change(&self) -> IoCall {
+        let config = self.config.clone();
+        let seed = self.config.user_id.to_bytes();
+        let build = move || SetAdminWrite::new(config.clone());
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        IoCall::Child(child)
+    }
+}
+
+impl Operation for SetAdminOperation {
+    type Output = HashSet<UserId>;
+    type Error = SetAdminError;
+
+    fn first(&mut self) -> Result<Next<HashSet<UserId>>, SetAdminError> {
         let realm_id = self.config.actor.realm_id;
-        let config = DocumentTarget::RealmConfig { realm_id };
-        let target = AdminDocumentTarget::Realm { realm_id };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (config.storage_keyspace().to_string(), config.storage_key()),
-                (AUTH_KEYSPACE.to_string(), (*realm_id.as_bytes()).into()),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        let user_id = self.config.user_id;
+        if user_id.is_nil() || user_id.realm_id != realm_id {
+            return Err(SetAdminError::InvalidUser);
+        }
+        if self.config.auth_context.realm_id != realm_id {
+            return Err(SetAdminError::Unauthorized);
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: format!("/{realm_id}/admin/roles/{user_id}"),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<HashSet<UserId>>, SetAdminError> {
+        if self.authorized {
+            return result
+                .child::<HashSet<UserId>, SetAdminError>()?
+                .map(Next::Done);
+        }
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => {
+                self.authorized = true;
+                Ok(Next::Call(self.change()))
+            }
+            Ok(false) => Err(SetAdminError::Unauthorized),
+            Err(error) => {
+                warn!(error = %error, "Realm admin authorization check failed");
+                match error {
+                    AuthorizationError::StorageError(error) => Err(error.into()),
+                    _ => Err(SetAdminError::Unauthorized),
+                }
+            }
+        }
+    }
+}
+
+/// What the role change transaction waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+    Marks,
+}
+
+/// Reads, validates and applies the role change in one write transaction; a removal marks key
+/// epochs due in the same transaction.
+#[derive(Debug, PartialEq)]
+struct SetAdminWrite {
+    config: SetAdminConfig,
+    stage: Stage,
+    narrowed: bool,
+    admins: HashSet<UserId>,
+    deletes: Vec<(KeySpace, Key)>,
+    marks: DueMarks,
+}
+
+impl SetAdminWrite {
+    fn new(config: SetAdminConfig) -> Self {
+        Self {
+            config,
+            stage: Stage::Read,
+            narrowed: false,
+            admins: HashSet::new(),
+            deletes: Vec::new(),
+            marks: DueMarks::new(None, aruna_core::time::unix_timestamp_millis()),
+        }
     }
 
     fn emit_write(
@@ -141,8 +204,7 @@ impl SetAdminOperation {
         config_value: Option<&Value>,
         auth_value: Option<&Value>,
         state_value: Option<&Value>,
-    ) -> Result<Effects, SetAdminError> {
-        let txn_id = self.txn_id.ok_or(SetAdminError::MissingTransaction)?;
+    ) -> Result<Next<HashSet<UserId>>, SetAdminError> {
         let actor = &self.config.actor;
         let (Some(config_value), Some(auth_value)) = (config_value, auth_value) else {
             return Err(SetAdminError::DocumentMissing);
@@ -235,185 +297,78 @@ impl SetAdminOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(admins));
-        self.state = SetAdminState::WriteDocument {
-            stale_conflict_deletes: stale_conflict_deletes(previous.as_ref(), Some(&reducer_state)),
-        };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.admins = admins;
+        self.deletes = stale_conflict_deletes(previous.as_ref(), Some(&reducer_state));
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    /// A removal narrows access, so key epochs are marked due inside the same transaction.
-    fn emit_commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(SetAdminError::MissingTransaction);
-        };
-        self.state = SetAdminState::CommitTransaction;
+    /// Marks key epochs due when the change narrowed access, then wakes the outbox drain.
+    fn after_writes(&mut self) -> Result<Next<HashSet<UserId>>, SetAdminError> {
         if self.narrowed {
-            return smallvec![crate::auth::epoch_due::mark_due(None, txn_id)];
+            self.stage = Stage::Marks;
+            return Ok(Next::Call(self.marks.first()));
         }
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        Ok(self.finish())
     }
 
-    /// Opens a transaction that reads, validates and applies the change from the start.
-    fn start_transaction(&mut self) -> Effects {
-        self.attempts += 1;
-        self.state = SetAdminState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn fail(&mut self, error: SetAdminError) -> Effects {
-        let cleanup = self.abort();
-        self.state = SetAdminState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &Event) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(SetAdminError::UnexpectedEvent {
-            state,
-            expected,
-            got: got.label(),
-        })
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Next<HashSet<UserId>> {
+        Next::Then {
+            output: std::mem::take(&mut self.admins),
+            calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],
+        }
     }
 }
 
-impl EffectOperation for SetAdminOperation {
+impl Operation for SetAdminWrite {
     type Output = HashSet<UserId>;
     type Error = SetAdminError;
 
-    fn start(&mut self) -> Effects {
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn conflict_retries() -> u32 {
+        COMMIT_ATTEMPTS as u32 - 1
+    }
+
+    fn first(&mut self) -> Result<Next<HashSet<UserId>>, SetAdminError> {
         let realm_id = self.config.actor.realm_id;
-        let user_id = self.config.user_id;
-        if user_id.is_nil() || user_id.realm_id != realm_id {
-            return self.fail(SetAdminError::InvalidUser);
-        }
-        if self.config.auth_context.realm_id != realm_id {
-            return self.fail(SetAdminError::Unauthorized);
-        }
-        self.state = SetAdminState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: format!("/{realm_id}/admin/roles/{user_id}"),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        let config = DocumentTarget::RealmConfig { realm_id };
+        let target = AdminDocumentTarget::Realm { realm_id };
+        Ok(Next::Call(IoCall::Read(vec![
+            (config.storage_keyspace().to_string(), config.storage_key()),
+            (AUTH_KEYSPACE.to_string(), (*realm_id.as_bytes()).into()),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if self.state == SetAdminState::CommitTransaction {
-                self.txn_id = None;
-                // It reads the realm config, so a background config write can win its commit.
-                if error == StorageError::TransactionConflict && self.attempts < COMMIT_ATTEMPTS {
-                    return self.start_transaction();
-                }
+    fn next(&mut self, result: IoResult) -> Result<Next<HashSet<UserId>>, SetAdminError> {
+        match self.stage {
+            Stage::Read => {
+                let [config, auth, reducer] = aruna_core::rows::values::<3>(result)?;
+                self.emit_write(config.as_ref(), auth.as_ref(), reducer.as_ref())
             }
-            return self.fail(error.into());
-        }
-        if self.state == SetAdminState::CommitTransaction
-            && let Some(txn_id) = self.txn_id
-            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
-        {
-            return next.unwrap_or_else(|error| self.fail(error.into()));
-        }
-        match (self.state.clone(), &event) {
-            (
-                SetAdminState::Auth,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => match allowed {
-                Ok(true) => self.start_transaction(),
-                Ok(false) => self.fail(SetAdminError::Unauthorized),
-                Err(error) => {
-                    warn!(error = %error, "Realm admin authorization check failed");
-                    match error {
-                        AuthorizationError::StorageError(error) => self.fail(error.clone().into()),
-                        _ => self.fail(SetAdminError::Unauthorized),
-                    }
-                }
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.after_writes()
+            }
+            Stage::Marks => match self.marks.next(result, true) {
+                Ok(Some(call)) => Ok(Next::Call(call)),
+                Ok(None) => Ok(self.finish()),
+                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
             },
-            (
-                SetAdminState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => self.emit_read(*txn_id),
-            (
-                SetAdminState::ReadCurrent,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                let [(_, config), (_, auth), (_, reducer)] = values.as_slice() else {
-                    return self.unexpected_event("three read values", &event);
-                };
-                match self.emit_write(config.as_ref(), auth.as_ref(), reducer.as_ref()) {
-                    Ok(effects) => effects,
-                    Err(error) => self.fail(error),
-                }
-            }
-            (
-                SetAdminState::WriteDocument {
-                    stale_conflict_deletes,
-                },
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => {
-                if stale_conflict_deletes.is_empty() {
-                    return self.emit_commit();
-                }
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(SetAdminError::MissingTransaction);
-                };
-                self.state = SetAdminState::DeleteConflicts;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: stale_conflict_deletes,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (
-                SetAdminState::DeleteConflicts,
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => self.emit_commit(),
-            (
-                SetAdminState::CommitTransaction,
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.txn_id = None;
-                self.state = SetAdminState::ScheduleDrain;
-                smallvec![schedule_drain_effect()]
-            }
-            (SetAdminState::ScheduleDrain, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                self.state = SetAdminState::Finish;
-                smallvec![]
-            }
-            (SetAdminState::ScheduleDrain, Event::Task(TaskEvent::Error { message, .. })) => {
-                warn!(error = %message, "Failed to schedule admin document outbox drain; durable outbox remains retryable");
-                self.state = SetAdminState::Finish;
-                smallvec![]
-            }
-            (SetAdminState::Init | SetAdminState::Finish | SetAdminState::Error, _) => smallvec![],
-            _ => self.unexpected_event("an event for the current state", &event),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SetAdminState::Finish | SetAdminState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !matches!(self.state, SetAdminState::Finish | SetAdminState::Error) {
-            return Err(SetAdminError::NotFinished);
-        }
-        self.output.unwrap_or(Err(SetAdminError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
         }
     }
 }

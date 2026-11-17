@@ -82,7 +82,7 @@ impl Operation for ListSessionOperation {
 
     /// The index and the session rows come from one snapshot.
     fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
+        TransactionMode::ReadSnapshot
     }
 
     fn first(&mut self) -> Result<Next<Vec<UserSession>>, ListSessionError> {
@@ -144,10 +144,7 @@ mod pure_tests {
             via: None,
         };
         let mut operation = ListSessionOperation::new(user_id);
-        assert_eq!(
-            operation.transaction(),
-            aruna_core::operation::TransactionMode::Write
-        );
+        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
         operation.first().unwrap();
         let index = postcard::to_allocvec(&BTreeSet::from([sid.clone()])).unwrap();
         let read = operation.next(IoResult::Values(vec![Some(ByteView::from(index))]));
