@@ -14,8 +14,10 @@ rust-version.workspace = true
 aruna-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
