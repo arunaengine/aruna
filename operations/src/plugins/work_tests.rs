@@ -494,3 +494,132 @@ async fn settles_answer() {
     let summary = settled.summary.unwrap();
     assert_eq!((summary.status, summary.reply), (Some(201), reply));
 }
+
+/// A work row's index answer and row answer for `row` under `key`.
+fn found(key: &[u8], row: &WorkRow) -> [Answer; 2] {
+    [
+        Answer::Values(vec![Some(key.to_vec())]),
+        Answer::Values(vec![Some(encode(row).unwrap())]),
+    ]
+}
+
+#[test]
+fn lookup_follows_index() {
+    let install_id = Ulid::from_parts(1, 1);
+    let mut row = WorkRow::reserved(&sample_install(install_id), WorkKind::Copy, Ulid::nil(), 1);
+    row.work_id = Ulid::from_parts(2, 2);
+    let mut lookup = WorkLookup::new(install_id, row.work_id);
+    let index = index_key(install_id, row.work_id);
+    assert_eq!(lookup.ask(), Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, index)]));
+    let [by_index, by_key] = found(b"key", &row);
+    let next = lookup.take(by_index).unwrap();
+    assert_eq!(next, Found::Ask(Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, b"key".to_vec())])));
+    assert_eq!(lookup.take(by_key).unwrap(), Found::Row(Some((b"key".to_vec(), row.clone()))));
+    // A missing index, and a row of another work under the key, find nothing.
+    let mut gone = WorkLookup::new(install_id, row.work_id);
+    assert_eq!(gone.take(Answer::Values(vec![None])).unwrap(), Found::Row(None));
+    let mut other = WorkLookup::new(install_id, Ulid::from_parts(3, 3));
+    let [by_index, by_key] = found(b"key", &row);
+    other.take(by_index).unwrap();
+    assert_eq!(other.take(by_key).unwrap(), Found::Row(None));
+    assert!(other.take(Answer::Done).is_err());
+}
+
+#[test]
+fn send_boundary_decides() {
+    let install_id = Ulid::from_parts(1, 1);
+    let mut row = WorkRow::reserved(&sample_install(install_id), WorkKind::Upload, Ulid::nil(), 1);
+    row.boundary = Some(SendBoundary::Sending { attempt: 1 });
+    let ids = (install_id, row.work_id);
+    // A begun send is undecided for a request that may not go twice.
+    let mut once = BeginSend {
+        lookup: WorkLookup::new(ids.0, ids.1),
+        again: false,
+        written: false,
+    };
+    let [by_index, by_key] = found(b"key", &row);
+    once.first().unwrap();
+    once.next(by_index).unwrap();
+    assert_eq!(once.next(by_key).unwrap(), Turn::Finish(Some(Send::Undecided)));
+    // One that may go twice moves the boundary to the next attempt first.
+    let mut again = BeginSend {
+        lookup: WorkLookup::new(ids.0, ids.1),
+        again: true,
+        written: false,
+    };
+    let [by_index, by_key] = found(b"key", &row);
+    again.next(by_index).unwrap();
+    let Turn::Ask(Ask::Write(rows)) = again.next(by_key).unwrap() else {
+        panic!("the boundary is written before sending");
+    };
+    let written: WorkRow = decode(&rows[0].2).unwrap();
+    assert_eq!(written.boundary, Some(SendBoundary::Sending { attempt: 2 }));
+    assert_eq!(again.next(Answer::Done).unwrap(), Turn::Finish(Some(Send::Now)));
+}
+
+#[test]
+fn reserve_adopts_or_conflicts() {
+    let install = sample_install(Ulid::from_parts(1, 1));
+    let row = proposed(&install, 1);
+    let reserve_with = |row: WorkRow| reserve((&install, &call(0)), row, None).unwrap();
+    // A row of the same account and digest is adopted without a write.
+    let mut adopt = reserve_with(row.clone());
+    let effects = adopt.start();
+    assert_eq!(effects.len(), 1);
+    let mut plan = ReserveWork {
+        key: row_key(install.install_id, &call(0)).unwrap(),
+        install_id: install.install_id,
+        account: install.account,
+        proposed: Some(Box::new(proposed(&install, 1))),
+        mark: None,
+        phase: ReservePhase::Reading,
+    };
+    let stored = Answer::Values(vec![Some(encode(&row).unwrap())]);
+    assert_eq!(plan.next(stored).unwrap(), Turn::Finish((row.clone(), Reserve::Earlier)));
+    let mut conflict = ReserveWork {
+        proposed: Some(Box::new(proposed(&install, 2))),
+        phase: ReservePhase::Reading,
+        ..plan
+    };
+    let stored = Answer::Values(vec![Some(encode(&row).unwrap())]);
+    assert_eq!(conflict.next(stored), Err(WorkError::Conflict));
+    // A new row writes its index and itself.
+    let mut fresh = ReserveWork {
+        proposed: Some(Box::new(row.clone())),
+        phase: ReservePhase::Reading,
+        ..conflict
+    };
+    let Turn::Ask(Ask::Write(rows)) = fresh.next(Answer::Values(vec![None])).unwrap() else {
+        panic!("a new row is written");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(fresh.next(Answer::Done).unwrap(), Turn::Finish((row, Reserve::Fresh)));
+}
+
+fn sample_install(install_id: Ulid) -> PluginInstall {
+    let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+    let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    PluginInstall {
+        install_id,
+        group_id: Ulid::from_parts(1, 9),
+        plugin: "copier".into(),
+        version: "0.1.0".into(),
+        digest: format!("sha256:{}", "ab".repeat(32)),
+        state: aruna_core::plugin_installs::InstallState::Active,
+        paused: false,
+        settings: "{}".into(),
+        grants: Default::default(),
+        account: UserId::local(install_id, realm_id),
+        role_id: install_id,
+        receiver: node,
+        granted_by: UserId::local(Ulid::from_parts(1, 3), realm_id),
+        request: String::new(),
+        revision: 1,
+        active_since_ms: Some(5),
+        failed: None,
+        prerequisites: Vec::new(),
+        activated_by: Some(node),
+        widened: None,
+        secrets: Default::default(),
+    }
+}

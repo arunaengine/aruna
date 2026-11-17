@@ -382,4 +382,76 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn put_decisions() {
+        let (run, install) = (Ulid::from_parts(9, 1), Ulid::from_parts(1, 1));
+        let mut plan = PutState {
+            run_id: run,
+            install_id: install,
+            put: put("k", b"v", Some(3), 0),
+            written: None,
+        };
+        let Turn::Ask(Ask::Read(reads)) = plan.first().unwrap() else {
+            panic!("a put reads first");
+        };
+        assert_eq!(reads.len(), 3);
+        let stored = |version| Some(encode(&StateRow { version, value: b"old".to_vec() }).unwrap());
+        let answer = |version, total: u64, last: u64| {
+            Answer::Values(vec![stored(version), Some(encode(&total).unwrap()), Some(encode(&last).unwrap())])
+        };
+        // Another version is a conflict and writes nothing.
+        let conflict = plan.next(answer(2, 4, 2));
+        assert!(matches!(conflict, Err(PutError::Refused(_, ErrorKind::Conflict))));
+        // The stored version writes the value, the bytes, the version and the settled intent.
+        let Turn::Ask(Ask::Write(rows)) = plan.next(answer(3, 4, 7)).unwrap() else {
+            panic!("a matching put writes");
+        };
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[2].2.to_vec(), encode(&8u64).unwrap());
+        assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(8));
+        // A value over its bound is refused before any read.
+        let mut big = PutState {
+            run_id: run,
+            install_id: install,
+            put: put("k", &vec![0; MAX_STATE_VALUE + 1], None, 1),
+            written: None,
+        };
+        assert!(matches!(big.first(), Err(PutError::Refused(_, ErrorKind::Limit))));
+        assert!(matches!(plan.next(Answer::Page(Vec::new(), None)), Err(PutError::Store(_))));
+    }
+
+    #[test]
+    fn remove_decisions() {
+        let (run, install) = (Ulid::from_parts(9, 1), Ulid::from_parts(1, 1));
+        let remove = StateRemove {
+            key: "k".into(),
+            expected: 3,
+            intent: Intent::new(1, &[b"k"]),
+        };
+        let mut plan = RemoveState {
+            run_id: run,
+            install_id: install,
+            remove,
+            phase: RemovePhase::Reading,
+        };
+        assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+        let row = encode(&StateRow { version: 3, value: b"abc".to_vec() }).unwrap();
+        let read = Answer::Values(vec![Some(row), Some(encode(&10u64).unwrap())]);
+        let Turn::Ask(Ask::Delete(keys)) = plan.next(read).unwrap() else {
+            panic!("a matching removal deletes the value");
+        };
+        assert_eq!(keys, [(PLUGIN_STATE_KEYSPACE, value_key(install, "k"))]);
+        let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Done).unwrap() else {
+            panic!("the bytes and intent follow");
+        };
+        assert_eq!(rows[0].2.to_vec(), encode(&6u64).unwrap());
+        assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
+        let mut absent = RemoveState {
+            phase: RemovePhase::Reading,
+            ..plan
+        };
+        let missing = absent.next(Answer::Values(vec![None, None]));
+        assert!(matches!(missing, Err(PutError::Refused(_, ErrorKind::Conflict))));
+    }
 }
