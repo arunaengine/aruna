@@ -35,7 +35,7 @@ use crate::onboarding::reserve_secret::{
 use crate::placement::expand_placement::{ensure_activated_map, expand_realm_placement};
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::mutate_placement::{MutatePlacementError, RealmPlacementMutation};
 use crate::realm::read_authorization::ReadAuthorizationOperation;
 
@@ -380,7 +380,7 @@ mod tests {
     use crate::onboarding::reserve_secret::ReserveSecretError;
     use crate::onboarding::secret_state::secret_state_key;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_config::{GetConfigError, GetConfigOperation};
+    use crate::document_repository::{GetConfigError, GetConfigOperation};
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;

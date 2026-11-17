@@ -5,12 +5,12 @@
 use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::document_repository::GetConfigOperation;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
-use crate::placement::process_placements::load_realm_config;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -111,7 +111,7 @@ pub(crate) async fn authorize_forwarded_caller(
     }
     // A User peer is owner-bound: whatever token it presents, the write it
     // forwards must be its owner's own.
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
         return Err(ForwardAuthError::Unavailable(
             "forwarded metadata write needs the realm configuration".to_string(),
         ));

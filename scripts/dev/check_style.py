@@ -54,7 +54,6 @@ SMALL_DOMAINS = {
     "operations/src/assistant": "coherent ownership scope",
     "operations/src/blob/migration": "grouped shared-prefix domain",
     "operations/src/blob/rewrite": "grouped shared-prefix domain",
-    "operations/src/forward": "coherent ownership scope",
     "operations/src/groups/imports": "grouped shared-prefix domain",
     "operations/src/harvest": "harvest operation scope; hoisting recreates harvest_*",
     "operations/src/harvest/oai_pmh": "grouped shared-prefix domain",
