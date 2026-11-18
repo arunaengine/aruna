@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
-use crate::driver::{drive, node_routing};
+use crate::blob::migration::misplaced::AnyKey;
+use crate::driver::{DriverContext, drive, node_routing};
 use crate::s3::bucket::rename::tests::{BUCKET, group, put, realm, rule, setup};
 use crate::tests::records::node;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
@@ -373,7 +374,9 @@ async fn bounds_scope_totals() {
         let head_key = BlobHeadKey::new(BUCKET, key).to_bytes().unwrap();
         put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
     }
-    let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
+    let routing = node_routing(&context);
+    let totals = ScopeTotalsOperation::new(routing, &scope(), AnyKey);
+    let totals = drive(totals, &context).await.unwrap();
     assert_eq!((totals.versions, totals.complete), (TOTAL_VERSIONS, false));
 }
 
@@ -436,7 +439,9 @@ async fn bounds_long_histories() {
     let head = CurrentVersionPointer::new(last).to_bytes().unwrap();
     let head_key = BlobHeadKey::new(BUCKET, "gone/big").to_bytes().unwrap();
     put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
-    let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
+    let routing = node_routing(&context);
+    let totals = ScopeTotalsOperation::new(routing, &scope(), AnyKey);
+    let totals = drive(totals, &context).await.unwrap();
     assert!(!totals.complete);
 }
 

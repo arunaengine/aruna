@@ -30,6 +30,12 @@ pub enum MigrationError {
     Failed(String),
 }
 
+impl From<ImportRowsError> for MigrationError {
+    fn from(error: ImportRowsError) -> Self {
+        Self::failed(error)
+    }
+}
+
 impl MigrationError {
     pub fn failed(error: impl Display) -> Self {
         Self::Failed(error.to_string())
