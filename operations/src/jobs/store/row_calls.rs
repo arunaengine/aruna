@@ -272,6 +272,20 @@ impl<T: Send + std::fmt::Debug> Operation for PageRead<T> {
     }
 }
 
+/// One page of schedule-index rows and the row to continue after.
+pub type SchedulePage = (Vec<(Key, Value)>, Option<Key>);
+
+/// Reads one page of the schedule index under `prefix`.
+pub fn schedule_page(prefix: &[u8], after: Option<Key>, limit: usize) -> PageRead<SchedulePage> {
+    PageRead {
+        space: SCHEDULE_INDEX_KEYSPACE,
+        prefix: ByteView::from(prefix.to_vec()),
+        after,
+        limit,
+        decode: Box::new(|rows, next| Ok((rows, next))),
+    }
+}
+
 /// One page of a job's entries with their plain keys, and the entry to continue after.
 pub type EntryPage = (Vec<(Vec<u8>, Value)>, Option<Vec<u8>>);
 

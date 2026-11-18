@@ -816,6 +816,8 @@ pub enum NetEffect {
     WritePeerAuth(Box<WritePeerRequest>),
     /// Reads a dataset's summary from its holders; answers `NetEvent::DatasetSummary`.
     DatasetSummary(Box<crate::structs::storage::dataset_description::DatasetSummaryRequest>),
+    /// Asks how long each node has been silent; answers `NetEvent::HeartbeatSilence`.
+    HeartbeatSilence(Vec<NodeId>),
     /// Works on this node's shard topics; answers `NetEvent::Shard`.
     Shard(Box<ShardNetEffect>),
     /// Creates shared sync topics with these peers; answers `NetEvent::TopicPeers`.

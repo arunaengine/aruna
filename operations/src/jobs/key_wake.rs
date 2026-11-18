@@ -12,16 +12,14 @@ use crate::blob::migration::queue::resume_transitions;
 use crate::blob::promote::PromoteError;
 use crate::blob::unlocked::promote_unlocked;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::key_locks::{
-    AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, ParkLockedOperation,
-    VersionWaitOperation,
-};
+use crate::jobs::key_locks::{KeyCheckError, ParkLockedOperation, VersionWaitOperation};
+use crate::jobs::remote_key::RemoteWakesOperation;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::key_wait::wake_key_waits;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::execution::job::{JobError, JobRecord, KeyWait};
-use aruna_core::structs::storage::blob::{HashIndex, VersionKey};
+use aruna_core::structs::storage::blob::VersionKey;
 use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
@@ -50,8 +48,7 @@ pub async fn wake_unlocked(
 ) -> Result<(usize, usize), KeyWakeError> {
     let woken = wake_key_waits(context, key, now_ms).await;
     // Remote waiters get owed wakes before promotion, so a corrupt archive never holds them back.
-    let queued = super::remote_key::queue_wakes(context, key).await;
-    super::remote_key::arm_delivery(context).await;
+    let queued = drive(RemoteWakesOperation::new(key), context).await;
     let mut resumed = resume_transitions(context, key).await;
     let promoted = promote_unlocked(context, key, origin, limits).await;
     if !matches!(promoted, Ok(0)) {
@@ -62,7 +59,7 @@ pub async fn wake_unlocked(
     let copies = drive(wake, context).await;
     let walk = crate::s3::abe_copies::CompleteCopiesOperation::new(key, origin);
     let envelopes = drive(walk, context).await;
-    queued.map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
+    queued?;
     resumed.map_err(KeyWakeError::Transition)?;
     copies.map_err(|error| KeyWakeError::Copies(error.to_string()))?;
     envelopes.map_err(|error| KeyWakeError::Envelopes(error.to_string()))?;
@@ -90,46 +87,6 @@ pub(crate) async fn read_row(
 
 fn lookup<T>(result: Result<T, KeyCheckError>) -> Result<T, String> {
     result.map_err(|error| error.0)
-}
-
-/// See [`FindAliasOperation`].
-pub(crate) async fn find_alias(
-    context: &DriverContext,
-    content: &[u8; 32],
-    version_id: Ulid,
-    node_id: NodeId,
-) -> Result<Option<HashIndex>, String> {
-    lookup(
-        drive(
-            FindAliasOperation::new(*content, version_id, node_id),
-            context,
-        )
-        .await,
-    )
-}
-
-/// See [`AliasPageOperation`].
-pub(crate) async fn alias_page(
-    context: &DriverContext,
-    content: &[u8; 32],
-    node_id: NodeId,
-    start_after: Option<aruna_core::types::Key>,
-) -> Result<AliasPage, String> {
-    lookup(
-        drive(
-            AliasPageOperation::new(*content, node_id, start_after),
-            context,
-        )
-        .await,
-    )
-}
-
-/// The locked key a read of the version an alias names would need.
-pub(crate) async fn alias_wait(
-    context: &DriverContext,
-    alias: &HashIndex,
-) -> Result<Option<KeyWait>, String> {
-    lookup(drive(VersionWaitOperation::of_alias(alias), context).await)
 }
 
 /// See [`VersionWaitOperation`].

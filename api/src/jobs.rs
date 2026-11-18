@@ -4,6 +4,7 @@
 
 use std::str::FromStr;
 
+use crate::job_service::read_owned_job;
 use aruna_core::UserId;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
@@ -35,7 +36,6 @@ use aruna_operations::jobs::local_run::{
     LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
 };
 use aruna_operations::jobs::route::JobRouteError;
-use aruna_operations::jobs::service::read_owned_job;
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};

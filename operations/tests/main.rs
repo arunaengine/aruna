@@ -20,6 +20,7 @@ mod genesis_confirmation;
 mod group_replication;
 mod harvest_pipeline;
 mod id_authority;
+mod job_calls;
 mod job_restart;
 mod linked_import;
 mod manifest_convergence;

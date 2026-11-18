@@ -477,6 +477,8 @@ pub enum NetEvent {
     DocumentSync(DocumentNetEvent),
     Stream(StreamEvent),
     JobControl(JobControlEvent),
+    /// Milliseconds since each asked node's last heartbeat, or since this node started.
+    HeartbeatSilence(std::collections::BTreeMap<NodeId, u64>),
     AuditPages(AuditPageBatch),
     PolicyFetch(PolicyFetchEvent),
     PolicySign(PolicySignEvent),
@@ -816,6 +818,11 @@ pub enum LaunchDecline {
 #[derive(Debug, PartialEq)]
 pub enum JobControlEvent {
     Response(Box<JobResponse>),
+    /// The owner's response and the artifact bytes that follow it on the stream.
+    Streamed {
+        response: Box<JobResponse>,
+        body: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
     Unavailable(String),
 }
 

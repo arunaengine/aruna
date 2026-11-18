@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::job_service::{lookup_job_dedup, submit_harvest_job};
 use aruna_core::structs::execution::harvest::{HarvestJobSpec, HarvestSelector};
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::auth::Permission;
@@ -12,7 +13,6 @@ use aruna_operations::driver::drive;
 use aruna_operations::harvest::create_source::{
     CreateSourceError, CreateSourceInput, CreateSourceOperation,
 };
-use aruna_operations::jobs::service::{lookup_job_dedup, submit_harvest_job};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

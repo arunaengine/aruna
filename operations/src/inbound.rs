@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::driver::{DriverContext, drive, drive_retry_until};
+use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
+use crate::jobs::records::pages::ServePageOperation;
+use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::after_sync::{AfterSyncOperation, run_maintenance};
@@ -36,6 +39,7 @@ use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_net::InboundEventHandler;
+use aruna_net::job_control::{read_request, write_answer};
 use aruna_net::notification::{
     close_stream, drain_request, read_frame, write_frame, write_message,
 };
@@ -182,16 +186,19 @@ async fn peer_request(
     match message {
         record @ (MetadataTransportMessage::ForwardJobRecord { .. }
         | MetadataTransportMessage::ForwardRecordPage { .. }) => {
-            let answer = Box::pin(async {
-                crate::jobs::records::transport::serve_job_record(context, peer, record).await
-            });
-            Ok(answer.await)
+            let now_ms = aruna_core::time::unix_timestamp_millis();
+            let serving = context.node_and_realm();
+            let serve = ServeRecordOperation::new(peer, record, serving, now_ms);
+            Ok(Box::pin(drive(serve, context.as_ref()))
+                .await
+                .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
         MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-            let answer = Box::pin(async {
-                crate::jobs::records::transport::serve_launch_offer(context, peer, *launch).await
-            });
-            Ok(answer.await)
+            let node = crate::jobs::lifecycle::target::launch_node(context, &launch);
+            let serve = ServeLaunchOperation::new(peer, *launch, node);
+            Ok(Box::pin(drive(serve, context.as_ref()))
+                .await
+                .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
         MetadataTransportMessage::ForwardJobSubmission {
             auth_token,
@@ -225,10 +232,16 @@ async fn peer_request(
             Ok(MetadataTransportMessage::ResolvedJobInputs { result })
         }
         MetadataTransportMessage::JobInputPage { submission, digest } => {
-            let page = crate::jobs::records::transport::serve_input_page(
-                context, peer, submission, digest,
-            );
-            let page = Box::pin(page).await;
+            let page = match context.node_and_realm() {
+                Some((_, realm_id)) => {
+                    let serve = ServePageOperation::new(realm_id, peer, submission, digest);
+                    Box::pin(drive(serve, context.as_ref()))
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                None => None,
+            };
             Ok(MetadataTransportMessage::InputPageResult { page })
         }
         message => Err(message),
@@ -587,16 +600,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     Box::pin(receive_heartbeat(self.context.as_ref(), stream, node_id)).await
                 }
                 Alpn::JobControl => {
-                    Box::pin(async {
-                        crate::jobs::protocol::handle_job_stream(
-                            self.context.as_ref(),
-                            &self.jobs_runtime,
-                            stream,
-                            node_id,
-                        )
-                        .await;
-                    })
-                    .await
+                    Box::pin(self.answer_job_stream(stream, node_id)).await
                 }
                 Alpn::Dht => {
                     warn!(
@@ -608,6 +612,24 @@ impl InboundEventHandler for OperationsInboundHandler {
         }
         .instrument(span)
         .await;
+    }
+
+    /// Answers one job-control request and signals the attempts a cancel reached.
+    async fn answer_job_stream(&self, mut stream: BiStream, peer: NodeId) {
+        let Some(request) = read_request(&mut stream, peer).await else {
+            return;
+        };
+        let context = self.context.as_ref();
+        let serving = context.node_and_realm();
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let serve = JobRequestOperation::new(peer, request, serving, now_ms);
+        let answer = drive(serve, context)
+            .await
+            .unwrap_or_else(JobAnswer::unavailable);
+        for job_id in answer.running {
+            self.jobs_runtime.request_cancel(job_id);
+        }
+        write_answer(stream, peer, &answer.response, answer.body).await;
     }
 
     async fn handle_evicted_documents(&self, documents: Vec<DocumentEvictedDocument>) -> bool {

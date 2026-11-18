@@ -4,6 +4,8 @@
 
 use crate::driver::DriverContext;
 use crate::driver::drive;
+use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
+use crate::jobs::submit_local::SubmitLocalOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::MetadataReadError;
@@ -30,6 +32,7 @@ use aruna_core::structs::placement::record::{
     DocumentClass, FIRST_GRANTABLE_HANDLE, PlacementScope,
 };
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
+use aruna_core::time::unix_timestamp_millis;
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
@@ -223,18 +226,51 @@ pub(super) async fn submit_pid_local(
     owner_node_id: NodeId,
     retention_ms: u64,
 ) -> Result<(JobId, bool), MetadataApiError> {
-    crate::jobs::service::submit_mint_local(
-        context.as_ref(),
-        MintPersistentSpec {
-            document_id,
-            minted_by,
-        },
+    let spec = MintPersistentSpec {
+        document_id,
+        minted_by,
+    };
+    let submit = SubmitLocalOperation::mint_pid(
+        spec,
+        context.serving_realm(minted_by.realm_id),
         owner_node_id,
         retention_ms,
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    drive(submit, context.as_ref())
+        .await
+        .map(|result| (result.job_id, result.created))
+        .map_err(|error| MetadataApiError::Internal(error.to_string()))
+}
+
+/// Registers a w3id PID for a document as a fenced job on the document's PID authority. The
+/// dedup key names the document without the submitting user, so a concurrent re-mint by another
+/// user joins the same job across ingress nodes.
+pub async fn submit_mint_pid(
+    context: &Arc<DriverContext>,
+    spec: MintPersistentSpec,
+    local_node_id: NodeId,
+    retention_ms: u64,
+    auth_token: Option<AuthToken>,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let (job_id, created) = submit_pid_routed(
+        context,
+        spec.document_id,
+        spec.minted_by,
+        local_node_id,
+        retention_ms,
+        auth_token,
     )
     .await
-    .map(|result| (result.job_id, result.created))
-    .map_err(|error| MetadataApiError::Internal(error.to_string()))
+    .map_err(|error| match error {
+        MetadataApiError::NotFound => SubmitJobError::DocumentMissing,
+        MetadataApiError::Unauthorized | MetadataApiError::Forbidden => {
+            SubmitJobError::AuthorityDenied
+        }
+        error => SubmitJobError::PlacementUnavailable(error.to_string()),
+    })?;
+    Ok(SubmitJobResult { job_id, created })
 }
 
 /// Explicit withdrawal through the document's authority.

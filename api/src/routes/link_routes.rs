@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use crate::job_service::cancel_owned_job;
 use aruna_core::repository::{LinkPatch, LinkStatus, RepositoryLink};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::driver::{DriverContext, drive};
@@ -15,7 +16,6 @@ use aruna_operations::jobs::repository::link_queue::{
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::{CheckNowOperation, StartPullOperation};
 use aruna_operations::jobs::repository::{Action, NodeScope, TransferError, seal_token};
-use aruna_operations::jobs::service::cancel_owned_job;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

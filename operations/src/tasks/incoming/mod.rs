@@ -65,13 +65,19 @@ use crate::device::sync_note::{NoteSyncOperation, SyncNote};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::forward::realm::RelayAdminOperation;
-use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
+use crate::jobs::JOB_PRUNE_PAGE;
+use crate::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
+use crate::jobs::executor::PayloadHandler;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
-use crate::jobs::lifecycle::publish::settle_terminals;
+use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
 use crate::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
-use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
-use crate::jobs::prune::{prune_job_batch, restore_prune_timer};
+use crate::jobs::lifecycle::witness::{
+    WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node,
+};
+use crate::jobs::prune::{
+    JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
+};
 use crate::jobs::runtime::JobsRuntime;
 use crate::jobs::store::state::release_job;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
@@ -999,8 +1005,11 @@ impl OperationsTaskHandler {
                 let start = (self.wake_cursor.lock())
                     .expect("wake cursor mutex poisoned")
                     .clone();
-                let delivery =
-                    crate::jobs::remote_key::deliver_owed_wakes(&self.context, start).await;
+                let serving = self.context.node_and_realm();
+                let deliver = crate::jobs::remote_key::DeliverWakesOperation::new(start, serving);
+                let delivery = drive(deliver, self.context.as_ref())
+                    .await
+                    .unwrap_or_else(|_| crate::jobs::remote_key::Delivery::unread());
                 *(self.wake_cursor.lock()).expect("wake cursor mutex poisoned") =
                     delivery.next.clone();
                 if delivery.owed {

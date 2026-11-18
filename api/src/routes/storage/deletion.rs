@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::job_service::submit_purge_job;
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
@@ -13,7 +14,6 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
-use aruna_operations::jobs::service::submit_purge_job;
 use aruna_operations::metadata::api::links::set_preview_distributed;
 use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
@@ -938,7 +938,7 @@ pub async fn control_purge(
     RealmAuth(auth): RealmAuth,
     axum::extract::Path((job_id, action)): axum::extract::Path<(String, String)>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
-    use aruna_operations::jobs::service::{CancelJobOutcome, cancel_owned_job};
+    use crate::job_service::{CancelJobOutcome, cancel_owned_job};
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
     let record = aruna_operations::jobs::store::state::read_job_record(&context, job_id, None)

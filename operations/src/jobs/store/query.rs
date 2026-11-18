@@ -97,13 +97,3 @@ pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(
         .await
         .map_err(|error| error.to_string())
 }
-
-pub(crate) async fn batch_delete(
-    context: &DriverContext,
-    deletes: JobDeletes,
-    _txn_id: Option<TxnId>,
-) -> Result<(), String> {
-    drive(row_calls::delete_rows(deletes), context)
-        .await
-        .map_err(|error| error.to_string())
-}
