@@ -709,86 +709,40 @@ mod pure_tests {
             error_of(op.next(IoResult::Values(vec![Some(record)]))),
             CreateUserError::IndexInconsistent
         );
-        op.start();
-        let txn_id = Ulid::from_parts(7, 7);
-        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        op.step(owner_read(
-            &op,
-            Some(encode_index(&std::collections::BTreeSet::from(["newkey".to_string()])).unwrap()),
-        ));
-        let access = UserAccess {
-            access_key: "newkey".to_string(),
-            user_identity,
-            group_id: Ulid::from_parts(8, 8),
-            secret: EncryptedS3Secret::empty(),
-            expiry: active_expiry(),
-            path_restrictions: None,
-            issued_by: test_issuer(),
-            revoked_at: None,
-        };
-        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(
-                "newkey".to_string().into(),
-                Some(access.to_bytes().unwrap().into()),
-            )],
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })]
-                if *id == txn_id
-        ));
-        assert!(matches!(
-            op.finalize().unwrap_err(),
-            CreateUserError::IndexInconsistent
-        ));
+    }
+
+    #[test]
+    fn rejects_foreign_record() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let other = UserId::new(Ulid::from_parts(8, 8), realm_id);
+        let mut op = with_index(UserId::default(), &["old"]);
+        let record = stored("old", other, active_expiry());
+        let read = IoResult::Values(vec![Some(record), None]);
+        assert_eq!(error_of(op.next(read)), CreateUserError::IndexInconsistent);
     }
 
     #[test]
     fn rejects_full_index() {
-        let user_identity = make_user_identity();
-        let keys = (0..MAX_ACTIVE_CREDENTIALS)
+        let user = UserId::default();
+        let keys: Vec<String> = (0..MAX_ACTIVE_CREDENTIALS)
             .map(|index| format!("key{index}"))
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut op = CreateUserOperation::new_with_key(
-            make_config(user_identity, Ulid::from_parts(9, 9)),
-            "newkey".to_string(),
-            test_key(),
-        );
-        op.start();
-        let txn_id = Ulid::from_parts(10, 10);
-        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        op.step(owner_read(&op, Some(encode_index(&keys).unwrap())));
-        let mut values = keys
-            .iter()
-            .map(|key| {
-                let access = UserAccess {
-                    access_key: key.clone(),
-                    user_identity,
-                    group_id: Ulid::from_parts(11, 11),
-                    secret: EncryptedS3Secret::empty(),
-                    expiry: active_expiry(),
-                    path_restrictions: None,
-                    issued_by: test_issuer(),
-                    revoked_at: None,
-                };
-                (key.clone().into(), Some(access.to_bytes().unwrap().into()))
-            })
-            .collect::<Vec<_>>();
-        values.push(("newkey".to_string().into(), None));
-        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
-        ));
-        assert!(matches!(
-            op.finalize().unwrap_err(),
+            .collect();
+        let names: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut op = with_index(user, &names);
+        let sorted: BTreeSet<&str> = names.iter().copied().collect();
+        let mut read: Vec<_> = (sorted.iter())
+            .map(|key| Some(stored(key, user, active_expiry())))
+            .collect();
+        read.push(None);
+        assert_eq!(
+            error_of(op.next(IoResult::Values(read))),
             CreateUserError::LimitReached
-        ));
+        );
     }
 
     #[test]
     fn rejects_oversized_restrictions() {
-        // Over the cap the operation fails with no storage write emitted.
+        // Over the cap the operation fails before any storage call.
         use aruna_core::permission_path::MAX_TOKEN_RESTRICTIONS;
         use aruna_core::structs::identity::auth::Permission;
         let restrictions = (0..=MAX_TOKEN_RESTRICTIONS)
@@ -797,51 +751,28 @@ mod pure_tests {
                 permission: Permission::READ,
             })
             .collect::<Vec<_>>();
-        let mut config = make_config(make_user_identity(), Ulid::from_parts(12, 12));
+        let mut config = make_config(UserId::default(), Ulid::from_parts(12, 12));
         config.path_restrictions = Some(restrictions);
         let mut op = CreateUserOperation::new(config, test_key());
-
-        let effects = op.start();
-        assert!(effects.is_empty());
-        assert_eq!(op.state, CreateUserState::Error);
         assert!(matches!(
-            op.finalize().unwrap_err(),
+            error_of(op.first()),
             CreateUserError::RestrictionLimit(_)
         ));
     }
 
     #[test]
-    fn rejects_invalid_steps() {
-        let user_identity = make_user_identity();
-        let group_id = Ulid::from_parts(13, 13);
-
-        // Starting twice does not bypass the transaction state.
-        let mut op = CreateUserOperation::new(make_config(user_identity, group_id), test_key());
-        op.start();
-        let effects = op.start();
-        assert!(effects.is_empty());
-        assert_eq!(op.state, CreateUserState::StartTransaction);
-
-        // A wrong event aborts the open transaction and fails closed.
-        let mut op = CreateUserOperation::new(make_config(user_identity, group_id), test_key());
-        op.start();
-        let key = Ulid::from_parts(14, 14).to_bytes().into();
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key,
-            value: None,
-        }));
-        assert!(effects.is_empty());
-        assert_eq!(op.state, CreateUserState::Error);
+    fn rejects_wrong_answer() {
+        let config = make_config(UserId::default(), Ulid::from_parts(13, 13));
+        let mut op = CreateUserOperation::new(config, test_key());
+        op.first().unwrap();
         assert!(matches!(
-            op.finalize().unwrap_err(),
-            CreateUserError::InvalidStateEvent { .. }
+            error_of(op.next(IoResult::Done)),
+            CreateUserError::StorageError(_)
         ));
     }
 
     mod tokens {
         use super::*;
-        use aruna_core::structs::identity::realm::RealmId;
-        use aruna_core::structs::storage::blob::BucketInfo;
         use aruna_core::structs::storage::encryption::EncryptionMode;
         use aruna_core::structs::storage::format::Compression;
 
@@ -874,12 +805,8 @@ mod pure_tests {
             }
         }
 
-        fn rows(values: Vec<Option<Vec<u8>>>) -> Event {
-            let values = values
-                .into_iter()
-                .map(|value| (Key::from(Vec::new()), value.map(Value::from)))
-                .collect();
-            Event::Storage(StorageEvent::BatchReadResult { values })
+        fn rows(read: Vec<Option<Vec<u8>>>) -> IoResult {
+            IoResult::Values(read.into_iter().map(|row| row.map(Value::from)).collect())
         }
 
         /// Runs a token credential of `caller` for bucket `sealed` up to its bucket read.
@@ -892,42 +819,25 @@ mod pure_tests {
                 (caller.realm_id, node),
                 9,
             );
-            operation.start();
-            let txn_id = Ulid::from_bytes([9; 16]);
-            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-            operation.step(owner_read(&operation, None));
-            let access_key = operation.access.as_ref().unwrap().access_key.clone();
-            let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![(access_key.into(), None)],
-            }));
-            let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice()
-            else {
-                panic!("expected the bucket read, got {effects:?}");
+            operation.first().unwrap();
+            operation.next(owner_read(None)).unwrap();
+            let turn = operation.next(IoResult::Values(vec![None]));
+            let Ok(Next::Call(IoCall::Read(reads))) = turn else {
+                panic!("expected the bucket read");
             };
             let spaces: Vec<_> = reads.iter().map(|(space, _)| space.as_str()).collect();
             assert_eq!(spaces, [S3_BUCKET_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE]);
             operation
         }
 
-        fn failed(operation: CreateUserOperation) -> CreateUserError {
-            match operation.finalize() {
-                Err(error) => error,
-                Ok(_) => panic!("the credential was created"),
-            }
-        }
-
         #[test]
         fn token_bucket_audited() {
             // Any caller may name an encrypted bucket, locked or not; key holders issue later.
             let mut operation = started(user(2));
-            let effects = operation.step(rows(vec![
+            let writes = writes_of(operation.next(rows(vec![
                 Some(info().to_bytes().unwrap()),
                 Some(sealed().to_bytes().unwrap()),
-            ]));
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
-            else {
-                panic!("expected the credential writes, got {effects:?}");
-            };
+            ])));
             let spaces: Vec<_> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
             assert_eq!(
                 spaces,
@@ -947,16 +857,15 @@ mod pure_tests {
         #[test]
         fn unusable_buckets_refused() {
             let mut operation = started(user(1));
-            operation.step(rows(vec![None, None]));
             assert_eq!(
-                failed(operation),
+                error_of(operation.next(rows(vec![None, None]))),
                 CreateUserError::NoSuchBucket("sealed".to_string())
             );
 
             let mut operation = started(user(1));
-            operation.step(rows(vec![Some(info().to_bytes().unwrap()), None]));
+            let plain = rows(vec![Some(info().to_bytes().unwrap()), None]);
             assert_eq!(
-                failed(operation),
+                error_of(operation.next(plain)),
                 CreateUserError::NotEncrypted("sealed".to_string())
             );
 
@@ -966,12 +875,12 @@ mod pure_tests {
                 group_id: Ulid::from_bytes([4; 16]),
                 ..info()
             };
-            operation.step(rows(vec![
+            let foreign = rows(vec![
                 Some(other.to_bytes().unwrap()),
                 Some(sealed().to_bytes().unwrap()),
-            ]));
+            ]);
             assert_eq!(
-                failed(operation),
+                error_of(operation.next(foreign)),
                 CreateUserError::OtherGroup("sealed".to_string())
             );
         }
