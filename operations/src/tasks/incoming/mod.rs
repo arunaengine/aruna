@@ -70,11 +70,9 @@ use crate::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget
 use crate::jobs::executor::PayloadHandler;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
-use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
 use crate::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
-use crate::jobs::lifecycle::witness::{
-    WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node,
-};
+use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node};
 use crate::jobs::prune::{
     JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
 };
@@ -137,7 +135,7 @@ async fn restore_graph_prune(
         Err(error) => warn!(error = ?error, "Failed to scan metadata graph prune jobs"),
     }
 }
-use crate::node::info::facts::NodeFacts;
+use crate::driver::node_facts;
 use crate::node::info::flows::ObservePlacementOperation;
 use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
@@ -862,7 +860,7 @@ impl OperationsTaskHandler {
                     realm_id,
                     node_id,
                     unix_timestamp_millis(),
-                    NodeFacts::gather(&self.context),
+                    node_facts(&self.context),
                 );
                 if let Err(error) = drive(observe, &self.context).await {
                     warn!(error = %error, "Placement subject reconcile failed");

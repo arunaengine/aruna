@@ -2,19 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::document::DocumentNetEvent;
-use aruna_core::effects::{ShardMembership, ShardNetEffect};
+use aruna_core::document::{DocumentEffect, DocumentNetEvent};
+use aruna_core::effects::{Effect, NetEffect, ShardMembership, ShardNetEffect};
 use aruna_core::events::{Event, GenesisProbe, NetEvent, ShardNetEvent};
+use aruna_core::handle::Handle;
 use aruna_net::NetHandle;
 use tracing::debug;
 
-use crate::driver::{DriverContext, drive};
-use crate::sync::reconcile::SyncTopicsOperation;
+use crate::driver::DriverContext;
 
 pub(super) async fn dispatch_shard(effect: ShardNetEffect, context: &DriverContext) -> Event {
     let answer = match &context.net_handle {
         None => ShardNetEvent::NoNetwork,
-        Some(net) => run_effect(effect, net, context).await,
+        Some(net) => run_effect(effect, net).await,
     };
     Event::Net(NetEvent::Shard(Box::new(answer)))
 }
@@ -23,11 +23,26 @@ fn outcome<E: std::fmt::Display>(result: Result<(), E>) -> ShardNetEvent {
     ShardNetEvent::Outcome(result.map_err(|error| error.to_string()))
 }
 
-async fn run_effect(
-    effect: ShardNetEffect,
+/// Fetches `topics` from `peers`; the caller reconciles and applies what arrived.
+async fn pull_topics(
     net: &NetHandle,
-    context: &DriverContext,
-) -> ShardNetEvent {
+    topics: Vec<irokle::TopicId>,
+    peers: Vec<aruna_core::NodeId>,
+) -> DocumentNetEvent {
+    let sync = DocumentEffect::SyncDocuments { topics, peers };
+    let effect = Effect::Net(NetEffect::DocumentSync(sync));
+    let error = match Box::pin(net.send_effect(effect)).await {
+        Event::Net(NetEvent::DocumentSync(answer)) => return answer,
+        Event::Net(NetEvent::Error(error)) => format!("{error:?}"),
+        other => format!("unexpected net answer {}", other.label()),
+    };
+    DocumentNetEvent::Error {
+        target: None,
+        error,
+    }
+}
+
+async fn run_effect(effect: ShardNetEffect, net: &NetHandle) -> ShardNetEvent {
     match effect {
         ShardNetEffect::Existing(topics) => ShardNetEvent::Existing(
             (topics.into_iter())
@@ -66,15 +81,11 @@ async fn run_effect(
                 unreachable: probe.unreachable,
             })
         }
-        ShardNetEffect::Pull { topics, peers } => {
-            let sync = SyncTopicsOperation::new(*net.realm_id(), topics, peers);
-            let synced = Box::pin(drive(sync, context)).await;
-            ShardNetEvent::Pulled {
-                node_id: net.node_id(),
-                realm_id: *net.realm_id(),
-                sync: Box::new(DocumentNetEvent::reconciled(synced)),
-            }
-        }
+        ShardNetEffect::Pull { topics, peers } => ShardNetEvent::Pulled {
+            node_id: net.node_id(),
+            realm_id: *net.realm_id(),
+            sync: Box::new(pull_topics(net, topics, peers).await),
+        },
         ShardNetEffect::EnsureLocal(topics) => outcome(net.ensure_local_topics(&topics).await),
         ShardNetEffect::EnsureShared { topics, peers } => {
             outcome(net.ensure_sync_topics(&topics, peers).await)

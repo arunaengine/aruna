@@ -5,10 +5,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Display;
 
-use aruna_compute::registry::ExecutorOffer;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
+use aruna_core::compute::offer::ExecutorOffer;
 use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeReservationSnapshot, JobReservationRecord, ResourceTotals,
     availability,
@@ -17,6 +17,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::{
     METADATA_INDEX_KEYSPACE, NODE_SUBJECT_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };
+use aruna_core::node_facts::NodeFacts;
 use aruna_core::operation::Operation;
 use aruna_core::placement::{build_view, held_buckets};
 use aruna_core::rows::{PrefixPages, decode, read_row, values};
@@ -32,7 +33,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::facts::NodeFacts;
 use crate::jobs::demand::{DemandError, DemandSnapshotOperation};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
@@ -544,7 +544,7 @@ pub(super) mod tests {
     #[test]
     fn offers_need_subject() {
         let mut facts = facts();
-        let caps = aruna_compute::executor::BackendCaps::default();
+        let caps = aruna_core::compute::offer::BackendCaps::default();
         facts.offers = vec![ExecutorOffer::new("local".to_string(), caps)];
         let mut operation = telemetry(facts.clone());
         let read = IoCall::child(SubjectRecordOperation);

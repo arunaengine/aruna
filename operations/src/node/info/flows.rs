@@ -14,6 +14,7 @@ use aruna_core::compute::quota::{
 use aruna_core::events::Event;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
+use aruna_core::node_facts::NodeFacts;
 use aruna_core::node_state::{
     DEPARTURE_KEY, DrainState, DrainStateError, DrainStateOperation, NodeInfoError,
     ReadInfoOperation, SetDrainOperation,
@@ -31,7 +32,6 @@ use ulid::Ulid;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::demand::{DemandError, DemandSnapshotOperation, merge_view};
 use crate::node::heartbeat::{HeartbeatError, SendHeartbeatOperation};
-use crate::node::info::facts::NodeFacts;
 use crate::node::info::inputs::{
     InfoFlowError, RevisionInputs, RevisionInputsOperation, Telemetry, TelemetryOperation,
     advertises_executors, child_answer,

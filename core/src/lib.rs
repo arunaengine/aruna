@@ -46,6 +46,7 @@ pub mod managed_copy;
 pub mod metadata;
 pub mod metrics;
 pub mod native_reference;
+pub mod node_facts;
 pub mod node_state;
 pub mod node_vault;
 pub mod onboarding;

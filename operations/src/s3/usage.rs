@@ -1037,7 +1037,8 @@ mod tests {
         realm_id: RealmId,
         full: bool,
     ) -> Result<PublishedUsage, String> {
-        let publish = PublishUsageOperation::new(ctx, (node_id, realm_id), full, false);
+        let serving = ctx.node_and_realm().map(|(_, realm_id)| realm_id);
+        let publish = PublishUsageOperation::new((node_id, realm_id), serving, full, false);
         drive(publish, ctx).await.map_err(|error| error.to_string())
     }
 
@@ -1047,7 +1048,8 @@ mod tests {
         realm_id: RealmId,
         full: bool,
     ) -> Result<PublishedUsage, String> {
-        let publish = PublishUsageOperation::new(ctx, (node_id, realm_id), full, true);
+        let serving = ctx.node_and_realm().map(|(_, realm_id)| realm_id);
+        let publish = PublishUsageOperation::new((node_id, realm_id), serving, full, true);
         drive(publish, ctx).await.map_err(|error| error.to_string())
     }
     fn row(value: Option<Vec<u8>>) -> IoResult {

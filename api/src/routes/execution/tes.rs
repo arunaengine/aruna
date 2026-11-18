@@ -25,7 +25,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, executor_limits};
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalRunOperation};
 use aruna_operations::jobs::route::JobRouteError;
@@ -711,12 +711,9 @@ pub async fn create_task(
             retention_ms: state.rocrate_limits().artifact_retention_ms,
         };
         let context = state.get_ctx();
-        return match drive(
-            LocalRunOperation::on_node(config, &context),
-            context.as_ref(),
-        )
-        .await
-        {
+        let limits = executor_limits(&context, config.spec.executor_constraint.as_deref());
+        let run = LocalRunOperation::new(config, limits, context.node_and_realm());
+        return match drive(run, context.as_ref()).await {
             Ok(result) => tes_json_response(
                 StatusCode::OK,
                 TesTaskResponse {

@@ -6,11 +6,13 @@ use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
 use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
+use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::node_facts::{NodeFacts, class_labels, permille_of};
 use aruna_core::operation::SubOperation;
 use aruna_core::operation::{AfterConflict, EffectOperation, HoldScope, Runnable};
 use aruna_core::structs::storage::routing::NodeRouting;
@@ -45,6 +47,48 @@ pub fn node_routing(context: &DriverContext) -> NodeRouting {
         .as_ref()
         .map(|handle| handle.routing())
         .unwrap_or_default()
+}
+
+/// What only this node's handles and host know, for a caller assembling node info.
+pub fn node_facts(context: &DriverContext) -> NodeFacts {
+    NodeFacts {
+        offers: (context.compute_handle.as_ref())
+            .map(|registry| registry.offers())
+            .unwrap_or_default(),
+        class_labels: (context.blob_handle.as_ref())
+            .map(|blob| class_labels(&blob.routing().catalog))
+            .unwrap_or_default(),
+        load_permille: read_load_permille(),
+        storage_capacity: node_routing(context).catalog.capacity(),
+        download_slots: (context.net_handle.as_ref()).map(|net| net.download_gauge().snapshot()),
+        serving: context.node_and_realm(),
+    }
+}
+
+/// 1-minute OS load average scaled to permille of logical core capacity, or
+/// `None` (with a warning) when the core count is unavailable.
+fn read_load_permille() -> Option<u32> {
+    match std::thread::available_parallelism() {
+        Ok(cores) => Some(permille_of(
+            sysinfo::System::load_average().one,
+            cores.get() as u64,
+        )),
+        Err(error) => {
+            warn!(%error, "failed to read logical core count for node info load");
+            None
+        }
+    }
+}
+
+/// Static ceilings of the executor backend a request with `constraint` would run on.
+pub fn executor_limits(
+    context: &DriverContext,
+    constraint: Option<&str>,
+) -> Option<ResourceEnvelope> {
+    let registry = context.compute_handle.as_ref()?;
+    let constraint = constraint.map(ExecutorKind::from_wire);
+    let backend = registry.select(constraint.as_ref())?;
+    Some(backend.capabilities().limits)
 }
 
 /// Handles and capabilities one operation run may use. Only `storage_handle` is
@@ -1199,9 +1243,13 @@ async fn take_hold(
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     match scope? {
         HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
-        HoldScope::DocumentWrite(document_id) => {
-            Some(context.graph_handle.as_ref()?.hold_document(document_id).await)
-        }
+        HoldScope::DocumentWrite(document_id) => Some(
+            context
+                .graph_handle
+                .as_ref()?
+                .hold_document(document_id)
+                .await,
+        ),
         scope => Some(local_hold(scope).lock_owned().await),
     }
 }

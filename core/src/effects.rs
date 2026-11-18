@@ -900,7 +900,7 @@ pub enum ShardNetEffect {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,
     },
-    /// Pulls these topics from peers and applies what arrived.
+    /// Fetches these topics from peers; the caller reconciles and applies what arrived.
     Pull {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,

@@ -20,7 +20,8 @@ pub async fn run_recovery(
     cancelled: CancellationToken,
 ) {
     let stop = RecoveryStop::new(cancelled);
-    let recovery = RecoveryOperation::new(&context, config, status.clone(), stop);
+    let serving = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let recovery = RecoveryOperation::new(config, serving, status.clone(), stop);
     let run = tokio::spawn(async move { drive(recovery, &context).await });
     let stopped = match run.await {
         Ok(Ok(())) => return,

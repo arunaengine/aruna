@@ -554,7 +554,7 @@ pub enum ShardNetEvent {
     Closed(Result<bool, String>),
     Outcome(Result<(), String>),
     Probed(GenesisProbe),
-    /// What a pull brought, for this node and realm to apply.
+    /// How the fetch of a pull ended, for this node and realm to reconcile and apply.
     Pulled {
         node_id: NodeId,
         realm_id: RealmId,

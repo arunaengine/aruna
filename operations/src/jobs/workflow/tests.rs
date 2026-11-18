@@ -106,8 +106,8 @@ impl ExecutorBackend for StubBackend {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Docker
     }
-    fn capabilities(&self) -> aruna_compute::executor::BackendCaps {
-        aruna_compute::executor::BackendCaps {
+    fn capabilities(&self) -> aruna_core::compute::offer::BackendCaps {
+        aruna_core::compute::offer::BackendCaps {
             s3_mount: self.mounts.load(Ordering::Relaxed),
             session: self.sessions.load(Ordering::Relaxed),
             ..Default::default()

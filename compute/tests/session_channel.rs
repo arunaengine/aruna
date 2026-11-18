@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
+use aruna_compute::executor::{ExecutorBackend, SessionChannel};
 use aruna_compute::session::{SessionConfig, SessionRegistry};
+use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::session::{EventKind, SessionPhase};
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
