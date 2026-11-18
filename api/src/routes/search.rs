@@ -23,7 +23,7 @@ use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
     ObjectExecution, ObjectQueryMode, SearchQueryRequest,
 };
-use aruna_operations::s3::bucket::dataset::dataset_description;
+use aruna_operations::s3::bucket::dataset::DatasetSummaryOperation;
 use aruna_operations::s3::object::search::ObjectKeyMatch;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
@@ -992,7 +992,8 @@ async fn describe_hits(
     let ctx = state.get_ctx();
     let reads = datasets.into_iter().map(|dataset| {
         let token = forwarded_bearer(bearer).ok().flatten();
-        let read = dataset_description(&ctx, state.get_realm_id(), dataset, (Some(auth), token));
+        let read = DatasetSummaryOperation::new(state.get_realm_id(), dataset, (Some(auth), token));
+        let read = drive(read, &ctx);
         async move { (dataset, read.await.ok()) }
     });
     let found: std::collections::BTreeMap<_, _> = futures_util::stream::iter(reads)

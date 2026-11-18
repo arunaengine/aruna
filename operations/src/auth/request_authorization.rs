@@ -114,6 +114,21 @@ pub struct BucketAccess {
 }
 
 impl BucketAccess {
+    /// The access decided by rules and policies an operation has already read.
+    pub(crate) fn from_parts(
+        auth: AuthContext,
+        bucket_path: String,
+        rules: PermissionRules,
+        policies: PolicyEvaluator,
+    ) -> Self {
+        Self {
+            auth,
+            bucket_path,
+            rules,
+            policies,
+        }
+    }
+
     pub async fn load(
         context: &DriverContext,
         auth: &AuthContext,

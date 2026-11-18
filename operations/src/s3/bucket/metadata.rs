@@ -176,7 +176,7 @@ impl Operation for PutMetadataOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::s3::bucket::dataset::bucket_metadata;
+    use crate::s3::bucket::dataset::BucketMetadataOperation;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
@@ -277,12 +277,10 @@ mod tests {
             drive(put(stranger), &context).await,
             Err(PutMetadataError::Forbidden)
         );
-        assert_eq!(bucket_metadata(&context, "db", &info).await, Ok(None));
+        let read = || drive(BucketMetadataOperation::new("db", &info), &context);
+        assert_eq!(read().await, Ok(None));
         drive(put(admin), &context).await.unwrap();
-        assert_eq!(
-            bucket_metadata(&context, "db", &info).await,
-            Ok(Some(metadata.clone()))
-        );
+        assert_eq!(read().await, Ok(Some(metadata.clone())));
         // A conditional write applies only while the stored metadata is what it expects, or
         // already holds what it writes, so a retry of an applied write succeeds.
         let mut stale = put(admin).expecting(BucketMetadata::default());

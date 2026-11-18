@@ -10,12 +10,10 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::identifier::Identifier;
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_metadata};
-use aruna_core::structs::storage::dataset_description::DatasetDescription;
+use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_operations::distribution::change::change_metadata;
 use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::dataset::{
-    DescriptionError, bucket_metadata, dataset_description,
-};
+use aruna_operations::s3::bucket::dataset::{BucketMetadataOperation, DatasetSummaryOperation};
 use aruna_operations::s3::bucket::metadata::{PutMetadataError, PutMetadataOperation};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -137,7 +135,8 @@ pub(crate) async fn describe_bucket(
         return (None, None);
     };
     let ctx = state.get_ctx();
-    let read = dataset_description(&ctx, state.get_realm_id(), dataset, (auth, token)).await;
+    let read = DatasetSummaryOperation::new(state.get_realm_id(), dataset, (auth, token));
+    let read = drive(read, &ctx).await;
     match read {
         Ok(described) => (Some(described.into()), None),
         Err(error) => (None, Some(error.to_string())),
@@ -154,8 +153,8 @@ async fn check_link(
         return Ok(None);
     };
     let ctx = state.get_ctx();
-    let read = dataset_description(&ctx, state.get_realm_id(), dataset, (Some(auth), token));
-    match read.await {
+    let read = DatasetSummaryOperation::new(state.get_realm_id(), dataset, (Some(auth), token));
+    match drive(read, &ctx).await {
         Ok(described) => Ok(Some(described.into())),
         Err(DescriptionError::Unreadable) => Err(ServerError::BadRequestReason(format!(
             "dataset {dataset} does not exist or you may not read it"
@@ -283,9 +282,12 @@ pub async fn get_bucket_metadata(
         &bucket,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    let metadata = bucket_metadata(&state.get_ctx(), &bucket, &info)
-        .await
-        .map_err(ServerError::ServiceUnavailableReason)?;
+    let metadata = drive(
+        BucketMetadataOperation::new(&bucket, &info),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
     let token = forwarded_auth_token(bearer)?;
     let (description, description_unavailable) =
         describe_bucket(&state, metadata.as_ref(), (Some(&auth), token)).await;

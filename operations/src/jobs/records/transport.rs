@@ -9,7 +9,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{FetchCursor, JobRecordFrame, LaunchFrame, PageLimit};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
 use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
+    InputPage, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind,
     PhysicalExecutionState, SubmissionId,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -20,6 +20,7 @@ use super::admit::Admission;
 use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use super::family::LoadFamilyOperation;
+use super::pages::{KeepPagesOperation, ServePageOperation};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
@@ -176,12 +177,11 @@ async fn accept_record(
         Admission::Authentic | Admission::Duplicate => {
             // The publisher retries until this holder keeps the pages the record binds.
             if let Some(record) = &paged {
-                super::pages::keep_pages(context.as_ref(), record, peer)
-                    .await
-                    .map_err(|error| {
-                        warn!(error = %error, "Job record input pages unavailable");
-                        ServeError::Unavailable
-                    })?;
+                let keep = KeepPagesOperation::new(record, peer, context.node_and_realm());
+                drive(keep, context.as_ref()).await.map_err(|error| {
+                    warn!(error = %error, "Job record input pages unavailable");
+                    ServeError::Unavailable
+                })?;
             }
             let cancels = drive(
                 LoadFamilyOperation::kind(family, JobRecordKind::Cancel),
@@ -228,6 +228,18 @@ fn rearms_witness(envelope: &JobRecordEnvelope) -> bool {
         JobFamilyRecord::Update(update) => update.state == PhysicalExecutionState::Error,
         _ => false,
     }
+}
+
+/// One input page for a realm infrastructure node; nothing for anyone else.
+pub async fn serve_input_page(
+    context: &DriverContext,
+    peer: NodeId,
+    submission: SubmissionId,
+    digest: [u8; 32],
+) -> Option<Box<InputPage>> {
+    let (_, realm_id) = context.node_and_realm()?;
+    let serve = ServePageOperation::new(realm_id, peer, submission, digest);
+    drive(serve, context).await.ok().flatten()
 }
 
 async fn serve_page(

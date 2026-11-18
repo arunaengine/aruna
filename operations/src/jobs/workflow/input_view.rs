@@ -23,7 +23,8 @@ use thiserror::Error;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::key_wake::read_row;
-use crate::jobs::source_read::{SourceReadError, authorize_read};
+use crate::jobs::read_access::SourceReadError;
+use crate::jobs::source_read::authorize_read;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};

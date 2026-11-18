@@ -41,6 +41,31 @@ pub enum GuardError {
     Unreadable(String),
 }
 
+impl From<aruna_core::calls::IoError> for GuardError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        Self::Unreadable(error.to_string())
+    }
+}
+
+/// Whether the bucket of `binding` is still the admitted member of the set `view` records.
+pub fn bound_member(
+    view: &DistributionView,
+    binding: &DistributionBinding,
+) -> Result<(), GuardError> {
+    let set_id = binding.set_id;
+    let member = view
+        .snapshot()
+        .member(binding.member_id)
+        .ok_or(RouteError::NotMember(set_id))?;
+    match member
+        .incarnation
+        .is_some_and(|admitted| admitted != binding.incarnation)
+    {
+        true => Err(GuardError::Unbound(set_id)),
+        false => Ok(()),
+    }
+}
+
 impl GuardError {
     /// Whether the key is not this member's to write anymore: another coordinator holds or
     /// takes over its range, or the member or the set goes away.
