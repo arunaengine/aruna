@@ -74,8 +74,8 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
         JobPayload::Harvest(spec) => crate::jobs::harvest::harvest_outcome(
             Box::pin(crate::driver::drive(
                 crate::jobs::harvest::HarvestJobOperation::new(
-                    crate::jobs::repository::NodeScope::of(&ctx.driver),
-                    crate::jobs::repository::JobScope::of(ctx),
+                    ctx.driver.node_scope(),
+                    ctx.job_scope(),
                     spec.clone(),
                 ),
                 &ctx.driver,

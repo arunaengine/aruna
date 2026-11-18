@@ -527,8 +527,6 @@ pub enum NetEvent {
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
     /// The verified claims of a token named for revocation, or why it is invalid.
     RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
-    /// The end of a routed harvest metadata write.
-    HarvestWrite(Result<(), crate::repository::remote::HarvestWriteFailure>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
 }
@@ -1027,7 +1025,6 @@ impl Event {
                     GrantedRead,
                     DelegatedRead,
                     DatasetSummary,
-                    HarvestWrite,
                     WritePeerAuth,
                     GrantSign,
                     Shard,

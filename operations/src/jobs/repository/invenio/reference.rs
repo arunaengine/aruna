@@ -11,7 +11,7 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::repository::invenio::{
     REFERENCE_FILE, REFERENCE_GROUP, REFERENCE_RECORD, validate_id,
 };
-use aruna_core::repository::remote::RemoteCall;
+use aruna_core::repository::remote::{NodeScope, RemoteCall};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec};
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -26,7 +26,7 @@ use super::{Session, finished, head_metadata, invalid};
 use crate::connectors::descriptor::build_source_binding;
 use crate::jobs::repository::connector::{ConnectOperation, ConnectRequest};
 use crate::jobs::repository::link_store::time_of;
-use crate::jobs::repository::{JobScope, NodeScope, TransferError, not_supported, remote_call};
+use crate::jobs::repository::{JobScope, TransferError, not_supported, remote_call};
 use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
 
 #[derive(Debug, PartialEq)]

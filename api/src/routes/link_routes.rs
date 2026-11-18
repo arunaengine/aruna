@@ -15,7 +15,7 @@ use aruna_operations::jobs::repository::link_queue::{
 };
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::{CheckNowOperation, StartPullOperation};
-use aruna_operations::jobs::repository::{Action, NodeScope, TransferError, seal_token};
+use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -43,7 +43,7 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
 /// Stores a decided review on the link and answers the link as stored.
 async fn refreshed(state: &ServerState, link: &RepositoryLink) -> ServerResult<RepositoryLink> {
     let context = state.get_ctx();
-    let refresh = RefreshReviewOperation::new(NodeScope::of(&context), link.clone());
+    let refresh = RefreshReviewOperation::new(context.node_scope(), link.clone());
     drive(refresh, context.as_ref()).await.map_err(link_error)
 }
 
@@ -55,7 +55,7 @@ async fn push_current(
 ) -> Result<aruna_core::structs::execution::job::JobId, LinkError> {
     let revision = drive(PushRevisionOperation::new(link.document_id), context).await?;
     let event = revision_event(revision)?;
-    let push = StartPushOperation::new(NodeScope::of(context), link.clone(), event, publish);
+    let push = StartPushOperation::new(context.node_scope(), link.clone(), event, publish);
     drive(push, context).await
 }
 
@@ -392,7 +392,7 @@ pub async fn rotate_token(
         .await
         .map_err(seal_error)?;
     let secret = seal_token(
-        &context,
+        &context.node_scope(),
         link.created_by,
         &connector,
         Some(link.link_id),
@@ -453,7 +453,7 @@ pub async fn accept_remote(
         ));
     }
     let context = state.get_ctx();
-    let remote = RemoteStateOperation::new(NodeScope::of(&context), link.clone());
+    let remote = RemoteStateOperation::new(context.node_scope(), link.clone());
     let remote = drive(remote, context.as_ref())
         .await
         .map_err(|error| match error {
@@ -521,7 +521,7 @@ pub async fn pull_link(
         return job_response(&state, job_id).await;
     }
     let context = state.get_ctx();
-    let scope = NodeScope::of(&context);
+    let scope = context.node_scope();
     let checked = drive(
         CheckNowOperation::new(scope.clone(), link.clone()),
         context.as_ref(),

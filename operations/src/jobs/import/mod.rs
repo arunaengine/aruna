@@ -398,7 +398,7 @@ async fn acquire_source(
         } => {
             use super::repository::connector::ConnectorViewOperation;
             use super::repository::invenio::import::{AcquireOperation, AcquireRequest};
-            use super::repository::{Action, JobScope, NodeScope, ensure_supported};
+            use super::repository::{Action, ensure_supported};
             let connector = ConnectorViewOperation::new(*group_id, *connector_id);
             let kind = drive(connector, &ctx.driver)
                 .await
@@ -425,8 +425,8 @@ async fn acquire_source(
             };
             let acquire = AcquireOperation::new(AcquireRequest {
                 kind,
-                scope: NodeScope::of(&ctx.driver),
-                job: JobScope::of(ctx),
+                scope: ctx.driver.node_scope(),
+                job: ctx.job_scope(),
                 spec: spec.clone(),
                 group_id: *group_id,
                 connector_id: *connector_id,
@@ -943,8 +943,8 @@ async fn write_next(
         let metadata = drive(
             super::repository::invenio::reference::WriteRepositoryReference::new(
                 kind,
-                super::repository::NodeScope::of(&ctx.driver),
-                super::repository::JobScope::of(ctx),
+                ctx.driver.node_scope(),
+                ctx.job_scope(),
                 spec.clone(),
                 bucket_info,
                 entry.target_key.clone(),
@@ -1391,7 +1391,7 @@ async fn cleanup_source(
         checkpoint.identifiers.clear();
     }
     let settle = super::repository::pull::SettleImportOperation::new(
-        super::repository::NodeScope::of(&ctx.driver),
+        ctx.driver.node_scope(),
         ctx.job_id,
         ctx.owner_node_id,
         spec.clone(),

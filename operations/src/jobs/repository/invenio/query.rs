@@ -15,7 +15,7 @@ use url::Url;
 
 use super::{Session, invalid, json};
 use crate::jobs::repository::connector::{ConnectOperation, ConnectRequest};
-use crate::jobs::repository::{NodeScope, TransferError, not_supported};
+use crate::jobs::repository::{TransferError, not_supported};
 
 fn read_connect(
     scope: NodeScope,
@@ -299,7 +299,7 @@ mod tests {
     use crate::jobs::repository::invenio::Session;
     use crate::jobs::repository::push::creator_auth;
     use crate::jobs::repository::test_support::{body, child, link, scope};
-    use aruna_core::repository::remote::InvenioAccess;
+    use aruna_core::repository::remote::{InvenioAccess, NodeScope};
     use serde_json::json;
 
     fn session() -> Session {
