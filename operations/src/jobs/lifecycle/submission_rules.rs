@@ -14,7 +14,6 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_core::structs::storage::origin::SourcePin;
-use aruna_core::time::unix_timestamp_millis;
 use serde::Serialize;
 use ulid::Ulid;
 
@@ -195,8 +194,9 @@ pub(super) fn caller_of(
     created_by: UserId,
     scope: &SubmissionScope,
     retention_ms: u64,
+    now_ms: u64,
 ) -> (UserId, SubmissionId, u64) {
-    let expires_at = (unix_timestamp_millis().saturating_add(retention_ms)) / 1000;
+    let expires_at = now_ms.saturating_add(retention_ms) / 1000;
     (
         created_by,
         ids::submission_of(created_by, scope),

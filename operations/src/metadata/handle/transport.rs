@@ -848,24 +848,6 @@ impl MetadataHandle {
         }
     }
 
-    /// One input page of a job family from `node_id`; `None` when it does not keep it.
-    pub(crate) async fn request_input_page(
-        &self,
-        node_id: NodeId,
-        submission: aruna_core::structs::execution::job::SubmissionId,
-        digest: [u8; 32],
-    ) -> Result<Option<aruna_core::structs::execution::job::InputPage>, String> {
-        let request = MetadataTransportMessage::JobInputPage { submission, digest };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
-            Ok(MetadataTransportMessage::InputPageResult { page }) => Ok(page.map(|page| *page)),
-            Ok(other) => Err(format!(
-                "the node answered {}",
-                transport_message_kind(&other)
-            )),
-            Err(error) => Err(error.to_string()),
-        }
-    }
-
     /// Sends a reference page to a member; an error leaves its outcome unknown.
     pub(crate) async fn request_reference_page(
         &self,

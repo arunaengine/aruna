@@ -6,7 +6,7 @@
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::read_grant::{READ_OPERATION, ReadGrant, SignedGrant};
+use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_core::types::GroupId;
 
 use super::read_access::{SourceObject, SourceReadError, SourceReadOperation};
@@ -52,19 +52,6 @@ pub async fn public_read(
         Err(SourceReadError::Denied) => Ok(false),
         Err(error) => Err(error),
     }
-}
-
-/// Signs `grant` with this node's key; the issuer must be this node. `None` without a network.
-pub fn issue_grant(context: &DriverContext, grant: ReadGrant) -> Option<SignedGrant> {
-    let net = context.net_handle.as_ref()?;
-    if grant.issuer != net.node_id() {
-        return None;
-    }
-    let bytes = grant.signing_bytes().ok()?;
-    Some(SignedGrant {
-        signature: net.sign(&bytes),
-        grant,
-    })
 }
 
 #[cfg(test)]
