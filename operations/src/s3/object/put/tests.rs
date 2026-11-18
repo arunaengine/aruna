@@ -948,3 +948,489 @@ pub async fn deduplicates_blob() {
     }
 }
 
+/// Two filesystem node backends with distinct roots: enough to prove that a
+/// routed write never adopts a copy sitting on the other backend.
+async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) {
+    let hot_root = format!("{temp_root}/hot");
+    let cold_root = format!("{temp_root}/cold");
+    std::fs::create_dir_all(&hot_root).unwrap();
+    std::fs::create_dir_all(&cold_root).unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+
+    let backend = |root: &str, prefix: &str, class: Option<String>| {
+        std::sync::Arc::new(NodeBackend::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some(prefix.to_string()),
+                max_bucket_size: Some(100_000),
+                multipart_bucket: Some(format!("{prefix}parts")),
+                root: root.to_string(),
+                service_config: HashMap::new(),
+                timeouts: Default::default(),
+            },
+            class,
+        ))
+    };
+    let mut backends = std::collections::BTreeMap::new();
+    backends.insert("default".to_string(), backend(&hot_root, "hot-", None));
+    backends.insert(
+        "cold".to_string(),
+        backend(&cold_root, "cold-", Some("cold".to_string())),
+    );
+    let registry = BackendRegistry::new(backends, "default".to_string()).unwrap();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle.clone(),
+        EgressPolicy::loopback(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    (
+        DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            metadata_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        },
+        hot_root,
+        cold_root,
+    )
+}
+
+fn archive_routing(group_id: Ulid) -> RoutingSnapshot {
+    let catalog = BackendCatalog::new("default")
+        .with_backend("default", None)
+        .with_backend("cold", Some("cold".to_string()));
+    RoutingSnapshot::new(group_id, catalog).with_node_rules(vec![NodeRoutingRule {
+        group: None,
+        bucket: None,
+        key_prefix: Some("archive/".to_string()),
+        target: RoutingTarget::Class("cold".to_string()),
+    }])
+}
+
+async fn put_routed(
+    context: &DriverContext,
+    group_id: Ulid,
+    realm_id: RealmId,
+    key: &str,
+    data: &'static [u8],
+) -> super::PutObjectResult {
+    drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id: context.net_handle.as_ref().unwrap().node_id(),
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: key.to_string(),
+                content_length: Some(data.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(data))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: archive_routing(group_id),
+        }),
+        context,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn dedup_per_backend() {
+    // Identical bytes routed to two backends must keep one copy on each.
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let (context, hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+    let data = b"identical bytes";
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+
+    let hot = put_routed(&context, group_id, realm_id, "hot.txt", data).await;
+    let cold = put_routed(&context, group_id, realm_id, "archive/cold.txt", data).await;
+
+    assert_eq!(hot.location.backend, BackendRef::node_default());
+    assert_eq!(cold.location.backend, BackendRef::Node("cold".to_string()));
+    assert_eq!(count_files(Path::new(&hot_root)), 1);
+    assert_eq!(count_files(Path::new(&cold_root)), 1);
+
+    let hash: [u8; 32] = hot.location.get_blake3().unwrap().try_into().unwrap();
+    assert_eq!(cold.location.get_blake3().unwrap(), hash);
+
+    for (key, result) in [("hot.txt", &hot), ("archive/cold.txt", &cold)] {
+        let version_value = read_value(
+            &context,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new("mybucket", key, result.version_id)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .expect("missing blob version entry");
+        let version = BlobVersion::from_bytes(version_value.as_ref()).unwrap();
+        assert_eq!(version.blob_backend(), Some(&result.location.backend));
+
+        let location_value = read_value(
+            &context,
+            BLOB_LOCATIONS_KEYSPACE,
+            version.location_key().unwrap().to_bytes(),
+        )
+        .await
+        .expect("missing blob location entry");
+        assert_eq!(
+            BackendLocation::from_bytes(location_value.as_ref()).unwrap(),
+            result.location
+        );
+        assert!(exists(result.location.get_full_path().unwrap()).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn release_row_committed() {
+    // A version tagged as a release commits its release row; an untagged one writes none.
+    use aruna_core::keyspaces::BUCKET_RELEASE_KEYSPACE;
+    use aruna_core::structs::storage::bucket_metadata::{
+        RELEASE_PREFIX_TAG, RELEASE_TAG, ReleasePointer, release_key, release_marker,
+    };
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let (context, _, _) = setup_two_backends(temp_root).await;
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let tags = HashMap::from([
+        (RELEASE_TAG.to_string(), "6.0".to_string()),
+        (RELEASE_PREFIX_TAG.to_string(), "db/".to_string()),
+    ]);
+    let put = |key: &str, metadata: HashMap<String, String>| {
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id: context.net_handle.as_ref().unwrap().node_id(),
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: key.to_string(),
+                content_length: Some(2),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    b"{}".as_slice(),
+                ))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: archive_routing(group_id),
+        })
+        .with_metadata(metadata)
+    };
+    let tagged = drive(put("db/release.json", tags), &context).await.unwrap();
+    let plain = drive(put("db/other.json", HashMap::new()), &context)
+        .await
+        .unwrap();
+    let row = read_value(
+        &context,
+        BUCKET_RELEASE_KEYSPACE,
+        release_key("mybucket", tagged.version_id),
+    )
+    .await
+    .expect("the release row commits with the version");
+    let pointer = ReleasePointer::from_bytes(row.as_ref()).unwrap();
+    assert_eq!(pointer.key, "db/release.json");
+    // The bucket's release marker names the newest release crate version.
+    let marker = read_value(
+        &context,
+        BUCKET_RELEASE_KEYSPACE,
+        release_marker("mybucket"),
+    )
+    .await;
+    assert_eq!(
+        marker.as_deref(),
+        Some(tagged.version_id.to_bytes().as_slice())
+    );
+    assert_eq!(
+        (pointer.label.as_str(), pointer.prefix.as_str()),
+        ("6.0", "db/")
+    );
+    let untagged = read_value(
+        &context,
+        BUCKET_RELEASE_KEYSPACE,
+        release_key("mybucket", plain.version_id),
+    )
+    .await;
+    assert!(untagged.is_none());
+}
+
+#[tokio::test]
+async fn dedup_repeats_backend() {
+    // A rewrite onto the same backend must still adopt the stored copy.
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let (context, _hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+    let data = b"identical bytes";
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+
+    let first = put_routed(&context, group_id, realm_id, "archive/one.txt", data).await;
+    let second = put_routed(&context, group_id, realm_id, "archive/two.txt", data).await;
+
+    assert_eq!(first.location, second.location);
+    assert_eq!(count_files(Path::new(&cold_root)), 1);
+}
+
+#[tokio::test]
+async fn delete_keeps_copy() {
+    // Deleting one object must leave the twin copy on the other backend.
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let (context, _hot_root, cold_root) = setup_two_backends(temp_root).await;
+
+    let data = b"identical bytes";
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+
+    let hot = put_routed(&context, group_id, realm_id, "hot.txt", data).await;
+    let cold = put_routed(&context, group_id, realm_id, "archive/cold.txt", data).await;
+
+    let deleted = drive(
+        crate::s3::object::delete::DeleteObjectOperation::new(
+            crate::s3::object::delete::DeleteObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "hot.txt".to_string(),
+                version_id: Some(hot.version_id),
+                group_id,
+                realm_id,
+                node_id: context.net_handle.as_ref().unwrap().node_id(),
+                deleted_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            },
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    let _ = deleted;
+
+    let location_value = read_value(
+        &context,
+        BLOB_LOCATIONS_KEYSPACE,
+        BlobLocationKey::new(
+            cold.location.get_blake3().unwrap().try_into().unwrap(),
+            EncodingClass::Raw,
+            cold.location.backend.clone(),
+        )
+        .to_bytes(),
+    )
+    .await
+    .expect("cold copy was removed with the hot object");
+    assert_eq!(
+        BackendLocation::from_bytes(location_value.as_ref()).unwrap(),
+        cold.location
+    );
+    assert_eq!(count_files(Path::new(&cold_root)), 1);
+}
+
+#[tokio::test]
+pub async fn overwrite_retains_index() {
+    let temp_handle = tempdir().unwrap();
+    let temp_root = temp_handle.path().to_str().unwrap();
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).unwrap();
+    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        .await
+        .unwrap();
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: Backend::FileSystem,
+            bucket_prefix: Some("aruna_".to_string()),
+            max_bucket_size: Some(100000),
+            multipart_bucket: Some("multipart".to_string()),
+            root: blob_root.clone(),
+            service_config: HashMap::new(),
+            timeouts: Default::default(),
+        },
+        storage_handle.clone(),
+        net_handle.clone(),
+    )
+    .await
+    .unwrap();
+
+    let context = DriverContext {
+        storage_handle,
+        net_handle: Some(net_handle),
+        blob_handle: Some(blob_handle),
+        metadata_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    };
+
+    let realm_id = RealmId::from_bytes([1u8; 32]);
+    let group_id = Ulid::generate();
+    let node_id = context.net_handle.as_ref().unwrap().node_id();
+
+    let first = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "same-key.txt".to_string(),
+                content_length: Some(5),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &b"first"[..],
+                ))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let second = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "same-key.txt".to_string(),
+                content_length: Some(6),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &b"second"[..],
+                ))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(first.location, second.location);
+    assert_eq!(count_files(Path::new(&blob_root)), 2);
+
+    let first_hash: [u8; 32] = first.location.get_blake3().unwrap().try_into().unwrap();
+    let second_hash: [u8; 32] = second.location.get_blake3().unwrap().try_into().unwrap();
+
+    let current_blob_head = read_value(
+        &context,
+        BLOB_HEAD_KEYSPACE,
+        BlobHeadKey::new("mybucket", "same-key.txt")
+            .to_bytes()
+            .unwrap(),
+    )
+    .await
+    .expect("missing blob head entry");
+    assert_eq!(
+        CurrentVersionPointer::from_bytes(current_blob_head.as_ref()).unwrap(),
+        CurrentVersionPointer::new_with_generation(second.version_id, 2)
+    );
+
+    let historical_hash_path = read_value(
+        &context,
+        PATHS_INDEX_KEYSPACE,
+        HashIndex::new(
+            first_hash,
+            first.version_id,
+            realm_id,
+            group_id,
+            node_id,
+            "mybucket",
+            "same-key.txt",
+        )
+        .to_bytes()
+        .unwrap(),
+    )
+    .await
+    .expect("missing historical hash path entry");
+    assert!(historical_hash_path.is_empty());
+
+    let new_hash_path = read_value(
+        &context,
+        PATHS_INDEX_KEYSPACE,
+        HashIndex::new(
+            second_hash,
+            second.version_id,
+            realm_id,
+            group_id,
+            node_id,
+            "mybucket",
+            "same-key.txt",
+        )
+        .to_bytes()
+        .unwrap(),
+    )
+    .await
+    .expect("missing replacement hash path entry");
+    assert!(new_hash_path.is_empty());
+
+    let first_blob_version = read_value(
+        &context,
+        BLOB_VERSIONS_KEYSPACE,
+        VersionKey::new("mybucket", "same-key.txt", first.version_id)
+            .to_bytes()
+            .unwrap(),
+    )
+    .await
+    .expect("missing first blob version");
+    assert_eq!(
+        BlobVersion::from_bytes(first_blob_version.as_ref())
+            .unwrap()
+            .blob_hash(),
+        Some(&first_hash)
+    );
+
+    let second_blob_version = read_value(
+        &context,
+        BLOB_VERSIONS_KEYSPACE,
+        VersionKey::new("mybucket", "same-key.txt", second.version_id)
+            .to_bytes()
+            .unwrap(),
+    )
+    .await
+    .expect("missing second blob version");
+    assert_eq!(
+        BlobVersion::from_bytes(second_blob_version.as_ref())
+            .unwrap()
+            .blob_hash(),
+        Some(&second_hash)
+    );
+}
+
