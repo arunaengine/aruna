@@ -16,6 +16,7 @@ use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_plugins::broker::{HostError, JobStatus, ObjectPage};
 use aruna_plugins::manifest::Manifest;
 use serde_json::{Map, Value};
 use ulid::Ulid;
@@ -23,6 +24,7 @@ use ulid::Ulid;
 use super::account::RepairAccount;
 use super::artifacts::ArtifactError;
 use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, CheckNodeBinding};
+use super::check::RunScope;
 use super::copies::Assembled;
 use super::copy_rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
 use super::dispatch::{EnqueueTimers, HookAuthorization, StartError, StartRun, VerifyHook};
@@ -31,6 +33,7 @@ use super::hooks::{AdmitHook, HookError};
 use super::install::{
     InstallCaller, InstallError, InstallPrepared, InstallRequest, PrepareInstall, Prepared,
 };
+use super::job_work::{CancelWork, JobState, RetireWork, SettleWork, StartWork};
 use super::lifecycle::{RemoveInstall, SetGrants, SetPaused, UpdateInstall};
 use super::publish::{CheckPublish, FinishPublish, PublishError, PublishStep};
 use super::reconcile::{RepairSettled, repair_account};
@@ -38,7 +41,10 @@ use super::records::{InstallEntryConfig, InstallEntryOperation};
 use super::rows::StoreError;
 use super::rules::{EnsureRules, RetireRules};
 use super::secret_use::{OpenSealed, ReleaseSecret, Sealed, SelectSecret, Selected};
+use super::submit::WorkRequest;
 use super::sweep::SweepOrphans;
+use super::work::WorkRow;
+use super::work_calls::{JobOutputs, JobRow};
 use crate::driver::{DriverContext, drive};
 pub(crate) use crate::plugin_host::read_config;
 use crate::plugin_host::ready_artifact;
@@ -364,4 +370,60 @@ pub(crate) async fn publish_plugin(
     };
     drive(plan.store_copy(&artifact), ctx).await?;
     drive(FinishPublish::new(actor, auth, *plan, artifact), ctx).await
+}
+
+pub(crate) async fn job_row(
+    ctx: &DriverContext,
+    install: &PluginInstall,
+    id: &str,
+) -> Result<WorkRow, HostError> {
+    Ok(drive(JobRow::new(install, id), ctx).await?)
+}
+
+pub(crate) async fn job_status(
+    ctx: &DriverContext,
+    place: (&PluginInstall, NodeId),
+    id: &str,
+) -> Result<JobStatus, HostError> {
+    Ok(drive(JobState::new(place, id), ctx).await?)
+}
+
+pub(crate) async fn cancel_job(
+    ctx: &DriverContext,
+    install: &PluginInstall,
+    id: &str,
+    now_ms: u64,
+) -> Result<(), HostError> {
+    Ok(drive(CancelWork::new(install, id, now_ms), ctx).await?)
+}
+
+pub(crate) async fn start_work(
+    ctx: &DriverContext,
+    scope: &RunScope,
+    request: WorkRequest,
+) -> Result<Ulid, HostError> {
+    let minted = (unix_timestamp_millis(), Ulid::generate());
+    let start = StartWork::new(scope, request, minted, ctx.node_and_realm());
+    Ok(drive(start, ctx).await?)
+}
+
+pub(crate) async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    drive(SettleWork::new(now_ms), ctx).await
+}
+
+pub(crate) async fn retire_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    drive(RetireWork::new(config, now_ms), ctx).await
+}
+
+pub(crate) async fn job_outputs(
+    ctx: &DriverContext,
+    place: (&PluginInstall, NodeId),
+    id: &str,
+    cursor: Option<String>,
+) -> Result<ObjectPage, HostError> {
+    Ok(drive(JobOutputs::new(place, id, cursor), ctx).await?)
 }

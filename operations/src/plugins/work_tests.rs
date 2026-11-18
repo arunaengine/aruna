@@ -10,9 +10,9 @@ use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 use super::*;
+use crate::plugins::calls::*;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::PayloadHandler;
-use crate::plugin_host::jobs::{retire_work, settle_work};
 use crate::plugin_host::plugin_work::PluginWorkHandler;
 use crate::plugin_host::worker::tests::installed;
 use crate::plugins::install::tests::Fixture;

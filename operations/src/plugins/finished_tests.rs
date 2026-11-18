@@ -11,7 +11,6 @@ use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use serde_json::json;
 
 use super::*;
-use crate::plugin_host::jobs::start_work;
 use crate::plugin_host::worker::{notify_work, prune_runs};
 use crate::plugins::host_calls::call_intent;
 use crate::plugins::install::tests::Fixture;

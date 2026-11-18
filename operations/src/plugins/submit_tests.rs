@@ -8,7 +8,6 @@ use aruna_core::plugin_installs::PluginInstall;
 use super::*;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::plugin_host::jobs::start_work;
 use crate::plugin_host::plugin_work::tests::copier;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::calls::*;
@@ -364,7 +363,6 @@ async fn marks_once() {
 async fn retired_unmarked() {
     // A download that was never submitted, retired with its install, loses its mark at the next
     // sweep: its row is gone and the version it would have written never existed.
-    use crate::plugin_host::jobs::retire_work;
     use crate::plugin_host::worker::sweep_marks;
     use aruna_core::plugin_installs::InstallState;
     let fixture = Fixture::keyed().await;

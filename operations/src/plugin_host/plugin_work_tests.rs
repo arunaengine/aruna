@@ -279,7 +279,6 @@ async fn marked_source_refused() {
 
     use crate::driver::drive;
     use crate::plugin_host::broker::RunBroker;
-    use crate::plugin_host::jobs::start_work;
     use crate::plugins::marks::{MARKED, Mark, mark_row};
     use crate::plugins::rows::write_rows;
     use crate::plugins::submit::WorkRequest;

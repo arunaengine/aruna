@@ -20,7 +20,6 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::store::query::insert_job;
 use crate::jobs::store::state::read_job_record;
-use crate::plugin_host::jobs::settle_work;
 use crate::plugin_host::plugin_work::run_plugin_work;
 use crate::plugin_host::plugin_work::tests::job_context;
 use crate::plugin_host::worker::tests::{install_artifact, job_guest, worker_on};

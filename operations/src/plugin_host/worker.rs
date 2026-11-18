@@ -16,7 +16,6 @@ use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use super::broker::RunBroker;
-use super::jobs::{retire_work, settle_work};
 use super::{read_config, ready_artifact};
 use crate::driver::{DriverContext, drive};
 use crate::plugins::attempt::{
@@ -29,6 +28,7 @@ use crate::plugins::decide::{DecideBatch, prune_seen};
 use crate::plugins::dispatch::EnqueueTimers;
 use crate::plugins::finished::DueCompletions;
 use crate::plugins::forward::{Backoff, CollectOutbox, REQUEST_BYTES, SendEvents, apply};
+use crate::plugins::job_work::{RetireWork, SettleWork};
 use crate::plugins::journal::JOURNAL_PAGE;
 use crate::plugins::journal::prune_journal;
 use crate::plugins::lifecycle::{match_targets, targets};
@@ -159,7 +159,7 @@ impl Worker {
         let swept = swept.map_err(|error| error.to_string())?;
         let hooks = drive(prune_hooks(&config, now_ms), &self.ctx).await;
         let hooks = hooks.map_err(|error| error.to_string())?;
-        let retired = retire_work(&self.ctx, &config, now_ms).await;
+        let retired = drive(RetireWork::new(&config, now_ms), &self.ctx).await;
         Ok(swept + hooks + retired.map_err(|error| error.to_string())?)
     }
 
@@ -480,7 +480,7 @@ pub fn spawn_worker(
             }
             if now.saturating_sub(settled_at) >= SETTLE_MS {
                 settled_at = now;
-                if let Err(error) = settle_work(&worker.ctx, now).await {
+                if let Err(error) = drive(SettleWork::new(now), &worker.ctx).await {
                     warn!(%error, "Could not keep the summaries of finished plugin work");
                 }
                 if let Err(error) = worker.notify(now).await {

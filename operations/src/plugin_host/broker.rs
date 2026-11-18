@@ -34,7 +34,6 @@ use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::jobs::{cancel_job, job_outputs, job_row, job_status, start_work};
 use super::read_config;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -47,9 +46,11 @@ use crate::metadata::api::export_types::{
 use crate::metadata::api::list::ListVisibleOperation;
 use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use crate::metadata::forward::read::get_metadata_routed;
 use crate::metadata::forward::pinned::PinnedCreate;
-use crate::metadata::forward::write::{CreateAuthorizedError, create_with_id, route_metadata_update};
+use crate::metadata::forward::read::get_metadata_routed;
+use crate::metadata::forward::write::{
+    CreateAuthorizedError, create_with_id, route_metadata_update,
+};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::plugins::check::{Authorize, CallError, CheckCall, RunScope, matching};
 use crate::plugins::creates::{
@@ -69,6 +70,7 @@ use crate::plugins::host_calls::{
 };
 use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::intents::{begin, unknown_row, written};
+use crate::plugins::job_work::{CancelWork, JobState, StartWork};
 use crate::plugins::objects::{LocalObject, Unmarked};
 use crate::plugins::outgoing::{
     SendConnection, declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
@@ -79,6 +81,7 @@ use crate::plugins::state::{MAX_STATE_KEY, read_state};
 use crate::plugins::submit::{CopyRequest, DownloadRequest, UploadRequest, WorkRequest};
 use crate::plugins::unavailable;
 use crate::plugins::work::RequestContext;
+use crate::plugins::work_calls::{JobOutputs, JobRow};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::entity_patch::craqle_patch_request;
@@ -512,6 +515,14 @@ impl RunBroker {
         self.record(intent, outcome.map_err(CallEnd::None)).await
     }
 
+    /// Starts or finds the work of `request`.
+    async fn start_work(&self, request: WorkRequest) -> Result<Ulid, HostError> {
+        let minted = (unix_timestamp_millis(), Ulid::generate());
+        let serving = self.ctx.node_and_realm();
+        let start = StartWork::new(&self.scope, request, minted, serving);
+        Ok(drive(start, &self.ctx).await?)
+    }
+
     /// The full permission path of an object path the plugin gave; see [`object_path`].
     fn expand(&self, text: &str) -> Result<String, HostError> {
         let place = (self.scope.realm_id, self.scope.local);
@@ -893,8 +904,7 @@ impl Broker for RunBroker {
             ordinal: copy.intent.ordinal,
         };
         let request = WorkRequest::Copy(request);
-        let start = start_work(&self.ctx, &self.scope, request);
-        let started = self.native(&copy.intent, start);
+        let started = self.native(&copy.intent, self.start_work(request));
         match started.await {
             Err(error) if error.kind == ErrorKind::Conflict => {
                 self.changed.store(true, Ordering::Relaxed);
@@ -935,8 +945,7 @@ impl Broker for RunBroker {
             ordinal: download.intent.ordinal,
         };
         let request = WorkRequest::Download(request);
-        let started = start_work(&self.ctx, &self.scope, request);
-        match self.native(&download.intent, started).await {
+        match (self.native(&download.intent, self.start_work(request))).await {
             Err(error) if error.kind == ErrorKind::Conflict => {
                 self.changed.store(true, Ordering::Relaxed);
                 Err(error)
@@ -980,8 +989,7 @@ impl Broker for RunBroker {
             ordinal: upload.intent.ordinal,
         };
         let request = WorkRequest::Upload(request);
-        let started = start_work(&self.ctx, &self.scope, request);
-        match self.native(&upload.intent, started).await {
+        match (self.native(&upload.intent, self.start_work(request))).await {
             Err(error) if error.kind == ErrorKind::Conflict => {
                 self.changed.store(true, Ordering::Relaxed);
                 Err(error)
@@ -992,9 +1000,10 @@ impl Broker for RunBroker {
 
     async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {
         let install = self.admitted(None).await?;
-        let mut status = job_status(&self.ctx, (&install, self.scope.local), id).await?;
+        let place = (&install, self.scope.local);
+        let mut status = drive(JobState::new(place, id), &self.ctx).await?;
         if status.reply_status.is_some() {
-            let row = job_row(&self.ctx, &install, id).await?;
+            let row = drive(JobRow::new(&install, id), &self.ctx).await?;
             let shown = match &row.context {
                 Some(context) => self.reply_shown(&install, context).await,
                 None => false,
@@ -1015,7 +1024,8 @@ impl Broker for RunBroker {
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError> {
         let install = self.admitted(None).await?;
-        job_outputs(&self.ctx, (&install, self.scope.local), id, cursor).await
+        let place = (&install, self.scope.local);
+        Ok(drive(JobOutputs::new(place, id, cursor), &self.ctx).await?)
     }
 
     async fn jobs_cancel(
@@ -1026,7 +1036,8 @@ impl Broker for RunBroker {
     ) -> Result<(), HostError> {
         // Asking again changes nothing, so a rerun cancels again instead of reading an intent.
         let install = self.admitted(None).await?;
-        cancel_job(&self.ctx, &install, id, unix_timestamp_millis()).await
+        let cancel = CancelWork::new(&install, id, unix_timestamp_millis());
+        Ok(drive(cancel, &self.ctx).await?)
     }
 
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {

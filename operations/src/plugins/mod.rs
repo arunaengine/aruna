@@ -24,6 +24,7 @@ pub mod hooks;
 pub(crate) mod host_calls;
 pub mod install;
 pub mod intents;
+pub(crate) mod job_work;
 pub mod journal;
 pub mod lifecycle;
 pub mod marks;
