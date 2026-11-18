@@ -261,14 +261,14 @@ fn conflicts_restart_then_pause() {
     let mut run = RebuildOperation::new(config(2, 1));
     run.first().unwrap();
     run.next(account_value(&fresh())).unwrap();
-    let read = read_row(RANGE_ACCOUNT_KEYSPACE, account_key(set(), range_id()));
+    let read = || read_row(RANGE_ACCOUNT_KEYSPACE, account_key(set(), range_id()));
     assert_eq!(
         run.next(answered(Ok(StepEnd::Stale))),
-        Ok(Next::Call(read.clone()))
+        Ok(Next::Call(read()))
     );
     run.next(account_value(&fresh())).unwrap();
     let lost = answered(Err(IoError::Conflict.into()));
-    assert_eq!(run.next(lost), Ok(Next::Call(read)));
+    assert_eq!(run.next(lost), Ok(Next::Call(read())));
     run.conflicts = MAX_CONFLICTS;
     run.next(account_value(&fresh())).unwrap();
     assert_eq!(

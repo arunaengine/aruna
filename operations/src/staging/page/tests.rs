@@ -831,16 +831,10 @@ fn guards_carry_hint() {
         revision: Default::default(),
     });
     let values = vec![
-        (Key::from(b"fence".to_vec()), None),
-        (
-            Key::from(b"bucket".to_vec()),
-            value(bound.to_bytes().unwrap()),
-        ),
-        (
-            Key::from(b"connector".to_vec()),
-            value(connector().to_bytes().unwrap()),
-        ),
-        (Key::from(b"job".to_vec()), claim(&record(token()))),
+        None,
+        value(bound.to_bytes().unwrap()),
+        value(connector().to_bytes().unwrap()),
+        claim(&record(token())),
     ];
     let input = input(vec![entry("a")]);
     let guards = crate::staging::page::rows::check_guards(&input, values).unwrap();
