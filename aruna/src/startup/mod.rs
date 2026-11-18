@@ -7,6 +7,7 @@ pub mod federation;
 pub mod https;
 pub mod listeners;
 pub mod realm;
+pub mod recovery;
 pub mod resources;
 pub mod test_hooks;
 

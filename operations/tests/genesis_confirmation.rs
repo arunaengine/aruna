@@ -16,7 +16,8 @@ use aruna_core::structs::placement::record::{PlacementOverride, PlacementRef};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_net::NetHandle;
 use aruna_operations::placement::process_placements::process_shard_placements;
-use aruna_operations::shard::restore::restore_shard_pass;
+use aruna_operations::shard::recovery::RecoveryStop;
+use aruna_operations::shard::restore::RestorePassOperation;
 use aruna_operations::shard::restore_plan::{ShardRestoreCursor, ShardRestorePass};
 use irokle::oplog::Oplog;
 use irokle::storage::Storage;
@@ -382,17 +383,7 @@ async fn withholds_shared_genesis() -> Result<(), Box<dyn std::error::Error>> {
     let node = &nodes[0];
     let topic =
         DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
-    let mut cursor = ShardRestoreCursor::default();
-    let cancelled = tokio_util::sync::CancellationToken::new();
-
-    let pass = restore_shard_pass(
-        &node.context,
-        node.net.node_id(),
-        realm_id,
-        &mut cursor,
-        &cancelled,
-    )
-    .await;
+    let pass = run_restore_pass(node, realm_id).await;
 
     assert!(
         !node.net.sync_topic_exists(topic).unwrap_or(false),
@@ -478,16 +469,16 @@ async fn concurrent_shared_restore() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_restore_pass(node: &TestNode, realm_id: RealmId) -> ShardRestorePass {
-    let mut cursor = ShardRestoreCursor::default();
-    let cancelled = tokio_util::sync::CancellationToken::new();
-    restore_shard_pass(
-        &node.context,
+    let restore = RestorePassOperation::new(
         node.net.node_id(),
         realm_id,
-        &mut cursor,
-        &cancelled,
-    )
-    .await
+        ShardRestoreCursor::default(),
+        RecoveryStop::default(),
+    );
+    let (pass, _) = aruna_operations::driver::drive(restore, &node.context)
+        .await
+        .expect("restore pass runs");
+    pass
 }
 
 fn topic_genesis(node: &TestNode, topic: ::irokle::TopicId) -> Option<::irokle::OpId> {

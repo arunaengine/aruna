@@ -1034,12 +1034,15 @@ async fn spawn_joiner_mode(
     mark_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
     // Join co-holder shard topics before creating rank-zero geneses.
     // This ordering adopts geneses already created by the seed.
-    aruna_operations::shard::restore::restore_shard_subscriptions(
+    aruna_operations::driver::drive(
+        aruna_operations::shard::restore::RestoreTopicsOperation::new(
+            config.node_id,
+            config.realm_id,
+        ),
         &joiner_context,
-        config.node_id,
-        config.realm_id,
     )
-    .await;
+    .await
+    .expect("shard topics restore");
     aruna_operations::placement::process_placements::reconcile_shard_topics(
         &joiner_context,
         config.realm_id,

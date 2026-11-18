@@ -375,7 +375,9 @@ async fn restore_prunes_password() {
         metadata_create_events: Vec::new(),
         metadata_graph_tombstones: Vec::new(),
     };
-    assert!(crate::shard::restore::apply_restored_reconcile(&context, node(), applied).await);
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let apply = crate::shard::pull::ApplyPulledOperation::new(node(), realm_id, applied);
+    assert!(crate::driver::drive(apply, &context).await.unwrap());
     let row = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_parts(3, 3));
     let event = context
         .storage_handle

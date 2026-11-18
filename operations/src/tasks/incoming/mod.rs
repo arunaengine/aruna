@@ -659,7 +659,7 @@ impl OperationsTaskHandler {
     }
 
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
-    // from the realm config at startup by `restore_shard_subscriptions`).
+    // from the realm config at startup by `RestoreTopicsOperation`).
     async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::NodeId) {
         let task_id = TaskKey::SyncPlacements { realm_id, node_id };
         let Some(task_handle) = self.context.task_handle.as_ref() else {

@@ -905,12 +905,12 @@ impl Topology {
         // The joiner runs the startup hook and joins the realm-config topic, as
         // a freshly started node does; without it no admin event reaches it.
         let node = self.find(node_id);
-        aruna_operations::shard::restore::restore_shard_subscriptions(
+        aruna_operations::driver::drive(
+            aruna_operations::shard::restore::RestoreTopicsOperation::new(node_id, self.realm_id),
             &node.context,
-            node_id,
-            self.realm_id,
         )
-        .await;
+        .await
+        .expect("shard topics restore");
         let topic = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         }
@@ -1201,10 +1201,12 @@ async fn install_realm_config(
         "shard placement reconciliation never reported clean",
         || async {
             join_all(nodes.iter().map(|node| {
-                aruna_operations::shard::restore::restore_shard_subscriptions(
+                aruna_operations::driver::drive(
+                    aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                        node.node_id(),
+                        realm_id,
+                    ),
                     &node.context,
-                    node.node_id(),
-                    realm_id,
                 )
             }))
             .await;
@@ -1678,12 +1680,15 @@ pub async fn install_replica_config(
 
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::shard::restore::restore_shard_subscriptions(
+            aruna_operations::driver::drive(
+                aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                    node.net.node_id(),
+                    *realm_id,
+                ),
                 &node.context,
-                node.net.node_id(),
-                *realm_id,
             )
-            .await;
+            .await
+            .expect("shard topics restore");
         }
         let mut retry = false;
         for node in nodes {
