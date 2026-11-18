@@ -33,7 +33,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::pages::{planned_inputs, with_inputs};
+use crate::jobs::records::pages::{PlannedInputsOperation, SpecInputsOperation};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::mint_local_job;
@@ -80,9 +80,14 @@ pub async fn admit_launch(
     let spec = spec_of(&records, &intent)?;
     // Paged inputs are read once here, so every check below sees the full lists; the signed
     // launch itself stays as offered, because its receipt binds that exact record.
-    let spec = with_inputs(context.as_ref(), &spec).await.ok()?;
+    let node = context.node_and_realm();
+    let spec = drive(SpecInputsOperation::new(&spec, node), context.as_ref())
+        .await
+        .ok()?;
     let mut planned = intent.clone();
-    planned.inputs = planned_inputs(context.as_ref(), &intent).await.ok()?;
+    planned.inputs = drive(PlannedInputsOperation::new(&intent, node), context.as_ref())
+        .await
+        .ok()?;
     planned.input_pages = None;
     // The launch becomes a retained record before it can be receipted; missing
     // family evidence is fetched before the offer is answered as undecidable.

@@ -235,7 +235,9 @@ async fn peer_request(
             Ok(MetadataTransportMessage::ResolvedJobInputs { result })
         }
         MetadataTransportMessage::JobInputPage { submission, digest } => {
-            let page = crate::jobs::records::pages::serve_page(context, peer, submission, digest);
+            let page = crate::jobs::records::transport::serve_input_page(
+                context, peer, submission, digest,
+            );
             let page = Box::pin(page).await;
             Ok(MetadataTransportMessage::InputPageResult { page })
         }
