@@ -415,82 +415,166 @@ impl<T: PageTransport> ProcessBlobBatchOperation<T> {
             }
             // No attempt, no error: the next unlock of a key makes the job due again.
             Ok(BlobJobOutcome::AwaitingKey(keys)) => {
-                let park = ParkJobOperation::new(job_key, job, keys, unix_timestamp_millis());
-                if let Some(due_at_ms) = drive(park, context).await? {
-                    next_due_ms = min_due_at(next_due_ms, due_at_ms);
-                }
+                let park = ParkJobOperation::new(job.0, job.1, keys, unix_timestamp_millis());
+                self.call(BatchStep::Parked, IoCall::child(park))
             }
-            Err(error) => {
-                let retry_due_at =
-                    reschedule_blob_job(&context.storage_handle, job_key, &job, error).await?;
-                next_due_ms = min_due_at(next_due_ms, retry_due_at);
-                failed = failed.saturating_add(1);
-            }
+            Err(error) => self.reschedule(job, error),
         }
     }
 
-    advance_replication_cursor(&context.storage_handle, next_cursor).await?;
-
-    if job_count > 0 || repair.processed > 0 {
-        info!(
-            event = "pipeline.blob_replication.summary",
-            jobs = job_count,
-            repaired_obligations = repair.processed,
-            repaired_jobs = repair.queued,
-            succeeded,
-            failed,
-            scan_ms = duration_ms(scan_elapsed),
-            total_ms = duration_ms(batch_started.elapsed()),
-            oldest_lag_ms,
-            has_more_due,
-            "Blob replication batch summary"
-        );
+    fn finish(&mut self) -> BatchTurn {
+        let now_ms = unix_timestamp_millis();
+        if self.job_count > 0 || self.repair.processed > 0 {
+            info!(
+                event = "pipeline.blob_replication.summary",
+                jobs = self.job_count,
+                repaired_obligations = self.repair.processed,
+                repaired_jobs = self.repair.queued,
+                succeeded = self.succeeded,
+                failed = self.failed,
+                scan_ms = self.scan_ms,
+                total_ms = now_ms.saturating_sub(self.started_ms),
+                oldest_lag_ms = self.oldest_lag_ms,
+                has_more_due = self.has_more_due,
+                "Blob replication batch summary"
+            );
+        }
+        let next = (self.next_due_ms).map(|due_at_ms| due_after(now_ms, due_at_ms));
+        // A bootstrap waiting for its jobs or the publisher is looked at again soon.
+        let next = match self.bootstrap {
+            true => Some(next.map_or(BOOTSTRAP_POLL, |after| after.min(BOOTSTRAP_POLL))),
+            false => next,
+        };
+        Ok(Next::Done(BlobDrainResult {
+            processed: self.job_count,
+            succeeded: self.succeeded,
+            failed: self.failed,
+            has_more_due: self.has_more_due,
+            next_due_after: next.filter(|_| !self.has_more_due),
+        }))
     }
-
-    Ok(BlobDrainResult {
-        processed: job_count,
-        succeeded,
-        failed,
-        has_more_due,
-        next_due_after: if has_more_due {
-            None
-        } else {
-            let next = next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms));
-            // A bootstrap waiting for its jobs or the publisher is looked at again soon.
-            match bootstrap {
-                true => Some(next.map_or(BOOTSTRAP_POLL, |after| after.min(BOOTSTRAP_POLL))),
-                false => next,
-            }
-        },
-    })
 }
 
-pub(super) async fn load_source_authorization(
-    context: &DriverContext,
-    auth_context: AuthContext,
-    source_node_id: NodeId,
-    bucket: &str,
-) -> Result<SourceAuthorization, (SourceAuthorizationError, Option<GroupId>)> {
-    let bucket_info = match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(bucket_info) => bucket_info,
-        Err(error) => {
-            return Err((
-                SourceAuthorizationError::Unavailable(error.to_string()),
-                None,
-            ));
+impl<T: PageTransport> Operation for ProcessBlobBatchOperation<T> {
+    type Output = BlobDrainResult;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> BatchTurn {
+        self.started_ms = unix_timestamp_millis();
+        Ok(Next::Call(
+            IoCall::child(ProcessObligationsOperation::new()),
+        ))
+    }
+
+    fn next(&mut self, result: IoResult) -> BatchTurn {
+        match std::mem::replace(&mut self.step, BatchStep::Cursor) {
+            BatchStep::Repair => {
+                self.repair = result.child::<LiveRepairResult, BlobQueueError>()??;
+                let bootstrap = ProcessBootstrapOperation::new(self.serving);
+                self.call(BatchStep::Bootstrap, IoCall::child(bootstrap))
+            }
+            BatchStep::Bootstrap => {
+                self.bootstrap = match result.child::<bool, BlobQueueError>()? {
+                    Ok(waiting) => waiting,
+                    Err(error) => {
+                        warn!(%error, "Distributed bucket bootstrap failed; retrying");
+                        true
+                    }
+                };
+                let scan = ScanJobsOperation::new(unix_timestamp_millis(), PAGE_RECORDS);
+                self.call(BatchStep::Scan, IoCall::child(scan))
+            }
+            BatchStep::Scan => {
+                let scan = result.child::<BlobJobScan, BlobQueueError>()??;
+                self.scanned(scan)
+            }
+            BatchStep::Deliver => {
+                let pages = result.child::<PageReport, BlobQueueError>()??;
+                self.delivered(pages)
+            }
+            BatchStep::Relationships => {
+                self.relationships = result.child::<Relationships, BlobQueueError>()??;
+                self.next_job()
+            }
+            BatchStep::Job(job) => {
+                let run = result.child::<JobRun, BlobQueueError>()?;
+                let run = run.unwrap_or_else(|error| JobRun {
+                    result: Err(error.to_string()),
+                    cached: None,
+                });
+                self.job_done(*job, run)
+            }
+            BatchStep::Retired => {
+                result.child::<(), BlobQueueError>()??;
+                self.next_job()
+            }
+            BatchStep::Rescheduled => {
+                result.done()?;
+                self.next_job()
+            }
+            BatchStep::Parked => {
+                if let Some(due_at_ms) = result.child::<Option<u64>, BlobQueueError>()?? {
+                    self.next_due_ms = min_due_at(self.next_due_ms, due_at_ms);
+                }
+                self.next_job()
+            }
+            BatchStep::Cursor => {
+                result.child::<(), BlobQueueError>()??;
+                self.finish()
+            }
         }
-    };
-    let group_id = bucket_info.group_id;
-    drive(
-        crate::replication::source_rules::SourceAuthOperation::new(
-            auth_context,
-            group_id,
+    }
+}
+
+/// A source check that ended without a usable authorization, with the bucket's group if known.
+pub(super) type SourceRefusal = (SourceAuthorizationError, Option<GroupId>);
+
+/// Loads what the source node allows a job's caller, for the bucket's group.
+#[derive(Debug, PartialEq)]
+pub(super) struct LoadSourceAuthOperation {
+    auth_context: Option<AuthContext>,
+    source_node_id: NodeId,
+    bucket: String,
+    group_id: Option<GroupId>,
+}
+
+impl LoadSourceAuthOperation {
+    pub(super) fn new(auth_context: AuthContext, source_node_id: NodeId, bucket: &str) -> Self {
+        Self {
+            auth_context: Some(auth_context),
             source_node_id,
-        ),
-        context,
-    )
-    .await
-    .map_err(|error| (error, Some(group_id)))
+            bucket: bucket.to_string(),
+            group_id: None,
+        }
+    }
+}
+
+impl Operation for LoadSourceAuthOperation {
+    type Output = Result<SourceAuthorization, SourceRefusal>;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<Self::Output> {
+        let read = GetBucketOperation::new(self.bucket.clone());
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Self::Output> {
+        if let Some(group_id) = self.group_id {
+            let loaded = result.child::<SourceAuthorization, SourceAuthorizationError>()?;
+            return Ok(Next::Done(loaded.map_err(|error| (error, Some(group_id)))));
+        }
+        let info = match result.child::<BucketInfo, GetBucketError>()? {
+            Ok(info) => info,
+            Err(error) => {
+                let error = SourceAuthorizationError::Unavailable(error.to_string());
+                return Ok(Next::Done(Err((error, None))));
+            }
+        };
+        self.group_id = Some(info.group_id);
+        let auth = self.auth_context.take().ok_or(IoError::Unfinished)?;
+        let load = SourceAuthOperation::new(auth, info.group_id, self.source_node_id);
+        Ok(Next::Call(IoCall::child(load)))
+    }
 }
 
 pub(super) fn mark_failure(relationship: &mut SyncRelationship, error: &str) {
@@ -529,29 +613,60 @@ fn scope_failure(error: &ReplicateScopeError) -> ReplicationFailure {
     error.failure()
 }
 
-pub(super) async fn store_relationship(
-    context: &DriverContext,
-    relationship: SyncRelationship,
-) -> Result<bool, String> {
-    let stored = drive(StoreStatusOperation::new(relationship.clone()), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    if stored {
-        let _ = drive(KickRepairOperation::new(), context).await;
-    }
-    Ok(stored)
+/// Stores a relationship's status and wakes the mirror repair. Outputs whether the status was
+/// stored, or why it could not be.
+#[derive(Debug, PartialEq)]
+pub(super) struct StoreRelationshipOperation {
+    relationship: Option<SyncRelationship>,
+    stored: bool,
 }
 
-async fn emit_sync_watch(
-    context: &DriverContext,
+impl StoreRelationshipOperation {
+    pub(super) fn new(relationship: SyncRelationship) -> Self {
+        Self {
+            relationship: Some(relationship),
+            stored: false,
+        }
+    }
+}
+
+impl Operation for StoreRelationshipOperation {
+    type Output = Result<bool, String>;
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Turn<Self::Output> {
+        let relationship = self.relationship.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(StoreStatusOperation::new(
+            relationship,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Self::Output> {
+        if self.stored {
+            // The repair also runs on its timer, so a failed kick costs only time.
+            result.child::<(), SyncMirrorError>()?.ok();
+            return Ok(Next::Done(Ok(true)));
+        }
+        match result.child::<bool, SyncMirrorError>()? {
+            Ok(true) => {
+                self.stored = true;
+                Ok(Next::Call(IoCall::child(KickRepairOperation::new())))
+            }
+            Ok(false) => Ok(Next::Done(Ok(false))),
+            Err(error) => Ok(Next::Done(Err(error.to_string()))),
+        }
+    }
+}
+
+/// The event of a finished or failed sync of `relationship`; `None` without a source bucket.
+fn sync_event(
     relationship: &SyncRelationship,
     group_id: GroupId,
     versions_synced: u64,
     error: Option<&str>,
-) {
-    let Some(bucket) = relationship.source.bucket() else {
-        return;
-    };
+    now_ms: u64,
+) -> Option<WatchEvent> {
+    let bucket = relationship.source.bucket()?;
     let node_id = relationship.source.node_id;
     let (kind, detail) = match error {
         Some(error) => (
@@ -575,7 +690,7 @@ async fn emit_sync_watch(
             },
         ),
     };
-    let emit = EmitEventOperation::new(WatchEvent {
+    Some(WatchEvent {
         event_id: Ulid::generate(),
         realm_id: relationship.source.realm_id,
         kind,
@@ -586,11 +701,9 @@ async fn emit_sync_watch(
             relationship.source.key_prefix().unwrap_or_default(),
         ),
         actor: relationship.created_by,
-        occurred_at_ms: unix_timestamp_millis(),
+        occurred_at_ms: now_ms,
         detail,
-    });
-    // Failures only warn inside the operation.
-    let _ = drive(emit, context).await;
+    })
 }
 
 pub(super) fn job_source_auth<'a>(
@@ -631,50 +744,146 @@ fn relationship_bucket<'a>(
     relationship.source.bucket().ok_or(BlobJobOutcome::Failed)
 }
 
-async fn process_blob_job(
-    context: &DriverContext,
-    job: &BlobJobRecord,
-    stored_relationship: Option<SyncRelationship>,
-    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
-) -> Result<BlobJobOutcome, String> {
-    if job.reference_advance.is_some() && job.relationship_id.is_none() {
-        return Ok(BlobJobOutcome::Failed);
-    }
-    let routing = match crate::driver::drive(
-        crate::groups::routing::QuotaOperation::new(crate::driver::node_routing(context)),
-        context,
-    )
-    .await
-    {
-        Ok(routing) => routing,
-        // Retrying a record that will never decode only pins the queue at its
-        // backoff ceiling; the drain repair re-enqueues once it is repaired.
-        Err(error) if error.storage().is_none() => {
-            error!(error = %error, "Dropping blob replication job with undecodable routing inputs");
-            return Ok(BlobJobOutcome::Failed);
+type JobResult = Result<BlobJobOutcome, String>;
+
+/// How one job's run ended, and the relationship status it stored, with whether it was taken.
+#[derive(Debug, PartialEq)]
+struct JobRun {
+    result: JobResult,
+    cached: Option<(SyncRelationship, bool)>,
+}
+
+/// What follows a stored relationship status.
+#[derive(Debug, PartialEq)]
+enum AfterStore {
+    Finish(JobResult),
+    /// The failure path goes on after a refused plaintext copy failed the relationship.
+    Failure(Option<ReplicationFailure>, String),
+}
+
+#[derive(Debug, PartialEq)]
+enum JobStep {
+    Quota,
+    Gate,
+    Member,
+    RelationAuth,
+    WriterAuth,
+    Plaintext(Box<SourceAuthorization>),
+    Scope,
+    Store(Option<(u64, Option<String>)>, Box<AfterStore>),
+    Emit(Box<AfterStore>),
+}
+
+/// Runs one replication job and keeps its relationship's status.
+#[derive(Debug, PartialEq)]
+struct ProcessJobOperation {
+    job: BlobJobRecord,
+    relationship: Option<SyncRelationship>,
+    routing: NodeRouting,
+    serving: Serving,
+    now_ms: u64,
+    step: JobStep,
+    node_routing: Option<NodeRouting>,
+    operation: Option<ReplicateScopeOperation>,
+    watch_group: Option<GroupId>,
+    creator: Option<AuthContext>,
+    cached: Option<(SyncRelationship, bool)>,
+}
+
+type JobTurn = Turn<JobRun>;
+
+impl ProcessJobOperation {
+    fn new(
+        job: BlobJobRecord,
+        relationship: Option<SyncRelationship>,
+        routing: NodeRouting,
+        serving: Serving,
+    ) -> Self {
+        Self {
+            job,
+            relationship,
+            routing,
+            serving,
+            now_ms: 0,
+            step: JobStep::Quota,
+            node_routing: None,
+            operation: None,
+            watch_group: None,
+            creator: None,
+            cached: None,
         }
-        Err(error) => return Err(error.to_string()),
-    };
-    // Reference materialization writes real bytes on this node, so the job
-    // carries this node's destination details; a node mid-transition refuses.
-    let gate = match crate::driver::drive(
-        crate::placement::policy::GateOperation::new(
-            job.input.auth_context.realm_id,
-            aruna_core::time::unix_timestamp_millis(),
-        ),
-        context,
-    )
-    .await
-    {
-        Ok(gate) => gate,
-        Err(error) => return Err(error.to_string()),
-    };
-    let mut operation = ReplicateScopeOperation::new(job.input.clone()).with_routing(routing);
-    if let Some(gate) = gate {
-        operation = operation.with_gate(gate);
     }
-    if let Some(target) = job.distribution.as_ref() {
-        return publish_member(context, job, target, operation, relationships).await;
+
+    fn call(&mut self, step: JobStep, call: IoCall) -> JobTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn finish(&mut self, result: JobResult) -> JobTurn {
+        Ok(Next::Done(JobRun {
+            result,
+            cached: self.cached.take(),
+        }))
+    }
+
+    fn local_node(&self) -> Result<NodeId, String> {
+        (self.serving.map(|(node, _)| node))
+            .ok_or_else(|| "source node identity unavailable".to_string())
+    }
+
+    fn gated(&mut self, gate: Option<GateContext>) -> JobTurn {
+        let routing = self.node_routing.take().ok_or(IoError::Unfinished)?;
+        let mut operation =
+            ReplicateScopeOperation::new(self.job.input.clone()).with_routing(routing);
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
+        self.operation = Some(operation);
+        if self.job.distribution.is_some() {
+            // A member publication keeps no relationship status.
+            self.relationship = None;
+            if !matches!(self.job.input.target, ReplicateScopeTarget::Version { .. }) {
+                return self.finish(Ok(BlobJobOutcome::Failed));
+            }
+            if let Err(error) = self.local_node() {
+                return self.finish(Err(error));
+            }
+            let read = BoundRecordOperation::new(&self.job.input.bucket);
+            return self.call(JobStep::Member, IoCall::child(read));
+        }
+        match self.job.relationship_id {
+            Some(relationship_id) => self.load_relationship_auth(relationship_id),
+            None => self.load_writer_auth(),
+        }
+    }
+
+    /// Sends a distributed bucket's version to one member under the publication this node's
+    /// record gives now. A job whose publication ended is done: the current coordinator owes it.
+    fn record_read(&mut self, record: Option<BoundRecord>) -> JobTurn {
+        let job = &self.job;
+        let publication = (|| {
+            let ReplicateScopeTarget::Version { key, .. } = &job.input.target else {
+                return None;
+            };
+            let target: &MemberTarget = job.distribution.as_ref()?;
+            let (binding, snapshot) = record.as_ref()?;
+            member_publication(binding, snapshot, key, target)
+                .filter(|(_, node_id)| *node_id == job.input.target_node_id)
+        })();
+        let Some((publication, _)) = publication else {
+            info!(
+                bucket = %job.input.bucket,
+                "Dropping a publication this node no longer owes"
+            );
+            return self.finish(Ok(BlobJobOutcome::Retired));
+        };
+        let local = match self.local_node() {
+            Ok(local) => local,
+            Err(error) => return self.finish(Err(error)),
+        };
+        let operation = self.operation.take().ok_or(IoError::Unfinished)?;
+        self.operation = Some(operation.with_distribution(publication, local));
+        self.run_scope()
     }
     let mut watch_group_id = None;
     let relationship = if let Some(relationship_id) = job.relationship_id {
