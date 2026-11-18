@@ -10,7 +10,9 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::CACHE_MANIFEST_KEY;
 use aruna_core::cursor;
+use aruna_core::errors::StagingSourceError;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
@@ -24,13 +26,14 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
-use crate::driver::{DriverContext, drive};
 use crate::jobs::read_access::SourceReadError;
 use crate::jobs::read_access::SourceReadOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
+use crate::s3::object::get::{
+    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
+};
 use crate::s3::object::visible::SCAN_BUDGET;
 use crate::staging::granted_read::GrantedReadOperation;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION, SignedGrant};
@@ -512,8 +515,7 @@ fn managed_error(error: BaoReadError) -> ViewError {
     }
 }
 
-fn granted_error(error: aruna_core::errors::StagingSourceError) -> ViewError {
-    use aruna_core::errors::StagingSourceError;
+fn granted_error(error: StagingSourceError) -> ViewError {
     match error {
         StagingSourceError::AccessDenied => ViewError::Denied,
         StagingSourceError::NotFound => ViewError::NotFound,
@@ -521,143 +523,171 @@ fn granted_error(error: aruna_core::errors::StagingSourceError) -> ViewError {
     }
 }
 
-/// Checks the creator may still read one entry, at its source: here, or at its holder.
-pub async fn head_entry(
-    context: &DriverContext,
-    record: &JobRecord,
-    entry: &ViewEntry,
-    local: NodeId,
-) -> Result<(), ViewError> {
-    let source = entry.captured.source_node_id;
-    if source == local {
-        let auth = creator(record, context.serving_realm(record.created_by.realm_id));
-        return drive(
-            SourceReadOperation::of_object(&auth, local, source_of(entry), HEAD_OPERATION),
-            context,
-        )
-        .await
-        .map(|_| ())
-        .map_err(source_error);
-    }
-    match entry.captured.content.blake3() {
-        Some(blake3) => {
-            let request = managed_request(context, record, entry, Some(blake3), true, None);
-            drive(ManagedReadOperation::new(source, request), context)
-                .await
-                .map(|_| ())
-                .map_err(managed_error)
-        }
-        None => {
-            let grant = entry.captured.grant.as_ref().ok_or(ViewError::Denied)?;
-            let read = granted_read(context, source, grant, None, true);
-            drive(read, context)
-                .await
-                .map(|_| ())
-                .map_err(granted_error)
-        }
-    }
+#[derive(Debug, PartialEq)]
+enum EntryStep {
+    Authorize,
+    Read,
+    Managed,
+    Granted,
 }
 
-fn granted_read(
-    context: &DriverContext,
-    source: NodeId,
-    grant: &SignedGrant,
-    range: Option<Range<u64>>,
+/// Reads one entry at its exact version from its source, here or at its holder, for the run's
+/// creator. A head only checks the creator may still read it and answers no bytes.
+#[derive(Debug, PartialEq)]
+pub struct ViewEntryOperation {
+    auth: AuthContext,
+    entry: ViewEntry,
+    local: NodeId,
     head: bool,
-) -> GrantedReadOperation {
-    GrantedReadOperation::new(context.node_and_realm(), source, grant, range, head)
+    range: Option<Range<u64>>,
+    step: EntryStep,
 }
 
-/// The bytes of one entry, or of `range` of it, at its exact version from its source.
-pub async fn read_entry(
-    context: &DriverContext,
-    record: &JobRecord,
-    entry: &ViewEntry,
-    local: NodeId,
-    range: Option<Range<u64>>,
-) -> Result<ViewStream, ViewError> {
-    let source = entry.captured.source_node_id;
-    if source == local {
-        let auth = creator(record, context.serving_realm(record.created_by.realm_id));
-        let group_id = drive(
-            SourceReadOperation::of_object(&auth, local, source_of(entry), READ_OPERATION),
-            context,
-        )
-        .await
-        .map_err(source_error)?;
-        let (bucket, key) = source_of(entry);
-        let get = drive(
-            GetObjectOperation::new(GetObjectInput {
+type EntryNext = Result<Next<Option<ViewStream>>, ViewError>;
+
+impl ViewEntryOperation {
+    pub fn head(auth: AuthContext, entry: ViewEntry, local: NodeId) -> Self {
+        Self::new(auth, entry, local, true, None)
+    }
+
+    /// The bytes of the entry, or of `range` of it.
+    pub fn read(
+        auth: AuthContext,
+        entry: ViewEntry,
+        local: NodeId,
+        range: Option<Range<u64>>,
+    ) -> Self {
+        Self::new(auth, entry, local, false, range)
+    }
+
+    fn new(
+        auth: AuthContext,
+        entry: ViewEntry,
+        local: NodeId,
+        head: bool,
+        range: Option<Range<u64>>,
+    ) -> Self {
+        Self {
+            auth,
+            entry,
+            local,
+            head,
+            range,
+            step: EntryStep::Authorize,
+        }
+    }
+
+    /// A managed read of the exact captured version for the creator, as admitted.
+    fn managed_request(&self, blake3: [u8; 32]) -> BaoReadRequest {
+        let (bucket, key) = source_of(&self.entry);
+        BaoReadRequest {
+            realm_id: self.auth.realm_id,
+            target: BaoReadTarget::ExactVersion(VersionedObjectArn {
+                realm_id: self.auth.realm_id,
+                node_id: self.entry.captured.source_node_id,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-                version_id: Some(entry.captured.version_id),
-                range: range.map(|range| ObjectRangeRequest::StartEnd {
-                    start: range.start,
-                    end: range.end.saturating_sub(1),
-                }),
-                group_id,
-                user_identity: record.created_by,
-                realm_id: auth.realm_id,
-                node_id: local,
+                version: self.entry.captured.version_id,
             }),
-            context,
-        )
-        .await
-        .map_err(|error| ViewError::Unavailable(error.to_string()))?;
-        return Ok(get.blob);
-    }
-    match entry.captured.content.blake3() {
-        Some(blake3) => {
-            let request = managed_request(context, record, entry, Some(blake3), false, range);
-            match drive(ManagedReadOperation::new(source, request), context).await {
-                Ok(BaoReadOutput::Stream { blob, .. }) => Ok(blob),
-                Ok(BaoReadOutput::Metadata { .. }) => Err(ViewError::Unavailable(
-                    "the holder sent no bytes".to_string(),
-                )),
-                Err(error) => Err(managed_error(error)),
-            }
-        }
-        None => {
-            let grant = entry.captured.grant.as_ref().ok_or(ViewError::Denied)?;
-            let read = granted_read(context, source, grant, range, false);
-            let body = drive(read, context).await.map_err(granted_error)?;
-            Ok(body.blob)
+            auth_context: self.auth.clone(),
+            expected_blake3: Some(blake3),
+            metadata_only: self.head,
+            destination: None,
+            known_refs: Vec::new(),
+            range: self.range.clone(),
         }
     }
 }
 
-/// A managed read of the exact captured version for the creator, as admitted.
-fn managed_request(
-    context: &DriverContext,
-    record: &JobRecord,
-    entry: &ViewEntry,
-    blake3: Option<[u8; 32]>,
-    metadata_only: bool,
-    range: Option<Range<u64>>,
-) -> BaoReadRequest {
-    let auth = creator(record, context.serving_realm(record.created_by.realm_id));
-    let (bucket, key) = source_of(entry);
-    BaoReadRequest {
-        realm_id: auth.realm_id,
-        target: BaoReadTarget::ExactVersion(VersionedObjectArn {
-            realm_id: auth.realm_id,
-            node_id: entry.captured.source_node_id,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version: entry.captured.version_id,
-        }),
-        auth_context: auth,
-        expected_blake3: blake3,
-        metadata_only,
-        destination: None,
-        known_refs: Vec::new(),
-        range,
+impl Operation for ViewEntryOperation {
+    type Output = Option<ViewStream>;
+    type Error = ViewError;
+
+    fn first(&mut self) -> EntryNext {
+        let source = self.entry.captured.source_node_id;
+        if source == self.local {
+            let operation = match self.head {
+                true => HEAD_OPERATION,
+                false => READ_OPERATION,
+            };
+            let object = source_of(&self.entry);
+            let read = SourceReadOperation::of_object(&self.auth, self.local, object, operation);
+            return Ok(Next::Call(IoCall::child(read)));
+        }
+        if let Some(blake3) = self.entry.captured.content.blake3() {
+            self.step = EntryStep::Managed;
+            let read = ManagedReadOperation::new(source, self.managed_request(blake3));
+            return Ok(Next::Call(IoCall::child(read)));
+        }
+        let grant = self
+            .entry
+            .captured
+            .grant
+            .as_ref()
+            .ok_or(ViewError::Denied)?;
+        let ids = Some((self.local, self.auth.realm_id));
+        let read = GrantedReadOperation::new(ids, source, grant, self.range.clone(), self.head);
+        self.step = EntryStep::Granted;
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> EntryNext {
+        match self.step {
+            EntryStep::Authorize => {
+                let group_id =
+                    (result.child::<GroupId, SourceReadError>()?).map_err(source_error)?;
+                if self.head {
+                    return Ok(Next::Done(None));
+                }
+                let (bucket, key) = source_of(&self.entry);
+                let get = GetObjectOperation::new(GetObjectInput {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: Some(self.entry.captured.version_id),
+                    range: self
+                        .range
+                        .clone()
+                        .map(|range| ObjectRangeRequest::StartEnd {
+                            start: range.start,
+                            end: range.end.saturating_sub(1),
+                        }),
+                    group_id,
+                    user_identity: self.auth.user_id,
+                    realm_id: self.auth.realm_id,
+                    node_id: self.local,
+                });
+                self.step = EntryStep::Read;
+                Ok(Next::Call(IoCall::child(get)))
+            }
+            EntryStep::Read => {
+                let get = (result.child::<GetObjectResult, GetObjectError>()?)
+                    .map_err(|error| ViewError::Unavailable(error.to_string()))?;
+                Ok(Next::Done(Some(get.blob)))
+            }
+            EntryStep::Managed => {
+                let read =
+                    (result.child::<BaoReadOutput, BaoReadError>()?).map_err(managed_error)?;
+                match (read, self.head) {
+                    (_, true) => Ok(Next::Done(None)),
+                    (BaoReadOutput::Stream { blob, .. }, false) => Ok(Next::Done(Some(blob))),
+                    (BaoReadOutput::Metadata { .. }, false) => Err(ViewError::Unavailable(
+                        "the holder sent no bytes".to_string(),
+                    )),
+                }
+            }
+            EntryStep::Granted => {
+                let body =
+                    (result.child::<GrantedBody, StagingSourceError>()?).map_err(granted_error)?;
+                Ok(Next::Done((!self.head).then_some(body.blob)))
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::encryption::EncryptionMode;
     use ulid::Ulid;
