@@ -9,45 +9,36 @@ use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::structs::execution::job::{JobId, JobPayload, RETENTION_MS, WorkspaceMode};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::{ErrorKind, Field, HostError, JobStatus, ObjectInfo, ObjectPage};
+use aruna_plugins::broker::{ErrorKind, Field, HostError, JobStatus, ObjectPage};
 use base64::Engine;
 use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::check::RunScope;
-use super::grants::short_path;
-use super::marks::is_marked;
-use super::rows::{StoreError, decode, delete_rows, scan_rows};
-use super::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
-use super::unavailable;
-use super::work::{
-    SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
-    install_at, read_work, summary_of, update_work, work_scan, work_state,
-};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::attempt::set_cancel_requested;
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::{SubmitJobError, SubmitJobSpec};
+use crate::plugins::check::RunScope;
+use crate::plugins::grants::short_path;
+use crate::plugins::rows::{StoreError, decode, delete_rows, scan_rows};
+use crate::plugins::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
+use crate::plugins::unavailable;
+use crate::plugins::work::{
+    SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
+    install_at, summary_of, update_work, work_scan, work_state,
+};
+use crate::plugins::work_calls::{JobOutputs, JobRow};
 
-/// Outputs of one page.
-const PAGE: usize = 100;
-
-/// The work row of job `id` of `install`; a row of an earlier install under the same id is not
-/// this install's job.
+/// The work row of job `id` of `install`.
 pub(crate) async fn job_row(
     ctx: &DriverContext,
     install: &PluginInstall,
     id: &str,
 ) -> Result<WorkRow, HostError> {
-    let missing = || HostError::new(ErrorKind::NotFound, format!("the install has no job {id}"));
-    let work_id = Ulid::from_string(id).map_err(|_| missing())?;
-    let row = drive(read_work(install.install_id, work_id), ctx).await;
-    let row = row.map_err(|error| unavailable(error.0))?;
-    row.filter(|row| row.account == install.account)
-        .ok_or_else(missing)
+    Ok(drive(JobRow::new(install, id), ctx).await?)
 }
 
 /// What job `id` did: from its kept summary once settled, else from its job record.
@@ -106,42 +97,11 @@ pub(crate) async fn job_status(
 /// One page of the objects job `id` wrote, after the output at `cursor`.
 pub(crate) async fn job_outputs(
     ctx: &DriverContext,
-    (install, local): (&PluginInstall, NodeId),
+    place: (&PluginInstall, NodeId),
     id: &str,
     cursor: Option<String>,
 ) -> Result<ObjectPage, HostError> {
-    let row = job_row(ctx, install, id).await?;
-    let start = match cursor {
-        Some(text) => text.parse::<usize>().map_err(|_| {
-            HostError::new(
-                ErrorKind::Invalid,
-                format!("`{text}` is not an outputs cursor"),
-            )
-        })?,
-        None => 0,
-    };
-    let outputs = (row.summary.map(|summary| summary.outputs)).unwrap_or_default();
-    let mut objects = Vec::new();
-    for output in (outputs.iter().skip(start).take(PAGE)).filter(|output| output.node_id == local) {
-        let version = (
-            output.bucket.as_str(),
-            output.key.as_str(),
-            output.version_id,
-        );
-        let marked = match is_marked(version) {
-            Ok(marked) => drive(marked, ctx).await,
-            Err(error) => Err(error),
-        };
-        objects.push(ObjectInfo {
-            path: format!("{}/{}", output.bucket, output.key),
-            size: output.size,
-            version: output.version_id.to_string(),
-            marked: marked.map_err(|error| unavailable(error.0))?,
-        });
-    }
-    let next = start + PAGE;
-    let cursor = (next < outputs.len()).then(|| next.to_string());
-    Ok(ObjectPage { objects, cursor })
+    Ok(drive(JobOutputs::new(place, id, cursor), ctx).await?)
 }
 
 /// Asks the job of `id` to stop. A job that ended, or whose record is gone, has nothing left to

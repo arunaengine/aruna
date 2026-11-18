@@ -22,6 +22,9 @@ use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use super::family::LoadFamilyOperation;
 use super::pages::{KeepPagesOperation, ServePageOperation};
 use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::cancel::CancelLocalRunsOperation;
+use crate::jobs::lifecycle::launch_admit::AdmitLaunchOperation;
+use crate::jobs::lifecycle::target::launch_node;
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
 use crate::realm::load_config::load_realm_config;
@@ -191,7 +194,12 @@ async fn accept_record(
             .map_err(|_| ServeError::Unavailable)?;
             // Admission may promote a pending cancel, and retries must reapply its side effect.
             if !cancels.is_empty() {
-                crate::jobs::lifecycle::cancel::cancel_local_runs(context.as_ref(), family).await;
+                let cancel = CancelLocalRunsOperation::new(
+                    family,
+                    context.node_and_realm(),
+                    aruna_core::time::unix_timestamp_millis(),
+                );
+                let _ = drive(cancel, context.as_ref()).await;
             }
             Ok(())
         }
@@ -313,7 +321,13 @@ pub async fn serve_launch_offer(
             result: Err(LaunchDecline::Unauthorized),
         };
     }
-    match crate::jobs::lifecycle::target::admit_launch(context, launch).await {
+    let Some(node) = launch_node(context, &launch) else {
+        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    };
+    match drive(AdmitLaunchOperation::new(launch, node), context.as_ref())
+        .await
+        .ok()
+    {
         Some(Ok(receipt)) => MetadataTransportMessage::ForwardedLaunchOffer {
             result: Ok(Box::new(receipt)),
         },

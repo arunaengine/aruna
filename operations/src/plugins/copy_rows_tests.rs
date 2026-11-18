@@ -335,3 +335,48 @@ fn sweeps_stale_copies() {
     assert_eq!(sweep.next(IoResult::Done), Ok(Next::Call(delete_call(old))));
     assert_eq!(sweep.next(IoResult::Done), Ok(Next::Done(2)));
 }
+
+mod operations {
+    use super::*;
+    use crate::plugins::fixtures::is_child;
+    use crate::plugins::rows::tests::child_result;
+
+    #[test]
+    fn local_copy_reads() {
+        let mut read = ReadLocal::new("d");
+        assert!(is_child(&read.first()));
+        let none = child_result(Ok::<Option<u64>, ArtifactError>(None));
+        assert!(matches!(read.next(none), Ok(Next::Done(None))));
+        let mut read = ReadLocal::new("d");
+        read.first().unwrap();
+        let total = child_result(Ok::<Option<u64>, ArtifactError>(Some(3)));
+        assert!(is_child(&read.next(total)));
+        let bytes = child_result(Ok::<_, ArtifactError>(vec![1u8, 2, 3]));
+        let Ok(Next::Done(Some(copy))) = read.next(bytes) else {
+            panic!("the bytes end the read");
+        };
+        assert_eq!(copy.bytes, [1, 2, 3]);
+    }
+
+    fn keep() -> KeepChunk {
+        KeepChunk::new(&config(), chunk_of("d", b"abc", 0), 5)
+    }
+
+    #[test]
+    fn chunk_answers_state() {
+        let stored = |state| child_result(Ok::<_, ArtifactError>(state));
+        let mut held = keep();
+        assert_eq!(held.hold_scope(), Some(HoldScope::PluginCopies));
+        assert!(is_child(&held.first()));
+        assert_eq!(held.next(stored(ChunkStored::Held)), Ok(Next::Done(false)));
+        let mut known = keep();
+        known.first().unwrap();
+        let confirmed = known.next(stored(ChunkStored::Confirmed));
+        assert_eq!(confirmed, Ok(Next::Done(true)));
+        let mut last = keep();
+        last.first().unwrap();
+        assert!(is_child(&last.next(stored(ChunkStored::AllHere))));
+        let complete = child_result(Ok::<(), ArtifactError>(()));
+        assert_eq!(last.next(complete), Ok(Next::Done(true)));
+    }
+}

@@ -8,14 +8,13 @@ use aruna_core::plugin_runs::{SourceKind, journal_entries};
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
-use crate::plugins::install::read_config;
+use crate::plugin_host::worker::match_journal;
+use crate::plugin_host::worker::tests::{created, installed, scoped, synced};
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::lifecycle::set_grants;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::store::Txn;
-use crate::plugins::worker::match_journal;
-use crate::plugins::worker::tests::{created, installed, scoped, synced};
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 use aruna_core::plugin_runs::journal_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -382,7 +381,7 @@ fn user_pending_dropped() {
 }
 
 #[test]
-fn journal_pages_until_short() {
+fn journal_reads_pages() {
     let mut matching = MatchJournal::new((Vec::new(), true), 5, 9);
     assert!(matches!(matching.first(), Ok(Next::Call(IoCall::Child(_)))));
     let full = child_result(Ok::<usize, StoreError>(JOURNAL_PAGE));

@@ -12,19 +12,19 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::PayloadHandler;
+use crate::plugin_host::jobs::{retire_work, settle_work};
+use crate::plugin_host::plugin_work::PluginWorkHandler;
+use crate::plugin_host::worker::tests::installed;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::jobs::{retire_work, settle_work};
-use crate::plugins::plugin_work::PluginWorkHandler;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::rows::{page_call, read_call, read_rows, write_rows};
 use crate::plugins::store::Txn;
-use crate::plugins::worker::tests::installed;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
 const TARGET: &str = "/realm/g/group/data/node/out/a.txt";
 
-fn proposed(install: &PluginInstall, digest: u8) -> WorkRow {
+pub(crate) fn proposed(install: &PluginInstall, digest: u8) -> WorkRow {
     let mut row = WorkRow::reserved(install, WorkKind::Copy, Ulid::generate(), 1);
     row.source = Some(SOURCE.into());
     row.target = Some(TARGET.into());
@@ -436,7 +436,7 @@ async fn removal_cancels_first() {
         config.installs[0].state = InstallState::Removing;
     };
     edit_config(&fixture, removing).await;
-    let config = crate::plugins::install::read_config(ctx, fixture.actor.realm_id);
+    let config = crate::plugins::calls::read_config(ctx, fixture.actor.realm_id);
     let config = config.await.unwrap();
     assert_eq!(retire_work(ctx, &config, 5).await, Ok(2));
     let kept = drive(read_work(ids(&rows[0]).0, ids(&rows[0]).1), ctx).await;
@@ -514,7 +514,7 @@ async fn removal_keeps_finished() {
         config.installs[0].state = InstallState::Removing;
     };
     edit_config(&fixture, removing).await;
-    let config = crate::plugins::install::read_config(ctx, fixture.actor.realm_id);
+    let config = crate::plugins::calls::read_config(ctx, fixture.actor.realm_id);
     let config = config.await.unwrap();
     assert_eq!(retire_work(ctx, &config, 5).await, Ok(0));
     let kept = drive(read_work(install.install_id, row.work_id), ctx).await;

@@ -24,7 +24,7 @@ use thiserror::Error;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::key_wake::read_row;
 use crate::jobs::read_access::SourceReadError;
-use crate::jobs::source_read::authorize_read;
+use crate::jobs::read_access::SourceReadOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
@@ -195,9 +195,12 @@ async fn manifest_for(
     }
     // Cached entries are stored copies on this node, so they are authorized here.
     for entry in entries.iter().filter(|entry| cached.contains(&entry.key)) {
-        authorize_read(context, auth, local, source_of(entry), READ_OPERATION)
-            .await
-            .map_err(source_error)?;
+        drive(
+            SourceReadOperation::of_object(auth, local, source_of(entry), READ_OPERATION),
+            context,
+        )
+        .await
+        .map_err(source_error)?;
     }
     Ok(Some(cache_manifest(entries, &cached)))
 }
@@ -383,10 +386,13 @@ pub async fn head_entry(
     let source = entry.captured.source_node_id;
     if source == local {
         let auth = creator(record, context);
-        return authorize_read(context, &auth, local, source_of(entry), HEAD_OPERATION)
-            .await
-            .map(|_| ())
-            .map_err(source_error);
+        return drive(
+            SourceReadOperation::of_object(&auth, local, source_of(entry), HEAD_OPERATION),
+            context,
+        )
+        .await
+        .map(|_| ())
+        .map_err(source_error);
     }
     match entry.captured.content.blake3() {
         Some(blake3) => {
@@ -428,9 +434,12 @@ pub async fn read_entry(
     let source = entry.captured.source_node_id;
     if source == local {
         let auth = creator(record, context);
-        let group_id = authorize_read(context, &auth, local, source_of(entry), READ_OPERATION)
-            .await
-            .map_err(source_error)?;
+        let group_id = drive(
+            SourceReadOperation::of_object(&auth, local, source_of(entry), READ_OPERATION),
+            context,
+        )
+        .await
+        .map_err(source_error)?;
         let (bucket, key) = source_of(entry);
         let get = drive(
             GetObjectOperation::new(GetObjectInput {
@@ -809,7 +818,10 @@ mod tests {
         let manifest = manifest_for(&context, &owner, &open, local).await.unwrap();
         assert!(manifest.is_some());
         let blocked = [entry("a"), entry("blocked")];
-        let head = authorize_read(&context, &owner, local, ("b", "blocked"), HEAD_OPERATION);
+        let head = drive(
+            SourceReadOperation::of_object(&owner, local, ("b", "blocked"), HEAD_OPERATION),
+            &context,
+        );
         assert!(head.await.is_ok());
         let denied = manifest_for(&context, &owner, &blocked, local).await;
         assert_eq!(denied, Err(ViewError::Denied));

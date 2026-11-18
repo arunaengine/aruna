@@ -6,8 +6,8 @@
 use aruna_core::structs::execution::job::OutputObject;
 
 use super::*;
+use crate::plugin_host::jobs::start_work;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::jobs::start_work;
 use crate::plugins::submit::WorkRequest;
 use crate::plugins::submit::tests::{ready, request, scope};
 use crate::plugins::work::tests::edit_work;

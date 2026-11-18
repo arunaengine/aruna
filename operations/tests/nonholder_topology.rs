@@ -25,8 +25,12 @@ use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
+use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
 use aruna_operations::jobs::lifecycle::ids::{SubmissionScope, submission_of};
-use aruna_operations::jobs::lifecycle::ingress::submit_external_job;
+use aruna_operations::jobs::lifecycle::ingress::ingress_node;
+use aruna_operations::jobs::lifecycle::submit_external::{
+    ExternalSubmission, SubmitExternalOperation,
+};
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
@@ -198,6 +202,35 @@ async fn record_routes_owner() -> TestResult<()> {
 
     realm.shutdown().await;
     Ok(())
+}
+
+/// Submits one execution through `context`, as the API routes do.
+#[allow(clippy::too_many_arguments)]
+async fn submit_external_job(
+    context: &aruna_operations::driver::DriverContext,
+    spec: aruna_core::structs::execution::job::ExecutionSpec,
+    created_by: aruna_core::UserId,
+    idempotency_key: Option<String>,
+    workspace_mode: WorkspaceMode,
+    workspace_bucket: Option<String>,
+    retention_ms: u64,
+    auth_token: Option<AuthToken>,
+) -> Result<AcceptedSubmission, SubmitJobError> {
+    let scope = match idempotency_key {
+        Some(key) => SubmissionScope::Keyed(key),
+        None => SubmissionScope::Unkeyed(ulid::Ulid::generate()),
+    };
+    let submission = ExternalSubmission {
+        spec,
+        created_by,
+        scope,
+        workspace_mode,
+        workspace_bucket,
+        retention_ms,
+        auth_token,
+    };
+    let submit = SubmitExternalOperation::new(submission, ingress_node(context));
+    drive(submit, context).await.map_err(placement_failure)
 }
 
 #[tokio::test]

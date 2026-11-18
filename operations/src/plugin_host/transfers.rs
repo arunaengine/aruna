@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -14,30 +14,25 @@ use aruna_core::secrets::{ResponseExposure, SecretFields};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::job::{JobError, JobResultPayload, PluginWorkSpec, UploadForm};
-use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::{ErrorKind, Field, HostError, Response};
-use aruna_plugins::permission::Permission;
+use aruna_plugins::broker::{Field, HostError, Response};
 use futures_util::StreamExt;
 use ulid::Ulid;
 
-use super::check::{Authorize, matching};
-use super::grants::InstallScope;
-use super::held::release_into;
-use super::install::{pick_version, read_manifest};
-use super::objects::{LocalObject, Unmarked};
-use super::outgoing::outgoing;
-use super::outgoing::whole_text;
 use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
-use super::work::{Send, WorkChange, WorkRow, begin_send, decided, retried, update_work};
 use crate::driver::{drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::placement::policy::GateOperation;
+use crate::plugins::held::PrepareRequest;
+use crate::plugins::objects::{LocalObject, Unmarked};
+use crate::plugins::outgoing::whole_text;
+use crate::plugins::work::{Send, WorkChange, WorkRow, begin_send, decided, retried, update_work};
+use crate::plugins::work_calls::TransferGrants;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
@@ -58,7 +53,12 @@ pub async fn download_work(
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
     download: Download<'_>,
 ) -> JobRunOutcome {
-    let patterns = match download_grants(ctx, install, (row, download.target)).await {
+    let patterns = match drive(
+        TransferGrants::download(install, row, download.target),
+        &ctx.driver,
+    )
+    .await
+    {
         Ok(found) => found,
         Err(error) => return refused(error),
     };
@@ -255,7 +255,12 @@ pub async fn upload_work(
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
     upload: Upload<'_>,
 ) -> JobRunOutcome {
-    let patterns = match upload_grants(ctx, install, (row, upload.source)).await {
+    let patterns = match drive(
+        TransferGrants::upload(install, row, upload.source),
+        &ctx.driver,
+    )
+    .await
+    {
         Ok(found) => found,
         Err(error) => return refused(error),
     };
@@ -438,60 +443,11 @@ fn sent(status: u16, again: bool, (size, version): (u64, Ulid)) -> JobRunOutcome
     }
 }
 
-/// The upload patterns of the source, after the connection was found still granted.
-async fn upload_grants(
-    ctx: &JobContext,
-    install: &PluginInstall,
-    (row, source): (&WorkRow, &str),
-) -> Result<BTreeSet<String>, HostError> {
-    connection_granted(ctx, install, row).await?;
-    let upload = Permission::TransfersUpload;
-    let patterns = matching(install, upload, source)?;
-    let check = Authorize::access(install, (upload, Access::READ), source, &patterns);
-    drive(check, &ctx.driver).await?;
-    Ok(patterns)
-}
-
-/// Whether the install may still send through the row's connection: its grant and its
-/// authorization, as at submission.
-async fn connection_granted(
-    ctx: &JobContext,
-    install: &PluginInstall,
-    row: &WorkRow,
-) -> Result<(), HostError> {
-    let context = row.context.as_ref();
-    let context = context.ok_or_else(|| HostError::new(ErrorKind::Invalid, "no request"))?;
-    let scope = InstallScope {
-        realm_id: install.account.realm_id,
-        group_id: install.group_id,
-        install_id: install.install_id,
-    };
-    let send = Permission::ConnectionsSend;
-    let connection = scope.connection(&context.connection);
-    let patterns = matching(install, send, &connection)?;
-    let check = Authorize::call(install, send, &connection, &patterns);
-    Ok(drive(check, &ctx.driver).await?)
-}
-
 fn locked(error: &GetObjectError) -> bool {
     matches!(
         error,
         GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(_)))
     )
-}
-
-/// The download patterns of the target, after the connection was found still granted.
-async fn download_grants(
-    ctx: &JobContext,
-    install: &PluginInstall,
-    (row, target): (&WorkRow, &str),
-) -> Result<BTreeSet<String>, HostError> {
-    connection_granted(ctx, install, row).await?;
-    let download = Permission::TransfersDownload;
-    let patterns = matching(install, download, target)?;
-    let check = Authorize::call(install, download, target, &patterns);
-    drive(check, &ctx.driver).await?;
-    Ok(patterns)
 }
 
 /// The row's request checked against the install's current manifest, with the connection's
@@ -500,26 +456,10 @@ async fn prepared(
     ctx: &JobContext,
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
 ) -> Result<(OutgoingRequest, ResponseExposure, SecretFields), HostError> {
-    let context = row.context.as_ref();
-    let context = context.ok_or_else(|| HostError::new(ErrorKind::Invalid, "no request"))?;
-    let plugin = pick_version(config, &install.plugin, Some(&install.digest));
-    let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
-    let manifest =
-        manifest.map_err(|error| HostError::new(ErrorKind::Unavailable, error.to_string()))?;
-    let (mut request, slot) = outgoing(&manifest, context)?;
-    let Some(slot) = slot else {
-        let fields = SecretFields::new(Default::default());
-        return Ok((request, ResponseExposure::Full, fields));
-    };
-    let place = (config, ctx.owner_node_id);
-    let released = release_into(
-        &ctx.driver,
-        place,
-        (install, &slot, row.run_id),
-        &mut request,
-    );
-    let (exposure, fields) = released.await?;
-    Ok((request, exposure, fields))
+    let config = Arc::new(config.clone());
+    let prepare = PrepareRequest::new(config, ctx.owner_node_id, install, row);
+    let prepared = drive(prepare, &ctx.driver).await.map_err(|error| error.0)?;
+    Ok((prepared.outgoing, prepared.exposure, prepared.fields))
 }
 
 /// The answer's body as a put stream that counts its bytes, ends with an error past `bound`, and

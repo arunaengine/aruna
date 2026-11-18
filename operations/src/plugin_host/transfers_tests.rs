@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::plugins::calls::*;
 use std::sync::atomic::AtomicUsize;
 
 use aruna_core::structs::checksum::ChecksumAlgorithm;
@@ -13,9 +14,9 @@ use serde_json::json;
 
 use super::*;
 use crate::driver::DriverContext;
+use crate::plugin_host::plugin_work::run_plugin_work;
+use crate::plugin_host::plugin_work::tests::job_context;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::plugin_work::run_plugin_work;
-use crate::plugins::plugin_work::tests::job_context;
 use crate::plugins::work::{Identity, RequestContext, WorkKind, reserve};
 use crate::s3::object::copy::test::{seed_bucket, with_blob};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
@@ -279,7 +280,6 @@ async fn narrowed_rule() {
     // A secret whose rule shows the status only would hide what the bucket keeps, so the work
     // ends after the release and before any request.
     use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret_with};
-    use crate::plugins::install::read_config;
     use aruna_core::secrets::ResponseExposure;
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
@@ -325,8 +325,8 @@ async fn narrowed_rule() {
 async fn sweep_during_download() {
     // A sweep while the answer is still on its way keeps the mark of the version not yet
     // written; once written, the version keeps it too.
+    use crate::plugin_host::worker::sweep_marks;
     use crate::plugins::marks::is_marked;
-    use crate::plugins::worker::sweep_marks;
     let fixture = Fixture::new().await;
     let install = downloader(&fixture).await;
     let (_root, blob) = ready(&fixture, &install).await;

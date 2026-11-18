@@ -15,6 +15,7 @@ use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::reconcile_shard_topics;
+use crate::plugin_host::peer::serve_peer;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::sync::reconcile::ReconcileTopicsOperation;
@@ -164,36 +165,11 @@ async fn peer_request(
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> Result<MetadataTransportMessage, MetadataTransportMessage> {
+    let message = match Box::pin(serve_peer(context, peer, message)).await {
+        Ok(answer) => return Ok(answer),
+        Err(message) => message,
+    };
     match message {
-        MetadataTransportMessage::StoreArtifact { chunk } => {
-            let stored = crate::plugins::artifacts::serve_store(context, peer, chunk);
-            let result = Box::pin(stored).await;
-            Ok(MetadataTransportMessage::ArtifactStored { result })
-        }
-        MetadataTransportMessage::FetchArtifact { digest, index } => {
-            let fetched = crate::plugins::artifacts::serve_fetch(context, peer, digest, index);
-            let result = Box::pin(fetched).await;
-            Ok(MetadataTransportMessage::FetchedArtifact { result })
-        }
-        MetadataTransportMessage::ProbeClock => {
-            let result = Box::pin(crate::plugins::clock::serve_clock(context, peer)).await;
-            Ok(MetadataTransportMessage::ClockProbed { result })
-        }
-        MetadataTransportMessage::ForwardEvents { batch } => {
-            let decided = crate::plugins::worker::serve_events(context, peer, batch);
-            let result = Box::pin(decided).await;
-            Ok(MetadataTransportMessage::EventsDecided { result })
-        }
-        MetadataTransportMessage::ReleaseSecret { request } => {
-            let released = crate::plugins::release::serve_release(context, peer, request);
-            let result = Box::pin(released).await;
-            Ok(MetadataTransportMessage::SecretReleased { result })
-        }
-        MetadataTransportMessage::CheckNodeSecret { name, kind } => {
-            let checked = crate::plugins::bound::serve_node_check(context, peer, name, kind);
-            let result = Box::pin(checked).await;
-            Ok(MetadataTransportMessage::NodeSecretChecked { result })
-        }
         record @ (MetadataTransportMessage::ForwardJobRecord { .. }
         | MetadataTransportMessage::ForwardRecordPage { .. }) => {
             let answer = Box::pin(async {
@@ -212,26 +188,30 @@ async fn peer_request(
             submission_id,
             request,
         } => {
-            let answer = Box::pin(async {
-                crate::jobs::lifecycle::ingress::serve_submission(
-                    context,
-                    peer,
-                    auth_token,
-                    submission_id,
-                    *request,
-                )
-                .await
-            });
-            Ok(answer.await)
+            let node = crate::jobs::lifecycle::ingress::ingress_node(context);
+            let admit = crate::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
+                peer,
+                auth_token,
+                submission_id,
+                *request,
+                node,
+            );
+            let result = Box::pin(crate::driver::drive(admit, context.as_ref())).await;
+            Ok(MetadataTransportMessage::ForwardedJobSubmission { result })
         }
         MetadataTransportMessage::ResolveJobInputs {
             auth_token,
             request,
         } => {
-            let resolved = crate::jobs::lifecycle::ingress::serve_input_resolve(
-                context, peer, auth_token, *request,
-            );
-            let result = Box::pin(resolved).await;
+            let result = match crate::jobs::lifecycle::ingress::ingress_node(context) {
+                Some(node) => {
+                    let serve = crate::jobs::lifecycle::serve_inputs::ServeInputsOperation::new(
+                        peer, auth_token, &node, *request,
+                    );
+                    Box::pin(crate::driver::drive(serve, context.as_ref())).await
+                }
+                None => Err(aruna_core::jobs::SubmissionRefusal::Unavailable),
+            };
             Ok(MetadataTransportMessage::ResolvedJobInputs { result })
         }
         MetadataTransportMessage::JobInputPage { submission, digest } => {

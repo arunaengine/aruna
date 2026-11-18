@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::plugins::calls::*;
 use std::collections::BTreeMap;
 
 use super::*;
@@ -535,7 +536,6 @@ async fn secret_values_granted() {
     use crate::plugins::account::{AccountChange, EnsureRole};
     use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, secret};
     use crate::plugins::grants::role_paths;
-    use crate::plugins::rules::ensure_rules;
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     secret(&fixture, &install).await;

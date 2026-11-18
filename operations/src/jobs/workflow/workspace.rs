@@ -43,7 +43,7 @@ use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, QuotaOperation, RoutingInputsError, SnapshotOperation};
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::read_access::SourceReadError;
-use crate::jobs::source_read::authorize_read;
+use crate::jobs::read_access::SourceReadOperation;
 use crate::jobs::store::attempt::reserve_output_commits;
 use crate::placement::policy::{GateContextError, GateOperation};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
@@ -400,12 +400,9 @@ async fn authorize_source(
         session: None,
     };
     let object = (source.bucket.as_str(), source.key.as_str());
-    match Box::pin(authorize_read(
+    match Box::pin(drive(
+        SourceReadOperation::of_object(&auth, node_id, object, READ_OPERATION),
         context,
-        &auth,
-        node_id,
-        object,
-        READ_OPERATION,
     ))
     .await
     {

@@ -4,9 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_HOOKS_KEYSPACE;
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_runs::{PluginRun, hook_key, hook_time_key};
 use ulid::Ulid;
 
@@ -44,8 +44,14 @@ pub enum HookError {
     Run(#[from] RunError),
 }
 
+impl From<IoError> for HookError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
 /// Queues a webhook's run once per delivery id in one transaction: `false` for a delivery id
-/// the receiver already admitted, which starts nothing. The caller holds `ADMISSIONS`.
+/// the receiver already admitted, which starts nothing.
 #[derive(Debug, PartialEq)]
 pub struct AdmitHook {
     /// The delivery's rows, written with the run; `None` without a delivery id.
@@ -90,6 +96,10 @@ impl AdmitHook {
 impl Operation for AdmitHook {
     type Output = bool;
     type Error = RunError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write

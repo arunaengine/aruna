@@ -7,12 +7,11 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugins::copies::store_local;
+use crate::plugins::calls::*;
 use crate::plugins::host_calls::call_intent;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::intents::unknown_row;
-use crate::plugins::lifecycle::set_grants;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::plugins::rows::write_rows;
 use crate::plugins::runs::event_run;
@@ -425,8 +424,7 @@ async fn drain(fixture: &Fixture) {
 
 #[tokio::test]
 async fn revoked_runs() {
-    use crate::plugins::dispatch::{StartError, start_run};
-    use crate::plugins::lifecycle::{pause_install, remove_install, resume_install};
+    use crate::plugins::dispatch::StartError;
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let install = installed(&fixture).await;
@@ -523,7 +521,6 @@ fn intents_decide_first() {
 #[tokio::test]
 async fn removed_with_intents() {
     // A queued run of a removed install whose call may have had its effect needs attention.
-    use crate::plugins::lifecycle::remove_install;
     let fixture = Fixture::new().await;
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let install = installed(&fixture).await;
@@ -583,7 +580,7 @@ async fn retries_hide_values() {
         run: run.clone(),
     };
     let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope);
-    broker.shows(SecretFields::new(
+    broker.shown.lock().unwrap().push(SecretFields::new(
         [("token".to_string(), Secret::new(VALUE))].into(),
     ));
     // A retryable error that names a value handed to the code keeps the run without it.

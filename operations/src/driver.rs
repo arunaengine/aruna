@@ -1196,7 +1196,19 @@ async fn take_hold(
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     match scope? {
         HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
+        scope => Some(local_hold(scope).lock_owned().await),
     }
+}
+
+/// The lock of a scope no backend owns; it lives as long as the process.
+fn local_hold(scope: HoldScope) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Holds = std::collections::HashMap<HoldScope, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static HOLDS: std::sync::LazyLock<std::sync::Mutex<Holds>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut holds = HOLDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    holds.entry(scope).or_default().clone()
 }
 
 /// Drives an operation of either kind under one wall-clock deadline. Cleanup after expiry is

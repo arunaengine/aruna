@@ -20,7 +20,7 @@ use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
-use aruna_operations::plugins::plugin_work::PluginWorkHandler;
+use aruna_operations::plugin_host::plugin_work::PluginWorkHandler;
 use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};

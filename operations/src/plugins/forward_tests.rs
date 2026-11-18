@@ -11,14 +11,14 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::driver::drive;
+use crate::plugin_host::worker::match_journal;
+use crate::plugin_host::worker::tests::{created, installed};
+use crate::plugin_host::worker::{send_bounded, send_outbox};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::store::Txn;
-use crate::plugins::worker::match_journal;
-use crate::plugins::worker::tests::{created, installed};
-use crate::plugins::worker::{send_bounded, send_outbox};
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 
 /// The batches a fake receiver got; it answers each event with `decide` and acknowledges gaps
@@ -586,7 +586,7 @@ fn drops_removed_install() {
 }
 
 #[test]
-fn readable_row_joins_request() {
+fn readable_row_joins() {
     let mut config = bare_config();
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
     let receiver = install.receiver;
@@ -609,4 +609,20 @@ fn readable_row_joins_request() {
         panic!("the gap scan ends the pass");
     };
     assert_eq!(batches[&receiver].open[0].0.0.events, [row]);
+}
+
+mod operations {
+    use super::*;
+    use crate::plugins::fixtures::{is_effect, node, peer_says, peer_silent};
+
+    #[test]
+    fn events_reach_receiver() {
+        let mut send = SendEvents::new(node(1), EventBatch::default());
+        assert!(is_effect(&send.first()));
+        let result = Ok(Decisions::default());
+        let said = peer_says(node(1), &MetadataTransportMessage::EventsDecided { result });
+        assert_eq!(send.next(said), Ok(Next::Done(Decisions::default())));
+        let silent = send.next(peer_silent(node(1)));
+        assert_eq!(silent, Err(MetadataReadError::Unavailable));
+    }
 }

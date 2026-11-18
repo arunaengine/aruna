@@ -26,37 +26,34 @@ use tokio_util::task::TaskTracker;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::artifacts::fetch_artifact;
-use super::artifacts::local_config;
 use super::broker::RunBroker;
-use super::check::{CallError, CheckCall, RunScope};
-use super::cleanup::sweep_events;
-use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start, probe_clock};
-use super::decide::{DecideBatch, prune_seen};
-use super::dispatch::enqueue_timers;
-use super::finished::DueCompletions;
-use super::forward::{Backoff, CollectOutbox, REQUEST_BYTES, apply};
-use super::grants::{parse_grants, patterns_for, short_path};
-use super::install::read_config;
-use super::intents::open_intent;
 use super::jobs::{retire_work, settle_work};
-use super::journal::JOURNAL_PAGE;
-use super::journal::prune_journal;
-use super::lifecycle::{match_targets, targets};
-use super::marks::SweepMarks;
-use super::matcher::{MatchJournal, event_trigger};
 use super::outbound::Outbound;
-use super::prune::{PruneAudit, prune_hooks};
-use super::receiver::{eligible, lost_reason};
-use super::replay::{PlanReplay, ReplayPlan, RunReplays, StartReplay};
-use super::rows::StoreError;
-use super::runs::{
-    ADMISSIONS, Ended, PruneRuns, RunError, TICK, conclude, ended, read_run, save_run, unfinished,
-};
-use super::waiting::RecheckWaiting;
-use super::work::prune_work;
+use super::{read_config, ready_artifact};
 use crate::driver::{DriverContext, drive};
-use crate::metadata::protocol::MetadataReadError;
+use crate::plugins::check::{CallError, CheckCall, RunScope};
+use crate::plugins::cleanup::sweep_events;
+use crate::plugins::clock::{AskClock, ClockReading, SKEW_MARGIN_MS, local_start};
+use crate::plugins::decide::{DecideBatch, prune_seen};
+use crate::plugins::dispatch::EnqueueTimers;
+use crate::plugins::finished::DueCompletions;
+use crate::plugins::forward::{Backoff, CollectOutbox, REQUEST_BYTES, SendEvents, apply};
+use crate::plugins::grants::{parse_grants, patterns_for, short_path};
+use crate::plugins::intents::open_intent;
+use crate::plugins::journal::JOURNAL_PAGE;
+use crate::plugins::journal::prune_journal;
+use crate::plugins::lifecycle::{match_targets, targets};
+use crate::plugins::marks::SweepMarks;
+use crate::plugins::matcher::{MatchJournal, event_trigger};
+use crate::plugins::prune::{PruneAudit, prune_hooks};
+use crate::plugins::receiver::{eligible, lost_reason};
+use crate::plugins::replay::{PlanReplay, ReplayPlan, RunReplays, StartReplay};
+use crate::plugins::rows::StoreError;
+use crate::plugins::runs::{
+    Ended, PruneRuns, RunError, TICK, conclude, ended, read_run, save_run, unfinished,
+};
+use crate::plugins::waiting::RecheckWaiting;
+use crate::plugins::work::prune_work;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::plugin_runs::{Decisions, EventBatch};
 
@@ -139,7 +136,7 @@ impl Worker {
             .await
             .map_err(|error| error.to_string())?;
         self.revoke(&config);
-        let timers = enqueue_timers(&self.ctx, &config, self.local, now_ms).await;
+        let timers = drive(EnqueueTimers::new(&config, self.local, now_ms), &self.ctx).await;
         timers.map_err(|error| error.to_string())?;
         let probe = |node| probe_clock(&self.ctx, node);
         if let Err(error) = plan_replays(&self.ctx, &config, self.local, now_ms, probe).await {
@@ -245,9 +242,7 @@ impl Worker {
             let decided = decide_batch(&self.ctx, config, nodes, batch, now_ms);
             return decided.await.map_err(|error| error.to_string());
         }
-        let handle = self.ctx.metadata_handle.as_ref();
-        let handle = handle.ok_or("the metadata transport is not running")?;
-        let decided = handle.request_forward(node, batch).await;
+        let decided = drive(SendEvents::new(node, batch), &self.ctx).await;
         decided.map_err(|error| format!("{error:?}"))
     }
 
@@ -392,7 +387,8 @@ impl Worker {
         {
             return refused;
         }
-        let mut assembled = match fetch_artifact(&self.ctx, &config, &run.digest).await {
+        let local = Some(self.local);
+        let mut assembled = match ready_artifact(&self.ctx, &config, &run.digest, local).await {
             Ok(assembled) => assembled,
             Err(error) => return Ended::Retry(format!("the artifact is not available: {error}")),
         };
@@ -504,20 +500,6 @@ pub(crate) async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError
     drive(SweepMarks::new(), ctx).await
 }
 
-/// The receiver side of a forward from an infrastructure peer.
-pub(crate) async fn serve_events(
-    ctx: &DriverContext,
-    peer: NodeId,
-    batch: EventBatch,
-) -> Result<Decisions, MetadataReadError> {
-    let (config, local) = local_config(ctx).await?;
-    if !node_kind(&config, peer).is_some_and(|kind| kind.is_sync_eligible()) {
-        return Err(MetadataReadError::Forbidden);
-    }
-    let decided = decide_batch(ctx, &config, (local, peer), batch, unix_timestamp_millis());
-    decided.await.map_err(|_| MetadataReadError::Unavailable)
-}
-
 /// Decides each event of a batch from `sender` and keeps its newest gap reports.
 pub(crate) async fn decide_batch(
     ctx: &DriverContext,
@@ -526,7 +508,6 @@ pub(crate) async fn decide_batch(
     batch: EventBatch,
     now_ms: u64,
 ) -> Result<Decisions, StoreError> {
-    let _admitting = ADMISSIONS.lock().await;
     let decide = DecideBatch::new(Arc::new(config.clone()), nodes, batch, now_ms);
     drive(decide, ctx).await
 }
@@ -555,7 +536,7 @@ pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
         .map(|install| install.receiver)
         .filter(|node| lost_reason(config, *node).is_none() && backoff.ready(*node, now_ms))
         .collect();
-    let metadata = ctx.metadata_handle.is_some();
+    let metadata = ctx.net_handle.is_some();
     let collect = CollectOutbox::new(Arc::new(config.clone()), open, (now_ms, bound), metadata);
     let batches = drive(collect, ctx).await?;
     let mut decided = 0;
@@ -594,7 +575,6 @@ pub(crate) async fn notify_work(
     let due = drive(due, ctx).await.map_err(RunError::from)?;
     let mut notified = 0;
     for notify in due {
-        let _admitting = ADMISSIONS.lock().await;
         let work = notify.work_id();
         match drive(notify, ctx).await {
             Ok(true) => notified += 1,
@@ -616,9 +596,20 @@ pub(crate) async fn recheck_waiting(
     local: NodeId,
     now_ms: u64,
 ) -> Result<usize, StoreError> {
-    let _admitting = ADMISSIONS.lock().await;
     let recheck = RecheckWaiting::new(Arc::new(config.clone()), local, now_ms);
     drive(recheck, ctx).await
+}
+
+/// Reads another node's clock with the times around the round trip.
+async fn probe_clock(ctx: &DriverContext, node: NodeId) -> Option<ClockReading> {
+    let sent_ms = unix_timestamp_millis();
+    let remote_ms = drive(AskClock(node), ctx).await.ok()??;
+    let received_ms = unix_timestamp_millis();
+    Some(ClockReading {
+        sent_ms,
+        remote_ms,
+        received_ms,
+    })
 }
 
 /// Starts a replay for each active install whose coverage grew here since its coverage row;

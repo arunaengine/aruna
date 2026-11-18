@@ -32,6 +32,7 @@ use super::service::{
 };
 use super::staging::read_staging_checkpoint;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::family_reads::FamilyStatusOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::metadata::write_peer::WritePeerOperation;
 
@@ -495,13 +496,18 @@ async fn prepare_cancel(
     }
     // A forwarded cancel reaches a family holder here: it publishes the record
     // and then still stops its own local execution row if it has one.
-    match crate::jobs::lifecycle::cancel::cancel_family(
+    match drive(
+        crate::jobs::lifecycle::cancel::CancelFamilyOperation::new(
+            auth,
+            job_id,
+            Some(auth_token.clone()),
+            context.node_and_realm(),
+            aruna_core::time::unix_timestamp_millis(),
+        ),
         context,
-        auth,
-        job_id,
-        Some(auth_token.clone()),
     )
     .await
+    .transpose()
     {
         Some(Ok(())) => {
             let reservations = match drive(HeldReservations::all(), context).await {
@@ -533,7 +539,12 @@ async fn prepare_cancel(
                     return PreparedResponse::new(JobResponse::Unavailable(error));
                 }
             }
-            return match crate::jobs::lifecycle::routing::family_status(context, auth, job_id).await
+            return match drive(
+                FamilyStatusOperation::new(auth, job_id, aruna_core::time::unix_timestamp_millis()),
+                context,
+            )
+            .await
+            .transpose()
             {
                 Some(Ok(status)) => PreparedResponse::new(JobResponse::Cancelled {
                     terminal: status.job.state.is_terminal(),

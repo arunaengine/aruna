@@ -1273,7 +1273,7 @@ mod tests {
 
     /// The plugin journal rows this node has not matched yet.
     async fn journaled(context: &DriverContext) -> Vec<SourceEvent> {
-        crate::plugins::journal::pending_events(context).await
+        crate::plugins::journal::tests::pending_events(context).await
     }
 
     #[tokio::test]

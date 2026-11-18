@@ -4,19 +4,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::plugins::calls::*;
 use aruna_core::structs::execution::job::PluginWorkSpec;
 
 use super::*;
 use crate::driver::DriverContext;
-use crate::plugins::install::read_config;
+use crate::plugin_host::jobs::retire_work;
+use crate::plugin_host::plugin_work::tests::ready_copy;
+use crate::plugin_host::worker::sweep_marks;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::jobs::retire_work;
-use crate::plugins::plugin_work::tests::ready_copy;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::values_result;
 use crate::plugins::rows::write_rows;
 use crate::plugins::work::tests::edit_work;
-use crate::plugins::worker::sweep_marks;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::calls::IoCall;
 
@@ -150,7 +150,7 @@ fn is_child(next: Next<usize>) -> bool {
 }
 
 #[test]
-fn sweep_drops_ended_absent() {
+fn sweep_drops_ended() {
     let mut sweep = SweepMarks::new();
     assert!(matches!(sweep.first(), Ok(Next::Call(IoCall::Page { .. }))));
     let page = marks_page(vec![mark_row_of(Ulid::from_parts(3, 3))]);
@@ -164,7 +164,7 @@ fn sweep_drops_ended_absent() {
 }
 
 #[test]
-fn sweep_keeps_live_marks() {
+fn sweep_keeps_live() {
     let mut running = SweepMarks::new();
     running
         .next(marks_page(vec![mark_row_of(Ulid::from_parts(3, 3))]))

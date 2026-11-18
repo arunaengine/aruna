@@ -8,10 +8,11 @@ use aruna_core::plugin_installs::PluginInstall;
 use super::*;
 use crate::driver::DriverContext;
 use crate::driver::drive;
+use crate::plugin_host::jobs::start_work;
+use crate::plugin_host::plugin_work::tests::copier;
 use crate::plugins::bound::tests::edit_config;
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::jobs::start_work;
-use crate::plugins::plugin_work::tests::copier;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::work::read_work;
@@ -110,7 +111,6 @@ async fn refusals_start_nothing() {
 async fn read_source_suffices() {
     // A copy reads its source and writes its target: read on the source is enough, and the
     // target needs write.
-    use crate::plugins::lifecycle::set_grants;
     let fixture = Fixture::new().await;
     let install = ready(&fixture).await;
     let (incoming, outgoing) = (
@@ -149,7 +149,7 @@ async fn broker_starts_copies() {
 
     use aruna_plugins::broker::{Broker, CallContext, Intent, JobCopy};
 
-    use crate::plugins::broker::RunBroker;
+    use crate::plugin_host::broker::RunBroker;
     let fixture = Fixture::new().await;
     let install = ready(&fixture).await;
     let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope(&fixture, &install));
@@ -185,7 +185,7 @@ async fn shifted_copy_refused() {
 
     use aruna_plugins::broker::{Broker, CallContext, Intent, JobCopy, StatePut};
 
-    use crate::plugins::broker::RunBroker;
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::work::list_work;
     let fixture = Fixture::new().await;
     let install = ready(&fixture).await;
@@ -228,7 +228,7 @@ async fn fetcher(fixture: &Fixture) -> PluginInstall {
         config.installs[0].grants.insert("write".into(), vec![data]);
     })
     .await;
-    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = (config.await.unwrap().installs.into_iter())
         .find(|found| found.install_id == install.install_id)
         .unwrap();
@@ -364,8 +364,8 @@ async fn marks_once() {
 async fn retired_unmarked() {
     // A download that was never submitted, retired with its install, loses its mark at the next
     // sweep: its row is gone and the version it would have written never existed.
-    use crate::plugins::jobs::retire_work;
-    use crate::plugins::worker::sweep_marks;
+    use crate::plugin_host::jobs::retire_work;
+    use crate::plugin_host::worker::sweep_marks;
     use aruna_core::plugin_installs::InstallState;
     let fixture = Fixture::keyed().await;
     let install = fetcher(&fixture).await;
@@ -391,7 +391,7 @@ async fn retired_unmarked() {
         config.installs[0].state = InstallState::Removing
     })
     .await;
-    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
     retire_work(&fixture.ctx, &config.await.unwrap(), 5)
         .await
         .unwrap();
@@ -407,7 +407,7 @@ async fn broker_starts_downloads() {
 
     use aruna_plugins::broker::{Broker, CallContext, Field, Intent, JobDownload};
 
-    use crate::plugins::broker::RunBroker;
+    use crate::plugin_host::broker::RunBroker;
     let fixture = Fixture::new().await;
     let install = ready(&fixture).await;
     let mut scope = scope(&fixture, &install);
@@ -472,8 +472,8 @@ async fn narrowed_download_refused() {
     use aruna_core::secrets::ResponseExposure;
     use aruna_plugins::broker::{Broker, CallContext, Intent, JobDownload};
 
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::bound::tests::{ORIGIN, hold_keys, secret_with};
-    use crate::plugins::broker::RunBroker;
     use crate::plugins::work::list_work;
     let fixture = Fixture::keyed().await;
     let install = fetcher(&fixture).await;
@@ -617,9 +617,10 @@ async fn reply_rechecked() {
     use aruna_core::secrets::{ResponseExposure, SecretName};
     use aruna_plugins::broker::{Broker, CallContext};
 
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::bound::tests::{ORIGIN, hold_keys, rule_for, secret_with};
-    use crate::plugins::broker::RunBroker;
-    use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
+    use crate::plugins::rules::tests::edit_rules;
+    use crate::plugins::rules::{RuleGuard, consumer};
     use crate::plugins::work::{WorkChange, reserve, update_work};
     let fixture = Fixture::keyed().await;
     fetcher(&fixture).await;
@@ -633,7 +634,7 @@ async fn reply_rechecked() {
         (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".into());
     })
     .await;
-    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = config.await.unwrap().installs.remove(0);
     secret_with(&fixture, &install, ResponseExposure::Full).await;
     let mut row = WorkRow::reserved(&install, WorkKind::Upload, Ulid::from_parts(9, 9), 1);
@@ -700,7 +701,7 @@ async fn broker_starts_uploads() {
 
     use aruna_plugins::broker::{Broker, CallContext, Field, Intent, JobUpload, Method};
 
-    use crate::plugins::broker::RunBroker;
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::work::read_work;
     let fixture = Fixture::new().await;
     let install = ready(&fixture).await;
@@ -713,7 +714,7 @@ async fn broker_starts_uploads() {
         (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".into());
     })
     .await;
-    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = (config.await.unwrap().installs.into_iter())
         .find(|found| found.install_id == install.install_id)
         .unwrap();
@@ -789,7 +790,7 @@ fn is_child(next: Next<PreparedWork>) -> bool {
 }
 
 #[test]
-fn copy_prepared_in_order() {
+fn copy_prepared_ordered() {
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
     let scope = plain_scope(&install);
     let mut prepare = PrepareWork::new(&scope, plain_copy(&install), (5, Ulid::from_parts(8, 8)));
