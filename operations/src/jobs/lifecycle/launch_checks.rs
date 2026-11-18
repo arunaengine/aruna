@@ -29,11 +29,13 @@ use ulid::Ulid;
 
 use super::ids;
 use super::plan::{REALM_STAGING, network_access};
-use super::policies::{Resolutions, ResolvePoliciesOperation};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{policy_reads, read_policies};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::{
+    GateContext, GateContextError, GateOperation, PolicySetError, PolicySetResolver, Resolutions,
+    ResolveMode,
+};
 
 /// What a check answers: the capability that runs the launch, or why this target refuses it.
 pub(crate) type Verdict = Result<ExecutorCapability, LaunchDecline>;
@@ -316,7 +318,7 @@ impl LaunchChecksOperation {
         self.policy_sets = std::iter::once(outputs).chain(inputs).collect();
         self.step = CheckStep::Policies;
         let (realm_id, now_ms) = (self.check.spec.realm_id, self.check.now_ms);
-        let resolve = ResolvePoliciesOperation::new(realm_id, local, now_ms, refs);
+        let resolve = PolicySetResolver::new(realm_id, local, now_ms, ResolveMode::Lenient, &refs);
         Ok(Next::Call(IoCall::child(resolve)))
     }
 
@@ -385,7 +387,8 @@ impl Operation for LaunchChecksOperation {
                 self.policies()
             }
             CheckStep::Policies => {
-                let policies = result.child::<Resolutions, IoError>()?.unwrap_or_default();
+                let policies = result.child::<Resolutions, PolicySetError>()?;
+                let policies = policies.unwrap_or_default();
                 Ok(Next::Done(self.placement(policies)))
             }
         }
@@ -447,4 +450,57 @@ fn pinned_policies(
         return Err(LaunchDecline::Unauthorized);
     }
     Ok((inputs, outputs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{Family, node};
+    use aruna_core::calls::ChildOutcome;
+
+    fn capability_of(family: &Family, local: NodeId) -> LocalCapabilityOperation {
+        let spec = family.spec();
+        let intent = family.launch(&spec, local, 0);
+        LocalCapabilityOperation::new(family.config.clone(), local, intent, spec)
+    }
+
+    // A node without its own advertisement drains; one outside the realm members is refused.
+    #[test]
+    fn capability_needs_membership() {
+        let family = Family::new([5u8; 32]);
+        let mut unread = capability_of(&family, node(9));
+        assert!(matches!(unread.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let missing = Ok::<_, NodeInfoError>(BTreeMap::<NodeId, NodeInfoDocument>::new());
+        let answer = IoResult::Child(ChildOutcome::new(missing));
+        assert_eq!(
+            unread.next(answer),
+            Ok(Next::Done(Err(LaunchDecline::Draining)))
+        );
+    }
+
+    fn check(family: &Family) -> LaunchChecksOperation {
+        let spec = family.spec();
+        let planned = family.launch(&spec, node(9), 0);
+        LaunchChecksOperation::new(LaunchCheck {
+            config: family.config.clone(),
+            local: node(9),
+            planned,
+            spec,
+            now_ms: 9,
+        })
+    }
+
+    // A refused capability answers at once, before the gate or any grant is read.
+    #[test]
+    fn checks_stop_early() {
+        let family = Family::new([6u8; 32]);
+        let mut refused = check(&family);
+        assert!(matches!(refused.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let verdict: Verdict = Err(LaunchDecline::Unauthorized);
+        let answer = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(verdict)));
+        assert_eq!(
+            refused.next(answer),
+            Ok(Next::Done(Err(LaunchDecline::Unauthorized)))
+        );
+    }
 }

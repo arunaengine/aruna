@@ -28,10 +28,7 @@ pub(super) struct Snapshot {
     pub checks: [Vec<RequestPolicy>; 2],
 }
 impl KeyOperation {
-    pub(super) fn snapshot_read(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<(), KeyError> {
+    pub(super) fn snapshot_read(&mut self, values: Vec<Option<Value>>) -> Result<(), KeyError> {
         if !matches!(values.len(), 8 | 9) {
             return Err(AbeError::Context.into());
         }
@@ -46,10 +43,10 @@ impl KeyOperation {
         // Without a local user row the account status is unknown, so the grant waits and retries.
         // Users of another realm have no row here; their cutoff below still applies.
         let local = self.recipient().realm_id == self.auth.realm_id;
-        if issues && local && values[7].1.is_none() {
+        if issues && local && values[7].is_none() {
             return Err(KeyError::Storage);
         }
-        let bytes = |index: usize| values[index].1.as_deref().ok_or(KeyError::Missing);
+        let bytes = |index: usize| values[index].as_deref().ok_or(KeyError::Missing);
         let realm =
             RealmAuthorizationDocument::from_bytes(bytes(0)?).map_err(|_| AbeError::Context)?;
         let group =
@@ -74,14 +71,13 @@ impl KeyOperation {
         let admin = holders.contains(&self.auth.user_id);
         holders.insert(info.created_by);
         let explicit = values[6]
-            .1
             .as_ref()
             .map(|v| BucketHolder::from_bytes(v))
             .transpose()
             .map_err(|_| AbeError::Context)?
             .is_some_and(|h| h.user_id == self.auth.user_id && h.origin == HolderOrigin::Explicit);
         let recipient = self.recipient();
-        let user = values[7].1.as_deref().map(User::from_bytes).transpose();
+        let user = values[7].as_deref().map(User::from_bytes).transpose();
         let deactivated = user
             .map_err(|_| AbeError::Context)?
             .is_some_and(|u| u.is_deactivated());
@@ -119,7 +115,7 @@ impl KeyOperation {
             PermissionRules::from_roles(roles, restrictions).map_err(|_| KeyError::Denied)?;
         let revisions = values[..3]
             .iter()
-            .map(|(_, v)| *blake3::hash(v.as_deref().unwrap_or_default()).as_bytes())
+            .map(|v| *blake3::hash(v.as_deref().unwrap_or_default()).as_bytes())
             .collect();
         let policies = config
             .request_policies
@@ -134,7 +130,7 @@ impl KeyOperation {
             holder: info.created_by == self.auth.user_id || admin || explicit,
             holders,
             policies,
-            due: values.get(8).is_some_and(|(_, v)| v.is_some()),
+            due: values.get(8).is_some_and(Option::is_some),
             checks: [config.request_policies.clone(), group.policies.clone()],
         });
         Ok(())

@@ -652,3 +652,40 @@ fn check_replaces_row() {
             .eq([LINK_QUEUE_KEYSPACE])
     );
 }
+
+fn queue_entry(due_at_ms: u64) -> LinkQueueEntry {
+    LinkQueueEntry {
+        document_id: Ulid::from_bytes([4u8; 16]),
+        due_at_ms,
+        first_at_ms: 90,
+        settle_only: false,
+    }
+}
+
+// An unchanged check goes; a rewritten one stays, due no later than the retry; a removed one stays
+// removed.
+#[test]
+fn settles_queued_check() {
+    use crate::jobs::store::mutation::{Rows, run_in_memory};
+    let link_id = Ulid::from_bytes([5u8; 16]);
+    let (space, key, queued) = queue_row(link_id, &queue_entry(100)).unwrap();
+    let row = (space.clone(), key.to_vec());
+    let mut rows = Rows::from([(row.clone(), queued.to_vec())]);
+    let delete = SettleCheckOperation::new(link_id, queued.clone(), None);
+    assert_eq!(delete.transaction(), TransactionMode::Write);
+    assert_eq!(run_in_memory(delete, &mut rows), Ok(()));
+    assert!(rows.is_empty());
+    let gone = SettleCheckOperation::new(link_id, queued.clone(), Some(500));
+    assert_eq!(run_in_memory(gone, &mut rows), Ok(()));
+    assert!(rows.is_empty());
+
+    let (_, _, newer) = queue_row(link_id, &queue_entry(300)).unwrap();
+    let mut rows = Rows::from([(row.clone(), newer.to_vec())]);
+    let kept = SettleCheckOperation::new(link_id, queued.clone(), None);
+    assert_eq!(run_in_memory(kept, &mut rows), Ok(()));
+    assert_eq!(rows[&row], newer.to_vec());
+    let retry = SettleCheckOperation::new(link_id, queued, Some(200));
+    assert_eq!(run_in_memory(retry, &mut rows), Ok(()));
+    let moved: LinkQueueEntry = postcard::from_bytes(&rows[&row]).unwrap();
+    assert_eq!(moved.due_at_ms, 200);
+}

@@ -157,10 +157,6 @@ pub enum SubOperationEvent {
     },
     /// A key request run failed and may succeed on retry.
     KeyRequestsFailed,
-    /// One reissue page finished; `more` pages remain.
-    ReissuePaged {
-        more: bool,
-    },
     /// One version of a re-key page ended.
     VersionRekeyed {
         outcome: RekeyOutcome,
@@ -961,7 +957,6 @@ impl Event {
                     KeyRequestsOpened,
                     EpochsMarked,
                     KeyRequestsFailed,
-                    ReissuePaged,
                     VersionRekeyed,
                     AuditStored,
                     KeysLooked,

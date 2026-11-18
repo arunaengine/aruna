@@ -20,7 +20,7 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
-use crate::s3::write_cleanup::{RollbackWrite, WriteCleanup};
+use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite, WriteCleanup};
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
@@ -1212,8 +1212,7 @@ pub(crate) use sharing::{ReaderScan, RuleScan};
 pub(crate) use trail::{Trail, TrailScan, trail_ranges};
 
 pub(crate) use plain::{
-    PlainRecord, intent_deletes, intent_keys, intent_rows, owner_call, owner_read, owns_path,
-    path_owned, same_name_path, version_row,
+    PlainRecord, intent_keys, intent_rows, owner_call, path_owned, same_name_path, version_row,
 };
 
 #[path = "abe.rs"]

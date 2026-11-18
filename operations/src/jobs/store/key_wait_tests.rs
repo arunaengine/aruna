@@ -194,3 +194,75 @@ async fn cancellation_beats_parking() {
     assert!(matches!(outcome, Ok(AwaitOutcome::Skipped)));
     assert!(rows(&context, KEY_WAIT_KEYSPACE).await.is_empty());
 }
+
+/// A claimed probe job in an in-memory store, with its claim token.
+fn claimed_rows(seed: u8) -> (crate::jobs::store::mutation::Rows, JobId, Ulid) {
+    let job_id = JobId::from_bytes([seed; 16]);
+    let payload = JobPayload::Probe {
+        steps: 1,
+        step_sleep_ms: 0,
+        fail_at: None,
+        panic_at: None,
+        cleanup_marker: None,
+    };
+    let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
+    let mut record = JobRecord::new(job_id, payload, owner, node(7), 1_000, 1_000, None);
+    let token = Ulid::from_bytes([9; 16]);
+    record.state = JobState::Claimed;
+    record.claim = Some(JobClaim {
+        holder_node_id: node(3),
+        claim_token: token,
+        lease_expires_ms: 60_000,
+    });
+    (
+        crate::jobs::store::mutation::seeded_rows(&record),
+        job_id,
+        token,
+    )
+}
+
+// Parking writes the wait rows with the parked job; the last satisfied key wakes it again.
+#[test]
+fn parks_and_wakes_rows() {
+    use crate::jobs::store::mutation::run_in_memory;
+    let (mut rows, job_id, token) = claimed_rows(11);
+    let first = wait("a", 8);
+    let second = wait("b", 9);
+    let waits = vec![first.clone(), second.clone()];
+    let park = ParkJobOperation::new(job_id, park_mutation(token, 3_000), waits);
+    let Ok(AwaitOutcome::Parked(parked)) = run_in_memory(park, &mut rows) else {
+        panic!("a claimed job parks");
+    };
+    assert_eq!(parked.state, JobState::AwaitingKey);
+    let list = (KEY_WAIT_KEYSPACE.to_string(), job_wait_key(job_id).to_vec());
+    assert!(rows.contains_key(&list));
+
+    let one = SatisfyWaitOperation::new(job_id, first.key, 4_000);
+    assert_eq!(run_in_memory(one, &mut rows), Ok(false));
+    let last = SatisfyWaitOperation::new(job_id, second.key, 5_000);
+    assert_eq!(run_in_memory(last, &mut rows), Ok(true));
+    assert!(!rows.contains_key(&list));
+    let job = (JOB_KEYSPACE.to_string(), job_record_key(job_id).to_vec());
+    let woken = JobRecord::from_bytes(&rows[&job]).expect("job row");
+    assert_eq!((woken.state, woken.due_at_ms), (JobState::Queued, 5_000));
+}
+
+// A foreign token parks nothing, and a satisfied key of a job without a list wakes nothing.
+#[test]
+fn refuses_foreign_park() {
+    use crate::jobs::store::mutation::run_in_memory;
+    let (mut rows, job_id, _) = claimed_rows(12);
+    let before = rows.clone();
+    let foreign = ParkJobOperation::new(
+        job_id,
+        park_mutation(Ulid::from_bytes([1; 16]), 3_000),
+        vec![wait("a", 8)],
+    );
+    assert!(matches!(
+        run_in_memory(foreign, &mut rows),
+        Err(JobMutationError::TokenMismatch)
+    ));
+    assert_eq!(rows, before);
+    let stray = SatisfyWaitOperation::new(job_id, wait("a", 8).key, 4_000);
+    assert_eq!(run_in_memory(stray, &mut rows), Ok(false));
+}

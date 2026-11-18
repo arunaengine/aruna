@@ -206,3 +206,99 @@ impl Operation for NoteListingOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::store::mutation::{Rows, run_in_memory};
+
+    fn rule() -> BackendImport {
+        BackendImport {
+            import_id: Ulid::from_parts(4, 4),
+            group_id: Ulid::from_parts(3, 3),
+            backend_id: Ulid::from_parts(5, 5),
+            backend_prefix: "raw/".to_string(),
+            bucket: "bucket".to_string(),
+            key_prefix: "in/".to_string(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: "{dir}{name}".to_string(),
+        }
+    }
+
+    fn row(space: &str, key: &Key) -> (String, Vec<u8>) {
+        (space.to_string(), key.to_vec())
+    }
+
+    // A note writes the row and retires its intents while the rule and every guard still hold.
+    #[test]
+    fn writes_while_guards_hold() {
+        let rule = rule();
+        let rule_row = (
+            row(BACKEND_IMPORT_KEYSPACE, &rule.key()),
+            rule.to_bytes().unwrap(),
+        );
+        let (row_key, intent) = (Key::from(b"row".to_vec()), Key::from(b"intent".to_vec()));
+        let guard = (
+            "guard".to_string(),
+            Key::from(b"g".to_vec()),
+            Some(Value::from(vec![1])),
+        );
+        let note = || ListingNote {
+            guards: vec![guard.clone()],
+            retired: vec![intent.clone()],
+            ..ListingNote::default()
+        };
+        let build = |note| {
+            NoteListingOperation::new(rule.clone(), row_key.clone(), None, vec![9].into(), note)
+        };
+        let mut rows = Rows::from([
+            rule_row.clone(),
+            (row(IMPORT_INTENT_KEYSPACE, &intent), vec![1]),
+        ]);
+        let moved = rows.clone();
+        assert_eq!(build(note()).transaction(), TransactionMode::Write);
+        assert_eq!(run_in_memory(build(note()), &mut rows), Ok(false));
+        assert_eq!(rows, moved);
+
+        rows.insert(row("guard", &guard.1), vec![1]);
+        assert_eq!(run_in_memory(build(note()), &mut rows), Ok(true));
+        assert_eq!(rows[&row(IMPORTED_OBJECT_KEYSPACE, &row_key)], vec![9]);
+        assert!(!rows.contains_key(&row(IMPORT_INTENT_KEYSPACE, &intent)));
+        let written = rows.clone();
+        assert_eq!(run_in_memory(build(note()), &mut rows), Ok(false));
+        assert_eq!(rows, written);
+    }
+
+    // A note expecting another rule in the folder is refused once that rule is gone.
+    #[test]
+    fn refuses_changed_sharing() {
+        let rule = rule();
+        let rule_row = (
+            row(BACKEND_IMPORT_KEYSPACE, &rule.key()),
+            rule.to_bytes().unwrap(),
+        );
+        let row_key = Key::from(b"row".to_vec());
+        let shared = ListingNote {
+            sharing: Some(BTreeSet::from([Ulid::from_parts(9, 9)])),
+            ..ListingNote::default()
+        };
+        let operation =
+            NoteListingOperation::new(rule.clone(), row_key.clone(), None, vec![9].into(), shared);
+        let mut rows = Rows::from([rule_row.clone()]);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(false));
+
+        let alone = ListingNote {
+            sharing: Some(BTreeSet::new()),
+            ..ListingNote::default()
+        };
+        let operation =
+            NoteListingOperation::new(rule.clone(), row_key, None, vec![9].into(), alone);
+        assert_eq!(run_in_memory(operation, &mut rows), Ok(true));
+    }
+}
