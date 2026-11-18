@@ -520,8 +520,10 @@ pub struct MetadataAnswer {
 /// Why a peer request has no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRequestError {
-    /// The request failed before an answer arrived.
+    /// The request failed before an answer arrived; the peer may have received it.
     Failed(String),
+    /// The request failed before it was sent, so the peer cannot have acted on it.
+    NotSent(String),
     /// No answer arrived within the request's timeout.
     TimedOut,
 }

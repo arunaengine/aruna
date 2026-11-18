@@ -105,7 +105,7 @@ impl Operation for FetchFamilyOperation {
             Ok(bytes) => bytes,
             // The shared deadline passed; no later holder gets a turn.
             Err(PeerRequestError::TimedOut) => return Ok(Next::Done((None, Vec::new()))),
-            Err(PeerRequestError::Failed(error)) => {
+            Err(PeerRequestError::Failed(error) | PeerRequestError::NotSent(error)) => {
                 warn!(peer = %peer, error = %error, "Job record fetch failed");
                 return Ok(self.ask());
             }
