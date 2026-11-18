@@ -1149,7 +1149,15 @@ async fn admit_here(
         now_ms: unix_timestamp_millis(),
         fresh: context.fresh_heartbeats(),
     };
-    drive(AdmitHereOperation::new(admission), context).await
+    // A store failure while admitting leaves the holder unavailable, as any admission failure.
+    drive(AdmitHereOperation::new(admission), context)
+        .await
+        .map_err(|error| match error {
+            error @ (SubmitJobError::Storage(_) | SubmitJobError::UnexpectedEvent(_)) => {
+                SubmitJobError::PlacementUnavailable(error.to_string())
+            }
+            error => error,
+        })
 }
 
 /// Forwards the complete request and its preassigned identity one hop. The
