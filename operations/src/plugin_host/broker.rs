@@ -3,22 +3,60 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::forward::pinned::PinnedMintOperation;
-use crate::metadata::forward::routed_export::RoutedExportOperation;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::driver::{DriverContext, drive};
+use crate::forward::transport::MetadataWriteError;
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::export_types::{GetVisibleRequest, RoCrateExportView};
+use crate::metadata::create_document::CreateDocumentError;
+use crate::metadata::forward::pinned::PinnedCreate;
+use crate::metadata::forward::read::get_metadata_routed;
+use crate::metadata::forward::write::{
+    CreateAuthorizedError, create_with_id, route_metadata_update,
+};
+use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
+use crate::plugins::check::RunScope;
+use crate::plugins::creates::{
+    Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
+};
+use crate::plugins::dataset::file_entity;
+use crate::plugins::grants::object_path;
+use crate::plugins::held::{AskRelease, HeldSecrets};
+use crate::plugins::host_calls::{
+    CallEnd, CallFailure, ObjectInfoCall, ObjectListCall, RecordCall, StateCall, StateChange,
+    begun_reply, call_intent, version_id,
+};
+use crate::plugins::host_steps::{
+    AdmitCall, CallStep, ChangeInput, CheckConfigured, CheckReply, ConfiguredCall, ConnectionAsk,
+    ConnectionPlan, Granted, GrantedCall, ListDatasets, NativeCall, PrepareChange,
+    PrepareConnection, PrepareCreate, ReadDataset, ReadFiles, ReadPlace, ReadyCreate, ReplyPlan,
+    change_message,
+};
+use crate::plugins::intents::{begin, unknown_row};
+use crate::plugins::job_work::{CancelWork, JobState};
+use crate::plugins::objects::{LocalObject, Unmarked};
+use crate::plugins::outgoing::{
+    SendConnection, declared_method, stored_whole, too_large, whole_text,
+};
+use crate::plugins::rows::write_rows;
+use crate::plugins::state::{MAX_STATE_KEY, read_state};
+use crate::plugins::submit::{CopyRequest, DownloadRequest, UploadRequest, WorkRequest};
+use crate::plugins::unavailable;
+use crate::plugins::work::RequestContext;
+use crate::plugins::work_calls::{JobOutputs, JobRow};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
 use aruna_core::metadata::{AuthToken, MetadataError};
+use aruna_core::outbound::{ConnectionAnswer, ConnectionError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{LogLine, PluginRun, StateRemoval, StateWrite};
+use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
-use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
+use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::job::UploadForm;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_core::structs::storage::data::identity::DataIdentity;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{
     Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
@@ -27,69 +65,12 @@ use aruna_plugins::broker::{
 };
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
-use craqle::GraphId;
 use futures_util::StreamExt;
-use oxrdf::Term;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 use ulid::Ulid;
-
-use super::read_config;
-use crate::auth::error::AuthorizeError;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
-use crate::forward::transport::MetadataWriteError;
-use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export_types::{
-    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
-};
-use crate::metadata::api::list::ListVisibleOperation;
-use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
-use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use crate::metadata::forward::pinned::PinnedCreate;
-use crate::metadata::forward::read::get_metadata_routed;
-use crate::metadata::forward::write::{
-    CreateAuthorizedError, create_with_id, route_metadata_update,
-};
-use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
-use crate::plugins::check::{Authorize, CallError, CheckCall, RunScope, matching};
-use crate::plugins::creates::{
-    Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
-};
-use crate::plugins::dataset::{
-    content_urls, dataset_change, dataset_crate, dataset_of, file_entities, file_entity,
-    parse_document, same_revision,
-};
-use crate::plugins::grants::{
-    install_scope, object_path, parse_grants, patterns_for, restricted_account,
-};
-use crate::plugins::held::{AskRelease, HeldSecrets};
-use crate::plugins::host_calls::{
-    CallEnd, CallFailure, ObjectInfoCall, ObjectListCall, RecordCall, StateCall, StateChange,
-    begun_reply, call_intent, version_id,
-};
-use crate::plugins::install::{pick_version, read_manifest};
-use crate::plugins::intents::{begin, unknown_row, written};
-use crate::plugins::job_work::{CancelWork, JobState, StartWork};
-use crate::plugins::objects::{LocalObject, Unmarked};
-use crate::plugins::outgoing::{
-    SendConnection, declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
-};
-use crate::plugins::rate::take_call;
-use crate::plugins::rows::write_rows;
-use crate::plugins::state::{MAX_STATE_KEY, read_state};
-use crate::plugins::submit::{CopyRequest, DownloadRequest, UploadRequest, WorkRequest};
-use crate::plugins::unavailable;
-use crate::plugins::work::RequestContext;
-use crate::plugins::work_calls::{JobOutputs, JobRow};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_core::entity_patch::craqle_patch_request;
-use aruna_core::outbound::{ConnectionAnswer, ConnectionError};
-use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
-
-/// Entries of one metadata or object listing page.
-const PAGE: usize = 100;
 
 /// The host side of one run.
 pub struct RunBroker {
@@ -133,15 +114,7 @@ impl RunBroker {
         &self,
         target: Option<(Permission, &str)>,
     ) -> Result<PluginInstall, HostError> {
-        let check = CheckCall::new(&self.scope, target);
-        let install = drive(check, &self.ctx).await?;
-        match take_call(install.install_id, std::time::Instant::now()) {
-            true => Ok(install),
-            false => Err(HostError::new(
-                ErrorKind::Limit,
-                "the install makes calls too fast",
-            )),
-        }
+        Ok(drive(AdmitCall::new(&self.scope, target), &self.ctx).await?)
     }
 
     /// Whether the run called differently than an earlier attempt, so it fails as changed.
@@ -155,12 +128,9 @@ impl RunBroker {
         permission: Permission,
         target: &str,
     ) -> Result<(PluginInstall, AuthContext), HostError> {
-        let install = self.admitted(Some((permission, target))).await?;
-        let patterns = matching(&install, permission, target)?;
-        Ok((
-            install.clone(),
-            restricted_account((&install, self.scope.realm_id), &patterns, permission),
-        ))
+        let check = GrantedCall::target(&self.scope, permission, target);
+        let Granted { install, auth } = drive(check, &self.ctx).await?;
+        Ok((install, auth))
     }
 
     /// Steps 0 to 2, and the account restricted to every grant of `permission`.
@@ -168,46 +138,53 @@ impl RunBroker {
         &self,
         permission: Permission,
     ) -> Result<(PluginInstall, AuthContext), HostError> {
-        let install = self.admitted(None).await?;
-        let grants = parse_grants(&install.grants);
-        let patterns = patterns_for(&grants, permission);
-        Ok((
-            install.clone(),
-            restricted_account((&install, self.scope.realm_id), &patterns, permission),
-        ))
+        let check = GrantedCall::listing(&self.scope, permission);
+        let Granted { install, auth } = drive(check, &self.ctx).await?;
+        Ok((install, auth))
     }
 
-    /// The registry record and JSON-LD of a document the account may read.
-    async fn export(
-        &self,
-        (document_id, view): (Ulid, RoCrateExportView),
-        auth: AuthContext,
-        max_bytes: usize,
-    ) -> Result<(MetadataRegistryRecord, String), HostError> {
-        let request = ExportMetadataRequest {
-            document_id,
-            auth: Some(auth.clone()),
-            view,
-            limit: None,
-            offset: None,
-            after: None,
-        };
-        let token = Some(AuthToken::Internal(auth));
-        let export = drive(
-            RoutedExportOperation::new(
-                self.ctx.net_handle.as_ref().map(|net| net.node_id()),
-                self.scope.realm_id,
-                request,
-                token,
-                max_bytes as u64,
-            ),
-            &self.ctx,
-        );
-        match export.await.map_err(api_error)? {
-            ExportMetadataResult::Full { record, jsonld }
-            | ExportMetadataResult::Summary { record, jsonld } => Ok((record, jsonld)),
-            _ => Err(unavailable("the document has no such export")),
+    fn read_place(&self, cx: &CallContext) -> ReadPlace {
+        ReadPlace {
+            scope: self.scope.clone(),
+            network_node: self.ctx.net_handle.as_ref().map(|net| net.node_id()),
+            max_bytes: cx.max_bytes,
         }
+    }
+
+    /// Checks a metadata change, then routes it and records its outcome in the call's intent.
+    async fn routed_change(
+        &self,
+        prepare: PrepareChange,
+        intent: &Intent,
+        mutation: impl FnOnce(Option<String>) -> UpdateDocumentMutation,
+    ) -> Result<String, HostError> {
+        let step = drive(prepare, &self.ctx).await;
+        let ready = match step.map_err(|failure| self.failed(failure))? {
+            CallStep::Replied(reply) => return Ok(reply),
+            CallStep::Proceed(ready) => ready,
+        };
+        let Granted { install, auth } = ready.granted;
+        let actor = Actor {
+            node_id: self.scope.local,
+            user_id: install.account,
+            realm_id: self.scope.realm_id,
+        };
+        let update = route_metadata_update(
+            &self.ctx,
+            actor,
+            Some(&ready.record),
+            ready.document_id,
+            None,
+            mutation(ready.entity),
+            Some(ready.expected),
+            Some(AuthToken::Internal(auth)),
+            Some(change_message(&install, self.scope.run.run_id)),
+        );
+        let outcome = update
+            .await
+            .map(|record| record.last_event_id.to_string())
+            .map_err(write_outcome);
+        self.record(intent, outcome).await
     }
 
     /// Runs a revision-checked change of one file entity under the write grants. A file it names
@@ -219,71 +196,11 @@ impl RunBroker {
         mutation: UpdateDocumentMutation,
         file: Option<Value>,
     ) -> Result<String, HostError> {
-        let document_id = parse_document(&change.resource)?;
-        let expected = Ulid::from_string(&change.expected)
-            .map_err(|_| HostError::new(ErrorKind::Invalid, "bad revision"))?;
-        let (_, auth) = self.listing(Permission::MetadataWrite).await?;
-        let read = (document_id, RoCrateExportView::Summary);
-        let (record, _) = self.export(read, auth, cx.max_bytes).await?;
-        let (install, auth) =
-            (self.checked(Permission::MetadataWrite, &record.permission_path)).await?;
-        if let Some(file) = file {
-            content_urls(&file)?;
-            self.objects_named(&install, (&record.graph_iri, &file))
-                .await?;
-        }
-        let run_id = self.scope.run.run_id;
-        let earlier = drive(written(run_id, &call_intent(&change.intent)), &self.ctx).await;
-        if !earlier.map_err(|error| unavailable(error.0))? {
-            same_revision(record.last_event_id, expected)?;
-        }
-        if let Some(reply) = self.begun(&change.intent).await? {
-            return Ok(reply);
-        }
-        let actor = Actor {
-            node_id: self.scope.local,
-            user_id: install.account,
-            realm_id: self.scope.realm_id,
-        };
-        let message = format!(
-            "plugin {} install {} run {run_id}",
-            install.plugin, install.install_id
-        );
-        let update = route_metadata_update(
-            &self.ctx,
-            actor,
-            Some(&record),
-            document_id,
-            None,
-            mutation,
-            Some(expected),
-            Some(AuthToken::Internal(auth)),
-            Some(message),
-        );
-        let outcome = update
-            .await
-            .map(|record| record.last_event_id.to_string())
-            .map_err(write_outcome);
-        self.record(&change.intent, outcome).await
-    }
-
-    /// The dataset entity of a document from the given export view, checked under the read grants.
-    async fn dataset_read(
-        &self,
-        cx: &CallContext,
-        resource: &str,
-        view: RoCrateExportView,
-    ) -> Result<Document, HostError> {
-        let document_id = parse_document(resource)?;
-        let (_, auth) = self.listing(Permission::MetadataRead).await?;
-        let (record, jsonld) = self.export((document_id, view), auth, cx.max_bytes).await?;
-        self.checked(Permission::MetadataRead, &record.permission_path)
-            .await?;
-        Ok(Document {
-            resource: resource.to_string(),
-            revision: record.last_event_id.to_string(),
-            json: dataset_of(&jsonld)?,
-        })
+        let revision = (change.resource.as_str(), change.expected.as_str());
+        let intent = call_intent(&change.intent);
+        let input = ChangeInput::File(file);
+        let prepare = PrepareChange::new(self.read_place(cx), revision, intent, input)?;
+        (self.routed_change(prepare, &change.intent, |_| mutation)).await
     }
 
     /// Creates the keyed document once: the stored create goes to its stored node with its stored
@@ -329,112 +246,6 @@ impl RunBroker {
                     return Err(CallEnd::Maybe(reason.to_string()));
                 }
             }
-        }
-    }
-
-    /// Checks each Aruna object an entity names through the plugin's own `objects.read` call
-    /// check and that it lies in a group bucket here. A content hash or global id needs one too.
-    /// The dataset's own JSON-LD context can make an export name others; it checks the exporter.
-    async fn objects_named(
-        &self,
-        install: &PluginInstall,
-        (graph, file): (&str, &Value),
-    ) -> Result<(), HostError> {
-        let realm_id = self.scope.realm_id;
-        // Export renders each stored value as is, without `./`, or as literal text, under any term
-        // the context gives (craqle `context_value`), so every value of every predicate is checked.
-        let converted = craqle_patch_request(&GraphId::new(graph), &file.to_string());
-        let converted =
-            converted.map_err(|error| HostError::new(ErrorKind::Invalid, error.to_string()))?;
-        let entity = converted.entity;
-        let objects = entity
-            .additional_triples
-            .iter()
-            .filter_map(|(_, object)| match object {
-                Term::NamedNode(node) => Some(node.as_str().to_string()),
-                Term::Literal(literal) => Some(literal.value().to_string()),
-                _ => None,
-            });
-        let own = [&entity.entity_id, &entity.entity_type, &entity.name].map(String::clone);
-        let stored: Vec<String> = own.into_iter().chain(objects).collect();
-        let bare = stored.iter().filter_map(|value| value.strip_prefix("./"));
-        let bare: Vec<String> = bare.map(str::to_string).collect();
-        let values: Vec<String> = stored.into_iter().chain(bare).collect();
-        let refused = |what: &str| {
-            let message = format!("{what} names no object a plugin may check; use its path");
-            HostError::new(ErrorKind::Denied, message)
-        };
-        let group = install.group_id;
-        // A content hash or global id names no object alone; a concrete one must come with it.
-        let (mut objects, mut hash, mut unplaced) = (Vec::new(), None, None);
-        for value in values.iter().map(String::as_str) {
-            let identity = DataIdentity::read(value, &[]);
-            if value.starts_with(&format!("/{realm_id}/g/")) {
-                objects.push((value.to_string(), None));
-            } else if let Some(exact) = identity.exact {
-                if exact.realm_id != realm_id {
-                    return Err(refused(value));
-                }
-                let (node, bucket, key) = (exact.node_id, &exact.bucket, &exact.key);
-                let path = object_permission_path(realm_id, group, node, bucket, key);
-                objects.push((path, Some(exact.version)));
-            } else if let Some(at) = identity.location {
-                let local = self.scope.local;
-                objects.push((
-                    object_permission_path(realm_id, group, local, &at.bucket, &at.key),
-                    None,
-                ));
-            } else if identity.is_aruna() {
-                // Readers keep one hash of a file, so two different ones are never admitted.
-                if let Some(found) = identity.hash {
-                    if hash.is_some_and(|known| known != found) {
-                        let message = "the file names two different content hashes";
-                        return Err(HostError::new(ErrorKind::Invalid, message));
-                    }
-                    hash = Some(found);
-                }
-                unplaced.get_or_insert(value);
-            }
-        }
-        if let (Some(value), true) = (unplaced, objects.is_empty()) {
-            return Err(refused(value));
-        }
-        for (path, version) in objects {
-            self.checked(Permission::ObjectsRead, &path).await?;
-            let (bucket, key) = self.object_at(install, &path).await?;
-            if let Some(hash) = hash {
-                self.same_content((bucket, key, version), hash).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Admits the hash a file names an object by only when the object's verified BLAKE3 digest is
-    /// recorded and equal; a pending upload without one cannot vouch for any hash.
-    async fn same_content(
-        &self,
-        (bucket, key, version_id): (String, String, Option<Ulid>),
-        hash: [u8; 32],
-    ) -> Result<(), HostError> {
-        let head = HeadObjectInput {
-            bucket,
-            key,
-            version_id,
-        };
-        let head = drive(HeadObjectOperation::new(head), &self.ctx).await;
-        let head = head.map_err(|_| HostError::new(ErrorKind::NotFound, "the object is gone"))?;
-        let stored = head
-            .location
-            .and_then(|location| location.hashes.get(HASH_BLAKE3).cloned());
-        let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
-        match stored {
-            None => Err(invalid(
-                "the object has no verified digest for the file's hash id yet",
-            )),
-            Some(stored) if stored != hash => Err(invalid(
-                "the object's content does not match the file's hash id",
-            )),
-            Some(_) => Ok(()),
         }
     }
 
@@ -495,32 +306,13 @@ impl RunBroker {
         begun_reply(begun).map_err(|failure| self.failed(failure))
     }
 
-    /// Starts native work through the run's call history: other arguments at a known ordinal are
-    /// refused before any work is reserved, a settled call answers its job id again, and an earlier
-    /// attempt is safe to repeat, as the work row names the job by run and ordinal.
-    async fn native(
-        &self,
-        intent: &Intent,
-        start: impl std::future::Future<Output = Result<Ulid, HostError>>,
-    ) -> Result<String, HostError> {
-        match self.begun(intent).await {
-            Ok(Some(reply)) => return Ok(reply),
-            Ok(None) => {}
-            Err(error) if error.kind == ErrorKind::UnknownOutcome => {}
-            Err(error) => return Err(error),
-        }
-        // A refused start leaves no job, or one its work row finds again, so the call may be made
-        // again; its intent goes.
-        let outcome = start.await.map(|work_id| work_id.to_string());
-        self.record(intent, outcome.map_err(CallEnd::None)).await
-    }
-
-    /// Starts or finds the work of `request`.
-    async fn start_work(&self, request: WorkRequest) -> Result<Ulid, HostError> {
+    /// Starts native work through the run's call history.
+    async fn native(&self, intent: &Intent, request: WorkRequest) -> Result<String, HostError> {
         let minted = (unix_timestamp_millis(), Ulid::generate());
-        let serving = self.ctx.node_and_realm();
-        let start = StartWork::new(&self.scope, request, minted, serving);
-        Ok(drive(start, &self.ctx).await?)
+        let place = (minted, self.ctx.node_and_realm());
+        let call = NativeCall::new(&self.scope, call_intent(intent), request, place);
+        let started = drive(call, &self.ctx).await;
+        started.map_err(|failure| self.failed(failure))
     }
 
     /// The full permission path of an object path the plugin gave; see [`object_path`].
@@ -537,27 +329,6 @@ impl RunBroker {
     ) -> Result<(String, String), HostError> {
         let place = (self.scope.realm_id, self.scope.local);
         Ok(drive(LocalObject::new(place, install, path), &self.ctx).await?)
-    }
-}
-
-impl RunBroker {
-    /// Whether the account may reach a listed target now: the grants must cover it and it must
-    /// pass the same authorization as an individual call. Only an unavailable check fails.
-    async fn authorized(
-        &self,
-        install: &PluginInstall,
-        permission: Permission,
-        target: &str,
-    ) -> Result<bool, HostError> {
-        let Ok(patterns) = matching(install, permission, target) else {
-            return Ok(false);
-        };
-        let check = Authorize::call(install, permission, target, &patterns);
-        match drive(check, &self.ctx).await {
-            Ok(()) => Ok(true),
-            Err(CallError(error)) if error.kind == ErrorKind::Unavailable => Err(error),
-            Err(_) => Ok(false),
-        }
     }
 }
 
@@ -583,8 +354,8 @@ fn byte_size(bytes: usize) -> String {
 #[async_trait]
 impl Broker for RunBroker {
     async fn metadata_get(&self, cx: &CallContext, resource: &str) -> Result<Document, HostError> {
-        self.dataset_read(cx, resource, RoCrateExportView::Full)
-            .await
+        let read = ReadDataset::new(self.read_place(cx), resource, RoCrateExportView::Full);
+        Ok(drive(read, &self.ctx).await?)
     }
 
     async fn metadata_summary(
@@ -592,8 +363,9 @@ impl Broker for RunBroker {
         cx: &CallContext,
         resource: &str,
     ) -> Result<Document, HostError> {
-        self.dataset_read(cx, resource, RoCrateExportView::Summary)
-            .await
+        let view = RoCrateExportView::Summary;
+        let read = ReadDataset::new(self.read_place(cx), resource, view);
+        Ok(drive(read, &self.ctx).await?)
     }
 
     async fn metadata_files(
@@ -602,38 +374,8 @@ impl Broker for RunBroker {
         resource: &str,
         cursor: Option<String>,
     ) -> Result<FilePage, HostError> {
-        let document_id = parse_document(resource)?;
-        let (_, auth) = self.listing(Permission::MetadataRead).await?;
-        let request = ExportMetadataRequest {
-            document_id,
-            auth: Some(auth.clone()),
-            view: RoCrateExportView::Page,
-            limit: Some(FILE_PAGE),
-            offset: None,
-            after: cursor,
-        };
-        // The holder counts the cursor and the room around each entity in this bound.
-        let bound = cx.max_bytes as u64;
-        let token = Some(AuthToken::Internal(auth));
-        let export = drive(
-            RoutedExportOperation::new(
-                self.ctx.net_handle.as_ref().map(|net| net.node_id()),
-                self.scope.realm_id,
-                request,
-                token,
-                bound,
-            ),
-            &self.ctx,
-        );
-        let ExportMetadataResult::Page { record, page } = export.await.map_err(api_error)? else {
-            return Err(unavailable("the document has no page export"));
-        };
-        self.checked(Permission::MetadataRead, &record.permission_path)
-            .await?;
-        Ok(FilePage {
-            files: file_entities(&page.jsonld)?,
-            cursor: page.next_cursor,
-        })
+        let read = ReadFiles::new(self.read_place(cx), resource, cursor);
+        Ok(drive(read, &self.ctx).await?)
     }
 
     async fn metadata_list(
@@ -641,38 +383,7 @@ impl Broker for RunBroker {
         _cx: &CallContext,
         cursor: Option<String>,
     ) -> Result<Listing, HostError> {
-        let (install, auth) = self.listing(Permission::MetadataRead).await?;
-        let offset = match cursor {
-            Some(cursor) => cursor
-                .parse::<usize>()
-                .map_err(|_| HostError::new(ErrorKind::Invalid, "bad cursor"))?,
-            None => 0,
-        };
-        let request = ListVisibleRequest {
-            group_id: Some(install.group_id),
-            path_prefix: None,
-            include_summary: false,
-            limit: Some(PAGE),
-            offset: Some(offset),
-            order: MetadataListOrder::Created,
-            auth: Some(auth),
-        };
-        let list = ListVisibleOperation::new(self.scope.realm_id, request);
-        let listed = drive(list, &self.ctx).await;
-        let listed = listed.map_err(api_error)?;
-        let full = listed.documents.len() >= PAGE;
-        let mut resources = Vec::new();
-        for document in &listed.documents {
-            let path = &document.record.permission_path;
-            if self
-                .authorized(&install, Permission::MetadataRead, path)
-                .await?
-            {
-                resources.push(document.record.document_id.to_string());
-            }
-        }
-        let cursor = full.then(|| (offset + listed.documents.len()).to_string());
-        Ok(Listing { resources, cursor })
+        Ok(drive(ListDatasets::new(&self.scope, cursor), &self.ctx).await?)
     }
 
     async fn metadata_patch(
@@ -680,54 +391,14 @@ impl Broker for RunBroker {
         cx: &CallContext,
         patch: MetadataPatch,
     ) -> Result<String, HostError> {
-        let document_id = parse_document(&patch.resource)?;
-        let expected = Ulid::from_string(&patch.expected)
-            .map_err(|_| HostError::new(ErrorKind::Invalid, "bad revision"))?;
-        // The target is resolved under the write grants; the plugin never sees what is read.
-        let (_, auth) = self.listing(Permission::MetadataWrite).await?;
-        // The summary has no file links, so a large dataset is not exported whole for a patch.
-        let read = (document_id, RoCrateExportView::Summary);
-        let (record, jsonld) = self.export(read, auth, cx.max_bytes).await?;
-        let path = &record.permission_path;
-        let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
-        // A new call starts only from the copy it expects; an earlier attempt's intent decides.
-        let run_id = self.scope.run.run_id;
-        let earlier = drive(written(run_id, &call_intent(&patch.intent)), &self.ctx).await;
-        if !earlier.map_err(|error| unavailable(error.0))? {
-            same_revision(record.last_event_id, expected)?;
-        }
-        // An invalid patch is refused before its intent exists, so it leaves no uncertainty.
-        let change = dataset_change(&jsonld, &patch.patch)?;
-        if let Some(reply) = self.begun(&patch.intent).await? {
-            return Ok(reply);
-        }
-        let actor = Actor {
-            node_id: self.scope.local,
-            user_id: install.account,
-            realm_id: self.scope.realm_id,
+        let revision = (patch.resource.as_str(), patch.expected.as_str());
+        let intent = call_intent(&patch.intent);
+        let input = ChangeInput::Patch(patch.patch.clone());
+        let prepare = PrepareChange::new(self.read_place(cx), revision, intent, input)?;
+        let mutation = |entity: Option<String>| UpdateDocumentMutation::UpsertContextualEntity {
+            jsonld: entity.unwrap_or_default(),
         };
-        let run = self.scope.run.run_id;
-        let message = format!(
-            "plugin {} install {} run {run}",
-            install.plugin, install.install_id
-        );
-        let mutation = UpdateDocumentMutation::UpsertContextualEntity { jsonld: change };
-        let update = route_metadata_update(
-            &self.ctx,
-            actor,
-            Some(&record),
-            document_id,
-            None,
-            mutation,
-            Some(expected),
-            Some(AuthToken::Internal(auth)),
-            Some(message),
-        );
-        let outcome = update
-            .await
-            .map(|record| record.last_event_id.to_string())
-            .map_err(write_outcome);
-        self.record(&patch.intent, outcome).await
+        self.routed_change(prepare, &patch.intent, mutation).await
     }
 
     async fn metadata_create(
@@ -735,50 +406,26 @@ impl Broker for RunBroker {
         _cx: &CallContext,
         create: MetadataCreate,
     ) -> Result<Created, HostError> {
-        let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
-        let path = MetadataRegistryRecord::normalize_document_path(&create.path);
-        if path.is_empty() || path.contains('@') {
-            return Err(invalid("a dataset path is not empty and has no @"));
-        }
-        if create.key.is_empty() || create.key.len() > MAX_KEY {
-            return Err(invalid("a create key has 1 to 256 bytes"));
-        }
-        let current = self.admitted(None).await?;
-        let realm_id = self.scope.realm_id;
-        let target = format!("/{realm_id}/g/{}/meta/{path}", current.group_id);
-        let (install, auth) = self.checked(Permission::MetadataCreate, &target).await?;
-        // An invalid dataset is refused before its intent exists, so it leaves no uncertainty.
-        let jsonld = dataset_crate(&create.dataset)?;
-        // The dataset entity is checked as stored, like a file; the new graph's name is not known.
-        let stored: Value = serde_json::from_str(&jsonld).unwrap_or(Value::Null);
-        let graph = MetadataRegistryRecord::graph_iri_for(Ulid::nil());
-        self.objects_named(&install, (&graph, &stored["@graph"][1]))
-            .await?;
-        if let Some(reply) = self.begun(&create.intent).await? {
-            return stored_created(&reply);
-        }
-        let actor = Actor {
-            node_id: self.scope.local,
-            user_id: install.account,
-            realm_id,
+        let place = (create.path.as_str(), create.key.as_str());
+        let intent = call_intent(&create.intent);
+        let prepare = PrepareCreate::new(&self.scope, place, &create.dataset, intent)?;
+        let step = drive(prepare, &self.ctx).await;
+        let ready = match step.map_err(|failure| self.failed(failure))? {
+            CallStep::Replied(reply) => return stored_created(&reply),
+            CallStep::Proceed(ready) => ready,
         };
-        let run = self.scope.run.run_id;
-        let message = format!(
-            "plugin {} install {} run {run}",
-            install.plugin, install.install_id
-        );
-        let payload = (CreateDocumentPayload::RoCrate { jsonld }, Some(message));
-        let minted = drive(
-            PinnedMintOperation::new(actor.clone(), (install.group_id, &path), payload),
-            &self.ctx,
-        )
-        .await;
+        let ReadyCreate {
+            actor,
+            granted,
+            minted,
+        } = ready;
         let outcome = match minted {
             Ok(minted) => {
-                let key = (&install, create.key.as_str());
-                self.keyed_create((actor, &auth), key, minted).await
+                let key = (&granted.install, create.key.as_str());
+                self.keyed_create((actor, &granted.auth), key, *minted)
+                    .await
             }
-            Err(error) => Err(CallEnd::None(unavailable(error.to_string()))),
+            Err(why) => Err(CallEnd::None(unavailable(why))),
         };
         let reply = self.record(&create.intent, outcome).await?;
         stored_created(&reply)
@@ -903,15 +550,7 @@ impl Broker for RunBroker {
             target: self.expand(&copy.target)?,
             ordinal: copy.intent.ordinal,
         };
-        let request = WorkRequest::Copy(request);
-        let started = self.native(&copy.intent, self.start_work(request));
-        match started.await {
-            Err(error) if error.kind == ErrorKind::Conflict => {
-                self.changed.store(true, Ordering::Relaxed);
-                Err(error)
-            }
-            answered => answered,
-        }
+        self.native(&copy.intent, WorkRequest::Copy(request)).await
     }
 
     async fn jobs_download(
@@ -944,14 +583,7 @@ impl Broker for RunBroker {
             secret: ready.secret,
             ordinal: download.intent.ordinal,
         };
-        let request = WorkRequest::Download(request);
-        match (self.native(&download.intent, self.start_work(request))).await {
-            Err(error) if error.kind == ErrorKind::Conflict => {
-                self.changed.store(true, Ordering::Relaxed);
-                Err(error)
-            }
-            answered => answered,
-        }
+        (self.native(&download.intent, WorkRequest::Download(request))).await
     }
 
     async fn jobs_upload(&self, _cx: &CallContext, upload: JobUpload) -> Result<String, HostError> {
@@ -988,14 +620,7 @@ impl Broker for RunBroker {
             form,
             ordinal: upload.intent.ordinal,
         };
-        let request = WorkRequest::Upload(request);
-        match (self.native(&upload.intent, self.start_work(request))).await {
-            Err(error) if error.kind == ErrorKind::Conflict => {
-                self.changed.store(true, Ordering::Relaxed);
-                Err(error)
-            }
-            answered => answered,
-        }
+        (self.native(&upload.intent, WorkRequest::Upload(request))).await
     }
 
     async fn jobs_get(&self, _cx: &CallContext, id: &str) -> Result<JobStatus, HostError> {
@@ -1005,7 +630,7 @@ impl Broker for RunBroker {
         if status.reply_status.is_some() {
             let row = drive(JobRow::new(&install, id), &self.ctx).await?;
             let shown = match &row.context {
-                Some(context) => self.reply_shown(&install, context).await,
+                Some(context) => self.reply_shown(context).await,
                 None => false,
             };
             // A refused check answers the state without the reply.
@@ -1079,13 +704,9 @@ impl Broker for RunBroker {
     }
 
     async fn secret_value(&self, _cx: &CallContext, slot: &str) -> Result<Vec<Field>, HostError> {
-        let current = self.admitted(None).await?;
-        let path = install_scope(&current).secret(slot);
-        let (install, _) = self.checked(Permission::SecretsValue, &path).await?;
-        let config = read_config(&self.ctx, self.scope.realm_id).await;
-        let config = config.map_err(|error| unavailable(error.to_string()))?;
+        let call = drive(CheckConfigured::secret(&self.scope, slot), &self.ctx).await?;
         let use_of = (Delivery::Value, None);
-        let (_, fields) = self.obtain(&install, slot, use_of, &config).await?;
+        let (_, fields) = (self.obtain(&call.install, slot, use_of, &call.config)).await?;
         let values = (fields.names())
             .filter_map(|name| {
                 let value = fields.get(name)?.to_string();
@@ -1119,12 +740,6 @@ impl Broker for RunBroker {
     }
 }
 
-/// File entities one page asks for; a page over the byte bound comes back smaller.
-const FILE_PAGE: usize = 100;
-
-/// Bytes of a create key at most.
-const MAX_KEY: usize = 256;
-
 /// Whether a failed create had no effect, or may have had one.
 fn create_outcome(error: CreateAuthorizedError) -> CallEnd {
     let none = |kind, message: String| CallEnd::None(HostError::new(kind, message));
@@ -1147,27 +762,6 @@ fn create_outcome(error: CreateAuthorizedError) -> CallEnd {
         }
         CreateAuthorizedError::Create(_) => CallEnd::Maybe(error.to_string()),
         CreateAuthorizedError::Write(error) => write_outcome(error),
-    }
-}
-
-/// Refuses a copy at another revision than the patch expects: one behind it is retryable,
-/// one ahead of it is a conflict the plugin resolves by reading again.
-/// A read error as the guest sees it; an unreachable or not yet visible document is retryable.
-fn api_error(error: MetadataApiError) -> HostError {
-    match error {
-        MetadataApiError::NotFound => HostError::new(ErrorKind::NotFound, "no such document"),
-        MetadataApiError::TooLarge => {
-            HostError::new(ErrorKind::Limit, "one entity is larger than a reply may be")
-        }
-        MetadataApiError::Unauthorized | MetadataApiError::Forbidden => {
-            HostError::new(ErrorKind::Denied, "the account may not read this")
-        }
-        MetadataApiError::BadRequest
-        | MetadataApiError::InvalidCursor(_)
-        | MetadataApiError::InvalidQuery(_) => {
-            HostError::new(ErrorKind::Invalid, error.to_string())
-        }
-        other => unavailable(other.to_string()),
     }
 }
 
@@ -1242,32 +836,30 @@ impl RunBroker {
     /// The per call check, the address below the connection, the guest's own headers, and the
     /// secret released and added; every use of a secret, a replay included, passes the check.
     async fn ready(&self, request: SendRequest) -> Result<Ready, HostError> {
-        let current = self.admitted(None).await?;
-        let path = install_scope(&current).connection(&request.connection);
-        let (install, _) = self.checked(Permission::ConnectionsSend, &path).await?;
-        let config = read_config(&self.ctx, self.scope.realm_id).await;
-        let config = config.map_err(|error| unavailable(error.to_string()))?;
-        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
-        let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
-        let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
-        // The guest built its request from the settings saved at admission; the address follows
-        // them, while the grant and release checks use the current install.
         let pairs = |fields: &[Field]| -> Vec<(String, String)> {
             let pairs = fields
                 .iter()
                 .map(|field| (field.name.clone(), field.value.clone()));
             pairs.collect()
         };
-        let (query, headers) = (pairs(&request.query), pairs(&request.headers));
-        let called = (request.connection.as_str(), declared_method(request.method));
-        let parts = (request.path.as_str(), &query[..], &headers[..]);
-        let context = request_context(&manifest, called, &self.scope.run.settings, parts)?;
-        let (mut outgoing, slot) = outgoing(&manifest, &context)?;
+        let ask = ConnectionAsk {
+            connection: request.connection.clone(),
+            method: declared_method(request.method),
+            path: request.path.clone(),
+            query: pairs(&request.query),
+            headers: pairs(&request.headers),
+        };
+        let prepare = PrepareConnection::new(&self.scope, ask);
+        let ConnectionPlan {
+            call,
+            context,
+            mut outgoing,
+            slot,
+        } = drive(prepare, &self.ctx).await?;
         let (exposure, fields) = match &slot {
             None => (ResponseExposure::Full, None),
             Some(slot) => {
-                let (released, fields) =
-                    self.inject(&install, slot, &config, &mut outgoing).await?;
+                let (released, fields) = (self.inject(&call, slot, &mut outgoing)).await?;
                 (released.exposure, Some(fields))
             }
         };
@@ -1284,29 +876,20 @@ impl RunBroker {
 
     /// Whether a kept reply of `context` may be shown now: the connection is still granted and
     /// declared, and its secret's rule still releases for the request and shows it whole.
-    async fn reply_shown(&self, install: &PluginInstall, context: &RequestContext) -> bool {
-        let path = install_scope(install).connection(&context.connection);
-        if self
-            .checked(Permission::ConnectionsSend, &path)
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        let Ok(config) = read_config(&self.ctx, self.scope.realm_id).await else {
+    async fn reply_shown(&self, context: &RequestContext) -> bool {
+        let check = CheckReply::new(&self.scope, context);
+        let Ok(Some(plan)) = drive(check, &self.ctx).await else {
             return false;
         };
-        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
-        let Ok(manifest) = plugin.and_then(|plugin| read_manifest(&plugin)) else {
-            return false;
-        };
-        let Ok((mut request, slot)) = outgoing(&manifest, context) else {
-            return false;
-        };
+        let ReplyPlan {
+            call,
+            mut outgoing,
+            slot,
+        } = plan;
         match slot {
             None => true,
             Some(slot) => {
-                let released = self.inject(install, &slot, &config, &mut request).await;
+                let released = self.inject(&call, &slot, &mut outgoing).await;
                 released.is_ok_and(|(released, _)| released.exposure == ResponseExposure::Full)
             }
         }
@@ -1315,14 +898,13 @@ impl RunBroker {
     /// Releases the slot's secret for this request and adds it as its kind says.
     async fn inject(
         &self,
-        install: &PluginInstall,
+        call: &ConfiguredCall,
         slot: &str,
-        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
         outgoing: &mut OutgoingRequest,
     ) -> Result<(Released, SecretFields), HostError> {
         let target = Some((outgoing.method.clone(), outgoing.url.to_string()));
         let use_of = (Delivery::Inject, target);
-        let (released, fields) = self.obtain(install, slot, use_of, config).await?;
+        let (released, fields) = (self.obtain(&call.install, slot, use_of, &call.config)).await?;
         let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
         injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
         Ok((released, fields))
@@ -1334,7 +916,7 @@ impl RunBroker {
         install: &PluginInstall,
         slot: &str,
         (delivery, target): (Delivery, Option<(String, String)>),
-        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+        config: &Arc<RealmConfigDocument>,
     ) -> Result<(Released, SecretFields), HostError> {
         let mut request = ReleaseRequest {
             install_id: install.install_id,
@@ -1346,7 +928,7 @@ impl RunBroker {
         };
         let mut held = self.held.lock().await;
         held.prepare(&mut request);
-        let ask = AskRelease::new(Arc::new(config.clone()), self.scope.local, request);
+        let ask = AskRelease::new(config.clone(), self.scope.local, request);
         let released = drive(ask, &self.ctx).await.map_err(|failure| failure.0);
         released
             .and_then(|released| held.absorb(slot, released))
