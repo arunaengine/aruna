@@ -33,6 +33,7 @@ pub mod report;
 pub mod reservation;
 pub mod routing;
 pub mod stage;
+mod submission_rules;
 pub mod target;
 pub mod updates;
 pub mod witness;
