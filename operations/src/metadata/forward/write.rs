@@ -48,8 +48,6 @@ use crate::forward::transport::unexpected_response;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::realm::load_config::config_unavailable;
 
-pub use super::authorized_create::CreateAuthorizedError;
-
 /// An offline edit's verdict, as the metadata routes report it.
 pub(super) fn device_edit_error(error: DeviceEditError) -> MetadataWriteError {
     match error {

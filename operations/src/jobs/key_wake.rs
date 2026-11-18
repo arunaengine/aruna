@@ -15,7 +15,7 @@ use crate::blob::migration::shared::MigrationError;
 use crate::blob::promote::PromoteError;
 use crate::blob::unlocked::PromoteUnlockedOperation;
 use crate::jobs::remote_key::RemoteWakesOperation;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls;
 use crate::replication::parking::WakeParkedOperation;
 use crate::replication::queue::BlobQueueError;
@@ -179,7 +179,6 @@ impl Operation for WakeUnlockedOperation {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

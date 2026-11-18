@@ -57,12 +57,12 @@ use super::key_locks::ParkLockedOperation;
 use super::lifecycle::LifecycleError;
 use super::lifecycle::held::HeldReservations;
 use super::lifecycle::updates::PublishProgressOperation;
-use super::store::JobMutationError;
 use super::store::attempt_intent::AttemptCommit;
 use super::store::job_calls::{
     begin_external_running, cancel_running_job, record_attempt_intent, transition_to_preparing,
     transition_to_ready,
 };
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::read_job_record;
 use crate::placement::policy::{LocalSubjectOperation, SubjectScanError};
 

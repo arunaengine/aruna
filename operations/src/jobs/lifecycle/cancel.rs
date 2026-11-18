@@ -34,8 +34,8 @@ use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::records::verify::FamilyView as HolderView;
 use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
-use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::submit::schedule_drain_effect;
 
 fn unavailable(reason: impl std::fmt::Display) -> JobRouteError {

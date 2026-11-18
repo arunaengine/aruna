@@ -20,8 +20,8 @@ use super::compute::{RecoveryAction, compute_answer, recovery_action};
 use super::finalize::{FinalizeGoal, FinalizeOperation};
 use super::prepare::{PrepareAttemptOperation, PreparedTask, build_task_spec};
 use super::settle::{ParkAttemptOperation, SubmitFailureOperation};
-use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::{begin_external_running, record_attempt_tombstone};
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 
 /// The job error of a submit that failed for good or for now.

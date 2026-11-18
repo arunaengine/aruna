@@ -13,8 +13,8 @@ use aruna_core::structs::storage::blob::UserAccess;
 use ulid::Ulid;
 
 use super::super::executor::JobRunOutcome;
-use super::super::store::JobMutationError;
 use super::super::store::job_calls::{authorize_cleanup, record_attempt_tombstone};
+use super::super::store::mutation_error::JobMutationError;
 use super::compute::{attempt_call, compute_answer};
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 

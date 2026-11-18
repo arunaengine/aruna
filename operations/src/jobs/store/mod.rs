@@ -86,7 +86,7 @@ pub mod store_call;
 use crate::driver::drive;
 use mutation::{MutateJobOperation, NoGuard};
 
-pub use mutation_error::JobMutationError;
+use mutation_error::JobMutationError;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactTombstone {

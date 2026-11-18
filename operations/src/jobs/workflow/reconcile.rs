@@ -29,11 +29,11 @@ use super::settle::{
     EndRunOperation, ParkAttemptOperation, RunEnding, SubmitFailureOperation, execution_result,
 };
 use super::supervise::SuperviseOperation;
-use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::{
     AdoptOutcome, ReleaseOutcome, adopt_external_attempt, begin_external_running,
     handoff_external_attempt, record_attempt_started, record_attempt_tombstone, release_job,
 };
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 
 /// What taking over a lost attempt left to do.

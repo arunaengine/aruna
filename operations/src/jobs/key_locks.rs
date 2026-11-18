@@ -30,7 +30,7 @@ use ulid::Ulid;
 
 use super::records::pages::ServingNode;
 use super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use super::store::park_wake::AwaitOutcome;
 use super::store::row_calls::{park_job, satisfy_key_wait};
 

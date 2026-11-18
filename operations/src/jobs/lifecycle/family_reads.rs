@@ -31,7 +31,7 @@ use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 
 /// A projection that lost its transaction every time is busy, not failed: the

@@ -6,7 +6,7 @@ use super::super::reports::report_read;
 use super::super::tests::{bucket, plan, run, stops};
 use super::*;
 use crate::jobs::repository::test_support::child;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 
 fn writing(step: Step) -> WriteEntryOperation {
     let mut write = WriteEntryOperation::new(run(), ImportCheckpoint::default(), &plan(&["a"]));

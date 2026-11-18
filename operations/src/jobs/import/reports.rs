@@ -19,7 +19,7 @@ use super::{
     system_report_key,
 };
 use crate::jobs::run_rows::SettledEntryOperation;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls;
 
 /// Report rows one read returns.

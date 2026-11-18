@@ -33,7 +33,7 @@ use crate::blob::migration::shared::MigrationError;
 use crate::blob::release::{DropClaimsOperation, ReleaseFile, ReleaseRenamedOperation};
 use crate::blob::trail::{DropTrailOperation, TrailError};
 use crate::groups::backends::backend_key;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use aruna_core::structs::storage::routing::NodeRouting;

@@ -42,7 +42,7 @@ use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::pages::{PageReadError, SpecInputsOperation, StoreEntriesOperation};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::{RowBatch, RowRead};
 use crate::realm::load_config::config_unavailable;
 use aruna_core::structs::execution::job::PageManifest;

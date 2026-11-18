@@ -7,7 +7,7 @@ use crate::jobs::repository::push::creator_auth;
 use crate::jobs::repository::test_support::{
     artifact, body, child, credential_key, job_scope, link, remote, scope, session,
 };
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use aruna_core::repository::remote::{RemoteFailure, StopReason};
 use aruna_core::repository::{LinkTarget, RepositoryCredential};
 use aruna_core::structs::checksum::Hasher;

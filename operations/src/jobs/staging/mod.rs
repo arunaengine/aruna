@@ -33,7 +33,7 @@ use ulid::Ulid;
 
 pub use self::job::StagingJobOperation;
 use super::run_rows::SettledRowsOperation;
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// Queue rows one cleanup pass deletes.
@@ -128,7 +128,6 @@ enum ReadStep {
     Main,
     Lanes(Box<StagingJobCheckpoint>),
 }
-
 
 /// The job's progress with its open prefix lanes counted in; a lane's prefix reads as not
 /// started yet, as a job handed over goes on from there.

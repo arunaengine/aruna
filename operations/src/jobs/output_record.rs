@@ -22,8 +22,8 @@ use super::records::append::{
     AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
 use super::records::pages::ServingNode;
-use super::store::JobMutationError;
 use super::store::job_calls::persist_output_record;
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::read_output_record;
 
 #[derive(Debug, PartialEq)]
@@ -344,11 +344,11 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::jobs::store::test_calls::{read_attempt_control, reserve_output_commits};
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::read_output_record as read_stored;
+    use crate::jobs::store::test_calls::{read_attempt_control, reserve_output_commits};
     use aruna_core::structs::execution::job::JobId;
 
     const TOKEN: Ulid = Ulid(0x5EA1);

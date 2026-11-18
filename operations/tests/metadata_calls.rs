@@ -18,11 +18,11 @@ use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
+use aruna_operations::metadata::forward::authorized_create::CreateAuthorizedError;
 use aruna_operations::metadata::forward::authorized_create::CreateWithIdOperation;
 use aruna_operations::metadata::forward::pinned::PinnedCreate;
 use aruna_operations::metadata::forward::routed_read::RoutedReadOperation;
 use aruna_operations::metadata::forward::routed_write::RouteDeleteOperation;
-use aruna_operations::metadata::forward::write::CreateAuthorizedError;
 use aruna_operations::metadata::id_mapping::PersistentIdError;
 use aruna_operations::metadata::persistent_id::MappingReadOperation;
 use aruna_operations::metadata::persistent_id::forward::{
@@ -189,7 +189,9 @@ pub async fn route_metadata_update(
     token: Option<AuthToken>,
     commit_message: Option<String>,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
-    use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+    use aruna_operations::metadata::forward::routed_update::{
+        DocumentUpdate, RouteUpdateOperation,
+    };
     let update = DocumentUpdate {
         public,
         mutation,

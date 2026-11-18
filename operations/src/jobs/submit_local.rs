@@ -21,7 +21,7 @@ use ulid::Ulid;
 use super::JOB_RETENTION_MS;
 use super::records::pages::ServingNode;
 use super::staging::{SeedCheckpointOperation, StagingStoreError};
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{find_dedup_plan, read_job_record};
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
