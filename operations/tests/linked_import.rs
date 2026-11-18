@@ -46,8 +46,8 @@ use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::store::state::ClaimOutcome;
+use aruna_operations::jobs::executor::{JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
@@ -56,6 +56,7 @@ use aruna_operations::s3::imports::discovery::{
 };
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::storage_read::iter_prefix_page;
+use aruna_operations::tasks::job_context::JobContext;
 use aruna_operations::tasks::job_host::run_backend_import;
 use aruna_operations::tasks::job_host::run_storage_purge;
 use aruna_storage::storage;

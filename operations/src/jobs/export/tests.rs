@@ -19,13 +19,13 @@ use crate::auth::permission_rules::PermissionRulesOperation;
 use crate::blob::permission_paths::MAX_HASH_ALIASES;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::jobs::executor::JobContext;
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::key_locks::AskWaitsOperation;
 use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
 use crate::replication::plaintext::HolderCheckOperation;
+use crate::tasks::job_context::JobContext;
 use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;
 use aruna_core::archive_path::safe_zip_path;

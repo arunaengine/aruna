@@ -301,11 +301,12 @@ mod tests {
 
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::executor::{JobContext, ProgressReporter};
+    use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
+    use crate::tasks::job_context::JobContext;
 
     async fn run_terminal_cleanup(
         ctx: &JobContext,

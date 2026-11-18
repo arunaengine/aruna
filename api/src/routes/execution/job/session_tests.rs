@@ -4,6 +4,9 @@
 
 use super::*;
 use crate::auth::UnrestrictedAuth;
+use crate::job_test_calls::insert_job;
+use crate::job_test_calls::put_job_entry;
+use crate::job_test_calls::{cancel_running_job, claim_job, read_job_record};
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::{ExecutorBackend, SessionChannel};
 use aruna_compute::session::{Session, SessionConfig};
@@ -39,10 +42,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use crate::job_test_calls::put_job_entry;
-use crate::job_test_calls::insert_job;
-use aruna_operations::jobs::store::state::ClaimOutcome;
-use crate::job_test_calls::{cancel_running_job, claim_job, read_job_record};
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;
 use byteview::ByteView;

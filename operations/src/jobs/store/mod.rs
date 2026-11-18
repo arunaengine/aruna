@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
 use aruna_core::UserId;
 use aruna_core::compute::{AttemptRef, FenceContext};
 use aruna_core::errors::ConversionError;
@@ -29,7 +28,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -41,24 +40,19 @@ use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_PRUNE_PAGE, MUTATE_MAX_ATTEMPTS};
 use crate::tasks::queue_backoff::retry_delay_ms;
 
-pub mod attempt;
 pub mod attempt_intent;
 pub mod control_mutation;
 pub mod job_calls;
 pub mod job_rows;
-pub mod key_wait;
 pub mod list_jobs;
 pub mod mark_start;
 pub mod mutation;
 pub mod park_wake;
-pub mod query;
 pub mod remote_wait;
 pub mod row_calls;
 pub mod run_delete;
-pub mod state;
 pub mod store_call;
 
-use crate::driver::drive;
 use mutation::{MutateJobOperation, NoGuard};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,51 +114,6 @@ fn guard_token(record: &JobRecord, token: Ulid) -> Result<(), JobMutationError> 
     }
 }
 
-/// Read, mutate, and persist a job with its index deltas in one transaction, with
-/// bounded OCC retry so a commit conflict re-reads and re-applies rather than losing.
-pub async fn mutate_job<F>(
-    context: &DriverContext,
-    job_id: JobId,
-    mutate: F,
-) -> Result<JobRecord, JobMutationError>
-where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
-{
-    let mut mutate = mutate;
-    let mut attempt = 0;
-    loop {
-        let result = drive(
-            MutateJobOperation::new(job_id, &mut mutate, None::<NoGuard>),
-            context,
-        )
-        .await;
-        match settle_attempt(result, attempt, "job mutation exhausted conflict retries").await {
-            Some(result) => return result,
-            None => attempt += 1,
-        }
-    }
-}
-
-/// What one attempt of a job write leaves: `None` after a lost conflict that is retried, once
-/// a short growing pause passed; otherwise the result, or the `exhausted` error after the last
-/// of [`MUTATE_MAX_ATTEMPTS`] attempts.
-pub(crate) async fn settle_attempt<T>(
-    result: Result<T, JobMutationError>,
-    attempt: u32,
-    exhausted: &str,
-) -> Option<Result<T, JobMutationError>> {
-    match result {
-        Err(JobMutationError::Conflict) if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
-            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
-            None
-        }
-        Err(JobMutationError::Conflict) => {
-            Some(Err(JobMutationError::Storage(exhausted.to_string())))
-        }
-        other => Some(other),
-    }
-}
-
 /// What deleting a run from this node's lists found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunDelete {
@@ -179,75 +128,14 @@ pub enum RunDelete {
     Unrecorded(String),
 }
 
-/// Read and decode a state row, keeping a missing row distinct from a malformed one.
-pub(super) async fn read_state<T: DeserializeOwned + Send + std::fmt::Debug + 'static>(
-    context: &DriverContext,
-    key_space: &str,
-    key: Key,
-    _label: &str,
-) -> Result<Option<T>, String> {
-    drive(row_calls::read_state(key_space, key), context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// Postcard-encode `row` and persist it through the token-guarded checkpoint write.
-pub(super) async fn put_state<T: Serialize>(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    key_space: &str,
-    key: Key,
-    row: &T,
-) -> Result<(), JobMutationError> {
-    drive(
-        job_calls::put_state(job_id, token, key_space, key, row),
-        context,
-    )
-    .await
-}
-
-pub async fn put_purge_checkpoint(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    checkpoint: &StoragePurgeCheckpoint,
-) -> Result<(), JobMutationError> {
-    drive(
-        job_calls::put_purge_checkpoint(job_id, token, checkpoint),
-        context,
-    )
-    .await
-}
-
-pub async fn read_purge_checkpoint(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<StoragePurgeCheckpoint>, JobMutationError> {
-    drive(row_calls::read_purge_checkpoint(job_id), context).await
-}
-
-pub async fn put_job_entry<T: Serialize>(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    entry_key: &[u8],
-    row: &T,
-) -> Result<(), JobMutationError> {
-    drive(
-        job_calls::put_job_entry(job_id, token, entry_key, row),
-        context,
-    )
-    .await
-}
-
 fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
+mod key_wait_tests;
+#[cfg(test)]
 pub(crate) mod test_calls;
 #[cfg(test)]
 mod tests;

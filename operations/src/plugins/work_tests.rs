@@ -11,7 +11,6 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::executor::PayloadHandler;
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::{page_result, values_result};
@@ -20,6 +19,7 @@ use crate::plugins::store::Txn;
 #[allow(unused_imports)]
 pub(crate) use crate::plugins::test_support::edit_work;
 use crate::plugins::test_support::installed;
+use crate::tasks::job_context::PayloadHandler;
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
@@ -60,7 +60,7 @@ struct WorkHolds;
 impl PayloadHandler for WorkHolds {
     fn run<'a>(
         &'a self,
-        _: &'a crate::jobs::executor::JobContext,
+        _: &'a crate::tasks::job_context::JobContext,
         _: &'a JobPayload,
     ) -> Option<futures_util::future::BoxFuture<'a, crate::jobs::executor::JobRunOutcome>> {
         None
