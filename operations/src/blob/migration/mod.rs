@@ -10,6 +10,7 @@ pub mod drain;
 pub mod misplaced;
 pub mod queue;
 pub mod rewrite;
+pub mod shared;
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
