@@ -42,7 +42,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
@@ -321,7 +321,6 @@ enum IncomingBaoState {
     ReadExactBucket,
     ResolveSource,
     ReadPolicy,
-    CheckPermission,
     ReadHashVersion,
     ReadLocation,
     CheckManagedCopy,
@@ -538,17 +537,31 @@ impl IncomingBaoOperation {
         let Some(txn_id) = self.txn_id else {
             return self.continue_policy(self.policy_paths.contains(&path));
         };
+        let mut reads = vec![
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                self.request.realm_id.as_bytes().to_vec().into(),
+            ),
+            (AUTH_KEYSPACE.to_string(), group_id.to_bytes().into()),
+        ];
+        // The caller's roles are read in this transaction, after the two policy rows.
+        match self.read_check(path).reads() {
+            Ok(roles) => reads.extend(roles),
+            Err(_) => return self.continue_policy(false),
+        }
         self.state = IncomingBaoState::ReadPolicy;
         smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    REALM_CONFIG_KEYSPACE.to_string(),
-                    self.request.realm_id.as_bytes().to_vec().into(),
-                ),
-                (AUTH_KEYSPACE.to_string(), group_id.to_bytes().into()),
-            ],
+            reads,
             txn_id: Some(txn_id),
         })]
+    }
+
+    fn read_check(&self, path: String) -> CheckPermissionsConfig {
+        CheckPermissionsConfig {
+            auth_context: self.request.auth_context.clone(),
+            path,
+            required_permission: Permission::READ,
+        }
     }
 
     fn continue_policy(&mut self, allowed: bool) -> Effects {
@@ -632,28 +645,9 @@ impl IncomingBaoOperation {
         };
         self.policy_current = matches!(realm_set.evaluate(&request), PolicyDecision::Allowed)
             && matches!(group_set.evaluate(&request), PolicyDecision::Allowed);
-        let Some(txn_id) = self.txn_id else {
-            return self.continue_policy(self.policy_current);
-        };
-        self.state = IncomingBaoState::CheckPermission;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new_with_txn(
-                CheckPermissionsConfig {
-                    auth_context: self.request.auth_context.clone(),
-                    path: path.to_string(),
-                    required_permission: Permission::READ,
-                },
-                txn_id,
-            ),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
-    }
-
-    fn handle_permission(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected(event);
-        };
-        self.continue_policy(allowed.is_ok_and(|allowed| allowed && self.policy_current))
+        let roles = values.iter().skip(2).map(|(_, value)| value.clone());
+        let allowed = self.read_check(path.to_string()).allowed(roles.collect());
+        self.continue_policy(self.policy_current && matches!(allowed, Ok(true)))
     }
 
     fn next_candidate(&mut self) -> Effects {
@@ -871,7 +865,6 @@ impl IncomingBaoOperation {
             IncomingBaoState::ReadExactBucket => "read_exact_bucket",
             IncomingBaoState::ResolveSource => "resolve_source",
             IncomingBaoState::ReadPolicy => "read_policy",
-            IncomingBaoState::CheckPermission => "check_permission",
             IncomingBaoState::ReadHashVersion => "read_hash_version",
             IncomingBaoState::ReadLocation => "read_location",
             IncomingBaoState::CheckManagedCopy => "check_managed_copy",
@@ -1519,7 +1512,6 @@ impl EffectOperation for IncomingBaoOperation {
                 other => self.unexpected(other),
             },
             IncomingBaoState::ReadPolicy => self.handle_policy(event),
-            IncomingBaoState::CheckPermission => self.handle_permission(event),
             IncomingBaoState::ReadHashVersion => self.handle_hash_version(event),
             IncomingBaoState::ReadLocation => self.handle_location(event),
             IncomingBaoState::CheckManagedCopy => self.handle_managed_copy(event),
@@ -2170,6 +2162,72 @@ mod pure_tests {
         operation.request.destination = Some(storage_subject(&entry, 4));
         let effects = operation.challenge_destination(location);
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    #[test]
+    fn folds_read_check() {
+        // The caller's roles are read with the policy rows, and they decide the read.
+        use aruna_core::structs::identity::auth::{Actor, Permission, Role};
+        use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+        use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+        use aruna_core::structs::storage::blob::object_permission_path;
+
+        let (realm, local, peer) = (test_realm(), node_from_seed(1), node_from_seed(2));
+        let (group_id, nil) = (Ulid::from(8u128), UserId::nil(realm));
+        let path = object_permission_path(realm, group_id, local, "bucket", "path/file.txt");
+        let actor = Actor {
+            node_id: local,
+            user_id: nil,
+            realm_id: realm,
+        };
+        let group = GroupAuthorizationDocument::default_group_doc(nil, realm, group_id);
+        let mut roles = GroupAuthorizationDocument::default_group_doc(nil, realm, group_id);
+        // The test caller is the nil user, which holds only public roles.
+        let role_id = Ulid::from(9u128);
+        let role = Role {
+            role_id,
+            name: "public".to_string(),
+            permissions: HashMap::from([(format!("/{realm}/g/{group_id}/**"), Permission::READ)]),
+            assigned_users: HashSet::from([nil]),
+        };
+        roles.roles.insert(role_id, role);
+        let config = RealmConfigDocument::default_for_realm(realm, Vec::new());
+        let realm_roles = RealmAuthorizationDocument::default_realm_doc(realm);
+        let decide = |group_roles: Option<Vec<u8>>| {
+            let request = read_request(local, [4u8; 32]);
+            let mut operation =
+                IncomingBaoOperation::new(peer, local, realm, Ulid::from(9u128), request);
+            let txn_id = Ulid::from(10u128);
+            operation.txn_id = Some(txn_id);
+            let next = super::PolicyNext::Exact;
+            let effects = operation.start_policy(group_id, path.clone(), next);
+            let [
+                Effect::Storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: read,
+                }),
+            ] = effects.as_slice()
+            else {
+                panic!("expected the policy read, got {effects:?}")
+            };
+            assert_eq!((reads.len(), *read), (4, Some(txn_id)));
+            let rows = [
+                Some(postcard::to_allocvec(&config).unwrap()),
+                Some(group.to_bytes(&actor).unwrap()),
+                Some(realm_roles.to_bytes(&actor).unwrap()),
+                group_roles,
+            ];
+            let values = reads
+                .iter()
+                .zip(rows)
+                .map(|((_, key), row)| (key.clone(), row.map(Into::into)))
+                .collect();
+            operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+            operation.policy_allowed
+        };
+        assert!(decide(Some(roles.to_bytes(&actor).unwrap())));
+        assert!(!decide(Some(group.to_bytes(&actor).unwrap())));
+        assert!(!decide(None));
     }
 
     fn device_realm_value(peer: aruna_core::NodeId, owner: UserId) -> byteview::ByteView {
