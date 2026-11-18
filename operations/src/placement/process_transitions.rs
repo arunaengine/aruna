@@ -36,6 +36,7 @@ use crate::realm::mutate_placement::{
     CONFLICT_ATTEMPTS, MutatePlacementConfig, MutatePlacementError, MutatePlacementOperation,
     RealmPlacementMutation, is_management,
 };
+use crate::shard::pull::PullTopicsOperation;
 use crate::shard::verify::ConvergeOperation;
 use crate::shard::{AssembleManifestOperation, ManifestError, shard_answer, shard_call};
 use crate::sync::document_outbox::OutboxTimerOperation;
@@ -751,16 +752,14 @@ impl Operation for CompletionStepOperation {
                 ShardNetEvent::Existing(topics) if !topics.contains(&self.topic()) => {
                     // Join-only: this adopts an existing genesis and can never mint one.
                     self.stage = CompletionStage::Pull;
-                    Ok(Next::Call(shard_call(ShardNetEffect::Pull {
-                        topics: vec![self.topic()],
-                        peers: self.sources.clone(),
-                    })))
+                    let pull = PullTopicsOperation::new(vec![self.topic()], self.sources.clone());
+                    Ok(Next::Call(IoCall::child(pull)))
                 }
                 ShardNetEvent::Existing(_) => self.verify(),
                 _ => Ok(Next::Done(StepPlan::Pending)),
             },
             CompletionStage::Pull => {
-                shard_answer(result)?;
+                drop(result.child::<bool, IoError>()?);
                 self.verify()
             }
             CompletionStage::Converge => {

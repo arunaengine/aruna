@@ -25,6 +25,7 @@ use super::{
     shard_call,
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::shard::pull::PullTopicsOperation;
 use crate::sync::shard_placement::{placement_key, placement_prefix};
 
 /// Page size for scanning persisted shard verification markers.
@@ -488,13 +489,11 @@ impl Operation for ConvergeOperation {
                 }
                 // Topic or entry digests differ: pull the co-holder's events and re-compare.
                 self.stage = ConvergeStage::Pull;
-                Ok(Next::Call(shard_call(ShardNetEffect::Pull {
-                    topics: vec![self.topic()],
-                    peers: vec![holder],
-                })))
+                let pull = PullTopicsOperation::new(vec![self.topic()], vec![holder]);
+                Ok(Next::Call(IoCall::child(pull)))
             }
             ConvergeStage::Pull => {
-                shard_answer(result)?;
+                drop(result.child::<bool, IoError>()?);
                 self.stage = ConvergeStage::Refetch;
                 Ok(Next::Call(self.fetch(holder)))
             }

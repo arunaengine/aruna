@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::placement::process_transitions::ProcessTransitionsOperation;
 use crate::realm::ensure_config::overlay_reducer_state;
+use crate::shard::pull::PullTopicsOperation;
 use crate::shard::verify::{VerifiedTopicsOperation, forget_verification};
 use crate::shard::{shard_answer, shard_call};
 use crate::sync::shard_placement::{
@@ -201,10 +202,8 @@ impl ResolveTopicsOperation {
         }
         self.adopted = adopt.clone();
         self.stage = ResolveStage::Pull;
-        Ok(Next::Call(shard_call(ShardNetEffect::Pull {
-            topics: adopt,
-            peers: self.co_members.clone(),
-        })))
+        let pull = PullTopicsOperation::new(adopt, self.co_members.clone());
+        Ok(Next::Call(IoCall::child(pull)))
     }
 }
 
@@ -233,7 +232,7 @@ impl Operation for ResolveTopicsOperation {
                 }
             },
             ResolveStage::Pull => {
-                shard_answer(result)?;
+                drop(result.child::<bool, IoError>()?);
                 self.stage = ResolveStage::Adopted;
                 Ok(Next::Call(existing_call(self.adopted.clone())))
             }
@@ -466,13 +465,11 @@ impl Operation for MemberGroupOperation {
                 );
                 self.topics = missing.clone();
                 self.stage = MemberStage::Pull(known);
-                Ok(Next::Call(shard_call(ShardNetEffect::Pull {
-                    topics: missing,
-                    peers: self.co_members.clone(),
-                })))
+                let pull = PullTopicsOperation::new(missing, self.co_members.clone());
+                Ok(Next::Call(IoCall::child(pull)))
             }
             MemberStage::Pull(known) => {
-                shard_answer(result)?;
+                drop(result.child::<bool, IoError>()?);
                 self.stage = MemberStage::Pulled(known);
                 Ok(Next::Call(existing_call(self.topics.clone())))
             }
