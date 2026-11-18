@@ -10,19 +10,18 @@ use aruna_core::structs::storage::replication_queue::MemberTarget;
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, DistributionView, KeyRange, Publication,
 };
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -111,18 +110,18 @@ pub enum RecordError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event while reading the set record: {0}")]
-    UnexpectedEvent(String),
-    #[error("the set record read did not finish")]
-    NotFinished,
 }
 
-fn record_read(set_id: Ulid) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: DISTRIBUTION_KEYSPACE.to_string(),
-        key: set_id.to_bytes().to_vec().into(),
-        txn_id: None,
-    })
+impl From<IoError> for RecordError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type Turn<T> = Result<Next<T>, RecordError>;
+
+fn record_read(set_id: Ulid) -> IoCall {
+    read_row(DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec())
 }
 
 fn decode_record(value: Option<Value>) -> Result<Option<DistributionView>, RecordError> {
@@ -135,148 +134,75 @@ fn decode_record(value: Option<Value>) -> Result<Option<DistributionView>, Recor
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReadRecordOperation {
     set_id: Ulid,
-    output: Option<Result<Option<DistributionView>, RecordError>>,
 }
 
 impl ReadRecordOperation {
     pub(crate) fn new(set_id: Ulid) -> Self {
-        Self {
-            set_id,
-            output: None,
-        }
+        Self { set_id }
     }
 }
 
-impl EffectOperation for ReadRecordOperation {
+impl Operation for ReadRecordOperation {
     type Output = Option<DistributionView>;
     type Error = RecordError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![record_read(self.set_id)]
+    fn first(&mut self) -> Turn<Self::Output> {
+        Ok(Next::Call(record_read(self.set_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(match (&self.output, event) {
-            (None, Event::Storage(StorageEvent::ReadResult { value, .. })) => decode_record(value),
-            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(RecordError::UnexpectedEvent(event.label().to_string())),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, RecordError> {
-        self.output.unwrap_or(Err(RecordError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Turn<Self::Output> {
+        Ok(Next::Done(decode_record(result.value()?)?))
     }
 }
 
 /// A local bucket's binding and this node's record of its set.
 pub(crate) type BoundRecord = (DistributionBinding, DistributionSnapshot);
 
-#[derive(Debug, PartialEq)]
-enum BoundState {
-    Init,
-    ReadBucket,
-    ReadRecord(Box<DistributionBinding>),
-    Finish,
-    Error,
-}
-
 /// The binding of a local bucket and this node's record of its set; `None` for an ordinary
 /// bucket, a missing bucket or a record that has not arrived.
 #[derive(Debug, PartialEq)]
 pub(crate) struct BoundRecordOperation {
     bucket: String,
-    state: BoundState,
-    output: Option<Result<Option<BoundRecord>, RecordError>>,
+    binding: Option<DistributionBinding>,
 }
 
 impl BoundRecordOperation {
     pub(crate) fn new(bucket: &str) -> Self {
         Self {
             bucket: bucket.to_string(),
-            state: BoundState::Init,
-            output: None,
+            binding: None,
         }
     }
 
-    fn done(&mut self, result: Result<Option<BoundRecord>, RecordError>) -> Effects {
-        self.state = match result {
-            Ok(_) => BoundState::Finish,
-            Err(_) => BoundState::Error,
-        };
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn bucket_read(&mut self, value: Option<Value>) -> Effects {
-        let info = match value
+    fn bucket_read(&mut self, value: Option<Value>) -> Turn<Option<BoundRecord>> {
+        let info = value
             .map(|value| BucketInfo::from_bytes(&value))
-            .transpose()
-        {
-            Ok(info) => info,
-            Err(error) => return self.done(Err(error.into())),
-        };
+            .transpose()?;
         let Some(binding) = info.and_then(|info| info.distribution) else {
-            return self.done(Ok(None));
+            return Ok(Next::Done(None));
         };
         let read = record_read(binding.set_id);
-        self.state = BoundState::ReadRecord(Box::new(binding));
-        smallvec![read]
+        self.binding = Some(binding);
+        Ok(Next::Call(read))
     }
 }
 
-impl EffectOperation for BoundRecordOperation {
+impl Operation for BoundRecordOperation {
     type Output = Option<BoundRecord>;
     type Error = RecordError;
 
-    fn start(&mut self) -> Effects {
-        self.state = BoundState::ReadBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Turn<Self::Output> {
+        let key = self.bucket.as_bytes().to_vec();
+        Ok(Next::Call(read_row(S3_BUCKET_KEYSPACE, key)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::replace(&mut self.state, BoundState::Error), event) {
-            (
-                BoundState::ReadBucket | BoundState::ReadRecord(_),
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.done(Err(error.into())),
-            (BoundState::ReadBucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.bucket_read(value)
-            }
-            (
-                BoundState::ReadRecord(binding),
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
-                let record = decode_record(value)
-                    .map(|view| view.map(|view| (*binding, view.head.snapshot)));
-                self.done(record)
-            }
-            (_, event) => self.done(Err(RecordError::UnexpectedEvent(event.label().to_string()))),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, BoundState::Finish | BoundState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, RecordError> {
-        self.output.unwrap_or(Err(RecordError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Turn<Self::Output> {
+        let value = result.value()?;
+        let Some(binding) = self.binding.take() else {
+            return self.bucket_read(value);
+        };
+        let view = decode_record(value)?;
+        Ok(Next::Done(view.map(|view| (binding, view.head.snapshot))))
     }
 }
 
@@ -293,7 +219,7 @@ struct QueueWalk {
 
 /// What a queue walk does after one page.
 enum WalkStep {
-    Read(Effect),
+    Read(IoCall),
     /// The current queue still has rows behind its last page, but its page budget is spent.
     Cut,
     /// Every queue was read to its end.
@@ -316,15 +242,14 @@ impl QueueWalk {
         self.queues[self.index.min(1)].0
     }
 
-    fn read(&self) -> Effect {
+    fn read(&self) -> IoCall {
         let (key_space, prefix) = &self.queues[self.index.min(1)];
-        Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: Some(prefix.clone().into()),
-            start: self.start.clone().map(IterStart::After),
+        IoCall::Page {
+            space: key_space.to_string(),
+            prefix: prefix.clone().into(),
+            after: self.start.clone(),
             limit: FANOUT_PAGE,
-            txn_id: None,
-        })
+        }
     }
 
     /// Moves on after a page whose last row is `last`; `more` when rows remain behind it.
@@ -352,41 +277,24 @@ impl QueueWalk {
     }
 }
 
-/// The rows of one queue page and whether more follow; any other event, or one after the
-/// answer, is refused.
-fn queue_page(answered: bool, event: Event) -> Result<(Vec<(Key, Value)>, bool), RecordError> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) if !answered => Ok((values, next_start_after.is_some())),
-        Event::Storage(StorageEvent::Error { error }) if !answered => Err(error.into()),
-        event => Err(RecordError::UnexpectedEvent(event.label().to_string())),
-    }
-}
-
 /// Whether this node still owes a publication of a key in `range` of the set: a queued member
 /// job or a live obligation that has not become jobs yet. A queue longer than one check reads
 /// counts as owing, so the caller looks again later.
 #[derive(Debug, PartialEq)]
 pub(crate) struct OwesFanoutOperation {
+    bucket: String,
     set_id: Ulid,
     range: KeyRange,
     walk: Option<QueueWalk>,
-    output: Option<Result<bool, RecordError>>,
 }
 
 impl OwesFanoutOperation {
     pub(crate) fn new(bucket: &str, set_id: Ulid, range: KeyRange) -> Self {
-        let (walk, output) = match QueueWalk::new(bucket, FANOUT_PAGES) {
-            Ok(walk) => (Some(walk), None),
-            Err(error) => (None, Some(Err(error.into()))),
-        };
         Self {
+            bucket: bucket.to_string(),
             set_id,
             range,
-            walk,
-            output,
+            walk: None,
         }
     }
 
@@ -405,54 +313,38 @@ impl OwesFanoutOperation {
         })
     }
 
-    fn page_read(&mut self, values: Vec<(Key, Value)>, more: bool) -> Effects {
+    fn page_read(&mut self, values: Vec<(Key, Value)>, more: bool) -> Turn<bool> {
         let Some(key_space) = self.walk.as_ref().map(QueueWalk::key_space) else {
-            return self.finish(Err(RecordError::NotFinished));
+            return Err(IoError::Unfinished.into());
         };
         if values.iter().any(|(_, value)| self.owed(key_space, value)) {
-            return self.finish(Ok(true));
+            return Ok(Next::Done(true));
         }
         let last = values.last().map(|(key, _)| key.clone());
         match self.walk.as_mut().map(|walk| walk.advance(last, more)) {
-            Some(WalkStep::Read(effect)) => smallvec![effect],
+            Some(WalkStep::Read(call)) => Ok(Next::Call(call)),
             // A queue longer than the check reads counts as owing.
-            Some(WalkStep::Cut) => self.finish(Ok(true)),
-            Some(WalkStep::Done) => self.finish(Ok(false)),
-            None => self.finish(Err(RecordError::NotFinished)),
+            Some(WalkStep::Cut) => Ok(Next::Done(true)),
+            Some(WalkStep::Done) => Ok(Next::Done(false)),
+            None => Err(IoError::Unfinished.into()),
         }
-    }
-
-    fn finish(&mut self, result: Result<bool, RecordError>) -> Effects {
-        self.output = Some(result);
-        smallvec![]
     }
 }
 
-impl EffectOperation for OwesFanoutOperation {
+impl Operation for OwesFanoutOperation {
     type Output = bool;
     type Error = RecordError;
 
-    fn start(&mut self) -> Effects {
-        self.walk.iter().map(QueueWalk::read).collect()
+    fn first(&mut self) -> Turn<bool> {
+        let walk = QueueWalk::new(&self.bucket, FANOUT_PAGES)?;
+        let read = walk.read();
+        self.walk = Some(walk);
+        Ok(Next::Call(read))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match queue_page(self.output.is_some(), event) {
-            Ok((values, more)) => self.page_read(values, more),
-            Err(error) => self.finish(Err(error)),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<bool, RecordError> {
-        self.output.unwrap_or(Err(RecordError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        let (values, next) = result.page()?;
+        self.page_read(values, next.is_some())
     }
 }
 
@@ -468,22 +360,16 @@ pub struct CopyLagOperation {
     walk: Option<QueueWalk>,
     lag: LagMap,
     counted: bool,
-    output: Option<Result<(LagMap, bool), RecordError>>,
 }
 
 impl CopyLagOperation {
     pub fn new(snapshot: DistributionSnapshot, coordinator: Ulid) -> Self {
-        let (walk, output) = match QueueWalk::new(&snapshot.config.bucket, LAG_PAGES) {
-            Ok(walk) => (Some(walk), None),
-            Err(error) => (None, Some(Err(error.into()))),
-        };
         Self {
             snapshot,
             coordinator,
-            walk,
+            walk: None,
             lag: LagMap::new(),
             counted: true,
-            output,
         }
     }
 
@@ -531,16 +417,16 @@ impl CopyLagOperation {
         }
     }
 
-    fn page_read(&mut self, values: Vec<(Key, Value)>, more: bool) -> Effects {
+    fn page_read(&mut self, values: Vec<(Key, Value)>, more: bool) -> Turn<(LagMap, bool)> {
         let Some(key_space) = self.walk.as_ref().map(QueueWalk::key_space) else {
-            return self.finish(Err(RecordError::NotFinished));
+            return Err(IoError::Unfinished.into());
         };
         for (_, value) in &values {
             self.count(key_space, value);
         }
         let last = values.last().map(|(key, _)| key.clone());
         let Some(walk) = self.walk.as_mut() else {
-            return self.finish(Err(RecordError::NotFinished));
+            return Err(IoError::Unfinished.into());
         };
         let mut step = walk.advance(last, more);
         if let WalkStep::Cut = step {
@@ -549,46 +435,28 @@ impl CopyLagOperation {
             step = walk.next_queue();
         }
         match step {
-            WalkStep::Read(effect) => smallvec![effect],
+            WalkStep::Read(call) => Ok(Next::Call(call)),
             WalkStep::Cut | WalkStep::Done => {
-                let lag = std::mem::take(&mut self.lag);
-                let counted = self.counted;
-                self.finish(Ok((lag, counted)))
+                Ok(Next::Done((std::mem::take(&mut self.lag), self.counted)))
             }
         }
     }
-
-    fn finish(&mut self, result: Result<(LagMap, bool), RecordError>) -> Effects {
-        self.output = Some(result);
-        smallvec![]
-    }
 }
 
-impl EffectOperation for CopyLagOperation {
+impl Operation for CopyLagOperation {
     type Output = (LagMap, bool);
     type Error = RecordError;
 
-    fn start(&mut self) -> Effects {
-        self.walk.iter().map(QueueWalk::read).collect()
+    fn first(&mut self) -> Turn<Self::Output> {
+        let walk = QueueWalk::new(&self.snapshot.config.bucket, LAG_PAGES)?;
+        let read = walk.read();
+        self.walk = Some(walk);
+        Ok(Next::Call(read))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match queue_page(self.output.is_some(), event) {
-            Ok((values, more)) => self.page_read(values, more),
-            Err(error) => self.finish(Err(error)),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<(LagMap, bool), RecordError> {
-        self.output.unwrap_or(Err(RecordError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Turn<Self::Output> {
+        let (values, next) = result.page()?;
+        self.page_read(values, next.is_some())
     }
 }
 
@@ -597,6 +465,7 @@ mod tests {
     use super::*;
     use crate::distribution::test_record::{binding, member, replicated};
     use crate::driver::{DriverContext, drive};
+    use aruna_core::effects::StorageEffect;
 
     #[test]
     fn publishes_while_coordinating() {
@@ -792,68 +661,70 @@ mod tests {
         assert!(member_jobs(&binding(&snapshot, 2, 5), &snapshot, &obligation, 9).is_empty());
     }
 
-    mod transitions {
+    mod calls {
         use super::*;
-        use aruna_core::operation_check::{
-            check_abort, rejects_events, rejects_finalize, sample_events,
-        };
 
-        fn page(rows: usize, more: bool) -> Event {
-            Event::Storage(StorageEvent::IterResult {
-                values: (0..rows)
+        fn page(rows: usize, more: bool) -> IoResult {
+            IoResult::Page {
+                rows: (0..rows)
                     .map(|index| (vec![index as u8].into(), Vec::new().into()))
                     .collect(),
-                next_start_after: more.then(|| vec![0xff].into()),
-            })
+                next: more.then(|| vec![0xff].into()),
+            }
         }
 
-        fn timeout() -> Event {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
+        fn row(value: Option<Vec<u8>>) -> IoResult {
+            IoResult::Values(vec![value.map(Into::into)])
         }
 
         #[test]
         fn record_reads_contract() {
             let set_id = Ulid::from_parts(1, 1);
             let mut missing = ReadRecordOperation::new(set_id);
-            assert_eq!(missing.start().as_slice(), [record_read(set_id)]);
-            missing.step(Event::Storage(StorageEvent::ReadResult {
-                key: Vec::new().into(),
-                value: None,
-            }));
-            assert_eq!(missing.finalize(), Ok(None));
-            // A plain or missing bucket has no record; a storage error fails.
+            assert_eq!(missing.first(), Ok(Next::Call(record_read(set_id))));
+            assert_eq!(missing.next(row(None)), Ok(Next::Done(None)));
+
+            // A plain or missing bucket has no record.
             let mut plain = BoundRecordOperation::new("plain");
-            plain.start();
-            assert!(
-                plain
-                    .step(Event::Storage(StorageEvent::ReadResult {
-                        key: Vec::new().into(),
-                        value: None,
-                    }))
-                    .is_empty()
-            );
-            assert_eq!(plain.finalize(), Ok(None));
-            let mut failed = BoundRecordOperation::new("b");
-            failed.start();
-            failed.step(timeout());
             assert_eq!(
-                failed.finalize(),
-                Err(RecordError::Storage(StorageError::Timeout))
+                plain.first(),
+                Ok(Next::Call(read_row(S3_BUCKET_KEYSPACE, b"plain".to_vec())))
             );
-            let reading = || {
-                let mut operation = BoundRecordOperation::new("b");
-                operation.start();
-                operation
+            assert_eq!(plain.next(row(None)), Ok(Next::Done(None)));
+
+            let mut broken = BoundRecordOperation::new("b");
+            broken.first().unwrap();
+            let turn = broken.next(row(Some(vec![0xff])));
+            assert!(matches!(turn, Err(RecordError::Conversion(_))));
+            assert!(BoundRecordOperation::new("b").abort().is_empty());
+        }
+
+        #[test]
+        fn bound_bucket_reads() {
+            // A bound bucket's record is read under the binding's set.
+            let (snapshot, record) = replicated(true, 1);
+            let bound = binding(&snapshot, 1, 5);
+            let bucket = BucketInfo {
+                group_id: Ulid::from_parts(2, 2),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                created_by: aruna_core::UserId::nil(snapshot.statements[0].statement.realm_id),
+                cors_configuration: None,
+                storage_routing: Vec::new(),
+                placement_policies: Vec::new(),
+                placement_policy_generation: 0,
+                compression: Default::default(),
+                distribution: Some(bound.clone()),
             };
-            let refused = rejects_events(reading, sample_events, |event| {
-                matches!(event, Event::Storage(StorageEvent::ReadResult { .. }))
-            });
-            assert_eq!(refused.len(), sample_events().len() - 1);
-            let mut open = reading();
-            check_abort(&mut open, &[]);
-            rejects_finalize(open);
+            let mut operation = BoundRecordOperation::new("spire");
+            operation.first().unwrap();
+            assert_eq!(
+                operation.next(row(Some(bucket.to_bytes().unwrap()))),
+                Ok(Next::Call(record_read(bound.set_id)))
+            );
+            assert_eq!(
+                operation.next(row(Some(record))),
+                Ok(Next::Done(Some((bound, snapshot))))
+            );
         }
 
         #[test]
@@ -862,21 +733,25 @@ mod tests {
             let range = crate::distribution::test_store::range(1, "", None);
             let set_id = Ulid::from_parts(1, 1);
             let mut empty = OwesFanoutOperation::new("spire", set_id, range.clone());
-            assert_eq!(empty.start().len(), 1);
-            assert_eq!(
-                empty.step(page(0, false)).len(),
-                1,
+            assert!(matches!(empty.first(), Ok(Next::Call(IoCall::Page { .. }))));
+            assert!(
+                matches!(
+                    empty.next(page(0, false)),
+                    Ok(Next::Call(IoCall::Page { .. }))
+                ),
                 "the obligations follow"
             );
-            assert!(empty.step(page(0, false)).is_empty());
-            assert_eq!(empty.finalize(), Ok(false));
+            assert_eq!(empty.next(page(0, false)), Ok(Next::Done(false)));
             let mut long = OwesFanoutOperation::new("spire", set_id, range);
-            long.start();
+            long.first().unwrap();
             for _ in 1..FANOUT_PAGES {
-                assert_eq!(long.step(page(1, true)).len(), 1);
+                let turn = long.next(page(1, true));
+                assert!(matches!(
+                    turn,
+                    Ok(Next::Call(IoCall::Page { after: Some(_), .. }))
+                ));
             }
-            assert!(long.step(page(1, true)).is_empty());
-            assert_eq!(long.finalize(), Ok(true));
+            assert_eq!(long.next(page(1, true)), Ok(Next::Done(true)));
         }
 
         #[test]
@@ -884,18 +759,27 @@ mod tests {
             // A cut queue makes the counts lower bounds, and the next queue is still read.
             let (snapshot, _) = replicated(true, 1);
             let mut operation = CopyLagOperation::new(snapshot, member(1));
-            operation.start();
+            operation.first().unwrap();
             for _ in 1..LAG_PAGES {
-                operation.step(page(1, true));
+                operation.next(page(1, true)).unwrap();
             }
-            assert_eq!(operation.step(page(1, true)).len(), 1);
-            assert!(operation.step(page(0, false)).is_empty());
-            let (lag, counted) = operation.finalize().unwrap();
-            assert!(lag.is_empty() && !counted);
-            let mut failed = CopyLagOperation::new(replicated(true, 1).0, member(1));
-            failed.start();
-            failed.step(timeout());
-            assert!(failed.finalize().is_err());
+            let turn = operation.next(page(1, true));
+            assert!(matches!(
+                turn,
+                Ok(Next::Call(IoCall::Page { after: None, .. }))
+            ));
+            assert_eq!(
+                operation.next(page(0, false)),
+                Ok(Next::Done((LagMap::new(), false)))
+            );
+        }
+
+        #[test]
+        fn storage_errors_stay() {
+            let error = RecordError::from(IoError::Storage(StorageError::Timeout));
+            assert_eq!(error, RecordError::Storage(StorageError::Timeout));
+            let mut operation = ReadRecordOperation::new(Ulid::from_parts(1, 1));
+            assert!(operation.next(IoResult::Done).is_err());
         }
     }
 }

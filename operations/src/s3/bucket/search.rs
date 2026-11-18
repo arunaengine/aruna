@@ -6,14 +6,14 @@ use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, DISTRIBUTION_KEYSPACE, GROUP_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
@@ -23,9 +23,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::types::{Effects, GroupId, Key, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -100,13 +99,10 @@ struct BucketCandidate {
 
 #[derive(Clone, Debug, PartialEq)]
 enum SearchBucketsState {
-    Init,
     ScanBuckets,
     CheckPermission,
     ReadGroup,
     ReadMetadata,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -117,14 +113,6 @@ pub enum SearchBucketsError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Policy(#[from] PolicyEnforcementError),
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
-    #[error("bucket search did not finish")]
-    NotFinished,
     #[error("bucket search scan budget exhausted")]
     Unavailable,
     #[error("bucket search position is not valid here")]
@@ -132,6 +120,14 @@ pub enum SearchBucketsError {
     #[error("bucket search policy context is not an MCP tool's")]
     Extras,
 }
+
+impl From<IoError> for SearchBucketsError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type SearchTurn = Result<Next<SearchBucketsOutput>, SearchBucketsError>;
 
 #[derive(Debug, PartialEq)]
 pub struct SearchBucketsOperation {
@@ -146,7 +142,6 @@ pub struct SearchBucketsOperation {
     last_decided: Option<Key>,
     max_scan_rows: usize,
     scanned_rows: usize,
-    output: Option<Result<SearchBucketsOutput, SearchBucketsError>>,
 }
 
 impl SearchBucketsOperation {
@@ -154,18 +149,13 @@ impl SearchBucketsOperation {
     const SCAN_LIMIT: usize = 1_000;
     pub(super) const MAX_SCAN_ROWS: usize = 1_024;
 
-    #[cfg(test)]
-    fn new(input: SearchBucketsInput) -> Self {
-        Self::with_budget(input, Self::MAX_SCAN_ROWS)
-    }
-
     pub(super) fn with_budget(mut input: SearchBucketsInput, max_scan_rows: usize) -> Self {
         input.limit = input.limit.clamp(1, Self::MAX_LIMIT);
         input.query = input.query.to_lowercase();
         let next_start_after = input.start_after.clone();
         Self {
             input,
-            state: SearchBucketsState::Init,
+            state: SearchBucketsState::ScanBuckets,
             candidates: VecDeque::new(),
             current: None,
             pending: None,
@@ -174,53 +164,30 @@ impl SearchBucketsOperation {
             last_decided: None,
             max_scan_rows: max_scan_rows.min(Self::MAX_SCAN_ROWS),
             scanned_rows: 0,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: SearchBucketsError) -> Effects {
-        self.state = SearchBucketsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(SearchBucketsError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        })
-    }
-
-    fn emit_bucket_scan(&mut self) -> Effects {
+    fn emit_bucket_scan(&mut self) -> SearchTurn {
         // A used-up budget ends the page at the scan position, so the next page goes on there.
         let remaining = self.max_scan_rows.saturating_sub(self.scanned_rows);
         if remaining == 0 {
             return self.finish();
         }
         self.state = SearchBucketsState::ScanBuckets;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            prefix: None,
-            start: self.next_start_after.clone().map(IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: S3_BUCKET_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.next_start_after.clone(),
             limit: Self::SCAN_LIMIT.min(remaining),
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn handle_bucket_scan(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.unexpected("Event::Storage(StorageEvent::IterResult)", got);
-        };
-        if let Err(error) = self.collect_candidates(values) {
-            return self.fail(error);
-        }
-        self.next_start_after = next_start_after;
+    fn handle_bucket_scan(
+        &mut self,
+        (values, next): (Vec<(Key, Value)>, Option<Key>),
+    ) -> SearchTurn {
+        self.collect_candidates(values)?;
+        self.next_start_after = next;
         self.continue_search()
     }
 
@@ -251,7 +218,7 @@ impl SearchBucketsOperation {
         Ok(())
     }
 
-    fn continue_search(&mut self) -> Effects {
+    fn continue_search(&mut self) -> SearchTurn {
         if self.hits.len() >= self.input.limit {
             return self.finish();
         }
@@ -266,66 +233,38 @@ impl SearchBucketsOperation {
         self.finish()
     }
 
-    fn emit_permission_check(&mut self) -> Effects {
-        let Some(candidate) = self.current.as_ref() else {
-            return self.fail(SearchBucketsError::NotFinished);
-        };
-        self.state = SearchBucketsState::CheckPermission;
+    fn emit_permission_check(&mut self) -> SearchTurn {
+        let candidate = self.current.as_ref().ok_or(IoError::Unfinished)?;
         let (group_id, node_id) = (candidate.info.group_id, self.input.node_id);
         let path = candidate_path(&self.input, group_id, node_id, &candidate.bucket);
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.input.auth.clone(),
-                path,
-                required_permission: Permission::READ,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.input.auth.clone(),
+            path,
+            required_permission: Permission::READ,
+        });
+        self.state = SearchBucketsState::CheckPermission;
+        Ok(Next::Call(IoCall::child(check)))
     }
 
-    fn handle_permission(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected(
-                "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
-                got,
-            );
-        };
+    fn handle_permission(&mut self, allowed: Result<bool, AuthorizationError>) -> SearchTurn {
         if !matches!(allowed, Ok(true)) {
             self.current = None;
             return self.continue_search();
         }
-        let Some(candidate) = self.current.as_ref() else {
-            return self.fail(SearchBucketsError::NotFinished);
-        };
+        let candidate = self.current.as_ref().ok_or(IoError::Unfinished)?;
+        let key = candidate.info.group_id.to_bytes().to_vec();
         self.state = SearchBucketsState::ReadGroup;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: GROUP_KEYSPACE.to_string(),
-            key: candidate.info.group_id.to_bytes().to_vec().into(),
-            txn_id: None,
-        })]
+        Ok(Next::Call(read_row(GROUP_KEYSPACE, key)))
     }
 
-    fn handle_group_read(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected("Event::Storage(StorageEvent::ReadResult)", got);
-        };
-        let group_name = match value {
-            Some(value) => match Group::from_bytes(value.as_ref()) {
-                Ok(group) => Some(group.display_name),
-                Err(error) => return self.fail(error.into()),
-            },
-            None => None,
-        };
-        let Some(candidate) = self.current.take() else {
-            return self.fail(SearchBucketsError::NotFinished);
-        };
-        let arn =
-            match ArunaArn::s3_bucket(self.input.realm_id, self.input.node_id, &candidate.bucket) {
-                Ok(arn) => arn.to_string(),
-                Err(error) => return self.fail(error.into()),
-            };
+    fn handle_group_read(&mut self, value: Option<Value>) -> SearchTurn {
+        let group_name = value
+            .map(|value| Group::from_bytes(value.as_ref()))
+            .transpose()?
+            .map(|group| group.display_name);
+        let candidate = self.current.take().ok_or(IoError::Unfinished)?;
+        let arn = ArunaArn::s3_bucket(self.input.realm_id, self.input.node_id, &candidate.bucket)?
+            .to_string();
         let set_id = (candidate.info.distribution.as_ref()).map(|binding| binding.set_id);
         let hit = BucketSearchHit {
             arn,
@@ -351,39 +290,28 @@ impl SearchBucketsOperation {
             ],
         };
         self.pending = Some(hit);
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// Adds the current metadata to a pending hit; a database search keeps only databases.
-    fn handle_metadata_read(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected("Event::Storage(StorageEvent::BatchReadResult)", got);
-        };
-        let Some(mut hit) = self.pending.take() else {
-            return self.fail(SearchBucketsError::NotFinished);
-        };
-        let mut values = values.into_iter().map(|(_, value)| value);
+    fn handle_metadata_read(&mut self, values: Vec<Option<Value>>) -> SearchTurn {
+        let mut hit = self.pending.take().ok_or(IoError::Unfinished)?;
+        let mut values = values.into_iter();
         let metadata = match hit.set_id {
             Some(_) => match values.next().flatten() {
-                Some(value) => match DistributionView::from_bytes(value.as_ref()) {
-                    Ok(view) => {
-                        (view.snapshot().config.settings.metadata.clone()).map(|metadata| *metadata)
-                    }
-                    Err(error) => return self.fail(error.into()),
-                },
+                Some(value) => {
+                    let view = DistributionView::from_bytes(value.as_ref())?;
+                    (view.snapshot().config.settings.metadata.clone()).map(|metadata| *metadata)
+                }
                 None => None,
             },
             None => match (values.next().flatten(), values.next().flatten()) {
-                (Some(row), creation) => match StoredMetadata::from_bytes(row.as_ref()) {
-                    Ok(stored) => (stored.incarnation
+                (Some(row), creation) => {
+                    let stored = StoredMetadata::from_bytes(row.as_ref())?;
+                    (stored.incarnation
                         == incarnation(creation.as_ref().map(|value| value.as_ref())))
-                    .then_some(stored.metadata),
-                    Err(error) => return self.fail(error.into()),
-                },
+                    .then_some(stored.metadata)
+                }
                 (None, _) => None,
             },
         };
@@ -394,8 +322,7 @@ impl SearchBucketsOperation {
         self.continue_search()
     }
 
-    fn finish(&mut self) -> Effects {
-        self.state = SearchBucketsState::Finish;
+    fn finish(&mut self) -> SearchTurn {
         // Candidates left in the queue were scanned past but never decided, so
         // the continuation is the last decided bucket rather than the batch end.
         let next_start_after = if self.candidates.is_empty() {
@@ -403,12 +330,11 @@ impl SearchBucketsOperation {
         } else {
             self.last_decided.take()
         };
-        self.output = Some(Ok(SearchBucketsOutput {
+        Ok(Next::Done(SearchBucketsOutput {
             hits: std::mem::take(&mut self.hits),
             next_start_after,
             scanned_rows: self.scanned_rows,
-        }));
-        smallvec![]
+        }))
     }
 }
 
@@ -425,42 +351,23 @@ pub(super) fn candidate_path(
     }
 }
 
-impl EffectOperation for SearchBucketsOperation {
+impl Operation for SearchBucketsOperation {
     type Output = SearchBucketsOutput;
     type Error = SearchBucketsError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> SearchTurn {
         self.emit_bucket_scan()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
+    fn next(&mut self, result: IoResult) -> SearchTurn {
         match self.state {
-            SearchBucketsState::ScanBuckets => self.handle_bucket_scan(event),
-            SearchBucketsState::CheckPermission => self.handle_permission(event),
-            SearchBucketsState::ReadGroup => self.handle_group_read(event),
-            SearchBucketsState::ReadMetadata => self.handle_metadata_read(event),
-            SearchBucketsState::Init | SearchBucketsState::Finish | SearchBucketsState::Error => {
-                smallvec![]
+            SearchBucketsState::ScanBuckets => self.handle_bucket_scan(result.page()?),
+            SearchBucketsState::CheckPermission => {
+                self.handle_permission(result.child::<bool, AuthorizationError>()?)
             }
+            SearchBucketsState::ReadGroup => self.handle_group_read(result.value()?),
+            SearchBucketsState::ReadMetadata => self.handle_metadata_read(result.values()?),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            SearchBucketsState::Finish | SearchBucketsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(SearchBucketsError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -470,13 +377,13 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BUCKET_METADATA_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
@@ -489,7 +396,7 @@ mod tests {
 
     use super::*;
     use crate::driver::DriverContext;
-    use crate::s3::bucket::local_search::{extras_valid, search_local_buckets, search_with_budget};
+    use crate::s3::bucket::local_search::{LocalBucketSearch, extras_valid};
 
     fn scan_input(query: &str, limit: usize) -> SearchBucketsInput {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -532,14 +439,46 @@ mod tests {
     }
 
     /// A bucket without metadata; every hit reads it.
-    fn no_metadata() -> Event {
-        Event::Storage(StorageEvent::BatchReadResult { values: Vec::new() })
+    fn searching(input: SearchBucketsInput) -> SearchBucketsOperation {
+        SearchBucketsOperation::with_budget(input, SearchBucketsOperation::MAX_SCAN_ROWS)
+    }
+
+    fn allowed() -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<bool, AuthorizationError>(true)))
+    }
+
+    fn row(value: Option<Value>) -> IoResult {
+        IoResult::Values(vec![value])
+    }
+
+    fn keyed_rows(values: Vec<(Key, Option<Value>)>) -> IoResult {
+        IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+    }
+
+    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Page { rows, next }
+    }
+
+    /// Answers the running call and keeps the page once the search finished.
+    fn feed(
+        operation: &mut SearchBucketsOperation,
+        result: IoResult,
+        output: &mut Option<SearchBucketsOutput>,
+    ) {
+        if let Next::Done(page) = operation.next(result).unwrap() {
+            *output = Some(page);
+        }
+    }
+
+    fn no_metadata() -> IoResult {
+        keyed_rows(Vec::new())
     }
 
     #[test]
     fn budget_keeps_position() {
-        let mut operation = SearchBucketsOperation::new(scan_input("missing", 1));
-        operation.start();
+        let mut operation = searching(scan_input("missing", 1));
+        operation.first().unwrap();
+        let mut output = None;
         let mut remaining = SearchBucketsOperation::MAX_SCAN_ROWS;
         let mut page = 0;
         while remaining > 0 {
@@ -552,16 +491,20 @@ mod tests {
                     )
                 })
                 .collect();
-            operation.step(Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after: Some(format!("cursor-{page}").into()),
-            }));
+            feed(
+                &mut operation,
+                IoResult::Page {
+                    rows: values,
+                    next: Some(format!("cursor-{page}").into()),
+                },
+                &mut output,
+            );
             remaining -= page_len;
             page += 1;
         }
 
         // The used-up budget ends the page where the scan stopped, not with an error.
-        let output = operation.finalize().unwrap();
+        let output = output.expect("the search finished");
         assert!(output.hits.is_empty());
         assert_eq!(output.next_start_after, Some(b"cursor-1".to_vec().into()));
         assert_eq!(output.scanned_rows, SearchBucketsOperation::MAX_SCAN_ROWS);
@@ -570,27 +513,23 @@ mod tests {
     #[test]
     fn cursor_after_hit() {
         let group_id = Ulid::from_bytes([11u8; 16]);
-        let mut operation = SearchBucketsOperation::new(scan_input("data", 1));
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
+        let mut operation = searching(scan_input("data", 1));
+        operation.first().unwrap();
+        let mut output = None;
+        let effects = operation.next(page(
+            vec![
                 bucket_entry("data-a", group_id),
                 bucket_entry("data-b", group_id),
             ],
-            next_start_after: Some("data-b".as_bytes().to_vec().into()),
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+            Some("data-b".as_bytes().to_vec().into()),
         ));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: group_id.to_bytes().to_vec().into(),
-            value: None,
-        }));
-        operation.step(no_metadata());
+        assert!(matches!(&effects, Ok(Next::Call(IoCall::Child(_)))));
 
-        let output = operation.finalize().unwrap();
+        feed(&mut operation, allowed(), &mut output);
+        feed(&mut operation, row(None), &mut output);
+        feed(&mut operation, no_metadata(), &mut output);
+
+        let output = output.expect("the search finished");
         assert_eq!(output.hits.len(), 1);
         assert_eq!(output.hits[0].bucket, "data-a");
         assert_eq!(
@@ -606,27 +545,27 @@ mod tests {
         let (mine, other) = (Ulid::from_bytes([11u8; 16]), Ulid::from_bytes([12u8; 16]));
         let mut input = scan_input("", 10);
         input.group_id = Some(mine);
-        let mut operation = SearchBucketsOperation::new(input);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
-                bucket_entry("alpha", mine),
-                bucket_entry("beta", other),
-                bucket_entry("gamma", mine),
-            ],
-            next_start_after: None,
-        }));
+        let mut operation = searching(input);
+        operation.first().unwrap();
+        let mut output = None;
+        feed(
+            &mut operation,
+            page(
+                vec![
+                    bucket_entry("alpha", mine),
+                    bucket_entry("beta", other),
+                    bucket_entry("gamma", mine),
+                ],
+                None,
+            ),
+            &mut output,
+        );
         for _ in 0..2 {
-            operation.step(Event::SubOperation(
-                SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-            ));
-            operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: mine.to_bytes().to_vec().into(),
-                value: None,
-            }));
-            operation.step(no_metadata());
+            feed(&mut operation, allowed(), &mut output);
+            feed(&mut operation, row(None), &mut output);
+            feed(&mut operation, no_metadata(), &mut output);
         }
-        let output = operation.finalize().unwrap();
+        let output = output.expect("the search finished");
         let names: Vec<_> = output.hits.iter().map(|hit| hit.bucket.as_str()).collect();
         assert_eq!(names, ["alpha", "gamma"]);
         assert_eq!(output.next_start_after, None);
@@ -645,26 +584,26 @@ mod tests {
             incarnation: 1,
             revision: Default::default(),
         });
-        let mut operation = SearchBucketsOperation::new(scan_input("", 10));
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
-                (key, info.to_bytes().unwrap().into()),
-                bucket_entry("single", group_id),
-            ],
-            next_start_after: None,
-        }));
+        let mut operation = searching(scan_input("", 10));
+        operation.first().unwrap();
+        let mut output = None;
+        feed(
+            &mut operation,
+            page(
+                vec![
+                    (key, info.to_bytes().unwrap().into()),
+                    bucket_entry("single", group_id),
+                ],
+                None,
+            ),
+            &mut output,
+        );
         for _ in 0..2 {
-            operation.step(Event::SubOperation(
-                SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-            ));
-            operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: group_id.to_bytes().to_vec().into(),
-                value: None,
-            }));
-            operation.step(no_metadata());
+            feed(&mut operation, allowed(), &mut output);
+            feed(&mut operation, row(None), &mut output);
+            feed(&mut operation, no_metadata(), &mut output);
         }
-        let output = operation.finalize().unwrap();
+        let output = output.expect("the search finished");
         let sets: Vec<_> = output
             .hits
             .iter()
@@ -804,9 +743,8 @@ mod tests {
             .await;
         }
 
-        let hits = search_local_buckets(
-            &context,
-            SearchBucketsInput {
+        let hits = crate::driver::drive(
+            LocalBucketSearch::new(SearchBucketsInput {
                 auth: AuthContext {
                     user_id: outsider,
                     realm_id,
@@ -822,7 +760,8 @@ mod tests {
                 group_id: None,
                 start_after: None,
                 database: false,
-            },
+            }),
+            &context,
         )
         .await
         .unwrap()
@@ -856,9 +795,8 @@ mod tests {
             )
             .await;
         }
-        let databases = search_local_buckets(
-            &context,
-            SearchBucketsInput {
+        let databases = crate::driver::drive(
+            LocalBucketSearch::new(SearchBucketsInput {
                 auth: AuthContext {
                     user_id: owner,
                     realm_id,
@@ -874,7 +812,8 @@ mod tests {
                 group_id: None,
                 start_after: None,
                 database: true,
-            },
+            }),
+            &context,
         )
         .await
         .unwrap()
@@ -903,7 +842,7 @@ mod tests {
             start_after: None,
             database: false,
         };
-        let cut = search_with_budget(&context, input.clone(), 1)
+        let cut = crate::driver::drive(LocalBucketSearch::with_budget(input.clone(), 1), &context)
             .await
             .unwrap();
         assert!(cut.hits.is_empty());
@@ -913,7 +852,9 @@ mod tests {
             start_after: Some(sealed.clone().into()),
             ..input.clone()
         };
-        let rest = search_local_buckets(&context, resumed).await.unwrap();
+        let rest = crate::driver::drive(LocalBucketSearch::new(resumed), &context)
+            .await
+            .unwrap();
         let names: Vec<_> = rest.hits.iter().map(|hit| hit.bucket.as_str()).collect();
         assert_eq!(names, ["data-public"]);
         let mut forged = sealed;
@@ -923,7 +864,9 @@ mod tests {
             ..input
         };
         // A position this node cannot open retires its scan instead of failing every page.
-        let retired = search_local_buckets(&context, forged).await.unwrap();
+        let retired = crate::driver::drive(LocalBucketSearch::new(forged), &context)
+            .await
+            .unwrap();
         assert!(retired.retired && retired.hits.is_empty() && retired.scanned_to.is_none());
     }
 

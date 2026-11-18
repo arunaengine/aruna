@@ -497,15 +497,10 @@ impl GetObjectOperation {
         }
     }
 
-    fn lookup_error(&self, expected: &'static str, error: LookupError) -> GetObjectError {
+    fn lookup_error(error: LookupError) -> GetObjectError {
         match error {
             LookupError::Conversion(err) => GetObjectError::ConversionError(err),
             LookupError::Managed(err) => GetObjectError::ManagedCopyError(err),
-            LookupError::InvalidEvent(received) => GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected,
-                received: received.label(),
-            },
             LookupError::Missing => GetObjectError::GetObjectFailed,
         }
     }
@@ -859,13 +854,12 @@ impl GetObjectOperation {
             &self.source_policies,
             ExpectedNode::Exact(self.input.node_id),
         )
-        .map_err(|error| self.lookup_error("IoResult::Values", error))?;
+        .map_err(Self::lookup_error)?;
         self.read_blob_location(key)
     }
 
     fn location_read(&mut self, value: Option<Value>) -> Turn {
-        let location = location_from_value(value)
-            .map_err(|error| self.lookup_error("IoResult::Values", error))?;
+        let location = location_from_value(value).map_err(Self::lookup_error)?;
         let Some(location) = location else {
             return Err(match self.missing_blake3 {
                 Some(blake3) => GetObjectError::BlobNotLocal {
@@ -973,8 +967,7 @@ impl GetObjectOperation {
     }
 
     fn summary_read(&mut self, value: Option<Value>) -> Turn {
-        let summary = summary_from_value(value)
-            .map_err(|error| self.lookup_error("IoResult::Values", error))?;
+        let summary = summary_from_value(value).map_err(Self::lookup_error)?;
         if let Some(summary) = summary {
             self.checksum_type = summary.checksum_type;
             self.composite_hashes = summary.composite_hashes;

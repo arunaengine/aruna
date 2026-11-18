@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::keyspaces::LINKED_JOB_KEYSPACE;
@@ -13,8 +14,8 @@ use tracing::warn;
 use super::job_progress::{JobStep, StoreProgressError, StoreProgressOperation};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::BucketAccess;
-use crate::driver::{DriverContext, drive_retry};
-use crate::s3::bucket::remap::{RemapScope, job_page};
+use crate::driver::{DriverContext, drive, drive_retry};
+use crate::s3::bucket::remap::{RemapJobOperation, RemapScope};
 
 /// Delay between pages of a running job, and before a waiting job tries again.
 const CONTINUE: Duration = Duration::from_secs(1);
@@ -63,7 +64,7 @@ async fn run_page(
     job: LinkedJob,
 ) -> Result<Duration, String> {
     let step = match job_access(context, bucket, &job).await {
-        Ok(Some(access)) => page(context, bucket, &job, &access).await,
+        Ok(Some(access)) => page(context, bucket, &job, Arc::new(access)).await,
         Ok(None) => {
             let ended = Some(LinkedState::Aborted);
             return store(context, bucket, &job, ended_step(), ended)
@@ -146,7 +147,7 @@ async fn page(
     context: &DriverContext,
     bucket: &str,
     job: &LinkedJob,
-    access: &BucketAccess,
+    access: Arc<BucketAccess>,
 ) -> JobStep {
     let waiting = |error: String| JobStep {
         cursor: job.cursor.clone(),
@@ -159,16 +160,16 @@ async fn page(
                 realm_id: job.auth.realm_id,
                 group_id: job.group_id,
                 node_id: job.node_id,
-                bucket,
+                bucket: bucket.to_string(),
                 access,
             };
-            match job_page(context, plan, &scope, job).await {
+            match drive(RemapJobOperation::new(plan, &scope, job), context).await {
                 Ok(step) => step,
                 Err(error) => waiting(error.to_string()),
             }
         }
         LinkedTask::Unify { prefix } => {
-            let page = crate::blob::unify::job_page(context, (bucket, prefix), access, job);
+            let page = crate::blob::unify::job_page(context, (bucket, prefix), &access, job);
             match page.await {
                 Ok(step) => step,
                 Err(error) => waiting(error),

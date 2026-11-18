@@ -15,10 +15,9 @@ use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE,
     PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -27,7 +26,7 @@ use aruna_core::managed_copy::{
     COPY_PAGE_LIMIT, CopyRegistration, CopyRequest, ManagedCopyError, register_entry,
     validate_registration, version_scope,
 };
-use aruna_core::operation::{Operation, SubOperation, TransactionMode, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -843,20 +842,6 @@ impl MintSuccessorOperation {
             }
         }
     }
-}
-
-/// The mint as a child run, for an operation that steps it by hand.
-pub(crate) fn mint_child(plan: SuccessorPlan) -> Box<dyn SubOperation> {
-    let mint = MintSuccessorOperation::new(plan);
-    boxed_suboperation(mint, |result| Event::Child(ChildOutcome::new(result)))
-}
-
-/// The outcome of a finished [`mint_child`].
-pub(crate) fn mint_outcome(event: Event) -> Result<SuccessorOutcome, SuccessorError> {
-    let Event::Child(outcome) = event else {
-        return Err(SuccessorError::InvalidEvent);
-    };
-    outcome.take().unwrap_or(Err(SuccessorError::InvalidEvent))
 }
 
 impl Operation for MintSuccessorOperation {

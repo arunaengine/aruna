@@ -1004,13 +1004,13 @@ impl OperationsTaskHandler {
                 };
                 let retention_ms = self.rocrate_limits.artifact_retention_ms;
                 let now = unix_timestamp_millis();
-                let run = crate::s3::imports::schedule::run_due(
-                    &self.context,
+                let run = crate::s3::imports::schedule::RunDueOperation::new(
                     net_handle.node_id(),
                     retention_ms,
                     now,
+                    self.context.node_and_realm(),
                 );
-                if let Some(after) = run.await {
+                if let Ok(Some(after)) = crate::driver::drive(run, &self.context).await {
                     self.reschedule_timer(TaskKey::RunBackendImports, after)
                         .await;
                 }

@@ -30,6 +30,7 @@ use tracing::warn;
 
 use crate::application::{Service, ServiceExit};
 use crate::startup::realm::CoreAnnouncement;
+use crate::startup::sweeps::{spawn_cutoff_sweep, spawn_session_sweep};
 use crate::startup::test_hooks;
 
 const FEED_IDLE: Duration = Duration::from_secs(2);

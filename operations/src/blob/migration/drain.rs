@@ -13,12 +13,11 @@ use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
     IMPORT_INTENT_KEYSPACE, MIGRATION_AHEAD_KEYSPACE, MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE,
-    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::backend_import::{RenameRequest, WriteIntent};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobCleanupWork, BlobVersion, BucketInfo, ResolvedBackend, VersionKey,
+    BackendLocation, BlobCleanupWork, BlobVersion, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{
@@ -115,7 +114,11 @@ pub async fn read_earlier(
 ) -> Result<Earlier, String> {
     let mut earlier = Earlier::new();
     for rule in &routing.imports {
-        let patterns = crate::s3::imports::read_earlier(context, rule.import_id).await;
+        let patterns = crate::driver::drive(
+            crate::s3::imports::ReadEarlierOperation::new(rule.import_id),
+            context,
+        )
+        .await;
         let patterns = patterns.map_err(|error| error.to_string())?;
         if !patterns.is_empty() {
             earlier.insert(rule.import_id, patterns);
@@ -985,26 +988,10 @@ pub async fn move_routing(
     context: &crate::driver::DriverContext,
     bucket: &str,
 ) -> Result<Option<RoutingSnapshot>, String> {
-    let read = StorageEffect::Read {
-        key_space: S3_BUCKET_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    let event = context.storage_handle.send_storage_effect(read).await;
-    let info = crate::groups::backends::parse_read(event, BucketInfo::from_bytes);
-    let Some(info) = info.map_err(|error| error.to_string())? else {
-        return Ok(None);
-    };
-    let snapshot = crate::driver::drive(
-        crate::groups::routing::SnapshotOperation::new(
-            &crate::driver::node_routing(context),
-            info.group_id,
-            crate::groups::routing::BucketRules::of(&info),
-        ),
-        context,
-    )
-    .await;
-    snapshot.map(Some).map_err(|error| error.to_string())
+    let routing = crate::driver::node_routing(context);
+    let operation = crate::blob::import_rows::BucketRoutingOperation::new(routing, bucket);
+    let snapshot = crate::driver::drive(operation, context).await;
+    snapshot.map_err(|error| error.to_string())
 }
 
 /// Stores the progress, with the rows a run finished `ahead` of its cursor where given.

@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoError, IoResult};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
@@ -774,71 +774,30 @@ impl QuotaGate {
     }
 }
 
-/// Reads the usage rebuild marker; a present row means the local counters are incomplete.
-fn rebuild_marker_read(txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: USAGE_STATS_KEYSPACE.to_string(),
-        key: Key::from(USAGE_REBUILD_KEY.to_vec()),
-        txn_id,
-    })
-}
-
 /// Reads whether the local usage counters are complete: false while a usage rebuild runs,
 /// when they must not count as free capacity and do not yet back quota decisions.
 #[derive(Debug, Default, PartialEq)]
-pub struct UsageCompleteOperation {
-    started: bool,
-    result: Option<Result<bool, StorageError>>,
-}
+pub struct UsageCompleteOperation;
 
 impl UsageCompleteOperation {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 }
 
-impl EffectOperation for UsageCompleteOperation {
+impl Operation for UsageCompleteOperation {
     type Output = bool;
     type Error = StorageError;
 
-    fn start(&mut self) -> Effects {
-        self.started = true;
-        smallvec![rebuild_marker_read(None)]
+    fn first(&mut self) -> Result<Next<bool>, StorageError> {
+        // A present row means the local counters are incomplete.
+        let read = read_row(USAGE_STATS_KEYSPACE, USAGE_REBUILD_KEY.to_vec());
+        Ok(Next::Call(read))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.result = Some(match (self.started && self.result.is_none(), event) {
-            (true, Event::Storage(StorageEvent::ReadResult { value, .. })) => Ok(value.is_none()),
-            (true, Event::Storage(StorageEvent::Error { error })) => Err(error),
-            _ => Err(StorageError::ReadError(
-                "unexpected event for the usage rebuild marker".to_string(),
-            )),
-        });
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, StorageError> {
+        Ok(Next::Done(result.value()?.is_none()))
     }
-
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.result.unwrap_or(Err(StorageError::ReadError(
-            "the usage rebuild marker was not read".to_string(),
-        )))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LoadCountersState {
-    Init,
-    ReadCounter,
-    ReadGlobal,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -849,117 +808,50 @@ pub enum LoadCountersError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     CounterError(#[from] UsageCounterError),
-    #[error(
-        "usage counter read received unexpected event in state {state:?}: expected {expected}, got {received}"
-    )]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        received: &'static str,
-    },
-    #[error("usage counter read did not finish")]
-    NotFinished,
+}
+
+impl From<IoError> for LoadCountersError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct LoadCountersOperation {
     key: Vec<u8>,
-    state: LoadCountersState,
-    output: Option<Result<UsageCounters, LoadCountersError>>,
 }
 
 impl LoadCountersOperation {
     pub fn new(key: Vec<u8>) -> Self {
-        Self {
-            key,
-            state: LoadCountersState::Init,
-            output: None,
-        }
+        Self { key }
     }
 
-    fn finish(&mut self, result: Result<UsageCounters, LoadCountersError>) -> Effects {
-        self.state = if result.is_ok() {
-            LoadCountersState::Finish
-        } else {
-            LoadCountersState::Error
-        };
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, received: Event) -> Effects {
-        self.finish(Err(LoadCountersError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            received: received.label(),
-        }))
-    }
-
-    fn handle_counter_read(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::ReadResult {
-                value: Some(bytes), ..
-            }) => self.finish(UsageCounters::from_bytes(&bytes).map_err(Into::into)),
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                self.finish(Ok(UsageCounters::default()))
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-            other => self.unexpected_event("storage read result", other),
-        }
-    }
-
-    fn handle_global_read(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                self.finish(global_sum(values.into_iter().map(|(_, value)| value)))
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-            other => self.unexpected_event("storage batch read result", other),
-        }
+    fn is_global(&self) -> bool {
+        self.key.as_slice() == USAGE_GLOBAL_KEY
     }
 }
 
-impl EffectOperation for LoadCountersOperation {
+impl Operation for LoadCountersOperation {
     type Output = UsageCounters;
     type Error = LoadCountersError;
 
-    fn start(&mut self) -> Effects {
-        if self.key.as_slice() == USAGE_GLOBAL_KEY {
-            self.state = LoadCountersState::ReadGlobal;
-            smallvec![Effect::Storage(global_shard_read(None))]
-        } else {
-            self.state = LoadCountersState::ReadCounter;
-            smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: USAGE_STATS_KEYSPACE.to_string(),
-                key: self.key.clone().into(),
-                txn_id: None,
-            })]
+    fn first(&mut self) -> Result<Next<UsageCounters>, LoadCountersError> {
+        Ok(Next::Call(match self.is_global() {
+            true => IoCall::Read(global_shard_rows()),
+            false => read_row(USAGE_STATS_KEYSPACE, self.key.clone()),
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<UsageCounters>, LoadCountersError> {
+        if self.is_global() {
+            let total = global_sum::<LoadCountersError>(result.values()?)?;
+            return Ok(Next::Done(total));
         }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            LoadCountersState::ReadCounter => self.handle_counter_read(event),
-            LoadCountersState::ReadGlobal => self.handle_global_read(event),
-            LoadCountersState::Init | LoadCountersState::Finish | LoadCountersState::Error => {
-                self.unexpected_event("no event", event)
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            LoadCountersState::Finish | LoadCountersState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(LoadCountersError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        let counters = match result.value()? {
+            Some(bytes) => UsageCounters::from_bytes(&bytes)?,
+            None => UsageCounters::default(),
+        };
+        Ok(Next::Done(counters))
     }
 }
 
@@ -1039,8 +931,12 @@ pub enum MarkDirtyError {
     Storage(#[from] StorageError),
     #[error("unexpected event while marking usage for a publish: {0}")]
     UnexpectedEvent(&'static str),
-    #[error("the usage marking has not finished")]
-    Unfinished,
+}
+
+impl From<IoError> for MarkDirtyError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
 }
 
 /// Marks groups and the global for the next usage publish, then schedules that publish; the
@@ -1050,7 +946,6 @@ pub enum MarkDirtyError {
 pub struct MarkDirtyOperation {
     writes: Option<Vec<(String, Key, Value)>>,
     marking: bool,
-    result: Option<Result<(), MarkDirtyError>>,
 }
 
 impl MarkDirtyOperation {
@@ -1058,7 +953,6 @@ impl MarkDirtyOperation {
         Self {
             writes: Some(dirty_rows(groups, generation)),
             marking: false,
-            result: None,
         }
     }
 
@@ -1066,60 +960,31 @@ impl MarkDirtyOperation {
         Self {
             writes: None,
             marking: false,
-            result: None,
         }
     }
 }
 
-impl EffectOperation for MarkDirtyOperation {
+impl Operation for MarkDirtyOperation {
     type Output = ();
     type Error = MarkDirtyError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<()>, MarkDirtyError> {
         let Some(writes) = self.writes.take() else {
-            return smallvec![schedule_snapshot_publish()];
+            return Ok(Next::Call(schedule_snapshot_publish().into()));
         };
         self.marking = true;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.result.is_some() {
-            self.result = Some(Err(MarkDirtyError::UnexpectedEvent(event.label())));
-            return smallvec![];
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, MarkDirtyError> {
+        if std::mem::take(&mut self.marking) {
+            result.done()?;
+            return Ok(Next::Call(schedule_snapshot_publish().into()));
         }
-        match (std::mem::replace(&mut self.marking, false), event) {
-            (true, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                smallvec![schedule_snapshot_publish()]
-            }
-            (true, Event::Storage(StorageEvent::Error { error })) => {
-                self.result = Some(Err(error.into()));
-                smallvec![]
-            }
-            (false, Event::Task(_)) => {
-                self.result = Some(Ok(()));
-                smallvec![]
-            }
-            (_, event) => {
-                self.result = Some(Err(MarkDirtyError::UnexpectedEvent(event.label())));
-                smallvec![]
-            }
+        match result.event()? {
+            Event::Task(_) => Ok(Next::Done(())),
+            other => Err(MarkDirtyError::UnexpectedEvent(other.label())),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.result.unwrap_or(Err(MarkDirtyError::Unfinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -1140,6 +1005,7 @@ mod tests {
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
         UPLOAD_KEYSPACE,
     };
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -2683,9 +2549,7 @@ mod tests {
         let generation_two = Ulid::generate().to_bytes().to_vec();
         write_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec(), generation_two.clone()).await;
 
-        drive(ClearMarkersOperation::new(observed), &ctx)
-            .await
-            .unwrap();
+        clear_consumed_markers(&ctx, observed).await.unwrap();
 
         // The re-dirtied marker survives, keeping the retry signal for the racing
         // write's counter change.
@@ -2699,9 +2563,7 @@ mod tests {
             Key::from(DIRTY_GLOBAL_KEY.to_vec()),
             Value::from(generation_two),
         )];
-        drive(ClearMarkersOperation::new(observed), &ctx)
-            .await
-            .unwrap();
+        clear_consumed_markers(&ctx, observed).await.unwrap();
         assert!(
             read_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec())
                 .await
@@ -3072,15 +2934,6 @@ mod tests {
     // A state that expects no event must reject one instead of ignoring it.
     #[test]
     fn terminal_rejects_event() {
-        let load = || LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
-        for (_, effects, error) in rejects_events(load, sample_events, |_| false) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(error, LoadCountersError::UnexpectedEvent { .. }),
-                "{error:?}"
-            );
-        }
-
         let rebuild = || {
             let mut rebuild = RebuildStatsOperation::new();
             rebuild.start();
@@ -3106,52 +2959,65 @@ mod tests {
 }
 
 #[cfg(test)]
-mod state_machine_tests {
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+mod call_tests {
     use aruna_core::task::TaskEvent;
 
     use super::*;
 
-    fn read(value: Option<Value>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(USAGE_REBUILD_KEY.to_vec()),
-            value,
-        })
+    fn task(event: TaskEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Task(event)))
+    }
+
+    fn publish_call() -> Next<()> {
+        Next::Call(schedule_snapshot_publish().into())
     }
 
     #[test]
     fn marker_marks_incomplete() {
-        let marker_read = || {
-            Effect::Storage(StorageEffect::Read {
-                key_space: USAGE_STATS_KEYSPACE.to_string(),
-                key: Key::from(USAGE_REBUILD_KEY.to_vec()),
-                txn_id: None,
-            })
-        };
+        let marker_read = || read_row(USAGE_STATS_KEYSPACE, USAGE_REBUILD_KEY.to_vec());
         for (value, complete) in [(None, true), (Some(Value::from(vec![1])), false)] {
             let mut operation = UsageCompleteOperation::new();
-            check_trace(
-                &mut operation,
-                &[marker_read()],
-                vec![(read(value), vec![])],
-            );
-            assert_eq!(operation.finalize(), Ok(complete));
+            assert_eq!(operation.first(), Ok(Next::Call(marker_read())));
+            let answer = IoResult::Values(vec![value]);
+            assert_eq!(operation.next(answer), Ok(Next::Done(complete)));
         }
-        let mut failed = UsageCompleteOperation::new();
-        failed.start();
-        failed.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(failed.finalize(), Err(StorageError::Timeout));
-        let refusals = rejects_events(UsageCompleteOperation::new, sample_events, |_| false);
-        assert_eq!(refusals.len(), sample_events().len());
-        let mut started = UsageCompleteOperation::new();
-        check_abort(&mut started, &[]);
-        started.start();
-        check_abort(&mut started, &[]);
-        rejects_finalize(started);
+        let mut wrong = UsageCompleteOperation::new();
+        wrong.first().unwrap();
+        assert!(wrong.next(IoResult::Done).is_err());
+        assert!(wrong.abort().is_empty());
+    }
+
+    #[test]
+    fn loads_one_counter() {
+        let key = usage_group_key(ulid::Ulid::from_parts(6, 6));
+        let mut missing = LoadCountersOperation::new(key.clone());
+        assert_eq!(
+            missing.first(),
+            Ok(Next::Call(read_row(USAGE_STATS_KEYSPACE, key.clone())))
+        );
+        let answer = IoResult::Values(vec![None]);
+        assert_eq!(
+            missing.next(answer),
+            Ok(Next::Done(UsageCounters::default()))
+        );
+        let mut broken = LoadCountersOperation::new(key);
+        broken.first().unwrap();
+        let answer = IoResult::Values(vec![Some(Value::from(vec![0xff]))]);
+        assert!(broken.next(answer).is_err());
+    }
+
+    #[test]
+    fn loads_global_shards() {
+        let mut operation = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Read(global_shard_rows())))
+        );
+        let answer = IoResult::Values(vec![None; global_shard_rows().len()]);
+        assert_eq!(
+            operation.next(answer),
+            Ok(Next::Done(UsageCounters::default()))
+        );
     }
 
     #[test]
@@ -3159,84 +3025,39 @@ mod state_machine_tests {
         let group = ulid::Ulid::from_parts(6, 6);
         let generation = ulid::Ulid::from_parts(1, 1);
         let mut mark = MarkDirtyOperation::new([group], generation);
-        let write = Effect::Storage(StorageEffect::BatchWrite {
-            writes: dirty_rows([group], generation),
-            txn_id: None,
-        });
-        let scheduled = Event::Task(TaskEvent::TimerScheduled {
+        assert_eq!(
+            mark.first(),
+            Ok(Next::Call(IoCall::Write(dirty_rows([group], generation))))
+        );
+        assert_eq!(mark.next(IoResult::Done), Ok(publish_call()));
+        let scheduled = task(TaskEvent::TimerScheduled {
             key: TaskKey::PublishUsageSnapshots,
             after: SNAPSHOT_PUBLISH_DEBOUNCE,
         });
-        let written = Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        });
-        check_trace(
-            &mut mark,
-            &[write],
-            vec![
-                (written, vec![schedule_snapshot_publish()]),
-                (scheduled, vec![]),
-            ],
-        );
-        assert_eq!(mark.finalize(), Ok(()));
+        assert_eq!(mark.next(scheduled), Ok(Next::Done(())));
         // A refused timer still ends the wake; the markers wait for the next publish.
         let mut wake = MarkDirtyOperation::wake();
-        let refused = Event::Task(TaskEvent::Error {
+        assert_eq!(wake.first(), Ok(publish_call()));
+        let refused = task(TaskEvent::Error {
             key: None,
             message: "no task handle".to_string(),
         });
-        check_trace(
-            &mut wake,
-            &[schedule_snapshot_publish()],
-            vec![(refused, vec![])],
-        );
-        assert_eq!(wake.finalize(), Ok(()));
-        let mut failed = MarkDirtyOperation::new([group], generation);
-        failed.start();
-        failed.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(
-            failed.finalize(),
-            Err(MarkDirtyError::Storage(StorageError::Timeout))
-        );
+        assert_eq!(wake.next(refused), Ok(Next::Done(())));
     }
 
     #[test]
     fn marking_rejects_stray() {
-        let marking = || {
-            let mut operation =
-                MarkDirtyOperation::new([ulid::Ulid::from_parts(6, 6)], ulid::Ulid::nil());
-            operation.start();
-            operation
-        };
-        let write = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::BatchWriteResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (label, effects, error) in rejects_events(marking, sample_events, write) {
-            assert!(effects.is_empty(), "{label}");
-            assert!(
-                matches!(error, MarkDirtyError::UnexpectedEvent(_)),
-                "{label}"
-            );
-        }
-        let waking = || {
-            let mut operation = MarkDirtyOperation::wake();
-            operation.start();
-            operation
-        };
-        let task = |event: &Event| matches!(event, Event::Task(_));
-        for (label, _, error) in rejects_events(waking, sample_events, task) {
-            assert!(
-                matches!(error, MarkDirtyError::UnexpectedEvent(_)),
-                "{label}"
-            );
-        }
-        let mut open = marking();
-        check_abort(&mut open, &[]);
-        rejects_finalize(open);
+        let mut marking =
+            MarkDirtyOperation::new([ulid::Ulid::from_parts(6, 6)], ulid::Ulid::nil());
+        marking.first().unwrap();
+        assert!(marking.next(IoResult::Values(vec![None])).is_err());
+        let mut waking = MarkDirtyOperation::wake();
+        waking.first().unwrap();
+        let stray = IoResult::Event(Box::new(Event::Search()));
+        assert!(matches!(
+            waking.next(stray),
+            Err(MarkDirtyError::UnexpectedEvent(_))
+        ));
+        assert!(waking.abort().is_empty());
     }
 }

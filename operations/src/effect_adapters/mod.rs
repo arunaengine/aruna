@@ -130,6 +130,22 @@ async fn dispatch_unboxed(
             context.notify_dashboard_change();
             Event::Net(NetEvent::Recorded)
         }
+        Effect::Net(NetEffect::LocalNode) => {
+            let node = context.net_handle.as_ref().map(|net| net.node_id());
+            Event::Net(NetEvent::LocalNode(node))
+        }
+        Effect::Net(NetEffect::WatchHolders {
+            realm_id,
+            path,
+            kind,
+        }) => {
+            let holders = context.net_handle.as_ref().map(|net| {
+                let interest = net.watch_interest_snapshot();
+                let holders = interest.matching_nodes(realm_id, &path, kind);
+                (net.node_id(), holders)
+            });
+            Event::Net(NetEvent::WatchHolders(holders))
+        }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
             Some(outbound) => Event::Outbound(Box::pin(outbound.run(effect)).await),

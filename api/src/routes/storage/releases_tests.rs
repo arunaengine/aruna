@@ -348,7 +348,10 @@ async fn purge_keeps_pinned() {
     use crate::routes::storage::deletion::{PurgeScopeRequest, SubmitPurgeRequest, submit_purge};
     use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
     use aruna_operations::driver::drive;
-    use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_pinned, refuse_scope};
+    use aruna_operations::driver::drive;
+    use aruna_operations::s3::object::delete::pinned::{
+        PinnedError, RefusePinnedOperation, RefuseScopeOperation,
+    };
     use aruna_operations::s3::object::delete::{
         DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
     };
@@ -379,7 +382,11 @@ async fn purge_keeps_pinned() {
     };
     let caller = &node.owner;
     let context = state.get_ctx();
-    let refused = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", pinned)).await;
+    let refused = drive(
+        RefusePinnedOperation::new(scope, caller, ("db/a.fasta", pinned)),
+        context.as_ref(),
+    )
+    .await;
     assert!(
         matches!(refused, Err(PinnedError::Version { .. })),
         "the pinned version is kept: {refused:?}"
@@ -388,23 +395,33 @@ async fn purge_keeps_pinned() {
     let (realm, node_id) = (state.get_realm_id(), state.get_node_id());
     let path = object_permission_path(realm, node.group_id, node_id, BUCKET, "db/a.fasta");
     let blind = limited(&node, &[(path, Permission::WRITE)]);
-    let refused = refuse_pinned(context.as_ref(), scope, &blind, ("db/a.fasta", pinned)).await;
+    let refused = drive(
+        RefusePinnedOperation::new(scope, &blind, ("db/a.fasta", pinned)),
+        context.as_ref(),
+    )
+    .await;
     assert!(matches!(refused, Err(PinnedError::Version { .. })));
     let file = StoragePurgeScope::File {
         bucket: BUCKET.to_string(),
         key: "db/a.fasta".to_string(),
     };
-    let refused = refuse_scope(context.as_ref(), scope, &blind, &file).await;
+    let refused = drive(
+        RefuseScopeOperation::new(scope, &blind, &file),
+        context.as_ref(),
+    )
+    .await;
     assert_eq!(refused, Err(PinnedError::Scope));
     // The newer version and the release crate itself belong to no release.
-    let newer = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
+    let newer = drive(
+        RefusePinnedOperation::new(scope, caller, ("db/a.fasta", current)),
+        context.as_ref(),
+    )
+    .await;
     let guards = newer.expect("no release pins the newer version");
     let crate_version = release.version_id.parse().unwrap();
-    let own = refuse_pinned(
+    let own = drive(
+        RefusePinnedOperation::new(scope, caller, ("db/release.json", crate_version)),
         context.as_ref(),
-        scope,
-        caller,
-        ("db/release.json", crate_version),
     );
     assert!(own.await.is_ok());
     // A release published after the check pins the newer version: the checked delete fails.
@@ -423,12 +440,16 @@ async fn purge_keeps_pinned() {
     .with_fence(guards, Vec::new());
     let raced = drive(delete, context.as_ref()).await;
     assert_eq!(raced, Err(DeleteObjectError::FenceTaken));
-    let again = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
+    let again = drive(
+        RefusePinnedOperation::new(scope, caller, ("db/a.fasta", current)),
+        context.as_ref(),
+    )
+    .await;
     assert!(matches!(again, Err(PinnedError::Version { .. })));
 
     let shared = context.as_ref();
     let purge = |purged: StoragePurgeScope| async move {
-        refuse_scope(shared, scope, caller, &purged).await
+        drive(RefuseScopeOperation::new(scope, caller, &purged), shared).await
     };
     let file = StoragePurgeScope::File {
         bucket: BUCKET.to_string(),

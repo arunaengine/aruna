@@ -32,7 +32,7 @@ use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
-use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
+use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation};
 use crate::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
@@ -647,7 +647,7 @@ async fn delete_local_bucket(
             restrictions: None,
             guards: Vec::new(),
         };
-        for outcome in delete_objects(context, input).await {
+        for outcome in drive(BulkDeleteOperation::new(input), context).await? {
             match outcome.result {
                 Ok(_) | Err(DeleteObjectError::NoSuchVersion) => {}
                 Err(error) => return Err(error.into()),

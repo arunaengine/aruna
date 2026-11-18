@@ -36,7 +36,7 @@ pub struct LookupKeysOperation {
     lookups: BTreeMap<UserId, KeyLookup>,
 }
 
-type Lookups = BTreeMap<UserId, KeyLookup>;
+pub type Lookups = BTreeMap<UserId, KeyLookup>;
 
 impl LookupKeysOperation {
     pub fn new(

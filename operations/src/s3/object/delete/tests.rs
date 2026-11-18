@@ -25,7 +25,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_storage::storage;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -636,7 +636,7 @@ async fn creates_tombstone() {
     std::fs::create_dir_all(&blob_root).unwrap();
 
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -790,7 +790,7 @@ async fn deletes_version() {
     std::fs::create_dir_all(&blob_root).unwrap();
 
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -1615,7 +1615,7 @@ async fn bucket_rows_sum() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(

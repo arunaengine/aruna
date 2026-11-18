@@ -8,10 +8,10 @@ use super::{GitError, publish, records, repository};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::resolve::{RESOLVE_BUDGET, resolve_version, version_found};
+use crate::driver::{DriverContext, drive, drive_until};
 use tokio::time::Instant;
-use crate::driver::{DriverContext, drive_until};
 use crate::replication::bao_read::BaoReadError;
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use aruna_core::git::{LfsObject, StoredObject};
 use aruna_core::stream::BackendStream;
@@ -53,7 +53,12 @@ async fn permit(
         if permission != Permission::READ {
             return Err(GitError::Invalid);
         }
-        return match managed_read(context, object.node_id, described(auth, object)).await {
+        return match drive(
+            ManagedReadOperation::new(object.node_id, described(auth, object)),
+            context,
+        )
+        .await
+        {
             Ok(_) => Ok(()),
             Err(BaoReadError::Refused(_)) => Err(GitError::NotFound),
             Err(_) => Err(GitError::Unavailable),
@@ -114,9 +119,12 @@ pub(super) async fn readable(
                 .is_ok_and(|found| found.is_some())
         }
         (true, None) => false,
-        (false, _) => managed_read(context, object.node_id, described(auth, object))
-            .await
-            .is_ok(),
+        (false, _) => drive(
+            ManagedReadOperation::new(object.node_id, described(auth, object)),
+            context,
+        )
+        .await
+        .is_ok(),
     }
 }
 
