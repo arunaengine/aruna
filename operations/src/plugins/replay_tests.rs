@@ -449,7 +449,7 @@ mod replay_pass {
     }
 
     #[test]
-    fn silent_clock_starts_anyway() {
+    fn silent_clock_starts() {
         let mut plans = plans();
         plans.planned(start_plan(Some(node(1))));
         let clock = child_result(Ok::<Option<u64>, IoError>(None));

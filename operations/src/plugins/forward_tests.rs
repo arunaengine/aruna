@@ -709,7 +709,7 @@ mod outbox_pass {
     }
 
     #[test]
-    fn store_failure_keeps_backoff() {
+    fn failure_keeps_backoff() {
         let mut send = pass(OutboxRoute::Remote);
         send.backoff.failed(node(2), 50);
         send.first().unwrap();

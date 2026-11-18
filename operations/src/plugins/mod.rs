@@ -63,6 +63,7 @@ pub mod calls;
 #[path = "fixtures_tests.rs"]
 pub(crate) mod fixtures;
 #[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_flows.rs"]
 pub mod flow_support;
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "store_tests.rs"]
