@@ -994,17 +994,23 @@ async fn aborted_purge_releases() {
     .await;
     // A page planned before the abort stays in the cleanup queue, released once it ended.
     let versions: Vec<_> = list_linked(&context).await;
-    let found = aruna_operations::blob::purge::storage_files(
+    let found = drive(
+        aruna_operations::blob::purge::StorageFilesOperation::new(
+            aruna_operations::driver::node_routing(&context.driver),
+            ("bucket", context.group_id),
+            &versions,
+            None,
+        ),
         &context.driver,
-        ("bucket", context.group_id),
-        &versions,
-        None,
     )
     .await
     .unwrap();
-    aruna_operations::blob::purge::plan_files(&context.driver, job.job_id.as_ulid(), &found)
-        .await
-        .unwrap();
+    drive(
+        aruna_operations::blob::purge::PlanFilesOperation::new(job.job_id.as_ulid(), &found),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let pause = PausePurgeOperation::new(job.job_id.as_ulid(), true);
     drive(pause, &context.driver).await.unwrap();
     job.cancel.cancel();
@@ -1065,17 +1071,23 @@ async fn cancelled_queue_releases() {
     );
     insert_job(&context.driver, &record).await.unwrap();
     let versions = list_linked(&context).await;
-    let found = aruna_operations::blob::purge::storage_files(
+    let found = drive(
+        aruna_operations::blob::purge::StorageFilesOperation::new(
+            aruna_operations::driver::node_routing(&context.driver),
+            ("bucket", context.group_id),
+            &versions,
+            None,
+        ),
         &context.driver,
-        ("bucket", context.group_id),
-        &versions,
-        None,
     )
     .await
     .unwrap();
-    aruna_operations::blob::purge::plan_files(&context.driver, job_id.as_ulid(), &found)
-        .await
-        .unwrap();
+    drive(
+        aruna_operations::blob::purge::PlanFilesOperation::new(job_id.as_ulid(), &found),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let storage = &context.driver.storage_handle;
     assert_eq!(releases(storage).await.len(), 1);
 

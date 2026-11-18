@@ -493,7 +493,10 @@ mod tests {
                 .collect();
             feed(
                 &mut operation,
-                page(values, Some(format!("cursor-{page}").into())),
+                IoResult::Page {
+                    rows: values,
+                    next: Some(format!("cursor-{page}").into()),
+                },
                 &mut output,
             );
             remaining -= page_len;

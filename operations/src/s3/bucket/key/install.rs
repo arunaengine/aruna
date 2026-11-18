@@ -368,6 +368,7 @@ mod tests {
     use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::operation::Runnable;
     use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_core::structs::identity::realm::RealmId;

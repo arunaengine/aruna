@@ -16,16 +16,13 @@ use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{
     ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BUCKET_KEY_KEYSPACE,
 };
 use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, check_copy, copy_envelope, create_envelope, create_parameters,
 };
-use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyRecord, EncryptionMode, public_key_of,
-};
+use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode, public_key_of};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionKind, TransitionTarget,
@@ -461,7 +458,7 @@ async fn copy_resets_page() {
     };
     assert_eq!(drive(raced, &context).await, Err(KeyError::Conflict));
     let kept = get(storage, ABE_REKEY_KEYSPACE, id).await.unwrap();
-    assert_eq!(kept.as_ref(), &reset[..]);
+    assert_eq!(kept, reset);
 }
 
 /// A walk over one pending copy row, stopped at the step after its quota read.

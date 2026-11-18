@@ -15,10 +15,6 @@ const BUCKET_ID: Ulid = Ulid::from_bytes([7; 16]);
 
 type Turn = Result<Next<ChangeResult>, ChangeError>;
 
-fn row(value: Option<Value>) -> IoResult {
-    IoResult::Values(vec![value])
-}
-
 fn keyed_rows(values: Vec<(Key, Option<Value>)>) -> IoResult {
     IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
 }
@@ -234,7 +230,7 @@ fn locking_needs_recovery() {
     // Without ready holders a vault_locked generation would be lost, and the node copy is
     // never written for it.
     let mut operation = operation(settings_change(EncryptionMode::VaultLocked));
-    loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new());
+    loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new()).unwrap();
 
     let effects = generated(&mut operation);
 
@@ -318,7 +314,7 @@ fn combined_change_reencodes() {
             .input
             .lookups
             .insert(admin(), KeyLookup::Keys(vec![holder.clone()]));
-        loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new());
+        loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new()).unwrap();
         let effects = generated(&mut operation);
         let Effect::Blob(BlobEffect::SealHolderCopies { key, .. }) = asked(&effects) else {
             panic!("expected holder copies")
@@ -491,7 +487,7 @@ fn unlocking_adds_copy() {
     let key = BucketKeyRef::new(BUCKET_ID, 1);
     assert_eq!(
         asked(&effects),
-        Effect::Blob(BlobEffect::ReadUnlockedKey { key })
+        &Effect::Blob(BlobEffect::ReadUnlockedKey { key })
     );
 
     let private_key = SharedSecret::new(SecretBytes::new(vec![4; 32]));
@@ -513,12 +509,10 @@ fn unlocking_adds_copy() {
 #[test]
 fn locked_bucket_stays() {
     let mut operation = operation(settings_change(EncryptionMode::NodeManaged));
-    loaded(&mut operation, EncryptionMode::VaultLocked, Vec::new());
+    loaded(&mut operation, EncryptionMode::VaultLocked, Vec::new()).unwrap();
 
     let locked = BucketKeyError::Locked(BUCKET_ID);
-    operation
-        .next(blob(BlobEvent::Error(locked.clone().into())))
-        .unwrap();
+    let effects = operation.next(blob(BlobEvent::Error(locked.clone().into())));
 
     assert_eq!(
         effects,
@@ -618,7 +612,7 @@ fn change_writes_audit() {
     use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
     use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
     let mut change = operation(KeyChange::Rotate);
-    loaded(&mut change, EncryptionMode::NodeManaged, Vec::new());
+    loaded(&mut change, EncryptionMode::NodeManaged, Vec::new()).unwrap();
     let rotation = rows(&generated(&mut change));
     let record = BucketAuditRecord::from_bytes(&row(&rotation, BUCKET_AUDIT_KEYSPACE)).unwrap();
     assert_eq!(record.action, AuditAction::Rotation);

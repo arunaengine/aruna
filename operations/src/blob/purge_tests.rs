@@ -259,12 +259,18 @@ async fn plans_until_ended() {
         )];
         let context = context.clone();
         async move {
-            batch(&context, read)
-                .await
-                .unwrap()
-                .pop()
-                .flatten()
-                .is_some()
+            let read = aruna_core::effects::StorageEffect::BatchRead {
+                reads: read,
+                txn_id: None,
+            };
+            let answer = context.storage_handle.send_storage_effect(read).await;
+            let aruna_core::events::Event::Storage(
+                aruna_core::events::StorageEvent::BatchReadResult { values },
+            ) = answer
+            else {
+                panic!("the claim read failed");
+            };
+            values[0].1.is_some()
         }
     };
     assert!(!claimed(&context).await);

@@ -441,7 +441,12 @@ mod tests {
         let read = operation.next(net(NetEvent::LocalNode(Some(node()))));
         assert!(matches!(read, Ok(Next::Call(IoCall::Read(_)))));
         let document = RealmConfigDocument::new(realm(), Vec::new(), 1);
-        let value = document.to_bytes().unwrap().into();
+        let actor = aruna_core::structs::identity::auth::Actor {
+            node_id: node(),
+            user_id: UserId::nil(realm()),
+            realm_id: realm(),
+        };
+        let value = document.to_bytes(&actor).unwrap().into();
         let turn = operation.next(IoResult::Values(vec![Some(value)]));
         assert_eq!(turn, Ok(Next::Done(false)));
     }

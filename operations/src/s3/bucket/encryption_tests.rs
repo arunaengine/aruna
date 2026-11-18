@@ -267,11 +267,6 @@ fn bucket_read(
     settings: Option<BucketEncryption>,
 ) -> Turn {
     operation.first().unwrap();
-    operation
-        .next(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9; 16]),
-        }))
-        .unwrap();
     let values = authority_rows(&bucket(), settings.as_ref(), &[user(2)]);
     let effects = operation.next(keyed_rows(values));
     match operation.state {
@@ -286,11 +281,6 @@ fn mapped_refuses_encryption() {
     let mut operation =
         EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, BTreeMap::new()));
     operation.first().unwrap();
-    operation
-        .next(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9; 16]),
-        }))
-        .unwrap();
     let values = authority_rows(&bucket(), None, &[user(2)]);
     operation.next(keyed_rows(values)).unwrap();
     let rule = BackendImport {
@@ -337,7 +327,7 @@ fn decryption_blocks_enable() {
     let kind = TransitionKind::Decrypt;
     let mut decrypt = EncryptionTransition::new(kind, Some(source), target, 1, 1);
     let read = |operation: &mut EnableEncryptionOperation, transition: &EncryptionTransition| {
-        bucket_read(operation, Some(decrypted.clone()));
+        bucket_read(operation, Some(decrypted.clone())).unwrap();
         operation.next(page(Vec::new(), None)).unwrap();
         let effects = no_versions(operation);
         assert!(matches!(
@@ -387,7 +377,7 @@ fn open_uploads_conflict() {
 
     let mut operation =
         EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, BTreeMap::new()));
-    bucket_read(&mut operation, None);
+    bucket_read(&mut operation, None).unwrap();
     let upload = MultipartUpload {
         upload_id: Ulid::generate(),
         backend: BackendRef::node_default(),
@@ -417,11 +407,6 @@ fn revoked_enabler_refused() {
     let lookups = BTreeMap::from([(user(1), keys(user(1), true))]);
     let mut operation = EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, lookups));
     operation.first().unwrap();
-    operation
-        .next(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9; 16]),
-        }))
-        .unwrap();
     let values = authority_rows(&bucket(), None, &[]);
     let effects = operation.next(keyed_rows(values));
     assert!(matches!(effects, Err(EnableError::NotAdmin)));
@@ -443,7 +428,7 @@ fn oversized_copy_refused() {
     let run = |size: u64| {
         let mut operation =
             EnableEncryptionOperation::new(input(EncryptionMode::NodeManaged, BTreeMap::new()));
-        bucket_read(&mut operation, None);
+        bucket_read(&mut operation, None).unwrap();
         operation.next(page(Vec::new(), None)).unwrap();
         let hash = [7u8; 32];
         let version = BlobVersion::materialized(
@@ -487,7 +472,7 @@ fn oversized_copy_refused() {
         (operation, effects)
     };
 
-    let (operation, effects) = run(MAX_SIZE + 1);
+    let (_, effects) = run(MAX_SIZE + 1);
     assert_eq!(
         effects,
         Err(EnableError::Blob(BlobError::SizeLimitExceeded {

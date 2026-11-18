@@ -1005,6 +1005,7 @@ mod tests {
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
         UPLOAD_KEYSPACE,
     };
+    use aruna_core::operation::EffectOperation;
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;

@@ -38,7 +38,7 @@ use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::cleanup::process_cleanup_batch;
-use aruna_operations::blob::purge::{scope_totals, storage_files};
+use aruna_operations::blob::purge::{StorageFilesOperation, scope_totals};
 use aruna_operations::blob::unify::{Unified, preview_page, unify};
 use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::backends::record_writes;
@@ -787,9 +787,17 @@ async fn s3_purges_named() {
     ]
     .map(|(key, id)| (key.to_string(), id));
     let scope = (BUCKET, context.group_id);
-    let files = storage_files(&context.driver, scope, &versions, Some(&spec.scope))
-        .await
-        .unwrap();
+    let files = drive(
+        StorageFilesOperation::new(
+            node_routing(&context.driver),
+            scope,
+            &versions,
+            Some(&spec.scope),
+        ),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let kept: Vec<_> = (files.iter()).map(|file| file.kept.is_some()).collect();
     assert_eq!(kept, [false, true]);
 
