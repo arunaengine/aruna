@@ -19,9 +19,10 @@ use ulid::Ulid;
 
 use super::*;
 use crate::driver::{drive, node_routing};
-use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use crate::jobs::executor::{JobRunOutcome, ProgressReporter};
 use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput};
 use crate::s3::object::search_scan::search_local_objects;
+use crate::tasks::job_context::JobContext;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use aruna_core::time::unix_timestamp_millis;
 

@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use super::job_context::JobContext;
-use crate::driver::{DriverContext, drive, node_routing};
+use crate::driver::{drive, node_routing};
 use crate::effect_adapters::job::{JobHost, with_job_host};
 use crate::jobs::backend_import::{BackendImportOperation, ImportJob};
 use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns};
@@ -28,7 +28,6 @@ use crate::jobs::workflow::purge::{PurgeJobOperation, PurgeRun};
 
 /// The running job's signals and shared state, as its operations reach them through effects.
 struct ContextHost {
-    driver: Arc<DriverContext>,
     cancel: CancellationToken,
     shutdown: CancellationToken,
     progress: ProgressReporter,
@@ -90,7 +89,6 @@ where
     O::Error: Display,
 {
     let host = Arc::new(ContextHost {
-        driver: ctx.driver.clone(),
         cancel: ctx.cancel.clone(),
         shutdown: ctx.shutdown.clone(),
         progress: ctx.progress.clone(),

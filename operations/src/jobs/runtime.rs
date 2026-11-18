@@ -14,8 +14,9 @@ use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::executor::{PayloadHandler, ProgressReporter, RangeTurns};
+use super::executor::{ProgressReporter, RangeTurns};
 use super::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
+use crate::tasks::job_context::PayloadHandler;
 use crate::tasks::job_reconcile::ExternalReconciler;
 
 struct RunningJob {
@@ -453,7 +454,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_MAX_ATTEMPTS;
-    use crate::jobs::executor::{JobContext, JobRunOutcome};
+    use crate::jobs::executor::JobRunOutcome;
     use crate::jobs::runtime_steps::requeue_call;
     use crate::jobs::store::JobMutation;
     use crate::jobs::store::JobMutationError;
@@ -463,6 +464,7 @@ mod tests {
         list_job_entries, mutate_job, read_job_record, record_attempt_intent, requeue_job,
         set_cancel_requested,
     };
+    use crate::tasks::job_context::JobContext;
     use crate::tasks::job_runner::{handle_panic, run_job};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;

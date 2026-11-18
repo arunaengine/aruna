@@ -13,7 +13,7 @@ use super::supervise::WalltimeAnchorOperation;
 use super::*;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::effect_adapters::job::with_job_host;
-use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use crate::jobs::executor::{JobRunOutcome, ProgressReporter};
 use crate::jobs::store::job_calls::ClaimOutcome;
 use crate::jobs::store::test_calls::{
     begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,
@@ -22,6 +22,7 @@ use crate::jobs::store::test_calls::{
 };
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::tasks::job_context::JobContext;
 use crate::tasks::job_runner::{execution_host, resume_attempt as run_resume, run_execution_job};
 use crate::tasks::job_runner::{run_wiring, under_lease};
 use aruna_compute::ExecutorBackend;

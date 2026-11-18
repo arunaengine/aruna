@@ -10,7 +10,7 @@ use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::job::{CopyJobSpec, JobError, JobResultPayload};
 use aruna_core::structs::storage::blob::BucketInfo;
 
-use super::executor::{JobContext, JobRunOutcome};
+use super::executor::JobRunOutcome;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{drive, node_routing};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -20,6 +20,7 @@ use crate::s3::object::copy::{
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::PutObjectError;
+use crate::tasks::job_context::JobContext;
 
 /// How often the bytes pulled so far reach the job's progress.
 const PROGRESS_TICK: Duration = Duration::from_secs(1);
