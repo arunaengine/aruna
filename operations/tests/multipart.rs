@@ -30,8 +30,10 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_net::dht::storage::decode_entries;
-use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::blob::cleanup::{
+    CleanupNode, ProcessCleanupOperation, SweepUploadsOperation,
+};
+use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
@@ -113,7 +115,15 @@ fn stream_from_bytes(
 // Completion defers part and duplicate deletes to the blob cleanup queue, which
 // production drains on a timer; tests drive that drain explicitly.
 async fn drain_cleanup(context: &TestContext) {
-    let outcome = process_cleanup_batch(&context.driver).await.unwrap();
+    let outcome = drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome.failed, 0);
     assert_eq!(outcome.dropped, 0);
 }
@@ -1701,7 +1711,9 @@ async fn sweep_reclaims_upload() {
     stale.completing_since_ms = Some(now - 3 * 60 * 60 * 1000);
     write_upload(&context, &stale).await;
 
-    let outcome = sweep_stale_uploads(&context.driver, now).await.unwrap();
+    let outcome = drive(SweepUploadsOperation::new(now), &context.driver)
+        .await
+        .unwrap();
 
     assert_eq!(outcome.aborted, 1);
     assert_eq!(outcome.failed, 0);
@@ -1740,9 +1752,12 @@ async fn sweep_finishes_abort() {
     halted.status = MultipartUploadStatus::Aborting;
     write_upload(&context, &halted).await;
 
-    let outcome = sweep_stale_uploads(&context.driver, unix_timestamp_millis())
-        .await
-        .unwrap();
+    let outcome = drive(
+        SweepUploadsOperation::new(unix_timestamp_millis()),
+        &context.driver,
+    )
+    .await
+    .unwrap();
 
     assert_eq!((outcome.aborted, outcome.failed), (1, 0));
     assert!(read_upload(&context, upload.upload_id).await.is_none());
@@ -1941,7 +1956,15 @@ async fn s3_provider_flow() {
     let slot = aborted.backend_upload.clone().unwrap().location;
     let load = || bucket_load(&context, &slot);
     let before = load().await;
-    process_cleanup_batch(&context.driver).await.unwrap();
+    drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(load().await, before);
     upload_part_bytes(
         &context,
@@ -1988,7 +2011,15 @@ async fn s3_provider_flow() {
     let lost_path = lost.get_storage_path().unwrap();
     native.create(&lost_path).await.unwrap();
     write_target_row(&context, Ulid::generate(), &lost).await;
-    process_cleanup_batch(&context.driver).await.unwrap();
+    drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(native.abort_path(&lost_path).await.unwrap(), 0);
 }
 
@@ -2051,7 +2082,15 @@ async fn orphan_target_discarded() {
     completed.ulid = Ulid::from_parts(1, 8);
     write_target_row(&context, Ulid::generate(), &completed).await;
 
-    process_cleanup_batch(&context.driver).await.unwrap();
+    drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
 
     assert!(exists(fresh.get_full_path().unwrap()).unwrap());
     assert!(!exists(stale.get_full_path().unwrap()).unwrap());

@@ -1125,9 +1125,17 @@ async fn cancelled_queue_releases() {
         backend.to_bytes().unwrap(),
     )
     .await;
-    let outcome = aruna_operations::blob::cleanup::process_cleanup_batch(&context.driver)
-        .await
-        .unwrap();
+    let outcome = drive(
+        aruna_operations::blob::cleanup::ProcessCleanupOperation::new(
+            aruna_operations::blob::cleanup::CleanupNode {
+                routing: aruna_operations::driver::node_routing(&context.driver),
+                has_blob: context.driver.blob_handle.is_some(),
+            },
+        ),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!((outcome.processed, outcome.dropped), (1, 0), "{outcome:?}");
     assert!(releases(storage).await.is_empty());
 }
@@ -1235,11 +1243,12 @@ async fn purge_releases_copies() {
     let location = seed_linked(&context, "linked/a.txt", version_id).await;
     let copy = seed_copy(&context, ("linked/a.txt", version_id), &location).await;
     let spec = files_spec(&context);
-    let readable = |_: &str| true;
-    let totals =
-        aruna_operations::blob::purge::scope_totals(&context.driver, &spec.scope, &readable)
-            .await
-            .unwrap();
+    let totals = aruna_operations::blob::purge::ScopeTotalsOperation::new(
+        aruna_operations::driver::node_routing(&context.driver),
+        &spec.scope,
+        aruna_operations::blob::migration::misplaced::AnyKey,
+    );
+    let totals = drive(totals, &context.driver).await.unwrap();
     assert_eq!((totals.storage_files, totals.storage_bytes), (2, 8));
     let job = claimed_job(
         context.driver.clone(),
