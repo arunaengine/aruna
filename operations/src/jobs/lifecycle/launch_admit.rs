@@ -318,3 +318,589 @@ impl Operation for CommitReceiptOperation {
         }
     }
 }
+
+#[derive(Debug, PartialEq)]
+enum PullStep {
+    Fetch,
+    Append(Vec<JobRecordFrame>),
+}
+
+/// Pulls one bounded page of the family from its holders, so a target that has not synchronized
+/// the spec, claim or budget yet can still admit the launch. Failures only leave it unsynced.
+#[derive(Debug, PartialEq)]
+struct PullFamilyOperation {
+    fetch: Option<FetchFamilyOperation>,
+    node: LaunchNode,
+    origin: RecordOrigin,
+    step: PullStep,
+}
+
+impl PullFamilyOperation {
+    fn new(
+        config: &RealmConfigDocument,
+        family: JobFamilyId,
+        scheduler: NodeId,
+        node: &LaunchNode,
+    ) -> Self {
+        let fetch = config
+            .family_placement(family.submission_id)
+            .ok()
+            .map(|placement| {
+                let mut holders = resolve_shard_holders(config, &placement);
+                holders.retain(|holder| *holder != scheduler);
+                holders.truncate(MAX_RECORD_HOLDERS.saturating_sub(1));
+                holders.insert(0, scheduler);
+                let family = (family.submission_id, family.request_digest);
+                FetchFamilyOperation::new(placement, holders, family, FETCH_DEADLINE)
+            });
+        Self {
+            fetch,
+            node: node.clone(),
+            origin: RecordOrigin::Local,
+            step: PullStep::Fetch,
+        }
+    }
+
+    fn append_next(&mut self, mut frames: Vec<JobRecordFrame>) -> Result<Next<()>, IoError> {
+        let Some(frame) = frames.pop() else {
+            return Ok(Next::Done(()));
+        };
+        self.step = PullStep::Append(frames);
+        let append = self.node.append(frame, self.origin);
+        Ok(Next::Call(IoCall::child(append)))
+    }
+}
+
+impl Operation for PullFamilyOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(match self.fetch.take() {
+            Some(fetch) => Next::Call(IoCall::child(fetch)),
+            None => Next::Done(()),
+        })
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        match std::mem::replace(&mut self.step, PullStep::Fetch) {
+            PullStep::Fetch => {
+                let Ok((source, mut frames)) = result.child::<FetchedFamily, LifecycleError>()?
+                else {
+                    return Ok(Next::Done(()));
+                };
+                self.origin = source.map_or(RecordOrigin::Local, RecordOrigin::Peer);
+                // Taken from the end, so the fetched order stays the append order.
+                frames.reverse();
+                self.append_next(frames)
+            }
+            PullStep::Append(frames) => {
+                let _ = result.child::<AppendOutcome, RecordStoreError>()?;
+                self.append_next(frames)
+            }
+        }
+    }
+}
+
+/// This node as a launch offer sees it. The limits are its advertisement for the offered
+/// executor kind; `None` means that kind is not offered here.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LaunchNode {
+    pub(crate) local: NodeId,
+    pub(crate) realm_id: RealmId,
+    pub(crate) now_ms: u64,
+    pub(crate) execution_id: Ulid,
+    pub(crate) limits: Option<ResourceEnvelope>,
+}
+
+impl LaunchNode {
+    fn append(&self, record: JobRecordFrame, origin: RecordOrigin) -> AppendRecordOperation {
+        AppendRecordOperation::new(AppendRecordConfig {
+            realm_id: self.realm_id,
+            local_node_id: self.local,
+            record,
+            local: None,
+            origin,
+            now_ms: self.now_ms,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum AdmitStep {
+    Config,
+    Records,
+    Pull,
+    RecordsAfterPull,
+    SpecInputs,
+    PlannedInputs(Box<LogicalJobSpec>),
+    Append { retried: bool },
+    PullBeforeAppend,
+    Decide,
+    Checks,
+    Membership(Box<ExecutorCapability>),
+    Sign(Box<PreparedReceipt>),
+    Commit,
+    Replay,
+}
+
+/// What the reservation needs besides the receipt being signed.
+#[derive(Debug, PartialEq)]
+struct PreparedReceipt {
+    job_id: JobId,
+    subject_generation: u64,
+    subject_digest: [u8; 32],
+    record: JobRecord,
+}
+
+/// Admits one offered launch, or answers why it was refused.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AdmitLaunchOperation {
+    launch: LaunchFrame,
+    node: LaunchNode,
+    config: Option<RealmConfigDocument>,
+    intent: Option<LaunchIntent>,
+    spec: Option<LogicalJobSpec>,
+    planned: Option<LaunchIntent>,
+    step: AdmitStep,
+}
+
+type AdmitNext = Result<Next<LaunchAnswer>, LaunchUndecided>;
+
+impl AdmitLaunchOperation {
+    pub(crate) fn new(launch: LaunchFrame, node: LaunchNode) -> Self {
+        Self {
+            launch,
+            node,
+            config: None,
+            intent: None,
+            spec: None,
+            planned: None,
+            step: AdmitStep::Config,
+        }
+    }
+
+    fn family(&self) -> JobFamilyId {
+        self.launch.envelope().family()
+    }
+
+    fn intent(&self) -> Result<&LaunchIntent, LaunchUndecided> {
+        self.intent.as_ref().ok_or(LaunchUndecided)
+    }
+
+    fn config(&self) -> Result<&RealmConfigDocument, LaunchUndecided> {
+        self.config.as_ref().ok_or(LaunchUndecided)
+    }
+
+    fn call(&mut self, step: AdmitStep, call: IoCall) -> AdmitNext {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn read_records(&mut self, step: AdmitStep) -> AdmitNext {
+        let read = LoadFamilyOperation::family(self.family());
+        self.call(step, IoCall::child(read))
+    }
+
+    fn pull(&mut self, step: AdmitStep) -> AdmitNext {
+        let scheduler = self.intent()?.scheduler_node_id;
+        let pull = PullFamilyOperation::new(self.config()?, self.family(), scheduler, &self.node);
+        self.call(step, IoCall::child(pull))
+    }
+
+    fn configured(&mut self, config: RealmConfigDocument) -> AdmitNext {
+        let envelope = self.launch.envelope();
+        let JobFamilyRecord::Launch(intent) = &envelope.record else {
+            return Ok(Next::Done(LaunchAnswer::declined(
+                LaunchDecline::Unauthorized,
+            )));
+        };
+        let intent = intent.as_ref().clone();
+        if intent.target.node_id != self.node.local {
+            // The offer names another node; this target has nothing to admit.
+            return Ok(Next::Done(LaunchAnswer::declined(
+                LaunchDecline::Unauthorized,
+            )));
+        }
+        let view = FamilyView::resolve(&config, self.node.realm_id, envelope.family())
+            .ok_or(LaunchUndecided)?;
+        if !view.holds(intent.scheduler_node_id) {
+            return Ok(Next::Done(LaunchAnswer::declined(LaunchDecline::NotHolder)));
+        }
+        self.config = Some(config);
+        self.intent = Some(intent);
+        self.read_records(AdmitStep::Records)
+    }
+
+    /// Paged inputs are read once here, so every check sees the full lists; the signed launch
+    /// itself stays as offered, because its receipt binds that exact record.
+    fn read_inputs(&mut self, spec: LogicalJobSpec) -> AdmitNext {
+        let node = Some((self.node.local, self.node.realm_id));
+        let fill = SpecInputsOperation::new(&spec, node);
+        self.call(AdmitStep::SpecInputs, IoCall::child(fill))
+    }
+
+    /// The launch becomes a retained record before it can be receipted.
+    fn append_launch(&mut self, retried: bool) -> AdmitNext {
+        let frame =
+            JobRecordFrame::new(self.launch.envelope().clone()).map_err(|_| LaunchUndecided);
+        let origin = RecordOrigin::Peer(self.intent()?.scheduler_node_id);
+        let append = self.node.append(frame?, origin);
+        self.call(AdmitStep::Append { retried }, IoCall::child(append))
+    }
+
+    fn decide(&mut self, records: Vec<JobRecordEnvelope>) -> AdmitNext {
+        let family = self.family();
+        let intent = self.intent()?;
+        // A replayed offer re-arms the wakeups the first acceptance may have lost,
+        // so the receipt still replicates and the execution still starts.
+        if let Some(decision) = existing_receipt(&records, intent) {
+            self.step = AdmitStep::Replay;
+            let settle = SettleLaunchOperation::new(decision);
+            return Ok(Next::Call(IoCall::child(settle)));
+        }
+        if cancelled(family, &records) {
+            return Ok(Next::Done(LaunchAnswer::declined(LaunchDecline::Cancelled)));
+        }
+        if already_running(family, &records, self.node.local) {
+            return Ok(Next::Done(LaunchAnswer::declined(
+                LaunchDecline::AlreadyRunning,
+            )));
+        }
+        let check = LaunchCheck {
+            config: self.config()?.clone(),
+            local: self.node.local,
+            planned: self.planned.clone().ok_or(LaunchUndecided)?,
+            spec: self.spec.clone().ok_or(LaunchUndecided)?,
+            now_ms: self.node.now_ms,
+        };
+        let checks = LaunchChecksOperation::new(check);
+        self.call(AdmitStep::Checks, IoCall::child(checks))
+    }
+
+    fn checked(&mut self, capability: ExecutorCapability) -> AdmitNext {
+        let spec = self.spec.as_ref().ok_or(LaunchUndecided)?;
+        let Some(limits) = self.node.limits else {
+            return Ok(Next::Done(LaunchAnswer::declined(LaunchDecline::Draining)));
+        };
+        if !limits.fits(&spec.resources) {
+            return Ok(Next::Done(LaunchAnswer::declined(LaunchDecline::Capacity)));
+        }
+        let read = ReadInfoOperation::new(vec![self.node.local]);
+        self.call(
+            AdmitStep::Membership(Box::new(capability)),
+            IoCall::child(read),
+        )
+    }
+
+    /// Mints the local execution identity and asks for the receipt that authorizes it, leaving
+    /// the reservation transaction as the only thing still to commit.
+    fn sign(&mut self, capability: &ExecutorCapability, generation: u64) -> AdmitNext {
+        let node = &self.node;
+        let spec = self.spec.as_ref().ok_or(LaunchUndecided)?;
+        let intent = self.intent()?;
+        let planned = self.planned.as_ref().ok_or(LaunchUndecided)?;
+        let limits = node.limits.ok_or(LaunchUndecided)?;
+        let declined = |reason| Ok(Next::Done(LaunchAnswer::declined(reason)));
+        let subject = node.execution_id.to_bytes();
+        let Ok(job_id) = mint_configured_job(self.config()?, node.local, &subject) else {
+            return declined(LaunchDecline::Draining);
+        };
+        let record = match materialize_local(spec, planned, job_id, node.local, node.now_ms) {
+            Ok(record) => record,
+            Err(reason) => return declined(reason),
+        };
+        let Ok(launch_digest) = JobRecordBody::digest(intent) else {
+            return declined(LaunchDecline::Unauthorized);
+        };
+        let receipt = ExecutionReceipt {
+            execution_id: node.execution_id,
+            physical_job_id: job_id,
+            launch_id: intent.launch_id,
+            launch_digest,
+            submission_id: spec.submission_id,
+            request_digest: spec.request_digest,
+            job_id: spec.job_id,
+            executor_node_id: node.local,
+            target: intent.target.clone(),
+            spec_digest: spec.spec_digest,
+            membership_generation: generation,
+            subject_generation: capability.subject.generation,
+            subject_digest: capability.subject_digest,
+            accepted_at_ms: node.now_ms,
+        };
+        let claim = ExecutionClaim {
+            realm_id: node.realm_id,
+            record: JobFamilyRecord::Receipt(Box::new(receipt)),
+            publisher: node.local,
+        };
+        let prepared = PreparedReceipt {
+            job_id,
+            subject_generation: capability.subject.generation,
+            subject_digest: capability.subject_digest,
+            record,
+        };
+        let effect = Effect::Net(NetEffect::ExecutionSign(Box::new(claim)));
+        self.call(
+            AdmitStep::Sign(Box::new(prepared)),
+            IoCall::Effect(Box::new(effect)),
+        )
+    }
+
+    fn commit(&mut self, prepared: PreparedReceipt, signed: IoResult) -> AdmitNext {
+        let expected = "Event::Net(NetEvent::ExecutionSign)";
+        let IoResult::Event(event) = signed else {
+            let got = signed.label();
+            return Err(IoError::Unexpected { expected, got }.into());
+        };
+        let envelope = match *event {
+            Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Signed(envelope))) => envelope,
+            Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Unavailable(_))) => {
+                return Ok(Next::Done(LaunchAnswer::declined(
+                    LaunchDecline::Unauthorized,
+                )));
+            }
+            _ => {
+                let got = "another event";
+                return Err(IoError::Unexpected { expected, got }.into());
+            }
+        };
+        let Ok(frame) = JobRecordFrame::new(*envelope) else {
+            return Ok(Next::Done(LaunchAnswer::declined(
+                LaunchDecline::Unauthorized,
+            )));
+        };
+        let node = &self.node;
+        let spec = self.spec.as_ref().ok_or(LaunchUndecided)?;
+        let intent = self.intent()?.clone();
+        let config = ReserveExecutionConfig {
+            realm_id: node.realm_id,
+            local_node_id: node.local,
+            envelope: node.limits.ok_or(LaunchUndecided)?,
+            receipt: frame,
+            launch: Box::new(intent.clone()),
+            job_id: prepared.job_id,
+            logical_job_id: spec.job_id,
+            execution_id: node.execution_id,
+            resources: spec.resources,
+            subject_generation: prepared.subject_generation,
+            subject_digest: prepared.subject_digest,
+            record: Box::new(prepared.record),
+            now_ms: node.now_ms,
+        };
+        let commit = CommitReceiptOperation::new(config, intent);
+        self.call(AdmitStep::Commit, IoCall::child(commit))
+    }
+}
+
+impl Operation for AdmitLaunchOperation {
+    type Output = LaunchAnswer;
+    type Error = LaunchUndecided;
+
+    fn first(&mut self) -> AdmitNext {
+        let read = GetConfigOperation::new(self.node.realm_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> AdmitNext {
+        match std::mem::replace(&mut self.step, AdmitStep::Commit) {
+            AdmitStep::Config => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                self.configured(config.map_err(|_| LaunchUndecided)?)
+            }
+            AdmitStep::Records => match spec_of(&family_read(result)?, self.intent()?) {
+                Some(spec) => self.read_inputs(spec),
+                None => self.pull(AdmitStep::Pull),
+            },
+            AdmitStep::Pull => {
+                let _ = result.child::<(), IoError>()?;
+                self.read_records(AdmitStep::RecordsAfterPull)
+            }
+            AdmitStep::RecordsAfterPull => {
+                let spec = spec_of(&family_read(result)?, self.intent()?);
+                self.read_inputs(spec.ok_or(LaunchUndecided)?)
+            }
+            AdmitStep::SpecInputs => {
+                let spec = result.child::<LogicalJobSpec, PageReadError>()?;
+                let spec = spec.map_err(|_| LaunchUndecided)?;
+                let node = Some((self.node.local, self.node.realm_id));
+                let read = PlannedInputsOperation::new(self.intent()?, node);
+                self.call(
+                    AdmitStep::PlannedInputs(Box::new(spec)),
+                    IoCall::child(read),
+                )
+            }
+            AdmitStep::PlannedInputs(spec) => {
+                let inputs = result.child::<Vec<PlannedInput>, PageReadError>()?;
+                let mut planned = self.intent()?.clone();
+                planned.inputs = inputs.map_err(|_| LaunchUndecided)?;
+                planned.input_pages = None;
+                self.spec = Some(*spec);
+                self.planned = Some(planned);
+                self.append_launch(false)
+            }
+            AdmitStep::Append { retried } => {
+                let appended = result.child::<AppendOutcome, RecordStoreError>()?;
+                let kept = appended.is_ok_and(|outcome| {
+                    matches!(
+                        outcome.admission,
+                        Admission::Authentic | Admission::Duplicate
+                    )
+                });
+                match (kept, retried) {
+                    (true, _) => self.read_records(AdmitStep::Decide),
+                    // Missing family evidence is fetched before the offer stays undecided.
+                    (false, false) => self.pull(AdmitStep::PullBeforeAppend),
+                    (false, true) => Err(LaunchUndecided),
+                }
+            }
+            AdmitStep::PullBeforeAppend => {
+                let _ = result.child::<(), IoError>()?;
+                self.append_launch(true)
+            }
+            AdmitStep::Decide => self.decide(family_read(result)?),
+            AdmitStep::Checks => match result.child::<Verdict, CheckError>()? {
+                Ok(Ok(capability)) => self.checked(capability),
+                Ok(Err(reason)) => Ok(Next::Done(LaunchAnswer::declined(reason))),
+                Err(_) => Err(LaunchUndecided),
+            },
+            AdmitStep::Membership(capability) => {
+                let info = result.child::<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>()?;
+                let generation = info
+                    .ok()
+                    .and_then(|mut documents| documents.remove(&self.node.local))
+                    .map(|document| document.epoch.membership_generation)
+                    .unwrap_or_default();
+                self.sign(&capability, generation)
+            }
+            AdmitStep::Sign(config) => self.commit(*config, result),
+            AdmitStep::Commit => {
+                let answer = result.child::<LaunchAnswer, LaunchUndecided>()??;
+                if answer.decision.is_ok() {
+                    info!(
+                        job_id = %self.spec.as_ref().ok_or(LaunchUndecided)?.job_id,
+                        execution_id = %self.node.execution_id,
+                        "Target admitted a launch and stored its receipt"
+                    );
+                }
+                Ok(Next::Done(answer))
+            }
+            AdmitStep::Replay => {
+                let answer = result.child::<LaunchAnswer, LaunchUndecided>()??;
+                Ok(Next::Done(answer))
+            }
+        }
+    }
+}
+
+fn materialize_local(
+    spec: &LogicalJobSpec,
+    intent: &LaunchIntent,
+    job_id: aruna_core::structs::execution::job::JobId,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<JobRecord, LaunchDecline> {
+    let mut payload = spec.payload.clone();
+    for input in &mut payload.inputs {
+        let Some(pin) = intent
+            .inputs
+            .iter()
+            .find(|pin| pin.destination_key == input.dest_key)
+        else {
+            return Err(LaunchDecline::Unauthorized);
+        };
+        let InputSource::S3 { version_id, .. } = &mut input.source;
+        *version_id = Some(pin.version_id.to_string());
+        // The plan picked which holder the bytes come from; no source means the
+        // target already holds the compliant copy.
+        input.source_node_id = pin.source_node_id.or(Some(local));
+    }
+    payload.resources.cpu_cores = Some(spec.resources.cpu_cores);
+    payload.resources.ram_bytes = Some(spec.resources.ram_bytes);
+    // A stored disk of zero is the absence of a request, not a zero-byte
+    // ceiling: storing it as `Some(0)` is a spec every backend refuses.
+    payload.resources.disk_bytes =
+        (spec.resources.disk_bytes > 0).then_some(spec.resources.disk_bytes);
+    payload.resources.max_walltime_ms = Some(spec.resources.max_walltime_ms);
+    payload.resources.preemptible = spec.resources.preemptible;
+    payload.executor_constraint = Some(intent.target.executor_kind.clone());
+    let (mode, bucket) = workspace_of(&spec.payload);
+    let (physical_mode, physical_bucket) = match mode {
+        WorkspaceMode::Existing if local != spec.ingress_node_id => {
+            return Err(LaunchDecline::Unauthorized);
+        }
+        WorkspaceMode::Existing => (mode, bucket),
+        WorkspaceMode::None => (mode, None),
+    };
+    let mut record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(payload),
+        spec.created_by,
+        local,
+        now_ms,
+        now_ms,
+        None,
+    );
+    record.retention_ms = spec.retention_ms;
+    record.workspace_mode = physical_mode;
+    record.workspace_bucket = physical_bucket;
+    record.captured_inputs = spec.captured_inputs.clone();
+    Ok(record)
+}
+
+/// The stored spec the launch names, by its exact digest.
+fn spec_of(records: &[JobRecordEnvelope], intent: &LaunchIntent) -> Option<LogicalJobSpec> {
+    records.iter().find_map(|envelope| match &envelope.record {
+        JobFamilyRecord::Spec(spec) if spec.spec_digest == intent.spec_digest => {
+            Some(spec.as_ref().clone())
+        }
+        _ => None,
+    })
+}
+
+/// The receipt this target already issued for the same launch id. A different
+/// launch digest under one id is a conflict, never a second acceptance.
+pub(crate) fn existing_receipt(
+    records: &[JobRecordEnvelope],
+    intent: &LaunchIntent,
+) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    let digest = aruna_core::structs::execution::job::JobRecordBody::digest(intent).ok()?;
+    records.iter().find_map(|envelope| match &envelope.record {
+        JobFamilyRecord::Receipt(receipt) if receipt.launch_id == intent.launch_id => {
+            match receipt.launch_digest == digest {
+                true => Some(
+                    ReceiptFrame::new(envelope.clone()).map_err(|_| LaunchDecline::LaunchConflict),
+                ),
+                false => Some(Err(LaunchDecline::LaunchConflict)),
+            }
+        }
+        _ => None,
+    })
+}
+
+/// An execution of the same family this node already accepted. A second launch
+/// is refused while that execution may finish, after success, and after permanent
+/// failure, so one family never runs twice here. The refusal is retryable.
+pub(crate) fn already_running(
+    family: JobFamilyId,
+    records: &[JobRecordEnvelope],
+    local: NodeId,
+) -> bool {
+    let Ok(Some(projection)) = reduce_family(family, records) else {
+        return false;
+    };
+    projection.executions.iter().any(|execution| {
+        execution.executor_node_id == local
+            && (!execution.state.is_terminal()
+                || matches!(
+                    execution.state,
+                    PhysicalExecutionState::Succeeded | PhysicalExecutionState::Failed
+                ))
+    })
+}
+
+fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
+    records.iter().any(|envelope| {
+        matches!(&envelope.record, JobFamilyRecord::Cancel(_)) && envelope.family() == family
+    })
+}
