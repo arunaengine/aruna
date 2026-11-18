@@ -13,13 +13,15 @@ use ed25519_dalek::SigningKey;
 use serde_json::json;
 
 use super::*;
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::{Fixture, REALM_KEY};
-use crate::plugins::install::{pick_version, read_config, read_manifest};
+use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::secret_use::slot_kind;
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
-use aruna_core::plugins::Refusal;
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugins::{Refusal, ReleaseError};
 use aruna_core::secrets::UseRule;
 use ulid::Ulid;
 
@@ -214,13 +216,11 @@ async fn node_binding_checks() {
     let remote = check_node_binding(&fixture.ctx, (local, receiver), &name, &bearer).await;
     assert_eq!(remote, Err(NodeCheckError::Unavailable));
     // Only a management node may ask a receiver.
-    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap();
-    let served = node_check_for(&fixture.ctx, (&config, receiver), &name, &bearer).await;
-    assert_eq!(served, Err(NodeCheckError::Forbidden));
-    let asked = node_check_for(&fixture.ctx, (&config, local), &name, &bearer).await;
-    assert_eq!(asked, Ok(None));
+    let place = (fixture.actor.realm_id, local);
+    let check = |peer| ServeNodeCheck::new(place, peer, name.clone(), bearer.clone());
+    let served = drive(check(receiver), &fixture.ctx).await;
+    assert_eq!(served, Err(NodeCheckFailure(NodeCheckError::Forbidden)));
+    assert_eq!(drive(check(local), &fixture.ctx).await, Ok(None));
 }
 
 #[tokio::test]
@@ -377,4 +377,136 @@ async fn delivery_clashes() {
     let selected = selected.unwrap().unwrap();
     assert!(delivery_clash(&manifest, "hook_key", &selected.settings));
     assert!(!delivery_clash(&manifest, "api_key", &selected.settings));
+}
+
+mod operations {
+    use aruna_core::plugins::NodeCheckError;
+
+    use super::*;
+    use crate::document_repository::GetConfigError;
+    use crate::metadata::protocol::MetadataTransportMessage;
+    use crate::plugins::entry::EntryError;
+    use crate::plugins::fixtures::{
+        self, config_result, is_child, is_effect, node, peer_says, peer_silent,
+    };
+    use crate::plugins::rows::tests::{child_result, values_result};
+
+    fn key() -> (SecretName, SecretKind) {
+        let name = SecretName::try_from("key".to_string()).unwrap();
+        (name, SecretKind::parse("bearer").unwrap())
+    }
+
+    fn checked(result: Result<Option<String>, NodeCheckFailure>) -> IoResult {
+        child_result(result)
+    }
+
+    fn slots(requested: &[(&str, &str)], receiver: Option<NodeId>) -> BindSlots {
+        let extra = json!({
+            "secrets": { "hook_key": { "title": "Hook key", "kind": "bearer" } }
+        });
+        let plugin = fixtures::plugin(extra);
+        let manifest = read_manifest(&plugin).unwrap();
+        let install = fixtures::install();
+        let place = BindPlace {
+            group_id: install.group_id,
+            local: Some(node(3)),
+            receiver,
+        };
+        let requested = (requested.iter())
+            .map(|(slot, text)| (slot.to_string(), text.to_string()))
+            .collect();
+        let config = Arc::new(fixtures::config(&install, json!({})));
+        BindSlots::new(config, place, &manifest, &requested)
+    }
+
+    #[test]
+    fn slots_refuse_unknown() {
+        let mut bind = slots(&[("other", "group:key")], None);
+        assert!(matches!(bind.first(), Err(BindError::Invalid(_))));
+        let mut bind = slots(&[("hook_key", "node:key")], None);
+        assert!(matches!(bind.first(), Err(BindError::Unavailable(_))));
+    }
+
+    #[test]
+    fn slots_read_group() {
+        let mut bind = slots(&[], None);
+        assert!(is_child(&bind.first()));
+        let none = child_result(Ok::<Option<SecretEntry>, EntryError>(None));
+        assert!(matches!(bind.next(none), Err(BindError::Invalid(_))));
+    }
+
+    #[test]
+    fn slots_check_node() {
+        let requested = [("hook_key", "node:key")];
+        let mut bind = slots(&requested, Some(node(1)));
+        assert!(is_child(&bind.first()));
+        let Ok(Next::Done((bound, warnings))) = bind.next(checked(Ok(None))) else {
+            panic!("a checked node secret binds the slot");
+        };
+        assert!(bound.contains_key("hook_key"));
+        assert_eq!(warnings.len(), 1);
+        let mut silent = slots(&requested, Some(node(1)));
+        silent.first().unwrap();
+        let failed = NodeCheckFailure(NodeCheckError::Unavailable);
+        let answer = silent.next(checked(Err(failed)));
+        assert!(matches!(answer, Err(BindError::Unavailable(_))));
+        let mut missing = slots(&requested, Some(node(1)));
+        missing.first().unwrap();
+        let failed = NodeCheckFailure(NodeCheckError::Missing);
+        assert!(matches!(
+            missing.next(checked(Err(failed))),
+            Err(BindError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn node_secret_missing() {
+        let (name, kind) = key();
+        let mut fits = NodeSecretFits::new(&name, &kind);
+        assert!(matches!(fits.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let missing = NodeCheckFailure(NodeCheckError::Missing);
+        assert_eq!(fits.next(values_result(vec![None])), Err(missing));
+    }
+
+    #[test]
+    fn binding_asks_receiver() {
+        let (name, kind) = key();
+        let mut here = CheckNodeBinding::new((node(3), node(3)), &name, &kind);
+        assert!(is_child(&here.first()));
+        let header = Some("x-key".to_string());
+        let answer = here.next(checked(Ok(header.clone())));
+        assert_eq!(answer, Ok(Next::Done(header.clone())));
+        let mut there = CheckNodeBinding::new((node(3), node(1)), &name, &kind);
+        assert!(is_effect(&there.first()));
+        let result = Ok(header.clone());
+        let said = peer_says(
+            node(1),
+            &MetadataTransportMessage::NodeSecretChecked { result },
+        );
+        assert_eq!(there.next(said), Ok(Next::Done(header)));
+        let silent = NodeCheckFailure(NodeCheckError::Unavailable);
+        assert_eq!(there.next(peer_silent(node(1))), Err(silent));
+    }
+
+    #[test]
+    fn serve_refuses_devices() {
+        let (name, kind) = key();
+        let place = (fixtures::realm(), node(1));
+        let mut device = ServeNodeCheck::new(place, node(4), name.clone(), kind.clone());
+        assert!(is_child(&device.first()));
+        let refused = NodeCheckFailure(NodeCheckError::Forbidden);
+        let answer = device.next(config_result(fixtures::realm_nodes()));
+        assert_eq!(answer, Err(refused));
+        let mut server = ServeNodeCheck::new(place, node(3), name, kind);
+        server.first().unwrap();
+        assert!(is_child(
+            &server.next(config_result(fixtures::realm_nodes()))
+        ));
+        assert_eq!(server.next(checked(Ok(None))), Ok(Next::Done(None)));
+        let mut lost = ServeNodeCheck::new(place, node(3), key().0, key().1);
+        lost.first().unwrap();
+        let failed = child_result(Err::<RealmConfigDocument, _>(GetConfigError::NotFinished));
+        let unavailable = NodeCheckFailure(NodeCheckError::Unavailable);
+        assert_eq!(lost.next(failed), Err(unavailable));
+    }
 }
