@@ -410,54 +410,71 @@ mod tests {
         IoResult::Values(vec![value.map(Into::into)])
     }
 
-    /// Answers the bucket read and, once it passed, the migration read.
-    fn read_with(
-        operation: &mut PutCompressionOperation,
-        info: Option<BucketInfo>,
-        migration: Option<CompressionMigration>,
-    ) -> Effects {
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-        let mut effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"b".to_vec().into(),
-            value: info.map(|info| info.to_bytes().unwrap().into()),
-        }));
-        if operation.state == PutCompressionState::CheckLinks {
-            effects = operation.step(Event::Storage(StorageEvent::IterResult {
-                values: Vec::new(),
-                next_start_after: None,
-            }));
+    fn no_rules() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
         }
-        if operation.state != PutCompressionState::ReadMigration {
-            return effects;
-        }
-        let migration = migration.map(|record| record.to_bytes().unwrap().into());
-        operation.step(rows(migration, None, None))
     }
 
-    /// Answers the link scan of a compressing change with no rules.
-    fn no_links(operation: &mut PutCompressionOperation) {
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
+    fn put(compression: Compression) -> PutCompressionOperation {
+        PutCompressionOperation::new("b".to_string(), group(), compression, 5)
+    }
+
+    /// Runs up to the migration read of a bucket of this node's group.
+    fn at_rows(operation: &mut PutCompressionOperation, info: &BucketInfo) {
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
+        operation.next(row(Some(info.to_bytes().unwrap()))).unwrap();
+        if operation.state == PutCompressionState::CheckLinks {
+            operation.next(no_rules()).unwrap();
+        }
+        assert_eq!(operation.state, PutCompressionState::ReadMigration);
+    }
+
+    /// The answer to the read of migration, encryption settings and transition rows.
+    fn rows(
+        migration: Option<Value>,
+        settings: Option<Value>,
+        transition: Option<Value>,
+    ) -> IoResult {
+        IoResult::Values(vec![migration, settings, transition])
+    }
+
+    fn written(turn: &CompressionTurn) -> &Vec<(String, Key, Value)> {
+        match turn {
+            Ok(Next::Call(IoCall::Write(writes))) => writes,
+            other => panic!("expected one write, got {other:?}"),
+        }
+    }
+
+    fn woke(turn: CompressionTurn) -> Migration {
+        match turn {
+            Ok(Next::Then { output, calls }) => {
+                assert_eq!(calls.len(), 1);
+                assert!(matches!(
+                    &calls[0],
+                    IoCall::Effect(effect) if matches!(
+                        effect.as_ref(),
+                        Effect::Task(TaskEffect::ShortenTimer {
+                            key: TaskKey::MigrateCompression,
+                            ..
+                        })
+                    )
+                ));
+                output
+            }
+            other => panic!("expected the migration to be woken, got {other:?}"),
+        }
     }
 
     #[test]
     fn mapped_refuses_compression() {
         use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
-        let compression = Compression::Zstd { level: 3 };
-        let mut operation = PutCompressionOperation::new("b".to_string(), group(), compression, 1);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"b".to_vec().into(),
-            value: Some(bucket(group()).to_bytes().unwrap().into()),
-        }));
+        let mut operation = put(Compression::Zstd { level: 3 });
+        operation.first().unwrap();
+        let turn = operation.next(row(Some(bucket(group()).to_bytes().unwrap())));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
         let rule = BackendImport {
             import_id: Ulid::from_bytes([5; 16]),
             group_id: group(),
@@ -475,26 +492,11 @@ mod tests {
             write_prefix: None,
             write_pattern: PLAIN_PATTERN.to_string(),
         };
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(rule.key(), rule.to_bytes().unwrap().into())],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(operation.finalize(), Err(PutCompressionError::Mapped));
-    }
-
-    /// The answer to the read of migration, encryption settings and transition rows.
-    fn rows(migration: Option<Value>, settings: Option<Value>, transition: Option<Value>) -> Event {
-        let values = [migration, settings, transition];
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: values
-                .into_iter()
-                .map(|value| (b"b".to_vec().into(), value))
-                .collect(),
-        })
+        let page = IoResult::Page {
+            rows: vec![(rule.key(), rule.to_bytes().unwrap().into())],
+            next: None,
+        };
+        assert_eq!(operation.next(page), Err(PutCompressionError::Mapped));
     }
 
     fn encrypted() -> (BucketEncryption, BucketKeyRecord) {
@@ -514,7 +516,7 @@ mod tests {
     }
 
     /// The registry's answer: the active generation unlocked, or nothing unlocked.
-    fn status(record: &BucketKeyRecord, unlocked: bool) -> Event {
+    fn status(record: &BucketKeyRecord, unlocked: bool) -> IoResult {
         let session = UnlockStatus {
             key: record.key,
             session_id: Ulid::from_bytes([5; 16]),
@@ -526,70 +528,42 @@ mod tests {
             max_remaining: None,
         };
         let generations = if unlocked { vec![session] } else { Vec::new() };
-        Event::Blob(BlobEvent::KeyStatus { generations })
+        IoResult::Event(Box::new(Event::Blob(BlobEvent::KeyStatus { generations })))
     }
 
     #[test]
     fn locked_key_refuses() {
         // Nothing is written while the archives' key is locked on this node.
-        let zstd = Compression::Zstd { level: 7 };
-        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"b".to_vec().into(),
-            value: Some(bucket(group()).to_bytes().unwrap().into()),
-        }));
-        no_links(&mut operation);
+        let mut operation = put(Compression::Zstd { level: 7 });
+        at_rows(&mut operation, &bucket(group()));
         let (settings, record) = encrypted();
-        operation.step(rows(None, Some(settings.to_bytes().unwrap().into()), None));
-
-        let effects = operation.step(status(&record, false));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
+        operation
+            .next(rows(None, Some(settings.to_bytes().unwrap().into()), None))
+            .unwrap();
         let locked = BucketKeyError::Locked(record.key.bucket_id);
-        assert_eq!(operation.finalize(), Err(PutCompressionError::Key(locked)));
+        assert_eq!(
+            operation.next(status(&record, false)),
+            Err(PutCompressionError::Key(locked))
+        );
     }
 
     #[test]
     fn encrypted_change_reencodes() {
         // Archives re-encode through a transition; no plain migration would read them.
         let zstd = Compression::Zstd { level: 7 };
-        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"b".to_vec().into(),
-            value: Some(bucket(group()).to_bytes().unwrap().into()),
-        }));
-        no_links(&mut operation);
+        let mut operation = put(zstd);
+        at_rows(&mut operation, &bucket(group()));
         let (settings, record) = encrypted();
-        let effects = operation.step(rows(None, Some(settings.to_bytes().unwrap().into()), None));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ReadKeyStatus { .. })]
-        ));
-        let effects = operation.step(status(&record, true));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BUCKET_KEY_KEYSPACE
-        ));
+        let turn = operation.next(rows(None, Some(settings.to_bytes().unwrap().into()), None));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Effect(_)))));
+        let turn = operation.next(status(&record, true));
+        assert_eq!(
+            turn,
+            Ok(Next::Call(read_row(BUCKET_KEY_KEYSPACE, record.key.key())))
+        );
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"b".to_vec().into(),
-            value: Some(record.to_bytes().unwrap().into()),
-        }));
-
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}")
-        };
+        let turn = operation.next(row(Some(record.to_bytes().unwrap())));
+        let writes = written(&turn);
         let spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
         assert_eq!(
             spaces,
@@ -607,70 +581,35 @@ mod tests {
         assert_eq!(transition.source, Some(record.key));
         assert_eq!(transition.target.compression, zstd);
         assert_eq!(transition.target.plan.unwrap().storage_generation, 8);
-        assert!(matches!(
-            commit(&mut operation).as_slice(),
-            [Effect::Task(TaskEffect::ShortenTimer { .. })]
-        ));
-        assert_eq!(operation.finalize(), Ok(None));
+        assert_eq!(woke(operation.next(IoResult::Done)), None);
     }
 
     #[test]
     fn running_transition_conflicts() {
-        let zstd = Compression::Zstd { level: 7 };
-        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"b".to_vec().into(),
-            value: Some(bucket(group()).to_bytes().unwrap().into()),
-        }));
-        no_links(&mut operation);
+        let mut operation = put(Compression::Zstd { level: 7 });
+        at_rows(&mut operation, &bucket(group()));
         let target = TransitionTarget {
             compression: Compression::Off,
             plan: None,
         };
         let running = EncryptionTransition::new(TransitionKind::Decrypt, None, target, 3, 1);
-
-        let effects = operation.step(rows(None, None, Some(running.to_bytes().unwrap().into())));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
         assert_eq!(
-            operation.finalize(),
+            operation.next(rows(None, None, Some(running.to_bytes().unwrap().into()))),
             Err(PutCompressionError::TransitionRunning)
         );
-    }
-
-    fn commit(operation: &mut PutCompressionOperation) -> Effects {
-        let commit = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            commit.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: TxnId::default(),
-        }))
     }
 
     #[test]
     fn change_starts_migration() {
         // The setting and a fresh migration record commit together, then the task runs.
         let zstd = Compression::Zstd { level: 7 };
-        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
+        let mut operation = put(zstd);
+        at_rows(&mut operation, &bucket(group()));
 
-        let effects = read(&mut operation, Some(bucket(group())));
+        let turn = operation.next(rows(None, None, None));
 
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}")
-        };
-        let [(_, _, info), (space, _, record), (queue, _, _)] = writes.as_slice() else {
-            panic!("expected bucket, migration and queue rows, got {writes:?}")
+        let [(_, _, info), (space, _, record), (queue, _, _)] = written(&turn).as_slice() else {
+            panic!("expected bucket, migration and queue rows, got {turn:?}")
         };
         assert_eq!(queue, COMPRESSION_QUEUE_KEYSPACE);
         assert_eq!(BucketInfo::from_bytes(info).unwrap().compression, zstd);
@@ -679,33 +618,19 @@ mod tests {
             CompressionMigration::from_bytes(record).unwrap(),
             CompressionMigration::new(zstd, 5)
         );
-        let scheduled = commit(&mut operation);
-        assert!(matches!(
-            scheduled.as_slice(),
-            [Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::MigrateCompression,
-                ..
-            })]
-        ));
         assert_eq!(
-            operation.finalize(),
-            Ok(Some(CompressionMigration::new(zstd, 5)))
+            woke(operation.next(IoResult::Done)),
+            Some(CompressionMigration::new(zstd, 5))
         );
     }
 
     #[test]
     fn unchanged_stays_idle() {
-        let mut operation =
-            PutCompressionOperation::new("b".to_string(), group(), Compression::Off, 5);
-
-        let effects = read(&mut operation, Some(bucket(group())));
-
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}")
-        };
-        assert_eq!(writes.len(), 1);
-        assert!(commit(&mut operation).is_empty());
-        assert_eq!(operation.finalize(), Ok(None));
+        let mut operation = put(Compression::Off);
+        at_rows(&mut operation, &bucket(group()));
+        let turn = operation.next(rows(None, None, None));
+        assert_eq!(written(&turn).len(), 1);
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(None)));
     }
 
     #[test]
@@ -717,75 +642,69 @@ mod tests {
         let mut failed = CompressionMigration::new(zstd, 1);
         failed.failed = 2;
         failed.finished_at_ms = Some(4);
-        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
-
-        let effects = read_with(&mut operation, Some(info.clone()), Some(failed));
-
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}")
-        };
-        assert_eq!(writes.len(), 3);
-        assert_eq!(commit(&mut operation).len(), 1);
-        let fresh = CompressionMigration::new(zstd, 5);
-        assert_eq!(operation.finalize(), Ok(Some(fresh)));
+        let mut operation = put(zstd);
+        at_rows(&mut operation, &info);
+        let turn = operation.next(rows(Some(failed.to_bytes().unwrap().into()), None, None));
+        assert_eq!(written(&turn).len(), 3);
+        assert_eq!(
+            woke(operation.next(IoResult::Done)),
+            Some(CompressionMigration::new(zstd, 5))
+        );
 
         let running = CompressionMigration::new(zstd, 1);
-        let mut operation = PutCompressionOperation::new("b".to_string(), group(), zstd, 5);
-        let effects = read_with(&mut operation, Some(info), Some(running.clone()));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected one batch write, got {effects:?}")
-        };
+        let mut operation = put(zstd);
+        at_rows(&mut operation, &info);
+        let turn = operation.next(rows(Some(running.to_bytes().unwrap().into()), None, None));
         // The bucket row and the queue entry; the running record stays as it is.
-        assert_eq!(writes.len(), 2);
-        assert!(matches!(
-            commit(&mut operation).as_slice(),
-            [Effect::Task(TaskEffect::ShortenTimer { .. })]
-        ));
-        assert_eq!(operation.finalize(), Ok(Some(running)));
+        assert_eq!(written(&turn).len(), 2);
+        assert_eq!(woke(operation.next(IoResult::Done)), Some(running));
     }
 
     #[test]
     fn refuses_bad_input() {
-        let mut level = PutCompressionOperation::new(
-            "b".to_string(),
-            group(),
-            Compression::Zstd { level: 40 },
-            5,
-        );
-        assert!(level.start().is_empty());
+        let mut level = put(Compression::Zstd { level: 40 });
         assert!(matches!(
-            level.finalize(),
+            level.first(),
             Err(PutCompressionError::ConversionError(_))
         ));
 
-        let mut missing =
-            PutCompressionOperation::new("b".to_string(), group(), Compression::Off, 5);
-        let effects = read(&mut missing, None);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(missing.finalize(), Err(PutCompressionError::NoSuchBucket));
+        let mut missing = put(Compression::Off);
+        missing.first().unwrap();
+        assert_eq!(
+            missing.next(row(None)),
+            Err(PutCompressionError::NoSuchBucket)
+        );
 
-        let mut foreign =
-            PutCompressionOperation::new("b".to_string(), group(), Compression::Off, 5);
-        read(&mut foreign, Some(bucket(Ulid::from_bytes([9u8; 16]))));
-        assert_eq!(foreign.finalize(), Err(PutCompressionError::GroupMismatch));
+        let mut foreign = put(Compression::Off);
+        foreign.first().unwrap();
+        let other = bucket(Ulid::from_bytes([9u8; 16])).to_bytes().unwrap();
+        assert_eq!(
+            foreign.next(row(Some(other))),
+            Err(PutCompressionError::GroupMismatch)
+        );
     }
 
     #[test]
-    fn rejects_wrong_event() {
-        let mut operation =
-            PutCompressionOperation::new("b".to_string(), group(), Compression::Off, 5);
-        operation.start();
+    fn rejects_wrong_result() {
+        let mut operation = put(Compression::Off);
+        operation.first().unwrap();
+        assert!(operation.next(IoResult::Done).is_err());
+    }
 
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"b".to_vec().into(),
-        }));
-
-        assert!(matches!(
-            operation.finalize(),
-            Err(PutCompressionError::InvalidStateEvent { .. })
-        ));
+    #[test]
+    fn reads_migration_status() {
+        let record = CompressionMigration::new(Compression::Off, 1);
+        let mut status = MigrationStatusOperation::new("b".to_string());
+        assert_eq!(
+            status.first(),
+            Ok(Next::Call(read_row(
+                COMPRESSION_MIGRATION_KEYSPACE,
+                b"b".to_vec()
+            )))
+        );
+        assert_eq!(
+            status.next(row(Some(record.to_bytes().unwrap()))),
+            Ok(Next::Done(Some(record)))
+        );
     }
 }
