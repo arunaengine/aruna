@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use aruna_core::time::unix_timestamp_millis;
+use tokio_util::sync::CancellationToken;
 
 /// Remote-recovery lifecycle. A locally safe node keeps serving while this is
 /// [`RecoveryState::Degraded`].
@@ -165,6 +166,13 @@ pub struct RecoveryStatus {
     inner: Arc<RecoveryInner>,
 }
 
+/// Two handles are equal when they share one status.
+impl PartialEq for RecoveryStatus {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
 impl RecoveryStatus {
     pub fn new() -> Self {
         Self::default()
@@ -229,7 +237,27 @@ impl RecoveryStatus {
     }
 }
 
+/// Asks a running recovery to stop at its next step; restore work stops between units.
 #[derive(Clone, Debug, Default)]
+pub struct RecoveryStop(CancellationToken);
+
+impl RecoveryStop {
+    pub fn new(token: CancellationToken) -> Self {
+        Self(token)
+    }
+
+    pub(crate) fn requested(&self) -> bool {
+        self.0.is_cancelled()
+    }
+}
+
+impl PartialEq for RecoveryStop {
+    fn eq(&self, other: &Self) -> bool {
+        self.requested() == other.requested()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RecoveryPass {
     pub(crate) unresolved_topics: BTreeSet<::irokle::TopicId>,
     pub(crate) unvisited_topics: usize,
@@ -249,7 +277,7 @@ pub(crate) struct RecoveryFailure {
     pub(crate) error: Option<RecoveryError>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RecoveryBaseline {
     fewest_topics: usize,
     error_cleared: bool,
@@ -273,7 +301,7 @@ impl RecoveryBaseline {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RecoveryRotation {
     unresolved_topics: BTreeSet<::irokle::TopicId>,
     error: Option<RecoveryError>,
@@ -369,7 +397,7 @@ pub(crate) fn apply_recovery_pass(
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct PhaseOutcome {
     pub(crate) progress: bool,
     pub(crate) error: Option<RecoveryError>,

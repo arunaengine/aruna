@@ -1327,6 +1327,8 @@ pub enum MetadataEffect {
         graph_iri: String,
     },
     ListGraphs,
+    /// Every live registry record of this node, from the metadata handle's cache.
+    CachedRecords,
     ContainsGraph {
         graph_iri: String,
     },
@@ -1427,6 +1429,7 @@ impl MetadataEffect {
             MetadataEffect::QueryGraphs { .. } => "query_graphs",
             MetadataEffect::DeleteGraph { .. } => "delete_graph",
             MetadataEffect::ListGraphs => "list_graphs",
+            MetadataEffect::CachedRecords => "cached_records",
             MetadataEffect::ContainsGraph { .. } => "contains_graph",
             MetadataEffect::ContainsDot { .. } => "contains_dot",
             MetadataEffect::PlanBatch { .. } => "plan_batch",
@@ -1478,6 +1481,7 @@ impl MetadataEffect {
                 .as_ref()
                 .and_then(|graph_iris| graph_iris.first().cloned()),
             MetadataEffect::ListGraphs
+            | MetadataEffect::CachedRecords
             | MetadataEffect::CheckStructure { .. }
             | MetadataEffect::CheckProfile { .. }
             | MetadataEffect::CachedShapes { .. }
@@ -1561,6 +1565,10 @@ pub enum MetadataEvent {
     },
     GraphListResult {
         graph_iris: Vec<String>,
+    },
+    CachedRecords {
+        records:
+            std::sync::Arc<Vec<crate::structs::storage::metadata_registry::MetadataRegistryRecord>>,
     },
     ContainsGraphResult {
         graph_iri: String,

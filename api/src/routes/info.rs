@@ -32,7 +32,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::PeerContacts;
-use aruna_operations::metadata::stats::{GroupCountOperation, count_realm_documents};
+use aruna_operations::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
 use aruna_operations::placement::mutation::PlacementMutationOperation;
@@ -1094,14 +1094,19 @@ pub(crate) async fn run_realm_info(
     let metadata_replication = RealmReplicationResponse {
         default_replication_factor: config.effective_replication_factor(),
     };
-    let live_datasets = match count_realm_documents(&state.get_ctx(), config.realm_id).await {
+    let live_datasets = match drive(
+        RealmDocumentsOperation::new(config.realm_id),
+        &state.get_ctx(),
+    )
+    .await
+    {
         Ok(count) => count,
         Err(error) => {
             warn!(error = %error, "metadata document count unavailable for public realm overview");
             None
         }
     };
-    let groups = match drive(GroupCountOperation::new(config.realm_id), &state.get_ctx()).await {
+    let groups = match drive(RealmGroupsOperation::new(config.realm_id), &state.get_ctx()).await {
         Ok(count) => Some(count),
         Err(error) => {
             warn!(error = %error, "group count unavailable for public realm overview");
@@ -2165,14 +2170,18 @@ pub async fn get_usage(
     response.realm.distinct_buckets = distinct_buckets(&state, None, response.realm.buckets).await;
     // Best effort: storage counters stay reportable when the metadata
     // subsystem cannot answer, and the omitted field never reads as zero.
-    response.metadata_documents =
-        match count_realm_documents(&state.get_ctx(), state.get_realm_id()).await {
-            Ok(count) => count,
-            Err(error) => {
-                warn!(error = %error, "metadata document count unavailable for usage response");
-                None
-            }
-        };
+    response.metadata_documents = match drive(
+        RealmDocumentsOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            warn!(error = %error, "metadata document count unavailable for usage response");
+            None
+        }
+    };
     Ok((StatusCode::OK, Json(response)))
 }
 

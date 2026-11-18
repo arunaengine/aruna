@@ -9,7 +9,7 @@ use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent, Metadat
 use aruna_core::telemetry::{record_elapsed_ms, record_error};
 use tracing::{Instrument, Span, debug_span, field};
 
-use super::lifecycle::{effect_rejects_deleted, metadata_graph_deleted};
+use super::lifecycle::{effect_rejects_deleted, list_local_records, metadata_graph_deleted};
 use super::search::list_visible_graphs;
 use super::{MetadataHandle, metadata_graph_fence};
 use crate::driver::DriverContext;
@@ -162,6 +162,15 @@ async fn run_effect(
                 error,
             },
         },
+        MetadataEffect::CachedRecords => {
+            match list_local_records(metadata.inner.clone(), graph).await {
+                Ok(records) => MetadataEvent::CachedRecords { records },
+                Err(error) => MetadataEvent::Error {
+                    graph_iri: None,
+                    error,
+                },
+            }
+        }
         other => {
             let mutates_graph = other.mutates_graph();
             let event = graph.run(other).await;

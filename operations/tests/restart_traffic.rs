@@ -17,7 +17,7 @@ use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::shard::restore::restore_shard_subscriptions;
+use aruna_operations::shard::restore::RestoreTopicsOperation;
 use aruna_operations::shard::restore_plan::RESTORE_TOPIC_COUNT;
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -97,7 +97,8 @@ async fn prepare_restart_state(
 
 async fn assert_restore_bound(node: &TestNode, realm_id: RealmId, created: &[(GroupId, Ulid)]) {
     // The startup restore touches O(held shards) topics, not O(documents).
-    let summary = restore_shard_subscriptions(&node.context, node.net.node_id(), realm_id).await;
+    let restore = RestoreTopicsOperation::new(node.net.node_id(), realm_id);
+    let summary = drive(restore, &node.context).await.expect("restore runs");
     println!(
         "restore summary: held_shards={} shard_topics={} shared_topics={} total={}",
         summary.held_shards,
@@ -436,22 +437,23 @@ fn spawn_recovery(
     tokio_util::sync::CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    use aruna_operations::shard::recovery::RecoveryStatus;
-    use aruna_operations::shard::restore::{RecoveryConfig, run_recovery};
+    use aruna_operations::node::recovery_run::{RecoveryConfig, RecoveryOperation};
+    use aruna_operations::shard::recovery::{RecoveryStatus, RecoveryStop};
     use tokio_util::sync::CancellationToken;
 
     let status = RecoveryStatus::new();
     let cancelled = CancellationToken::new();
-    let driver = tokio::spawn(run_recovery(
-        node.context.clone(),
-        RecoveryConfig {
-            realm_id,
-            node_id: node.net.node_id(),
-            publish_full_usage: false,
-        },
-        status.clone(),
-        cancelled.clone(),
-    ));
+    let config = RecoveryConfig {
+        realm_id,
+        node_id: node.net.node_id(),
+        publish_full_usage: false,
+    };
+    let stop = RecoveryStop::new(cancelled.clone());
+    let recovery = RecoveryOperation::new(&node.context, config, status.clone(), stop);
+    let context = node.context.clone();
+    let driver = tokio::spawn(async move {
+        drive(recovery, &context).await.expect("recovery runs");
+    });
     (status, cancelled, driver)
 }
 
@@ -555,13 +557,27 @@ async fn finish_outage(
     );
     // Each restored peer runs its own restore, as every configured node does.
     for peer in &nodes[1..] {
-        aruna_operations::shard::restore::restore_shard_subscriptions(
+        aruna_operations::driver::drive(
+            aruna_operations::shard::restore::RestoreTopicsOperation::new(
+                peer.net.node_id(),
+                realm_id,
+            ),
             &peer.context,
-            peer.net.node_id(),
-            realm_id,
         )
-        .await;
-        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, peer.net.node_id(), true), &peer.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        .await
+        .expect("shard topics restore");
+        aruna_operations::driver::drive(
+            aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(
+                realm_id,
+                peer.net.node_id(),
+                true,
+            ),
+            &peer.context,
+        )
+        .await
+        .unwrap_or_else(|_| {
+            aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure()
+        });
     }
 
     let expected_event = Ulid::from_parts(3, INCIDENT_METADATA_RECORDS as u128);

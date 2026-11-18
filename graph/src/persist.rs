@@ -91,6 +91,7 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::ExportSummaryAt { .. }
         | MetadataEffect::ExportRoCratePage { .. }
         | MetadataEffect::ListGraphs
+        | MetadataEffect::CachedRecords
         | MetadataEffect::ContainsGraph { .. }
         | MetadataEffect::ContainsDot { .. }
         | MetadataEffect::GraphSnapshot { .. }

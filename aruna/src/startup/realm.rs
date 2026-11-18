@@ -20,7 +20,7 @@ use aruna_operations::node::info::facts::NodeFacts;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
-use aruna_operations::shard::restore::prepare_shard_policy;
+use aruna_operations::shard::restore::PreparePolicyOperation;
 use tracing::{info, warn};
 
 use crate::bootstrap::{
@@ -68,7 +68,10 @@ pub(crate) async fn prepare(
     };
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
-    prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
+    let policy = PreparePolicyOperation::new(config.node_id, config.realm_id);
+    if let Err(error) = drive(policy, driver_ctx).await {
+        warn!(error = %error, "Deferring shard topic policy to remote recovery");
+    }
     if stop.is_cancelled() {
         return Ok(None);
     }
