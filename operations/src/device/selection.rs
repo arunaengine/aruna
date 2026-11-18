@@ -3,11 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::structs::SyncRefusal;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
@@ -55,10 +53,7 @@ pub struct SelectDocumentOperation {
 }
 
 /// The selection of one document; see [`SelectDocumentOperation`].
-pub fn select_document(
-    ids: Option<(NodeId, RealmId)>,
-    document_id: Ulid,
-) -> SelectDocumentOperation {
+pub fn select_document(ids: NodeRealm, document_id: Ulid) -> SelectDocumentOperation {
     SelectDocumentOperation {
         ids,
         document_id,
@@ -177,10 +172,7 @@ pub struct KeepReadOperation {
 }
 
 /// The keeping of one document just read; see [`KeepReadOperation`].
-pub fn keep_read(
-    ids: Option<(NodeId, RealmId)>,
-    record: &MetadataRegistryRecord,
-) -> KeepReadOperation {
+pub fn keep_read(ids: NodeRealm, record: &MetadataRegistryRecord) -> KeepReadOperation {
     KeepReadOperation {
         ids,
         record: record.clone(),
