@@ -24,7 +24,7 @@ use aruna_operations::abe::{
     KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::abe_copies::complete_copies;
+use aruna_operations::s3::abe_copies::CompleteCopiesOperation;
 use aruna_operations::s3::abe_rekey::{RekeyOperation, RekeyProgress};
 use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -2491,7 +2491,7 @@ async fn abe_rekey() -> TestResult<()> {
         };
         assert_eq!(read_copy().await?.as_ref(), b"foo/a");
         let origin = (seed.realm_id, seed.net.node_id());
-        complete_copies(&seed.context, key, origin).await?;
+        drive(CompleteCopiesOperation::new(key, origin), &seed.context).await?;
         let completed = envelope(&base, &owner, "bar/copy", &copied).await?;
         assert_eq!(completed.0, StatusCode::OK, "{}", completed.1);
         assert_eq!(read_copy().await?.as_ref(), b"foo/a");

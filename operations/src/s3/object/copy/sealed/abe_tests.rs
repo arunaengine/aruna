@@ -5,16 +5,21 @@
 use super::*;
 use crate::abe::KeyError;
 use crate::abe::envelope::EnvelopeOperation;
+use crate::document_repository::GetConfigError;
 use crate::driver::drive;
-use crate::s3::abe_copies::{CopyEnvelopeOperation, CopyOutcome, copy_row};
+use crate::s3::abe_copies::{
+    CompleteCopiesError, CompleteCopiesOperation, CopyEnvelopeOperation, CopyOutcome, copy_row,
+};
 use crate::s3::abe_rekey::{PageEnd, PageScope, RekeyPage};
 use crate::s3::object::put::abe::envelope_write;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{
     ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BUCKET_KEY_KEYSPACE,
 };
 use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, check_copy, copy_envelope, create_envelope, create_parameters,
 };
@@ -457,6 +462,72 @@ async fn copy_resets_page() {
     assert_eq!(drive(raced, &context).await, Err(KeyError::Conflict));
     let kept = get(storage, ABE_REKEY_KEYSPACE, id).await.unwrap();
     assert_eq!(kept.as_ref(), &reset[..]);
+}
+
+/// A walk over one pending copy row, stopped at the step after its quota read.
+async fn copy_walk(
+    key: Option<BucketKeyRef>,
+) -> (
+    CompleteCopiesOperation,
+    Result<Next<usize>, CompleteCopiesError>,
+) {
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    let copy = copy_input(&sealed, (SOURCE, source_id), "copy");
+    let copied = run(SealedCopyOperation::new(copy), storage, None, Race::Off)
+        .await
+        .unwrap();
+    let value = pending_row(storage, "copy", copied.version_id)
+        .await
+        .unwrap();
+    let own = sealed.location.format.bucket_key().unwrap();
+    let version = VersionKey::new("bucket", "copy", copied.version_id);
+    let row = copy_row(own.bucket_id, &version).unwrap();
+    let base = input(&sealed.location, Ulid::nil());
+    let origin = (base.realm_id, base.node_id);
+    let mut walk = CompleteCopiesOperation::new(key.unwrap_or(own), origin);
+    assert!(matches!(walk.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let page = IoResult::Page {
+        rows: vec![(row.into(), value.into())],
+        next: None,
+    };
+    let turn = walk.next(page);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let config = Ok::<_, GetConfigError>(RealmConfigDocument::new(origin.0, Vec::new(), 1));
+    let turn = walk.next(IoResult::Child(ChildOutcome::new(config)));
+    (walk, turn)
+}
+
+#[tokio::test]
+async fn copy_walk_locks() {
+    // A lock in between ends the walk with what it completed.
+    let (mut walk, turn) = copy_walk(None).await;
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let locked = Ok::<_, AbeError>(CopyOutcome::Locked);
+    let turn = walk.next(IoResult::Child(ChildOutcome::new(locked)));
+    assert_eq!(turn, Ok(Next::Done(0)));
+}
+
+#[tokio::test]
+async fn copy_walk_continues() {
+    // A copy that fails stays for the next unlock, and the completed count is kept.
+    let (mut walk, _) = copy_walk(None).await;
+    let failed = Err::<CopyOutcome, _>(AbeError::Parameters);
+    let turn = walk.next(IoResult::Child(ChildOutcome::new(failed)));
+    assert_eq!(turn, Ok(Next::Done(0)));
+    let (mut walk, _) = copy_walk(None).await;
+    let done = Ok::<_, AbeError>(CopyOutcome::Completed);
+    let turn = walk.next(IoResult::Child(ChildOutcome::new(done)));
+    assert_eq!(turn, Ok(Next::Done(1)));
+}
+
+#[tokio::test]
+async fn copy_walk_skips() {
+    // A row of another key generation waits for that key.
+    let other = BucketKeyRef::new(Ulid::from_bytes([7; 16]), 9);
+    let (_, turn) = copy_walk(Some(other)).await;
+    assert_eq!(turn, Ok(Next::Done(0)));
 }
 
 #[tokio::test]
