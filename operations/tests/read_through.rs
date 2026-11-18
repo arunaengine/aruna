@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use crate::topology;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
@@ -33,7 +34,7 @@ const EXPORT_BYTES: u64 = 16_000_000;
 /// Whether the device holds a copy that answers offline and whose installed graph is exactly
 /// what it displays, so a later local edit plans against the bytes the owner saw.
 async fn usable(device: &TestNode, document_id: Ulid) -> bool {
-    let Some(replica) = read_replica(&device.context, document_id).await else {
+    let Some(replica) = drive(read_replica(document_id), &device.context).await.ok().flatten() else {
         return false;
     };
     let Ok(installed) = aruna_operations::metadata::export_rocrate_jsonld(
@@ -58,7 +59,7 @@ async fn keeps_owner_reads() -> TestResult<()> {
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let path = "datasets/field-notes";
     let origin = realm.leading_node(group_id, path);
     let document_id =
@@ -83,8 +84,7 @@ async fn keeps_owner_reads() -> TestResult<()> {
     // A holder serves the graph once its render is ready, so a read may come before the copy.
     wait_until("the owner's read leaves a copy", device.node_id(), read).await?;
 
-    let replica = read_replica(&device.context, document_id)
-        .await
+    let replica = drive(read_replica(document_id), &device.context).await.ok().flatten()
         .ok_or("the owner's read left no copy on the device")?;
     assert!(!replica.selected, "a read copy is a cache, not a selection");
     Ok(())
@@ -96,7 +96,7 @@ async fn keeps_owner_exports() -> TestResult<()> {
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let path = "datasets/exported";
     let origin = realm.leading_node(group_id, path);
     let document_id =
@@ -127,8 +127,7 @@ async fn keeps_owner_exports() -> TestResult<()> {
             && usable(device, document_id).await
     };
     wait_until("the owner's export leaves a copy", device.node_id(), export).await?;
-    let replica = read_replica(&device.context, document_id)
-        .await
+    let replica = drive(read_replica(document_id), &device.context).await.ok().flatten()
         .ok_or("the owner's export left no copy on the device")?;
     assert!(!replica.selected);
     Ok(())
@@ -140,7 +139,7 @@ async fn keeps_selected_document() -> TestResult<()> {
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let path = "datasets/selected";
     let origin = realm.leading_node(group_id, path);
     let document_id =
@@ -149,7 +148,7 @@ async fn keeps_selected_document() -> TestResult<()> {
         .create_document(origin, group_id, document_id, path, "notes")
         .await?;
     let select = || async {
-        select_document(&device.context, document_id)
+        drive(select_document(&device.context, document_id), &device.context)
             .await
             .is_ok_and(|replica| replica.selected)
             && usable(device, document_id).await
@@ -170,7 +169,7 @@ async fn replacement_removes_scaffold() -> TestResult<()> {
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let path = "datasets/replaced";
     let origin = realm.leading_node(group_id, path);
     let document_id =
@@ -193,8 +192,7 @@ async fn replacement_removes_scaffold() -> TestResult<()> {
             && usable(device, document_id).await
     };
     wait_until("the owner's read leaves a copy", device.node_id(), read).await?;
-    let replica = read_replica(&device.context, document_id)
-        .await
+    let replica = drive(read_replica(document_id), &device.context).await.ok().flatten()
         .ok_or("the owner's read left no copy on the device")?;
     assert!(replica.displayed_jsonld.contains("scaffold-notes"));
 

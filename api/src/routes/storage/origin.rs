@@ -18,12 +18,10 @@ use aruna_core::structs::storage::origin::{
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::distribution::guard::GuardError;
-use aruna_operations::distribution::resolve::{
-    GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version,
-};
+use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version, resolved};
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::s3::bucket::sources::{BucketSourcesOperation, FileSource};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, bucket_runs, read_origin};
 use axum::extract::{Path, Query, State};
@@ -458,7 +456,7 @@ async fn origin_answer(
         let context = state.get_ctx();
         if params.version_id.is_none() {
             let path = origin_path(&bucket, &params);
-            let coordinator = read_coordinator(context.as_ref(), binding, &params.key).await;
+            let coordinator = drive(read_coordinator(binding, &params.key), context.as_ref()).await;
             let asked = match coordinator.map_err(map_guard_error) {
                 Ok(None) => None,
                 Ok(Some((range_id, node_id))) => {
@@ -470,7 +468,7 @@ async fn origin_answer(
             };
             match asked {
                 Some(Err(error)) if error.status_code().is_server_error() => {
-                    let readers = copy_readers(context.as_ref(), binding, &params.key).await;
+                    let readers = drive(copy_readers(binding, &params.key), context.as_ref()).await;
                     let (range_id, here, copies) = readers.map_err(map_guard_error)?;
                     if !here && copies.is_empty() {
                         return Err(error);
@@ -485,9 +483,9 @@ async fn origin_answer(
                 None => {}
             }
         }
-        let route = route_read(context.as_ref(), binding, &params.key, false).await;
+        let route = drive(route_read(binding, &params.key, false), context.as_ref()).await;
         if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
-            let mut holders = key_holders(context.as_ref(), binding.set_id, &params.key).await;
+            let mut holders = drive(key_holders(binding.set_id, &params.key), context.as_ref()).await.unwrap_or_default();
             holders.retain(|holder| *holder != state.get_node_id());
             holders.push(node_id);
             let target = (binding.set_id, range_id, node_id);
@@ -501,7 +499,7 @@ async fn origin_answer(
         && headers.contains_key(RELAY_HOP_HEADER)
         && !headers.contains_key(COPY_READ_HEADER)
     {
-        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        let coordinator = drive(read_coordinator(binding, &params.key), state.get_ctx().as_ref()).await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
             return Err(map_guard_error(GuardError::NotCoordinator {
                 set_id: binding.set_id,
@@ -523,7 +521,7 @@ async fn origin_answer(
     if let (Err(OriginError::VersionMissing), Some(binding), None) =
         (&view, info.distribution.as_ref(), stale)
     {
-        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        let coordinator = drive(read_coordinator(binding, &params.key), state.get_ctx().as_ref()).await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
             && !headers.contains_key(RELAY_HOP_HEADER)
         {
@@ -718,7 +716,7 @@ async fn global_origin(
     version_id: Ulid,
 ) -> ServerResult<Json<OriginResponse>> {
     let deadline = tokio::time::Instant::now() + RESOLVE_BUDGET;
-    let found = match resolve_version(state.get_ctx().as_ref(), version_id, deadline).await {
+    let found = match resolved(drive_until(resolve_version(state.get_ctx().as_ref(), version_id, deadline), state.get_ctx().as_ref(), deadline).await) {
         GlobalResolution::Found(found) => found,
         GlobalResolution::NotFound => return Err(ServerError::NotFound),
         GlobalResolution::Unavailable => {

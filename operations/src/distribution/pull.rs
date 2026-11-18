@@ -18,7 +18,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo, HiddenBlobKey};
+use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo};
 use aruna_core::structs::storage::distribution::on_use::{
     CACHE_CAPACITY_BYTES, FillClaim, KeptKind, PullPlan, claim_key,
 };
@@ -34,6 +34,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::held::{HeldElsewhere, PullRequest, admitted};
+use super::purge_steps::DropCopyOperation;
 use super::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
@@ -500,16 +501,8 @@ pub(super) async fn drop_evicted(
 }
 
 pub(super) async fn drop_copy(context: &DriverContext, location: &BackendLocation) {
-    let (Some(blob_handle), Ok(key)) = (
-        context.blob_handle.as_ref(),
-        HiddenBlobKey::try_from(location),
-    ) else {
-        return;
-    };
-    if let Event::Blob(BlobEvent::Error(error)) = blob_handle
-        .send_blob_effect(BlobEffect::DeleteHidden { key })
-        .await
-    {
+    let drop = DropCopyOperation::new(location.clone());
+    if let Err(error) = drive(drop, context).await {
         warn!(%error, "A dropped kept copy is left to the hidden sweep");
     }
 }

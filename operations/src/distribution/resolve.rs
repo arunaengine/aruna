@@ -6,26 +6,33 @@
 // Budgets are bounded; an exhausted budget or a silent range is "not resolvable now", never
 // absence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{
     CONTENT_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
+use aruna_core::operation::Operation;
+use aruna_core::rows::{read_row, value};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::inventory::{
     IndexEntry, Position, content_prefix, index_key,
 };
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionSnapshot, DistributionView, MemberState, MetadataCoverage, SetHint,
 };
+use aruna_core::types::Key;
+use thiserror::Error;
 use tokio::time::Instant;
 use ulid::Ulid;
 
+use super::here::NodeRealm;
+use super::inventory::{StagedCall, outside_answer};
 use crate::distribution::counts::MAX_SETS;
-use crate::distribution::version_key::{MemberAnswer, VersionKeyOperation};
-use crate::driver::{DriverContext, drive, drive_until};
+use crate::distribution::version_key::{MemberAnswer, VersionKeyError, VersionKeyOperation};
+use crate::driver::DriverContext;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// At most this many candidate sets are looked at for one id.
@@ -36,6 +43,24 @@ pub const MAX_PROBES: usize = 16;
 pub const MAX_CONTENT_VERSIONS: usize = 16;
 /// How long resolving one id inside a longer request may take.
 pub const RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Set records one page reads.
+const SET_PAGE: usize = 256;
+
+/// Why an index of this node could not answer.
+#[derive(Clone, Debug, Error, PartialEq)]
+#[error("{0}")]
+pub struct ResolveError(String);
+
+impl From<IoError> for ResolveError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+fn failed(error: impl std::fmt::Display) -> ResolveError {
+    ResolveError(error.to_string())
+}
 
 /// Where one global version id lives.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,19 +116,35 @@ pub fn range_holders(snapshot: &DistributionSnapshot, key: &str) -> Vec<NodeId> 
 
 /// The ready members that keep the bytes of `key`'s range in `set_id`, from this node's
 /// record; none without a readable record.
-pub async fn key_holders(context: &DriverContext, set_id: Ulid, key: &str) -> Vec<NodeId> {
-    let read = StorageEffect::Read {
-        key_space: DISTRIBUTION_KEYSPACE.to_string(),
-        key: set_id.to_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => DistributionView::from_bytes(&value)
-            .map(|view| range_holders(view.snapshot(), key))
-            .unwrap_or_default(),
-        _ => Vec::new(),
+#[derive(Debug, PartialEq)]
+pub struct KeyHoldersOperation {
+    set_id: Ulid,
+    key: String,
+}
+
+/// The holders of `key` in `set_id`; see [`KeyHoldersOperation`].
+pub fn key_holders(set_id: Ulid, key: &str) -> KeyHoldersOperation {
+    KeyHoldersOperation {
+        set_id,
+        key: key.to_string(),
+    }
+}
+
+impl Operation for KeyHoldersOperation {
+    type Output = Vec<NodeId>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Vec<NodeId>>, IoError> {
+        let read = read_row(DISTRIBUTION_KEYSPACE, self.set_id.to_bytes().to_vec());
+        Ok(Next::Call(StagedCall::Outside(read).into_call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<NodeId>>, IoError> {
+        let stored = outside_answer(result).and_then(|read| read.value());
+        let holders = (stored.ok().flatten())
+            .and_then(|value| DistributionView::from_bytes(&value).ok())
+            .map(|view| range_holders(view.snapshot(), &self.key));
+        Ok(Next::Done(holders.unwrap_or_default()))
     }
 }
 
@@ -146,243 +187,530 @@ fn ready_here(snapshot: &DistributionSnapshot, local: NodeId) -> bool {
         .any(|member| member.node_id == local && member.state == MemberState::Ready)
 }
 
-/// The snapshots of this node's records that `keep` accepts, at most `wanted` of them, and
+/// Which records a scan keeps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetFilter {
+    All,
+    Hinted(SetHint),
+}
+
+impl SetFilter {
+    fn keeps(self, snapshot: &DistributionSnapshot) -> bool {
+        match self {
+            Self::All => true,
+            Self::Hinted(hint) => SetHint::of_set(snapshot.set_id()) == hint,
+        }
+    }
+}
+
+/// The snapshots of this node's records the filter accepts, at most `wanted` of them, and
 /// whether accepted records were dropped or records left unread because [`MAX_SETS`] were read.
-async fn scan_sets(
-    context: &DriverContext,
-    keep: impl Fn(&DistributionSnapshot) -> bool,
+#[derive(Debug, PartialEq)]
+struct ScanSetsOperation {
+    filter: SetFilter,
     wanted: usize,
-) -> Result<(Vec<DistributionSnapshot>, bool), String> {
-    let mut found = Vec::new();
-    let mut dropped = false;
-    let mut start = None;
-    let mut seen = 0usize;
-    loop {
-        let iter = StorageEffect::Iter {
-            key_space: DISTRIBUTION_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.take().map(IterStart::After),
-            limit: 256,
-            txn_id: None,
-        };
-        let (values, next) = match context.storage_handle.send_storage_effect(iter).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected storage answer {}", other.label())),
-        };
-        for (_, value) in values {
-            seen += 1;
+    after: Option<Key>,
+    seen: usize,
+    found: Vec<DistributionSnapshot>,
+    dropped: bool,
+}
+
+impl ScanSetsOperation {
+    fn new(filter: SetFilter, wanted: usize) -> Self {
+        Self {
+            filter,
+            wanted,
+            after: None,
+            seen: 0,
+            found: Vec::new(),
+            dropped: false,
+        }
+    }
+
+    fn page(&self) -> IoCall {
+        IoCall::Page {
+            space: DISTRIBUTION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.after.clone(),
+            limit: SET_PAGE,
+        }
+    }
+}
+
+type Scanned = (Vec<DistributionSnapshot>, bool);
+
+impl Operation for ScanSetsOperation {
+    type Output = Scanned;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Scanned>, IoError> {
+        Ok(Next::Call(self.page()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Scanned>, IoError> {
+        let (rows, next) = result.page()?;
+        for (_, value) in rows {
+            self.seen += 1;
             let Ok(view) = DistributionView::from_bytes(&value) else {
                 continue;
             };
             let snapshot = view.snapshot();
-            match keep(snapshot) && found.len() < wanted {
-                true => found.push(snapshot.clone()),
-                false => dropped |= keep(snapshot),
+            let keep = self.filter.keeps(snapshot);
+            match keep && self.found.len() < self.wanted {
+                true => self.found.push(snapshot.clone()),
+                false => self.dropped |= keep,
             }
         }
+        let found = std::mem::take(&mut self.found);
         match next {
-            Some(next) if seen < MAX_SETS => start = Some(next),
-            Some(_) => return Ok((found, true)),
-            None => return Ok((found, dropped)),
+            Some(next) if self.seen < MAX_SETS => {
+                self.found = found;
+                self.after = Some(next);
+                Ok(Next::Call(self.page()))
+            }
+            Some(_) => Ok(Next::Done((found, true))),
+            None => Ok(Next::Done((found, self.dropped))),
         }
     }
 }
 
-/// The snapshots of the sets whose hint `version_id` carries, from this node's records, and
-/// whether some candidates were left out.
-async fn candidate_sets(
-    context: &DriverContext,
-    version_id: Ulid,
-) -> Result<(Vec<DistributionSnapshot>, bool), String> {
-    let hint = SetHint::of_version(version_id);
-    let keep = |snapshot: &DistributionSnapshot| SetHint::of_set(snapshot.set_id()) == hint;
-    scan_sets(context, keep, MAX_CANDIDATES).await
-}
-
-/// The key this node's version id index holds for `version_id` in `set_id`.
-pub async fn indexed_key(
-    context: &DriverContext,
+/// The key this node's version id index holds for a version in a set.
+#[derive(Debug, PartialEq)]
+pub struct IndexedKeyOperation {
     set_id: Ulid,
     version_id: Ulid,
-) -> Result<Option<String>, String> {
-    let read = StorageEffect::Read {
-        key_space: VERSION_INDEX_KEYSPACE.to_string(),
-        key: index_key(set_id, version_id).into(),
-        txn_id: None,
-    };
-    let value = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected storage answer {}", other.label())),
-    };
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let entry = IndexEntry::from_bytes(&value).map_err(|error| error.to_string())?;
-    let position = Position::decode(&entry.position).map_err(|error| error.to_string())?;
-    Ok(Some(position.key))
 }
 
-/// Whether this node's bucket of the set's name is bound to the set.
-async fn bound_here(context: &DriverContext, snapshot: &DistributionSnapshot) -> bool {
-    let bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
-    match drive(bucket, context).await {
-        Ok(info) => info
-            .distribution
-            .is_some_and(|binding| binding.set_id == snapshot.set_id()),
-        Err(GetBucketError::NotFound) | Err(_) => false,
+/// The indexed key of `version_id`; see [`IndexedKeyOperation`].
+pub fn indexed_key(set_id: Ulid, version_id: Ulid) -> IndexedKeyOperation {
+    IndexedKeyOperation { set_id, version_id }
+}
+
+impl Operation for IndexedKeyOperation {
+    type Output = Option<String>;
+    type Error = ResolveError;
+
+    fn first(&mut self) -> Result<Next<Option<String>>, ResolveError> {
+        let key = index_key(self.set_id, self.version_id);
+        Ok(Next::Call(read_row(VERSION_INDEX_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, ResolveError> {
+        let Some(stored) = value(result)? else {
+            return Ok(Next::Done(None));
+        };
+        let entry = IndexEntry::from_bytes(&stored).map_err(failed)?;
+        let position = Position::decode(&entry.position).map_err(failed)?;
+        Ok(Next::Done(Some(position.key)))
+    }
+}
+
+/// Whether a bucket read shows this node's bucket bound to the set.
+fn bound_to(result: IoResult, set_id: Ulid) -> Result<bool, IoError> {
+    let info = result.child::<BucketInfo, GetBucketError>()?;
+    let binding = info.ok().and_then(|info| info.distribution);
+    Ok(binding.is_some_and(|binding| binding.set_id == set_id))
+}
+
+fn bucket_read(snapshot: &DistributionSnapshot) -> IoCall {
+    IoCall::child(GetBucketOperation::new(snapshot.config.bucket.clone()))
+}
+
+/// The members still to ask for a set, group by group.
+#[derive(Debug, Default, PartialEq)]
+struct ProbeWalk {
+    groups: VecDeque<Vec<NodeId>>,
+    group: VecDeque<NodeId>,
+    covered: bool,
+    answered: HashMap<NodeId, bool>,
+    /// The member asked now.
+    asked: Option<NodeId>,
+}
+
+/// What the walk does next.
+enum Probe {
+    Ask(NodeId),
+    /// One group ended; `covered` tells whether a member of it answered.
+    GroupEnd {
+        covered: bool,
+    },
+}
+
+impl ProbeWalk {
+    fn new(snapshot: &DistributionSnapshot, local: NodeId) -> Self {
+        Self {
+            groups: probe_targets(snapshot, local).into(),
+            ..Self::default()
+        }
+    }
+
+    /// Opens the next group; an empty one is covered when this node's own index proves it.
+    fn open(&mut self, local_proves: bool) -> bool {
+        let Some(group) = self.groups.pop_front() else {
+            return false;
+        };
+        self.covered = group.is_empty() && local_proves;
+        self.group = group.into();
+        true
+    }
+
+    fn step(&mut self) -> Probe {
+        while !self.covered {
+            let Some(node_id) = self.group.pop_front() else {
+                break;
+            };
+            match self.answered.get(&node_id) {
+                Some(known) => self.covered = *known,
+                None => {
+                    self.asked = Some(node_id);
+                    return Probe::Ask(node_id);
+                }
+            }
+        }
+        self.group.clear();
+        Probe::GroupEnd {
+            covered: self.covered,
+        }
+    }
+
+    fn record(&mut self, covered: bool) {
+        self.covered = covered;
+        if let Some(node_id) = self.asked.take() {
+            self.answered.insert(node_id, covered);
+        }
     }
 }
 
 /// What one candidate set says about a version.
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SetAnswer {
     Found { key: String, local: bool },
     Absent,
     Unknown,
 }
 
-async fn ask_set(
-    context: &DriverContext,
-    snapshot: &DistributionSnapshot,
+/// What the pending call of asking one set answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AskStep {
+    Bound,
+    Index,
+    Probe,
+}
+
+/// Asks this node's index and then the set's members for a version, within the probe budget.
+#[derive(Debug, PartialEq)]
+struct AskSetOperation {
+    ids: NodeRealm,
+    snapshot: DistributionSnapshot,
     version_id: Ulid,
-    probes: &mut usize,
+    probes: usize,
     deadline: Instant,
-) -> SetAnswer {
-    let set_id = snapshot.set_id();
-    let bound = bound_here(context, snapshot).await;
-    if bound {
-        match indexed_key(context, set_id, version_id).await {
-            Ok(Some(key)) => return SetAnswer::Found { key, local: true },
-            Ok(None) => {}
-            Err(_) => return SetAnswer::Unknown,
+    step: AskStep,
+    local_proves: bool,
+    complete: bool,
+    walk: ProbeWalk,
+}
+
+type Asked = (SetAnswer, usize);
+type Asking = Result<Next<Asked>, IoError>;
+
+impl AskSetOperation {
+    fn new(
+        ids: NodeRealm,
+        snapshot: DistributionSnapshot,
+        version_id: Ulid,
+        (probes, deadline): (usize, Instant),
+    ) -> Self {
+        Self {
+            ids,
+            snapshot,
+            version_id,
+            probes,
+            deadline,
+            step: AskStep::Bound,
+            local_proves: false,
+            complete: true,
+            walk: ProbeWalk::default(),
         }
     }
-    let Some(net) = context.net_handle.as_ref() else {
-        return SetAnswer::Unknown;
-    };
-    // A catching-up member's own index is incomplete, so it proves no absence.
-    let local_proves = bound && ready_here(snapshot, net.node_id());
-    let mut answered: HashMap<NodeId, bool> = HashMap::new();
-    let mut complete = true;
-    for group in probe_targets(snapshot, net.node_id()) {
-        let mut covered = group.is_empty() && local_proves;
-        for node_id in group {
-            if covered {
-                break;
-            }
-            if let Some(known) = answered.get(&node_id) {
-                covered = *known;
-                continue;
-            }
-            if *probes >= MAX_PROBES || Instant::now() >= deadline {
-                return SetAnswer::Unknown;
-            }
-            *probes += 1;
-            let lookup = VersionKeyOperation::new(node_id, *net.realm_id(), set_id, version_id);
-            match drive_until(lookup, context, deadline).await {
-                Ok(MemberAnswer::Key(Some(key))) => return SetAnswer::Found { key, local: false },
-                Ok(MemberAnswer::Key(None)) => covered = true,
-                Ok(MemberAnswer::Versions { .. }) | Err(_) => {}
-            }
-            answered.insert(node_id, covered);
-        }
-        complete &= covered;
+
+    fn answer(&self, answer: SetAnswer) -> Asking {
+        Ok(Next::Done((answer, self.probes)))
     }
-    match complete {
-        true => SetAnswer::Absent,
-        false => SetAnswer::Unknown,
+
+    /// Starts on the set's members; a catching-up member's own index proves no absence.
+    fn probe_members(&mut self, bound: bool) -> Asking {
+        let Some((local, _)) = self.ids else {
+            return self.answer(SetAnswer::Unknown);
+        };
+        self.local_proves = bound && ready_here(&self.snapshot, local);
+        self.walk = ProbeWalk::new(&self.snapshot, local);
+        self.next_group()
+    }
+
+    fn next_group(&mut self) -> Asking {
+        if !self.walk.open(self.local_proves) {
+            return self.answer(match self.complete {
+                true => SetAnswer::Absent,
+                false => SetAnswer::Unknown,
+            });
+        }
+        self.next_probe()
+    }
+
+    fn next_probe(&mut self) -> Asking {
+        let node_id = match self.walk.step() {
+            Probe::Ask(node_id) => node_id,
+            Probe::GroupEnd { covered } => {
+                self.complete &= covered;
+                return self.next_group();
+            }
+        };
+        let Some((_, realm_id)) = self.ids else {
+            return self.answer(SetAnswer::Unknown);
+        };
+        if self.probes >= MAX_PROBES || Instant::now() >= self.deadline {
+            return self.answer(SetAnswer::Unknown);
+        }
+        self.probes += 1;
+        self.step = AskStep::Probe;
+        let set_id = self.snapshot.set_id();
+        let lookup = VersionKeyOperation::new(node_id, realm_id, set_id, self.version_id);
+        Ok(Next::Call(IoCall::child(lookup)))
     }
 }
 
-/// Resolves `version_id` within `deadline`.
-pub async fn resolve_version(
-    context: &DriverContext,
-    version_id: Ulid,
-    deadline: Instant,
-) -> GlobalResolution {
-    let Ok((candidates, truncated)) = candidate_sets(context, version_id).await else {
-        return GlobalResolution::Unavailable;
-    };
-    if candidates.is_empty() {
-        return GlobalResolution::Unavailable;
+impl Operation for AskSetOperation {
+    type Output = Asked;
+    type Error = IoError;
+
+    fn first(&mut self) -> Asking {
+        Ok(Next::Call(bucket_read(&self.snapshot)))
     }
-    let mut probes = 0usize;
-    let mut found: Option<ResolvedVersion> = None;
-    // Candidates left out may hold it, so their silence proves nothing.
-    let mut complete = !truncated;
-    for snapshot in &candidates {
-        match ask_set(context, snapshot, version_id, &mut probes, deadline).await {
-            SetAnswer::Found { key, local } => {
-                if found.is_some() {
-                    return GlobalResolution::Ambiguous;
+
+    fn next(&mut self, result: IoResult) -> Asking {
+        match self.step {
+            AskStep::Bound => {
+                if !bound_to(result, self.snapshot.set_id())? {
+                    return self.probe_members(false);
                 }
-                found = Some(ResolvedVersion {
-                    set_id: snapshot.set_id(),
-                    bucket: snapshot.config.bucket.clone(),
-                    holders: range_holders(snapshot, &key),
-                    key,
-                    version_id,
-                    local,
-                });
+                self.step = AskStep::Index;
+                let index = indexed_key(self.snapshot.set_id(), self.version_id);
+                Ok(Next::Call(IoCall::child(index)))
             }
-            SetAnswer::Absent => {}
-            SetAnswer::Unknown => complete = false,
+            AskStep::Index => match result.child::<Option<String>, ResolveError>()? {
+                Ok(Some(key)) => self.answer(SetAnswer::Found { key, local: true }),
+                Ok(None) => self.probe_members(true),
+                Err(_) => self.answer(SetAnswer::Unknown),
+            },
+            AskStep::Probe => match result.child::<MemberAnswer, VersionKeyError>()? {
+                Ok(MemberAnswer::Key(Some(key))) => {
+                    self.answer(SetAnswer::Found { key, local: false })
+                }
+                Ok(MemberAnswer::Key(None)) => {
+                    self.walk.record(true);
+                    self.next_probe()
+                }
+                Ok(MemberAnswer::Versions { .. }) | Err(_) => {
+                    self.walk.record(false);
+                    self.next_probe()
+                }
+            },
         }
-    }
-    match (found, complete) {
-        (Some(found), _) => GlobalResolution::Found(found),
-        (None, true) => GlobalResolution::NotFound,
-        (None, false) => GlobalResolution::Unavailable,
     }
 }
 
-/// Where `version_id` lives, within [`RESOLVE_BUDGET`]; `None` when it is not resolvable now.
-pub async fn version_holders(context: &DriverContext, version_id: Ulid) -> Option<ResolvedVersion> {
-    match resolve_version(context, version_id, Instant::now() + RESOLVE_BUDGET).await {
+/// Resolves a version id within its deadline; the caller runs it with the same deadline, so a
+/// probe that hangs ends the run.
+#[derive(Debug, PartialEq)]
+pub struct ResolveVersionOperation {
+    ids: NodeRealm,
+    version_id: Ulid,
+    deadline: Instant,
+    candidates: VecDeque<DistributionSnapshot>,
+    current: Option<DistributionSnapshot>,
+    probes: usize,
+    found: Option<ResolvedVersion>,
+    complete: bool,
+}
+
+/// The resolution of `version_id` by `deadline`; see [`ResolveVersionOperation`].
+pub fn resolve_version(
+    context: &DriverContext,
+    version_id: Ulid,
+    deadline: Instant,
+) -> ResolveVersionOperation {
+    ResolveVersionOperation::new(context.node_and_realm(), version_id, deadline)
+}
+
+/// The resolution a run reached; a run that did not finish in time resolves nothing now.
+pub fn resolved(run: Result<GlobalResolution, IoError>) -> GlobalResolution {
+    run.unwrap_or(GlobalResolution::Unavailable)
+}
+
+/// Where a version lives according to a finished run, if it is resolvable now.
+pub fn version_found(run: Result<GlobalResolution, IoError>) -> Option<ResolvedVersion> {
+    match resolved(run) {
         GlobalResolution::Found(found) => Some(found),
         _ => None,
     }
 }
 
+type Resolving = Result<Next<GlobalResolution>, IoError>;
+
+impl ResolveVersionOperation {
+    pub(crate) fn new(ids: NodeRealm, version_id: Ulid, deadline: Instant) -> Self {
+        Self {
+            ids,
+            version_id,
+            deadline,
+            candidates: VecDeque::new(),
+            current: None,
+            probes: 0,
+            found: None,
+            complete: false,
+        }
+    }
+
+    fn next_set(&mut self) -> Resolving {
+        let Some(snapshot) = self.candidates.pop_front() else {
+            return Ok(Next::Done(match (self.found.take(), self.complete) {
+                (Some(found), _) => GlobalResolution::Found(found),
+                (None, true) => GlobalResolution::NotFound,
+                (None, false) => GlobalResolution::Unavailable,
+            }));
+        };
+        let budget = (self.probes, self.deadline);
+        let ask = AskSetOperation::new(self.ids, snapshot.clone(), self.version_id, budget);
+        self.current = Some(snapshot);
+        Ok(Next::Call(IoCall::child(ask)))
+    }
+}
+
+impl Operation for ResolveVersionOperation {
+    type Output = GlobalResolution;
+    type Error = IoError;
+
+    fn first(&mut self) -> Resolving {
+        let hint = SetHint::of_version(self.version_id);
+        let scan = ScanSetsOperation::new(SetFilter::Hinted(hint), MAX_CANDIDATES);
+        Ok(Next::Call(IoCall::child(scan)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Resolving {
+        let Some(snapshot) = self.current.take() else {
+            let Ok((candidates, truncated)) = result.child::<Scanned, IoError>()? else {
+                return Ok(Next::Done(GlobalResolution::Unavailable));
+            };
+            if candidates.is_empty() {
+                return Ok(Next::Done(GlobalResolution::Unavailable));
+            }
+            // Candidates left out may hold it, so their silence proves nothing.
+            self.complete = !truncated;
+            self.candidates = candidates.into();
+            return self.next_set();
+        };
+        let (answer, probes) = result.child::<Asked, IoError>()??;
+        self.probes = probes;
+        match answer {
+            SetAnswer::Found { key, local } => {
+                if self.found.is_some() {
+                    return Ok(Next::Done(GlobalResolution::Ambiguous));
+                }
+                self.found = Some(ResolvedVersion {
+                    set_id: snapshot.set_id(),
+                    bucket: snapshot.config.bucket.clone(),
+                    holders: range_holders(&snapshot, &key),
+                    key,
+                    version_id: self.version_id,
+                    local,
+                });
+            }
+            SetAnswer::Absent => {}
+            SetAnswer::Unknown => self.complete = false,
+        }
+        self.next_set()
+    }
+}
+
 /// The versions of one content identity this node's content index holds in `set_id`, at most
 /// `limit`, and whether more exist.
-pub async fn content_versions(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct ContentVersionsOperation {
+    set_id: Ulid,
+    identity: [u8; 32],
+    limit: usize,
+    ids: VecDeque<Ulid>,
+    current: Option<Ulid>,
+    versions: Vec<(Ulid, String)>,
+    more: bool,
+    listed: bool,
+}
+
+/// The local versions of `identity`; see [`ContentVersionsOperation`].
+pub fn content_versions(
     set_id: Ulid,
     identity: &[u8; 32],
     limit: usize,
-) -> Result<(Vec<(Ulid, String)>, bool), String> {
-    let iter = StorageEffect::Iter {
-        key_space: CONTENT_INDEX_KEYSPACE.to_string(),
-        prefix: Some(content_prefix(set_id, identity).into()),
-        start: None,
-        limit: limit.saturating_add(1),
-        txn_id: None,
-    };
-    let values = match context.storage_handle.send_storage_effect(iter).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected storage answer {}", other.label())),
-    };
-    let more = values.len() > limit;
-    let mut versions = Vec::new();
-    for (row, _) in values.into_iter().take(limit) {
-        let Some(id) = row.len().checked_sub(16).and_then(|at| row.get(at..)) else {
-            continue;
-        };
-        let Ok(id) = <[u8; 16]>::try_from(id) else {
-            continue;
-        };
-        let version_id = Ulid::from_bytes(id);
-        if let Some(key) = indexed_key(context, set_id, version_id).await? {
-            versions.push((version_id, key));
-        }
+) -> ContentVersionsOperation {
+    ContentVersionsOperation {
+        set_id,
+        identity: *identity,
+        limit,
+        ids: VecDeque::new(),
+        current: None,
+        versions: Vec::new(),
+        more: false,
+        listed: false,
     }
-    Ok((versions, more))
+}
+
+type ContentPage = (Vec<(Ulid, String)>, bool);
+
+impl ContentVersionsOperation {
+    fn next_key(&mut self) -> Result<Next<ContentPage>, ResolveError> {
+        let Some(version_id) = self.ids.pop_front() else {
+            let versions = std::mem::take(&mut self.versions);
+            return Ok(Next::Done((versions, self.more)));
+        };
+        self.current = Some(version_id);
+        let index = indexed_key(self.set_id, version_id);
+        Ok(Next::Call(IoCall::child(index)))
+    }
+}
+
+impl Operation for ContentVersionsOperation {
+    type Output = ContentPage;
+    type Error = ResolveError;
+
+    fn first(&mut self) -> Result<Next<ContentPage>, ResolveError> {
+        Ok(Next::Call(IoCall::Page {
+            space: CONTENT_INDEX_KEYSPACE.to_string(),
+            prefix: content_prefix(self.set_id, &self.identity).into(),
+            after: None,
+            limit: self.limit.saturating_add(1),
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ContentPage>, ResolveError> {
+        if !self.listed {
+            self.listed = true;
+            let (rows, _) = result.page()?;
+            self.more = rows.len() > self.limit;
+            self.ids = (rows.into_iter().take(self.limit))
+                .filter_map(|(row, _)| {
+                    let id = row.get(row.len().checked_sub(16)?..)?;
+                    Some(Ulid::from_bytes(<[u8; 16]>::try_from(id).ok()?))
+                })
+                .collect();
+            return self.next_key();
+        }
+        let version_id = self.current.take().ok_or(IoError::Unfinished)?;
+        if let Some(key) = result.child::<Option<String>, ResolveError>()?? {
+            self.versions.push((version_id, key));
+        }
+        self.next_key()
+    }
 }
 
 /// The versions of a content identity across distributed buckets.
@@ -431,80 +759,193 @@ fn holds_every_range(snapshot: &DistributionSnapshot, local: NodeId) -> bool {
     })
 }
 
-/// Resolves a content identity within `deadline`: this node's content index for its own
+/// What the pending call of a content resolution answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentStep {
+    Sets,
+    Bound,
+    Index,
+    Probe,
+}
+
+/// Resolves a content identity within its deadline: this node's content index for its own
 /// members, otherwise one `all` coverage member per set or the coordinator of every range.
 /// Distributed buckets do not announce their objects in the DHT; this is their lookup.
-pub async fn resolve_content(
+#[derive(Debug, PartialEq)]
+pub struct ResolveContentOperation {
+    ids: NodeRealm,
+    identity: [u8; 32],
+    deadline: Instant,
+    step: ContentStep,
+    sets: VecDeque<DistributionSnapshot>,
+    current: Option<DistributionSnapshot>,
+    bound: bool,
+    probes: usize,
+    walk: ProbeWalk,
+    resolution: ContentResolution,
+}
+
+/// The resolution of a content identity by `deadline`; see [`ResolveContentOperation`].
+pub fn resolve_content(
     context: &DriverContext,
     identity: [u8; 32],
     deadline: Instant,
-) -> ContentResolution {
-    let mut resolution = ContentResolution::default();
-    let (sets, truncated) = match scan_sets(context, |_| true, MAX_SETS).await {
-        Ok(found) => found,
-        Err(_) => {
-            resolution.incomplete = true;
-            return resolution;
+) -> ResolveContentOperation {
+    ResolveContentOperation {
+        ids: context.node_and_realm(),
+        identity,
+        deadline,
+        step: ContentStep::Sets,
+        sets: VecDeque::new(),
+        current: None,
+        bound: false,
+        probes: 0,
+        walk: ProbeWalk::default(),
+        resolution: ContentResolution::default(),
+    }
+}
+
+/// The resolution a run reached; a run that did not finish in time is incomplete.
+pub fn content_resolved(run: Result<ContentResolution, IoError>) -> ContentResolution {
+    run.unwrap_or(ContentResolution {
+        versions: Vec::new(),
+        incomplete: true,
+    })
+}
+
+type ResolvingContent = Result<Next<ContentResolution>, IoError>;
+
+impl ResolveContentOperation {
+    fn done(&mut self) -> ResolvingContent {
+        Ok(Next::Done(std::mem::take(&mut self.resolution)))
+    }
+
+    fn snapshot(&self) -> Result<&DistributionSnapshot, IoError> {
+        self.current.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn next_set(&mut self) -> ResolvingContent {
+        let Some(snapshot) = self.sets.pop_front() else {
+            return self.done();
+        };
+        if self.resolution.versions.len() >= MAX_CONTENT_VERSIONS {
+            self.resolution.incomplete = true;
+            return self.done();
         }
-    };
-    resolution.incomplete = truncated;
-    let Some(net) = context.net_handle.as_ref() else {
-        resolution.incomplete |= !sets.is_empty();
-        return resolution;
-    };
-    let local = net.node_id();
-    let mut probes = 0usize;
-    for snapshot in &sets {
-        if resolution.versions.len() >= MAX_CONTENT_VERSIONS {
-            resolution.incomplete = true;
-            break;
-        }
-        let set_id = snapshot.set_id();
-        let bound = bound_here(context, snapshot).await;
-        if bound {
-            match content_versions(context, set_id, &identity, MAX_CONTENT_VERSIONS).await {
-                Ok((found, more)) => {
-                    resolution.incomplete |= more;
-                    resolution.add(snapshot, found, true);
-                }
-                Err(_) => resolution.incomplete = true,
-            }
-            if holds_every_range(snapshot, local) {
-                continue;
-            }
-        }
-        let local_proves = bound && ready_here(snapshot, local);
-        let mut answered: HashMap<NodeId, bool> = HashMap::new();
-        for group in probe_targets(snapshot, local) {
-            let mut covered = group.is_empty() && local_proves;
-            for node_id in group {
-                if covered {
-                    break;
-                }
-                if let Some(known) = answered.get(&node_id) {
-                    covered = *known;
-                    continue;
-                }
-                if probes >= MAX_PROBES || Instant::now() >= deadline {
-                    resolution.incomplete = true;
-                    return resolution;
-                }
-                probes += 1;
-                let lookup =
-                    VersionKeyOperation::content(node_id, *net.realm_id(), set_id, identity);
-                if let Ok(MemberAnswer::Versions { versions, more }) =
-                    drive_until(lookup, context, deadline).await
-                {
-                    resolution.incomplete |= more;
-                    resolution.add(snapshot, versions, false);
-                    covered = true;
-                }
-                answered.insert(node_id, covered);
-            }
-            resolution.incomplete |= !covered;
+        let read = bucket_read(&snapshot);
+        self.current = Some(snapshot);
+        self.step = ContentStep::Bound;
+        Ok(Next::Call(read))
+    }
+
+    /// Asks the set's members once this node's own index said what it can.
+    fn probe_members(&mut self, local: NodeId) -> ResolvingContent {
+        self.walk = ProbeWalk::new(self.snapshot()?, local);
+        self.next_group(local)
+    }
+
+    fn next_group(&mut self, local: NodeId) -> ResolvingContent {
+        let proves = self.bound && ready_here(self.snapshot()?, local);
+        match self.walk.open(proves) {
+            true => self.next_probe(local),
+            false => self.next_set(),
         }
     }
-    resolution
+
+    fn next_probe(&mut self, local: NodeId) -> ResolvingContent {
+        let node_id = match self.walk.step() {
+            Probe::Ask(node_id) => node_id,
+            Probe::GroupEnd { covered } => {
+                self.resolution.incomplete |= !covered;
+                return self.next_group(local);
+            }
+        };
+        if self.probes >= MAX_PROBES || Instant::now() >= self.deadline {
+            self.resolution.incomplete = true;
+            return self.done();
+        }
+        self.probes += 1;
+        let (_, realm_id): (NodeId, RealmId) = self.ids.ok_or(IoError::Unfinished)?;
+        let set_id = self.snapshot()?.set_id();
+        let lookup = VersionKeyOperation::content(node_id, realm_id, set_id, self.identity);
+        self.step = ContentStep::Probe;
+        Ok(Next::Call(IoCall::child(lookup)))
+    }
+
+    fn local(&self) -> Result<NodeId, IoError> {
+        self.ids.map(|(local, _)| local).ok_or(IoError::Unfinished)
+    }
+}
+
+impl Operation for ResolveContentOperation {
+    type Output = ContentResolution;
+    type Error = IoError;
+
+    fn first(&mut self) -> ResolvingContent {
+        let scan = ScanSetsOperation::new(SetFilter::All, MAX_SETS);
+        Ok(Next::Call(IoCall::child(scan)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ResolvingContent {
+        match self.step {
+            ContentStep::Sets => {
+                let Ok((sets, truncated)) = result.child::<Scanned, IoError>()? else {
+                    self.resolution.incomplete = true;
+                    return self.done();
+                };
+                self.resolution.incomplete = truncated;
+                if self.ids.is_none() {
+                    self.resolution.incomplete |= !sets.is_empty();
+                    return self.done();
+                }
+                self.sets = sets.into();
+                self.next_set()
+            }
+            ContentStep::Bound => {
+                let snapshot = self.snapshot()?;
+                let set_id = snapshot.set_id();
+                self.bound = bound_to(result, set_id)?;
+                if !self.bound {
+                    return self.probe_members(self.local()?);
+                }
+                let read = content_versions(set_id, &self.identity, MAX_CONTENT_VERSIONS);
+                self.step = ContentStep::Index;
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            ContentStep::Index => {
+                let snapshot = self.current.take().ok_or(IoError::Unfinished)?;
+                match result.child::<ContentPage, ResolveError>()? {
+                    Ok((found, more)) => {
+                        self.resolution.incomplete |= more;
+                        self.resolution.add(&snapshot, found, true);
+                    }
+                    Err(_) => self.resolution.incomplete = true,
+                }
+                let local = self.local()?;
+                let every = holds_every_range(&snapshot, local);
+                self.current = Some(snapshot);
+                match every {
+                    true => self.next_set(),
+                    false => self.probe_members(local),
+                }
+            }
+            ContentStep::Probe => {
+                let answer = result.child::<MemberAnswer, VersionKeyError>()?;
+                let covered = match answer {
+                    Ok(MemberAnswer::Versions { versions, more }) => {
+                        self.resolution.incomplete |= more;
+                        let snapshot = self.current.take().ok_or(IoError::Unfinished)?;
+                        self.resolution.add(&snapshot, versions, false);
+                        self.current = Some(snapshot);
+                        true
+                    }
+                    _ => false,
+                };
+                self.walk.record(covered);
+                self.next_probe(self.local()?)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

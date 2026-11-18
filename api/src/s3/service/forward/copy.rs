@@ -5,6 +5,7 @@
 
 // Nothing is queued.
 
+use aruna_operations::driver::drive;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -174,12 +175,12 @@ impl ArunaS3Service {
             return Ok(true);
         };
         if !pinned {
-            let coordinator = read_coordinator(self.state.as_ref(), binding, key).await;
+            let coordinator = drive(read_coordinator(binding, key), self.state.as_ref()).await;
             return coordinator
                 .map(|coordinator| coordinator.is_none())
                 .map_err(|error| guard_error(&error));
         }
-        match route_read(self.state.as_ref(), binding, key, false).await {
+        match drive(route_read(binding, key, false), self.state.as_ref()).await {
             Ok(ReadRoute::Local { catching_up }) => Ok(!catching_up),
             Ok(ReadRoute::Holder { .. }) => Ok(false),
             Err(error) => Err(guard_error(&error)),

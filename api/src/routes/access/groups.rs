@@ -502,7 +502,7 @@ pub async fn create_group(
         request_span.record("group_id", field::display(forwarded.0.group_id));
         // Cached here so the new group answers on the next read instead of
         // after the device's next realm-document fetch.
-        if !install_group_docs(&ctx, &actor_for(&state, &auth), &forwarded.0, &forwarded.1).await {
+        if !drive(install_group_docs(&actor_for(&state, &auth), &forwarded.0, &forwarded.1), &ctx).await.unwrap_or(false) {
             warn!(group_id = %forwarded.0.group_id, "Failed to cache a forwarded group locally");
         }
         return Ok((StatusCode::CREATED, Json(forwarded.into())));

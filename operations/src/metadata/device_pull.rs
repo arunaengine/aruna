@@ -275,7 +275,7 @@ async fn coordinates(
     let Some(binding) = bucket.distribution.as_ref() else {
         return Ok(());
     };
-    match route_write(context, binding, key).await {
+    match drive(route_write(binding, key), context).await {
         Ok(WriteRoute::Local { .. }) => Ok(()),
         Ok(WriteRoute::Forward { node_id, .. }) => Err(SyncRefusal::Coordinator(node_id)),
         Err(
@@ -439,7 +439,7 @@ pub(crate) async fn authorize_pull(
 
 /// Only a real denial refuses the caller; an unreadable policy state or a
 /// failed check is this node's problem and stays retryable.
-fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
+pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
     match error {
         AuthorizeError::PermissionDenied
         | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => SyncRefusal::Forbidden,
@@ -786,11 +786,11 @@ async fn set_heads(
     binding: &DistributionBinding,
     listing: SetListing,
 ) -> Result<SyncVersionPage, SyncRefusal> {
-    let view = bound_view(context, binding)
+    let view = drive(bound_view(binding), context)
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     let snapshot = view.snapshot();
-    let fence = local_fence(context, binding.set_id)
+    let fence = drive(local_fence(binding.set_id), context)
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     let prefix = (!listing.prefix.is_empty()).then(|| listing_prefix(&listing.prefix));

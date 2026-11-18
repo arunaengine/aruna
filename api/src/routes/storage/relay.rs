@@ -5,6 +5,7 @@
 
 // The target checks the token and the caller's permissions again on its own path.
 
+use aruna_operations::driver::drive;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -16,7 +17,6 @@ use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::read_coordinator;
 use aruna_operations::distribution::routing::{route_read, route_write};
 use aruna_operations::distribution::status::node_reach;
-use aruna_operations::driver::drive;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
@@ -102,7 +102,7 @@ pub(crate) async fn rest_target(
     if headers.contains_key(RELAY_HOP_HEADER) {
         return Ok(None);
     }
-    match route_write(state.get_ctx().as_ref(), binding, key).await {
+    match drive(route_write(binding, key), state.get_ctx().as_ref()).await {
         Ok(WriteRoute::Local { .. }) => Ok(None),
         Ok(WriteRoute::Forward {
             range_id, node_id, ..
@@ -131,11 +131,11 @@ pub(crate) async fn read_holders(
         return Ok(None);
     }
     let context = state.get_ctx();
-    let route = route_read(context.as_ref(), binding, key, false).await;
+    let route = drive(route_read(binding, key, false), context.as_ref()).await;
     let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? else {
         return Ok(None);
     };
-    let mut holders = key_holders(context.as_ref(), binding.set_id, key).await;
+    let mut holders = drive(key_holders(binding.set_id, key), context.as_ref()).await.unwrap_or_default();
     holders.retain(|holder| *holder != state.get_node_id() && *holder != node_id);
     holders.push(node_id);
     let forward = |node_id| RestForward {
@@ -190,7 +190,7 @@ pub(crate) async fn copy_miss(
     if headers.contains_key(RELAY_HOP_HEADER) {
         return Ok(None);
     }
-    let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, key).await;
+    let coordinator = drive(read_coordinator(binding, key), state.get_ctx().as_ref()).await;
     Ok(coordinator
         .map_err(map_guard_error)?
         .map(|(range_id, node_id)| {

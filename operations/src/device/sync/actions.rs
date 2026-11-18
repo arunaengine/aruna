@@ -76,7 +76,7 @@ pub async fn apply_action(
     context: &Arc<DriverContext>,
     input: ApplyActionInput,
 ) -> Result<SyncActionRecord, ActionError> {
-    let folder = read_bound(context, input.folder_id).await?;
+    let folder = drive(read_bound(input.folder_id), context).await?;
     if folder.state == FolderState::Deleting {
         return Err(FolderError::NotFound.into());
     }
@@ -316,7 +316,7 @@ async fn apply_pending(
     let mut applied = 0usize;
     let mut stale = 0usize;
     loop {
-        let (entries, next) = list_entries(context, folder.folder_id, None, cursor).await?;
+        let (entries, next) = drive(list_entries(folder.folder_id, None, cursor), context).await?;
         // A removal is per entry: only the entries that name a remote version
         // to take are replaced in bulk.
         for (relative, base) in entries.into_iter().filter(|(_, base)| {

@@ -10,6 +10,7 @@ use aruna_core::structs::execution::job::{
     JobId, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec, StagingWalk,
 };
 use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -25,6 +26,8 @@ use crate::storage_read::iter_prefix_page;
 /// Lanes one job walks at the same time. Each lane holds at most one listed page ahead, so a
 /// job holds a bounded number of pages whatever the source holds.
 const LANE_LIMIT: usize = 4;
+/// Checkpoint rows of one job a reader looks at: its own, and two per lane.
+pub(super) const LANE_ROWS: usize = 2 * LANE_LIMIT + 1;
 /// Slots per spec prefix: lane `slot` walks part `slot % PARTS` of prefix `slot / PARTS`.
 const PARTS: u64 = LANE_LIMIT as u64;
 /// One-key listings that split one prefix, whatever its key space looks like.
@@ -80,10 +83,15 @@ pub(super) async fn read_lanes(
         STAGING_STATE_KEYSPACE,
         Some(prefix),
         None,
-        2 * LANE_LIMIT + 1,
+        LANE_ROWS,
         None,
     )
     .await?;
+    lanes_of(rows)
+}
+
+/// The open lanes among a job's checkpoint rows, each with its bound row.
+pub(super) fn lanes_of(rows: Vec<(Key, Value)>) -> Result<Vec<Lane>, String> {
     let mut lanes: Vec<Lane> = Vec::new();
     for (key, value) in rows {
         let Some(slot) = (key.get(16..24)).and_then(|slot| <[u8; 8]>::try_from(slot).ok()) else {
@@ -633,10 +641,10 @@ mod tests {
     ) -> Result<PageImportResult, PageImportError> {
         use aruna_core::effects::{Effect, StorageEffect};
         use aruna_core::events::Event;
-        use aruna_core::operation::EffectOperation;
+        use aruna_core::operation::{EffectOperation, Runnable};
         use aruna_core::task::{TaskEffect, TaskEvent};
         let handle = &ctx.driver.storage_handle;
-        let mut operation = PageImportOperation::new(input);
+        let mut operation = PageImportOperation::new(input).into_machine();
         let mut effects: std::collections::VecDeque<Effect> =
             operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {

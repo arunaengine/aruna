@@ -4,6 +4,7 @@
 
 pub mod bucket_guard;
 pub mod check_source;
+pub mod granted_read;
 pub mod head_source;
 pub mod list_offers;
 pub mod list_source;

@@ -5,15 +5,17 @@
 use std::ops::Range;
 use std::str::FromStr;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
 use crate::errors::StagingSourceError;
+use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use crate::structs::execution::source_connector::SourceConnectorKind;
 use crate::structs::storage::distribution::delegation::SignedDelegation;
-use crate::structs::storage::read_grant::SignedRequest;
+use crate::structs::storage::read_grant::{GrantedRequest, SignedRequest};
 use crate::types::GroupId;
 
 /// Connector setting that names the sync relationship a native source reads through.
@@ -41,6 +43,25 @@ pub enum NativeAuthority {
     Granted(Box<SignedRequest>),
     /// A caller the reading node verified itself, for one request bound by a D33 delegation.
     Delegated(Box<SignedDelegation>),
+}
+
+/// One version read from the node `request` targets, under the grant it carries. The runner
+/// signs the request with this node's key, so it must name this node as issuer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantedReadEffect {
+    pub request: GrantedRequest,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Ulid,
+    pub head: bool,
+    pub range: Option<NativeRange>,
+}
+
+/// What a holder answered a granted read: the version's metadata and its bytes.
+#[derive(Debug, PartialEq)]
+pub struct GrantedBody {
+    pub metadata: SourceMetadata,
+    pub blob: BackendStream<Result<Bytes, StreamError>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

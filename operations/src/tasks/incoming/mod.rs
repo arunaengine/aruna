@@ -746,11 +746,15 @@ impl OperationsTaskHandler {
                 return;
             }
         }
-        let fetched = crate::device::realm_documents::fetch_realm_documents(
+        let fetched = drive(
+            crate::device::realm_documents::fetch_realm_documents(
+                &self.context,
+                REALM_DOCUMENTS_BUDGET,
+            ),
             &self.context,
-            REALM_DOCUMENTS_BUDGET,
         )
-        .await;
+        .await
+        .unwrap_or(false);
         let note = match fetched {
             true => SyncNote::Contact,
             false => SyncNote::Failure,
@@ -777,7 +781,8 @@ impl OperationsTaskHandler {
     /// Refreshes the metadata replicas this device keeps, on the same beat the
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
-        if crate::device::refresh::refresh_replicas(&self.context).await > 0 {
+        let pass = crate::device::refresh::refresh_replicas(&self.context);
+        if drive(pass, &self.context).await.unwrap_or(0) > 0 {
             let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
             if let Err(error) = drive(note, &self.context).await {
                 warn!(%error, "Failed to note the device sync state");
@@ -1024,7 +1029,32 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::MaintainRanges => Box::pin(async move {
-                let after = crate::distribution::sharding::maintain_ranges(&self.context).await;
+                use crate::distribution::sharding::{maintain_ranges, maintain_retry};
+                let context = &self.context;
+                let mut after = match crate::driver::drive(maintain_ranges(context), context).await
+                {
+                    Ok(pass) => {
+                        let (after, imports) = pass.finish();
+                        for start in imports {
+                            let started =
+                                crate::distribution::import_start::start_kept(context, start);
+                            if let Err(error) = started.await {
+                                warn!(%error, "Handed over imports could not start");
+                            }
+                        }
+                        after
+                    }
+                    Err(error) => {
+                        warn!(%error, "Range maintenance could not finish a pass");
+                        maintain_retry()
+                    }
+                };
+                // Version links metadata could not verify in a set are retried a page per pass.
+                match crate::metadata::data_links::retry_unverified(context).await {
+                    Ok(true) => after = std::time::Duration::ZERO,
+                    Ok(false) => {}
+                    Err(error) => warn!(%error, "Unverified data links could not be retried"),
+                }
                 self.reschedule_timer(TaskKey::MaintainRanges, after).await;
             }),
             TaskKey::RunBackendImports => Box::pin(async move {
@@ -1071,7 +1101,9 @@ impl OperationsTaskHandler {
                 self.refresh_device_replicas().await;
             }),
             TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let after = match crate::device::sync::drain_sync_outbox(&self.context).await {
+                let drain = crate::device::sync::drain_sync_outbox(&self.context);
+                let outcome = drive(drain, &self.context).await;
+                let after = match outcome.unwrap_or(DrainOutcome::Deferred) {
                     DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
                     DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,

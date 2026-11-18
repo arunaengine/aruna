@@ -178,7 +178,7 @@ pub(crate) async fn write_metadata(
         Some(binding) => {
             let bearer = forwarded_auth_token(bearer)?;
             let change = (metadata, expected);
-            change_metadata(&state.get_ctx(), (auth, bearer), binding.set_id, change)
+            drive(change_metadata(&state.get_ctx(), (auth, bearer), binding.set_id, change), &state.get_ctx())
                 .await
                 .map_err(map_create_error)?;
         }

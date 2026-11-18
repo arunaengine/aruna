@@ -742,25 +742,6 @@ impl MetadataHandle {
         }
     }
 
-    pub(crate) async fn request_staging_spec(
-        &self,
-        node_id: NodeId,
-        transfer_id: Ulid,
-        job_id: aruna_core::structs::execution::job::JobId,
-    ) -> Result<crate::distribution::imports::HandedImport, MetadataReadError> {
-        let request = MetadataTransportMessage::StagingSpec {
-            transfer_id,
-            job_id,
-        };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::StagingSpecResult { result } => result.map(|spec| *spec),
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
     /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
     /// it holds the whole, checked artifact.
     pub(crate) async fn request_store_artifact(

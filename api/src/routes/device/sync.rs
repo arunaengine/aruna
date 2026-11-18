@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use std::sync::Arc;
 
 use axum::Json;
@@ -189,8 +190,8 @@ async fn get_sync_status(
     _: OwnerAuth,
 ) -> ServerResult<Json<DeviceSyncStatus>> {
     let context = state.get_ctx();
-    let mut status: DeviceSyncStatus = sync_status(&context).await.into();
-    status.removed_from_realm = realm_removed(&context, state.get_realm_id()).await;
+    let mut status: DeviceSyncStatus = drive(sync_status(), &context).await.unwrap_or_default().into();
+    status.removed_from_realm = drive(realm_removed(state.get_realm_id()), &context).await.unwrap_or(false);
     Ok(Json(status))
 }
 
@@ -222,7 +223,7 @@ async fn run_sync(
     State(state): State<Arc<ServerState>>,
     _: OwnerAuth,
 ) -> ServerResult<(axum::http::StatusCode, Json<DeviceSyncRun>)> {
-    start_sync_run(&state.get_ctx()).await;
+    drive(start_sync_run(), &state.get_ctx()).await.unwrap_or(false);
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(DeviceSyncRun { started: true }),

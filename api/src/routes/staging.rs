@@ -1216,7 +1216,7 @@ pub async fn list_references(
         None => true,
         Some(binding) => {
             let reach = prefix.as_deref().unwrap_or_default();
-            let route = route_read(state.get_ctx().as_ref(), binding, reach, true).await;
+            let route = drive(route_read(binding, reach, true), state.get_ctx().as_ref()).await;
             matches!(route, Ok(ReadRoute::Local { catching_up: false }))
         }
     };
@@ -1703,7 +1703,7 @@ async fn coordinator_jobs(
     (bearer, request): (Option<&ValidatedBearer>, &StageBatchRequest),
     source: &GetSourceResult,
 ) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
-    let view = bound_view(state.get_ctx().as_ref(), binding)
+    let view = drive(bound_view(binding), state.get_ctx().as_ref())
         .await
         .map_err(crate::lookup::map_guard_error)?;
     let snapshot = view.snapshot();

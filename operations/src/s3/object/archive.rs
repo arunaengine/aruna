@@ -665,7 +665,7 @@ async fn resolve<R: MemberReader>(
             MemberRead::Local(range_id) => stale = range_id,
         }
         // Without records of the key's range here, a miss would prove nothing.
-        match route_read(scope.context, binding, key, false).await {
+        match drive(route_read(binding, key, false), scope.context).await {
             Ok(ReadRoute::Local {
                 catching_up: behind,
             }) => catching_up = behind,

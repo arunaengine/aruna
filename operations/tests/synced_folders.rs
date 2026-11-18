@@ -65,8 +65,8 @@ async fn await_uploads(realm: &Topology) -> TestResult<()> {
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "the device never published its queued uploads",
         || async {
-            drain_sync_outbox(&device.context).await;
-            Ok(list_transfers(&device.context).await?.len())
+            drive(drain_sync_outbox(&device.context), &device.context).await?;
+            Ok(drive(list_transfers(), &device.context).await?.len())
         },
     )
     .await
@@ -222,7 +222,7 @@ async fn entry_of(
     folder_id: Ulid,
     path: &str,
 ) -> TestResult<SyncBase> {
-    let (entries, _) = list_entries(context, folder_id, None, None).await?;
+    let (entries, _) = drive(list_entries(folder_id, None, None), context).await?;
     entries
         .into_iter()
         .find(|(relative, _)| relative == path)
@@ -404,7 +404,7 @@ async fn fences_overlapping_pulls() -> TestResult<()> {
     std::fs::write(root.path().join("note.txt"), b"from the device")?;
     let folder = bind(&realm, root.path(), group_id).await?;
     reconcile_folder(&device.context, &folder).await?;
-    let upload = list_transfers(&device.context)
+    let upload = drive(list_transfers(), &device.context)
         .await?
         .pop()
         .ok_or("the file is queued")?;
@@ -520,7 +520,7 @@ async fn records_pull_origin() -> TestResult<()> {
         }),
         "the version's origin names the device"
     );
-    let origin = local_origin(&device.context, version_id)
+    let origin = drive(local_origin(version_id), &device.context)
         .await?
         .ok_or("the device keeps the origin of what it published")?;
     assert_eq!(origin.folder_id, folder.folder_id);
@@ -617,7 +617,7 @@ async fn binds_before_scanning() -> TestResult<()> {
     )
     .await?;
     assert_eq!(
-        read_bound(&device.context, folder.folder_id)
+        drive(read_bound(folder.folder_id), &device.context)
             .await?
             .observed_files,
         1
@@ -751,7 +751,7 @@ async fn skips_unbound_folder() -> TestResult<()> {
             .iter()
             .all(|offer| offer.bucket != listed.local_bucket)
     );
-    let (entries, _) = list_entries(&device.context, listed.folder_id, None, None).await?;
+    let (entries, _) = drive(list_entries(listed.folder_id, None, None), &device.context).await?;
     assert!(entries.is_empty());
     Ok(())
 }
@@ -779,7 +779,7 @@ async fn finishes_cancelled_unbind() -> TestResult<()> {
     set_folder_state(&device.context, folder.folder_id, FolderState::Deleting).await?;
     reconcile_folders(&manual_context(&device.context)).await;
     assert_eq!(
-        read_bound(&device.context, folder.folder_id).await,
+        drive(read_bound(folder.folder_id), &device.context).await,
         Err(FolderError::NotFound)
     );
     let offers = list_offers(&device.context).await?;
@@ -788,7 +788,7 @@ async fn finishes_cancelled_unbind() -> TestResult<()> {
             .iter()
             .all(|offer| offer.bucket != folder.local_bucket)
     );
-    let (entries, _) = list_entries(&device.context, folder.folder_id, None, None).await?;
+    let (entries, _) = drive(list_entries(folder.folder_id, None, None), &device.context).await?;
     assert!(entries.is_empty());
     assert!(
         matches!(
@@ -828,7 +828,7 @@ async fn recovers_interrupted_bind() -> TestResult<()> {
         Err(FolderError::Unavailable)
     );
     // The device's own timer may already have finished it; either way the bind is recorded.
-    let recorded = read_bound(&device.context, folder_id).await?.state;
+    let recorded = drive(read_bound(folder_id), &device.context).await?.state;
     assert!(
         matches!(
             recorded,
@@ -851,7 +851,7 @@ async fn recovers_interrupted_bind() -> TestResult<()> {
 
     reconcile_folders(&manual_context(&device.context)).await;
     assert_eq!(
-        read_bound(&device.context, folder_id).await?.state,
+        drive(read_bound(folder_id), &device.context).await?.state,
         FolderState::Active
     );
     let bucket = drive(
@@ -901,7 +901,7 @@ async fn refuses_foreign_bucket() -> TestResult<()> {
             reason: format!("bucket \"{REMOTE_BUCKET}\" belongs to another group"),
         }
     );
-    assert!(list_folders(&device.context).await?.is_empty());
+    assert!(drive(list_folders(), &device.context).await?.is_empty());
     Ok(())
 }
 
@@ -1028,7 +1028,7 @@ async fn refuses_invalid_remotes() -> TestResult<()> {
             .expect_err("a user node is not a realm server"),
         FolderError::NotRealmNode(device.node_id())
     );
-    assert!(list_folders(&device.context).await?.is_empty());
+    assert!(drive(list_folders(), &device.context).await?.is_empty());
     Ok(())
 }
 
@@ -1053,7 +1053,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
         .await
         .expect_err("the missing bucket is reported");
     assert_eq!(error, ReconcileFolderError::Refused(SyncRefusal::NotFound));
-    let failed = read_bound(&device.context, folder.folder_id).await?;
+    let failed = drive(read_bound(folder.folder_id), &device.context).await?;
     assert_eq!(
         failed.last_error.as_deref(),
         Some(error.describe(&folder.remote).as_str())
@@ -1114,7 +1114,7 @@ async fn recovers_missing_bucket() -> TestResult<()> {
     create_bucket(&server.context, group_id, realm.user_id).await?;
     let plan = reconcile_folder(&device.context, &failed).await?;
     assert_eq!(plan.uploads, 1);
-    let recovered = read_bound(&device.context, folder.folder_id).await?;
+    let recovered = drive(read_bound(folder.folder_id), &device.context).await?;
     assert_eq!(recovered.last_error, None);
     assert_eq!(recovered.last_error_ms, None);
     assert_eq!(recovered.observed_files, 1);

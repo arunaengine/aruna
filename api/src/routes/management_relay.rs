@@ -303,8 +303,7 @@ async fn holder_target(
     match management_node_urls(&config, &documents).into_iter().next() {
         Some((node, _)) if node == state.get_node_id() => Ok(None),
         Some((node, Some(url))) => Ok(Some((Some(node), url))),
-        _ => installed_management_urls(&state.get_ctx(), state.get_realm_id())
-            .await
+        _ => drive(installed_management_urls(state.get_realm_id()), &state.get_ctx()).await.unwrap_or_default()
             .into_iter()
             .next()
             .map(|url| Some((None, url)))
@@ -654,7 +653,7 @@ async fn management_targets(state: &Arc<ServerState>) -> Vec<String> {
         Ok(config) => {
             let documents = load_node_documents(state, &config).await;
             let peers = peer_management_urls(state.get_node_id(), &config, &documents);
-            let installed = installed_management_urls(&state.get_ctx(), state.get_realm_id()).await;
+            let installed = drive(installed_management_urls(state.get_realm_id()), &state.get_ctx()).await.unwrap_or_default();
             cached.urls = relay_targets(peers, installed);
         }
         Err(error) => debug!(error = %error, "Management relay reuses cached management urls"),

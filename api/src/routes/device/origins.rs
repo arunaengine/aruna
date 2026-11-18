@@ -17,6 +17,7 @@ use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_operations::device::sync::outbox::local_origin;
+use aruna_operations::driver::drive;
 
 use super::folders::map_folder_error;
 
@@ -76,7 +77,7 @@ async fn get_local_origin(
     Path(version_id): Path<String>,
 ) -> ServerResult<Json<DeviceOrigin>> {
     let version_id = Ulid::from_str(&version_id).map_err(|_| ServerError::BadRequest)?;
-    let origin = local_origin(&state.get_ctx(), version_id)
+    let origin = drive(local_origin(version_id), &state.get_ctx())
         .await
         .map_err(map_folder_error)?
         .ok_or(ServerError::NotFound)?;

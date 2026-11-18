@@ -60,8 +60,7 @@ use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation}
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::staging::native_source::granted_read;
-use aruna_blob::native::body_stream;
+use crate::staging::granted_read::GrantedReadOperation;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::SourcePin;
@@ -1128,20 +1127,23 @@ async fn granted_source(
     let grant = captured.grant.as_ref().ok_or_else(|| {
         JobError::permanent("a reference input on another node has no read grant")
     })?;
-    let read = granted_read(context, captured.source_node_id, grant, None, false);
-    let (metadata, stream) = Box::pin(read).await.map_err(|error| match error {
-        StagingSourceError::AccessDenied | StagingSourceError::NotFound => {
-            JobError::permanent(format!("reference input read refused: {error}"))
-        }
-        other => JobError::retryable(format!("reference input read failed: {other}")),
-    })?;
-    if metadata.content_length != captured.bytes {
+    let ids = context.node_and_realm();
+    let read = GrantedReadOperation::new(ids, captured.source_node_id, grant, None, false);
+    let body = Box::pin(drive(read, context))
+        .await
+        .map_err(|error| match error {
+            StagingSourceError::AccessDenied | StagingSourceError::NotFound => {
+                JobError::permanent(format!("reference input read refused: {error}"))
+            }
+            other => JobError::retryable(format!("reference input read failed: {other}")),
+        })?;
+    if body.metadata.content_length != captured.bytes {
         return Err(JobError::permanent(
             "staged input size differs from the captured input".to_string(),
         ));
     }
     Ok(StagedSource {
-        blob: body_stream(stream),
+        blob: body.blob,
         location: None,
         size: Some(captured.bytes),
         served_source: None,

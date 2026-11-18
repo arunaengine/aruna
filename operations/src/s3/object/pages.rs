@@ -579,9 +579,9 @@ async fn merged_page<R: RangeRelay>(
         None => None,
     };
     let checks = access.as_ref().map(|access| (access, info.group_id));
-    let view = bound_view(context, binding).await?;
+    let view = drive(bound_view(binding), context).await?;
     let snapshot = view.snapshot();
-    let fence = local_fence(context, binding.set_id).await?;
+    let fence = drive(local_fence(binding.set_id), context).await?;
     let resume = request.cursor.as_deref().map(decode_resume).transpose()?;
     // A sealed position resumes its range at the member that sealed it.
     let (after, from, mut resumed, hidden_group) = match &resume {

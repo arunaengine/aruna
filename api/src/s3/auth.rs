@@ -725,7 +725,11 @@ impl AuthProvider {
             .and_then(|value| SignedDelegation::decode(value).ok())
             .ok_or_else(|| denied("malformed delegation"))?;
         let now = aruna_core::time::unix_timestamp_secs();
-        let delegation = match accept_delegation(&self.driver_ctx, &signed, now).await {
+        let accepted = match accept_delegation(&self.driver_ctx, &signed, now) {
+            Ok(accept) => drive(accept, &self.driver_ctx).await,
+            Err(error) => Err(error),
+        };
+        let delegation = match accepted {
             Ok(delegation) => delegation,
             Err(DelegateError::Unavailable) => {
                 return Err(s3_error!(
@@ -777,8 +781,8 @@ impl AuthProvider {
         if let Some(binding) = bucket_info.distribution.as_ref().filter(|_| !listing) {
             let context = self.driver_ctx.as_ref();
             let routed = match matches!(operation, "GetObject" | "HeadObject") {
-                true => delegated_read(context, binding, delegation.range_id, &key).await,
-                false => delegated_range(context, binding, delegation.range_id, &key).await,
+                true => drive(delegated_read(binding, delegation.range_id, &key), context).await,
+                false => drive(delegated_range(binding, delegation.range_id, &key), context).await,
             };
             routed.map_err(|error| crate::s3::error::guard_error(&error))?;
         }

@@ -6,14 +6,16 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect, abort_effects};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent, StatementSignEvent, StorageEvent};
+use aruna_core::events::{Event, NetEvent, StatementSignEvent};
 use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, CAPACITY_RESERVATION_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
     S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::done;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, incarnation};
 use aruna_core::structs::storage::distribution::accounting::account_key;
@@ -27,12 +29,11 @@ use aruna_core::structs::storage::distribution::{
 use aruna_core::structs::storage::usage::{
     BucketCounters, USAGE_REBUILD_KEY, UsageCounters, global_shard_keys, usage_bucket_key,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::inventory::open_ranges;
+use super::inventory::{StagedCall, open_ranges, outside_answer};
 
 /// Reservation rows read per page; a node holds one per member and one per held range.
 const RESERVATION_PAGE: usize = 256;
@@ -71,11 +72,8 @@ pub enum AdmitError {
     SignUnavailable(String),
     #[error("operation did not finish")]
     NotFinished,
-    #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
+    #[error("unexpected answer to the signing request: {0}")]
+    UnexpectedEvent(&'static str),
     #[error("usage counters are being rebuilt; new ranges are admitted once they are complete")]
     UsageIncomplete,
     #[error(
@@ -92,25 +90,28 @@ pub enum AdmitError {
     SizeUnknown(Ulid),
 }
 
+impl From<IoError> for AdmitError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+/// What the pending call of an admission answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmitState {
-    Init,
-    StartTransaction,
     Read,
     Reservations,
     Usage,
     Write,
     Sign,
-    Commit,
-    Finish,
-    Error,
 }
+
+type AdmitNext = Result<Next<SignedStatement>, AdmitError>;
 
 #[derive(Debug, PartialEq)]
 pub struct AdmitOperation {
     config: AdmitConfig,
     state: AdmitState,
-    txn_id: Option<TxnId>,
     /// The claim to sign once the range rows are staged.
     pending: Option<StatementClaim>,
     /// The ranges to open and what the member needs for them.
@@ -121,30 +122,28 @@ pub struct AdmitOperation {
     held: u64,
     /// Bucket and reserved bytes of every member this node admitted, by set.
     reserved: BTreeMap<Ulid, (Option<String>, u64)>,
-    signed: Option<SignedStatement>,
-    output: Option<Result<SignedStatement, AdmitError>>,
 }
 
 impl AdmitOperation {
     pub fn new(config: AdmitConfig) -> Self {
         Self {
             config,
-            state: AdmitState::Init,
-            txn_id: None,
+            state: AdmitState::Read,
             pending: None,
             missing: Vec::new(),
             need: MemberNeed::default(),
             grown: Vec::new(),
             held: 0,
             reserved: BTreeMap::new(),
-            signed: None,
-            output: None,
         }
     }
 
-    fn read(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = AdmitState::Read;
+    fn call(&mut self, state: AdmitState, call: IoCall) -> AdmitNext {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn read(&self) -> IoCall {
         let bucket: Key = self.config.bucket.as_bytes().into();
         let mut reads = vec![
             (S3_BUCKET_KEYSPACE.to_string(), bucket.clone()),
@@ -159,16 +158,13 @@ impl AdmitOperation {
             USAGE_STATS_KEYSPACE.to_string(),
             Key::from(USAGE_REBUILD_KEY.to_vec()),
         ));
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        IoCall::Read(reads)
     }
 
     /// The bucket must carry this member's binding for its own incarnation; ranges without an
     /// account row are opened, never while this node's usage counters are being rebuilt. An open
     /// range the member gains a copy of reserves its bytes too.
-    fn plan(&mut self, mut values: Vec<Option<Value>>) -> Result<Effects, AdmitError> {
+    fn plan(&mut self, mut values: Vec<Option<Value>>) -> AdmitNext {
         let rebuilding = values.pop().flatten().is_some();
         let mut values = values.into_iter();
         let bucket = values.next().flatten();
@@ -216,7 +212,7 @@ impl AdmitOperation {
             statement,
         };
         if missing.is_empty() && grown.is_empty() {
-            return Ok(self.sign(claim));
+            return self.sign(claim);
         }
         if rebuilding {
             return Err(AdmitError::UsageIncomplete);
@@ -237,22 +233,17 @@ impl AdmitOperation {
 
     /// Reads one page of the node's reservations inside the transaction, so two admissions
     /// that both fit alone cannot both commit.
-    fn reservations(&mut self, start: Option<IterStart>) -> Result<Effects, AdmitError> {
-        self.state = AdmitState::Reservations;
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: CAPACITY_RESERVATION_KEYSPACE.to_string(),
-            prefix: None,
-            start,
+    fn reservations(&mut self, after: Option<Key>) -> AdmitNext {
+        let page = IoCall::Page {
+            space: CAPACITY_RESERVATION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
             limit: RESERVATION_PAGE,
-            txn_id: Some(self.txn_id.ok_or(AdmitError::NotFinished)?),
-        })])
+        };
+        self.call(AdmitState::Reservations, page)
     }
 
-    fn add_reservations(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        next: Option<Key>,
-    ) -> Result<Effects, AdmitError> {
+    fn add_reservations(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> AdmitNext {
         let invalid = || ConversionError::InvalidLength("capacity reservation row".into());
         for (key, value) in values {
             let set_id = key.get(..16).and_then(|set| <[u8; 16]>::try_from(set).ok());
@@ -274,8 +265,8 @@ impl AdmitOperation {
             }
             entry.1 = entry.1.saturating_add(bytes);
         }
-        if let Some(next) = next {
-            return self.reservations(Some(IterStart::After(next)));
+        if next.is_some() {
+            return self.reservations(next);
         }
         // Usage rows change with every write; read outside the transaction, they never
         // conflict it.
@@ -287,11 +278,8 @@ impl AdmitOperation {
             let key = Key::from(usage_bucket_key(bucket));
             (USAGE_STATS_KEYSPACE.to_string(), key)
         }));
-        self.state = AdmitState::Usage;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })])
+        let usage = StagedCall::Outside(IoCall::Read(reads)).into_call();
+        self.call(AdmitState::Usage, usage)
     }
 
     fn member_buckets(&self) -> impl Iterator<Item = &String> {
@@ -302,7 +290,7 @@ impl AdmitOperation {
 
     /// Stored bytes plus the part of each reservation its bucket has not filled yet must leave
     /// room for the member's need.
-    fn check_capacity(&mut self, values: Vec<Option<Value>>) -> Result<Effects, AdmitError> {
+    fn check_capacity(&mut self, values: Vec<Option<Value>>) -> AdmitNext {
         let capacity = self.config.capacity.ok_or(AdmitError::NotFinished)?;
         let shards = global_shard_keys().len();
         let mut used = 0u64;
@@ -330,8 +318,7 @@ impl AdmitOperation {
     }
 
     /// Opens the missing ranges and reserves what the member needs for them and its new copies.
-    fn write(&mut self) -> Result<Effects, AdmitError> {
-        let txn_id = self.txn_id.ok_or(AdmitError::NotFinished)?;
+    fn write(&mut self) -> AdmitNext {
         let set_id = self.config.set_id;
         let mut writes = open_ranges(set_id, &self.missing)?;
         let member = MemberReservation {
@@ -349,127 +336,50 @@ impl AdmitOperation {
             let key = account_key(set_id, *range_id);
             writes.push(row(key, bytes.to_be_bytes().to_vec()));
         }
-        self.state = AdmitState::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.call(AdmitState::Write, IoCall::Write(writes))
     }
 
-    fn sign(&mut self, claim: StatementClaim) -> Effects {
-        self.state = AdmitState::Sign;
-        smallvec![Effect::Net(NetEffect::StatementSign(Box::new(claim)))]
-    }
-
-    fn commit(&mut self, signed: SignedStatement) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(AdmitError::NotFinished);
-        };
-        self.signed = Some(signed);
-        self.state = AdmitState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: AdmitError) -> Effects {
-        let cleanup = self.abort();
-        self.state = AdmitState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected(&mut self, state: &'static str, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        self.fail(AdmitError::UnexpectedEvent {
-            state,
-            got: event.label(),
-        })
+    fn sign(&mut self, claim: StatementClaim) -> AdmitNext {
+        let sign = Effect::Net(NetEffect::StatementSign(Box::new(claim)));
+        self.call(AdmitState::Sign, IoCall::Effect(Box::new(sign)))
     }
 }
 
-impl EffectOperation for AdmitOperation {
+impl Operation for AdmitOperation {
     type Output = SignedStatement;
     type Error = AdmitError;
 
-    fn start(&mut self) -> Effects {
-        self.state = AdmitState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> AdmitNext {
+        Ok(Next::Call(self.read()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (
-                AdmitState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => self.read(txn_id),
-            (AdmitState::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let values = values.into_iter().map(|(_, value)| value).collect();
-                self.plan(values).unwrap_or_else(|error| self.fail(error))
+    fn next(&mut self, result: IoResult) -> AdmitNext {
+        match self.state {
+            AdmitState::Read => self.plan(result.values()?),
+            AdmitState::Reservations => {
+                let (rows, next) = result.page()?;
+                self.add_reservations(rows, next)
             }
-            (
-                AdmitState::Reservations,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => (self.add_reservations(values, next_start_after))
-                .unwrap_or_else(|error| self.fail(error)),
-            (AdmitState::Usage, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let values = values.into_iter().map(|(_, value)| value).collect();
-                self.check_capacity(values)
-                    .unwrap_or_else(|error| self.fail(error))
+            AdmitState::Usage => self.check_capacity(outside_answer(result)?.values()?),
+            AdmitState::Write => {
+                done(result)?;
+                let claim = self.pending.take().ok_or(AdmitError::NotFinished)?;
+                self.sign(claim)
             }
-            (AdmitState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                match self.pending.take() {
-                    Some(claim) => self.sign(claim),
-                    None => self.fail(AdmitError::NotFinished),
+            AdmitState::Sign => match result.event()? {
+                Event::Net(NetEvent::StatementSign(StatementSignEvent::Signed(signed))) => {
+                    Ok(Next::Done(*signed))
                 }
-            }
-            (AdmitState::Sign, Event::Net(NetEvent::StatementSign(signed))) => match signed {
-                StatementSignEvent::Signed(signed) => self.commit(*signed),
-                StatementSignEvent::Unavailable(reason) => {
-                    self.fail(AdmitError::SignUnavailable(reason))
+                Event::Net(NetEvent::StatementSign(StatementSignEvent::Unavailable(reason))) => {
+                    Err(AdmitError::SignUnavailable(reason))
                 }
+                other => Err(AdmitError::UnexpectedEvent(other.label())),
             },
-            (AdmitState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = AdmitState::Finish;
-                self.output = self.signed.take().map(Ok);
-                smallvec![]
-            }
-            (AdmitState::Init | AdmitState::Finish | AdmitState::Error, _) => smallvec![],
-            (state, event) => {
-                let name = match state {
-                    AdmitState::StartTransaction => "start transaction",
-                    AdmitState::Read => "read",
-                    AdmitState::Reservations => "reservations",
-                    AdmitState::Usage => "usage",
-                    AdmitState::Write => "write",
-                    AdmitState::Sign => "sign",
-                    AdmitState::Commit => "commit",
-                    AdmitState::Init | AdmitState::Finish | AdmitState::Error => "done",
-                };
-                self.unexpected(name, event)
-            }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, AdmitState::Finish | AdmitState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !self.is_complete() {
-            return Err(AdmitError::NotFinished);
-        }
-        self.output.unwrap_or(Err(AdmitError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

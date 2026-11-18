@@ -7,9 +7,9 @@ use super::state::{Ancestry, reduce};
 use super::{GitError, publish, records, repository};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::resolve::version_holders;
-use crate::driver::DriverContext;
-use crate::driver::drive;
+use crate::distribution::resolve::{RESOLVE_BUDGET, resolve_version, version_found};
+use crate::driver::{DriverContext, drive, drive_until};
+use tokio::time::Instant;
 use crate::replication::bao_read::BaoReadError;
 use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -188,10 +188,13 @@ pub async fn upload(
 /// The members that keep a pinned distributed version, found through the resolver.
 async fn set_holders(context: &DriverContext, object: &StoredObject) -> Vec<aruna_core::NodeId> {
     match &object.global {
-        Some(GlobalId::Version { version_id, .. }) => version_holders(context, *version_id)
-            .await
-            .map(|resolved| resolved.holders)
-            .unwrap_or_default(),
+        Some(GlobalId::Version { version_id, .. }) => {
+            let deadline = Instant::now() + RESOLVE_BUDGET;
+            let resolve = resolve_version(context, *version_id, deadline);
+            version_found(drive_until(resolve, context, deadline).await)
+                .map(|resolved| resolved.holders)
+                .unwrap_or_default()
+        }
         _ => Vec::new(),
     }
 }

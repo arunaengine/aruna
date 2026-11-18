@@ -436,11 +436,11 @@ async fn coordinated_files(
         return all_files(context, scope, access, asked, None).await;
     };
     let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let view = read_view(context, binding.set_id)
+    let view = drive(read_view(binding.set_id), context)
         .await
         .map_err(|error| unavailable(&error))?
         .ok_or_else(|| PublishError::Unavailable("this node holds no record of the set".into()))?;
-    let fence = local_fence(context, binding.set_id)
+    let fence = drive(local_fence(binding.set_id), context)
         .await
         .map_err(|error| unavailable(&error))?;
     let snapshot = view.snapshot();
@@ -684,11 +684,11 @@ pub async fn holder_answer(
             let Some(binding) = &info.distribution else {
                 return Ok(HolderAnswer::Files(refused));
             };
-            let view = read_view(context, binding.set_id)
+            let view = drive(read_view(binding.set_id), context)
                 .await
                 .map_err(|error| unavailable(&error))?
                 .ok_or_else(|| PublishError::Unavailable("no record of the set".into()))?;
-            let fence = local_fence(context, binding.set_id)
+            let fence = drive(local_fence(binding.set_id), context)
                 .await
                 .map_err(|error| unavailable(&error))?;
             let snapshot = view.snapshot();

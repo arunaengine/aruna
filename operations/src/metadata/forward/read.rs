@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use crate::device::replica::ReplicaRecord;
 use crate::device::replica_store::read_replica;
 use crate::device::selection::keep_read;
@@ -94,8 +95,7 @@ pub(super) async fn device_replica(
     if local_node.is_none_or(|node| is_sync_eligible(config, node)) {
         return None;
     }
-    read_replica(context, document_id)
-        .await
+    drive(read_replica(document_id), context).await.ok().flatten()
         .filter(ReplicaRecord::serves_reads)
 }
 
@@ -140,7 +140,7 @@ pub async fn get_metadata_routed(
     match (routed, cached) {
         (Ok(record), _) => {
             if keeps {
-                keep_read(context, &record).await;
+                drive(keep_read(context, &record), context).await.ok();
             }
             Ok(record)
         }

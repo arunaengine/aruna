@@ -1016,14 +1016,20 @@ impl MetadataHandle {
             }
             admit @ MetadataTransportMessage::ForwardAdmitMember { .. } => {
                 Box::pin(async {
-                    crate::distribution::forward::serve_admission(context, peer, admit).await
+                    let serve = crate::distribution::forward::serve_admission(context, peer, admit);
+                    crate::driver::drive(serve, context)
+                        .await
+                        .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
             publish @ (MetadataTransportMessage::ForwardDistributionRequest { .. }
             | MetadataTransportMessage::SubmitDistributionStatement { .. }) => {
                 Box::pin(async {
-                    crate::distribution::forward::serve_publish(context, peer, publish).await
+                    let serve = crate::distribution::forward::serve_publish(context, peer, publish);
+                    crate::driver::drive(serve, context)
+                        .await
+                        .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
@@ -1219,8 +1225,8 @@ impl MetadataHandle {
                 job_id,
             } => {
                 let job = (transfer_id, job_id);
-                let spec = crate::distribution::imports::staging_spec(context, peer, job);
-                let result = spec.await.map(Box::new);
+                let spec = crate::distribution::imports::StagingSpecOperation::new(peer, job);
+                let result = crate::driver::drive(spec, context).await.map(Box::new);
                 (MetadataTransportMessage::StagingSpecResult { result }, None)
             }
             MetadataTransportMessage::ReferencePage { page } => {

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -82,7 +83,7 @@ async fn list_device_transfers(
     _: OwnerAuth,
 ) -> ServerResult<Json<DeviceTransferList>> {
     let context = state.get_ctx();
-    let folders: HashMap<Ulid, SyncedFolder> = list_folders(&context)
+    let folders: HashMap<Ulid, SyncedFolder> = drive(list_folders(), &context)
         .await
         .map_err(map_folder_error)?
         .into_iter()
@@ -104,7 +105,7 @@ async fn list_device_transfers(
     for folder in folders.values() {
         let mut cursor = None;
         loop {
-            let (entries, next) = list_entries(&context, folder.folder_id, None, cursor)
+            let (entries, next) = drive(list_entries(folder.folder_id, None, cursor), &context)
                 .await
                 .map_err(map_folder_error)?;
             for (path, base) in entries {

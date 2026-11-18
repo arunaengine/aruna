@@ -5,17 +5,17 @@
 
 // Every pass is bounded and resumes.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StatementSignEvent, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
 };
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, RangeAccount, RangeCounters, SAMPLE_SIZE, SampleEntry, generation_key, needs_refill,
@@ -28,15 +28,21 @@ use aruna_core::types::{Key, Value};
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use super::create::submit;
+use super::balance::{BalanceInputs, BalanceOperation, COOL_DOWN, balance_inputs};
+use super::here::NodeRealm;
+use super::imports::{ContinueImportsOperation, ImportError, KeptStart};
+use super::inventory::{StagedCall, outside_answer};
+use super::lifecycle::{LifecycleCursors, LifecyclePass, TendLifecycleOperation};
+pub use super::rebuild::BeginRebuildsError;
 use super::rebuild::{
-    BeginRebuildsOperation, RebuildConfig, RebuildOperation, RebuildOutcome, decode,
+    BeginRebuildsOperation, RebuildConfig, RebuildError, RebuildOperation, RebuildOutcome, decode,
 };
-use super::refill::{RefillConfig, RefillOperation};
-use super::refresh::{RefreshCursor, RefreshRangesOperation};
+use super::refill::{RefillConfig, RefillError, RefillOperation, RefillOutcome};
+use super::refresh::{RefreshCursor, RefreshError, RefreshPass, RefreshRangesOperation};
 use super::split::{SplitConfig, SplitError, SplitOperation};
-use crate::driver::{DriverContext, drive};
-use crate::s3::usage::MarkDirtyOperation;
+use super::submit::{StateOperation, Stated};
+use crate::driver::DriverContext;
+use crate::s3::usage::{MarkDirtyError, MarkDirtyOperation};
 
 /// How long a pass that found nothing to do waits before it looks again.
 const MAINTAIN_AFTER: Duration = Duration::from_secs(60);
@@ -49,240 +55,390 @@ const WALK_BYTES: usize = 4 * 1024 * 1024;
 /// Page transactions one rebuild or refill run commits.
 const WALK_PAGES: usize = 8;
 
-/// The account row after which the next pass continues; a restart begins again at the start.
-static CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-/// Where the periodic source refresh goes on; a restart begins again at the start.
-static REFRESH_CURSOR: Mutex<Option<RefreshCursor>> = Mutex::new(None);
+/// Where the passes go on; a restart begins again at the start.
+static CURSORS: Mutex<Option<MaintainCursors>> = Mutex::new(None);
+
+/// What range maintenance keeps between its passes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct MaintainCursors {
+    /// The account row after which the next pass continues.
+    accounts: Option<Vec<u8>>,
+    refresh: Option<RefreshCursor>,
+    lifecycle: LifecycleCursors,
+    /// When this node last proposed a balancing transfer.
+    balanced_at: Option<Instant>,
+}
+
+/// One finished pass: when the next should run, and where it goes on.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MaintainPass {
+    after: Duration,
+    cursors: MaintainCursors,
+    imports: Vec<KeptStart>,
+}
+
+impl MaintainPass {
+    /// Keeps the cursors for the next pass; returns when it should run and the handed imports
+    /// to start now.
+    pub(crate) fn finish(self) -> (Duration, Vec<KeptStart>) {
+        if let Ok(mut kept) = CURSORS.lock() {
+            *kept = Some(self.cursors);
+        }
+        (self.after, self.imports)
+    }
+}
+
+/// One bounded pass over the range accounts and this node's other range work, resuming where
+/// the last finished pass stopped.
+pub(crate) fn maintain_ranges(context: &DriverContext) -> MaintainRangesOperation {
+    let kept = CURSORS.lock().ok().and_then(|cursors| cursors.clone());
+    MaintainRangesOperation::new(
+        context.node_and_realm(),
+        kept.unwrap_or_default(),
+        balance_inputs(context),
+    )
+}
+
+/// How long to wait after a pass the runner could not finish.
+pub(crate) fn maintain_retry() -> Duration {
+    MAINTAIN_AFTER
+}
 
 /// What tending one range left behind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Tended {
+pub(super) enum Tended {
     Idle,
     /// Work remains; the next pass comes at once.
     Busy,
 }
 
-/// One bounded pass over the range accounts. Returns when the next pass should run.
-pub async fn maintain_ranges(context: &Arc<DriverContext>) -> Duration {
-    let lifecycle = super::lifecycle::tend_lifecycle(context).await;
-    let mut after = maintain_accounts(context).await;
-    // Imports handed over with a range start once this node coordinates it.
-    if let Err(error) = super::imports::continue_imports(context).await {
-        warn!(%error, "Handed over imports could not start");
-    }
-    // Coordinators walk their ranges for the periodic source refresh, a few pages per pass.
-    if let Some(net) = context.net_handle.as_ref() {
-        let cursor = (REFRESH_CURSOR.lock().ok()).and_then(|mut cursor| cursor.take());
-        let (realm_id, now) = (*net.realm_id(), std::time::SystemTime::now());
-        let cursor = cursor.unwrap_or_default();
-        let began = cursor.record.clone();
-        let pass = RefreshRangesOperation::new(realm_id, net.node_id(), now, cursor);
-        let (busy, cursor) = match drive(pass, context).await {
-            Ok(pass) => (pass.busy, pass.cursor),
-            Err(error) => {
-                warn!(%error, "The periodic source refresh could not run");
-                // A runner failure names no cursor; the next pass resumes where this one began.
-                let record = error.record.or(began);
-                (
-                    false,
-                    RefreshCursor {
-                        record,
-                        sweep: None,
-                    },
-                )
-            }
-        };
-        if busy {
-            after = Duration::ZERO;
-        }
-        if let Ok(mut kept) = REFRESH_CURSOR.lock() {
-            *kept = Some(cursor);
-        }
-    }
-    // Version links metadata could not verify in a set are retried here, a page per pass.
-    match crate::metadata::data_links::retry_unverified(context).await {
-        Ok(true) => after = Duration::ZERO,
-        Ok(false) => {}
-        Err(error) => warn!(%error, "Unverified data links could not be retried"),
-    }
-    lifecycle.map_or(after, |lifecycle| lifecycle.min(after))
+/// What the pending call of a maintenance pass answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaintainStep {
+    Lifecycle,
+    Accounts,
+    Record,
+    Tend,
+    Balance,
+    Imports,
+    Refresh,
 }
 
-/// One bounded pass over the range accounts.
-async fn maintain_accounts(context: &Arc<DriverContext>) -> Duration {
-    let Some(net) = context.net_handle.as_ref() else {
-        return MAINTAIN_AFTER;
-    };
-    let (realm_id, local) = (*net.realm_id(), net.node_id());
-    let mut start = CURSOR.lock().map(|cursor| cursor.clone()).unwrap_or(None);
-    let mut records: HashMap<Ulid, Option<DistributionSnapshot>> = HashMap::new();
-    let mut busy = false;
-    for _ in 0..MAX_PAGES {
-        let (rows, more) = match accounts(context, start.clone()).await {
-            Ok(page) => page,
-            Err(error) => {
-                warn!(%error, "Range maintenance could not read the range accounts");
-                return MAINTAIN_AFTER;
-            }
+/// See [`maintain_ranges`].
+#[derive(Debug, PartialEq)]
+pub(crate) struct MaintainRangesOperation {
+    ids: NodeRealm,
+    cursors: MaintainCursors,
+    inputs: BalanceInputs,
+    step: MaintainStep,
+    pages: usize,
+    more: bool,
+    busy: bool,
+    rows: VecDeque<(Vec<u8>, Value)>,
+    records: BTreeMap<Ulid, Option<DistributionSnapshot>>,
+    /// The account waiting for its set's record.
+    current: Option<(Ulid, Ulid, RangeAccount)>,
+    balancing: VecDeque<DistributionSnapshot>,
+    lifecycle_poll: Option<Duration>,
+    after: Duration,
+    refresh_began: Option<Vec<u8>>,
+    imports: Vec<KeptStart>,
+}
+
+type Maintaining = Result<Next<MaintainPass>, IoError>;
+
+impl MaintainRangesOperation {
+    fn new(ids: NodeRealm, cursors: MaintainCursors, inputs: BalanceInputs) -> Self {
+        Self {
+            ids,
+            cursors,
+            inputs,
+            step: MaintainStep::Lifecycle,
+            pages: 0,
+            more: false,
+            busy: false,
+            rows: VecDeque::new(),
+            records: BTreeMap::new(),
+            current: None,
+            balancing: VecDeque::new(),
+            lifecycle_poll: None,
+            after: MAINTAIN_AFTER,
+            refresh_began: None,
+            imports: Vec::new(),
+        }
+    }
+
+    fn node(&self) -> Result<(NodeId, RealmId), IoError> {
+        self.ids.ok_or(IoError::Unfinished)
+    }
+
+    fn read_accounts(&mut self) -> Maintaining {
+        let page = IoCall::Page {
+            space: RANGE_ACCOUNT_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.cursors.accounts.clone().map(Key::from),
+            limit: ACCOUNT_PAGE,
         };
-        for (key, value) in rows {
-            start = Some(key.clone());
+        self.step = MaintainStep::Accounts;
+        Ok(Next::Call(StagedCall::Outside(page).into_call()))
+    }
+
+    fn accounts_read(&mut self, result: IoResult) -> Maintaining {
+        match outside_answer(result) {
+            Ok(IoResult::Page { rows, next }) => {
+                self.more = next.is_some();
+                self.rows = (rows.into_iter())
+                    .map(|(key, value)| (key.to_vec(), value))
+                    .collect();
+                self.next_row()
+            }
+            Ok(other) => self.accounts_failed(&other.label()),
+            Err(error) => self.accounts_failed(&error),
+        }
+    }
+
+    fn accounts_failed(&mut self, error: &dyn std::fmt::Display) -> Maintaining {
+        warn!(%error, "Range maintenance could not read the range accounts");
+        self.after = MAINTAIN_AFTER;
+        self.continue_imports()
+    }
+
+    /// Tends the next account of the page, reading its set's record once.
+    fn next_row(&mut self) -> Maintaining {
+        while let Some((key, value)) = self.rows.pop_front() {
+            self.cursors.accounts = Some(key.clone());
             let Some((set_id, range_id, account)) = decode(&key, &value) else {
                 continue;
             };
-            if let Entry::Vacant(slot) = records.entry(set_id) {
-                slot.insert(read_record(context, set_id).await);
+            self.current = Some((set_id, range_id, account));
+            if !self.records.contains_key(&set_id) {
+                let read = read_row(DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec());
+                self.step = MaintainStep::Record;
+                return Ok(Next::Call(StagedCall::Outside(read).into_call()));
             }
-            let Some(Some(snapshot)) = records.get(&set_id) else {
-                continue;
-            };
-            let range = Tending {
-                realm_id,
-                local,
-                snapshot,
-                range_id,
-                account: &account,
-            };
-            if range.tend(context).await == Tended::Busy {
-                busy = true;
+            if let Some(tend) = self.tend_current()? {
+                return Ok(tend);
             }
         }
-        if !more {
-            start = None;
-            break;
+        self.pages += 1;
+        if !self.more {
+            self.cursors.accounts = None;
+        } else if self.pages < MAX_PAGES {
+            return self.read_accounts();
+        }
+        self.accounts_done()
+    }
+
+    /// The call that tends the current account, when its set has a usable record.
+    fn tend_current(&mut self) -> Result<Option<Next<MaintainPass>>, IoError> {
+        let (set_id, range_id, account) = self.current.take().ok_or(IoError::Unfinished)?;
+        let Some(Some(snapshot)) = self.records.get(&set_id) else {
+            return Ok(None);
+        };
+        let (local, realm_id) = self.node()?;
+        let tend = TendRangeOperation::new(realm_id, local, snapshot.clone(), range_id, account);
+        self.step = MaintainStep::Tend;
+        Ok(Some(Next::Call(IoCall::child(tend))))
+    }
+
+    fn accounts_done(&mut self) -> Maintaining {
+        self.after = match self.busy || self.cursors.accounts.is_some() {
+            true => Duration::ZERO,
+            false => MAINTAIN_AFTER,
+        };
+        self.balancing = self.records.values().flatten().cloned().collect();
+        self.next_balance()
+    }
+
+    fn next_balance(&mut self) -> Maintaining {
+        let cooling = (self.cursors.balanced_at).is_some_and(|at| at.elapsed() < COOL_DOWN);
+        match self.balancing.pop_front() {
+            Some(snapshot) if !cooling => {
+                let (local, realm_id) = self.node()?;
+                let ids = (local, realm_id);
+                let balance = BalanceOperation::new(ids, snapshot, self.inputs.clone());
+                self.step = MaintainStep::Balance;
+                Ok(Next::Call(IoCall::child(balance)))
+            }
+            _ => self.continue_imports(),
         }
     }
-    let more = start.is_some();
-    if let Ok(mut cursor) = CURSOR.lock() {
-        *cursor = start;
+
+    /// Imports handed over with a range start once this node coordinates it.
+    fn continue_imports(&mut self) -> Maintaining {
+        let (local, _) = self.node()?;
+        self.step = MaintainStep::Imports;
+        let imports = ContinueImportsOperation::new(local);
+        Ok(Next::Call(IoCall::child(imports)))
     }
-    for snapshot in records.values().flatten() {
-        super::balance::balance_set(context, realm_id, local, snapshot).await;
+
+    /// Coordinators walk their ranges for the periodic source refresh, a few pages per pass.
+    fn refresh(&mut self) -> Maintaining {
+        let (local, realm_id) = self.node()?;
+        let cursor = self.cursors.refresh.take().unwrap_or_default();
+        self.refresh_began = cursor.record.clone();
+        let pass = RefreshRangesOperation::new(realm_id, local, SystemTime::now(), cursor);
+        self.step = MaintainStep::Refresh;
+        Ok(Next::Call(IoCall::child(pass)))
     }
-    match busy || more {
-        true => Duration::ZERO,
-        false => MAINTAIN_AFTER,
+
+    fn finished(&mut self) -> Maintaining {
+        let poll = self.lifecycle_poll;
+        Ok(Next::Done(MaintainPass {
+            after: poll.map_or(self.after, |poll| poll.min(self.after)),
+            cursors: std::mem::take(&mut self.cursors),
+            imports: std::mem::take(&mut self.imports),
+        }))
     }
+}
+
+impl Operation for MaintainRangesOperation {
+    type Output = MaintainPass;
+    type Error = IoError;
+
+    fn first(&mut self) -> Maintaining {
+        let Some((local, realm_id)) = self.ids else {
+            return self.finished();
+        };
+        let cursors = std::mem::take(&mut self.cursors.lifecycle);
+        let tend = TendLifecycleOperation::new(realm_id, local, cursors);
+        Ok(Next::Call(IoCall::child(tend)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Maintaining {
+        match self.step {
+            MaintainStep::Lifecycle => {
+                let pass = result.child::<LifecyclePass, IoError>()??;
+                self.lifecycle_poll = pass.poll;
+                self.cursors.lifecycle = pass.cursors;
+                self.read_accounts()
+            }
+            MaintainStep::Accounts => self.accounts_read(result),
+            MaintainStep::Record => {
+                let (set_id, ..) = self.current.as_ref().ok_or(IoError::Unfinished)?;
+                let set_id = *set_id;
+                let stored = (outside_answer(result).and_then(|read| read.value())).ok();
+                self.records.insert(set_id, usable_record(stored.flatten()));
+                match self.tend_current()? {
+                    Some(tend) => Ok(tend),
+                    None => self.next_row(),
+                }
+            }
+            MaintainStep::Tend => {
+                if result.child::<Tended, IoError>()?? == Tended::Busy {
+                    self.busy = true;
+                }
+                self.next_row()
+            }
+            MaintainStep::Balance => {
+                if result.child::<bool, IoError>()?? {
+                    self.cursors.balanced_at = Some(Instant::now());
+                }
+                self.next_balance()
+            }
+            MaintainStep::Imports => {
+                match result.child::<Vec<KeptStart>, ImportError>()? {
+                    Ok(starts) => self.imports = starts,
+                    Err(error) => warn!(%error, "Handed over imports could not start"),
+                }
+                self.refresh()
+            }
+            MaintainStep::Refresh => {
+                let (busy, cursor) = match result.child::<RefreshPass, RefreshError>()? {
+                    Ok(pass) => (pass.busy, pass.cursor),
+                    Err(error) => {
+                        warn!(%error, "The periodic source refresh could not run");
+                        // A runner failure names no cursor; the next pass resumes where this
+                        // one began.
+                        let record = error.record.or(self.refresh_began.take());
+                        let sweep = None;
+                        (false, RefreshCursor { record, sweep })
+                    }
+                };
+                if busy {
+                    self.after = Duration::ZERO;
+                }
+                self.cursors.refresh = Some(cursor);
+                self.finished()
+            }
+        }
+    }
+}
+
+/// The set's head from its stored record; a conflicted set takes no configuration changes,
+/// splits included.
+fn usable_record(stored: Option<Value>) -> Option<DistributionSnapshot> {
+    let view = DistributionView::from_bytes(&stored?).ok()?;
+    (!view.conflicted()).then_some(view.head.snapshot)
 }
 
 /// Begins a counter rebuild of every active range account without one, so range counters are
 /// confirmed again after a node-wide usage rebuild started. The range maintenance runs the
 /// rebuilds; until they activate, the counters report incomplete.
-pub async fn begin_range_rebuilds(context: &DriverContext) -> Result<usize, String> {
-    let begin = BeginRebuildsOperation::new(ACCOUNT_PAGE, (WALK_ROWS, WALK_BYTES));
-    drive(begin, context)
-        .await
-        .map_err(|error| error.to_string())
+pub fn begin_range_rebuilds() -> BeginRebuildsOperation {
+    BeginRebuildsOperation::new(ACCOUNT_PAGE, (WALK_ROWS, WALK_BYTES))
 }
 
-async fn accounts(
-    context: &DriverContext,
-    start: Option<Vec<u8>>,
-) -> Result<(Vec<(Vec<u8>, Value)>, bool), String> {
-    let iter = StorageEffect::Iter {
-        key_space: RANGE_ACCOUNT_KEYSPACE.to_string(),
-        prefix: None,
-        start: start.map(|key| IterStart::After(Key::from(key))),
-        limit: ACCOUNT_PAGE,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(iter).await {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((
-            values
-                .into_iter()
-                .map(|(key, value)| (key.to_vec(), value))
-                .collect(),
-            next_start_after.is_some(),
-        )),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected answer {}", other.label())),
-    }
+/// What the pending call of tending one range answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TendStep {
+    Split,
+    Rebuild,
+    Refill,
+    Republish(Tended),
+    Counters,
+    Sample,
+    State,
 }
 
-async fn read(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        _ => None,
-    }
-}
-
-async fn read_record(context: &DriverContext, set_id: Ulid) -> Option<DistributionSnapshot> {
-    let bytes = read(context, DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec()).await?;
-    let view = DistributionView::from_bytes(&bytes).ok()?;
-    // A conflicted set takes no configuration changes, splits included.
-    (!view.conflicted()).then_some(view.head.snapshot)
-}
-
-/// One range account this node holds, with the record of its set.
-struct Tending<'a> {
+/// Tends one range account this node holds, with the record of its set.
+#[derive(Debug, PartialEq)]
+pub(super) struct TendRangeOperation {
     realm_id: RealmId,
     local: NodeId,
-    snapshot: &'a DistributionSnapshot,
+    snapshot: DistributionSnapshot,
     range_id: Ulid,
-    account: &'a RangeAccount,
+    account: RangeAccount,
+    step: TendStep,
+    objects: i128,
+    split_key: Option<String>,
 }
 
-impl Tending<'_> {
+type Tending = Result<Next<Tended>, IoError>;
+
+impl TendRangeOperation {
+    pub(super) fn new(
+        realm_id: RealmId,
+        local: NodeId,
+        snapshot: DistributionSnapshot,
+        range_id: Ulid,
+        account: RangeAccount,
+    ) -> Self {
+        Self {
+            realm_id,
+            local,
+            snapshot,
+            range_id,
+            account,
+            step: TendStep::Rebuild,
+            objects: 0,
+            split_key: None,
+        }
+    }
+
     fn set_id(&self) -> Ulid {
         self.snapshot.set_id()
     }
 
-    async fn tend(&self, context: &Arc<DriverContext>) -> Tended {
-        match (&self.account.charge, self.account.rebuild.is_some()) {
-            (Charge::Retired { .. }, _) => Tended::Idle,
-            (Charge::Active(_), false) => match self.snapshot.retired_range(self.range_id) {
-                Some(retired) => {
-                    let config = SplitConfig {
-                        set_id: self.set_id(),
-                        range_id: self.range_id,
-                        split_key: retired.split_key.clone(),
-                        left: retired.lower_id,
-                        right: retired.upper_id,
-                    };
-                    self.split_accounting(context, config).await
-                }
-                None => self.check_thresholds(context).await,
-            },
-            (Charge::Active(_) | Charge::Child { .. }, _) => self.rebuild(context).await,
-        }
-    }
-
-    /// Splits this node's accounting the way the record split the range.
-    async fn split_accounting(&self, context: &Arc<DriverContext>, config: SplitConfig) -> Tended {
-        match drive(SplitOperation::new(config), context.as_ref()).await {
-            Ok(()) => {
-                self.republish(context).await;
-                Tended::Busy
-            }
-            // Concurrent writers left more sample entries than one split reads.
-            Err(SplitError::Refused(_, "the key sample needs a refill")) => {
-                self.refill(context).await
-            }
-            Err(error) => {
-                warn!(set_id = %self.set_id(), range_id = %self.range_id, %error, "A range split could not be accounted");
-                Tended::Idle
-            }
-        }
-    }
-
     /// A finished accounting transition moves the charged rows a replica share reads.
-    async fn republish(&self, context: &DriverContext) {
+    fn republish(&mut self, then: Tended) -> Tending {
         let group = self.snapshot.config.owner_group;
         let mark = MarkDirtyOperation::new([group], Ulid::generate());
-        if let Err(error) = drive(mark, context).await {
-            warn!(set_id = %self.set_id(), %error, "The replica share was not marked for a publish");
-        }
+        self.step = TendStep::Republish(then);
+        Ok(Next::Call(IoCall::child(mark)))
     }
 
-    async fn rebuild(&self, context: &Arc<DriverContext>) -> Tended {
+    fn rebuild(&mut self) -> Tending {
         let config = RebuildConfig {
             set_id: self.set_id(),
             range_id: self.range_id,
@@ -291,21 +447,11 @@ impl Tending<'_> {
             max_pages: WALK_PAGES,
             group_id: Some(self.snapshot.config.owner_group),
         };
-        match drive(RebuildOperation::new(config), context.as_ref()).await {
-            Ok(RebuildOutcome::Paused) => Tended::Busy,
-            Ok(RebuildOutcome::Done) => {
-                self.republish(context).await;
-                Tended::Idle
-            }
-            Ok(RebuildOutcome::Waiting) => Tended::Idle,
-            Err(error) => {
-                warn!(set_id = %self.set_id(), range_id = %self.range_id, %error, "A range rebuild failed");
-                Tended::Idle
-            }
-        }
+        self.step = TendStep::Rebuild;
+        Ok(Next::Call(IoCall::child(RebuildOperation::new(config))))
     }
 
-    async fn refill(&self, context: &Arc<DriverContext>) -> Tended {
+    fn refill(&mut self) -> Tending {
         let config = RefillConfig {
             set_id: self.set_id(),
             range_id: self.range_id,
@@ -313,18 +459,13 @@ impl Tending<'_> {
             page_bytes: WALK_BYTES,
             max_pages: WALK_PAGES,
         };
-        match drive(RefillOperation::new(config), context.as_ref()).await {
-            Ok(_) => Tended::Busy,
-            Err(error) => {
-                warn!(set_id = %self.set_id(), range_id = %self.range_id, %error, "A key sample refill failed");
-                Tended::Idle
-            }
-        }
+        self.step = TendStep::Refill;
+        Ok(Next::Call(IoCall::child(RefillOperation::new(config))))
     }
 
     /// The range this node coordinates and may split now, with the member it signs as.
     fn splittable(&self) -> Option<(&DistributionMember, &KeyRange)> {
-        let snapshot = self.snapshot;
+        let snapshot = &self.snapshot;
         let settings = &snapshot.config.settings;
         if settings.split_objects.is_none() && settings.split_bytes.is_none() {
             return None;
@@ -341,39 +482,55 @@ impl Tending<'_> {
         (open && range.coordinator == member.member_id).then_some((member, range))
     }
 
-    /// Splits the range when its counters pass a threshold, at a key from its sample.
-    async fn check_thresholds(&self, context: &Arc<DriverContext>) -> Tended {
-        let Some((member, range)) = self.splittable() else {
-            return Tended::Idle;
+    /// Reads the range's counters when it may split at all.
+    fn check_thresholds(&mut self) -> Tending {
+        let Some((_, range)) = self.splittable() else {
+            return Ok(Next::Done(Tended::Idle));
         };
         let Charge::Active(generation) = self.account.charge else {
-            return Tended::Idle;
+            return Ok(Next::Done(Tended::Idle));
         };
         let row = generation_key(self.set_id(), range.range_id, generation);
-        let counters = read(context, RANGE_COUNTER_KEYSPACE, row)
-            .await
-            .and_then(|value| RangeCounters::from_bytes(&value).ok())
-            .unwrap_or_default();
+        let read = read_row(RANGE_COUNTER_KEYSPACE, row);
+        self.step = TendStep::Counters;
+        Ok(Next::Call(StagedCall::Outside(read).into_call()))
+    }
+
+    /// Goes on to the key sample once the counters pass a threshold.
+    fn counted(&mut self, counters: RangeCounters) -> Tending {
         let settings = &self.snapshot.config.settings;
         let above =
             |limit: Option<u64>, value: i128| limit.is_some_and(|limit| value > i128::from(limit));
         if !above(settings.split_objects, counters.objects)
             && !above(settings.split_bytes, counters.current_bytes)
         {
-            return Tended::Idle;
+            return Ok(Next::Done(Tended::Idle));
         }
-        let keys = match range_sample(context, self.set_id(), self.range_id).await {
-            Some(keys) if !needs_refill(keys.len(), counters.objects) => keys,
-            _ => return self.refill(context).await,
+        self.objects = counters.objects;
+        let sample = RangeSampleOperation::new(self.set_id(), self.range_id);
+        self.step = TendStep::Sample;
+        Ok(Next::Call(IoCall::child(sample)))
+    }
+
+    /// States the split at a key from the sample; a thin sample is refilled first.
+    fn sampled(&mut self, keys: Option<Vec<String>>) -> Tending {
+        let keys = match keys {
+            Some(keys) if !needs_refill(keys.len(), self.objects) => keys,
+            _ => return self.refill(),
+        };
+        let Some((member, range)) = self.splittable() else {
+            return Ok(Next::Done(Tended::Idle));
         };
         let Some(split_key) = split_point(&keys, range) else {
-            return Tended::Idle;
+            return Ok(Next::Done(Tended::Idle));
         };
+        let snapshot = &self.snapshot;
+        let set_id = snapshot.set_id();
         let statement = Statement::split(
             self.realm_id,
-            self.set_id(),
+            set_id,
             member,
-            self.snapshot.number,
+            snapshot.number,
             range,
             &split_key,
         );
@@ -381,54 +538,142 @@ impl Tending<'_> {
             signer: self.local,
             statement,
         };
-        let signed = match context.net_handle.as_ref().map_or_else(
-            || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
-            |net| net.sign_statement(claim),
-        ) {
-            StatementSignEvent::Signed(signed) => *signed,
-            StatementSignEvent::Unavailable(reason) => {
-                warn!(%reason, "A range split could not be signed");
-                return Tended::Idle;
+        let ids = Some((self.local, self.realm_id));
+        let state = StateOperation::new(ids, snapshot.root.publisher, claim);
+        self.split_key = Some(split_key);
+        self.step = TendStep::State;
+        Ok(Next::Call(IoCall::child(state)))
+    }
+
+    fn stated(&mut self, stated: Stated) -> Next<Tended> {
+        let (set_id, range_id) = (self.set_id(), self.range_id);
+        let split_key = self.split_key.take().unwrap_or_default();
+        match stated {
+            Stated::Taken => {
+                info!(%set_id, %range_id, %split_key, "Split a distributed bucket range");
             }
-        };
-        let publisher = self.snapshot.root.publisher;
-        match submit(context, publisher, self.local, signed).await {
-            Ok(()) => {
-                info!(set_id = %self.set_id(), range_id = %range.range_id, %split_key, "Split a distributed bucket range");
-                Tended::Idle
+            Stated::Refused(refusal) => {
+                warn!(%set_id, %range_id, %refusal, "The publisher did not take a range split");
             }
-            Err(refusal) => {
-                warn!(set_id = %self.set_id(), range_id = %range.range_id, %refusal, "The publisher did not take a range split");
-                Tended::Idle
+            Stated::Unsigned(reason) => warn!(%reason, "A range split could not be signed"),
+        }
+        Next::Done(Tended::Idle)
+    }
+}
+
+impl Operation for TendRangeOperation {
+    type Output = Tended;
+    type Error = IoError;
+
+    fn first(&mut self) -> Tending {
+        match (&self.account.charge, self.account.rebuild.is_some()) {
+            (Charge::Retired { .. }, _) => Ok(Next::Done(Tended::Idle)),
+            (Charge::Active(_), false) => match self.snapshot.retired_range(self.range_id) {
+                // Splits this node's accounting the way the record split the range.
+                Some(retired) => {
+                    let split = SplitOperation::new(SplitConfig {
+                        set_id: self.snapshot.set_id(),
+                        range_id: self.range_id,
+                        split_key: retired.split_key.clone(),
+                        left: retired.lower_id,
+                        right: retired.upper_id,
+                    });
+                    self.step = TendStep::Split;
+                    Ok(Next::Call(IoCall::child(split)))
+                }
+                None => self.check_thresholds(),
+            },
+            (Charge::Active(_) | Charge::Child { .. }, _) => self.rebuild(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Tending {
+        let (set_id, range_id) = (self.set_id(), self.range_id);
+        match self.step {
+            TendStep::Split => match result.child::<(), SplitError>()? {
+                Ok(()) => self.republish(Tended::Busy),
+                // Concurrent writers left more sample entries than one split reads.
+                Err(SplitError::Refused(_, "the key sample needs a refill")) => self.refill(),
+                Err(error) => {
+                    warn!(%set_id, %range_id, %error, "A range split could not be applied");
+                    Ok(Next::Done(Tended::Idle))
+                }
+            },
+            TendStep::Rebuild => match result.child::<RebuildOutcome, RebuildError>()? {
+                Ok(RebuildOutcome::Paused) => Ok(Next::Done(Tended::Busy)),
+                Ok(RebuildOutcome::Done) => self.republish(Tended::Idle),
+                Ok(RebuildOutcome::Waiting) => Ok(Next::Done(Tended::Idle)),
+                Err(error) => {
+                    warn!(%set_id, %range_id, %error, "A range rebuild failed");
+                    Ok(Next::Done(Tended::Idle))
+                }
+            },
+            TendStep::Refill => match result.child::<RefillOutcome, RefillError>()? {
+                Ok(_) => Ok(Next::Done(Tended::Busy)),
+                Err(error) => {
+                    warn!(%set_id, %range_id, %error, "A key sample refill failed");
+                    Ok(Next::Done(Tended::Idle))
+                }
+            },
+            TendStep::Republish(then) => {
+                if let Err(error) = result.child::<(), MarkDirtyError>()? {
+                    warn!(%set_id, %error, "The replica share was not marked for a publish");
+                }
+                Ok(Next::Done(then))
             }
+            TendStep::Counters => {
+                let stored = outside_answer(result).and_then(|read| read.value());
+                let counters = (stored.ok().flatten())
+                    .and_then(|value| RangeCounters::from_bytes(&value).ok())
+                    .unwrap_or_default();
+                self.counted(counters)
+            }
+            TendStep::Sample => {
+                let keys = result.child::<Option<Vec<String>>, IoError>()??;
+                self.sampled(keys)
+            }
+            TendStep::State => Ok(self.stated(result.child::<Stated, IoError>()??)),
         }
     }
 }
 
 /// The keys of this node's sample of a range, in key order; `None` when it cannot be read.
-pub(crate) async fn range_sample(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub(crate) struct RangeSampleOperation {
     set_id: Ulid,
     range_id: Ulid,
-) -> Option<Vec<String>> {
-    let iter = StorageEffect::Iter {
-        key_space: KEY_SAMPLE_KEYSPACE.to_string(),
-        prefix: Some(sample_prefix(set_id, range_id).into()),
-        start: None,
-        limit: usize::from(SAMPLE_SIZE) * 2,
-        txn_id: None,
-    };
-    let Event::Storage(StorageEvent::IterResult { values, .. }) =
-        context.storage_handle.send_storage_effect(iter).await
-    else {
-        return None;
-    };
-    let mut keys: Vec<String> = values
-        .iter()
-        .filter_map(|(key, _)| SampleEntry::decode(key).map(|entry| entry.key))
-        .collect();
-    keys.sort();
-    Some(keys)
+}
+
+impl RangeSampleOperation {
+    pub(crate) fn new(set_id: Ulid, range_id: Ulid) -> Self {
+        Self { set_id, range_id }
+    }
+}
+
+impl Operation for RangeSampleOperation {
+    type Output = Option<Vec<String>>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<Vec<String>>>, IoError> {
+        let page = IoCall::Page {
+            space: KEY_SAMPLE_KEYSPACE.to_string(),
+            prefix: sample_prefix(self.set_id, self.range_id).into(),
+            after: None,
+            limit: usize::from(SAMPLE_SIZE) * 2,
+        };
+        Ok(Next::Call(StagedCall::Outside(page).into_call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Vec<String>>>, IoError> {
+        let Ok(IoResult::Page { rows, .. }) = outside_answer(result) else {
+            return Ok(Next::Done(None));
+        };
+        let mut keys: Vec<String> = (rows.iter())
+            .filter_map(|(key, _)| SampleEntry::decode(key).map(|entry| entry.key))
+            .collect();
+        keys.sort();
+        Ok(Next::Done(Some(keys)))
+    }
 }
 
 /// A split key near the sample's median at a folder boundary: the deepest folder of the
@@ -508,12 +753,12 @@ mod tests {
         .await;
         assert!(apply(&handle, write(set, "a", 1, 5)).await.unwrap());
         let context = context(&handle);
-        assert_eq!(begin_range_rebuilds(&context).await.unwrap(), 1);
+        assert_eq!(drive(begin_range_rebuilds(), &context).await.unwrap(), 1);
         let range_id = Ulid::from_bytes([1; 16]);
         let begun = account(&handle, set, range_id).await.unwrap();
         assert!(begun.rebuild.is_some() && !begun.is_complete());
         // A running rebuild is left alone.
-        assert_eq!(begin_range_rebuilds(&context).await.unwrap(), 0);
+        assert_eq!(drive(begin_range_rebuilds(), &context).await.unwrap(), 0);
         let config = RebuildConfig {
             set_id: set,
             range_id,
@@ -537,6 +782,7 @@ mod tests {
         // A split of this node's accounting moves the charged rows, so the group's replica
         // share is published again.
         use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
+        use aruna_core::structs::storage::distribution::split::RetiredRange;
         use aruna_core::structs::storage::usage::dirty_group_key;
         let (_dir, handle) = open();
         let (snapshot, _) = crate::distribution::test_record::record(true);
@@ -553,24 +799,22 @@ mod tests {
         }
         let context = std::sync::Arc::new(context(&handle));
         let account = account(&handle, set, range_id).await.unwrap();
-        let tending = super::Tending {
-            realm_id: crate::distribution::test_record::realm(),
-            local: crate::distribution::test_record::secret(1).public(),
-            snapshot: &snapshot,
+        let mut snapshot = snapshot;
+        snapshot.retired.push(RetiredRange {
             range_id,
-            account: &account,
-        };
-        let config = super::SplitConfig {
-            set_id: set,
-            range_id,
+            lineage: None,
             split_key: "m".to_string(),
-            left: Ulid::from_bytes([2; 16]),
-            right: Ulid::from_bytes([3; 16]),
-        };
-        assert_eq!(
-            tending.split_accounting(&context, config).await,
-            super::Tended::Busy
+            lower_id: Ulid::from_bytes([2; 16]),
+            upper_id: Ulid::from_bytes([3; 16]),
+        });
+        let tend = super::TendRangeOperation::new(
+            crate::distribution::test_record::realm(),
+            crate::distribution::test_record::secret(1).public(),
+            snapshot.clone(),
+            range_id,
+            account,
         );
+        assert_eq!(drive(tend, &context).await, Ok(super::Tended::Busy));
         let marker = super::super::test_store::get(
             &handle,
             NODE_STATS_KEYSPACE,
