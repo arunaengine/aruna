@@ -5,98 +5,20 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::storage::distribution::accounting::RangeCounters;
-use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
 use aruna_core::types::{GroupId, TxnId};
-use ulid::Ulid;
 
-use super::charged_ranges::{ChargedRangesOperation, UsageError, charged_rows};
+pub use super::charged_ranges::{HeldRange, HeldRanges, RangeUsage, sum_held};
+use super::charged_ranges::{HeldRangesOperation, UsageError};
 use super::replica_shares::{GroupShare, ReplicaSharesOperation};
 use crate::driver::{DriverContext, drive};
-use crate::replication::members::BoundRecordOperation;
-use crate::s3::usage::UsageCompleteOperation;
-
-/// The counted part of a distributed bucket on this member.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RangeUsage {
-    pub counters: RangeCounters,
-    /// Ranges of the set.
-    pub ranges: usize,
-    /// Ranges whose records this member holds and whose counters were summed.
-    pub counted: usize,
-    /// Every range is held here and its counters are exact (active, not rebuilding, and no
-    /// node-wide usage rebuild is running).
-    pub complete: bool,
-}
-
-/// The charged counter rows of one range this member holds, so a member that does not hold the
-/// range can add them without counting a shared parent row twice.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HeldRange {
-    pub range_id: Ulid,
-    /// The range's counters are exact: active, not rebuilding, and no node-wide usage rebuild.
-    pub complete: bool,
-    /// This member coordinates the range, so its counters include every acknowledged write; a
-    /// copy's counters may lag behind its coordinator's.
-    pub coordinated: bool,
-    /// Counter row keys with their values; a split child names its parent's frozen row.
-    pub rows: Vec<(Vec<u8>, RangeCounters)>,
-}
 
 /// The local distributed bucket's binding, record and the charged rows of every range this
 /// member holds; `None` for an ordinary bucket or a member whose record has not arrived.
 pub async fn held_ranges(
     context: &DriverContext,
     bucket: &str,
-) -> Result<Option<(DistributionBinding, DistributionSnapshot, Vec<HeldRange>)>, UsageError> {
-    let Some((binding, snapshot)) = drive(BoundRecordOperation::new(bucket), context)
-        .await
-        .map_err(|error| error.to_string())
-        .map_err(UsageError::Record)?
-    else {
-        return Ok(None);
-    };
-    let held = (snapshot.held_ranges(binding.member_id).iter())
-        .map(|range| range.range_id)
-        .collect();
-    let charged = ChargedRangesOperation::new(binding.set_id, held);
-    let (accounts, values) = drive(charged, context).await?;
-    let set_id = binding.set_id;
-    // A node-wide usage rebuild also leaves range counters unconfirmed.
-    let confirmed = drive(UsageCompleteOperation::new(), context).await?;
-    let ranges = (accounts.iter())
-        .map(|(range_id, account)| HeldRange {
-            range_id: *range_id,
-            complete: confirmed && account.is_complete(),
-            coordinated: (snapshot.config.ranges.iter())
-                .any(|range| range.range_id == *range_id && range.coordinator == binding.member_id),
-            rows: charged_rows(set_id, &[(*range_id, account.clone())])
-                .into_iter()
-                .map(|key| {
-                    let counters = values.get(&key).copied().unwrap_or_default();
-                    (key, counters)
-                })
-                .collect(),
-        })
-        .collect();
-    Ok(Some((binding, snapshot, ranges)))
-}
-
-/// Adds the rows of `ranges`, each distinct row once.
-pub fn sum_held<'a>(
-    ranges: impl IntoIterator<Item = &'a HeldRange>,
-) -> Result<RangeCounters, UsageError> {
-    let mut rows = BTreeMap::new();
-    for range in ranges {
-        for (key, counters) in &range.rows {
-            rows.entry(key.clone()).or_insert(*counters);
-        }
-    }
-    let mut total = RangeCounters::default();
-    for counters in rows.into_values() {
-        total = total.merge(counters)?;
-    }
-    Ok(total)
+) -> Result<Option<HeldRanges>, UsageError> {
+    drive(HeldRangesOperation::new(bucket), context).await
 }
 
 /// Each group's replica share on this node; see [`ReplicaSharesOperation`].
@@ -110,18 +32,21 @@ pub async fn replica_shares(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::charged_ranges::sum_rows;
+    use crate::distribution::charged_ranges::{charged_rows, sum_rows};
     use crate::distribution::replica_shares::BindingShareOperation;
+    use crate::replication::members::BoundRecordOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::distribution::accounting::{
-        Charge, RangeAccount, account_key, generation_key, pending_key,
+        Charge, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
     };
+    use aruna_core::structs::storage::distribution::DistributionSnapshot;
     use aruna_core::structs::storage::usage::UsageCounters;
     use aruna_core::types::Value;
+    use ulid::Ulid;
 
     /// What this member holds of `bucket`'s set as copies: every range with an account here, one
     /// being purged included, less the ranges it coordinates. Zero for an ordinary bucket.
