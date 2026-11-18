@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::s3::bucket::checked_rename::authorized_rename;
+use crate::s3::bucket::checked_rename::AuthorizedRenameOperation;
 use crate::testing::test_context;
 use crate::tests::records::node;
 use crate::tests::s3::test_storage;
@@ -525,7 +525,11 @@ async fn refuses_denied_keys() {
     object(&context, "a/x", &[v1], false).await;
     object(&context, "secret/y", &[v2], false).await;
 
-    let open = authorized_rename(&context, &auth, input("a/", "b/", None, false)).await;
+    let open = drive(
+        AuthorizedRenameOperation::new(&auth, input("a/", "b/", None, false)),
+        &context,
+    )
+    .await;
     assert_eq!(open.unwrap().items.len(), 1);
     // A denied old key or new key refuses the preview and the rename, and nothing moves.
     let cases = [
@@ -535,7 +539,11 @@ async fn refuses_denied_keys() {
         input("a/", "secret/", Some(vec!["a/x"]), true),
     ];
     for case in cases {
-        let result = authorized_rename(&context, &auth, case.clone()).await;
+        let result = drive(
+            AuthorizedRenameOperation::new(&auth, case.clone()),
+            &context,
+        )
+        .await;
         assert_eq!(result, Err(RenameError::Forbidden), "{case:?}");
     }
     for key in ["a/x", "secret/y"] {
