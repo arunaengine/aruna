@@ -10,6 +10,7 @@ use crate::jobs::repository::test_support::{
     NOW_MS, child, event as io_event, job_scope, link, local_scope, realm, registry_record, remote,
     scope,
 };
+use aruna_core::effects::Effect;
 use aruna_core::structs::execution::harvest::{HarvestGranularity, HarvestSelector};
 
 fn source() -> HarvestSource {
@@ -399,8 +400,8 @@ fn created() -> IoResult {
     }))
 }
 
-fn routed(answer: Result<(), HarvestWriteFailure>) -> IoResult {
-    io_event(Event::Net(NetEvent::HarvestWrite(answer)))
+fn updated(answer: Result<MetadataRegistryRecord, MetadataWriteError>) -> IoResult {
+    child(answer)
 }
 
 fn allowed() -> IoResult {
@@ -508,12 +509,14 @@ fn existing_document_updated() {
         operation.next(exists),
         Ok(Next::Call(ApplyRecordOperation::registry_call(document())))
     );
-    assert!(matches!(
+    assert_eq!(
         operation.next(stored_row()),
-        Ok(Next::Call(IoCall::Effect(_)))
-    ));
+        Ok(Next::Call(
+            operation.update_call(document(), Some(registry_record()))
+        ))
+    );
     assert!(matches!(
-        operation.next(routed(Ok(()))),
+        operation.next(updated(Ok(registry_record()))),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
     assert_eq!(
@@ -525,12 +528,14 @@ fn existing_document_updated() {
 #[test]
 fn stored_document_updated() {
     let mut operation = updating();
-    assert!(matches!(
+    assert_eq!(
         operation.next(stored_row()),
-        Ok(Next::Call(IoCall::Effect(_)))
-    ));
+        Ok(Next::Call(
+            operation.update_call(document(), Some(registry_record()))
+        ))
+    );
     assert!(matches!(
-        operation.next(routed(Ok(()))),
+        operation.next(updated(Ok(registry_record()))),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
     assert_eq!(
@@ -544,7 +549,7 @@ fn stored_absence_fails() {
     let mut operation = updating();
     operation.next(stored_row()).unwrap();
     let Err(HarvestFailure::Job(error)) =
-        operation.next(routed(Err(HarvestWriteFailure::NotFound)))
+        operation.next(updated(Err(MetadataWriteError::NotFound)))
     else {
         panic!("a stored document cannot be missing");
     };
@@ -561,12 +566,12 @@ fn absent_document_remints() {
         operation.next(read_answer::<MetadataRegistryRecord>(None)),
         Ok(Next::Call(ApplyRecordOperation::pending_call(document())))
     );
-    assert!(matches!(
-        operation.next(nothing_pending()),
-        Ok(Next::Call(IoCall::Effect(_)))
-    ));
     assert_eq!(
-        operation.next(routed(Err(HarvestWriteFailure::NotFound))),
+        operation.next(nothing_pending()),
+        Ok(Next::Call(operation.update_call(document(), None)))
+    );
+    assert_eq!(
+        operation.next(updated(Err(MetadataWriteError::NotFound))),
         Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm()))))
     );
     assert_eq!(
@@ -622,14 +627,12 @@ fn withdrawn_record_tombstones() {
 
 #[test]
 fn rejected_record_permanent() {
-    let failure = apply_failure(HarvestWriteFailure::Rejected(Vec::new()));
+    let rejected = MetadataWriteError::Create(CreateDocumentError::MetadataError(
+        aruna_core::metadata::MetadataError::Validation(Vec::new()),
+    ));
     assert_eq!(
-        failure,
+        write_failure(rejected),
         permanent("harvest record rejected by validation: []")
-    );
-    assert_eq!(
-        apply_failure(HarvestWriteFailure::Retryable("busy".into())),
-        retryable("harvest apply: busy")
     );
 }
 

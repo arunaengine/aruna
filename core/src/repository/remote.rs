@@ -17,14 +17,11 @@ use super::ImportMode;
 use crate::UserId;
 use crate::credential_encryption::CredentialEncryptionKey;
 use crate::id::NodeId;
-use crate::metadata::MetadataValidationViolation;
 use crate::structs::checksum::Hasher;
 use crate::structs::execution::job::{ArtifactRef, RoCrateLimits};
 use crate::structs::execution::source_access::SourceMetadata;
-use crate::structs::identity::auth::{Actor, AuthContext};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::BackendLocation;
-use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 
 /// What an operation needs to know about this node; the caller reads it before the run.
 #[derive(Clone, Debug, PartialEq)]
@@ -333,27 +330,4 @@ pub enum RemoteFailure {
     Permanent(String),
     #[error("{0}")]
     Retryable(String),
-}
-
-/// One metadata update of a harvest job, routed to the document's holders.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HarvestWrite {
-    pub actor: Actor,
-    pub owner: AuthContext,
-    pub record: Option<Box<MetadataRegistryRecord>>,
-    pub document_id: Ulid,
-    pub jsonld: String,
-}
-
-/// How a routed harvest update failed, sorted for the job's retry decision.
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
-pub enum HarvestWriteFailure {
-    #[error("metadata document not found")]
-    NotFound,
-    #[error("{0}")]
-    Retryable(String),
-    #[error("{0}")]
-    Permanent(String),
-    #[error("the record was rejected by validation")]
-    Rejected(Vec<MetadataValidationViolation>),
 }

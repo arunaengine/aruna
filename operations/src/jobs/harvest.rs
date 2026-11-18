@@ -7,14 +7,12 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::repository::remote::{
-    HarvestWrite, HarvestWriteFailure, NodeScope, RemoteAnswer, RemoteCall, RemoteFailure,
-    StopReason,
+    NodeScope, RemoteAnswer, RemoteCall, RemoteFailure, StopReason,
 };
 use aruna_core::rows::{event, page};
 use aruna_core::structs::execution::harvest::{
@@ -57,8 +55,10 @@ use crate::metadata::create_document::{
     CreateDocumentResult, mint_document_for,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
+use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::forward::routed_write::RouteDeleteOperation;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
+use crate::metadata::update_document::UpdateDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a
@@ -711,16 +711,19 @@ impl ApplyRecordOperation {
     }
 
     fn update_call(&self, document_id: Ulid, record: Option<MetadataRegistryRecord>) -> IoCall {
-        let write = HarvestWrite {
-            actor: self.actor.clone(),
-            owner: self.owner(),
-            record: record.map(Box::new),
-            document_id,
-            jsonld: dc_to_jsonld(&self.record),
-        };
-        IoCall::Effect(Box::new(Effect::Net(NetEffect::HarvestWrite(Box::new(
-            write,
-        )))))
+        IoCall::child(RouteUpdateOperation::new(
+            (self.actor.clone(), self.local_node),
+            (record, document_id),
+            DocumentUpdate {
+                public: None,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: dc_to_jsonld(&self.record),
+                },
+                expected_revision: None,
+                commit_message: None,
+            },
+            self.owner_token(),
+        ))
     }
 
     fn registry_call(document_id: Ulid) -> IoCall {
@@ -816,14 +819,10 @@ fn confirm_absent(result: IoResult, document_id: Ulid) -> Result<(), HarvestFail
     )))
 }
 
-fn routed_result(result: IoResult) -> Result<Result<(), HarvestWriteFailure>, HarvestFailure> {
-    match event(result)? {
-        Event::Net(NetEvent::HarvestWrite(answer)) => Ok(answer),
-        other => Err(retryable(format!(
-            "harvest write: unexpected {}",
-            other.label()
-        ))),
-    }
+fn update_result(
+    result: IoResult,
+) -> Result<Result<MetadataRegistryRecord, MetadataWriteError>, HarvestFailure> {
+    Ok(result.child::<MetadataRegistryRecord, MetadataWriteError>()?)
 }
 
 impl Operation for ApplyRecordOperation {
@@ -902,7 +901,7 @@ impl Operation for ApplyRecordOperation {
                 Ok(Next::Call(call))
             }
             ApplyStep::CreateUpdate => {
-                routed_result(result)?.map_err(apply_failure)?;
+                update_result(result)?.map_err(write_failure)?;
                 let document_id = self.row()?.meta_resource_id;
                 self.finish_live(document_id, RecordApplied::Minted)
             }
@@ -930,13 +929,13 @@ impl Operation for ApplyRecordOperation {
                 self.step = ApplyStep::Update(document_id, false);
                 Ok(Next::Call(call))
             }
-            ApplyStep::Update(document_id, stored) => match routed_result(result)? {
-                Ok(()) => self.finish_live(document_id, RecordApplied::Updated),
-                Err(HarvestWriteFailure::NotFound) if !stored => {
+            ApplyStep::Update(document_id, stored) => match update_result(result)? {
+                Ok(_) => self.finish_live(document_id, RecordApplied::Updated),
+                Err(MetadataWriteError::NotFound) if !stored => {
                     self.row()?.predecessors.push(document_id);
                     self.mint()
                 }
-                Err(error) => Err(apply_failure(error)),
+                Err(error) => Err(write_failure(error)),
             },
             // Prove the harvested document is gone before its provenance may go terminal. An
             // empty local read is not evidence of absence, since the create may still be queued
@@ -1036,28 +1035,16 @@ fn read_failure(error: StorageReadError) -> HarvestFailure {
     retryable(format!("harvest storage read: {error}"))
 }
 
-fn apply_failure(error: HarvestWriteFailure) -> HarvestFailure {
-    match error {
-        HarvestWriteFailure::Retryable(message) => retryable(format!("harvest apply: {message}")),
-        HarvestWriteFailure::Permanent(message) => {
+fn write_failure(error: MetadataWriteError) -> HarvestFailure {
+    match classify_metadata(error) {
+        MetadataFailure::Retryable(message) => retryable(format!("harvest apply: {message}")),
+        MetadataFailure::Permanent(message) => {
             permanent(format!("harvest apply failed: {message}"))
         }
-        HarvestWriteFailure::Rejected(violations) => permanent(format!(
+        MetadataFailure::Validation(violations) => permanent(format!(
             "harvest record rejected by validation: {violations:?}"
         )),
-        error @ HarvestWriteFailure::NotFound => {
-            permanent(format!("harvest apply failed: {error}"))
-        }
     }
-}
-
-/// How a metadata create or delete of this job failed, sorted like a routed update.
-fn write_failure(error: MetadataWriteError) -> HarvestFailure {
-    apply_failure(match classify_metadata(error) {
-        MetadataFailure::Retryable(message) => HarvestWriteFailure::Retryable(message),
-        MetadataFailure::Permanent(message) => HarvestWriteFailure::Permanent(message),
-        MetadataFailure::Validation(violations) => HarvestWriteFailure::Rejected(violations),
-    })
 }
 
 #[cfg(test)]

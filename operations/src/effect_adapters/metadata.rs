@@ -9,19 +9,14 @@ use aruna_core::events::{
     Event, MetadataAnswer, NetEvent, PeerAuthRefusal, PeerRequestError, WritePeerRefusal,
 };
 use aruna_core::metadata::{AuthToken, MetadataEffect, MetadataError, MetadataEvent};
-use aruna_core::repository::remote::{HarvestWrite, HarvestWriteFailure};
 use aruna_core::structs::storage::dataset_description::DatasetSummaryRequest;
 use std::future::{Future, ready};
 use std::pin::Pin;
 use tokio::time::{Instant, timeout};
 
 use crate::driver::DriverContext;
-use crate::forward::transport::MetadataWriteError;
-use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::forward::read::dataset_summary;
-use crate::metadata::forward::write::route_metadata_update;
 use crate::metadata::handle::{MetadataRequestDelivery, WritePeerError};
-use crate::metadata::update_document::UpdateDocumentMutation;
 
 // A boxed future: the metadata effect path reads authorization through the runner again,
 // so its type must not contain the runner's own future.
@@ -47,51 +42,6 @@ pub(super) fn dispatch_summary(
         let answer = dataset_summary(context, request).await;
         Event::Net(NetEvent::DatasetSummary(answer))
     })
-}
-
-// A boxed future for the same reason: the routed update drives operations again.
-pub(super) fn dispatch_harvest_write(
-    write: HarvestWrite,
-    context: &DriverContext,
-) -> Pin<Box<dyn Future<Output = Event> + Send + '_>> {
-    Box::pin(async move {
-        Event::Net(NetEvent::HarvestWrite(
-            routed_write(write, context).await.map_err(harvest_failure),
-        ))
-    })
-}
-
-async fn routed_write(
-    write: HarvestWrite,
-    context: &DriverContext,
-) -> Result<(), MetadataWriteError> {
-    let context = std::sync::Arc::new(context.clone());
-    Box::pin(route_metadata_update(
-        &context,
-        write.actor,
-        write.record.as_deref(),
-        write.document_id,
-        None,
-        UpdateDocumentMutation::ReplaceRoCrate {
-            jsonld: write.jsonld,
-        },
-        None,
-        Some(AuthToken::internal(write.owner)),
-        None,
-    ))
-    .await?;
-    Ok(())
-}
-
-fn harvest_failure(error: MetadataWriteError) -> HarvestWriteFailure {
-    match error {
-        MetadataWriteError::NotFound => HarvestWriteFailure::NotFound,
-        error => match classify_metadata(error) {
-            MetadataFailure::Retryable(message) => HarvestWriteFailure::Retryable(message),
-            MetadataFailure::Permanent(message) => HarvestWriteFailure::Permanent(message),
-            MetadataFailure::Validation(violations) => HarvestWriteFailure::Rejected(violations),
-        },
-    }
 }
 
 /// Checks a forwarded token with the validation state the metadata handle keeps.

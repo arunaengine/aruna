@@ -16,7 +16,6 @@ use aruna_core::events::{
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::metadata::MetadataError;
-use aruna_core::repository::remote::HarvestWriteFailure;
 use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::dataset_description::DescriptionError;
@@ -270,10 +269,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::DatasetSummary(_) => {
             NetEvent::DatasetSummary(Err(DescriptionError::Unavailable))
         }
-        // The routed write drives metadata operations through the runner.
-        NetEffect::HarvestWrite(_) => NetEvent::HarvestWrite(Err(HarvestWriteFailure::Retryable(
-            "harvest writes must be dispatched by the operations runner".to_string(),
-        ))),
         // Metadata requests ride the metadata transport the runner holds.
         NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
             peer: request.peer,
@@ -665,7 +660,6 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::GrantedRead(_) => "granted_read",
         NetEffect::DelegatedRead(_) => "delegated_read",
         NetEffect::DatasetSummary(_) => "dataset_summary",
-        NetEffect::HarvestWrite(_) => "harvest_write",
         NetEffect::WritePeerAuth(_) => "write_peer_auth",
         NetEffect::GrantSign(_) => "grant_sign",
         NetEffect::Shard(_) => "shard",
