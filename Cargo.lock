@@ -458,6 +458,7 @@ dependencies = [
  "aruna-net",
  "aruna-storage",
  "astral_async_zip",
+ "async-compression",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",

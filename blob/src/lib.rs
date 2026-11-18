@@ -6,6 +6,7 @@
 #![recursion_limit = "256"]
 
 pub mod arc;
+pub mod archive;
 mod autoindex;
 pub mod bao_tree;
 pub mod blob;
