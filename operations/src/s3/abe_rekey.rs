@@ -336,20 +336,111 @@ impl Operation for VersionScan {
             prefix: self.prefix.clone(),
             after: self.after.clone(),
             limit: SCAN,
-            txn_id: None,
-        })]
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<(Vec<Key>, bool)>, KeyError> {
+        let (rows, next) = result.page()?;
+        let keys = rows.into_iter().map(|(key, _)| key).collect();
+        Ok(Next::Done((keys, next.is_some())))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PageStep {
+    Hold,
+    Scan,
+    Run,
+    Check,
+    Save,
+}
+
+/// How a page ended; a stopped page still saved its cursor.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PageEnd {
+    progress: RekeyProgress,
+    done: bool,
+    stopped: Option<KeyError>,
+}
+
+type PageTurn = Result<Next<PageEnd>, KeyError>;
+
+/// Walks one page in the transaction that read the pass row before the scan, so any write to the
+/// rows it read makes its save conflict.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RekeyPage {
+    scope: PageScope,
+    unit: EncryptionTransition,
+    id: Key,
+    progress: RekeyProgress,
+    /// The progress row this page started from.
+    seen: Value,
+    step: PageStep,
+    rows: Vec<Key>,
+    handled: usize,
+    next: bool,
+    moved: usize,
+    stopped: Option<KeyError>,
+    done: bool,
+}
+
+impl RekeyPage {
+    pub(crate) fn new(
+        scope: PageScope,
+        unit: EncryptionTransition,
+        id: Key,
+        progress: RekeyProgress,
+        seen: Value,
+    ) -> Self {
+        Self {
+            scope,
+            unit,
+            id,
+            progress,
+            seen,
+            step: PageStep::Hold,
+            rows: Vec::new(),
+            handled: 0,
+            next: false,
+            moved: 0,
+            stopped: None,
+            done: false,
+        }
+    }
+
+    fn call(&mut self, step: PageStep, call: IoCall) -> PageTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn end(&mut self) -> PageTurn {
+        Ok(Next::Done(PageEnd {
+            progress: self.progress.clone(),
+            done: self.done,
+            stopped: self.stopped.take(),
+        }))
+    }
+
+    fn scan(&mut self) -> PageTurn {
+        let prefix =
+            VersionKey::bucket_prefix(&self.scope.bucket).map_err(|_| KeyError::Storage)?;
+        let cursor = &self.progress.cursor;
+        let after = (!cursor.is_empty()).then(|| cursor.clone().into());
+        let scan = VersionScan {
+            prefix: prefix.into(),
+            after,
+        };
+        self.call(PageStep::Scan, IoCall::child(scan))
     }
 
     /// Starts the next version under the prefix; others only move the cursor.
-    fn run_next(&mut self) -> Effects {
+    fn run_next(&mut self) -> PageTurn {
         while let Some(row) = self.rows.get(self.handled) {
-            if self.moved >= self.page {
+            if self.moved >= self.scope.page {
                 break;
             }
-            let Ok(version) = VersionKey::from_bytes(row) else {
-                return self.finish(Err(KeyError::Storage));
-            };
-            if version.key.starts_with(&self.prefix) {
+            let version = VersionKey::from_bytes(row).map_err(|_| KeyError::Storage)?;
+            if version.key.starts_with(&self.scope.prefix) {
                 return self.rewrite(version);
             }
             self.advance();
@@ -357,68 +448,50 @@ impl Operation for VersionScan {
         self.save()
     }
 
-    /// Saves in the transaction that read the row before the scan, so any write to it conflicts.
-    fn save(&mut self) -> Effects {
-        let Some(txn_id) = self.txn else {
-            return self.finish(Err(KeyError::Storage));
-        };
-        self.step = Step::Check;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (ABE_REKEY_KEYSPACE.to_string(), self.id.clone()),
-                (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
-                (ABE_DUE_KEYSPACE.to_string(), self.id.clone()),
-            ],
-            txn_id: Some(txn_id),
-        })]
+    /// Reads in the transaction that read the row before the scan, so any write to it conflicts.
+    fn save(&mut self) -> PageTurn {
+        let reads = vec![
+            (ABE_REKEY_KEYSPACE.to_string(), self.id.clone()),
+            (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
+            (ABE_DUE_KEYSPACE.to_string(), self.id.clone()),
+        ];
+        self.call(PageStep::Check, IoCall::Read(reads))
     }
 
     fn advance(&mut self) {
-        if let (Some(row), Some(progress)) = (self.rows.get(self.handled), self.progress.as_mut()) {
-            progress.cursor = row.to_vec();
+        if let Some(row) = self.rows.get(self.handled) {
+            self.progress.cursor = row.to_vec();
         }
         self.handled += 1;
     }
 
-    fn rewrite(&mut self, version: VersionKey) -> Effects {
-        let Some(unit) = self.unit.clone() else {
-            return self.finish(Err(KeyError::Storage));
-        };
-        let mut operation = RewriteVersionOperation::new(version, unit, self.now).rekey();
-        if let Some((quota, realm, node)) = &self.quota {
+    fn rewrite(&mut self, version: VersionKey) -> PageTurn {
+        let unit = self.unit.clone();
+        let mut operation = RewriteVersionOperation::new(version, unit, self.scope.now).rekey();
+        if let Some((quota, realm, node)) = &self.scope.quota {
             operation = operation.with_quota(quota.clone(), *realm, *node);
         }
-        let bucket = self.bucket.clone();
-        let sub = boxed_suboperation(operation, move |result| {
-            let outcome = match result {
-                Ok(RewriteOutcome::Moved) => RekeyOutcome::Moved,
-                Ok(RewriteOutcome::Skipped) => RekeyOutcome::Skipped,
-                Ok(RewriteOutcome::AwaitingKey) => RekeyOutcome::Locked,
-                Ok(RewriteOutcome::Unfinished) => RekeyOutcome::Unfinished,
-                Err(error) => {
-                    tracing::warn!(event = "abe.rekey.failed", bucket = %bucket, error = %error);
-                    RekeyOutcome::Failed
-                }
-            };
-            Event::SubOperation(SubOperationEvent::VersionRekeyed { outcome })
-        });
-        self.step = Step::Run;
-        smallvec![Effect::SubOperation(sub)]
+        self.call(PageStep::Run, IoCall::child(operation))
     }
 
-    fn version_done(&mut self, outcome: RekeyOutcome) -> Effects {
-        match outcome {
-            RekeyOutcome::Moved => {
-                if let Some(progress) = self.progress.as_mut() {
-                    progress.rekeyed += 1;
-                }
+    fn version_done(&mut self, result: Result<RewriteOutcome, RewriteError>) -> PageTurn {
+        match result {
+            Ok(RewriteOutcome::Moved) => {
+                self.progress.rekeyed += 1;
                 self.moved += 1;
             }
-            RekeyOutcome::Skipped => {}
-            RekeyOutcome::Locked => self.stopped = Some(KeyError::Locked),
-            RekeyOutcome::Failed => self.stopped = Some(KeyError::Storage),
+            Ok(RewriteOutcome::Skipped) => {}
+            Ok(RewriteOutcome::AwaitingKey) => self.stopped = Some(KeyError::Locked),
             // The pass stays unfinished while an in-scope version still waits.
-            RekeyOutcome::Unfinished => self.stopped = Some(KeyError::Unfinished),
+            Ok(RewriteOutcome::Unfinished) => self.stopped = Some(KeyError::Unfinished),
+            Err(error) => {
+                tracing::warn!(
+                    event = "abe.rekey.failed",
+                    bucket = %self.scope.bucket,
+                    error = %error
+                );
+                self.stopped = Some(KeyError::Storage);
+            }
         }
         // A stopped page keeps its cursor before this version.
         if self.stopped.is_some() {
@@ -430,252 +503,157 @@ impl Operation for VersionScan {
 
     /// Saves the cursor while the row is still the one this page read. The last page finishes the
     /// pass only without a raise or due removal since it began; otherwise the pass starts again.
-    fn check_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let (Some(txn_id), Ok([(_, row), (_, epoch), (_, due)])) =
-            (self.txn, <[_; 3]>::try_from(values))
-        else {
-            return self.finish(Err(KeyError::Storage));
-        };
+    fn check_read(&mut self, [row, epoch, due]: [Option<Value>; 3]) -> PageTurn {
         // Another call moved the pass meanwhile; its own save stands.
-        if row != self.seen {
+        if row.as_ref() != Some(&self.seen) {
             return self.end();
         }
         let more = self.stopped.is_some() || self.handled < self.rows.len() || self.next;
-        let Some(progress) = self.progress.as_mut() else {
-            return self.finish(Err(KeyError::Storage));
-        };
         // A removal during the walk is not covered by it, so the subtree is walked again.
-        let restart = !more && (epoch_of(epoch.as_ref()) != Some(progress.epoch) || due.is_some());
+        let moved_epoch = epoch_of(epoch.as_ref()) != Some(self.progress.epoch);
+        let restart = !more && (moved_epoch || due.is_some());
         if restart {
-            progress.cursor.clear();
-            progress.rekeyed = 0;
+            self.progress.cursor.clear();
+            self.progress.rekeyed = 0;
         }
         self.done = !more && !restart;
-        let effect = match (self.done, postcard::to_allocvec(&*progress)) {
-            (true, _) => StorageEffect::BatchDelete {
-                deletes: vec![(ABE_REKEY_KEYSPACE.to_string(), self.id.clone())],
-                txn_id: Some(txn_id),
-            },
-            (false, Ok(row)) => StorageEffect::BatchWrite {
-                writes: vec![(ABE_REKEY_KEYSPACE.to_string(), self.id.clone(), row.into())],
-                txn_id: Some(txn_id),
-            },
-            (false, Err(_)) => return self.finish(Err(KeyError::Storage)),
+        let call = if self.done {
+            IoCall::Delete(vec![(ABE_REKEY_KEYSPACE.to_string(), self.id.clone())])
+        } else {
+            let row = postcard::to_allocvec(&self.progress).map_err(|_| KeyError::Storage)?;
+            let write = (ABE_REKEY_KEYSPACE.to_string(), self.id.clone(), row.into());
+            IoCall::Write(vec![write])
         };
-        self.step = Step::Save;
-        smallvec![Effect::Storage(effect)]
+        self.call(PageStep::Save, call)
     }
 }
 
-impl EffectOperation for RekeyOperation {
-    type Output = (RekeyProgress, bool);
+impl Operation for RekeyPage {
+    type Output = PageEnd;
     type Error = KeyError;
-    fn start(&mut self) -> Effects {
-        let name: Key = self.bucket.as_bytes().to_vec().into();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), name.clone()),
-                (S3_BUCKET_KEYSPACE.to_string(), name),
-            ],
-            txn_id: None,
-        })]
+
+    fn first(&mut self) -> PageTurn {
+        let read = read_row(ABE_REKEY_KEYSPACE, self.id.clone());
+        self.call(PageStep::Hold, read)
     }
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.step, event) {
-            (Step::Settings, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.settings_read(values)
-            }
-            (Step::Rows, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.rows_read(values)
-            }
-            (Step::Claim, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn = Some(txn_id);
-                self.step = Step::ClaimRead;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: ABE_REKEY_KEYSPACE.to_string(),
-                    key: self.id.clone(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (Step::ClaimRead, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.claim_read(value)
-            }
-            (Step::ClaimWrite, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                match self.txn {
-                    Some(txn_id) => {
-                        self.step = Step::ClaimCommit;
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    None => self.finish(Err(KeyError::Storage)),
-                }
-            }
-            (Step::ClaimCommit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn = None;
-                self.step = Step::Start;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            }
-            (Step::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn = Some(txn_id);
-                self.step = Step::Hold;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: ABE_REKEY_KEYSPACE.to_string(),
-                    key: self.id.clone(),
-                    txn_id: Some(txn_id),
-                })]
-            }
+
+    fn next(&mut self, result: IoResult) -> PageTurn {
+        match self.step {
             // Another call moved the pass after the claim; its own save stands.
-            (Step::Hold, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                if value != self.seen {
-                    return self.end();
-                }
-                self.scan()
-            }
-            (
-                Step::Scan,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                self.rows = values.into_iter().map(|(key, _)| key).collect();
-                self.next = next_start_after.is_some();
+            PageStep::Hold => match result.value()? {
+                Some(row) if row == self.seen => self.scan(),
+                _ => self.end(),
+            },
+            PageStep::Scan => {
+                (self.rows, self.next) = result.child::<(Vec<Key>, bool), KeyError>()??;
                 self.run_next()
             }
-            (Step::Run, Event::SubOperation(SubOperationEvent::VersionRekeyed { outcome })) => {
-                self.version_done(outcome)
+            PageStep::Run => {
+                let rewritten = result.child::<RewriteOutcome, RewriteError>()?;
+                self.version_done(rewritten)
             }
-            (Step::Check, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.check_read(values)
-            }
-            (
-                Step::Save,
-                Event::Storage(
-                    StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. },
-                ),
-            ) => match self.txn {
-                Some(txn_id) => {
-                    self.step = Step::Commit;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                }
-                None => self.finish(Err(KeyError::Storage)),
-            },
-            (Step::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn = None;
+            PageStep::Check => self.check_read(values::<3>(result)?),
+            PageStep::Save => {
+                result.done()?;
                 self.end()
             }
-            // A copy, raise or removal wrote a read row during the page; the next call resumes.
-            (
-                Step::Commit,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            ) => {
-                self.txn = None;
-                self.done = false;
-                self.end()
-            }
-            _ => self.finish(Err(KeyError::Storage)),
         }
     }
-    fn is_complete(&self) -> bool {
-        self.step == Step::Done
-    }
-    fn finalize(self) -> Result<(RekeyProgress, bool), KeyError> {
-        self.output.unwrap_or(Err(KeyError::Storage))
-    }
-    fn abort(&mut self) -> Effects {
-        self.txn.take().map_or_else(Effects::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::format::Compression;
     use ulid::Ulid;
 
-    fn row(key: &str) -> (Key, Value) {
+    fn row(key: &str) -> Key {
         let version = VersionKey::new("bucket", key, Ulid::from_bytes([2; 16]));
-        (version.to_bytes().unwrap().into(), Vec::new().into())
+        version.to_bytes().unwrap().into()
     }
 
-    /// A page of `page` versions under foo/ that has read its rows and waits for the scan.
-    fn scanning(page: usize) -> RekeyOperation {
-        let mut operation = RekeyOperation::new("bucket", "foo/", page, None, UNIX_EPOCH);
-        operation.id = vec![1; 16].into();
-        operation.progress = Some(RekeyProgress {
-            prefix: "foo/".into(),
+    fn progress(prefix: &str) -> RekeyProgress {
+        RekeyProgress {
+            prefix: prefix.into(),
             epoch: 2,
             cursor: Vec::new(),
             rekeyed: 0,
-        });
+        }
+    }
+
+    fn unit() -> EncryptionTransition {
         let target = TransitionTarget {
             compression: Compression::Off,
             plan: None,
         };
-        let unit = EncryptionTransition::new(TransitionKind::Rotate, None, target, 3, 0);
-        operation.unit = Some(unit);
-        operation.txn = Some(TxnId::generate());
-        operation.step = Step::Scan;
+        EncryptionTransition::new(TransitionKind::Rotate, None, target, 3, 0)
+    }
+
+    fn seen_row() -> Value {
+        postcard::to_allocvec(&progress("foo/")).unwrap().into()
+    }
+
+    /// A page of `page` versions under foo/ that holds its transaction and waits for the scan.
+    fn scanning(page: usize) -> RekeyPage {
+        let scope = PageScope::new("bucket", "foo/", page, None, UNIX_EPOCH);
+        let id = Key::from(vec![1; 16]);
+        let mut operation = RekeyPage::new(scope, unit(), id, progress("foo/"), seen_row());
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
+        let turn = operation.next(IoResult::Values(vec![Some(seen_row())]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         operation
     }
 
-    fn scanned(operation: &mut RekeyOperation, keys: &[&str]) -> Effects {
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: keys.iter().map(|key| row(key)).collect(),
-            next_start_after: None,
-        }))
+    fn scanned(operation: &mut RekeyPage, keys: &[&str]) -> PageTurn {
+        let rows = keys.iter().map(|key| row(key)).collect::<Vec<_>>();
+        let answer = Ok::<_, KeyError>((rows, false));
+        operation.next(IoResult::Child(ChildOutcome::new(answer)))
     }
 
-    fn ended(operation: &mut RekeyOperation, outcome: RekeyOutcome) -> Effects {
-        operation.step(Event::SubOperation(SubOperationEvent::VersionRekeyed {
-            outcome,
-        }))
+    fn ended(operation: &mut RekeyPage, outcome: RewriteOutcome) -> PageTurn {
+        let answer = Ok::<_, RewriteError>(outcome);
+        operation.next(IoResult::Child(ChildOutcome::new(answer)))
     }
 
     /// Answers the save reads with the progress row `seen`, epoch 2 and no due marker.
-    fn saved(operation: &mut RekeyOperation, seen: Option<Value>) -> Effects {
-        let values = vec![
-            (Key::from(Vec::new()), seen),
-            (
-                Key::from(Vec::new()),
-                Some(2u64.to_be_bytes().to_vec().into()),
-            ),
-            (Key::from(Vec::new()), None),
-        ];
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    fn saved(operation: &mut RekeyPage, seen: Option<Value>) -> PageTurn {
+        let epoch = Some(2u64.to_be_bytes().to_vec().into());
+        operation.next(IoResult::Values(vec![seen, epoch, None]))
     }
 
     /// The progress a save writes.
-    fn written(effects: &Effects) -> RekeyProgress {
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("one progress write: {effects:?}");
+    fn written(turn: PageTurn) -> RekeyProgress {
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("one progress write: {turn:?}");
         };
         postcard::from_bytes(&writes[0].2).unwrap()
+    }
+
+    fn page_end(operation: &mut RekeyPage) -> PageEnd {
+        let Ok(Next::Done(end)) = operation.next(IoResult::Done) else {
+            panic!("the saved page ends");
+        };
+        end
     }
 
     #[test]
     fn pages_then_saves() {
         // One version per page: the cursor stops after the first re-keyed version.
         let mut operation = scanning(1);
-        let effects = scanned(&mut operation, &["foo/a", "bar/x", "foo/b"]);
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = ended(&mut operation, RekeyOutcome::Moved);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead {
-                txn_id: Some(_),
-                ..
-            })]
-        ));
-        let progress = written(&saved(&mut operation, None));
+        let turn = scanned(&mut operation, &["foo/a", "bar/x", "foo/b"]);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let turn = ended(&mut operation, RewriteOutcome::Moved);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        let progress = written(saved(&mut operation, Some(seen_row())));
         assert_eq!(
             (progress.cursor, progress.rekeyed),
-            (row("foo/a").0.to_vec(), 1)
+            (row("foo/a").to_vec(), 1)
         );
         operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
