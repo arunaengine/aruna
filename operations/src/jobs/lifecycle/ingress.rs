@@ -1,31 +1,14 @@
-//! Takes in external submissions and the requests other nodes send about them. Each entry point
-//! gathers what only this node knows and drives the operation that decides.
+//! The view of this node that the submission operations start from.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
-use aruna_core::UserId;
-use aruna_core::id::NodeId;
-use aruna_core::jobs::{InputResolveRequest, SubmissionRefusal};
-use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputSelection, SubmissionId, WorkspaceMode,
-};
 use aruna_core::time::unix_timestamp_millis;
-use ulid::Ulid;
 
-use super::admit_forwarded::AdmitForwardedOperation;
-use super::admit_here::{AcceptedSubmission, placement_failure};
-use super::ids::{SubmissionRequest, SubmissionScope};
-use super::serve_inputs::ServeInputsOperation;
-use super::submit_external::{ExternalSubmission, IngressNode, SubmitExternalOperation};
-use crate::driver::{DriverContext, drive};
-use crate::jobs::submit::SubmitJobError;
-use crate::metadata::protocol::MetadataTransportMessage;
+use super::submit_external::IngressNode;
+use crate::driver::DriverContext;
 
 /// This node as the submission operations see it; `None` without a network.
-fn ingress_node(context: &DriverContext) -> Option<IngressNode> {
+pub fn ingress_node(context: &DriverContext) -> Option<IngressNode> {
     let (local, realm_id) = context.node_and_realm()?;
     Some(IngressNode {
         local,
@@ -35,65 +18,9 @@ fn ingress_node(context: &DriverContext) -> Option<IngressNode> {
     })
 }
 
-/// Resolves inputs this node holds for an ingress; see [`ServeInputsOperation`].
-pub async fn serve_input_resolve(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    auth_token: AuthToken,
-    request: InputResolveRequest,
-) -> Result<Vec<(InputSelection, CapturedInput)>, SubmissionRefusal> {
-    let node = ingress_node(context).ok_or(SubmissionRefusal::Unavailable)?;
-    let caller = node.input_caller(request.created_by);
-    let serve = ServeInputsOperation::new(peer, auth_token, caller, request, node.now_ms);
-    drive(serve, context.as_ref()).await
-}
-
-/// Normalizes, authorizes, and admits one external execution request.
-#[allow(clippy::too_many_arguments)]
-pub async fn submit_external_job(
-    context: &DriverContext,
-    spec: ExecutionSpec,
-    created_by: UserId,
-    idempotency_key: Option<String>,
-    workspace_mode: WorkspaceMode,
-    workspace_bucket: Option<String>,
-    retention_ms: u64,
-    auth_token: Option<AuthToken>,
-) -> Result<AcceptedSubmission, SubmitJobError> {
-    let scope = match idempotency_key {
-        Some(key) => SubmissionScope::Keyed(key),
-        None => SubmissionScope::Unkeyed(Ulid::generate()),
-    };
-    let submission = ExternalSubmission {
-        spec,
-        created_by,
-        scope,
-        workspace_mode,
-        workspace_bucket,
-        retention_ms,
-        auth_token,
-    };
-    let submit = SubmitExternalOperation::new(submission, ingress_node(context));
-    drive(submit, context).await.map_err(placement_failure)
-}
-
-/// Serves one forwarded submission; see [`AdmitForwardedOperation`].
-pub async fn serve_submission(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    auth_token: AuthToken,
-    submission_id: SubmissionId,
-    request: SubmissionRequest,
-) -> MetadataTransportMessage {
-    let node = ingress_node(context);
-    let admit = AdmitForwardedOperation::new(peer, auth_token, submission_id, request, node);
-    let result = drive(admit, context.as_ref()).await;
-    MetadataTransportMessage::ForwardedJobSubmission { result }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::driver::drive;
     use crate::jobs::lifecycle::ids::store_workspace;
     use crate::jobs::lifecycle::input_walk::RangeHolderOperation;
     use crate::jobs::lifecycle::submission_rules::{
@@ -101,9 +28,14 @@ mod tests {
         reference_content, reference_shape, refusal_of, resolve_answer, resolver_admits,
         sources_match,
     };
+    use crate::jobs::submit::SubmitJobError;
+    use crate::metadata::protocol::MetadataTransportMessage;
     use crate::tests::records::captured_input;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::jobs::SubmissionRefusal;
     use aruna_core::structs::execution::job::OutputDestination;
+    use aruna_core::structs::execution::job::{CapturedInput, WorkspaceMode};
     use aruna_core::structs::execution::job::{
         InputContent, InputMode, InputSelection, InputSource, OutputSelection, WorkspaceOutput,
     };
@@ -112,6 +44,7 @@ mod tests {
     use aruna_core::structs::storage::dataset_description::DatasetDescription;
     use aruna_core::structs::storage::dataset_description::DescriptionError;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use ulid::Ulid;
 
     use crate::tests::records::{node, payload};
 

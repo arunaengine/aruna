@@ -105,7 +105,7 @@ enum ForwardedStep {
 
 /// Admits one submission another node forwarded here.
 #[derive(Debug, PartialEq)]
-pub(super) struct AdmitForwardedOperation {
+pub struct AdmitForwardedOperation {
     peer: NodeId,
     token: AuthToken,
     submission_id: SubmissionId,
@@ -117,7 +117,7 @@ pub(super) struct AdmitForwardedOperation {
 type ForwardedNext = Result<Next<SubmissionAck>, SubmissionRefusal>;
 
 impl AdmitForwardedOperation {
-    pub(super) fn new(
+    pub fn new(
         peer: NodeId,
         token: AuthToken,
         submission_id: SubmissionId,

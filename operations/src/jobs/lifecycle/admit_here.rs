@@ -73,7 +73,7 @@ pub(super) fn admission_error(error: LifecycleError) -> SubmitJobError {
 }
 
 /// A store failure while admitting leaves the holder unavailable, as any admission failure.
-pub(super) fn placement_failure(error: SubmitJobError) -> SubmitJobError {
+pub fn placement_failure(error: SubmitJobError) -> SubmitJobError {
     match error {
         error @ (SubmitJobError::Storage(_) | SubmitJobError::UnexpectedEvent(_)) => {
             unavailable(error)
