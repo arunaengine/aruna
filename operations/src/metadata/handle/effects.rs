@@ -48,6 +48,30 @@ async fn run_effect(
     context: &DriverContext,
     effect: MetadataEffect,
 ) -> MetadataEvent {
+    let cache = &metadata.inner.visibility_cache;
+    match effect {
+        MetadataEffect::CacheGeneration => {
+            return MetadataEvent::CacheGeneration {
+                generation: cache.current_generation(),
+            };
+        }
+        MetadataEffect::CacheRecords {
+            records,
+            generation,
+        } => {
+            cache.upsert_at(&records, generation);
+            return MetadataEvent::CacheGeneration {
+                generation: cache.current_generation(),
+            };
+        }
+        MetadataEffect::UncacheRecord { document_id } => {
+            cache.remove_registry_record(document_id);
+            return MetadataEvent::CacheGeneration {
+                generation: cache.current_generation(),
+            };
+        }
+        _ => {}
+    }
     let Some(graph) = context.graph_handle.as_ref() else {
         return MetadataEvent::Error {
             graph_iri: None,

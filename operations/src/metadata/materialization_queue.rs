@@ -1544,9 +1544,14 @@ async fn process_materialization_job(
                     craqle_elapsed,
                 ));
             }
-            let checkpoint: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> = Box::pin(
-                crate::metadata::checkpoint::after_materialization(context, &event.record),
-            );
+            let checkpoint: std::pin::Pin<Box<dyn Future<Output = _> + Send + '_>> =
+                Box::pin(drive(
+                    crate::metadata::checkpoint::CheckpointOperation::new(
+                        context.net_handle.as_ref().map(|net| net.node_id()),
+                        event.record.clone(),
+                    ),
+                    context,
+                ));
             if let Err(error) = checkpoint.await {
                 // The next materialization of this document checks the window again.
                 warn!(document_id = %event.record.document_id, %error, "Metadata checkpoint failed");

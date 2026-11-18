@@ -37,7 +37,7 @@ use aruna_operations::metadata::profile::validation::{
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
-use aruna_operations::metadata::update_entry::update_metadata_document;
+use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::metadata::{
     MetadataHandle, materialization_queue::process_materialization_batch,
     projector::drain_projection_queue,
@@ -855,17 +855,24 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
     process_materialization_batch(test.context.as_ref()).await?;
     let tag = profile_public_iri(profile_id);
 
-    let error = update_metadata_document(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id,
-            public: true,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: crate_json(document_id, Some(&tag), false, true),
-            },
-            expected_revision: None,
-        }),
+    let error = drive(
+        UpdateEntryOperation::new(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id,
+                public: true,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: crate_json(document_id, Some(&tag), false, true),
+                },
+                expected_revision: None,
+            }),
+            test.context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
         test.context.as_ref(),
     )
     .await
@@ -880,17 +887,24 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
         .expect("original status remains");
     assert_eq!(status.dataset_revision, created.event_id);
 
-    let updated = update_metadata_document(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id,
-            public: true,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: crate_json(document_id, Some(&tag), true, true),
-            },
-            expected_revision: None,
-        }),
+    let updated = drive(
+        UpdateEntryOperation::new(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id,
+                public: true,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: crate_json(document_id, Some(&tag), true, true),
+                },
+                expected_revision: None,
+            }),
+            test.context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
         test.context.as_ref(),
     )
     .await?;
@@ -1221,17 +1235,24 @@ async fn make_private(
     group_id: Ulid,
     profile_id: Ulid,
 ) -> Result<Ulid, Box<dyn std::error::Error>> {
-    let updated = update_metadata_document(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id: profile_id,
-            public: false,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: profile_json(profile_id, minimum_shape()),
-            },
-            expected_revision: None,
-        }),
+    let updated = drive(
+        UpdateEntryOperation::new(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id: profile_id,
+                public: false,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: profile_json(profile_id, minimum_shape()),
+                },
+                expected_revision: None,
+            }),
+            test.context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
         test.context.as_ref(),
     )
     .await?;
@@ -1260,17 +1281,24 @@ async fn revision_change_repins() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     drain_projection_queue(test.context.as_ref()).await?;
 
-    let updated_profile = update_metadata_document(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id: profile_id,
-            public: true,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: profile_json(profile_id, minimum_shape()),
-            },
-            expected_revision: None,
-        }),
+    let updated_profile = drive(
+        UpdateEntryOperation::new(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id: profile_id,
+                public: true,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: profile_json(profile_id, minimum_shape()),
+                },
+                expected_revision: None,
+            }),
+            test.context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
         test.context.as_ref(),
     )
     .await?;

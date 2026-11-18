@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use super::snapshot::execute;
 use super::{GitError, records};
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
-use crate::metadata::update_entry::update_metadata_document;
+use crate::metadata::update_entry::UpdateEntryOperation;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
@@ -137,7 +137,15 @@ async fn apply_one(
             expected_revision: None,
         })
         .with_expected_graph(version);
-        match Box::pin(update_metadata_document(operation, context)).await {
+        match Box::pin(drive(
+            UpdateEntryOperation::new(
+                operation,
+                context.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            context,
+        ))
+        .await
+        {
             Ok(_) => return Ok(()),
             Err(UpdateDocumentError::GraphChanged) => {}
             // Only a verdict on the merged crate itself is final; anything else is retried.

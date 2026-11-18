@@ -31,7 +31,7 @@ use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
-use crate::metadata::update_entry::update_metadata_document;
+use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
@@ -507,16 +507,23 @@ pub async fn route_metadata_update(
     let local_holds = holders.contains(&local_node_id);
     let mut local_capacity = false;
     if local_holds && let Some(record) = record {
-        match update_metadata_document(
-            UpdateDocumentOperation::new(UpdateDocumentConfig {
-                actor: actor.clone(),
-                group_id: record.group_id,
-                document_id,
-                public: public.unwrap_or(record.public),
-                mutation: mutation.clone(),
-                expected_revision,
-            })
-            .with_message(commit_message.clone()),
+        match drive(
+            UpdateEntryOperation::new(
+                UpdateDocumentOperation::new(UpdateDocumentConfig {
+                    actor: actor.clone(),
+                    group_id: record.group_id,
+                    document_id,
+                    public: public.unwrap_or(record.public),
+                    mutation: mutation.clone(),
+                    expected_revision,
+                })
+                .with_message(commit_message.clone()),
+                context
+                    .as_ref()
+                    .net_handle
+                    .as_ref()
+                    .map(|net| net.node_id()),
+            ),
             context.as_ref(),
         )
         .await
@@ -994,7 +1001,19 @@ pub(crate) async fn apply_forwarded_write(
                     expected_revision,
                 })
                 .with_message(commit_message);
-                match update_metadata_document(operation, context.as_ref()).await {
+                match drive(
+                    UpdateEntryOperation::new(
+                        operation,
+                        context
+                            .as_ref()
+                            .net_handle
+                            .as_ref()
+                            .map(|net| net.node_id()),
+                    ),
+                    context.as_ref(),
+                )
+                .await
+                {
                     Ok(record) => MetadataTransportMessage::ForwardedRecord {
                         record: Box::new(record),
                     },

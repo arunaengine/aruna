@@ -64,6 +64,15 @@ impl GraphHandle {
                     .insert(profile_id, revision, Arc::new(shapes));
                 return MetadataEvent::ProfileShapes { shapes: None };
             }
+            // The registry cache stays with the metadata handle, which answers these first.
+            MetadataEffect::CacheGeneration
+            | MetadataEffect::CacheRecords { .. }
+            | MetadataEffect::UncacheRecord { .. } => {
+                return MetadataEvent::Error {
+                    graph_iri: None,
+                    error: MetadataError::InvalidEffect,
+                };
+            }
             effect => effect,
         };
         let graph_iri = effect.graph_iri();
@@ -915,7 +924,10 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::CheckStructure { .. }
         | MetadataEffect::CheckProfile { .. }
         | MetadataEffect::CachedShapes { .. }
-        | MetadataEffect::CacheShapes { .. } => unreachable!("handled asynchronously"),
+        | MetadataEffect::CacheShapes { .. }
+        | MetadataEffect::CacheGeneration
+        | MetadataEffect::CacheRecords { .. }
+        | MetadataEffect::UncacheRecord { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }

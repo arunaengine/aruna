@@ -1382,6 +1382,18 @@ pub enum MetadataEffect {
         revision: Ulid,
         shapes: Vec<String>,
     },
+    // This node's registry cache.
+    /// The generation of the registry cache, read before a write whose row it caches later.
+    CacheGeneration,
+    /// Caches registry rows; with a generation, only when no fill or removal happened since.
+    CacheRecords {
+        records: Vec<MetadataRegistryRecord>,
+        generation: Option<u64>,
+    },
+    /// Drops one document's row from the registry cache.
+    UncacheRecord {
+        document_id: Ulid,
+    },
 }
 
 impl MetadataEffect {
@@ -1416,6 +1428,9 @@ impl MetadataEffect {
             MetadataEffect::CheckProfile { .. } => "check_profile",
             MetadataEffect::CachedShapes { .. } => "cached_shapes",
             MetadataEffect::CacheShapes { .. } => "cache_shapes",
+            MetadataEffect::CacheGeneration => "cache_generation",
+            MetadataEffect::CacheRecords { .. } => "cache_records",
+            MetadataEffect::UncacheRecord { .. } => "uncache_record",
         }
     }
 
@@ -1453,7 +1468,10 @@ impl MetadataEffect {
             | MetadataEffect::CheckStructure { .. }
             | MetadataEffect::CheckProfile { .. }
             | MetadataEffect::CachedShapes { .. }
-            | MetadataEffect::CacheShapes { .. } => None,
+            | MetadataEffect::CacheShapes { .. }
+            | MetadataEffect::CacheGeneration
+            | MetadataEffect::CacheRecords { .. }
+            | MetadataEffect::UncacheRecord { .. } => None,
         }
     }
 
@@ -1560,6 +1578,10 @@ pub enum MetadataEvent {
     BatchMerged {
         graph_iri: String,
         applied: bool,
+    },
+    /// The registry cache generation; a cache change answers with the generation after it.
+    CacheGeneration {
+        generation: u64,
     },
     /// The kept shape sources of one Profile revision, if any; a store answers with `None`.
     ProfileShapes {
