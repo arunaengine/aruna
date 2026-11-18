@@ -11,6 +11,7 @@ use super::{
 use crate::lookup::actor;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
 use aruna_operations::metadata::api::read::{
     query_metadata, query_metadata_document, references_metadata,
@@ -23,7 +24,7 @@ use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::read::export_rocrate_routed;
 use aruna_operations::metadata::forward::write::route_metadata_update;
-use aruna_operations::metadata::profile::validation::preview_submission;
+use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
@@ -349,7 +350,10 @@ impl McpServer {
             None => metadata_probe(self, &auth, "validate_dataset", extras).await?,
         }
         let jsonld = rocrate_json(&input.rocrate.0)?;
-        let preview = preview_submission(&self.state.get_ctx(), group_id, &jsonld)
+        let context = self.state.get_ctx();
+        let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+        let preview = ProfileAssessOperation::preview(local_node, group_id, jsonld);
+        let preview = drive(preview, &context)
             .await
             .map_err(crate::metadata::map_metadata_error)
             .map_err(server_error)?;

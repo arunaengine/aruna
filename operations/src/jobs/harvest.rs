@@ -48,7 +48,7 @@ use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::create_entry::mint_job_document;
+use crate::metadata::create_entry::DocumentMintOperation;
 use crate::metadata::forward::write::{
     route_metadata_create, route_metadata_delete, route_metadata_update,
 };
@@ -462,7 +462,8 @@ async fn mint_and_create(
     row: &mut HarvestProvenance,
 ) -> Result<(), HarvestFailure> {
     let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let document_id = mint_job_document(&ctx.driver, actor, source.group_id, &document_path)
+    let mint = DocumentMintOperation::job(actor.clone(), source.group_id, document_path.clone());
+    let document_id = drive(mint, &ctx.driver)
         .await
         .map_err(|error| retryable(format!("harvest mint document id: {error}")))?
         .as_ulid();

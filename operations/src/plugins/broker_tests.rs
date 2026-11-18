@@ -13,7 +13,7 @@ use crate::metadata::api::read_types::DocumentQueryRequest;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::create_entry::create_metadata_document;
+use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::materialization_queue::process_materialization_batch;
 use crate::metadata::projector::drain_projection_queue;
 use crate::plugins::dataset::merge_into;
@@ -72,7 +72,12 @@ async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
             license: None,
         },
     });
-    let created = create_metadata_document(create, ctx.clone()).await.unwrap();
+    let created = drive(
+        CreateEntryOperation::new(create, ctx.net_handle.as_ref().map(|net| net.node_id())),
+        &ctx,
+    )
+    .await
+    .unwrap();
     project(&ctx).await;
     let mut run = queued(installed.install_id, 1);
     run.digest = installed.digest.clone();
@@ -411,9 +416,15 @@ async fn patch_keeps_entities() {
             jsonld: jsonld.to_string(),
         },
     });
-    let created = create_metadata_document(create, broker.ctx.clone())
-        .await
-        .unwrap();
+    let created = drive(
+        CreateEntryOperation::new(
+            create,
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+        ),
+        &broker.ctx,
+    )
+    .await
+    .unwrap();
     project(&broker.ctx).await;
     let document = created.record.document_id;
     let read = broker
@@ -735,7 +746,13 @@ async fn files_named(fixture: &Fixture, broker: &RunBroker, ids: &[&str]) -> Uli
             jsonld: jsonld.to_string(),
         },
     });
-    let created = create_metadata_document(create, broker.ctx.clone());
+    let created = drive(
+        CreateEntryOperation::new(
+            create,
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+        ),
+        &broker.ctx,
+    );
     let created = created.await.unwrap();
     project(&broker.ctx).await;
     created.record.document_id
@@ -1308,9 +1325,15 @@ async fn crate_with_term(fixture: &Fixture, broker: &RunBroker, term: Value) -> 
             jsonld: jsonld.to_string(),
         },
     });
-    let document = create_metadata_document(create, broker.ctx.clone())
-        .await
-        .unwrap();
+    let document = drive(
+        CreateEntryOperation::new(
+            create,
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+        ),
+        &broker.ctx,
+    )
+    .await
+    .unwrap();
     let document = document.record.document_id;
     project(&broker.ctx).await;
     (document, revision_of(broker, document).await)

@@ -18,8 +18,7 @@ use crate::metadata::api::read::ensure_record_readable;
 use crate::metadata::api::read::load_live_record;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::profile::rules::PROFILE_DOCUMENT_PREFIX;
-use crate::metadata::profile::validation::current_validation_status;
-use crate::metadata::profile::validation::revalidate_current;
+use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::revision_read::RawDisplayOperation;
@@ -411,9 +410,9 @@ pub async fn route_profile_status(
         )
         .await?;
         return if revalidate {
-            revalidate_current(context.as_ref(), &registry).await
+            drive(RevalidateOperation::new(context.as_ref().net_handle.as_ref().map(|net| net.node_id()), registry.clone()), context.as_ref()).await
         } else {
-            current_validation_status(context.as_ref(), &registry).await
+            drive(ValidationStatusOperation::new(registry.clone()), context.as_ref()).await
         }
         .map_err(|_| MetadataApiError::ServiceUnavailable);
     }
@@ -452,9 +451,9 @@ pub async fn route_profile_status(
                 .await
                 .map_err(read_error)?;
                 if revalidate {
-                    revalidate_current(context.as_ref(), &record).await
+                    drive(RevalidateOperation::new(context.as_ref().net_handle.as_ref().map(|net| net.node_id()), record.clone()), context.as_ref()).await
                 } else {
-                    current_validation_status(context.as_ref(), &record).await
+                    drive(ValidationStatusOperation::new(record.clone()), context.as_ref()).await
                 }
                 .map_err(|_| MetadataReadError::Unavailable)
             } else {

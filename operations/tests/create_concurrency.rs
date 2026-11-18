@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use std::sync::Arc;
 
 use aruna_core::UserId;
@@ -14,7 +15,7 @@ use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use aruna_operations::metadata::create_entry::create_metadata_document;
+use aruna_operations::metadata::create_entry::CreateEntryOperation;
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
 
@@ -109,7 +110,14 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
                 public: true,
                 payload: scaffold(index),
             });
-            create_metadata_document(operation, context).await
+            drive(
+                CreateEntryOperation::new(
+                    operation,
+                    context.net_handle.as_ref().map(|net| net.node_id()),
+                ),
+                &context,
+            )
+            .await
         }));
     }
 

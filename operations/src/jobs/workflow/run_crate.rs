@@ -50,7 +50,7 @@ use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::create_entry::mint_job_document;
+use crate::metadata::create_entry::DocumentMintOperation;
 use crate::metadata::forward::write::route_metadata_create;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::notifications::watch::emit::emit_metadata_created;
@@ -191,7 +191,12 @@ pub(crate) async fn record_crate(
     // Persist the first minted id before create so retries survive policy changes.
     let document_id = match saved_id {
         Some(document_id) => document_id,
-        None => match mint_job_document(context, &actor, spec.group_id, &document_path).await {
+        None => match drive(
+            DocumentMintOperation::job(actor.clone(), spec.group_id, document_path.clone()),
+            context,
+        )
+        .await
+        {
             Ok(id) => id.as_ulid(),
             Err(error) => {
                 return JobRunOutcome::Failed(JobError::retryable(format!(

@@ -21,7 +21,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
@@ -31,8 +31,8 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::forward::read::{admits_profile_peer, export_profile_local};
 use aruna_operations::metadata::forward::write::route_metadata_create;
 use aruna_operations::metadata::profile::validation::{
-    check_profile, current_validation_status, load_validation_status, preview_submission,
-    profile_public_iri, revalidate_current,
+    MetadataProfilePreview, ProfileAssessOperation, RevalidateOperation, StoredStatusOperation,
+    ValidationStatusOperation, profile_public_iri, profile_verdict,
 };
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
@@ -48,6 +48,51 @@ use byteview::ByteView;
 use serde_json::json;
 use tempfile::TempDir;
 use ulid::Ulid;
+
+fn local_node(context: &DriverContext) -> Option<aruna_core::NodeId> {
+    context.net_handle.as_ref().map(|net| net.node_id())
+}
+
+async fn preview_submission(
+    context: &DriverContext,
+    group_id: Option<Ulid>,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let preview =
+        ProfileAssessOperation::preview(local_node(context), group_id, jsonld.to_string());
+    drive(preview, context).await
+}
+
+async fn check_profile(
+    context: &DriverContext,
+    iri: &str,
+    jsonld: &str,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let check = ProfileAssessOperation::against(local_node(context), iri, jsonld.to_string());
+    drive(check, context).await.map(profile_verdict)
+}
+
+async fn load_validation_status(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<Option<ProfileValidationStatus>, MetadataError> {
+    drive(StoredStatusOperation::new(document_id), context).await
+}
+
+async fn current_validation_status(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    drive(ValidationStatusOperation::new(record.clone()), context).await
+}
+
+async fn revalidate_current(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let revalidate = RevalidateOperation::new(local_node(context), record.clone());
+    drive(revalidate, context).await
+}
 
 static PROFILE_TEST_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
@@ -97,7 +142,7 @@ async fn tagged_create_retryable() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert_eq!(event_count(&test, document_id).await?, 1);
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("create commits status atomically");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -311,7 +356,7 @@ async fn warning_severity_accepts() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )
     .await?;
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("status is durable");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -351,7 +396,7 @@ async fn spans_crate_versions() -> Result<(), Box<dyn std::error::Error>> {
             versioned_crate(document_id, &tag, version, true),
         )
         .await?;
-        let status = load_validation_status(test.context.as_ref(), document_id, None)
+        let status = load_validation_status(test.context.as_ref(), document_id)
             .await?
             .expect("status is durable");
         assert_eq!(status.state, ProfileValidationState::Valid);
@@ -466,7 +511,7 @@ async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
         run_crate_json(document_id, true),
     )
     .await?;
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("a built-in verdict is durable");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -830,7 +875,7 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
         UpdateDocumentError::MetadataError(MetadataError::ProfileValidation(_))
     ));
     assert_eq!(event_count(&test, document_id).await?, 1);
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("original status remains");
     assert_eq!(status.dataset_revision, created.event_id);
@@ -850,7 +895,7 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert_eq!(event_count(&test, document_id).await?, 2);
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("replacement commits status");
     assert_eq!(status.dataset_revision, updated.last_event_id);
@@ -937,7 +982,7 @@ async fn accepts_group_profile() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )
     .await?;
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("an accepted create commits its status");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -1000,7 +1045,7 @@ async fn public_crosses_groups() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )
     .await?;
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("an accepted create commits its status");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -1060,7 +1105,7 @@ async fn render_resolves_group() -> Result<(), Box<dyn std::error::Error>> {
     drain_projection_queue(test.context.as_ref()).await?;
     process_materialization_batch(test.context.as_ref()).await?;
 
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("materialization writes a status");
     assert_eq!(status.state, ProfileValidationState::Valid);

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
+use aruna_operations::driver::drive;
 
 use aruna_core::StructuredId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
@@ -10,7 +11,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::create_entry::create_metadata_document;
+use aruna_operations::metadata::create_entry::CreateEntryOperation;
 use aruna_operations::metadata::projector::replay_event_log;
 use ulid::Ulid;
 
@@ -183,21 +184,24 @@ async fn create_document(
 ) -> TestResult<PlacementRef> {
     // The realm's background writers can conflict with this create, so use
     // the same retrying entry point the API uses.
-    let created = create_metadata_document(
-        CreateDocumentOperation::new(CreateDocumentConfig {
-            actor: realm.actor(node),
-            group_id,
-            document_id,
-            document_path: document_path.to_string(),
-            public: false,
-            payload: CreateDocumentPayload::Scaffold {
-                name: document_path.to_string(),
-                description: "expansion fixture".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: None,
-            },
-        }),
-        node.context.clone(),
+    let created = drive(
+        CreateEntryOperation::new(
+            CreateDocumentOperation::new(CreateDocumentConfig {
+                actor: realm.actor(node),
+                group_id,
+                document_id,
+                document_path: document_path.to_string(),
+                public: false,
+                payload: CreateDocumentPayload::Scaffold {
+                    name: document_path.to_string(),
+                    description: "expansion fixture".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: None,
+                },
+            }),
+            node.context.net_handle.as_ref().map(|net| net.node_id()),
+        ),
+        &node.context,
     )
     .await?;
     replay_event_log(node.context.as_ref()).await?;

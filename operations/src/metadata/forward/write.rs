@@ -7,6 +7,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
 use crate::device::edit::accepts_edits;
 use crate::device::edit::apply_local_edit;
+use crate::driver::drive;
 use crate::driver::{DriverContext, drive_retry};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::get_visible_document;
@@ -21,10 +22,9 @@ use crate::metadata::create_document::CreateDocumentResult;
 use crate::metadata::create_document::mint_forward_document;
 use crate::metadata::create_document::mint_local_document;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::create_entry::create_metadata_document;
+use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
-use crate::metadata::profile::validation::current_validation_status;
-use crate::metadata::profile::validation::revalidate_current;
+use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::UpdateDocumentConfig;
@@ -93,7 +93,15 @@ pub async fn route_metadata_create(
 ) -> Result<CreateDocumentResult, MetadataWriteError> {
     let config = operation.config().clone();
     let commit_message = operation.message().map(str::to_owned);
-    match create_metadata_document(operation, context.clone()).await {
+    match drive(
+        CreateEntryOperation::new(
+            operation,
+            context.net_handle.as_ref().map(|net| net.node_id()),
+        ),
+        &context,
+    )
+    .await
+    {
         Err(CreateDocumentError::HoldsNoBucket) => {}
         Ok(created) => return Ok(created),
         Err(error) => return Err(error.into()),
@@ -395,7 +403,14 @@ pub async fn create_with_id(
     let created = if local {
         let operation =
             CreateDocumentOperation::new_generated_id(config).with_message(create.message.clone());
-        create_metadata_document(operation, context.clone()).await?
+        drive(
+            CreateEntryOperation::new(
+                operation,
+                context.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            &context,
+        )
+        .await?
     } else {
         let realm_config = load_realm_config(context, realm_id)
             .await
@@ -831,9 +846,24 @@ pub(crate) async fn apply_forwarded_write(
                         };
                     }
                     if *revalidate {
-                        revalidate_current(context.as_ref(), &record).await
+                        drive(
+                            RevalidateOperation::new(
+                                context
+                                    .as_ref()
+                                    .net_handle
+                                    .as_ref()
+                                    .map(|net| net.node_id()),
+                                record.clone(),
+                            ),
+                            context.as_ref(),
+                        )
+                        .await
                     } else {
-                        current_validation_status(context.as_ref(), &record).await
+                        drive(
+                            ValidationStatusOperation::new(record.clone()),
+                            context.as_ref(),
+                        )
+                        .await
                     }
                     .map(Box::new)
                     .map_err(|_| MetadataReadError::Unavailable)
@@ -895,7 +925,15 @@ pub(crate) async fn apply_forwarded_write(
                 }
                 let operation = CreateDocumentOperation::new_forwarded(create_config.clone())
                     .with_message(commit_message);
-                match create_metadata_document(operation, context.clone()).await {
+                match drive(
+                    CreateEntryOperation::new(
+                        operation,
+                        context.net_handle.as_ref().map(|net| net.node_id()),
+                    ),
+                    &context,
+                )
+                .await
+                {
                     Ok(created) => MetadataTransportMessage::ForwardedRecord {
                         record: Box::new(created.record),
                     },

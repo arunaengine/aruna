@@ -255,6 +255,14 @@ pub(crate) fn parse_registry_iter(
 }
 
 /// Wakes the materialization drain at once.
+/// Wakes the projection drain after `after`.
+pub(crate) fn schedule_projection(after: Duration) -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainProjectionQueue,
+        after,
+    })
+}
+
 pub(crate) fn schedule_materialization() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainMaterializationQueue,
@@ -356,9 +364,9 @@ pub(crate) fn schedule_prune_drain() -> Effect {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::keyspaces::METADATA_HOLDERS_KEYSPACE;
     use crate::sync::outbox_record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
+    use aruna_core::keyspaces::METADATA_HOLDERS_KEYSPACE;
     use aruna_core::keyspaces::{
         SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
         UPDATED_INDEX_KEYSPACE,

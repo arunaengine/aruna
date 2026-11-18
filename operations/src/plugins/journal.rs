@@ -217,7 +217,7 @@ mod tests {
         use crate::metadata::create_document::{
             CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
         };
-        use crate::metadata::create_entry::create_metadata_document;
+        use crate::metadata::create_entry::CreateEntryOperation;
         let fixture = crate::plugins::install::tests::Fixture::new().await;
         let mut ctx = fixture.ctx.clone();
         let dir = tempfile::tempdir().unwrap();
@@ -251,7 +251,12 @@ mod tests {
                 license: None,
             },
         });
-        let created = create_metadata_document(create, ctx.clone()).await.unwrap();
+        let created = drive(
+            CreateEntryOperation::new(create, ctx.net_handle.as_ref().map(|net| net.node_id())),
+            &ctx,
+        )
+        .await
+        .unwrap();
         for _ in 0..3 {
             crate::metadata::projector::drain_projection_queue(&ctx)
                 .await

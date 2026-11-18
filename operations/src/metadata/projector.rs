@@ -108,18 +108,13 @@ pub enum MetadataProjectionError {
     UnexpectedEvent(String),
 }
 
-fn pending_drain_effect(after: Duration) -> TaskEffect {
-    TaskEffect::ResetTimer {
-        key: TaskKey::DrainProjectionQueue,
-        after,
-    }
-}
-
 pub async fn schedule_projection_drain(
     context: &DriverContext,
     after: Duration,
 ) -> Result<(), MetadataProjectionError> {
-    let effect = pending_drain_effect(after);
+    let Effect::Task(effect) = crate::metadata::repository::schedule_projection(after) else {
+        return Ok(());
+    };
     persist_task_effect(&context.storage_handle, &effect)
         .await
         .map_err(MetadataProjectionError::UnexpectedEvent)?;
@@ -152,7 +147,9 @@ pub(crate) async fn restore_projection_timer(storage: &StorageHandle, task_handl
         Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty() => {}
         Event::Storage(StorageEvent::IterResult { .. }) => {
             let event = task_handle
-                .send_effect(Effect::Task(pending_drain_effect(Duration::ZERO)))
+                .send_effect(crate::metadata::repository::schedule_projection(
+                    Duration::ZERO,
+                ))
                 .await;
             if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
                 warn!(message = %message, "Failed to restore metadata projection timer");
