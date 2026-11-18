@@ -396,7 +396,7 @@ mod tests {
 
     use super::*;
     use crate::driver::DriverContext;
-    use crate::s3::bucket::local_search::{extras_valid, search_local_buckets, search_with_budget};
+    use crate::s3::bucket::local_search::{LocalBucketSearch, extras_valid};
 
     fn scan_input(query: &str, limit: usize) -> SearchBucketsInput {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -740,9 +740,8 @@ mod tests {
             .await;
         }
 
-        let hits = search_local_buckets(
-            &context,
-            SearchBucketsInput {
+        let hits = crate::driver::drive(
+            LocalBucketSearch::new(SearchBucketsInput {
                 auth: AuthContext {
                     user_id: outsider,
                     realm_id,
@@ -758,7 +757,8 @@ mod tests {
                 group_id: None,
                 start_after: None,
                 database: false,
-            },
+            }),
+            &context,
         )
         .await
         .unwrap()
@@ -792,9 +792,8 @@ mod tests {
             )
             .await;
         }
-        let databases = search_local_buckets(
-            &context,
-            SearchBucketsInput {
+        let databases = crate::driver::drive(
+            LocalBucketSearch::new(SearchBucketsInput {
                 auth: AuthContext {
                     user_id: owner,
                     realm_id,
@@ -810,7 +809,8 @@ mod tests {
                 group_id: None,
                 start_after: None,
                 database: true,
-            },
+            }),
+            &context,
         )
         .await
         .unwrap()
@@ -839,7 +839,7 @@ mod tests {
             start_after: None,
             database: false,
         };
-        let cut = search_with_budget(&context, input.clone(), 1)
+        let cut = crate::driver::drive(LocalBucketSearch::with_budget(input.clone(), 1), &context)
             .await
             .unwrap();
         assert!(cut.hits.is_empty());
@@ -849,7 +849,9 @@ mod tests {
             start_after: Some(sealed.clone().into()),
             ..input.clone()
         };
-        let rest = search_local_buckets(&context, resumed).await.unwrap();
+        let rest = crate::driver::drive(LocalBucketSearch::new(resumed), &context)
+            .await
+            .unwrap();
         let names: Vec<_> = rest.hits.iter().map(|hit| hit.bucket.as_str()).collect();
         assert_eq!(names, ["data-public"]);
         let mut forged = sealed;
@@ -859,7 +861,9 @@ mod tests {
             ..input
         };
         // A position this node cannot open retires its scan instead of failing every page.
-        let retired = search_local_buckets(&context, forged).await.unwrap();
+        let retired = crate::driver::drive(LocalBucketSearch::new(forged), &context)
+            .await
+            .unwrap();
         assert!(retired.retired && retired.hits.is_empty() && retired.scanned_to.is_none());
     }
 
