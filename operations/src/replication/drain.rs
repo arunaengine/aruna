@@ -885,18 +885,18 @@ impl ProcessJobOperation {
         self.operation = Some(operation.with_distribution(publication, local));
         self.run_scope()
     }
-    let mut watch_group_id = None;
-    let relationship = if let Some(relationship_id) = job.relationship_id {
-        let Some(relationship) = stored_relationship else {
+
+    fn load_relationship_auth(&mut self, relationship_id: Ulid) -> JobTurn {
+        let Some(relationship) = self.relationship.as_ref() else {
             info!(
                 relationship_id = %relationship_id,
                 "Skipping replication job for missing sync relationship"
             );
-            return Ok(BlobJobOutcome::Retired);
+            return self.finish(Ok(BlobJobOutcome::Retired));
         };
-        let bucket = match relationship_bucket(job, &relationship, relationship_id) {
-            Ok(bucket) => bucket,
-            Err(outcome) => return Ok(outcome),
+        let bucket = match relationship_bucket(&self.job, relationship, relationship_id) {
+            Ok(bucket) => bucket.to_string(),
+            Err(outcome) => return self.finish(Ok(outcome)),
         };
         let creator = AuthContext {
             user_id: relationship.created_by,
@@ -904,238 +904,266 @@ impl ProcessJobOperation {
             path_restrictions: None,
             session: None,
         };
-        let source_auth_context = job_source_auth(job, &creator).clone();
-        let source_authorization = match load_source_authorization(
-            context,
-            source_auth_context,
-            relationship.source.node_id,
-            bucket,
-        )
-        .await
-        {
-            Ok(authorization) => {
-                watch_group_id = Some(authorization.group_id());
-                authorization
-            }
-            Err((SourceAuthorizationError::Denied, group_id)) => {
-                if job.reference_advance.is_some() {
-                    return Ok(BlobJobOutcome::Failed);
-                }
-                let mut relationship = relationship;
-                relationship.state = SyncState::Failed {
-                    reason: "access_denied".to_string(),
-                };
-                mark_failure(&mut relationship, "access_denied");
-                let stored = store_relationship(context, relationship.clone()).await?;
-                cache_relationship(relationships, job, &relationship, stored);
-                if stored && let Some(group_id) = group_id {
-                    emit_sync_watch(context, &relationship, group_id, 0, Some("access_denied"))
-                        .await;
-                }
-                return Ok(BlobJobOutcome::Failed);
-            }
-            Err((SourceAuthorizationError::Unavailable(error), group_id)) => {
-                let mut relationship = relationship;
-                mark_failure(&mut relationship, &error);
-                let stored = store_relationship(context, relationship.clone()).await?;
-                cache_relationship(relationships, job, &relationship, stored);
-                if stored && let Some(group_id) = group_id {
-                    emit_sync_watch(context, &relationship, group_id, 0, Some(&error)).await;
-                }
-                return Err(error);
-            }
-        };
-        let writer_auth_context = if job.reference_advance.is_some() {
-            None
-        } else {
-            job.writer_auth_context.clone().or(Some(creator))
-        };
-        let consent = super::plaintext::relationship_consent(relationship.id);
-        let realm_id = job.input.auth_context.realm_id;
-        let plaintext = HolderCheckOperation::new(realm_id, bucket, relationship.created_by)
-            .with_consent(consent);
-        let plaintext = drive(plaintext, context)
-            .await
-            .map_err(|error| error.to_string())?;
-        operation = operation
-            .with_plaintext(plaintext)
-            .with_relationship(
-                relationship.clone(),
-                job.origin.clone(),
-                job.upstream_sources.clone(),
-                writer_auth_context,
-            )
-            .with_source_authorization(source_authorization);
-        if let Some(advance) = job.reference_advance {
-            operation = operation.with_reference_advance(advance);
-        }
-        Some(relationship)
-    } else {
-        let Some(writer) = job.writer_auth_context.as_ref() else {
+        let source_auth = job_source_auth(&self.job, &creator).clone();
+        let source_node = relationship.source.node_id;
+        self.creator = Some(creator);
+        let load = LoadSourceAuthOperation::new(source_auth, source_node, &bucket);
+        self.call(JobStep::RelationAuth, IoCall::child(load))
+    }
+
+    fn load_writer_auth(&mut self) -> JobTurn {
+        let Some(writer) = self.job.writer_auth_context.clone() else {
             error!(
-                bucket = %job.input.bucket,
+                bucket = %self.job.input.bucket,
                 "Dropping replication job without durable source writer"
             );
-            return Ok(BlobJobOutcome::Failed);
+            return self.finish(Ok(BlobJobOutcome::Failed));
         };
-        let Some(source_node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
-            return Err("source node identity unavailable".to_string());
+        let local = match self.local_node() {
+            Ok(local) => local,
+            Err(error) => return self.finish(Err(error)),
         };
-        let source_authorization = match load_source_authorization(
-            context,
-            writer.clone(),
-            source_node_id,
-            &job.input.bucket,
-        )
-        .await
-        {
+        let load = LoadSourceAuthOperation::new(writer, local, &self.job.input.bucket);
+        self.call(JobStep::WriterAuth, IoCall::child(load))
+    }
+
+    fn relation_auth(&mut self, loaded: Result<SourceAuthorization, SourceRefusal>) -> JobTurn {
+        let authorization = match loaded {
+            Ok(authorization) => authorization,
+            Err((SourceAuthorizationError::Denied, group_id)) => {
+                if self.job.reference_advance.is_some() {
+                    return self.finish(Ok(BlobJobOutcome::Failed));
+                }
+                self.watch_group = group_id;
+                return self.access_denied();
+            }
+            Err((SourceAuthorizationError::Unavailable(error), group_id)) => {
+                self.watch_group = group_id;
+                if let Some(relationship) = self.relationship.as_mut() {
+                    mark_failure(relationship, &error);
+                }
+                let watch = Some((0, Some(error.clone())));
+                return self.store(watch, AfterStore::Finish(Err(error)));
+            }
+        };
+        self.watch_group = Some(authorization.group_id());
+        let Some(relationship) = self.relationship.as_ref() else {
+            return self.finish(Ok(BlobJobOutcome::Retired));
+        };
+        let bucket = relationship.source.bucket().unwrap_or_default();
+        let realm_id = self.job.input.auth_context.realm_id;
+        let check = HolderCheckOperation::new(realm_id, bucket, relationship.created_by)
+            .with_consent(relationship_consent(relationship.id));
+        let step = JobStep::Plaintext(Box::new(authorization));
+        self.call(step, IoCall::child(check))
+    }
+
+    fn writer_auth(&mut self, loaded: Result<SourceAuthorization, SourceRefusal>) -> JobTurn {
+        let authorization = match loaded {
             Ok(authorization) => authorization,
             Err((SourceAuthorizationError::Denied, _)) => {
-                return Ok(BlobJobOutcome::Failed);
+                return self.finish(Ok(BlobJobOutcome::Failed));
             }
-            Err((SourceAuthorizationError::Unavailable(error), _)) => return Err(error),
+            Err((SourceAuthorizationError::Unavailable(error), _)) => {
+                return self.finish(Err(error));
+            }
         };
-        let consent = job_consent(&blob_job_key(job).map_err(|error| error.to_string())?);
-        let (realm_id, bucket) = (job.input.auth_context.realm_id, &job.input.bucket);
-        let plaintext =
-            HolderCheckOperation::new(realm_id, bucket, writer.user_id).with_consent(consent);
-        let plaintext = drive(plaintext, context)
-            .await
-            .map_err(|error| error.to_string())?;
-        operation = operation
-            .with_source_authorization(source_authorization)
-            .with_writer_auth(writer.clone())
-            .with_plaintext(plaintext);
-        None
-    };
+        let Some(writer) = self.job.writer_auth_context.as_ref() else {
+            return self.finish(Ok(BlobJobOutcome::Failed));
+        };
+        let consent = match blob_job_key(&self.job) {
+            Ok(key) => job_consent(&key),
+            Err(error) => return self.finish(Err(error.to_string())),
+        };
+        let realm_id = self.job.input.auth_context.realm_id;
+        let check = HolderCheckOperation::new(realm_id, &self.job.input.bucket, writer.user_id)
+            .with_consent(consent);
+        let step = JobStep::Plaintext(Box::new(authorization));
+        self.call(step, IoCall::child(check))
+    }
 
-    finish_blob_job(
-        context,
-        job,
-        operation,
-        relationship,
-        watch_group_id,
-        relationships,
-    )
-    .await
-}
-
-/// Sends a distributed bucket's version to one member under the publication this node's
-/// record gives now. A job whose publication ended is done: the current coordinator owes it.
-async fn publish_member(
-    context: &DriverContext,
-    job: &BlobJobRecord,
-    target: &MemberTarget,
-    operation: ReplicateScopeOperation,
-    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
-) -> Result<BlobJobOutcome, String> {
-    let ReplicateScopeTarget::Version { key, .. } = &job.input.target else {
-        return Ok(BlobJobOutcome::Failed);
-    };
-    let Some(local) = context.net_handle.as_ref().map(|net| net.node_id()) else {
-        return Err("source node identity unavailable".to_string());
-    };
-    let publication = drive(BoundRecordOperation::new(&job.input.bucket), context)
-        .await
-        .map_err(|error| error.to_string())?
-        .and_then(|(binding, snapshot)| member_publication(&binding, &snapshot, key, target))
-        .filter(|(_, node_id)| *node_id == job.input.target_node_id);
-    let Some((publication, _)) = publication else {
-        info!(
-            bucket = %job.input.bucket,
-            member_id = %target.member_id,
-            "Dropping a publication this node no longer owes"
-        );
-        return Ok(BlobJobOutcome::Retired);
-    };
-    let operation = operation.with_distribution(publication, local);
-    finish_blob_job(context, job, operation, None, None, relationships).await
-}
-
-async fn finish_blob_job(
-    context: &DriverContext,
-    job: &BlobJobRecord,
-    operation: ReplicateScopeOperation,
-    mut relationship: Option<SyncRelationship>,
-    watch_group_id: Option<GroupId>,
-    relationships: &mut HashMap<(String, Ulid), SyncRelationship>,
-) -> Result<BlobJobOutcome, String> {
-    let failure: Option<ReplicationFailure>;
-    let error = match drive(operation, context).await {
-        Ok(result) if result.failed == 0 && !result.awaiting.is_empty() => {
-            if result.replicated > 0
-                && let Some(relationship) = relationship.as_mut()
-            {
-                mark_progress(relationship, result.replicated, result.replicated_bytes);
-                let stored = store_relationship(context, relationship.clone()).await?;
-                cache_relationship(relationships, job, relationship, stored);
-            }
-            return Ok(BlobJobOutcome::AwaitingKey(result.awaiting));
-        }
-        Ok(result) if result.failed == 0 => {
-            if let Some(relationship) = relationship.as_mut() {
-                mark_success(relationship, result.replicated, result.replicated_bytes);
-                let stored = store_relationship(context, relationship.clone()).await?;
-                cache_relationship(relationships, job, relationship, stored);
-                if stored && let Some(group_id) = watch_group_id {
-                    emit_sync_watch(context, relationship, group_id, result.replicated, None).await;
-                }
-            }
-            return Ok(BlobJobOutcome::Completed);
-        }
-        Ok(result) => {
-            failure = result.failure;
-            if failure.is_some_and(ReplicationFailure::is_writer_denied) {
-                return Ok(BlobJobOutcome::Failed);
-            }
-            if job.reference_advance.is_some()
-                && failure.is_some_and(ReplicationFailure::is_access_denied)
-            {
-                return Ok(BlobJobOutcome::Failed);
-            }
-            if result.replicated > 0
-                && let Some(relationship) = relationship.as_mut()
-            {
-                mark_progress(relationship, result.replicated, result.replicated_bytes);
-            }
-            let error = match result.last_error.as_deref() {
-                Some(last_error) => format!(
-                    "replication completed with {} replicated, {} skipped, {} failed: {}",
-                    result.replicated, result.skipped, result.failed, last_error
-                ),
-                None => format!(
-                    "replication completed with {} replicated, {} skipped, {} failed",
-                    result.replicated, result.skipped, result.failed
-                ),
-            };
-            if failure.is_some_and(ReplicationFailure::is_access_denied)
-                && let Some(relationship) = relationship.as_mut()
-            {
-                relationship.state = SyncState::Failed {
-                    reason: "access_denied".to_string(),
+    fn plaintext_known(&mut self, authorization: SourceAuthorization, plaintext: bool) -> JobTurn {
+        let operation = self.operation.take().ok_or(IoError::Unfinished)?;
+        let job = &self.job;
+        let operation = match self
+            .relationship
+            .as_ref()
+            .filter(|_| job.relationship_id.is_some())
+        {
+            Some(relationship) => {
+                let writer = match job.reference_advance {
+                    Some(_) => None,
+                    None => job.writer_auth_context.clone().or(self.creator.take()),
                 };
-                mark_failure(relationship, "access_denied");
-                let stored = store_relationship(context, relationship.clone()).await?;
-                cache_relationship(relationships, job, relationship, stored);
-                if stored && let Some(group_id) = watch_group_id {
-                    emit_sync_watch(context, relationship, group_id, 0, Some("access_denied"))
-                        .await;
+                let operation = operation
+                    .with_plaintext(plaintext)
+                    .with_relationship(
+                        relationship.clone(),
+                        job.origin.clone(),
+                        job.upstream_sources.clone(),
+                        writer,
+                    )
+                    .with_source_authorization(authorization);
+                match job.reference_advance {
+                    Some(advance) => operation.with_reference_advance(advance),
+                    None => operation,
                 }
-                return Ok(BlobJobOutcome::Failed);
             }
-            error
+            None => {
+                let writer = job.writer_auth_context.clone().ok_or(IoError::Unfinished)?;
+                operation
+                    .with_source_authorization(authorization)
+                    .with_writer_auth(writer)
+                    .with_plaintext(plaintext)
+            }
+        };
+        self.operation = Some(operation);
+        self.run_scope()
+    }
+
+    fn run_scope(&mut self) -> JobTurn {
+        let operation = self.operation.take().ok_or(IoError::Unfinished)?;
+        self.call(JobStep::Scope, IoCall::child(operation))
+    }
+
+    fn tracked(&self) -> bool {
+        self.relationship.is_some() && self.job.relationship_id.is_some()
+    }
+
+    fn store(&mut self, watch: Option<(u64, Option<String>)>, after: AfterStore) -> JobTurn {
+        let relationship = self.relationship.clone().filter(|_| self.tracked());
+        let Some(relationship) = relationship else {
+            return self.after_store(after);
+        };
+        let store = StoreRelationshipOperation::new(relationship);
+        self.call(JobStep::Store(watch, Box::new(after)), IoCall::child(store))
+    }
+
+    fn stored(
+        &mut self,
+        watch: Option<(u64, Option<String>)>,
+        after: AfterStore,
+        stored: Result<bool, String>,
+    ) -> JobTurn {
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(error) => return self.finish(Err(error)),
+        };
+        let Some(relationship) = self.relationship.as_ref() else {
+            return self.after_store(after);
+        };
+        self.cached = Some((relationship.clone(), stored));
+        let event = watch.filter(|_| stored).zip(self.watch_group).and_then(
+            |((versions, error), group_id)| {
+                sync_event(
+                    relationship,
+                    group_id,
+                    versions,
+                    error.as_deref(),
+                    self.now_ms,
+                )
+            },
+        );
+        match event {
+            // Failures only warn inside the operation.
+            Some(event) => {
+                let emit = EmitEventOperation::new(event);
+                self.call(JobStep::Emit(Box::new(after)), IoCall::child(emit))
+            }
+            None => self.after_store(after),
         }
-        Err(error) => {
-            failure = Some(scope_failure(&error));
-            error.to_string()
+    }
+
+    fn after_store(&mut self, after: AfterStore) -> JobTurn {
+        match after {
+            AfterStore::Finish(result) => self.finish(result),
+            AfterStore::Failure(failure, error) => self.after_failure(failure, error),
         }
-    };
-    // A refused plaintext copy fails the relationship until it is changed and run again.
-    if failure == Some(ReplicationFailure::PlaintextRefused)
-        && let Some(relationship) = relationship.as_mut()
-    {
-        relationship.state = SyncState::Failed {
-            reason: "plaintext_required".to_string(),
+    }
+
+    fn access_denied(&mut self) -> JobTurn {
+        if let Some(relationship) = self.relationship.as_mut() {
+            relationship.state = SyncState::Failed {
+                reason: "access_denied".to_string(),
+            };
+            mark_failure(relationship, "access_denied");
+        }
+        let watch = Some((0, Some("access_denied".to_string())));
+        self.store(watch, AfterStore::Finish(Ok(BlobJobOutcome::Failed)))
+    }
+
+    fn scope_done(
+        &mut self,
+        outcome: Result<ReplicateScopeResult, ReplicateScopeError>,
+    ) -> JobTurn {
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => return self.failure(Some(scope_failure(&error)), error.to_string()),
+        };
+        if result.failed == 0 && !result.awaiting.is_empty() {
+            let outcome = Ok(BlobJobOutcome::AwaitingKey(result.awaiting));
+            let progressed = (self.relationship.as_mut()).filter(|_| result.replicated > 0);
+            let Some(relationship) = progressed else {
+                return self.finish(outcome);
+            };
+            mark_progress(relationship, result.replicated, result.replicated_bytes);
+            return self.store(None, AfterStore::Finish(outcome));
+        }
+        if result.failed == 0 {
+            let outcome = AfterStore::Finish(Ok(BlobJobOutcome::Completed));
+            if let Some(relationship) = self.relationship.as_mut() {
+                mark_success(relationship, result.replicated, result.replicated_bytes);
+            }
+            return self.store(Some((result.replicated, None)), outcome);
+        }
+        let failure = result.failure;
+        if failure.is_some_and(ReplicationFailure::is_writer_denied) {
+            return self.finish(Ok(BlobJobOutcome::Failed));
+        }
+        let denied = failure.is_some_and(ReplicationFailure::is_access_denied);
+        if self.job.reference_advance.is_some() && denied {
+            return self.finish(Ok(BlobJobOutcome::Failed));
+        }
+        if result.replicated > 0
+            && let Some(relationship) = self.relationship.as_mut()
+        {
+            mark_progress(relationship, result.replicated, result.replicated_bytes);
+        }
+        let counts = format!(
+            "replication completed with {} replicated, {} skipped, {} failed",
+            result.replicated, result.skipped, result.failed
+        );
+        let error = match result.last_error.as_deref() {
+            Some(last_error) => format!("{counts}: {last_error}"),
+            None => counts,
+        };
+        if denied && self.relationship.is_some() {
+            return self.access_denied();
+        }
+        self.failure(failure, error)
+    }
+
+    /// A refused plaintext copy fails the relationship until it is changed and run again.
+    fn failure(&mut self, failure: Option<ReplicationFailure>, error: String) -> JobTurn {
+        if failure == Some(ReplicationFailure::PlaintextRefused)
+            && let Some(relationship) = self.relationship.as_mut()
+        {
+            relationship.state = SyncState::Failed {
+                reason: "plaintext_required".to_string(),
+            };
+            mark_failure(relationship, &error);
+            let watch = Some((0, Some(error.clone())));
+            return self.store(watch, AfterStore::Failure(failure, error));
+        }
+        self.after_failure(failure, error)
+    }
+
+    fn after_failure(&mut self, failure: Option<ReplicationFailure>, error: String) -> JobTurn {
+        if failure.is_some_and(ReplicationFailure::is_denied) {
+            return self.finish(Ok(BlobJobOutcome::Failed));
+        }
+        let Some(relationship) = self.relationship.as_mut() else {
+            return self.finish(Err(error));
         };
         mark_failure(relationship, &error);
         let stored = store_relationship(context, relationship.clone()).await?;
