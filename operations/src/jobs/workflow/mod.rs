@@ -15,6 +15,7 @@ pub mod reconcile;
 pub mod recovery;
 pub mod run_crate;
 pub mod session;
+pub mod settle;
 pub mod supervise;
 pub mod workspace;
 

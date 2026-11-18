@@ -113,7 +113,7 @@ fn backend_caps(context: &DriverContext, spec: &ExecutionSpec) -> Option<Backend
 }
 
 /// Whether the backend this run is placed on can mount inputs.
-fn backend_mounts(context: &DriverContext, spec: &ExecutionSpec) -> bool {
+pub(super) fn backend_mounts(context: &DriverContext, spec: &ExecutionSpec) -> bool {
     backend_caps(context, spec).is_some_and(|caps| caps.s3_mount)
 }
 
