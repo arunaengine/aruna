@@ -1,32 +1,22 @@
-//! Runs the S3 HeadObject state machine that resolves object metadata without reading data.
+//! Runs S3 HeadObject: resolves object metadata without reading data.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::records::{blob_location_read, pending_location_read};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::s3::object::lookup::{
-    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, finish_pending_check,
-    location_from_read, multipart_summary_read, summary_from_read,
-};
-use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
+use crate::s3::object::lookup::{FoundVersion, VersionLookup, VersionLookupError};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{
     ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
-use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::managed_copy::{ManagedCopyError, serve_reads};
-use aruna_core::operation::EffectOperation;
+use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
+use aruna_core::managed_copy::ManagedCopyError;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
-use aruna_core::structs::storage::blob::{
-    ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
-    CurrentVersionPointer, ManagedCopyKey, VersionKey,
-};
+use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -34,19 +24,9 @@ use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeadObjectState {
-    Init,
-    StartTransaction,
-    GetVersion,
-    CheckManagedCopy,
-    CheckPendingCopy,
-    GetBlobLocation,
-    GetCurrentVersion,
-    ReadMultipartSummary,
-    CommitTransaction,
+    Lookup,
     ResolveReferenceAccess,
     HeadReferenceSource,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -55,19 +35,12 @@ pub enum HeadObjectError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
-    InvalidState {
-        current: HeadObjectState,
-        expected: HeadObjectState,
-    },
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: HeadObjectState,
         expected: &'static str,
         received: &'static str,
     },
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("The specified key does not exist.")]
     NoSuchKey,
     #[error("The specified version does not exist.")]
@@ -82,8 +55,26 @@ pub enum HeadObjectError {
     ManagedCopyError(#[from] ManagedCopyError),
     #[error("HeadObject failed")]
     HeadObjectFailed,
-    #[error("operation did not finish")]
-    NotFinished,
+}
+
+impl From<IoError> for HeadObjectError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+impl From<VersionLookupError> for HeadObjectError {
+    fn from(error: VersionLookupError) -> Self {
+        match error {
+            VersionLookupError::Storage(error) => Self::StorageError(error),
+            VersionLookupError::Conversion(error) => Self::ConversionError(error),
+            VersionLookupError::Managed(error) => Self::ManagedCopyError(error),
+            VersionLookupError::NoSuchKey => Self::NoSuchKey,
+            VersionLookupError::NoSuchVersion => Self::NoSuchVersion,
+            VersionLookupError::DeleteMarker => Self::DeleteMarker,
+            VersionLookupError::Failed => Self::HeadObjectFailed,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -112,277 +103,68 @@ pub struct HeadObjectResult {
     pub source_binding: Option<VersionSourceBinding>,
 }
 
+type HeadTurn = Result<Next<HeadObjectResult>, HeadObjectError>;
+
+/// Reads the version in one snapshot in a child; a reference to another Aruna node then asks
+/// that source for its current metadata, outside the snapshot.
 #[derive(Debug, PartialEq)]
 pub struct HeadObjectOperation {
     input: HeadObjectInput,
     state: HeadObjectState,
-    txn_id: Option<Ulid>,
-    location: Option<BackendLocation>,
-    metadata: HashMap<String, String>,
-    source_metadata: Option<SourceMetadata>,
-    last_refresh: Option<SystemTime>,
-    version_created_at: Option<SystemTime>,
-    resolved_version_id: Option<Ulid>,
-    checksum_type: MultipartChecksumType,
-    composite_hashes: HashMap<String, Vec<u8>>,
-    part_count: Option<usize>,
-    reference_source: Option<VersionSourceBinding>,
-    /// Held while a governed version's local registration is verified.
-    pending_location: Option<BlobLocationKey>,
-    pending_copy: Option<ManagedCopyKey>,
-    /// The archive of a governed pending version while its registration is verified.
-    pending_archive: Option<ArchiveKey>,
-    /// Refs of the version being served, compared against its registration.
-    source_policies: Vec<PlacementPolicyRef>,
-    source_binding: Option<VersionSourceBinding>,
-    output: Option<Result<HeadObjectResult, HeadObjectError>>,
+    found: Option<FoundVersion>,
 }
 
 impl HeadObjectOperation {
     pub fn new(input: HeadObjectInput) -> Self {
         Self {
             input,
-            state: HeadObjectState::Init,
-            txn_id: None,
-            location: None,
-            metadata: HashMap::new(),
-            source_metadata: None,
-            last_refresh: None,
-            version_created_at: None,
-            resolved_version_id: None,
-            checksum_type: MultipartChecksumType::FullObject,
-            composite_hashes: HashMap::new(),
-            part_count: None,
-            reference_source: None,
-            pending_location: None,
-            pending_copy: None,
-            pending_archive: None,
-            source_policies: Vec::new(),
-            source_binding: None,
-            output: None,
+            state: HeadObjectState::Lookup,
+            found: None,
         }
     }
 
-    fn emit_error(&mut self, error: HeadObjectError) -> Effects {
-        self.state = HeadObjectState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn lookup_error(&self, expected: &'static str, error: LookupError) -> HeadObjectError {
-        match error {
-            LookupError::Conversion(err) => HeadObjectError::ConversionError(err),
-            LookupError::Managed(err) => HeadObjectError::ManagedCopyError(err),
-            LookupError::InvalidEvent(received) => HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected,
-                received: received.label(),
-            },
-            LookupError::Missing => HeadObjectError::HeadObjectFailed,
+    fn result(&self, found: FoundVersion) -> HeadObjectResult {
+        let summary = found.summary;
+        HeadObjectResult {
+            location: found.location,
+            metadata: found.metadata,
+            source_metadata: found.source_metadata,
+            last_refresh: found.last_refresh,
+            version_created_at: found.created_at,
+            version_id: found.version_id.or(self.input.version_id),
+            resolved_version_id: found.version_id,
+            checksum_type: (summary.as_ref())
+                .map_or(MultipartChecksumType::FullObject, |it| it.checksum_type),
+            part_count: summary.as_ref().map(|summary| summary.part_count),
+            composite_hashes: summary.map(|it| it.composite_hashes).unwrap_or_default(),
+            source_policies: found.source_policies,
+            source_binding: found.source_binding,
         }
     }
 
-    fn handle_init(&mut self) -> Effects {
-        if self.state != HeadObjectState::Init {
-            self.emit_error(HeadObjectError::InvalidState {
-                current: self.state.clone(),
-                expected: HeadObjectState::Init,
-            })
-        } else {
-            self.state = HeadObjectState::StartTransaction;
-            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: true
-            })]
-        }
+    fn invalid(&self, expected: &'static str, event: Event) -> HeadTurn {
+        Err(HeadObjectError::InvalidStateEvent {
+            state: self.state.clone(),
+            expected,
+            received: event.label(),
+        })
     }
 
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
-            self.txn_id = Some(txn_id);
-            if let Some(version_id) = self.input.version_id {
-                self.state = HeadObjectState::GetVersion;
-                let key = match VersionKey::new(&self.input.bucket, &self.input.key, version_id)
-                    .to_bytes()
-                {
-                    Ok(key) => key.into(),
-                    Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
-                };
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                    key,
-                    txn_id: self.txn_id,
-                })]
-            } else {
-                self.state = HeadObjectState::GetCurrentVersion;
-                let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
-                    Ok(key) => key.into(),
-                    Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
-                };
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
-                    key,
-                    txn_id: self.txn_id,
-                })]
-            }
-        } else {
-            self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: (event).label(),
-            })
-        }
+    fn looked_up(&mut self, outcome: Result<FoundVersion, VersionLookupError>) -> HeadTurn {
+        let mut found = outcome?;
+        let Some(source) = found.native_reference.take() else {
+            return Ok(Next::Done(self.result(found)));
+        };
+        self.found = Some(found);
+        self.state = HeadObjectState::ResolveReferenceAccess;
+        let resolve = resolve_binding_effect(ResolveBindingInput {
+            source,
+            group_id: None,
+        });
+        Ok(Next::Call(resolve.into()))
     }
 
-    fn handle_received_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
-
-        let Some(val) = value else {
-            return self.emit_error(if self.input.version_id.is_some() {
-                HeadObjectError::NoSuchVersion
-            } else {
-                HeadObjectError::NoSuchKey
-            });
-        };
-
-        let version = match BlobVersion::from_bytes(val.as_ref()) {
-            Ok(version) => version,
-            Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
-        };
-
-        let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
-            return self.emit_error(HeadObjectError::HeadObjectFailed);
-        };
-
-        self.read_version(version_id, version, self.input.version_id.is_some())
-    }
-
-    fn current_version_received(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
-
-        let Some(val) = value else {
-            return self.emit_error(HeadObjectError::NoSuchKey);
-        };
-
-        let pointer = match CurrentVersionPointer::from_bytes(val.as_ref()) {
-            Ok(pointer) => pointer,
-            Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
-        };
-
-        let key = match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
-            .to_bytes()
-        {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
-        };
-
-        self.resolved_version_id = Some(pointer.version_id);
-        self.state = HeadObjectState::GetVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn read_version(
-        &mut self,
-        version_id: Ulid,
-        version: BlobVersion,
-        explicit_version_request: bool,
-    ) -> Effects {
-        self.resolved_version_id = Some(version_id);
-        self.metadata = version.metadata.clone();
-
-        match version.state {
-            BlobVersionState::Materialized {
-                blob_hash,
-                backend,
-                encoding,
-                source,
-            } => {
-                let location_key = BlobLocationKey::new(blob_hash, encoding, backend);
-                self.source_binding = source;
-                self.source_metadata = None;
-                self.last_refresh = None;
-                self.version_created_at = Some(version.created_at);
-                self.source_policies = version.placement_policies.clone();
-                if version.placement_policies.is_empty() {
-                    return self.read_blob_location(location_key);
-                }
-                self.check_managed_copy(version_id, location_key)
-            }
-            BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
-                HeadObjectError::DeleteMarker
-            } else {
-                HeadObjectError::NoSuchKey
-            }),
-            BlobVersionState::Reference {
-                source,
-                cached_metadata,
-                last_refresh,
-                ..
-            } => {
-                self.location = None;
-                self.source_metadata = Some(cached_metadata);
-                self.last_refresh = Some(last_refresh);
-                self.version_created_at = None;
-                self.source_policies = version.placement_policies.clone();
-                self.source_binding = Some(source.clone());
-                if source.descriptor.kind == SourceConnectorKind::ArunaNative {
-                    self.commit_reference(source)
-                } else {
-                    self.finish_lookup()
-                }
-            }
-            BlobVersionState::PendingContent { archive, source } => {
-                self.source_binding = source;
-                self.source_metadata = None;
-                self.last_refresh = None;
-                self.version_created_at = Some(version.created_at);
-                self.source_policies = version.placement_policies.clone();
-                if !version.placement_policies.is_empty() {
-                    return self.check_pending_copy(version_id, archive);
-                }
-                self.state = HeadObjectState::GetBlobLocation;
-                smallvec![pending_location_read(&archive, self.txn_id)]
-            }
-        }
-    }
-
-    /// A governed pending archive is described only through this node's registration of it.
-    fn check_pending_copy(&mut self, version_id: Ulid, archive: ArchiveKey) -> Effects {
-        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
-        let copy_key = ManagedCopyKey::new(version, archive.backend.clone());
-        let effect = match serve_reads(&copy_key, self.txn_id) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.pending_copy = Some(copy_key);
-        self.pending_archive = Some(archive);
-        self.state = HeadObjectState::CheckPendingCopy;
-        smallvec![effect]
-    }
-
-    fn handle_pending_copy(&mut self, event: Event) -> Effects {
-        let (Some(copy_key), Some(archive)) =
-            (self.pending_copy.take(), self.pending_archive.take())
-        else {
-            let error = self.lookup_error("a pending registration check", LookupError::Missing);
-            return self.emit_error(error);
-        };
-        if let Err(err) = finish_pending_check(event, &copy_key, &archive, &self.source_policies) {
+    fn access_resolved(&mut self, event: Event) -> HeadTurn {
             let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
             return self.emit_error(error);
         }
