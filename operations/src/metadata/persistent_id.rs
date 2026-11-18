@@ -490,13 +490,7 @@ mod tests {
 
         assert!(fence_open(&ctx, &route).await);
 
-        crate::placement::process_transitions::close(
-            &ctx.storage_handle,
-            &realm(),
-            &route.placement,
-            1,
-        )
-        .await
+        crate::driver::drive(crate::placement::process_transitions::CloseFenceOperation::new(realm(), route.placement, 1), &crate::driver::DriverContext::for_storage(ctx.storage_handle.clone())).await
         .expect("the departing holder closes the fence");
         assert!(!fence_open(&ctx, &route).await);
     }

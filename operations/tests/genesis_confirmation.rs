@@ -17,7 +17,6 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_net::NetHandle;
 use aruna_operations::node::restore_plan::{ShardRestoreCursor, ShardRestorePass};
 use aruna_operations::node::startup::restore_shard_pass;
-use aruna_operations::placement::process_placements::process_shard_placements;
 use irokle::oplog::Oplog;
 use irokle::storage::Storage;
 use irokle::{ReplicationPolicy, TopicGenesis};
@@ -26,6 +25,9 @@ use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use crate::topology::{TestNode, spawn_replica};
+use aruna_operations::driver::drive;
+use aruna_operations::placement::process_placements::ReconcilePlacementsOperation;
+use aruna_operations::placement::process_placements::PlacementReconcileOutcome;
 
 // If the final ensure/create step fails after the topic was selected for ensuring, no pending
 // placement record exists yet.
@@ -41,7 +43,7 @@ async fn ensure_failure_retries() -> Result<(), Box<dyn std::error::Error>> {
     let topic = shard_topic_id(realm_id, &placement);
     seed_wrong_topic(&rank0.net, topic)?;
 
-    let outcome = process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+    let outcome = drive(ReconcilePlacementsOperation::new(realm_id, rank0.net.node_id(), true), &rank0.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
 
     assert!(
         outcome.retry_scheduled,
@@ -69,7 +71,7 @@ async fn peer_allows_genesis() -> Result<(), Box<dyn std::error::Error>> {
         "no genesis exists before the placement reconciler runs"
     );
 
-    process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+    drive(ReconcilePlacementsOperation::new(realm_id, rank0.net.node_id(), true), &rank0.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
 
     assert!(
         rank0.net.sync_topic_exists(topic).unwrap_or(false),
@@ -92,7 +94,7 @@ async fn unreachable_peer_retries() -> Result<(), Box<dyn std::error::Error>> {
     let placement = rank0_shard_of(&config, rank0.net.node_id(), co_holder.net.node_id());
     let topic = shard_topic_id(realm_id, &placement);
 
-    let outcome = process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+    let outcome = drive(ReconcilePlacementsOperation::new(realm_id, rank0.net.node_id(), true), &rank0.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
     assert!(
         !rank0.net.sync_topic_exists(topic).unwrap_or(false),
         "an unreachable co-holder must withhold genesis creation (a fork would be permanent)"
@@ -165,19 +167,19 @@ async fn nonmember_adopts_genesis() -> Result<(), Box<dyn std::error::Error>> {
         "the co-holder must hold the genesis before the probe"
     );
 
-    process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+    drive(ReconcilePlacementsOperation::new(realm_id, rank0.net.node_id(), true), &rank0.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
     assert!(
         !rank0.net.sync_topic_exists(topic).unwrap_or(false),
         "a refused (held-but-not-a-member) probe must withhold creation, not fork a genesis"
     );
 
     // The co-holder's member top-up admits the rank-0 holder.
-    process_shard_placements(&co_holder.context, realm_id, co_holder.net.node_id()).await;
+    drive(ReconcilePlacementsOperation::new(realm_id, co_holder.net.node_id(), true), &co_holder.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
 
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "genesis top-up did not adopt topic",
         || async {
-            process_shard_placements(&rank0.context, realm_id, rank0.net.node_id()).await;
+            drive(ReconcilePlacementsOperation::new(realm_id, rank0.net.node_id(), true), &rank0.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
             Ok(if rank0.net.sync_topic_exists(topic).unwrap_or(false) {
                 0
             } else {
@@ -208,7 +210,7 @@ async fn holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
     config.placement_overrides = pin_rank0_everywhere(&config, incumbents[0].net.node_id());
     write_realm_config(&nodes, realm_id, &config).await?;
     for node in incumbents {
-        process_shard_placements(&node.context, realm_id, node.net.node_id()).await;
+        drive(ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
     }
 
     let newcomer = newcomer_node.net.node_id();
@@ -217,7 +219,7 @@ async fn holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
     // The incumbents' own config-apply pass: it admits the newcomer to every bucket's
     // membership (a local control op), which is all a holder can do for another.
     for node in incumbents {
-        process_shard_placements(&node.context, realm_id, node.net.node_id()).await;
+        drive(ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
     }
 
     let held = member_shard_topics(&config, realm_id, newcomer);
@@ -238,7 +240,7 @@ async fn holder_pulls_topics() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    process_shard_placements(&newcomer_node.context, realm_id, newcomer).await;
+    drive(ReconcilePlacementsOperation::new(realm_id, newcomer, true), &newcomer_node.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
 
     for topic in &held {
         assert!(

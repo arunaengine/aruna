@@ -561,12 +561,7 @@ async fn finish_outage(
             realm_id,
         )
         .await;
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &peer.context,
-            realm_id,
-            peer.net.node_id(),
-        )
-        .await;
+        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, peer.net.node_id(), true), &peer.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
 
     let expected_event = Ulid::from_parts(3, INCIDENT_METADATA_RECORDS as u128);

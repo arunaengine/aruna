@@ -262,12 +262,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
     }
     seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            realm_id,
-            node.net.node_id(),
-        )
-        .await;
+        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }

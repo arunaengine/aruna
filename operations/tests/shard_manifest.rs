@@ -13,11 +13,11 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::shard::assemble_shard_manifest;
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
 use crate::topology::{TestNode, announce_nodes, install_default_config, spawn_replicas};
+use aruna_operations::shard::AssembleManifestOperation;
 
 // A metadata document created on node A must leave a manifest row on the origin AND on the
 // receiver that syncs it.
@@ -68,13 +68,13 @@ async fn manifest_rows_match() -> Result<(), Box<dyn std::error::Error>> {
         "receiver manifest entry did not arrive",
         || async {
             let manifest =
-                assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
+                drive(AssembleManifestOperation::new(realm_id, placement), nodes[1].context.as_ref()).await?;
             Ok(usize::from(!manifest_contains(&manifest, &target)))
         },
     )
     .await?;
-    let receiver = assemble_shard_manifest(nodes[1].context.as_ref(), realm_id, placement).await?;
-    let origin = assemble_shard_manifest(nodes[0].context.as_ref(), realm_id, placement).await?;
+    let receiver = drive(AssembleManifestOperation::new(realm_id, placement), nodes[1].context.as_ref()).await?;
+    let origin = drive(AssembleManifestOperation::new(realm_id, placement), nodes[0].context.as_ref()).await?;
 
     assert!(
         manifest_contains(&origin, &target),

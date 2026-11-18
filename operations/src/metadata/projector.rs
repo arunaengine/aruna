@@ -1411,13 +1411,7 @@ mod tests {
         let config = activated_config(event.record.realm_id, &[node(1), node(2), node(3)]);
         let event = stamped(event, &config);
         store_realm_config(&storage, &config).await;
-        crate::placement::process_transitions::close(
-            &storage,
-            &event.record.realm_id,
-            &event.record.placement,
-            1,
-        )
-        .await
+        crate::driver::drive(crate::placement::process_transitions::CloseFenceOperation::new(event.record.realm_id, event.record.placement, 1), &crate::driver::DriverContext::for_storage(storage.clone())).await
         .expect("the departing holder closes the fence");
         let context = DriverContext {
             storage_handle: storage.clone(),

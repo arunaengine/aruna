@@ -1201,11 +1201,7 @@ async fn install_realm_config(
             }))
             .await;
             let outcomes = join_all(nodes.iter().map(|node| {
-                aruna_operations::placement::process_placements::process_shard_placements(
-                    &node.context,
-                    realm_id,
-                    node.node_id(),
-                )
+                aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             }))
             .await;
             let pending = outcomes
@@ -1313,11 +1309,7 @@ async fn reconcile_nodes(
         async move {
             let started = std::time::Instant::now();
             let outcome = tracing::Instrument::instrument(
-                aruna_operations::placement::process_placements::process_shard_placements(
-                    &node.context,
-                    realm_id,
-                    node.node_id(),
-                ),
+                aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure()),
                 span,
             )
             .await;
@@ -1679,12 +1671,7 @@ pub async fn install_replica_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_operations::placement::process_placements::process_shard_placements(
-                &node.context,
-                *realm_id,
-                node.net.node_id(),
-            )
-            .await
+            retry |= aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {
@@ -1711,12 +1698,7 @@ pub async fn install_default_config(
         store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
     }
     for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
+        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(config)
 }

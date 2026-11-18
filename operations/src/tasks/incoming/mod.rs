@@ -93,7 +93,7 @@ use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::notifications::watch::table::RebuildTableOperation;
-use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
+use crate::placement::process_placements::PlacementReconcileStatus;
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
@@ -115,6 +115,8 @@ use crate::tasks::task_persistence::{
 use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 use crate::forward::realm::RelayAdminOperation;
+use crate::placement::process_placements::ReconcilePlacementsOperation;
+use crate::placement::process_placements::PlacementReconcileOutcome;
 
 mod drained;
 mod outbox;
@@ -790,7 +792,7 @@ impl OperationsTaskHandler {
                 {
                     warn!(error = %error, "Placement subject reconcile failed");
                 }
-                let outcome = process_shard_placements(&self.context, realm_id, node_id).await;
+                let outcome = drive(ReconcilePlacementsOperation::new(realm_id, node_id, true), &self.context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
                 match outcome.status {
                     PlacementReconcileStatus::Clean => self.reset_backoff(&key),
                     PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {

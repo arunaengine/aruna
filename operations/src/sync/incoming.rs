@@ -14,7 +14,6 @@ use crate::node::document_sync::{apply_metadata, run_maintenance};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
-use crate::placement::process_placements::reconcile_shard_topics;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::sync::reconcile::ReconcileTopicsOperation;
@@ -35,6 +34,8 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
+use crate::placement::process_placements::ReconcilePlacementsOperation;
+use crate::placement::process_placements::PlacementReconcileOutcome;
 
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MAINTENANCE_JITTER_SECS: u64 = 15;
@@ -402,7 +403,7 @@ async fn reconcile_inbound_topics(
     if realm_config_changed {
         // Transition-free: a heavy transition step here would stall document
         // application; the reconcile arms the SyncPlacements timer instead.
-        reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
+        drive(ReconcilePlacementsOperation::new(*net_handle.realm_id(), net_handle.node_id(), false), context).await.unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
         let (realm_id, node_id) = (*net_handle.realm_id(), net_handle.node_id());
         let soon = crate::federation::publish::PublishSoonOperation::new(realm_id, node_id);
         if let Err(error) = drive(soon, context).await {
@@ -583,14 +584,11 @@ impl InboundEventHandler for OperationsInboundHandler {
                     .await
                 }
                 Alpn::Shard => {
-                    Box::pin(async {
-                        crate::shard::incoming::handle_shard_stream(
-                            self.context.as_ref(),
-                            stream,
-                            node_id,
-                        )
-                        .await;
-                    })
+                    Box::pin(crate::effect_adapters::shard::serve_stream(
+                        self.context.as_ref(),
+                        stream,
+                        node_id,
+                    ))
                     .await
                 }
                 Alpn::Heartbeat => {
