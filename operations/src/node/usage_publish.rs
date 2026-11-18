@@ -3,17 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::pin::pin;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::operation::Operation;
-use aruna_core::rows::done;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{PrefixPages, done};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, USAGE_GROUP_PREFIX, UsageCounters,
@@ -21,20 +18,36 @@ use aruna_core::structs::storage::usage::{
     usage_group_key, usage_node_id, usage_snapshot_key,
 };
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{GroupId, Key, TxnId, Value};
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
-use futures_util::TryStreamExt;
+use aruna_core::types::{GroupId, Key, Value};
+use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
-use crate::distribution::usage::replica_shares;
-use crate::driver::{DriverContext, drive};
-use crate::node::realm_usage::RealmUsageOperation;
+use crate::distribution::replica_shares::{GroupShare, ReplicaSharesOperation};
+use crate::driver::DriverContext;
+use crate::node::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
 use crate::s3::usage::{
-    LoadCountersError, global_shard_read, global_sum, schedule_snapshot_publish,
+    LoadCountersError, global_shard_rows, global_sum, schedule_snapshot_publish,
 };
-use crate::storage_read::scan_pages;
-use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use crate::sync::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsError, ReplicateDocumentsOperation,
+};
+
+/// Rows one marker or counter scan reads per page.
+const SCAN_PAGE: usize = 1_000;
+const GROUP_COUNTER_PREFIX: &[u8] = b"group/";
+
+#[derive(Debug, Error, PartialEq)]
+pub enum UsagePublishError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error("{0}")]
+    Failed(String),
+}
+
+fn failed(error: impl std::fmt::Display) -> UsagePublishError {
+    UsagePublishError::Failed(error.to_string())
+}
 
 /// Groups/global scope touched by a publish run, so callers can refresh exactly
 /// the affected realm summary cache entries.
@@ -69,167 +82,178 @@ impl PublishedUsage {
     }
 }
 
-async fn read_local_global(
-    storage: &StorageHandle,
-    txn_id: Option<TxnId>,
-) -> Result<UsageCounters, String> {
-    match storage.send_storage_effect(global_shard_read(txn_id)).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            let values = values.into_iter().map(|(_, value)| value);
-            global_sum::<LoadCountersError>(values).map_err(|error| error.to_string())
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected global read event: {}", other.label())),
-    }
+/// The groups and global scope one publish reports.
+#[derive(Debug, Default, PartialEq)]
+struct UsageScope {
+    global: bool,
+    groups: BTreeSet<GroupId>,
 }
 
-async fn read_local_group(
-    storage: &StorageHandle,
-    group_id: GroupId,
-    txn_id: Option<TxnId>,
-) -> Result<UsageCounters, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: Key::from(usage_group_key(group_id)),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Ok(UsageCounters::default())
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected group read event: {}", other.label())),
-    }
-}
-
-/// Rebuilds this node's snapshot documents from live counters and distributes them
-/// over the sync layer: dirty mode refreshes marked groups, full mode all groups plus
-/// the global. Markers clear only after durable replication, never if re-dirtied.
-pub async fn publish_usage_snapshots(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    realm_id: RealmId,
-    full: bool,
-) -> Result<PublishedUsage, String> {
-    let (published, observed_markers) =
-        publish_retaining_markers(ctx, node_id, realm_id, full).await?;
-    clear_consumed_markers(ctx, observed_markers).await?;
-    Ok(published)
-}
-
-async fn publish_retaining_markers(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    realm_id: RealmId,
-    full: bool,
-) -> Result<(PublishedUsage, Vec<(Key, Value)>), String> {
-    let storage = &ctx.storage_handle;
-
-    let dirty_prefix = Some(Key::from(DIRTY_PREFIX.to_vec()));
-    let mut pages = pin!(scan_pages(storage, NODE_STATS_KEYSPACE, dirty_prefix));
-    let mut observed_markers = Vec::new();
-    while let Some(page) = pages.try_next().await? {
-        observed_markers.extend(page);
-    }
-
-    let mut groups: BTreeSet<GroupId> = BTreeSet::new();
-    let mut global = false;
-    for (key, _) in &observed_markers {
-        if key.as_ref() == DIRTY_GLOBAL_KEY {
-            global = true;
-        } else if let Some(group_id) = dirty_group_id(key.as_ref()) {
-            groups.insert(group_id);
-        } else if let Some(group_id) = dirty_share_id(key.as_ref()) {
-            // A share marker the scan saw without its group's marker still needs a publish.
-            groups.insert(group_id);
-        }
-    }
-
-    if full {
-        global = true;
-        let group_prefix = Some(Key::from(b"group/".to_vec()));
-        let mut pages = pin!(scan_pages(storage, USAGE_STATS_KEYSPACE, group_prefix));
-        while let Some(page) = pages.try_next().await? {
-            for (key, _) in page {
-                if let Some(rest) = key.as_ref().strip_prefix(b"group/")
-                    && let Ok(bytes) = <[u8; 16]>::try_from(rest)
-                {
-                    groups.insert(GroupId::from_bytes(bytes));
-                }
-            }
-        }
-        // Republish snapshots missing a live counter as zero so peers stop summing stale data.
-        let usage_prefix = Some(Key::from(USAGE_GROUP_PREFIX.to_vec()));
-        let mut pages = pin!(scan_pages(storage, NODE_STATS_KEYSPACE, usage_prefix));
-        while let Some(page) = pages.try_next().await? {
-            for (key, _) in page {
-                if usage_node_id(key.as_ref()) == Some(node_id)
-                    && let Some(group_id) = usage_group_id(key.as_ref())
-                {
-                    groups.insert(group_id);
-                }
+impl UsageScope {
+    fn add_markers(&mut self, rows: &[(Key, Value)]) {
+        for (key, _) in rows {
+            if key.as_ref() == DIRTY_GLOBAL_KEY {
+                self.global = true;
+            } else if let Some(group_id) = dirty_group_id(key.as_ref()) {
+                self.groups.insert(group_id);
+            } else if let Some(group_id) = dirty_share_id(key.as_ref()) {
+                // A share marker the scan saw without its group's marker still needs a publish.
+                self.groups.insert(group_id);
             }
         }
     }
 
-    if !global && groups.is_empty() {
-        return Ok((PublishedUsage::default(), Vec::new()));
+    fn add_counters(&mut self, rows: &[(Key, Value)]) {
+        for (key, _) in rows {
+            if let Some(rest) = key.as_ref().strip_prefix(GROUP_COUNTER_PREFIX)
+                && let Ok(bytes) = <[u8; 16]>::try_from(rest)
+            {
+                self.groups.insert(GroupId::from_bytes(bytes));
+            }
+        }
     }
 
-    // Counters and replica shares come from one snapshot, as a purge debits both together.
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: true })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("unexpected transaction answer {}", other.label())),
-    };
-    let group_list: Vec<GroupId> = groups.into_iter().collect();
-    let read = async {
-        let shares = replica_shares(ctx, txn_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let counters = if global {
-            read_local_global(storage, Some(txn_id)).await?
-        } else {
-            UsageCounters::default()
+    /// Snapshots missing a live counter republish as zero so peers stop summing stale data.
+    fn add_snapshots(&mut self, rows: &[(Key, Value)], node_id: NodeId) {
+        for (key, _) in rows {
+            if usage_node_id(key.as_ref()) == Some(node_id)
+                && let Some(group_id) = usage_group_id(key.as_ref())
+            {
+                self.groups.insert(group_id);
+            }
+        }
+    }
+}
+
+/// The live counters and replica shares of one publish.
+#[derive(Debug, PartialEq)]
+struct UsageRead {
+    shares: BTreeMap<GroupId, GroupShare>,
+    global: UsageCounters,
+    groups: Vec<UsageCounters>,
+}
+
+/// Reads counters and replica shares from one snapshot, as a purge debits both together.
+#[derive(Debug, PartialEq)]
+struct UsageReadOperation {
+    global: bool,
+    groups: Vec<GroupId>,
+    shares: ReplicaSharesOperation,
+    read: Option<BTreeMap<GroupId, GroupShare>>,
+}
+
+impl UsageReadOperation {
+    fn new(global: bool, groups: Vec<GroupId>) -> Self {
+        Self {
+            global,
+            groups,
+            shares: ReplicaSharesOperation::new(),
+            read: None,
+        }
+    }
+
+    fn share_turn(
+        &mut self,
+        turn: Next<BTreeMap<GroupId, GroupShare>>,
+    ) -> Result<Next<UsageRead>, UsagePublishError> {
+        match turn {
+            Next::Call(call) => Ok(Next::Call(call)),
+            Next::Done(shares) => {
+                self.read = Some(shares);
+                let mut rows = Vec::with_capacity(self.groups.len());
+                if self.global {
+                    rows.extend(global_shard_rows());
+                }
+                rows.extend(self.groups.iter().map(|group_id| {
+                    let key = Key::from(usage_group_key(*group_id));
+                    (USAGE_STATS_KEYSPACE.to_string(), key)
+                }));
+                Ok(Next::Call(IoCall::Read(rows)))
+            }
+            Next::Wait | Next::Then { .. } => Err(IoError::Unfinished.into()),
+        }
+    }
+
+    fn counters(&mut self, values: Vec<Option<Value>>) -> Result<UsageRead, UsagePublishError> {
+        let shares = self.read.take().ok_or(IoError::Unfinished)?;
+        let split = values.len().saturating_sub(self.groups.len());
+        let mut values = values;
+        let group_values = values.split_off(split);
+        let global = match self.global {
+            true => global_sum::<LoadCountersError>(values).map_err(failed)?,
+            false => UsageCounters::default(),
         };
-        let mut group_counters = Vec::with_capacity(group_list.len());
-        for group_id in &group_list {
-            group_counters.push(read_local_group(storage, *group_id, Some(txn_id)).await?);
-        }
-        Ok::<_, String>((shares, counters, group_counters))
+        let groups = (group_values.into_iter())
+            .map(|value| match value {
+                Some(bytes) => UsageCounters::from_bytes(bytes.as_ref()).map_err(failed),
+                None => Ok(UsageCounters::default()),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(UsageRead {
+            shares,
+            global,
+            groups,
+        })
     }
-    .await;
-    storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
-    let (shares, counters, group_counters) = read?;
-    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(group_list.len() + 1);
-    if global {
+}
+
+impl Operation for UsageReadOperation {
+    type Output = UsageRead;
+    type Error = UsagePublishError;
+
+    fn first(&mut self) -> Result<Next<UsageRead>, UsagePublishError> {
+        let turn = self.shares.first().map_err(failed)?;
+        self.share_turn(turn)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<UsageRead>, UsagePublishError> {
+        if self.read.is_some() {
+            return Ok(Next::Done(self.counters(result.values()?)?));
+        }
+        let turn = self.shares.next(result).map_err(failed)?;
+        self.share_turn(turn)
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
+}
+
+/// The snapshot rows of one publish. Each key has a single writer, this node.
+fn snapshot_rows(
+    node_id: NodeId,
+    scope: &PublishedUsage,
+    read: UsageRead,
+) -> Result<Vec<(String, Key, Value)>, UsagePublishError> {
+    let row = |key: Vec<u8>, snapshot: NodeUsageSnapshot| {
+        let bytes = snapshot.to_bytes().map_err(failed)?;
+        Ok::<_, UsagePublishError>((
+            NODE_STATS_KEYSPACE.to_string(),
+            Key::from(key),
+            Value::from(bytes),
+        ))
+    };
+    let UsageRead {
+        shares,
+        global,
+        groups,
+    } = read;
+    let mut writes = Vec::with_capacity(scope.groups.len() + 1);
+    if scope.global {
         let (mut replicas, mut revisions) = (UsageCounters::default(), BTreeMap::new());
         for share in shares.values() {
-            replicas.add(&share.replicas).map_err(|e| e.to_string())?;
+            replicas.add(&share.replicas).map_err(failed)?;
             revisions.extend(&share.revisions);
         }
         let snapshot = NodeUsageSnapshot {
             node_id,
-            counters,
+            counters: global,
             replicas,
             revisions,
         };
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(usage_global_key(node_id)),
-            Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
-        ));
+        writes.push(row(usage_global_key(node_id), snapshot)?);
     }
-    for (group_id, counters) in group_list.iter().zip(group_counters) {
+    for (group_id, counters) in scope.groups.iter().zip(groups) {
         let share = shares.get(group_id).cloned().unwrap_or_default();
         let snapshot = NodeUsageSnapshot {
             node_id,
@@ -237,83 +261,245 @@ async fn publish_retaining_markers(
             replicas: share.replicas,
             revisions: share.revisions,
         };
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(usage_snapshot_key(*group_id, node_id)),
-            Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
-        ));
+        writes.push(row(usage_snapshot_key(*group_id, node_id), snapshot)?);
+    }
+    Ok(writes)
+}
+
+#[derive(Debug, PartialEq)]
+enum PublishStep {
+    Markers,
+    Counters,
+    Snapshots,
+    Read,
+    Write,
+    Replicate,
+    Summary,
+    Clear,
+    /// The retry signal runs; the run then fails with this error.
+    Retry(String),
+}
+
+type PublishTurn = Result<Next<PublishedUsage>, UsagePublishError>;
+
+/// Rebuilds this node's snapshot documents from live counters and distributes them over the sync
+/// layer: dirty mode refreshes marked groups, full mode all groups plus the global. Markers clear
+/// only after durable replication, and with `refresh` after the realm summary too, never if
+/// re-dirtied. A failure after the write marks the scopes so the publish retries.
+#[derive(Debug, PartialEq)]
+pub struct PublishUsageOperation {
+    node_id: NodeId,
+    realm_id: RealmId,
+    /// The realm of this node's net transport, which the summary is computed for.
+    serving_realm: Option<RealmId>,
+    full: bool,
+    refresh: bool,
+    retry_generation: Ulid,
+    pages: PrefixPages,
+    observed: Vec<(Key, Value)>,
+    scope: UsageScope,
+    published: PublishedUsage,
+    step: PublishStep,
+}
+
+impl PublishUsageOperation {
+    pub fn new(
+        context: &DriverContext,
+        (node_id, realm_id): (NodeId, RealmId),
+        full: bool,
+        refresh: bool,
+    ) -> Self {
+        let serving_realm = context.node_and_realm().map(|(_, realm_id)| realm_id);
+        Self::with_generation(
+            (node_id, realm_id),
+            serving_realm,
+            full,
+            refresh,
+            Ulid::generate(),
+        )
     }
 
-    // Persist the refreshed snapshots but keep the dirty markers until the
-    // documents have been durably handed to replication.
-    write_snapshot_documents(storage, writes).await?;
-
-    let published = PublishedUsage {
-        global,
-        groups: group_list,
-    };
-    let targets = published.targets(realm_id, node_id);
-    if let Err(error) = drive(
-        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+    fn with_generation(
+        (node_id, realm_id): (NodeId, RealmId),
+        serving_realm: Option<RealmId>,
+        full: bool,
+        refresh: bool,
+        retry_generation: Ulid,
+    ) -> Self {
+        Self {
+            node_id,
             realm_id,
-            local_node_id: node_id,
+            serving_realm,
+            full,
+            refresh,
+            retry_generation,
+            pages: marker_pages(),
+            observed: Vec::new(),
+            scope: UsageScope::default(),
+            published: PublishedUsage::default(),
+            step: PublishStep::Markers,
+        }
+    }
+
+    fn scan(&mut self, step: PublishStep, pages: PrefixPages) -> PublishTurn {
+        self.step = step;
+        self.pages = pages;
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    /// Reads the live values once the scope is known; nothing to report ends the run.
+    fn read_scope(&mut self) -> PublishTurn {
+        let scope = std::mem::take(&mut self.scope);
+        self.published = PublishedUsage {
+            global: scope.global,
+            groups: scope.groups.into_iter().collect(),
+        };
+        if self.published.is_empty() {
+            self.observed.clear();
+            return Ok(Next::Done(PublishedUsage::default()));
+        }
+        self.step = PublishStep::Read;
+        let read = UsageReadOperation::new(self.published.global, self.published.groups.clone());
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn replicate(&mut self) -> PublishTurn {
+        self.step = PublishStep::Replicate;
+        let replicate = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id: self.realm_id,
+            local_node_id: self.node_id,
             excluded_peers: Vec::new(),
-            documents: targets,
+            documents: self.published.targets(self.realm_id, self.node_id),
             // Steady-state publishers must not mint the shared node-usage
             // genesis; bootstrap/placement-origin paths do that authoritatively.
             allow_genesis: false,
-        }),
-        ctx,
-    )
-    .await
-    .map_err(|error| format!("node usage snapshot replication failed: {error}"))
-    {
-        if let Err(retry_error) = signal_snapshot_retry(ctx, &published, &observed_markers).await {
-            return Err(format!(
-                "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
-            ));
-        }
-        return Err(error);
+        });
+        Ok(Next::Call(IoCall::child(replicate)))
     }
 
-    Ok((published, observed_markers))
-}
-
-pub async fn publish_refresh_snapshots(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    realm_id: RealmId,
-    full: bool,
-) -> Result<PublishedUsage, String> {
-    let (published, observed_markers) =
-        publish_retaining_markers(ctx, node_id, realm_id, full).await?;
-    if !published.is_empty()
-        && let Err(error) =
-            recompute_summary(ctx, node_id, published.global, published.groups.clone()).await
-    {
-        if let Err(retry_error) = signal_snapshot_retry(ctx, &published, &observed_markers).await {
-            return Err(format!(
-                "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
-            ));
+    fn after_replication(&mut self) -> PublishTurn {
+        if !self.refresh {
+            return self.clear();
         }
-        return Err(error);
+        self.step = PublishStep::Summary;
+        let summary = RealmUsageOperation::summary(
+            self.node_id,
+            self.serving_realm,
+            self.published.global,
+            self.published.groups.clone(),
+        );
+        Ok(Next::Call(IoCall::child(summary)))
     }
-    // Replication and summary refresh both succeeded; only now consume the
-    // markers, and only those a concurrent write did not re-dirty meanwhile.
-    clear_consumed_markers(ctx, observed_markers).await?;
-    Ok(published)
+
+    /// Replication, and a refresh's summary, succeeded: only now the markers are consumed.
+    fn clear(&mut self) -> PublishTurn {
+        self.step = PublishStep::Clear;
+        let observed = std::mem::take(&mut self.observed);
+        Ok(Next::Call(IoCall::child(ClearMarkersOperation::new(
+            observed,
+        ))))
+    }
+
+    fn retry(&mut self, error: String) -> PublishTurn {
+        let generation = Value::from(self.retry_generation.to_bytes().to_vec());
+        let markers = retry_markers(&self.published, &self.observed, generation);
+        self.step = PublishStep::Retry(error);
+        Ok(Next::Call(IoCall::child(RetrySignalOperation::new(
+            markers,
+        ))))
+    }
 }
 
-async fn signal_snapshot_retry(
-    ctx: &DriverContext,
-    published: &PublishedUsage,
-    observed_markers: &[(Key, Value)],
-) -> Result<(), String> {
-    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
-    let markers = retry_markers(published, observed_markers, generation);
-    drive(RetrySignalOperation::new(markers), ctx)
-        .await
-        .map_err(|error| format!("retry marker write failed: {error}"))
+fn marker_pages() -> PrefixPages {
+    PrefixPages::new(NODE_STATS_KEYSPACE, DIRTY_PREFIX.to_vec(), SCAN_PAGE)
+}
+
+impl Operation for PublishUsageOperation {
+    type Output = PublishedUsage;
+    type Error = UsagePublishError;
+
+    fn first(&mut self) -> PublishTurn {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn {
+        match std::mem::replace(&mut self.step, PublishStep::Read) {
+            PublishStep::Markers => {
+                let rows = self.pages.take(result)?;
+                self.scope.add_markers(&rows);
+                self.observed.extend(rows);
+                if !self.pages.done() {
+                    self.step = PublishStep::Markers;
+                    return Ok(Next::Call(self.pages.call()));
+                }
+                if !self.full {
+                    return self.read_scope();
+                }
+                self.scope.global = true;
+                let pages = PrefixPages::new(
+                    USAGE_STATS_KEYSPACE,
+                    GROUP_COUNTER_PREFIX.to_vec(),
+                    SCAN_PAGE,
+                );
+                self.scan(PublishStep::Counters, pages)
+            }
+            PublishStep::Counters => {
+                let rows = self.pages.take(result)?;
+                self.scope.add_counters(&rows);
+                if !self.pages.done() {
+                    self.step = PublishStep::Counters;
+                    return Ok(Next::Call(self.pages.call()));
+                }
+                let pages =
+                    PrefixPages::new(NODE_STATS_KEYSPACE, USAGE_GROUP_PREFIX.to_vec(), SCAN_PAGE);
+                self.scan(PublishStep::Snapshots, pages)
+            }
+            PublishStep::Snapshots => {
+                let rows = self.pages.take(result)?;
+                self.scope.add_snapshots(&rows, self.node_id);
+                if !self.pages.done() {
+                    self.step = PublishStep::Snapshots;
+                    return Ok(Next::Call(self.pages.call()));
+                }
+                self.read_scope()
+            }
+            PublishStep::Read => {
+                let read = result.child::<UsageRead, UsagePublishError>()??;
+                // Persisted now, while the markers stay until replication accepted the documents.
+                let writes = snapshot_rows(self.node_id, &self.published, read)?;
+                self.step = PublishStep::Write;
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
+            PublishStep::Write => {
+                done(result).map_err(|error| failed(format!("snapshot write failed: {error}")))?;
+                self.replicate()
+            }
+            PublishStep::Replicate => match result.child::<(), ReplicateDocumentsError>()? {
+                Ok(()) => self.after_replication(),
+                Err(error) => {
+                    self.retry(format!("node usage snapshot replication failed: {error}"))
+                }
+            },
+            PublishStep::Summary => match result.child::<Vec<RealmUsage>, RealmUsageError>()? {
+                Ok(_) => self.clear(),
+                Err(error) => self.retry(error.to_string()),
+            },
+            PublishStep::Clear => match result.child::<(), IoError>()? {
+                // A lost conflict means a counter update re-dirtied a marker, which stays.
+                Ok(()) | Err(IoError::Conflict) => {
+                    Ok(Next::Done(std::mem::take(&mut self.published)))
+                }
+                Err(error) => Err(failed(format!("marker cleanup failed: {error}"))),
+            },
+            PublishStep::Retry(error) => match result.child::<(), IoError>()? {
+                Ok(()) => Err(UsagePublishError::Failed(error)),
+                Err(retry) => Err(failed(format!(
+                    "{error}; additionally failed to mark usage snapshot retry: \
+                     retry marker write failed: {retry}"
+                ))),
+            },
+        }
+    }
 }
 
 /// Marker rows for the published scopes a concurrent write did not mark already, so the next
@@ -402,39 +588,17 @@ impl Operation for RetrySignalOperation {
     }
 }
 
-/// Persists the refreshed snapshot documents. Each snapshot key has a single
-/// writer (this node), so a plain batch write is enough.
-async fn write_snapshot_documents(
-    storage: &StorageHandle,
-    writes: Vec<(String, Key, Value)>,
-) -> Result<(), String> {
-    if writes.is_empty() {
-        return Ok(());
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("snapshot write failed: {}", other.label())),
-    }
-}
-
 /// Deletes each observed dirty marker only if its stored generation still matches the one seen
 /// at publish start. The re-read runs in the deleting transaction, so a racing counter update
 /// makes the commit conflict and its retry signal is never lost.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ClearMarkersOperation {
+pub struct ClearMarkersOperation {
     observed: Vec<(Key, Value)>,
     deleting: bool,
 }
 
 impl ClearMarkersOperation {
-    pub(crate) fn new(observed: Vec<(Key, Value)>) -> Self {
+    pub fn new(observed: Vec<(Key, Value)>) -> Self {
         Self {
             observed,
             deleting: false,
@@ -477,71 +641,176 @@ impl Operation for ClearMarkersOperation {
     }
 }
 
-/// Runs [`ClearMarkersOperation`]; a lost commit conflict keeps every marker for the next run.
-pub(crate) async fn clear_consumed_markers(
-    ctx: &DriverContext,
-    observed: Vec<(Key, Value)>,
-) -> Result<(), String> {
-    match drive(ClearMarkersOperation::new(observed), ctx).await {
-        Ok(()) | Err(IoError::Conflict) => Ok(()),
-        Err(error) => Err(format!("marker cleanup failed: {error}")),
-    }
-}
-
-/// Re-arms the debounced publish task when dirty markers survived a restart.
-pub(crate) async fn restore_usage_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let has_markers = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: NODE_STATS_KEYSPACE.to_string(),
-            prefix: Some(Key::from(DIRTY_PREFIX.to_vec())),
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to scan node usage dirty markers");
-            return;
-        }
-        other => {
-            warn!(
-                event = other.label(),
-                "Unexpected event while scanning node usage dirty markers"
-            );
-            return;
-        }
-    };
-    if has_markers
-        && let Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(schedule_snapshot_publish()).await
-    {
-        warn!(message = %message, "Failed to restore node usage publish timer");
-    }
-}
-
-/// Recomputes the persisted realm summary cache for the global total and the given groups.
-async fn recompute_summary(
-    ctx: &DriverContext,
-    local_node_id: NodeId,
-    include_global: bool,
-    groups: Vec<GroupId>,
-) -> Result<(), String> {
-    let realm_id = ctx.node_and_realm().map(|(_, realm_id)| realm_id);
-    let summary = RealmUsageOperation::summary(local_node_id, realm_id, include_global, groups);
-    drive(summary, ctx)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn marker(seed: u8) -> (Key, Value) {
         (Key::from(vec![b'd', seed]), Value::from(vec![seed]))
+    }
+
+    const REALM: RealmId = RealmId([4; 32]);
+    const GROUP: GroupId = Ulid::from_parts(9, 9);
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1; 32]).public()
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+    }
+
+    fn publish(full: bool, refresh: bool) -> PublishUsageOperation {
+        let generation = Ulid::from_parts(1, 1);
+        PublishUsageOperation::with_generation((node(), REALM), None, full, refresh, generation)
+    }
+
+    fn dirty_group() -> (Key, Value) {
+        (Key::from(dirty_group_key(GROUP)), Value::from(vec![1]))
+    }
+
+    fn page(rows: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Page { rows, next: None }
+    }
+
+    fn read_result() -> UsageRead {
+        UsageRead {
+            shares: BTreeMap::new(),
+            global: UsageCounters::default(),
+            groups: vec![UsageCounters::default()],
+        }
+    }
+
+    fn published() -> PublishedUsage {
+        PublishedUsage {
+            global: false,
+            groups: vec![GROUP],
+        }
+    }
+
+    /// A publish standing at its replication step after reading and writing one group.
+    fn replicating(refresh: bool) -> PublishUsageOperation {
+        let mut operation = publish(false, refresh);
+        operation.first().unwrap();
+        operation.next(page(vec![dirty_group()])).unwrap();
+        operation
+            .next(child::<_, UsagePublishError>(Ok(read_result())))
+            .unwrap();
+        operation.next(IoResult::Done).unwrap();
+        operation
+    }
+
+    #[test]
+    fn nothing_dirty_ends() {
+        let mut operation = publish(false, false);
+        assert_eq!(operation.first(), Ok(Next::Call(marker_pages().call())));
+        let answer = operation.next(page(Vec::new()));
+        assert_eq!(answer, Ok(Next::Done(PublishedUsage::default())));
+    }
+
+    #[test]
+    fn publishes_dirty_group() {
+        let mut operation = publish(false, false);
+        operation.first().unwrap();
+        let read = IoCall::child(UsageReadOperation::new(false, vec![GROUP]));
+        assert_eq!(
+            operation.next(page(vec![dirty_group()])),
+            Ok(Next::Call(read))
+        );
+        let answer = operation.next(child::<_, UsagePublishError>(Ok(read_result())));
+        assert!(matches!(answer, Ok(Next::Call(IoCall::Write(rows))) if rows.len() == 1));
+        let answer = operation.next(IoResult::Done);
+        assert!(matches!(answer, Ok(Next::Call(IoCall::Child(_)))));
+        let clear = IoCall::child(ClearMarkersOperation::new(vec![dirty_group()]));
+        let answer = operation.next(child::<(), ReplicateDocumentsError>(Ok(())));
+        assert_eq!(answer, Ok(Next::Call(clear)));
+        // A lost conflict leaves the re-dirtied marker for the next run.
+        let answer = operation.next(child::<(), _>(Err(IoError::Conflict)));
+        assert_eq!(answer, Ok(Next::Done(published())));
+    }
+
+    #[test]
+    fn full_scans_counters() {
+        let mut operation = publish(true, false);
+        operation.first().unwrap();
+        let counters = PrefixPages::new(
+            USAGE_STATS_KEYSPACE,
+            GROUP_COUNTER_PREFIX.to_vec(),
+            SCAN_PAGE,
+        );
+        let answer = operation.next(page(Vec::new()));
+        assert_eq!(answer, Ok(Next::Call(counters.call())));
+        let key = [GROUP_COUNTER_PREFIX, &GROUP.to_bytes()].concat();
+        let row = (Key::from(key), Value::from(vec![0]));
+        let snapshots =
+            PrefixPages::new(NODE_STATS_KEYSPACE, USAGE_GROUP_PREFIX.to_vec(), SCAN_PAGE);
+        let answer = operation.next(page(vec![row]));
+        assert_eq!(answer, Ok(Next::Call(snapshots.call())));
+        let read = IoCall::child(UsageReadOperation::new(true, vec![GROUP]));
+        assert_eq!(operation.next(page(Vec::new())), Ok(Next::Call(read)));
+    }
+
+    #[test]
+    fn failed_replication_retries() {
+        let mut operation = replicating(false);
+        let failed = child::<(), _>(Err(ReplicateDocumentsError::ConfigMissing));
+        let generation = Value::from(Ulid::from_parts(1, 1).to_bytes().to_vec());
+        // The observed group marker already carries the retry, so none is written again.
+        let markers = retry_markers(&published(), &[dirty_group()], generation);
+        let signal = IoCall::child(RetrySignalOperation::new(markers));
+        assert_eq!(operation.next(failed), Ok(Next::Call(signal)));
+        let answer = operation.next(child::<(), IoError>(Ok(())));
+        let message = "node usage snapshot replication failed: realm config document not found";
+        assert_eq!(answer, Err(UsagePublishError::Failed(message.to_string())));
+    }
+
+    #[test]
+    fn refresh_updates_summary() {
+        let mut operation = replicating(true);
+        let summary = RealmUsageOperation::summary(node(), None, false, vec![GROUP]);
+        let answer = operation.next(child::<(), ReplicateDocumentsError>(Ok(())));
+        assert_eq!(answer, Ok(Next::Call(IoCall::child(summary))));
+        let clear = IoCall::child(ClearMarkersOperation::new(vec![dirty_group()]));
+        let answer = operation.next(child::<_, RealmUsageError>(Ok(Vec::<RealmUsage>::new())));
+        assert_eq!(answer, Ok(Next::Call(clear)));
+    }
+
+    #[test]
+    fn reads_shares_then_counters() {
+        let mut read = UsageReadOperation::new(false, vec![GROUP]);
+        assert_eq!(read.transaction(), TransactionMode::ReadSnapshot);
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let rows = vec![(
+            USAGE_STATS_KEYSPACE.to_string(),
+            Key::from(usage_group_key(GROUP)),
+        )];
+        assert_eq!(
+            read.next(page(Vec::new())),
+            Ok(Next::Call(IoCall::Read(rows)))
+        );
+        let answer = read.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Ok(Next::Done(read_result())));
+    }
+
+    #[test]
+    fn snapshots_name_scopes() {
+        let scope = PublishedUsage {
+            global: true,
+            groups: vec![GROUP],
+        };
+        let read = UsageRead {
+            shares: BTreeMap::new(),
+            global: UsageCounters::default(),
+            groups: vec![UsageCounters::default()],
+        };
+        let rows = snapshot_rows(node(), &scope, read).unwrap();
+        let keys: Vec<_> = rows.iter().map(|(_, key, _)| key.to_vec()).collect();
+        let expected = vec![usage_global_key(node()), usage_snapshot_key(GROUP, node())];
+        assert_eq!(keys, expected);
     }
 
     #[test]

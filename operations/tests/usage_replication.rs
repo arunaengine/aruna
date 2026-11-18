@@ -18,7 +18,7 @@ use aruna_core::structs::storage::usage::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
-use aruna_operations::node::usage_publish::publish_usage_snapshots;
+use aruna_operations::node::usage_publish::{PublishUsageOperation, PublishedUsage, UsagePublishError};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
@@ -433,4 +433,14 @@ async fn realm_usage(
     let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
     let mut totals = drive(RealmUsageOperation::new(node_id, realm_id, scope), context).await?;
     Ok(totals.pop().expect("one scope gives one total"))
+}
+
+async fn publish_usage_snapshots(
+    context: &DriverContext,
+    node_id: NodeId,
+    realm_id: RealmId,
+    full: bool,
+) -> Result<PublishedUsage, UsagePublishError> {
+    let publish = PublishUsageOperation::new(context, (node_id, realm_id), full, false);
+    drive(publish, context).await
 }
