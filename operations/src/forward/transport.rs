@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::delete_document::DeleteDocumentError;
@@ -10,9 +9,7 @@ use crate::metadata::handle::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::UpdateDocumentError;
-use aruna_core::NodeId;
 use aruna_core::calls::IoError;
-use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
 
 /// Why a request forwarded to peers ended without being accepted.
@@ -42,11 +39,6 @@ impl From<ForwardError> for MetadataApiError {
     }
 }
 
-/// This node's id and serving realm, when it has a network.
-pub(crate) fn local_identity(context: &DriverContext) -> Option<(NodeId, RealmId)> {
-    let net = context.net_handle.as_ref()?;
-    Some((net.node_id(), *net.realm_id()))
-}
 
 #[derive(Debug, Error)]
 pub enum MetadataWriteError {
