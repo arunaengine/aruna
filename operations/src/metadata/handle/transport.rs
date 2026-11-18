@@ -641,33 +641,6 @@ impl MetadataHandle {
         result
     }
 
-    pub(crate) async fn request_document_query(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        config_digest: [u8; 32],
-        document_id: Ulid,
-        sparql: String,
-    ) -> Result<MetadataQueryResults, MetadataReadError> {
-        match send_remote_request(
-            &self.inner,
-            &Span::current(),
-            node_id,
-            MetadataTransportMessage::QueryDocument {
-                auth_token,
-                config_digest,
-                document_id,
-                sparql,
-            },
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::DocumentQueryResults { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
     #[tracing::instrument(
         name = "metadata.search.remote",
         level = "debug",

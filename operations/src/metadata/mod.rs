@@ -111,7 +111,5 @@ pub use handle::{
     list_cached_records, query_authorized_local, search_authorized_local, send_metadata_effect,
     warm_caches,
 };
-pub(crate) use handle::{
-    export_summary_jsonld, list_group_records, search_local_filtered, transport_message_kind,
-};
+pub(crate) use handle::{export_summary_jsonld, search_local_filtered, transport_message_kind};
 pub use protocol::{MetadataPathWinner, MetadataReadError, PersistentIdResolution};

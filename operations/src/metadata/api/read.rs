@@ -4,26 +4,22 @@
 
 use super::preflight::{reference_document_title, resolve_graph_reference};
 use super::read_types::{
-    ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
-    MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
+    MetadataQueryExecution, MetadataQueryRequest, MetadataReferenceEntry,
+    MetadataReferencesExecution, MetadataReferencesRequest,
 };
 use super::{
-    AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
-    DISTRIBUTED_QUERY_DEADLINE, Event, GroupId, ListGroupOperation, MetadataApiError,
-    MetadataFanoutScope, MetadataFanoutStats, MetadataQueryResults, MetadataReadError,
-    MetadataRegistryRecord, NodeId, Permission, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT,
-    REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect, StorageEvent, StorageReadError, TxnId, Ulid,
-    check_policy_limit, map_query_error, merge_pending_records, query_fingerprint,
-    replica_query_nodes, warn,
+    AuthContext, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
+    DISTRIBUTED_QUERY_DEADLINE, Event, GroupId, MetadataApiError, MetadataFanoutScope,
+    MetadataRegistryRecord, NodeId, Permission, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, RealmId,
+    StorageEffect, StorageEvent, StorageReadError, TxnId, Ulid, query_fingerprint,
 };
 use crate::driver::{DriverContext, drive};
-use crate::metadata::record_reads::{DocumentRecordOperation, RecordMaterializedOperation};
+use crate::metadata::record_reads::DocumentRecordOperation;
 
 use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
 use crate::auth::enforcement::EnforcePolicyOperation;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::document_repository::GetConfigOperation;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 
@@ -193,20 +189,6 @@ pub(crate) async fn load_live_record(
             .next()
             .ok_or(MetadataApiError::NotFound),
         Ok(None) => Err(MetadataApiError::NotFound),
-        Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
-        Err(StorageReadError::Conversion(error)) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-    }
-}
-
-pub(super) async fn ensure_record_materialized(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-) -> Result<(), MetadataApiError> {
-    match drive(RecordMaterializedOperation::new(record), context).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(MetadataApiError::ServiceUnavailable),
         Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
         Err(StorageReadError::Conversion(error)) => {
             Err(MetadataApiError::Internal(error.to_string()))

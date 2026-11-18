@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::document_repository::GetConfigOperation;
 use crate::device::replica::ReplicaRecord;
 use crate::device::replica_store::read_replica;
 use crate::device::selection::keep_read;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::VisibleRecordOperation;
@@ -94,7 +94,10 @@ pub(super) async fn device_replica(
     if local_node.is_none_or(|node| is_sync_eligible(config, node)) {
         return None;
     }
-    drive(read_replica(document_id), context).await.ok().flatten()
+    drive(read_replica(document_id), context)
+        .await
+        .ok()
+        .flatten()
         .filter(ReplicaRecord::serves_reads)
 }
 

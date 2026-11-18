@@ -37,7 +37,6 @@ use crate::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_ver
 use crate::driver::{DriverContext, drive_until};
 
 const PAGE_SIZE: usize = 256;
-const BATCH_SIZE: usize = 256;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const SCHEMA_BASES: [&str; 2] = ["http://schema.org/", "https://schema.org/"];
 
@@ -181,68 +180,6 @@ pub(crate) async fn document_rows(
         }
     }
     Ok(keys)
-}
-
-/// Deletes every posting of the given documents, for documents that were deleted.
-pub(crate) async fn delete_documents(
-    storage: &StorageHandle,
-    document_ids: &BTreeSet<Ulid>,
-) -> Result<(), DataLinkError> {
-    let mut deletes = Vec::new();
-    for document_id in document_ids {
-        for key in document_rows(storage, DOCUMENT_LINK_KEYSPACE, *document_id).await? {
-            deletes.push((
-                DOCUMENT_LINK_KEYSPACE.to_string(),
-                ByteView::from(document_key(*document_id, &key)),
-            ));
-            deletes.push((DATA_LINK_KEYSPACE.to_string(), ByteView::from(key)));
-        }
-    }
-    apply_rows(
-        storage,
-        LinkRows {
-            writes: Vec::new(),
-            deletes,
-        },
-    )
-    .await
-}
-
-/// Writes and deletes rows outside a transaction, for rebuilds and pruning.
-pub(crate) async fn apply_rows(
-    storage: &StorageHandle,
-    rows: LinkRows,
-) -> Result<(), DataLinkError> {
-    for chunk in rows.writes.chunks(BATCH_SIZE) {
-        expect_ok(
-            storage
-                .send_storage_effect(StorageEffect::BatchWrite {
-                    writes: chunk.to_vec(),
-                    txn_id: None,
-                })
-                .await,
-        )?;
-    }
-    for chunk in rows.deletes.chunks(BATCH_SIZE) {
-        expect_ok(
-            storage
-                .send_storage_effect(StorageEffect::BatchDelete {
-                    deletes: chunk.to_vec(),
-                    txn_id: None,
-                })
-                .await,
-        )?;
-    }
-    Ok(())
-}
-
-fn expect_ok(event: Event) -> Result<(), DataLinkError> {
-    match event {
-        Event::Storage(StorageEvent::BatchWriteResult { .. })
-        | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
-    }
 }
 
 pub(crate) async fn iter_page(
@@ -485,7 +422,14 @@ pub(crate) async fn retry_unverified(context: &DriverContext) -> Result<bool, Da
             Some(set_id) => Some(Some(*set_id)),
             None => {
                 let deadline = Instant::now() + RESOLVE_BUDGET;
-                match resolved(drive_until(resolve_version(context, version_id, deadline), context, deadline).await) {
+                match resolved(
+                    drive_until(
+                        resolve_version(context, version_id, deadline),
+                        context,
+                        deadline,
+                    )
+                    .await,
+                ) {
                     GlobalResolution::Found(found) => Some(Some(found.set_id)),
                     GlobalResolution::NotFound => Some(None),
                     GlobalResolution::Unavailable | GlobalResolution::Ambiguous => None,
@@ -746,4 +690,4 @@ pub(crate) async fn unsettled_documents(
 
 #[cfg(test)]
 #[path = "data_links_tests.rs"]
-mod tests;
+pub(super) mod tests;

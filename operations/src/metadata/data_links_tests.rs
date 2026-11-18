@@ -90,6 +90,30 @@ fn descriptor_names_root() {
     assert!(links[&DataLink::parse(&folder).unwrap()].part);
 }
 
+/// Writes and deletes rows outside a transaction, as fixtures.
+pub(crate) async fn apply_rows(
+    storage: &StorageHandle,
+    rows: LinkRows,
+) -> Result<(), DataLinkError> {
+    let writes = StorageEffect::BatchWrite {
+        writes: rows.writes,
+        txn_id: None,
+    };
+    let deletes = StorageEffect::BatchDelete {
+        deletes: rows.deletes,
+        txn_id: None,
+    };
+    for effect in [writes, deletes] {
+        match storage.send_storage_effect(effect).await {
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+            | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => return Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
+        }
+    }
+    Ok(())
+}
+
 async fn stored(rows: LinkRows, storage: &StorageHandle) {
     apply_rows(storage, rows).await.unwrap();
 }
@@ -189,38 +213,6 @@ async fn budget_marks_incomplete() {
         .unwrap();
     assert!(!complete);
     assert_eq!(links.len(), 2);
-}
-
-#[tokio::test]
-async fn deletion_leaves_nothing() {
-    let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let document = Ulid::from_bytes([7; 16]);
-    let links = project_links(
-        GRAPH,
-        Ulid::nil(),
-        &[triple(GRAPH, HAS_PART, &set_url("a/"))],
-    );
-    stored(
-        plan_link_rows(&storage, document, &links).await.unwrap(),
-        &storage,
-    )
-    .await;
-    delete_documents(&storage, &BTreeSet::from([document]))
-        .await
-        .unwrap();
-    assert!(
-        document_rows(&storage, DOCUMENT_LINK_KEYSPACE, document)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let mut budget = budget();
-    let key = DataLink::parse(&set_url("a/")).unwrap().key();
-    let (postings, _) = read_postings(&storage, &key, None, 10, &mut budget)
-        .await
-        .unwrap();
-    assert!(postings.is_empty());
 }
 
 #[tokio::test]
