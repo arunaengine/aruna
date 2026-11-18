@@ -39,17 +39,14 @@ use super::store::attempt::{CancelRequestOutcome, read_crate_status, set_cancel_
 use super::store::key_wait::read_key_waits;
 use super::store::state::{read_artifact_tombstone, read_job_record};
 use super::store::{JobMutationError, RunDelete, delete_finished_run};
-use super::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
-    schedule_drain_effect,
-};
-use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, mint_unplaced};
+use super::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec, schedule_drain_effect};
+use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
 use super::submit_local::{MintJobOperation, QueueJobOperation, SubmitLocalOperation};
 use super::workflow::finalize::finalize_followups;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive, drive_retry};
+use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
 use crate::metadata::record_reads::load_document_record;
