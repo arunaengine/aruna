@@ -41,7 +41,7 @@ use crate::forward::transport::reject;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
-use crate::s3::bucket::release::publish::{PublishError, holder_answer};
+use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
 use crate::s3::bucket::search::SearchBucketsInput;
 use crate::s3::object::search::SearchObjectsInput;
 use crate::s3::object::search_scan::SearchObjectsOperation;
@@ -605,7 +605,8 @@ impl MetadataHandle {
                     let net_handle =
                         (self.inner.net_handle.as_ref()).ok_or(MetadataReadError::Unavailable)?;
                     let scope = (*net_handle.realm_id(), net_handle.node_id());
-                    holder_answer(context.as_ref(), scope, &auth, (bucket.as_str(), ask))
+                    let answer = HolderAnswerOperation::new(scope, &auth, (bucket.as_str(), ask));
+                    crate::driver::drive(answer, context.as_ref())
                         .await
                         .map_err(|error| match error {
                             PublishError::Forbidden(_) => MetadataReadError::Forbidden,
@@ -1009,8 +1010,9 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardNewBucket { .. }) => {
                 Box::pin(async {
                     let local = context.node_and_realm();
-                    let answer =
-                        crate::s3::bucket::forward::BucketForwardOperation::new(local, peer, bucket);
+                    let answer = crate::s3::bucket::forward::BucketForwardOperation::new(
+                        local, peer, bucket,
+                    );
                     crate::driver::drive(answer, context)
                         .await
                         .unwrap_or_else(|error| {

@@ -57,7 +57,7 @@ use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
 use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
-use aruna_operations::s3::bucket::release::read::release_members;
+use aruna_operations::s3::bucket::release::access::MembersCheckOperation;
 use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 
 /// How long an origin read directed at another node may take, body included.
@@ -490,7 +490,9 @@ async fn origin_answer(
         }
         let route = drive(route_read(binding, &params.key, false), context.as_ref()).await;
         if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
-            let mut holders = drive(key_holders(binding.set_id, &params.key), context.as_ref()).await.unwrap_or_default();
+            let mut holders = drive(key_holders(binding.set_id, &params.key), context.as_ref())
+                .await
+                .unwrap_or_default();
             holders.retain(|holder| *holder != state.get_node_id());
             holders.push(node_id);
             let target = (binding.set_id, range_id, node_id);
@@ -504,7 +506,11 @@ async fn origin_answer(
         && headers.contains_key(RELAY_HOP_HEADER)
         && !headers.contains_key(COPY_READ_HEADER)
     {
-        let coordinator = drive(read_coordinator(binding, &params.key), state.get_ctx().as_ref()).await;
+        let coordinator = drive(
+            read_coordinator(binding, &params.key),
+            state.get_ctx().as_ref(),
+        )
+        .await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
             return Err(map_guard_error(GuardError::NotCoordinator {
                 set_id: binding.set_id,
@@ -528,7 +534,11 @@ async fn origin_answer(
     if let (Err(OriginError::VersionMissing), Some(binding), None) =
         (&view, info.distribution.as_ref(), stale)
     {
-        let coordinator = drive(read_coordinator(binding, &params.key), state.get_ctx().as_ref()).await;
+        let coordinator = drive(
+            read_coordinator(binding, &params.key),
+            state.get_ctx().as_ref(),
+        )
+        .await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
             && !headers.contains_key(RELAY_HOP_HEADER)
         {
@@ -575,7 +585,12 @@ async fn origin_answer(
         key: params.key.clone(),
         version_id,
     }];
-    match release_members(state.get_ctx().as_ref(), scope, caller, &query).await {
+    match drive(
+        MembersCheckOperation::new(scope, caller, &query),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    {
         Ok(mut found) => {
             let members = found.answers.remove(0);
             answer.releases = members.releases.into_iter().map(Into::into).collect();
@@ -723,7 +738,14 @@ async fn global_origin(
     version_id: Ulid,
 ) -> ServerResult<Json<OriginResponse>> {
     let deadline = tokio::time::Instant::now() + RESOLVE_BUDGET;
-    let found = match resolved(drive_until(resolve_version(state.get_ctx().as_ref(), version_id, deadline), state.get_ctx().as_ref(), deadline).await) {
+    let found = match resolved(
+        drive_until(
+            resolve_version(state.get_ctx().as_ref(), version_id, deadline),
+            state.get_ctx().as_ref(),
+            deadline,
+        )
+        .await,
+    ) {
         GlobalResolution::Found(found) => found,
         GlobalResolution::NotFound => return Err(ServerError::NotFound),
         GlobalResolution::Unavailable => {

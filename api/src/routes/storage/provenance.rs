@@ -6,7 +6,7 @@
 // Each hop is read with the caller's credential on the node that holds it, exactly as the
 // origin and run routes answer it; the crate shows only what those reads show.
 
-use aruna_operations::driver::drive_until;
+use aruna_operations::driver::{drive, drive_until};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
@@ -27,7 +27,7 @@ use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
 };
-use aruna_operations::s3::bucket::release::publish::read_crate;
+use aruna_operations::s3::bucket::release::publish::ReadCrateOperation;
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use axum::body::Body;
@@ -507,7 +507,14 @@ async fn release_crate(
             version_id,
         })) if realm_id == state.get_realm_id() => {
             let deadline = Instant::now() + RESOLVE_BUDGET;
-            match resolved(drive_until(resolve_version(context.as_ref(), version_id, deadline), context.as_ref(), deadline).await) {
+            match resolved(
+                drive_until(
+                    resolve_version(context.as_ref(), version_id, deadline),
+                    context.as_ref(),
+                    deadline,
+                )
+                .await,
+            ) {
                 GlobalResolution::Found(found) => {
                     // Holders come coordinator first.
                     let holder = match found.local {
@@ -538,7 +545,9 @@ async fn release_crate(
         realm_id,
         node_id,
     };
-    match read_crate(context.as_ref(), read).await {
+    let found = drive(ReadCrateOperation::new(read), context.as_ref()).await;
+    let found = found.unwrap_or_else(|error| Err(CrateReadError::Failed(error.to_string())));
+    match found {
         Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
             serde_json::from_slice(&found.bytes)
                 .map_err(|error| ServerError::InternalError(error.into()))
