@@ -12,7 +12,8 @@ use aruna_core::structs::identity::auth::AuthContext;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::report::{AuditPaging, AuditRange, family_audit, family_report};
+use crate::jobs::lifecycle::report::{AuditPaging, AuditRange};
+use crate::jobs::lifecycle::routing::{family_audit, family_report};
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::tests::records::{Family, REALM, context, user};
 

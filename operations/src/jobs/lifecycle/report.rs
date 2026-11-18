@@ -10,19 +10,15 @@ use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
 use aruna_core::structs::execution::job::{
-    CancelAuthority, ExecutionRole, JobFamilyId, JobFamilyRecord, JobId, JobProjection,
-    JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
+    CancelAuthority, JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordEnvelope,
+    JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
     PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::Key;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
 
-use super::routing::{family_projection, status_view};
 use super::witness_arm::{WitnessDeadline, WitnessExplain, deadline_index_key};
-use crate::driver::{DriverContext, drive};
-use crate::jobs::records::audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::route::JobRouteError;
 use aruna_core::calls::{IoCall, IoResult, Next};
@@ -101,90 +97,13 @@ pub struct FamilyReport {
     pub plan: Option<PlanEstimate>,
 }
 
-/// Reduces one alias into the full report. `None` means the alias names no
-/// family here, so the caller keeps its ordinary routing.
-pub async fn family_report(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-) -> Option<Result<FamilyReport, JobRouteError>> {
-    let (projected, spec) = match family_projection(context, job_id).await {
-        Ok(Some(projected)) => projected,
-        Ok(None) => return None,
-        Err(error) => return Some(Err(error)),
-    };
-    // Reads stay self-scoped: another submitter's job is absent, never refused.
-    if spec.created_by != auth.user_id {
-        return Some(Err(JobRouteError::NotFound));
-    }
-    // A paged spec reports its inputs as if they were inline.
-    let spec = match crate::jobs::records::pages::with_inputs(context, &spec).await {
-        Ok(spec) => spec,
-        Err(error) => return Some(Err(JobRouteError::Unavailable(error.to_string()))),
-    };
-    let projection = projected.projection.clone()?;
-    let family = JobFamilyId {
-        submission_id: projection.submission_id,
-        request_digest: projection.request_digest,
-    };
-    let responder = context.net_handle.as_ref().map(|net| net.node_id());
-    let details = ReportDetailsOperation::new(family, &projection, responder);
-    let details = match drive(details, context).await {
-        Ok(details) => details,
-        Err(error) => return Some(Err(error)),
-    };
-    // A run its submitter deleted answers as absent on every holder its deletion reached.
-    if details.deleted {
-        return Some(Err(JobRouteError::NotFound));
-    }
-    let digest = match projection.digest() {
-        Ok(digest) => digest,
-        Err(error) => return Some(Err(JobRouteError::Internal(error.to_string()))),
-    };
-    Some(Ok(FamilyReport {
-        job: status_view(job_id, &projection, &spec),
-        submission_id: projection.submission_id,
-        request_digest: projection.request_digest,
-        canonical_job_id: projection.canonical_job_id,
-        aliases: projection.aliases.clone(),
-        conflicts: details.conflicts,
-        state: projection.state,
-        canonical_execution_id: projection.canonical_execution_id,
-        canonical_result: projection.canonical_execution_id.and_then(|execution_id| {
-            projection
-                .executions
-                .iter()
-                .find(|execution| execution.execution_id == execution_id)
-                .and_then(|execution| execution.result.clone())
-        }),
-        executions: projection.executions.len() as u32,
-        started_at_ms: started_at(&projection),
-        execution_list: projection.executions.clone(),
-        duplicate_successes: projection
-            .executions
-            .iter()
-            .filter(|execution| execution.role == ExecutionRole::DuplicateSuccess)
-            .count() as u32,
-        outputs: projection.outputs.as_slice().to_vec(),
-        output_endpoints: details.output_endpoints,
-        revision: projected.revision,
-        digest,
-        cancel_requested: projection.cancel_requested,
-        responder,
-        partial: projected.truncated,
-        locally_exhausted: details.locally_exhausted,
-        plan: details.plan,
-        spec,
-    }))
-}
-
 fn terminal(state: PhysicalExecutionState) -> bool {
     state.is_terminal()
 }
 
 /// When the family's work started: the canonical execution's start, else the
 /// newest start any execution reports.
-fn started_at(projection: &JobProjection) -> Option<u64> {
+pub(super) fn started_at(projection: &JobProjection) -> Option<u64> {
     projection
         .canonical_execution_id
         .and_then(|execution_id| {
@@ -456,8 +375,8 @@ pub enum PagingError {
 /// Validated paging of one audit request, built before any effect exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditPaging {
-    cursor: Option<FetchCursor>,
-    limit: PageLimit,
+    pub(super) cursor: Option<FetchCursor>,
+    pub(super) limit: PageLimit,
 }
 
 impl AuditPaging {
@@ -502,65 +421,4 @@ pub enum AuditRange {
     Family,
     /// Every request family of the submission, including idempotency conflicts.
     Submission,
-}
-
-/// Pages the immutable log of one alias's family. `None` means the alias names
-/// no family here; a caller that did not submit the job gets `NotFound`, so the
-/// surface never confirms that another user's id exists.
-pub async fn family_audit(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-    range: AuditRange,
-    paging: AuditPaging,
-) -> Option<Result<AuditPage, JobRouteError>> {
-    let (projected, spec) = match family_projection(context, job_id).await {
-        Ok(Some(projected)) => projected,
-        Ok(None) => return None,
-        Err(error) => return Some(Err(error)),
-    };
-    if spec.created_by != auth.user_id {
-        return Some(Err(JobRouteError::NotFound));
-    }
-    let scope = match range {
-        AuditRange::Family => AuditScope::Family(projected.family),
-        AuditRange::Submission => AuditScope::Submission(projected.family.submission_id),
-    };
-    Some(
-        drive(
-            FamilyAuditOperation::new(FamilyAuditConfig {
-                scope,
-                cursor: paging.cursor,
-                limit: paging.limit,
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| JobRouteError::Internal(error.to_string())),
-    )
-}
-
-pub async fn audit_endpoints(
-    context: &DriverContext,
-    records: &[JobRecordEnvelope],
-    mut endpoints: BTreeMap<NodeId, String>,
-) -> BTreeMap<NodeId, String> {
-    for envelope in records {
-        let JobFamilyRecord::Output(output) = &envelope.record else {
-            continue;
-        };
-        for object in output.outputs.as_slice() {
-            if endpoints.contains_key(&object.node_id) {
-                continue;
-            }
-            let read = drive(ReadInfoOperation::new(vec![object.node_id]), context).await;
-            if let Ok(mut documents) = read
-                && let Some(document) = documents.remove(&object.node_id)
-                && let Some(endpoint) = document.urls.s3
-            {
-                endpoints.insert(object.node_id, endpoint);
-            }
-        }
-    }
-    endpoints
 }
