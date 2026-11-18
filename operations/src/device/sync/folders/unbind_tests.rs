@@ -5,7 +5,7 @@
 use aruna_core::calls::ChildOutcome;
 use aruna_core::types::Value;
 
-use super::super::reconcile::pure_tests::folder;
+use super::super::super::reconcile::pure_tests::folder;
 use super::*;
 
 fn child<T, E>(result: Result<T, E>) -> IoResult

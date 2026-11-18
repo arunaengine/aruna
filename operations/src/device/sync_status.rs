@@ -28,8 +28,8 @@ use super::replica::{
 };
 use super::replica_store::list_replicas;
 use super::scan_rows::{ScanRowsError, ScanRowsOperation};
-use super::sync::folder_reads::{folder_bases, list_folders, list_transfers};
 use super::sync::folders::FolderError;
+use super::sync::folders::reads::{folder_bases, list_folders, list_transfers};
 use super::sync::outbox::RequeueUploadsOperation;
 use super::sync::repository::SyncUpload;
 use super::sync_note::{DeviceSyncState, sync_state_key};

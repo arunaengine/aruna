@@ -41,9 +41,9 @@ use crate::staging::offered_directory::{
     OfferedDirectoryError, WithdrawOfferInput, withdraw_offer,
 };
 
-use super::folder_reads::read_bound;
-use super::folders::{FolderChange, FolderError, UpdateFolderOperation};
-use super::repository::{SYNC_PAGE_SIZE, folder_key, folder_prefix};
+use super::super::repository::{SYNC_PAGE_SIZE, folder_key, folder_prefix};
+use super::reads::read_bound;
+use super::{FolderChange, FolderError, UpdateFolderOperation};
 
 /// Rows, uploads and versions one cleanup pass removes at most, so writes that keep arriving
 /// cannot hold the folder lock. Anything left fails this pass, and the next pass goes on.
@@ -496,5 +496,5 @@ impl Operation for AbortUploadsOperation {
 }
 
 #[cfg(test)]
-#[path = "folder_unbind_tests.rs"]
+#[path = "unbind_tests.rs"]
 mod tests;

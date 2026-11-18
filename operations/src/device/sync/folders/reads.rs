@@ -17,10 +17,10 @@ use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::folders::{FolderCounters, FolderError};
-use super::repository::{
+use super::super::repository::{
     MAX_SYNCED_FOLDERS, SYNC_PAGE_SIZE, SyncUpload, base_key, folder_key, folder_prefix, key_path,
 };
+use super::{FolderCounters, FolderError};
 
 /// A synced folder row as its reader wants it.
 pub trait FolderRow: Sized + Send + Debug + PartialEq + 'static {

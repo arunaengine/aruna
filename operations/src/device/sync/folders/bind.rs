@@ -26,12 +26,10 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::transport_message_kind;
 use crate::staging::offered_directory::{OfferedDirectoryError, check_root};
 
-use super::ReconcileFolderError;
-use super::folder_reads::read_bound;
-use super::folders::{
-    BindFolderInput, FolderChange, FolderError, RealmBucketInput, UpdateFolderOperation,
-};
-use super::repository::{MAX_SYNCED_FOLDERS, folder_bucket, folder_entry, folder_key};
+use super::super::ReconcileFolderError;
+use super::super::repository::{MAX_SYNCED_FOLDERS, folder_bucket, folder_entry, folder_key};
+use super::reads::read_bound;
+use super::{BindFolderInput, FolderChange, FolderError, RealmBucketInput, UpdateFolderOperation};
 
 type RemoteError = ReconcileFolderError;
 
@@ -283,7 +281,7 @@ impl Operation for EnsureRealmOperation {
 
 /// One page of the versions under a prefix, served by a realm node with the owner's authority.
 #[derive(Debug, PartialEq)]
-pub(super) struct RequestVersionsOperation {
+pub(in crate::device::sync) struct RequestVersionsOperation {
     node_id: NodeId,
     auth: AuthContext,
     bucket: String,
@@ -293,7 +291,7 @@ pub(super) struct RequestVersionsOperation {
 }
 
 impl RequestVersionsOperation {
-    pub(super) fn new(
+    pub(in crate::device::sync) fn new(
         (remote, auth): (&RemoteBinding, AuthContext),
         cursor: Option<aruna_core::structs::SyncListCursor>,
         limit: SyncPageLimit,
@@ -689,5 +687,5 @@ impl Operation for DropBindingOperation {
 }
 
 #[cfg(test)]
-#[path = "folder_bind_tests.rs"]
+#[path = "bind_tests.rs"]
 mod tests;

@@ -36,8 +36,8 @@ use crate::device::drain::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_ms};
 use crate::device::scan_rows::{ScanRowsError, ScanRowsOperation};
 use crate::document_repository::{config_of, realm_config};
-use aruna_core::structs::identity::realm::NodeRealm;
 use crate::driver::DriverContext;
+use aruna_core::structs::identity::realm::NodeRealm;
 
 use super::folders::FolderError;
 use super::pull::{PullStep, PullWalk};
@@ -669,12 +669,10 @@ mod tests {
         SyncPullAck, SyncUpload, UploadState, drain_sync_outbox,
     };
     use crate::device::drain::DrainOutcome;
-    use crate::device::sync::folders::store_folder;
     use crate::device::sync::repository::requeued;
     use crate::device::sync::repository::{base_key, upload_entry};
-    use crate::device::sync::rows::{read_value, write_rows};
     use crate::driver::{DriverContext, drive};
-    use crate::tests::device::context;
+    use crate::tests::device::{context, read_value, store_folder, write_rows};
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderState, SyncBase, SyncedFolder};
