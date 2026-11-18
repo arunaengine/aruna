@@ -56,6 +56,7 @@ pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
 pub mod warmup;
+pub mod write_peer;
 
 /// The phase-time and identity samples a metadata operation stamps records
 /// with. Production keeps the defaults and samples per phase; tests replace the
