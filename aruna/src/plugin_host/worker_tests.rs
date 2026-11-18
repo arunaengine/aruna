@@ -1,3 +1,8 @@
+//! Tests the worker with the runtime fixture: a run that succeeds, one left with an unknown
+//! call, the per install bound, and a stop that leaves a run to start again from the top.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::*;
 use crate::plugin_host::read_config;
 use aruna_core::plugin_installs::PluginInstall;
