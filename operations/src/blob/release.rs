@@ -355,15 +355,64 @@ impl ForgetDeletedOperation {
             step: ForgetStep::Row,
         }
     }
-    let row = read_value(context, IMPORTED_OBJECT_KEYSPACE, key.clone()).await?;
-    let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
-    let row = row.map_err(|error| error.to_string())?;
-    Ok(row
-        .filter(|row| row.version_id == version_id)
-        .and_then(|row| row.etag))
+
+    fn after_row(&mut self) -> Turn<bool> {
+        if !self.file.version.is_empty() {
+            return Ok(Next::Done(true));
+        }
+        self.step = ForgetStep::Cleared;
+        Ok(Next::Call(claim_call(&self.claim, None)))
+    }
+}
+
+impl Operation for ForgetDeletedOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        Ok(Next::Call(read_row(
+            IMPORTED_OBJECT_KEYSPACE,
+            self.file.row_key(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match std::mem::replace(&mut self.step, ForgetStep::Cleared) {
+            ForgetStep::Row => {
+                let pinned = PinnedOperation::new(&self.file.location, &self.file.version);
+                self.step = ForgetStep::Pinned(result.value()?);
+                Ok(Next::Call(IoCall::child(pinned)))
+            }
+            ForgetStep::Pinned(observed) => {
+                // Another location of the path at another backend version keeps the row.
+                let pinned = result.child::<Option<bool>, MigrationError>()?;
+                let shared = !matches!(pinned, Ok(Some(false)));
+                let row = observed.as_deref().map(ImportedObject::from_bytes);
+                let version_id = self.file.version_id;
+                let named = matches!(row, Some(Ok(row)) if row.version_id == version_id);
+                match observed.filter(|_| named && !shared) {
+                    Some(observed) => {
+                        let drop = DropRowOperation::new(self.file.row_key(), observed.to_vec());
+                        self.step = ForgetStep::Dropped;
+                        Ok(Next::Call(IoCall::child(drop)))
+                    }
+                    None => self.after_row(),
+                }
+            }
+            ForgetStep::Dropped => match result.child::<bool, MigrationError>()?? {
+                true => self.after_row(),
+                false => Ok(Next::Done(false)),
+            },
+            ForgetStep::Cleared => {
+                result.done()?;
+                Ok(Next::Done(true))
+            }
+        }
+    }
 }
 
 /// How a release ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Released {
     /// Something still reads the file, or the storage cannot delete one version: it stays.
     Kept,
@@ -371,263 +420,187 @@ enum Released {
     Retry,
 }
 
-/// Stores the delete claim `key` with `value` and its entry under the file's rule, which
-/// removes the rule's claims with the rule, or drops both with `None`.
-async fn claimed(
-    context: &DriverContext,
-    (key, index): (&Key, &Key),
-    value: Option<&[u8]>,
-) -> bool {
-    let rows = [
-        (DELETE_CLAIM_KEYSPACE.to_string(), key.clone(), value),
-        (
-            CLAIM_INDEX_KEYSPACE.to_string(),
-            index.clone(),
-            Some(&[][..]),
-        ),
-    ];
-    let effect = match value {
-        Some(_) => StorageEffect::BatchWrite {
-            writes: rows
-                .into_iter()
-                .map(|(space, key, value)| (space, key, value.unwrap_or_default().to_vec().into()))
-                .collect(),
-            txn_id: None,
-        },
-        None => StorageEffect::BatchDelete {
-            deletes: rows
-                .into_iter()
-                .map(|(space, key, _)| (space, key))
-                .collect(),
-            txn_id: None,
-        },
-    };
-    matches!(
-        send(context, effect).await,
-        Event::Storage(
-            StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. }
-        )
-    )
+#[derive(Debug, PartialEq)]
+enum ClaimedStep {
+    Row,
+    Referenced,
+    Pinned,
+    Retired,
+    RetireSynced,
+    Deleting,
+    DeletingSynced,
+    Delete,
+    Tombstone,
+    TombstoneSynced,
+    Dropped,
+    Cleared,
 }
 
-async fn release_claimed(
-    context: &DriverContext,
-    location: BackendLocation,
-    (import_id, version_id): (Ulid, Ulid),
-    (version, claim): (String, (&Key, &Key)),
-) -> Released {
-    let key = object_key(import_id, &location.backend_path);
-    let observed = match read_value(context, IMPORTED_OBJECT_KEYSPACE, key.clone()).await {
-        Ok(observed) => observed,
-        Err(error) => {
-            warn!(%error, "Renamed file row could not be read");
-            return Released::Retry;
+/// Releases a claimed file: it goes when nothing reads it, its old location retires first, and
+/// the claim records each step that cannot be undone.
+#[derive(Debug, PartialEq)]
+struct ReleaseClaimedOperation {
+    file: ReleaseFile,
+    claim: Claim,
+    step: ClaimedStep,
+    observed: Option<Value>,
+    etag: Option<String>,
+    shared: bool,
+    now_ms: u64,
+}
+
+impl ReleaseClaimedOperation {
+    fn new(file: ReleaseFile, claim: Claim) -> Self {
+        Self {
+            file,
+            claim,
+            step: ClaimedStep::Row,
+            observed: None,
+            etag: None,
+            shared: false,
+            now_ms: 0,
         }
-    };
-    let row = observed
-        .as_deref()
-        .map(ImportedObject::from_bytes)
-        .transpose();
-    let observed_etag = match row {
+    }
+
+    fn call(&mut self, step: ClaimedStep, call: IoCall) -> Turn<Released> {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn row_read(&mut self, observed: Option<Value>) -> Turn<Released> {
+        let row = imported_row(&observed)?;
+        self.observed = observed;
         // Another write took the path, so the file there is not the renamed one.
-        Ok(Some(row)) if row.version_id != version_id => return Released::Kept,
-        Ok(row) => row.and_then(|row| row.etag),
-        Err(error) => {
-            warn!(%error, "Renamed file row could not be decoded");
-            return Released::Retry;
+        if row
+            .as_ref()
+            .is_some_and(|row| row.version_id != self.file.version_id)
+        {
+            return Ok(Next::Done(Released::Kept));
         }
-    };
-    match referenced(context, &location, (import_id, &version)).await {
-        Ok(true) => return Released::Kept,
-        Ok(false) => {}
-        Err(error) => {
-            warn!(%error, "References of a renamed file could not be read");
-            return Released::Retry;
-        }
+        self.etag = row.and_then(|row| row.etag);
+        let referenced = ReferencedOperation::new(&self.file);
+        self.call(ClaimedStep::Referenced, IoCall::child(referenced))
     }
-    // A stored location of the file, also one waiting for reclaim, may still be reused; one
-    // of another backend version at the path keeps the path's row.
-    let shared = match pinned(context, &location, &version).await {
-        Ok(Some(shared)) => shared,
-        Ok(None) => return Released::Retry,
-        Err(error) => {
-            warn!(%error, "Locations of a renamed file could not be read");
-            return Released::Retry;
-        }
-    };
-    // The rename's own old location goes first, whatever the storage's cleanup strategy, and
-    // the rename and that retirement are on disk before the file is deleted.
-    if !retire_source(context, &location).await || !synced(context).await {
-        return Released::Retry;
+
+    /// The rename's own old location goes first, whatever the storage's cleanup strategy.
+    fn retire(&mut self) -> Turn<Released> {
+        let Ok(key) = self.file.location.location_key() else {
+            return Ok(Next::Done(Released::Retry));
+        };
+        let candidate = ReclaimCandidateKey::new(key.backend, key.encoding, key.blake3_hash);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let retire = ReclaimBlobOperation::new(candidate, now, now).forced();
+        self.call(ClaimedStep::Retired, IoCall::child(retire))
     }
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return Released::Retry;
-    };
-    // From here the claim is never cleared: the delete may land whatever its answer says.
-    if !claimed(context, claim, Some(DELETING)).await || !synced(context).await {
-        return Released::Retry;
-    }
-    let etag = match version.is_empty() {
-        true => observed_etag,
-        false => None,
-    };
-    let unversioned = version.is_empty();
-    let effect = BlobEffect::DeletePlain {
-        location,
-        version,
-        etag,
-    };
-    match blob_handle.send_blob_effect(effect).await {
-        // The tombstone is on disk before anything else may fail.
-        Event::Blob(BlobEvent::DeleteFinished) => {
-            if !claimed(context, claim, Some(TOMBSTONE)).await || !synced(context).await {
-                return Released::Retry;
+
+    fn retired(&mut self, verdict: Result<ReclaimVerdict, ReclaimBlobError>) -> Turn<Released> {
+        match verdict {
+            Ok(ReclaimVerdict::Freed { .. } | ReclaimVerdict::Dropped) => {
+                self.call(ClaimedStep::RetireSynced, IoCall::Sync)
+            }
+            Ok(ReclaimVerdict::Pinned | ReclaimVerdict::NotDue) => Ok(Next::Done(Released::Retry)),
+            Err(error) => {
+                warn!(%error, "Old location of a renamed file could not be retired");
+                Ok(Next::Done(Released::Retry))
             }
         }
-        // A storage that cannot delete this exact version surely kept the file and its row.
-        Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) => return Released::Kept,
-        event => {
-            warn!(?event, "Renamed file could not be deleted");
-            return Released::Retry;
-        }
     }
-    let dropped = match observed {
-        Some(observed) if !shared => drop_row(context, key, observed).await,
-        _ => true,
-    };
-    // An unversioned path has no exact version to tombstone: once its row is gone, a later
-    // file there is new and may be registered again.
-    let cleared = !unversioned || claimed(context, claim, None).await;
-    match dropped && cleared {
-        true => Released::Deleted,
-        false => Released::Retry,
-    }
-}
 
-/// Drops a page of the claims and tombstones of the removed rule `import_id`; a claim whose
-/// delete was sent stays until its release settles it. `Some(true)` once none is left.
-pub(crate) async fn drop_claims(context: &DriverContext, import_id: Ulid) -> Option<bool> {
-    let prefix: Key = import_id.to_bytes().to_vec().into();
-    let mut after = None;
-    let mut seen = false;
-    for _ in 0..DROP_PAGES {
-        let page = iter_prefix_page(
-            &context.storage_handle,
-            CLAIM_INDEX_KEYSPACE,
-            Some(prefix.clone()),
-            after.take(),
-            RULE_PAGE,
-            None,
-        );
-        let (rows, next) = page.await.ok()?;
-        seen |= !rows.is_empty();
-        let claims: Vec<(String, Key)> = (rows.iter())
-            .map(|(key, _)| {
-                let claim = key.get(16..).unwrap_or_default().to_vec().into();
-                (DELETE_CLAIM_KEYSPACE.to_string(), claim)
-            })
-            .collect();
-        let read = StorageEffect::BatchRead {
-            reads: claims.clone(),
-            txn_id: None,
-        };
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = send(context, read).await
-        else {
-            return None;
-        };
-        let mut deletes = Vec::with_capacity(rows.len() * 2);
-        for ((key, _), (_, value)) in rows.into_iter().zip(values) {
-            if value.as_deref() == Some(DELETING) {
-                continue;
+    fn deleted(&mut self, event: Event) -> Turn<Released> {
+        match event {
+            // The tombstone is on disk before anything else may fail.
+            Event::Blob(BlobEvent::DeleteFinished) => {
+                let write = claim_call(&self.claim, Some(TOMBSTONE));
+                self.call(ClaimedStep::Tombstone, write)
             }
-            let claim: Key = key.get(16..).unwrap_or_default().to_vec().into();
-            deletes.push((DELETE_CLAIM_KEYSPACE.to_string(), claim));
-            deletes.push((CLAIM_INDEX_KEYSPACE.to_string(), key));
-        }
-        if !deletes.is_empty() {
-            let effect = StorageEffect::BatchDelete {
-                deletes,
-                txn_id: None,
-            };
-            return match send(context, effect).await {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Some(false),
-                _ => None,
-            };
-        }
-        match next {
-            Some(next) => after = Some(next),
-            None => break,
+            // A storage that cannot delete this exact version surely kept the file and its row.
+            Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) => {
+                Ok(Next::Done(Released::Kept))
+            }
+            event => {
+                warn!(event = event.label(), "Renamed file could not be deleted");
+                Ok(Next::Done(Released::Retry))
+            }
         }
     }
-    Some(!seen)
+
+    fn drop_row(&mut self) -> Turn<Released> {
+        match self.observed.take().filter(|_| !self.shared) {
+            Some(observed) => {
+                let drop = DropRowOperation::new(self.file.row_key(), observed.to_vec());
+                self.call(ClaimedStep::Dropped, IoCall::child(drop))
+            }
+            None => self.clear_claim(),
+        }
+    }
+
+    /// An unversioned path has no exact version to tombstone: once its row is gone, a later
+    /// file there is new and may be registered again.
+    fn clear_claim(&mut self) -> Turn<Released> {
+        if !self.file.version.is_empty() {
+            return Ok(Next::Done(Released::Deleted));
+        }
+        let clear = claim_call(&self.claim, None);
+        self.call(ClaimedStep::Cleared, clear)
+    }
 }
 
-/// Claim index pages one pass reads past claims whose delete was sent.
-const DROP_PAGES: usize = 16;
+impl Operation for ReleaseClaimedOperation {
+    type Output = Released;
+    type Error = MigrationError;
 
-/// The backend version a location row's file was written as, if one is recorded.
-async fn provider(
-    context: &DriverContext,
-    location: &BackendLocation,
-) -> Result<Option<String>, String> {
-    let value = read_value(
-        context,
-        BACKEND_VERSION_KEYSPACE,
-        version_key(location.ulid),
-    )
-    .await?;
-    let value = value.map(String::from_utf8).transpose();
-    value.map_err(|error| error.to_string())
-}
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
-/// Whether `other` names other bytes at the same path: another known backend version.
-async fn other_version(
-    context: &DriverContext,
-    other: &BackendLocation,
-    version: &str,
-) -> Result<bool, String> {
-    Ok(provider(context, other)
-        .await?
-        .is_some_and(|other| other != version))
-}
+    fn first(&mut self) -> Turn<Released> {
+        Ok(Next::Call(read_row(
+            IMPORTED_OBJECT_KEYSPACE,
+            self.file.row_key(),
+        )))
+    }
 
-/// Whether a version, an archive owner or another rule's row still names the copy.
-async fn referenced(
-    context: &DriverContext,
-    location: &BackendLocation,
-    (import_id, provider): (Ulid, &str),
-) -> Result<bool, String> {
-    let wanted = location.location_key().map_err(|error| error.to_string())?;
-    let mut start = None;
-    loop {
-        let effect = iter_index_effect(&wanted.blake3_hash, start.take(), None)
-            .map_err(|error| error.to_string())?;
-        let effect = storage(effect)?;
-        let (aliases, next) = match send(context, effect).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            other => return Err(format!("could not read hash aliases: {}", other.label())),
-        };
-        for (key, _) in aliases {
-            let alias = HashIndex::from_bytes(key.as_ref()).map_err(|error| error.to_string())?;
-            let version = VersionKey::new(&alias.bucket, &alias.key, alias.version_id);
-            let version = version.to_bytes().map_err(|error| error.to_string())?;
-            // A missing indexed version proves nothing, so the copy stays.
-            let Some(value) = read_value(context, BLOB_VERSIONS_KEYSPACE, version.into()).await?
-            else {
-                return Ok(true);
-            };
-            let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
-            let Some(other) = version.location_key() else {
-                continue;
-            };
-            if other == wanted
-                || (other.backend == wanted.backend
-                    && same_file(context, &other, (location, provider)).await?)
-            {
-                return Ok(true);
+    fn next(&mut self, result: IoResult) -> Turn<Released> {
+        match self.step {
+            ClaimedStep::Row => self.row_read(result.value()?),
+            ClaimedStep::Referenced => match result.child::<bool, MigrationError>()? {
+                Ok(true) => Ok(Next::Done(Released::Kept)),
+                Ok(false) => {
+                    let pinned = PinnedOperation::new(&self.file.location, &self.file.version);
+                    self.call(ClaimedStep::Pinned, IoCall::child(pinned))
+                }
+                Err(error) => {
+                    warn!(%error, "References of a renamed file could not be read");
+                    Ok(Next::Done(Released::Retry))
+                }
+            },
+            // A stored location of the file, also one waiting for reclaim, may still be reused;
+            // one of another backend version at the path keeps the path's row.
+            ClaimedStep::Pinned => match result.child::<Option<bool>, MigrationError>()? {
+                Ok(Some(shared)) => {
+                    self.shared = shared;
+                    self.retire()
+                }
+                Ok(None) => Ok(Next::Done(Released::Retry)),
+                Err(error) => {
+                    warn!(%error, "Locations of a renamed file could not be read");
+                    Ok(Next::Done(Released::Retry))
+                }
+            },
+            ClaimedStep::Retired => self.retired(result.child()?),
+            // The rename and the retirement are on disk before the file is deleted.
+            ClaimedStep::RetireSynced => {
+                result.done()?;
+                if !self.file.has_blob {
+                    return Ok(Next::Done(Released::Retry));
+                }
+                // From here the claim is never cleared: the delete may land whatever it answers.
+                let write = claim_call(&self.claim, Some(DELETING));
+                self.call(ClaimedStep::Deleting, write)
+            }
+            ClaimedStep::Deleting => {
+                result.done()?;
+                self.call(ClaimedStep::DeletingSynced, IoCall::Sync)
             }
         }
         match next {
