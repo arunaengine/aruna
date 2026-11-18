@@ -3,14 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, retry_effect, retry_timer};
+use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, AuditWrite, retry_effect, retry_timer};
 use crate::s3::bucket::key::lock::{answers_timer, lock_timer};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SharedSecret;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::BUCKET_AUDIT_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::events::{BlobEvent, Event};
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, UnlockStatus, deadline_after,
 };
@@ -18,26 +18,20 @@ use aruna_core::structs::storage::key_audit::{
     AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
 };
 use aruna_core::task::TaskEffect;
-use aruna_core::types::Effects;
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use std::time::Duration;
 use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InstallState {
-    Init,
     PrepareKey,
     WriteIntent,
-    SyncIntent,
     ActivateKey,
     ArmTimer,
     DiscardKey,
     WriteOutcome,
     ArmRetry,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -57,6 +51,14 @@ pub enum InstallError {
     #[error("installing the key did not finish")]
     NotFinished,
 }
+
+impl From<IoError> for InstallError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type InstallTurn = Result<Next<UnlockStatus>, InstallError>;
 
 /// The key and its unlock bounds: without a duration it lasts until `max`, or until lock or
 /// restart when there is no maximum.
@@ -90,13 +92,14 @@ pub struct InstallKeyOperation {
     discarded: Option<KeyTicket>,
     failure: Option<InstallError>,
     activated: Option<UnlockStatus>,
+    /// What the run ends with once its outcome record is settled.
+    finished: Option<Result<UnlockStatus, InstallError>>,
     /// True once the intent is durable, so a failed activation records its outcome.
     intent_synced: bool,
     /// The event id of the stored intent, which the outcome names.
     intent_id: Option<Ulid>,
     outcome: Option<BucketAuditRecord>,
     attempts: u32,
-    output: Option<Result<UnlockStatus, InstallError>>,
 }
 
 impl InstallKeyOperation {
@@ -106,17 +109,17 @@ impl InstallKeyOperation {
             bounds: (input.duration, input.max),
             input: Some(input),
             audit: None,
-            state: InstallState::Init,
+            state: InstallState::PrepareKey,
             ticket: None,
             session: None,
             discarded: None,
             failure: None,
             activated: None,
+            finished: None,
             intent_synced: false,
             intent_id: None,
             outcome: None,
             attempts: 0,
-            output: None,
         }
     }
 
@@ -130,21 +133,31 @@ impl InstallKeyOperation {
         self
     }
 
-    /// A failure discards the prepared key this operation still owns.
-    fn fail(&mut self, error: impl Into<InstallError>) -> Effects {
-        self.output = Some(Err(error.into()));
-        self.state = InstallState::Error;
-        self.abort()
+    fn call(&mut self, state: InstallState, call: IoCall) -> InstallTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn discard(&mut self, error: impl Into<InstallError>) -> Effects {
+    fn refused(&self, received: Event) -> InstallTurn {
+        match received {
+            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+            other => Err(InstallError::InvalidStateEvent {
+                state: format!("{:?}", self.state),
+                expected: "the event of the current step",
+                received: other.label(),
+            }),
+        }
+    }
+
+    /// Discards the prepared key before the failure ends the run.
+    fn discard(&mut self, error: impl Into<InstallError>) -> InstallTurn {
         let Some(ticket) = self.ticket.take() else {
-            return self.fail(error);
+            return Err(error.into());
         };
         self.failure = Some(error.into());
-        self.state = InstallState::DiscardKey;
         self.discarded = Some(ticket);
-        smallvec![Effect::Blob(BlobEffect::DiscardKey { ticket })]
+        let discard = Effect::Blob(BlobEffect::DiscardKey { ticket });
+        self.call(InstallState::DiscardKey, discard.into())
     }
 
     fn record(&self, audit: InstallAudit, outcome: AuditOutcome) -> BucketAuditRecord {
@@ -168,28 +181,29 @@ impl InstallKeyOperation {
         }
     }
 
-    fn write(&mut self, record: &BucketAuditRecord) -> Effects {
-        match record.to_bytes() {
-            Ok(value) => smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
-                key: record.key().into(),
-                value: value.into(),
-                txn_id: None,
-            })],
+    fn activate(&mut self) -> InstallTurn {
+        let ticket = self.ticket.ok_or(InstallError::NotFinished)?;
+        let activate = Effect::Blob(BlobEffect::ActivateKey { ticket });
+        self.call(InstallState::ActivateKey, activate.into())
+    }
+
+    fn prepared(&mut self, ticket: KeyTicket) -> InstallTurn {
+        self.ticket = Some(ticket);
+        self.session = Some(ticket.session_id);
+        let Some(audit) = self.audit else {
+            return self.activate();
+        };
+        let intent = self.record(audit, AuditOutcome::Intent);
+        self.intent_id = Some(intent.event_id);
+        // The intent must survive a crash before any read can use the key.
+        match AuditWrite::new(&intent, true) {
+            Ok(write) => self.call(InstallState::WriteIntent, IoCall::child(write)),
             Err(error) => self.discard(error),
         }
     }
 
-    fn activate(&mut self) -> Effects {
-        let Some(ticket) = self.ticket else {
-            return self.fail(InstallError::NotFinished);
-        };
-        self.state = InstallState::ActivateKey;
-        smallvec![Effect::Blob(BlobEffect::ActivateKey { ticket })]
-    }
-
     /// The registry closes admission at the deadline; the timer records the lock.
-    fn arm_timer(&mut self, status: UnlockStatus) -> Effects {
+    fn arm_timer(&mut self, status: UnlockStatus) -> InstallTurn {
         let Some(after) = status.remaining else {
             return self.complete(Ok(status));
         };
@@ -198,19 +212,17 @@ impl InstallKeyOperation {
             session_id: status.session_id,
         };
         self.activated = Some(status);
-        self.state = InstallState::ArmTimer;
-        smallvec![Effect::Task(TaskEffect::ShortenTimer {
+        let arm = Effect::Task(TaskEffect::ShortenTimer {
             key: lock_timer(&ticket),
             after,
-        })]
+        });
+        self.call(InstallState::ArmTimer, arm.into())
     }
 
     /// Writes the outcome record when the activation is audited.
-    fn complete(&mut self, result: Result<UnlockStatus, InstallError>) -> Effects {
+    fn complete(&mut self, result: Result<UnlockStatus, InstallError>) -> InstallTurn {
         let Some(audit) = self.audit else {
-            self.state = InstallState::Finish;
-            self.output = Some(result);
-            return smallvec![];
+            return result.map(Next::Done);
         };
         let outcome = match result {
             Ok(_) => AuditOutcome::Applied,
@@ -221,87 +233,70 @@ impl InstallKeyOperation {
             record.deadline_ms = status.deadline_ms;
             record.sequence = Some(status.sequence);
         }
-        self.output = Some(result);
+        self.finished = Some(result);
         record.intent_id = self.intent_id;
         self.outcome = Some(record);
-        self.retry_outcome()
+        self.write_outcome()
     }
 
     /// A synced intent gets its failed outcome; otherwise nothing was recorded.
-    fn key_discarded(&mut self) -> Effects {
+    fn key_discarded(&mut self) -> InstallTurn {
         let error = self.failure.take().unwrap_or(InstallError::NotFinished);
         match self.intent_synced {
             true => self.complete(Err(error)),
-            false => self.fail(error),
+            false => Err(error),
         }
     }
 
-    fn retry_outcome(&mut self) -> Effects {
-        let Some(record) = self.outcome.clone() else {
-            return self.fail(InstallError::NotFinished);
-        };
+    fn write_outcome(&mut self) -> InstallTurn {
+        let record = self.outcome.as_ref().ok_or(InstallError::NotFinished)?;
+        let write = AuditWrite::new(record, false)?;
         self.attempts += 1;
-        self.state = InstallState::WriteOutcome;
-        self.write(&record)
-    }
-}
-
-impl EffectOperation for InstallKeyOperation {
-    type Output = UnlockStatus;
-    type Error = InstallError;
-
-    /// The operation hands its only key handle to the adapter and keeps none.
-    fn start(&mut self) -> Effects {
-        let Some(input) = self.input.take() else {
-            return self.fail(InstallError::NotFinished);
-        };
-        self.state = InstallState::PrepareKey;
-        smallvec![Effect::Blob(BlobEffect::PrepareKey {
-            key: input.key,
-            public_key: input.public_key,
-            private_key: input.private_key,
-            duration: input.duration,
-            max: input.max,
-        })]
+        self.call(InstallState::WriteOutcome, IoCall::child(write))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let ticket = self.ticket;
-        let discarded = self.discarded;
+    /// The key state is settled, so the run ends with what the activation decided.
+    fn finish(&mut self) -> InstallTurn {
+        self.outcome = None;
+        let result = self.finished.take().ok_or(InstallError::NotFinished)?;
+        result.map(Next::Done)
+    }
+
+    /// A failed outcome write is retried here first; a lasting outage hands the record to its
+    /// own retry timer.
+    fn outcome_written(&mut self, written: Result<(), StorageError>) -> InstallTurn {
+        if written.is_ok() {
+            return self.finish();
+        }
+        if self.attempts < AUDIT_ATTEMPTS {
+            return self.write_outcome();
+        }
+        let record = self.outcome.as_ref().ok_or(InstallError::NotFinished)?;
+        let retry = retry_effect(record);
+        self.call(InstallState::ArmRetry, retry.into())
+    }
+
+    fn matches_ticket(&self, status: &UnlockStatus) -> bool {
+        (self.ticket).is_some_and(|ticket| {
+            (ticket.key, ticket.session_id) == (status.key, status.session_id)
+        })
+    }
+
+    fn event_answered(&mut self, event: Event) -> InstallTurn {
         match (self.state, event) {
             (InstallState::PrepareKey, Event::Blob(BlobEvent::KeyPrepared { ticket }))
                 if ticket.key == self.key =>
             {
-                self.ticket = Some(ticket);
-                self.session = Some(ticket.session_id);
-                let Some(audit) = self.audit else {
-                    return self.activate();
-                };
-                let intent = self.record(audit, AuditOutcome::Intent);
-                self.intent_id = Some(intent.event_id);
-                self.state = InstallState::WriteIntent;
-                self.write(&intent)
+                self.prepared(ticket)
             }
-            (InstallState::WriteIntent, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.state = InstallState::SyncIntent;
-                smallvec![Effect::Storage(StorageEffect::SyncAll)]
-            }
-            // The intent must survive a crash before any read can use the key.
-            (InstallState::SyncIntent, Event::Storage(StorageEvent::SyncAllFinished)) => {
-                self.intent_synced = true;
-                self.activate()
-            }
-            (
-                InstallState::WriteIntent | InstallState::SyncIntent,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.discard(error),
             (InstallState::ActivateKey, Event::Blob(BlobEvent::KeyActivated { status }))
-                if ticket.is_some_and(|ticket| {
-                    (ticket.key, ticket.session_id) == (status.key, status.session_id)
-                }) =>
+                if self.matches_ticket(&status) =>
             {
                 self.ticket = None;
                 self.arm_timer(status)
+            }
+            (InstallState::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
+                self.discard(error)
             }
             (InstallState::ArmTimer, Event::Task(event))
                 if self.activated.as_ref().is_some_and(|status| {
@@ -312,73 +307,62 @@ impl EffectOperation for InstallKeyOperation {
                     answers_timer(&event, &lock_timer(&ticket))
                 }) =>
             {
-                match self.activated.take() {
-                    Some(status) => self.complete(Ok(status)),
-                    None => self.fail(InstallError::NotFinished),
-                }
-            }
-            (InstallState::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
-                self.discard(error)
+                let status = self.activated.take().ok_or(InstallError::NotFinished)?;
+                self.complete(Ok(status))
             }
             (InstallState::DiscardKey, Event::Blob(BlobEvent::KeyDiscarded { ticket }))
-                if discarded == Some(ticket) =>
+                if self.discarded == Some(ticket) =>
             {
                 self.key_discarded()
             }
             (InstallState::DiscardKey, Event::Blob(BlobEvent::Error(_))) => self.key_discarded(),
-            // The key state is settled; a failed outcome write is retried here first.
-            (InstallState::WriteOutcome, Event::Storage(StorageEvent::Error { .. }))
-                if self.attempts < AUDIT_ATTEMPTS =>
-            {
-                self.retry_outcome()
-            }
-            (InstallState::WriteOutcome, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.outcome = None;
-                self.state = InstallState::Finish;
-                smallvec![]
-            }
-            // A lasting outage hands the outcome to its own retry timer.
-            (InstallState::WriteOutcome, Event::Storage(StorageEvent::Error { .. })) => {
-                let Some(record) = self.outcome.as_ref() else {
-                    return self.fail(InstallError::NotFinished);
-                };
-                self.state = InstallState::ArmRetry;
-                smallvec![retry_effect(record)]
-            }
             (InstallState::ArmRetry, Event::Task(event))
-                if self
-                    .outcome
-                    .as_ref()
+                if (self.outcome.as_ref())
                     .is_some_and(|record| answers_timer(&event, &retry_timer(record))) =>
             {
-                self.outcome = None;
-                self.state = InstallState::Finish;
-                smallvec![]
+                self.finish()
             }
-            (InstallState::Finish | InstallState::Error, _) => smallvec![],
-            (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
-            (state, received) => self.fail(InstallError::InvalidStateEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current step",
-                received: received.label(),
-            }),
+            (_, received) => self.refused(received),
+        }
+    }
+}
+
+impl Operation for InstallKeyOperation {
+    type Output = UnlockStatus;
+    type Error = InstallError;
+
+    /// The operation hands its only key handle to the adapter and keeps none.
+    fn first(&mut self) -> InstallTurn {
+        let input = self.input.take().ok_or(InstallError::NotFinished)?;
+        let prepare = Effect::Blob(BlobEffect::PrepareKey {
+            key: input.key,
+            public_key: input.public_key,
+            private_key: input.private_key,
+            duration: input.duration,
+            max: input.max,
+        });
+        self.call(InstallState::PrepareKey, prepare.into())
+    }
+
+    fn next(&mut self, result: IoResult) -> InstallTurn {
+        match self.state {
+            InstallState::WriteIntent => match result.child::<(), StorageError>()? {
+                Ok(()) => {
+                    self.intent_synced = true;
+                    self.activate()
+                }
+                Err(error) => self.discard(error),
+            },
+            InstallState::WriteOutcome => self.outcome_written(result.child::<(), StorageError>()?),
+            _ => self.event_answered(result.event()?),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, InstallState::Finish | InstallState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(InstallError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
+    /// A failed run discards the prepared key it still owns.
+    fn abort(&mut self) -> Vec<IoCall> {
         self.input = None;
-        match self.ticket.take() {
-            Some(ticket) => smallvec![Effect::Blob(BlobEffect::DiscardKey { ticket })],
-            None => smallvec![],
-        }
+        let discard = |ticket| Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        self.ticket.take().map(discard).into_iter().collect()
     }
 }
 
@@ -387,36 +371,77 @@ mod tests {
     use super::*;
     use crate::driver::DriverContext;
     use crate::s3::bucket::key::wake::activate_and_wake;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::SecretBytes;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::execution::job::RoCrateLimits;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{BucketKeyError, public_key_of};
     use std::time::SystemTime;
     use ulid::Ulid;
 
-    fn prepared() -> (InstallKeyOperation, KeyTicket) {
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn blob(blob: BlobEvent) -> IoResult {
+        event(Event::Blob(blob))
+    }
+
+    fn asked(turn: &InstallTurn) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
+            other => panic!("expected an effect call, got {other:?}"),
+        }
+    }
+
+    fn write_done(result: Result<(), StorageError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    /// The audit record the write child of `turn` stores.
+    fn audit_record(turn: InstallTurn) -> BucketAuditRecord {
+        let Ok(Next::Call(IoCall::Child(mut child))) = turn else {
+            panic!("expected an audit write, got {turn:?}");
+        };
+        let effects = child.start();
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected an audit write, got {effects:?}");
+        };
+        BucketAuditRecord::from_bytes(&writes[0].2).unwrap()
+    }
+
+    fn input(duration: Option<Duration>, max: Option<Duration>) -> InstallInput {
         let private = SecretBytes::new(vec![4; 32]);
-        let mut operation = InstallKeyOperation::new(InstallInput {
+        InstallInput {
             key: BucketKeyRef::new(Ulid::from_bytes([1; 16]), 1),
             public_key: public_key_of(&private).unwrap(),
             private_key: SharedSecret::new(private),
-            duration: None,
-            max: Some(Duration::from_secs(60)),
-        });
-        let effects = operation.start();
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::PrepareKey { .. })]
-        ));
-        assert!(operation.input.is_none(), "the key handle is handed on");
-        let ticket = KeyTicket {
+            duration,
+            max,
+        }
+    }
+
+    fn ticket_of(operation: &InstallKeyOperation) -> KeyTicket {
+        KeyTicket {
             key: operation.key,
             session_id: Ulid::from_bytes([2; 16]),
-        };
-        let effects = operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket }));
+        }
+    }
+
+    fn prepared() -> (InstallKeyOperation, KeyTicket) {
+        let mut operation = InstallKeyOperation::new(input(None, Some(Duration::from_secs(60))));
+        let turn = operation.first();
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::PrepareKey { .. })
+        ));
+        assert!(operation.input.is_none(), "the key handle is handed on");
+        let ticket = ticket_of(&operation);
+        let turn = operation.next(blob(BlobEvent::KeyPrepared { ticket }));
         assert_eq!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ActivateKey { ticket })]
+            asked(&turn),
+            &Effect::Blob(BlobEffect::ActivateKey { ticket })
         );
         (operation, ticket)
     }
@@ -437,7 +462,7 @@ mod tests {
     #[test]
     fn installs_prepared_key() {
         let (mut operation, ticket) = prepared();
-        let effects = operation.step(Event::Blob(BlobEvent::KeyActivated {
+        let turn = operation.next(blob(BlobEvent::KeyActivated {
             status: status(ticket),
         }));
         // A timed session arms its lock timer, so the timed lock is recorded.
@@ -446,65 +471,46 @@ mod tests {
             key: key.clone(),
             after: Duration::from_secs(60),
         };
-        assert_eq!(effects.as_slice(), [Effect::Task(arm)]);
+        assert_eq!(asked(&turn), &Effect::Task(arm));
         let after = Duration::from_secs(60);
         let armed = aruna_core::task::TaskEvent::TimerScheduled { key, after };
-        operation.step(Event::Task(armed));
-        assert_eq!(operation.finalize(), Ok(status(ticket)));
+        assert_eq!(
+            operation.next(event(Event::Task(armed))),
+            Ok(Next::Done(status(ticket)))
+        );
 
         // A status of another session is no answer to this activation.
         let (mut operation, mut ticket) = prepared();
         ticket.session_id = Ulid::from_bytes([3; 16]);
-        operation.step(Event::Blob(BlobEvent::KeyActivated {
+        let turn = operation.next(blob(BlobEvent::KeyActivated {
             status: status(ticket),
         }));
-        assert!(matches!(
-            operation.finalize(),
-            Err(InstallError::InvalidStateEvent { .. })
-        ));
+        assert!(matches!(turn, Err(InstallError::InvalidStateEvent { .. })));
     }
 
     #[test]
     fn delayed_install_recorded() {
-        let private = SecretBytes::new(vec![4; 32]);
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let mut operation = InstallKeyOperation::new(InstallInput {
-            key: BucketKeyRef::new(Ulid::from_bytes([1; 16]), 1),
-            public_key: public_key_of(&private).unwrap(),
-            private_key: SharedSecret::new(private),
-            duration: Some(Duration::from_secs(60)),
-            max: None,
-        })
-        .audited(node, None, 1_000);
-        operation.start();
-        let ticket = KeyTicket {
-            key: operation.key,
-            session_id: Ulid::from_bytes([2; 16]),
-        };
-        let effects = operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket }));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("intent missing")
-        };
-        let intent = BucketAuditRecord::from_bytes(value).unwrap();
+        let mut operation = InstallKeyOperation::new(input(Some(Duration::from_secs(60)), None))
+            .audited(node, None, 1_000);
+        operation.first().unwrap();
+        let ticket = ticket_of(&operation);
+        let intent = audit_record(operation.next(blob(BlobEvent::KeyPrepared { ticket })));
         assert_eq!(intent.deadline_ms, Some(61_000));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
-        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        operation.next(write_done(Ok(()))).unwrap();
         let mut active = status(ticket);
         active.unlocked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(31);
         active.deadline_ms = Some(91_000);
-        operation.step(Event::Blob(BlobEvent::KeyActivated {
-            status: active.clone(),
-        }));
-        let effects = operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+        operation
+            .next(blob(BlobEvent::KeyActivated {
+                status: active.clone(),
+            }))
+            .unwrap();
+        let armed = aruna_core::task::TaskEvent::TimerScheduled {
             key: lock_timer(&ticket),
             after: Duration::from_secs(60),
-        }));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("outcome missing")
         };
-        let record = BucketAuditRecord::from_bytes(value).unwrap();
+        let record = audit_record(operation.next(event(Event::Task(armed))));
         assert_eq!(
             (record.deadline_ms, record.sequence),
             (Some(91_000), Some(active.sequence))
@@ -521,36 +527,14 @@ mod tests {
 
     #[test]
     fn audited_install_syncs() {
-        let private = SecretBytes::new(vec![4; 32]);
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let mut operation = InstallKeyOperation::new(InstallInput {
-            key: BucketKeyRef::new(Ulid::from_bytes([1; 16]), 1),
-            public_key: public_key_of(&private).unwrap(),
-            private_key: SharedSecret::new(private),
-            duration: None,
-            max: None,
-        })
-        .audited(node, None, 1_000);
-        operation.start();
-        let ticket = KeyTicket {
-            key: operation.key,
-            session_id: Ulid::from_bytes([2; 16]),
-        };
-        let effects = operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket }));
-        let record = |effects: &Effects| {
-            let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-                panic!("expected an audit write, got {effects:?}");
-            };
-            BucketAuditRecord::from_bytes(value).unwrap()
-        };
-        assert_eq!(record(&effects).outcome, AuditOutcome::Intent);
-        let written = || {
-            Event::Storage(StorageEvent::WriteResult {
-                key: Vec::new().into(),
-            })
-        };
+        let mut operation = InstallKeyOperation::new(input(None, None)).audited(node, None, 1_000);
+        operation.first().unwrap();
+        let ticket = ticket_of(&operation);
+        let intent = audit_record(operation.next(blob(BlobEvent::KeyPrepared { ticket })));
+        assert_eq!(intent.outcome, AuditOutcome::Intent);
         // Reads see the key only after the intent reached the disk.
-        let effects = operation.step(written());
+        let turn = operation.next(write_done(Ok(())));
         assert_eq!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::SyncAll)]
