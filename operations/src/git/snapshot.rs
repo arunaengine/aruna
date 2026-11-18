@@ -9,8 +9,9 @@ use super::{GitError, document, objects, publish, records};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::distribution::resolve::version_holders;
-use crate::driver::DriverContext;
+use crate::distribution::resolve::{RESOLVE_BUDGET, resolve_version, version_found};
+use tokio::time::Instant;
+use crate::driver::{DriverContext, drive_until};
 use crate::driver::drive;
 use crate::metadata::materialization_queue::capture_pending;
 use crate::replication::bao_read::BaoReadOutput;
@@ -277,7 +278,10 @@ async fn located(
                     .extend(VersionedObjectArn::new(realm_id, node, bucket, key, *version_id).ok());
             }
             _ => {
-                if let Some(resolved) = version_holders(context, *version_id).await {
+                let deadline = Instant::now() + RESOLVE_BUDGET;
+                let resolve = resolve_version(context, *version_id, deadline);
+                let holders = version_found(drive_until(resolve, context, deadline).await);
+                if let Some(resolved) = holders {
                     found.extend(resolved.holders.iter().take(4).filter_map(|holder| {
                         let (bucket, key) = (&resolved.bucket, &resolved.key);
                         VersionedObjectArn::new(realm_id, *holder, bucket, key, *version_id).ok()

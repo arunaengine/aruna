@@ -22,7 +22,7 @@ use aruna_core::structs::storage::replication::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
-use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version};
+use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version, content_resolved, resolved};
 use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, issue_ticket, redeem_ticket,
 };
@@ -1225,7 +1225,7 @@ async fn resolve_distributed_hash(
     hash: [u8; 32],
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
-    let resolution = resolve_content(&state.get_ctx(), hash, deadline).await;
+    let resolution = content_resolved(drive_until(resolve_content(&state.get_ctx(), hash, deadline), &state.get_ctx(), deadline).await);
     let realm_id = state.get_realm_id();
     let mut denied = false;
     for found in resolution.versions {
@@ -1258,7 +1258,7 @@ async fn resolve_global(
         return Ok(ResolveOutcome::NotFound);
     }
     let context = state.get_ctx();
-    let found = match resolve_version(&context, version_id, deadline).await {
+    let found = match resolved(drive_until(resolve_version(&context, version_id, deadline), &context, deadline).await) {
         GlobalResolution::Found(found) => found,
         GlobalResolution::NotFound => return Ok(ResolveOutcome::NotFound),
         GlobalResolution::Unavailable => return Ok(ResolveOutcome::Unavailable),

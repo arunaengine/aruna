@@ -10,10 +10,10 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::share::{ShareLink, ShareTarget, TicketBody};
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
-use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version};
+use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version, content_resolved, resolved};
 use aruna_operations::distribution::routing::bound_view;
 use aruna_operations::distribution::status::read_view;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
@@ -225,7 +225,7 @@ async fn local_parts(
             }
             FilePlace::Version(version_id) => {
                 let deadline = Instant::now() + RESOLVE_TIMEOUT;
-                let resolved = resolve_version(&state.get_ctx(), *version_id, deadline).await;
+                let resolved = resolved(drive_until(resolve_version(&state.get_ctx(), *version_id, deadline), &state.get_ctx(), deadline).await);
                 let GlobalResolution::Found(found) = resolved else {
                     continue;
                 };
@@ -284,7 +284,7 @@ async fn member_content(
     hash: [u8; 32],
 ) -> Option<(String, String, Ulid)> {
     let deadline = Instant::now() + RESOLVE_TIMEOUT;
-    let found = resolve_content(&state.get_ctx(), hash, deadline).await;
+    let found = content_resolved(drive_until(resolve_content(&state.get_ctx(), hash, deadline), &state.get_ctx(), deadline).await);
     for found in found.versions {
         let (bucket, key) = (found.bucket.as_str(), found.key.as_str());
         if bound_here(state, found.set_id, bucket).await

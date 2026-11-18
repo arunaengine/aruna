@@ -253,7 +253,7 @@ impl ArunaS3Service {
                 Ok(ReadRoute::Local { .. }) => return Ok(None),
                 Err(error) => return Err(guard_error(&error)),
             };
-        let holders = key_holders(self.state.as_ref(), binding.set_id, key).await;
+        let holders = drive(key_holders(binding.set_id, key), self.state.as_ref()).await.unwrap_or_default();
         let choice = HolderChoiceOperation::new(&holders, unix_timestamp_millis());
         let candidates = drive(choice, self.state.as_ref()).await.unwrap_or_default();
         let seed = Ulid::generate().random();

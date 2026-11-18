@@ -275,7 +275,7 @@ async fn answer_version_key(
     set_id: Ulid,
     version_id: Ulid,
 ) {
-    let key = crate::distribution::resolve::indexed_key(context, set_id, version_id)
+    let key = drive(crate::distribution::resolve::indexed_key(set_id, version_id), context)
         .await
         .ok()
         .flatten();
@@ -302,7 +302,7 @@ async fn answer_content(
 ) {
     use crate::distribution::resolve::{MAX_CONTENT_VERSIONS, content_versions};
     let Ok((versions, more)) =
-        content_versions(context, set_id, &identity, MAX_CONTENT_VERSIONS).await
+        drive(content_versions(set_id, &identity, MAX_CONTENT_VERSIONS), context).await
     else {
         blob_handle.close_stream(stream_id).await;
         return;

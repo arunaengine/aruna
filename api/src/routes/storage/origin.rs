@@ -19,12 +19,10 @@ use aruna_core::structs::storage::origin::{
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::distribution::guard::GuardError;
-use aruna_operations::distribution::resolve::{
-    GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version,
-};
+use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version, resolved};
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::s3::bucket::sources::{BucketSourcesOperation, FileSource};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, bucket_runs, read_origin};
 use axum::extract::{Path, Query, State};
@@ -487,7 +485,7 @@ async fn origin_answer(
         }
         let route = drive(route_read(binding, &params.key, false), context.as_ref()).await;
         if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
-            let mut holders = key_holders(context.as_ref(), binding.set_id, &params.key).await;
+            let mut holders = drive(key_holders(binding.set_id, &params.key), context.as_ref()).await.unwrap_or_default();
             holders.retain(|holder| *holder != state.get_node_id());
             holders.push(node_id);
             let target = (binding.set_id, range_id, node_id);
@@ -718,7 +716,7 @@ async fn global_origin(
     version_id: Ulid,
 ) -> ServerResult<Json<OriginResponse>> {
     let deadline = tokio::time::Instant::now() + RESOLVE_BUDGET;
-    let found = match resolve_version(state.get_ctx().as_ref(), version_id, deadline).await {
+    let found = match resolved(drive_until(resolve_version(state.get_ctx().as_ref(), version_id, deadline), state.get_ctx().as_ref(), deadline).await) {
         GlobalResolution::Found(found) => found,
         GlobalResolution::NotFound => return Err(ServerError::NotFound),
         GlobalResolution::Unavailable => {

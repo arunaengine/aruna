@@ -135,7 +135,7 @@ pub(crate) async fn read_holders(
     let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? else {
         return Ok(None);
     };
-    let mut holders = key_holders(context.as_ref(), binding.set_id, key).await;
+    let mut holders = drive(key_holders(binding.set_id, key), context.as_ref()).await.unwrap_or_default();
     holders.retain(|holder| *holder != state.get_node_id() && *holder != node_id);
     holders.push(node_id);
     let forward = |node_id| RestForward {
