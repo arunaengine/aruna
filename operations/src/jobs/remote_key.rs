@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -14,9 +13,8 @@ use aruna_core::handle::Handle;
 use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
+use aruna_core::structs::execution::job::{JobId, JobState, KeyWait};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, VersionKey, object_permission_path};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -36,8 +34,7 @@ use crate::jobs::store::remote_wait::{
 use crate::jobs::store::state::read_job_record;
 use crate::tasks::task_persistence::persist_task_effect;
 
-/// Targets one registration may name; more is refused rather than scanned.
-const MAX_AWAITED: usize = 1024;
+use crate::jobs::key_locks::{AskWaitsOperation, MAX_AWAITED};
 
 /// Key node: registers `job_id` of `peer` on the locked keys of `targets`, then answers only
 /// the keys still locked. A key unlocked in between is either seen here or wakes the job later.
@@ -209,37 +206,7 @@ async fn ask(
     }
 }
 
-/// Waiting node: registers the job on each source node of its remote inputs and collects the
-/// keys still locked there. An unreachable source is left to staging, as before.
-pub(crate) async fn remote_waits(
-    context: &DriverContext,
-    record: &JobRecord,
-    node_id: NodeId,
-) -> Vec<KeyWait> {
-    let mut by_node: BTreeMap<NodeId, Vec<WaitTarget>> = BTreeMap::new();
-    for input in &record.captured_inputs {
-        if let Some(blake3) = input.content.blake3()
-            && input.source_node_id != node_id
-        {
-            by_node
-                .entry(input.source_node_id)
-                .or_default()
-                .push(WaitTarget::Captured {
-                    blake3,
-                    version_id: input.version_id,
-                });
-        }
-    }
-    let auth = owner_auth(record, context.serving_realm(record.created_by.realm_id));
-    let mut waits = Vec::new();
-    for (node, targets) in by_node {
-        waits.extend(ask_waits(context, &auth, record.job_id, node, &targets).await);
-    }
-    waits
-}
-
-/// Waiting node: registers the job on `node` for `targets` and returns the keys still locked
-/// there. An unreachable or refusing node yields none.
+/// See [`AskWaitsOperation`].
 pub(crate) async fn ask_waits(
     context: &DriverContext,
     auth: &AuthContext,
@@ -247,35 +214,9 @@ pub(crate) async fn ask_waits(
     node: NodeId,
     targets: &[WaitTarget],
 ) -> Vec<KeyWait> {
-    let mut waits = Vec::new();
-    for targets in targets.chunks(MAX_AWAITED) {
-        let request = JobRequest::AwaitKeys {
-            auth_token: AuthToken::Internal(auth.clone()),
-            job_id,
-            targets: targets.to_vec(),
-        };
-        match ask(context, node, job_id, request).await {
-            Some(JobResponse::KeysLocked(locked)) => {
-                // The answering node names its own keys only.
-                waits.extend(locked.into_iter().filter(|wait| wait.node_id == node));
-            }
-            Some(response) => {
-                warn!(job_id = %job_id, node = %node, ?response, "Key wait refused")
-            }
-            None => {}
-        }
-    }
-    waits
-}
-
-/// The job owner this node vouches for in key wait requests, signed in to `realm_id`.
-fn owner_auth(record: &JobRecord, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id: record.created_by,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    let serving = context.node_and_realm();
+    let ask = AskWaitsOperation::new(auth, job_id, node, targets, serving);
+    drive(ask, context).await.unwrap_or_default()
 }
 
 /// Key node: turns the registrations on `key` into owed wakes, in bounded pages.
