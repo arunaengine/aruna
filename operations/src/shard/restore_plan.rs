@@ -70,7 +70,7 @@ pub(crate) const RESTORE_UNIT_BUDGET: usize = 8;
 /// Topics per work unit; one unit still fills a document sync topic batch.
 pub(crate) const RESTORE_CHUNK_TOPICS: usize = 64;
 
-/// What a [`restore_shard_subscriptions`] pass touched. The load-bearing
+/// What a [`crate::shard::restore::RestoreTopicsOperation`] run touched. The load-bearing
 /// invariant is `shard_topics == held_shards`, i.e. one topic per held shard,
 /// never one per stored document, as asserted by the restart-traffic gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,7 +100,7 @@ pub struct ShardRestoreCursor {
     pub(crate) plan_hash: Option<[u8; 32]>,
 }
 
-/// What one bounded [`restore_shard_pass`] did.
+/// What one bounded [`crate::shard::restore::RestorePassOperation`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardRestorePass {
     pub summary: RestoreShardSummary,
@@ -241,7 +241,7 @@ pub(crate) fn restore_range(cursor: ShardRestoreCursor, units_total: usize) -> R
 
 /// One bounded unit of restore work: one co-holder group's ensure and sync over
 /// a chunk of topics.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RestoreUnit {
     pub(crate) kind: RestoreKind,
     pub(crate) peers: Vec<NodeId>,
@@ -355,7 +355,7 @@ impl ShardPlan {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct RestoreUnitOutcome {
     pub(crate) unresolved_topics: BTreeSet<::irokle::TopicId>,
     pub(crate) error: Option<RecoveryError>,

@@ -309,13 +309,17 @@ impl PublishUsageOperation {
         refresh: bool,
     ) -> Self {
         let serving_realm = context.node_and_realm().map(|(_, realm_id)| realm_id);
-        Self::with_generation(
-            (node_id, realm_id),
-            serving_realm,
-            full,
-            refresh,
-            Ulid::generate(),
-        )
+        Self::on_realm((node_id, realm_id), serving_realm, full, refresh)
+    }
+
+    /// A publish for a node that serves `serving_realm`, when it runs a net transport.
+    pub(super) fn on_realm(
+        keys: (NodeId, RealmId),
+        serving_realm: Option<RealmId>,
+        full: bool,
+        refresh: bool,
+    ) -> Self {
+        Self::with_generation(keys, serving_realm, full, refresh, Ulid::generate())
     }
 
     fn with_generation(

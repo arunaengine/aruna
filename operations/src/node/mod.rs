@@ -8,6 +8,7 @@ pub mod heartbeat;
 pub mod info;
 pub mod realm_usage;
 mod rebuild_counts;
+pub mod recovery_run;
 pub mod summary_refresh;
 pub mod usage_publish;
 pub mod usage_rebuild;
