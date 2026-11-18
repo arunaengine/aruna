@@ -17,6 +17,7 @@ use crate::metadata::create_entry::create_metadata_document;
 use crate::metadata::materialization_queue::process_materialization_batch;
 use crate::metadata::projector::drain_projection_queue;
 use crate::plugins::dataset::merge_into;
+use crate::plugins::host_calls::VisibleObjects;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::store::Txn;
@@ -241,6 +242,18 @@ async fn objects_broker(
     (RunBroker::new(broker.ctx.clone(), scope), installed)
 }
 
+/// The listed objects the broker's account may read in `bucket`.
+async fn visible(
+    broker: &RunBroker,
+    install: &PluginInstall,
+    bucket: &str,
+    listed: Vec<(String, u64, String)>,
+) -> Vec<aruna_plugins::broker::ObjectInfo> {
+    let place = (broker.scope.realm_id, broker.scope.local);
+    let visible = VisibleObjects::new(place, install, bucket, listed);
+    drive(visible, &broker.ctx).await.unwrap()
+}
+
 #[tokio::test]
 async fn object_paths() {
     // A key of bucket `data` never passes a grant for bucket `dataset`.
@@ -253,18 +266,9 @@ async fn object_paths() {
     let dataset = format!("/{realm}/g/{group}/data/{node}/dataset/**");
     let (objects, install) = objects_broker(&fixture, &broker, &[dataset]).await;
     let listed = vec![("set/private".to_string(), 1, "v1".to_string())];
-    assert!(
-        objects
-            .visible(&install, "data", listed)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(visible(&objects, &install, "data", listed).await.is_empty());
     let listed = vec![("private".to_string(), 1, "v1".to_string())];
-    let shown = objects
-        .visible(&install, "dataset", listed.clone())
-        .await
-        .unwrap();
+    let shown = visible(&objects, &install, "dataset", listed).await;
     // Listed objects of this node come back by their short bucket path.
     let path = "dataset/private".to_string();
     assert_eq!(
@@ -300,22 +304,13 @@ async fn listings_authorize() {
     fixture.deny(&[]).await;
     let (objects, install) = objects_broker(&fixture, &broker, &[data]).await;
     let listed = vec![("a.txt".to_string(), 1, "v1".to_string())];
-    let shown = objects
-        .visible(&install, "data", listed.clone())
-        .await
-        .unwrap();
+    let shown = visible(&objects, &install, "data", listed.clone()).await;
     assert_eq!(shown.len(), 1);
     fixture.deny(&["operation == 'plugin.objects.read'"]).await;
     let path = format!("/{realm}/g/{group}/data/{node}/data/a.txt");
     let refused = objects.objects_info(&cx(), &path, None).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Denied);
-    assert!(
-        objects
-            .visible(&install, "data", listed)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(visible(&objects, &install, "data", listed).await.is_empty());
 }
 
 #[tokio::test]

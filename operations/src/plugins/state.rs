@@ -277,7 +277,7 @@ impl Operation for RemoveState {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::plugins::broker::call_intent;
+    use crate::plugins::host_calls::call_intent;
     use crate::plugins::intents::{Begun, begin};
     use crate::plugins::rows::tests::{page_result, values_result};
     use crate::plugins::runs::tests::opened;

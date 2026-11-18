@@ -21,6 +21,7 @@ pub mod forward;
 pub mod grants;
 pub mod held;
 pub mod hooks;
+pub(crate) mod host_calls;
 pub mod install;
 pub mod intents;
 pub mod jobs;
