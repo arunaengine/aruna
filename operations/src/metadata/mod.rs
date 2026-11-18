@@ -15,7 +15,6 @@ pub mod create_entry;
 pub(crate) mod data_links;
 pub mod delete_document;
 pub mod device_pull;
-pub mod document_holder;
 pub mod forward;
 pub(crate) mod frames;
 pub mod get_document;

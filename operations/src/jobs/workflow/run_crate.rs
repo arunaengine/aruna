@@ -52,7 +52,7 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::create_entry::mint_job_document;
 use crate::metadata::forward::write::route_metadata_create;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
@@ -210,7 +210,7 @@ pub(crate) async fn record_crate(
     }
     // A re-driven job whose create already committed records it instead of importing again.
     if saved_id.is_some() {
-        match load_document_record(context, document_id).await {
+        match drive(DocumentRecordOperation::new(document_id), context).await {
             Ok(Some(record)) => {
                 let event_id = record.establishing_event_id;
                 return record_written(driver, (for_job, parent, spec), record, event_id).await;

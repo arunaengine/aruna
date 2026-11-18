@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 use crate::metadata::forward::read::export_profile_routed;
 use crate::metadata::raw_revision::load_raw_revision;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
 use aruna_core::profile_shapes::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
@@ -575,7 +576,7 @@ pub async fn current_validation_status(
     // A built-in Profile carries no id, so no registry row can age it out.
     let pinned = status.profile_id.zip(status.profile_revision.clone());
     if let Some((profile_id, validated_revision)) = pinned {
-        match load_document_record(context, profile_id)
+        match drive(DocumentRecordOperation::new(profile_id), context)
             .await
             .map_err(map_registry_error)
         {
@@ -745,7 +746,7 @@ async fn resolve_registered_profile(
     let Some(profile_id) = profile_from_iri(requested_iri) else {
         return Err(profile_not_registered(requested_iri));
     };
-    let record = match load_document_record(context, profile_id)
+    let record = match drive(DocumentRecordOperation::new(profile_id), context)
         .await
         .map_err(map_registry_error)
     {

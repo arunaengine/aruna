@@ -10,6 +10,7 @@ pub(crate) mod rewrite;
 pub mod upload;
 pub mod upload_store;
 
+use crate::metadata::record_reads::DocumentRecordOperation;
 use upload::UploadClaimError;
 use upload_store::{claim_rocrate_upload, delete_rocrate_upload};
 
@@ -1222,7 +1223,7 @@ async fn update_document(
             realm_id: spec.auth_context.realm_id,
         };
         let record =
-            crate::metadata::record_reads::load_document_record(&ctx.driver, spec.document_id)
+            drive(DocumentRecordOperation::new(spec.document_id), &ctx.driver)
                 .await
                 .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
         // The holder refuses the update inside its transaction when an edit landed after `base`.

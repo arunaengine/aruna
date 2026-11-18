@@ -2,10 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use super::snapshot::execute;
 use super::{GitError, records};
 use crate::driver::DriverContext;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
@@ -188,7 +189,7 @@ async fn drain(context: &DriverContext) {
         .map(Ulid::from_bytes)
         .collect();
     for id in documents {
-        let Ok(Some(document)) = load_document_record(context, id).await else {
+        let Ok(Some(document)) = drive(DocumentRecordOperation::new(id), context).await else {
             continue;
         };
         let _guard = store.lock(id).await;

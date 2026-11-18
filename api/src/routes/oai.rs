@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -23,7 +24,7 @@ use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
 use aruna_operations::metadata::forward::read::export_rocrate_routed;
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::visibility_index::{
     VisibilityError, earliest_visible, effective_datestamp, visible_page,
 };
@@ -598,7 +599,7 @@ async fn get_record(
     let Some(document_id) = parse_identifier(identifier) else {
         return Err(protocol("idDoesNotExist", "Unknown identifier"));
     };
-    let record = load_document_record(ctx.as_ref(), document_id)
+    let record = drive(DocumentRecordOperation::new(document_id), ctx.as_ref())
         .await
         .map_err(|_| OaiFault::Internal)?
         // A record from another realm is not this repository's to serve, and a

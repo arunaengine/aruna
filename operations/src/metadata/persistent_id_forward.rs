@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::resolve_metadata_id;
@@ -10,7 +11,7 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::PersistentIdOutcome;
 use crate::metadata::protocol::PersistentIdRequest;
 use crate::metadata::protocol::PersistentIdResolution;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::placement::process_placements::load_realm_config;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
@@ -497,7 +498,7 @@ pub(super) async fn local_pid_resolution(
     if !mapping.is_active() {
         return Ok(PersistentIdResolution::Missing);
     }
-    let record = load_document_record(context.as_ref(), document_id)
+    let record = drive(DocumentRecordOperation::new(document_id), context.as_ref())
         .await
         .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     // An active mapping without a registry row is a permanent 410 only once this node has

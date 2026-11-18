@@ -19,7 +19,7 @@ use super::{
     read_document_registry, replica_query_nodes, warn,
 };
 use crate::driver::{DriverContext, drive};
-use crate::metadata::record_reads::{load_document_record, record_materialized_read};
+use crate::metadata::record_reads::{DocumentRecordOperation, RecordMaterializedOperation};
 use crate::realm::load_config::load_realm_config;
 
 use super::distributed::run_query_distributed;
@@ -385,7 +385,7 @@ pub(crate) async fn load_live_record(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    match load_document_record(context, document_id).await {
+    match drive(DocumentRecordOperation::new(document_id), context).await {
         Ok(Some(record)) => drive(LiveRecordsOperation::new(vec![record], None), context)
             .await?
             .into_iter()
@@ -429,7 +429,7 @@ pub(super) async fn ensure_record_materialized(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Result<(), MetadataApiError> {
-    match record_materialized_read(context, record).await {
+    match drive(RecordMaterializedOperation::new(record), context).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(MetadataApiError::ServiceUnavailable),
         Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),

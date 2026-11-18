@@ -53,7 +53,7 @@ use aruna_operations::metadata::create_document::{
     mint_local_document,
 };
 use aruna_operations::metadata::forward::write::{route_metadata_create, route_metadata_update};
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
@@ -1007,7 +1007,7 @@ async fn registry_record(
     node: &TestNode,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, Box<dyn std::error::Error>> {
-    load_document_record(node.context.as_ref(), document_id)
+    drive(DocumentRecordOperation::new(document_id), node.context.as_ref())
         .await
         .map_err(|error| format!("metadata registry read failed: {error:?}").into())
 }

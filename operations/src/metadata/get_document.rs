@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -157,7 +158,7 @@ impl Operation for GetDocumentOperation {
 #[cfg(test)]
 mod tests {
     use crate::driver::DriverContext;
-    use crate::metadata::record_reads::record_materialized_read;
+    use crate::metadata::record_reads::RecordMaterializedOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
     use aruna_core::metadata::{MaterializationState, MaterializationStatusRecord};
@@ -241,10 +242,10 @@ mod tests {
             .await;
 
         let stale = make_record(document_id, Ulid::generate());
-        assert!(!record_materialized_read(&context, &stale).await.unwrap());
+        assert!(!drive(RecordMaterializedOperation::new(&stale), &context).await.unwrap());
 
         let current = make_record(document_id, materialized_event);
-        assert!(record_materialized_read(&context, &current).await.unwrap());
+        assert!(drive(RecordMaterializedOperation::new(&current), &context).await.unwrap());
     }
 
     mod calls {

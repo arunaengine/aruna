@@ -51,7 +51,7 @@ use aruna_operations::metadata::forward::write::{
     route_metadata_update,
 };
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
@@ -892,7 +892,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
         || registry_row_present(bystander, document_id),
     )
     .await?;
-    let record = load_document_record(bystander.context.as_ref(), document_id)
+    let record = drive(DocumentRecordOperation::new(document_id), bystander.context.as_ref())
         .await
         .map_err(|error| format!("registry read failed: {error:?}"))?
         .ok_or("the non-holder must carry the registry row")?;
@@ -939,7 +939,7 @@ async fn bystander_writes_forward() -> TestResult<()> {
     );
 
     let stale = realm.find(holders[0]);
-    let stale_record = load_document_record(stale.context.as_ref(), document_id)
+    let stale_record = drive(DocumentRecordOperation::new(document_id), stale.context.as_ref())
         .await
         .map_err(|error| format!("registry read failed: {error:?}"))?
         .ok_or("the holder must carry the registry row")?;
@@ -1294,7 +1294,7 @@ async fn delete_routed(node: &TestNode, realm: &Topology, document_id: Ulid) -> 
 }
 
 async fn registry_row_present(node: &TestNode, document_id: Ulid) -> bool {
-    load_document_record(node.context.as_ref(), document_id)
+    drive(DocumentRecordOperation::new(document_id), node.context.as_ref())
         .await
         .is_ok_and(|record| record.is_some())
 }

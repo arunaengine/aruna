@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::metadata::document_holder::choose_holder;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -36,7 +35,10 @@ use aruna_operations::metadata::api::fanout::lookup_identifier_distributed;
 use aruna_operations::metadata::persistent_id::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
+use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
+use aruna_core::NodeId;
+use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::secondary_ids::IdentifierMatch;
 
 use crate::auth::UnrestrictedAuth;
@@ -635,7 +637,7 @@ pub(crate) async fn list_persistent_ids(
 ) -> ServerResult<Json<Vec<PersistentView>>> {
     let document_id = Ulid::from_string(&document_id).map_err(|_| ServerError::BadRequest)?;
     let ctx = state.get_ctx();
-    let record = load_document_record(&ctx, document_id)
+    let record = drive(DocumentRecordOperation::new(document_id), &ctx)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let routed = read_pid_routed(&ctx, state.get_realm_id(), document_id).await;
@@ -1308,4 +1310,22 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{rest}");
         }
     }
+}
+
+/// The holder that should serve `document_id`, or `None` to serve it here: this node holds
+/// no registry record of it, no holder is a fresh candidate, or this node was chosen. Of two
+/// random fresh holders, the one with more free download slots wins; it never chooses again.
+async fn choose_holder(
+    context: &DriverContext,
+    local_node_id: NodeId,
+    document_id: Ulid,
+    now_ms: u64,
+) -> Option<HolderCandidate> {
+    let record = drive(DocumentRecordOperation::new(document_id), context)
+        .await
+        .ok()??;
+    let choice = HolderChoiceOperation::new(&record.holder_node_ids, now_ms);
+    let candidates = drive(choice, context).await.unwrap_or_default();
+    pick(candidates, Ulid::generate().random())
+        .filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
 }

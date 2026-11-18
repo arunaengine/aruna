@@ -17,7 +17,7 @@ use crate::metadata::protocol::MAX_DEVICE_GROUPS;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::RealmDocuments;
 use crate::metadata::raw_revision::load_raw_view;
-use crate::metadata::record_reads::record_materialized_read;
+use crate::metadata::record_reads::RecordMaterializedOperation;
 use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
@@ -408,7 +408,7 @@ async fn scaffold_display(
         .metadata_handle
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
-    if !record_materialized_read(context.as_ref(), record)
+    if !drive(RecordMaterializedOperation::new(record), context.as_ref())
         .await
         .map_err(|_| SyncRefusal::Unavailable)?
     {

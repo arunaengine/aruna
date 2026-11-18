@@ -21,7 +21,7 @@ use crate::metadata::live_records::LiveRecordsOperation;
 use crate::metadata::profile::rules::{
     PROFILE_TYPE_IRI, collect_conforms_terms, jsonld_contains_iri,
 };
-use crate::metadata::record_reads::record_materialized_read;
+use crate::metadata::record_reads::RecordMaterializedOperation;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 
 const COUNT_PAGE_SIZE: usize = 1_000;
@@ -162,7 +162,7 @@ pub async fn count_group_purpose(
         .collect::<Vec<_>>();
 
     let classifications = stream::iter(records.into_iter().map(|record| async move {
-        if !record_materialized_read(context, &record)
+        if !drive(RecordMaterializedOperation::new(&record), context)
             .await
             .map_err(|error| match error {
                 StorageReadError::Storage(error) => MetadataApiError::Internal(error.to_string()),

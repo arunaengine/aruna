@@ -36,7 +36,7 @@ use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::raw_revision::load_raw_revision;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::realm::load_config::load_realm_config;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 use aruna_core::placement::holds_placement;
@@ -124,7 +124,7 @@ async fn check_link(
         _ => return drop_entry().await,
     };
     // A deleted dataset takes its links and their sealed tokens along; remote records stay.
-    let record = load_document_record(context, entry.document_id)
+    let record = drive(DocumentRecordOperation::new(entry.document_id), context)
         .await
         .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?;
     if record.is_none() {
@@ -324,7 +324,7 @@ async fn push_revision(
     if let Some(revision) = raw {
         return Ok(Some((revision.winning_event_id, revision.dataset_digest)));
     }
-    let record = load_document_record(context, document_id)
+    let record = drive(DocumentRecordOperation::new(document_id), context)
         .await
         .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?;
     Ok(record.map(|record| (record.last_event_id, None)))

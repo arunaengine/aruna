@@ -34,7 +34,7 @@ use aruna_operations::metadata::persistent_id::forward::{
 };
 use aruna_operations::metadata::persistent_id::read_mapping;
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use ulid::Ulid;
 
@@ -952,7 +952,7 @@ async fn seed_document(
 }
 
 async fn registry_present(context: &DriverContext, document_id: Ulid) -> bool {
-    load_document_record(context, document_id)
+    drive(DocumentRecordOperation::new(document_id), context)
         .await
         .is_ok_and(|record| record.is_some())
 }
@@ -961,7 +961,7 @@ async fn registry_record(
     node: &TestNode,
     document_id: Ulid,
 ) -> Option<aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord> {
-    load_document_record(node.context.as_ref(), document_id)
+    drive(DocumentRecordOperation::new(document_id), node.context.as_ref())
         .await
         .ok()
         .flatten()

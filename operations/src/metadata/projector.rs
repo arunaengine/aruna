@@ -44,7 +44,7 @@ use ulid::Ulid;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{
     StorageReadError, create_materialization_entries, create_outbox_entries, create_outbox_record,
     parse_status_read, read_status_effect, registry_outbox_record, schedule_materialization,
@@ -429,7 +429,7 @@ pub async fn project_create_events(
             let existing_registry = match registry_cache.get(&document_id) {
                 Some(record) => record.clone(),
                 None => {
-                    let record = load_document_record(context, document_id).await?;
+                    let record = drive(DocumentRecordOperation::new(document_id), context).await?;
                     registry_cache.insert(document_id, None);
                     record
                 }
@@ -447,7 +447,7 @@ pub async fn project_create_events(
         let existing_registry = match registry_cache.get(&document_id) {
             Some(record) => record.clone(),
             None => {
-                let record = load_document_record(context, document_id).await?;
+                let record = drive(DocumentRecordOperation::new(document_id), context).await?;
                 registry_cache.insert(document_id, record.clone());
                 record
             }

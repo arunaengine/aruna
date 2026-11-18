@@ -37,7 +37,7 @@ use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDoc
 use aruna_operations::metadata::forward::write::{
     CreateAuthorizedError, create_metadata_authorized,
 };
-use aruna_operations::metadata::record_reads::load_document_record as load_metadata_record_by_document_from_operations;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
@@ -439,7 +439,7 @@ pub(crate) async fn local_write_record(
         return Ok(None);
     }
     let record =
-        match load_metadata_record_by_document_from_operations(context.as_ref(), document_id).await
+        match drive(DocumentRecordOperation::new(document_id), context.as_ref()).await
         {
             Ok(Some(record)) => record,
             Ok(None) => return Ok(None),
@@ -472,7 +472,7 @@ pub(crate) async fn load_document_record(
     document_id: Ulid,
 ) -> ServerResult<MetadataRegistryRecord> {
     let ctx = state.get_ctx();
-    match load_metadata_record_by_document_from_operations(ctx.as_ref(), document_id).await {
+    match drive(DocumentRecordOperation::new(document_id), ctx.as_ref()).await {
         Ok(Some(record)) => Ok(record),
         Ok(None) => Err(ServerError::NotFound),
         Err(ReadError::Storage(error)) => Err(ServerError::InternalError(error.into())),

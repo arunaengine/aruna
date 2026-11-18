@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::collections::HashSet;
 use std::future::Future;
 use std::time::{Duration, SystemTime};
@@ -51,7 +52,7 @@ use crate::metadata::create_entry::mint_job_document;
 use crate::metadata::forward::write::{
     route_metadata_create, route_metadata_delete, route_metadata_update,
 };
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use aruna_core::metadata::AuthToken;
 
@@ -407,7 +408,7 @@ async fn read_stored(
     ctx: &JobContext,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
-    load_document_record(&ctx.driver, document_id)
+    drive(DocumentRecordOperation::new(document_id), &ctx.driver)
         .await
         .map_err(|error| retryable(format!("harvest record read: {error:?}")))
 }
