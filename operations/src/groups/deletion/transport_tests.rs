@@ -11,6 +11,8 @@ use aruna_core::structs::identity::group_delete::{
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 
+use ulid::Ulid;
+
 use super::tests::{Fixture, read};
 use crate::metadata::MetadataHandle;
 use crate::sync::incoming::initialize_incoming_fixture;
@@ -72,7 +74,7 @@ async fn peers_delete_together() {
         &second_context
     };
     for _ in 0..2 {
-        crate::driver::drive(super::DeleteGroupOperation::new((context.node_and_realm(), auth.clone(), None, group_id, Ulid::generate()), context)
+        crate::driver::drive(super::DeleteGroupOperation::new(context.node_and_realm(), auth.clone(), None, group_id, Ulid::generate()), context)
             .await
             .unwrap();
     }

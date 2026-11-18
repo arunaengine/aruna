@@ -47,7 +47,13 @@ fn config() -> RealmConfigDocument {
 }
 
 fn group() -> Group {
-    Group::new(group_id(), realm(), "group".to_string(), auth().user_id)
+    Group {
+        display_name: "group".to_string(),
+        group_id: group_id(),
+        realm_id: realm(),
+        roles: Default::default(),
+        owner: auth().user_id,
+    }
 }
 
 fn answer<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {

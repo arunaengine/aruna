@@ -35,7 +35,6 @@ use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
-use aruna_operations::placement::provision::allocate_placement_binding;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::RealmPresence;
@@ -53,6 +52,7 @@ use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 use tower::ServiceExt;
 use ulid::Ulid;
+use aruna_operations::placement::provision::AllocateBindingOperation;
 
 async fn setup_state() -> (Arc<ServerState>, TempDir) {
     let (tempdir, storage_handle) = test_storage();
@@ -728,13 +728,7 @@ fn placement_strategy(strategy_id: Ulid) -> RealmPlacementStrategy {
 }
 
 async fn provision_strategy(state: &ServerState, actor: Actor, strategy_id: Ulid) {
-    allocate_placement_binding(
-        state.get_ctx().as_ref(),
-        actor.clone(),
-        PlacementScope::Realm(actor.realm_id),
-        DocumentClass::Metadata,
-        strategy_id,
-    )
+    drive(AllocateBindingOperation::new(actor.clone(), PlacementScope::Realm(actor.realm_id), DocumentClass::Metadata, strategy_id), state.get_ctx().as_ref())
     .await
     .unwrap();
 }

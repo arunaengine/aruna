@@ -35,8 +35,6 @@ use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
-use aruna_operations::placement::mutation::drive_placement_mutation;
-use aruna_operations::placement::provision::provision_metadata_binding;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
@@ -65,6 +63,8 @@ use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use aruna_operations::placement::mutation::PlacementMutationOperation;
+use aruna_operations::placement::provision::ProvisionBindingOperation;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -1673,11 +1673,7 @@ pub async fn mutate_realm_placement(
                 Permission::WRITE,
             )
             .await?;
-            drive_placement_mutation(
-                MutatePlacementConfig { actor, mutation },
-                Some(auth),
-                &context,
-            )
+            drive(PlacementMutationOperation::new(MutatePlacementConfig { actor, mutation }, Some(auth), context.node_and_realm().map(|(node_id, _)| node_id)), &context)
             .await
             .map_err(map_placement_error)?
         }
@@ -1690,7 +1686,7 @@ pub async fn mutate_realm_placement(
             let scope = group_id
                 .map(PlacementScope::Group)
                 .unwrap_or(PlacementScope::Realm(actor.realm_id));
-            provision_metadata_binding(context.as_ref(), actor.clone(), scope, strategy_id)
+            drive(ProvisionBindingOperation::new(actor.clone(), scope, strategy_id), context.as_ref())
                 .await
                 .map_err(map_handle_error)?;
             drive(GetConfigOperation::new(actor.realm_id), &context)

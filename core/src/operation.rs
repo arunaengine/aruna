@@ -16,6 +16,8 @@ pub enum HoldScope {
     /// The document reconcile of `net`, which also excludes its shard membership changes and
     /// topic evictions.
     DocumentReconcile,
+    /// Drawing placement handles and provisioning bindings on this node.
+    PlacementHandles,
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the

@@ -789,6 +789,16 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Creates shared sync topics with these peers; answers `NetEvent::TopicPeers`.
+    EnsureTopics {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Lets these peers into existing sync topics; answers `NetEvent::TopicPeers`.
+    AllowTopicPeers {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
     /// Signs this node's statement that it is ready for a group deletion plan; answers
     /// `NetEvent::DeletePlanSigned`.
     SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),

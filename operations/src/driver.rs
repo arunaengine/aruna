@@ -1196,6 +1196,11 @@ async fn take_hold(
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     match scope? {
         HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
+        HoldScope::PlacementHandles => {
+            static HOLD: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+                std::sync::OnceLock::new();
+            Some(HOLD.get_or_init(Default::default).clone().lock_owned().await)
+        }
     }
 }
 

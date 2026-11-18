@@ -1113,6 +1113,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Release(_)) => "release",
         Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
         Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
+        Effect::Net(NetEffect::EnsureTopics { .. }) => "ensure_topics",
+        Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
         Effect::Net(NetEffect::AuthorizeWritePeer { .. }) => "authorize_write_peer",
         Effect::Net(NetEffect::RevocationClaims(_)) => "revocation_claims",
         Effect::Net(NetEffect::Notification(_)) => "notification",

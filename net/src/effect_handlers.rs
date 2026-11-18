@@ -257,6 +257,11 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             )),
         })),
         // Notification requests and inbox wakes need the net handle, which the runner holds.
+        NetEffect::EnsureTopics { .. } | NetEffect::AllowTopicPeers { .. } => {
+            NetEvent::TopicPeers(Err(aruna_core::events::TopicPeerError::Failed(
+                "topic peers must be set by the operations runner".to_string(),
+            )))
+        }
         NetEffect::AuthorizeWritePeer { .. } => NetEvent::WritePeerChecked(Err(
             aruna_core::events::WritePeerRefusal::Unavailable(
                 "peer checks must be dispatched by the operations runner".to_string(),
@@ -602,6 +607,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Release(_) => "release",
         NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::MetadataRequest(_) => "metadata_request",
+        NetEffect::EnsureTopics { .. } => "ensure_topics",
+        NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",
         NetEffect::AuthorizeWritePeer { .. } => "authorize_write_peer",
         NetEffect::RevocationClaims(_) => "revocation_claims",
         NetEffect::Notification(_) => "notification",

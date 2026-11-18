@@ -36,7 +36,7 @@ use aruna_operations::placement::policy::read::{
 };
 use aruna_operations::placement::policy::{
     PolicyForwardError, PolicyGateError, QuarantineError, ResolveQuarantineConfig,
-    ResolveQuarantineOperation, create_policy_routed,
+    ResolveQuarantineOperation, CreateRoutedOperation,
 };
 use aruna_operations::s3::bucket::placement::{
     PutPlacementError, PutPlacementInput, PutPlacementOperation,
@@ -62,6 +62,7 @@ use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use aruna_operations::forward::routing::HolderWriteError;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -486,8 +487,8 @@ fn map_create_error(error: PolicyForwardError) -> ServerError {
         PolicyForwardError::Create(CreatePolicyError::Policy(reason)) => {
             ServerError::BadRequestReason(reason.to_string())
         }
-        PolicyForwardError::Forward(MetadataWriteError::Unauthorized) => ServerError::Unauthorized,
-        PolicyForwardError::Forward(MetadataWriteError::Forbidden) => ServerError::Forbidden,
+        PolicyForwardError::Forward(HolderWriteError::Unauthorized) => ServerError::Unauthorized,
+        PolicyForwardError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
         other => ServerError::ServiceUnavailableReason(other.to_string()),
     }
 }
@@ -782,11 +783,10 @@ pub async fn create_placement_policy(
         policy,
         created_at_ms: unix_timestamp_millis(),
     };
-    let document = create_policy_routed(
-        &state.get_ctx(),
-        config,
-        forwarded_auth_token(bearer_token)?,
-    )
+    let ctx = state.get_ctx();
+    let local = ctx.node_and_realm().map(|(node_id, _)| node_id);
+    let create = CreateRoutedOperation::new(config, forwarded_auth_token(bearer_token)?, local);
+    let document = aruna_operations::driver::drive(create, &ctx)
     .await
     .map_err(map_create_error)?;
     Ok(Json(policy_response(&document)?))

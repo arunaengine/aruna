@@ -504,6 +504,8 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// Whether sync topics took the requested peers.
+    TopicPeers(Result<(), TopicPeerError>),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
     /// The caller a forwarded credential names, or why the peer may not act for it.
@@ -512,6 +514,13 @@ pub enum NetEvent {
     RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
+}
+
+/// Why sync topics did not take the requested peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TopicPeerError {
+    NoNetwork,
+    Failed(String),
 }
 
 /// Why a forwarded credential was not accepted.
@@ -936,6 +945,7 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    TopicPeers,
                     DeletePlanSigned,
                     WritePeerChecked,
                     RevocationClaims,

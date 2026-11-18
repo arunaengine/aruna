@@ -946,10 +946,14 @@ impl MetadataHandle {
                 }
             }
             forward @ MetadataTransportMessage::ForwardCreatePolicy { .. } => {
-                Box::pin(async {
-                    crate::placement::policy::apply_forwarded_policy(context, peer, forward).await
-                })
-                .await
+                let apply = crate::placement::policy::ApplyPolicyOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| reject(error.to_string()))
             }
             pull @ MetadataTransportMessage::ForwardSyncPull { .. } => {
                 Box::pin(async {

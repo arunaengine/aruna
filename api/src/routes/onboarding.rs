@@ -28,7 +28,7 @@ use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
 use aruna_operations::onboarding::finalize_bootstrap::{
-    BootstrapFinalizeError, BootstrapFinalizeInput, bootstrap_onboarding_finalize,
+    BootstrapFinalizeError, BootstrapFinalizeInput, FinalizeBootstrapOperation,
 };
 use aruna_operations::onboarding::inspect_secret::{
     InspectSecretError, InspectSecretInput, InspectSecretOperation,
@@ -800,8 +800,8 @@ pub async fn bootstrap_onboarding(
         _ => return Err(ServerError::Forbidden),
     };
 
-    let finalized = bootstrap_onboarding_finalize(
-        BootstrapFinalizeInput {
+    let finalized = aruna_operations::driver::drive(
+        FinalizeBootstrapOperation::new(BootstrapFinalizeInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
             node_id,
@@ -812,8 +812,8 @@ pub async fn bootstrap_onboarding(
             node_location: request.node_location.clone(),
             node_weight: request.node_weight,
             node_labels: request.node_labels.clone(),
-        },
-        state.get_ctx(),
+        }),
+        &state.get_ctx(),
     )
     .await
     .map_err(map_finalize_error)?;

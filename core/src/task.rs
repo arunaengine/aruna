@@ -108,6 +108,8 @@ pub struct PersistedTaskTimer {
 pub enum TaskEffect {
     ResetTimer { key: TaskKey, after: Duration },
     ShortenTimer { key: TaskKey, after: Duration },
+    /// Arms the timer only when none is set and no handler of the key is running.
+    ArmIdleTimer { key: TaskKey, after: Duration },
     CancelTimer { key: TaskKey },
     AbortRunningHandlers { key: TaskKey },
 }
