@@ -5,9 +5,9 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -22,9 +22,8 @@ use aruna_core::structs::storage::usage::{
     usage_node_id,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use thiserror::Error;
@@ -194,48 +193,6 @@ fn merge_entry(entries: &mut Vec<(Vec<u8>, UsageDelta)>, key: Vec<u8>, delta: Us
     match entries.iter_mut().find(|(existing, _)| *existing == key) {
         Some((_, existing)) => *existing = existing.merge(delta),
         None => entries.push((key, delta)),
-    }
-}
-
-/// Books one multipart upload record of `bucket` created (`1`) or removed (`-1`) in `txn_id`;
-/// storage answers with `BatchWriteResult`.
-pub fn count_upload(bucket: &str, uploads: i128, txn_id: TxnId) -> Effect {
-    let delta = BucketDelta {
-        open_uploads: uploads,
-        ..Default::default()
-    };
-    Effect::Storage(StorageEffect::AddUsage {
-        key_space: USAGE_STATS_KEYSPACE.to_string(),
-        deltas: Vec::new(),
-        buckets: vec![(usage_bucket_key(bucket).into(), delta)],
-        txn_id,
-    })
-}
-
-/// Commits one counter update in its own transaction, as a writer's commit would.
-#[cfg(test)]
-#[derive(Debug, PartialEq)]
-pub(crate) struct ApplyUsage(pub(crate) UsageCounterUpdate);
-
-#[cfg(test)]
-impl aruna_core::operation::Operation for ApplyUsage {
-    type Output = ();
-    type Error = UsageUpdateError;
-
-    fn first(&mut self) -> Result<aruna_core::calls::Next<()>, UsageUpdateError> {
-        let call = self.0.start_calls().into_call();
-        Ok(aruna_core::calls::Next::Call(call))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<aruna_core::calls::Next<()>, UsageUpdateError> {
-        Ok(match self.0.step_calls(result)? {
-            Some(call) => aruna_core::calls::Next::Call(call.into_call()),
-            None => aruna_core::calls::Next::Done(()),
-        })
-    }
-
-    fn transaction(&self) -> aruna_core::operation::TransactionMode {
-        aruna_core::operation::TransactionMode::Write
     }
 }
 
@@ -433,42 +390,6 @@ impl UsageCounterUpdate {
             self.phase = UsageUpdatePhase::Done;
         }
         call
-    }
-
-    pub fn start(&mut self, txn_id: TxnId) -> Effects {
-        match self.start_calls().into_effect(txn_id) {
-            Ok(effect) => smallvec![effect],
-            // The counter addition is always a storage call.
-            Err(_) => smallvec![],
-        }
-    }
-
-    /// Returns `Ok(Some(effects))` while more storage work is needed and
-    /// `Ok(None)` once the update is staged in the transaction.
-    pub fn step(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-    ) -> Result<Option<Effects>, UsageUpdateError> {
-        let result = match (&self.phase, event) {
-            (UsageUpdatePhase::Inventory, event) => {
-                let inventory = self.inventory.as_mut().ok_or(IoError::Unfinished)?;
-                let next = inventory.step(event, txn_id)?;
-                if next.is_none() {
-                    self.phase = UsageUpdatePhase::Done;
-                }
-                return Ok(next);
-            }
-            (
-                UsageUpdatePhase::Adding | UsageUpdatePhase::Writing,
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => IoResult::Done,
-            (_, received) => return Err(UsageUpdateError::UnexpectedEvent(received.label())),
-        };
-        match self.step_calls(result)? {
-            Some(call) => Ok(Some(smallvec![call.into_effect(txn_id)?])),
-            None => Ok(None),
-        }
     }
 
     pub fn is_done(&self) -> bool {
@@ -694,36 +615,6 @@ impl QuotaGate {
                 Err(QuotaGateError::UnexpectedEvent(result.label()))
             }
         }
-    }
-
-    pub fn start(&mut self, txn_id: TxnId) -> Effects {
-        let call = StagedCall::InTransaction(self.start_calls());
-        call.into_effect(txn_id).into_iter().collect()
-    }
-
-    /// Returns `Ok(Some(effects))` while more storage work is needed and
-    /// `Ok(None)` once the group's realm-wide usage has been summed.
-    pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, QuotaGateError> {
-        // The gate's reads go out as batch reads, so a single read is answered as a batch.
-        let result = match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
-            }
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => IoResult::Page {
-                rows: values,
-                next: next_start_after,
-            },
-            received => return Err(QuotaGateError::UnexpectedEvent(received.label())),
-        };
-        let Some(call) = self.step_calls(result)? else {
-            return Ok(None);
-        };
-        let effect = StagedCall::InTransaction(call).into_effect(txn_id);
-        let effect = effect.map_err(|_| QuotaGateError::UnexpectedEvent("a gate storage call"))?;
-        Ok(Some(smallvec![effect]))
     }
 
     /// Deducts only shares, this node's own included, computed under the newest record known for
@@ -995,6 +886,8 @@ mod tests {
     };
     use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::s3::bucket::create::CreateBucketOperation;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
         UPLOAD_KEYSPACE,
@@ -1021,6 +914,7 @@ mod tests {
         SUMMARY_GLOBAL_KEY, global_shard_keys, usage_global_key, usage_snapshot_key,
         usage_summary_key,
     };
+    use aruna_core::types::TxnId;
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -1071,44 +965,26 @@ mod tests {
         assert!(!complete.is_rebuilding());
     }
 
-    // The event path answers the gate's batch reads: every read of the gate goes out as a batch
-    // read of one row in the host's transaction, and its answer moves the gate on.
+    // Every read of the gate goes out as one call, and its answer moves the gate on.
     #[test]
     fn gate_reads_batches() {
         let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let group_id = Ulid::from_bytes([2; 16]);
-        let txn_id = Ulid::from_bytes([1; 16]);
-        let batch = |value: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![(Key::from(b"row".to_vec()), value.map(Into::into))],
-            })
-        };
-        let read_in_txn = |effects: &[Effect]| {
-            matches!(
-                effects,
-                [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: Some(read) })]
-                    if reads.len() == 1 && *read == txn_id
-            )
-        };
         let mut gate = QuotaGate::new(10, 4, group_id, node_id);
-        assert!(read_in_txn(&gate.start(txn_id)));
+        gate.start_calls();
         // No rebuild runs, so the gate reads the group's counters next.
-        let next = gate.step(batch(None), txn_id).unwrap().unwrap();
-        assert!(read_in_txn(&next));
-        let next = gate.step(batch(Some(logical(3).to_bytes().unwrap())), txn_id);
-        assert!(matches!(
-            next.unwrap().as_deref(),
-            Some([Effect::Storage(StorageEffect::Iter { .. })])
-        ));
-        let scanned = Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        });
-        assert_eq!(gate.step(scanned, txn_id).unwrap(), None);
+        gate.step_calls(row(None)).unwrap();
+        gate.step_calls(row(Some(logical(3).to_bytes().unwrap())))
+            .unwrap();
+        let scanned = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(gate.step_calls(scanned), Ok(None));
         assert_eq!(gate.projected_usage(), 7);
         assert!(!gate.is_exceeded());
 
-        // The same reads in call form.
+        // A larger write no longer fits.
         let mut gate = QuotaGate::new(10, 8, group_id, node_id);
         assert!(matches!(gate.start_calls(), IoCall::Read(_)));
         assert!(matches!(
@@ -1358,7 +1234,6 @@ mod tests {
     #[test]
     fn update_applies_deltas() {
         let group_id = Ulid::generate();
-        let txn_id = Ulid::generate();
         let mut update = UsageCounterUpdate::for_group(
             group_id,
             UsageDelta {
@@ -1368,9 +1243,9 @@ mod tests {
             },
         );
 
-        let effects = update.start(txn_id);
-        let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
-            panic!("expected the counter deltas, got {effects:?}");
+        let StagedCall::InTransaction(IoCall::AddUsage { deltas, .. }) = update.start_calls()
+        else {
+            panic!("expected the counter deltas");
         };
         let expected = UsageDelta {
             objects: 1,
@@ -1379,22 +1254,15 @@ mod tests {
         };
         assert_eq!(
             deltas,
-            &vec![
+            vec![
                 (global_group_key(group_id).into(), expected),
                 (usage_group_key(group_id).into(), expected),
             ]
         );
 
-        let effects = update
-            .step(
-                Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }),
-                txn_id,
-            )
-            .unwrap()
-            .unwrap();
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+        let Some(StagedCall::InTransaction(IoCall::Write(writes))) =
+            update.step_calls(IoResult::Done).unwrap()
+        else {
             panic!("expected the dirty marker write");
         };
         assert!(
@@ -1403,14 +1271,7 @@ mod tests {
                 .all(|(key_space, ..)| key_space == NODE_STATS_KEYSPACE)
         );
 
-        let done = update
-            .step(
-                Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }),
-                txn_id,
-            )
-            .unwrap();
+        let done = update.step_calls(IoResult::Done).unwrap();
         assert!(done.is_none());
         assert!(update.is_done());
     }
@@ -1426,14 +1287,11 @@ mod tests {
         };
         let update = UsageCounterUpdate::for_group(group_id, delta);
         let mut update = update.in_bucket("data", RowChange::RemovedVersion);
-        let effects = update.start(Ulid::generate());
-        let [
-            Effect::Storage(StorageEffect::AddUsage {
-                deltas, buckets, ..
-            }),
-        ] = effects.as_slice()
+        let StagedCall::InTransaction(IoCall::AddUsage {
+            deltas, buckets, ..
+        }) = update.start_calls()
         else {
-            panic!("expected the counter deltas, got {effects:?}");
+            panic!("expected the counter deltas");
         };
         assert_eq!(deltas.len(), 2);
         let bucket = BucketDelta {
@@ -1442,7 +1300,7 @@ mod tests {
             logical_bytes: -42,
             ..Default::default()
         };
-        assert_eq!(buckets, &vec![(usage_bucket_key("data").into(), bucket)]);
+        assert_eq!(buckets, vec![(usage_bucket_key("data").into(), bucket)]);
 
         // A marker alone moves no group counter, yet the update still books it.
         let update = UsageCounterUpdate::for_group(group_id, UsageDelta::default());
@@ -1452,9 +1310,9 @@ mod tests {
         // The reclaim sweep's physical debit names no group, so no bucket row moves.
         let stored = StoredDelta::new([1; 32], BackendRef::node_default(), -1, -5);
         let mut update = UsageCounterUpdate::for_stored(stored).in_bucket("data", RowChange::Kept);
-        let effects = update.start(Ulid::generate());
-        let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice() else {
-            panic!("expected the counter deltas, got {effects:?}");
+        let StagedCall::InTransaction(IoCall::AddUsage { buckets, .. }) = update.start_calls()
+        else {
+            panic!("expected the counter deltas");
         };
         assert!(buckets.is_empty());
     }
@@ -1475,17 +1333,16 @@ mod tests {
             assert_eq!(RowChange::written(existing, marker), row);
             let update = UsageCounterUpdate::for_group(group_id, UsageDelta::default());
             let mut update = update.in_bucket("data", row);
-            let effects = update.start(Ulid::generate());
-            let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice()
+            let StagedCall::InTransaction(IoCall::AddUsage { buckets, .. }) = update.start_calls()
             else {
-                panic!("expected the counter deltas, got {effects:?}");
+                panic!("expected the counter deltas");
             };
             let delta = BucketDelta {
                 versions,
                 delete_markers,
                 ..Default::default()
             };
-            assert_eq!(buckets, &vec![(usage_bucket_key("data").into(), delta)]);
+            assert_eq!(buckets, vec![(usage_bucket_key("data").into(), delta)]);
         }
     }
 
@@ -2093,21 +1950,17 @@ mod tests {
     #[test]
     fn additions_keep_share() {
         let group_id = Ulid::from_bytes([2; 16]);
-        let txn_id = Ulid::from_bytes([1; 16]);
         let markers = |logical_bytes| {
             let delta = UsageDelta {
                 logical_bytes,
                 ..Default::default()
             };
             let mut update = UsageCounterUpdate::for_group(group_id, delta);
-            update.start(txn_id);
-            let added = Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            });
-            let effects = update.step(added, txn_id).unwrap().unwrap();
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
+            update.start_calls();
+            let Some(StagedCall::InTransaction(IoCall::Write(writes))) =
+                update.step_calls(IoResult::Done).unwrap()
             else {
-                panic!("the update writes its markers: {effects:?}");
+                panic!("the update writes its markers");
             };
             writes
                 .iter()
