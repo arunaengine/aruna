@@ -809,7 +809,7 @@ async fn scaffold_link_checked() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn admins_read_pushes() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_operations::jobs::service::{JobReportLookup, read_job_routed, read_report_routed};
+    use crate::job_calls::{JobReportLookup, read_job_routed, read_report_routed};
 
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;

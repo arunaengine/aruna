@@ -9,6 +9,15 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 
 use super::*;
+use crate::driver::{DriverContext, drive};
+use crate::jobs::job_cancel::{CancelJobOutcome, CancelOwnedOperation};
+use crate::jobs::job_delete::DeleteOwnedOperation;
+use crate::jobs::job_reports::{
+    JobReportLookup, JobReportOperation, ReportQuery, ReportRouteOperation,
+};
+use crate::jobs::runtime::JobsRuntime;
+use crate::jobs::store::RunDelete;
+use aruna_core::time::unix_timestamp_millis;
 
 pub(crate) fn realm() -> RealmId {
     RealmId([1u8; 32])
@@ -63,6 +72,63 @@ pub(crate) fn stored(record: Option<JobRecord>) -> IoResult {
 
 pub(crate) fn is_child<T>(next: &Next<T>) -> bool {
     matches!(next, Next::Call(IoCall::Child(_)))
+}
+
+pub(crate) async fn read_owned_job(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<Option<JobRecord>, String> {
+    drive(OwnedJobOperation::new(user_id, job_id), context)
+        .await
+        .map_err(|error| error.0)
+}
+
+pub(crate) async fn read_owned_report(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    query: ReportQuery,
+) -> Result<JobReportLookup, String> {
+    let now_ms = unix_timestamp_millis();
+    let read = JobReportOperation::owned(user_id, job_id, query, now_ms);
+    drive(read, context).await.map_err(|error| error.0)
+}
+
+pub(crate) async fn read_report_routed(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+    query: ReportQuery,
+) -> Result<JobReportLookup, JobRouteError> {
+    let serving = context.node_and_realm();
+    let now_ms = unix_timestamp_millis();
+    let route = ReportRouteOperation::new(auth, job_id, query, None, serving, now_ms);
+    drive(route, context).await
+}
+
+pub(crate) async fn delete_owned_run(
+    context: &DriverContext,
+    auth: &AuthContext,
+    job_id: JobId,
+) -> Result<RunDelete, JobMutationError> {
+    let serving = context.node_and_realm();
+    let delete = DeleteOwnedOperation::new(auth, job_id, serving, unix_timestamp_millis());
+    drive(delete, context).await
+}
+
+pub(crate) async fn cancel_owned_job(
+    context: &DriverContext,
+    runtime: &JobsRuntime,
+    user_id: UserId,
+    job_id: JobId,
+) -> Result<CancelJobOutcome, String> {
+    let cancel = CancelOwnedOperation::new(user_id, job_id, unix_timestamp_millis());
+    let report = drive(cancel, context).await.map_err(|error| error.0)?;
+    for running in report.running {
+        runtime.request_cancel(running);
+    }
+    Ok(report.outcome)
 }
 
 fn mint_record() -> JobRecord {

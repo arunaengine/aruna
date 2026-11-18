@@ -1740,12 +1740,12 @@ mod tests {
         insert_job(&ctx, &record).await.unwrap();
         assert_eq!(runtime.available_slots(), 0);
 
-        let outcome = crate::jobs::service::cancel_owned_job(&ctx, &runtime, owner, job_id)
+        let outcome = crate::jobs::job_reads::tests::cancel_owned_job(&ctx, &runtime, owner, job_id)
             .await
             .unwrap();
         assert!(matches!(
             outcome,
-            crate::jobs::service::CancelJobOutcome::Requested(_)
+            crate::jobs::job_cancel::CancelJobOutcome::Requested(_)
         ));
 
         let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
