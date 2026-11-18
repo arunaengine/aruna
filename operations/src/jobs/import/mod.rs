@@ -257,12 +257,12 @@ fn bucket_result(bucket: &str, result: IoResult) -> Result<BucketInfo, ImportFai
     }
 }
 
-fn job_call(effect: JobEffect) -> IoCall {
+pub(in crate::jobs) fn job_call(effect: JobEffect) -> IoCall {
     IoCall::Effect(Box::new(Effect::Job(effect)))
 }
 
 /// The answer to `JobEffect::Stops`.
-fn stops_of(result: IoResult) -> Result<JobStops, IoError> {
+pub(in crate::jobs) fn stops_of(result: IoResult) -> Result<JobStops, IoError> {
     match result.event()? {
         Event::Job(JobEvent::Stops(stops)) => Ok(stops),
         other => Err(unexpected("the job's stop state", &other)),
@@ -270,14 +270,14 @@ fn stops_of(result: IoResult) -> Result<JobStops, IoError> {
 }
 
 /// The answer to `JobEffect::Report`.
-fn reported(result: IoResult) -> Result<(), IoError> {
+pub(in crate::jobs) fn reported(result: IoResult) -> Result<(), IoError> {
     match result.event()? {
         Event::Job(JobEvent::Reported) => Ok(()),
         other => Err(unexpected("the recorded progress", &other)),
     }
 }
 
-fn unexpected(expected: &'static str, event: &Event) -> IoError {
+pub(in crate::jobs) fn unexpected(expected: &'static str, event: &Event) -> IoError {
     IoError::Unexpected {
         expected,
         got: event.label(),
@@ -285,7 +285,7 @@ fn unexpected(expected: &'static str, event: &Event) -> IoError {
 }
 
 /// Deletes a hidden blob.
-fn hidden_delete(location: &BackendLocation) -> Result<IoCall, String> {
+pub(in crate::jobs) fn hidden_delete(location: &BackendLocation) -> Result<IoCall, String> {
     let key = HiddenBlobKey::try_from(location).map_err(|error| error.to_string())?;
     let delete = Effect::Blob(BlobEffect::DeleteHidden { key });
     Ok(IoCall::Effect(Box::new(delete)))

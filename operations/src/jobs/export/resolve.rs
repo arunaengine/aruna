@@ -391,10 +391,9 @@ enum OpenStep {
     Admission,
 }
 
-/// Checks a local candidate again in one read snapshot before its bytes are read: the bucket,
-/// version and location still match, the caller may read the path, this node may still serve
-/// a governed version, an export into another realm reads only as a key holder, and an
-/// encrypting bucket admits the read under a lease.
+/// Checks a local candidate again in one read snapshot before its bytes are read: it still
+/// matches, the caller and this node may read it, a realm export reads only as a key holder,
+/// and an encrypting bucket admits the read under a lease.
 #[derive(Debug, PartialEq)]
 pub(super) struct OpenLocalOperation {
     auth: AuthContext,
