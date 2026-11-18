@@ -1765,21 +1765,18 @@ fn quota_excess_rejects() {
     assert_eq!(op.state, IncomingVersionState::EnforceQuota);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { txn_id: read_txn_id, .. })]
+        [Effect::Storage(StorageEffect::BatchRead { txn_id: read_txn_id, .. })]
             if *read_txn_id == Some(txn_id)
     ));
     // No usage rebuild marker.
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: None,
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(vec![0u8; 4].into(), None)],
     }));
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: Some(config_bytes.into()),
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(vec![0u8; 4].into(), Some(config_bytes.into()))],
     }));
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0u8; 4].into(),
-        value: None,
+    op.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: vec![(vec![0u8; 4].into(), None)],
     }));
     let effects = op.step(Event::Storage(StorageEvent::IterResult {
         values: Vec::new(),

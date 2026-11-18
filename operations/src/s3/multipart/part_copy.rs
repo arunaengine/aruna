@@ -379,7 +379,6 @@ mod test {
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
     use aruna_core::structs::storage::routing::RoutingSnapshot;
-    use aruna_core::time::unix_timestamp_millis;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;

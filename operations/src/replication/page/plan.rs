@@ -67,11 +67,6 @@ pub enum PageError {
     Encrypted,
     #[error("the version a head names is missing")]
     HeadMissing,
-    #[error("unexpected event in state {state}: {received}")]
-    UnexpectedEvent {
-        state: &'static str,
-        received: String,
-    },
     #[error("operation did not finish")]
     NotFinished,
     #[error("page storage failed: {0}")]
@@ -101,7 +96,6 @@ impl PageError {
             | Self::ForeignPublication
             | Self::Encrypted
             | Self::HeadMissing
-            | Self::UnexpectedEvent { .. }
             | Self::NotFinished => false,
         }
     }

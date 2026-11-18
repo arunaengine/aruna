@@ -4,17 +4,17 @@
 
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
     PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventRecord;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, overlay_placement};
+use aruna_core::rows::{PrefixPages, done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, pending_projection_target, reducer_state_entry, reducer_state_key,
     stale_conflict_deletes,
@@ -34,10 +34,8 @@ use aruna_core::structs::placement::transition::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::reserved_label;
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use tracing::warn;
@@ -713,6 +711,8 @@ pub struct MutatePlacementConfig {
     pub mutation: RealmPlacementMutation,
 }
 
+/// Checks a caller's config permission when there is one, then applies the mutations in one write
+/// transaction. Callers rerun it after a lost commit.
 #[derive(Debug, PartialEq)]
 pub struct MutatePlacementOperation {
     actor: Actor,
@@ -720,9 +720,8 @@ pub struct MutatePlacementOperation {
     /// mutation paths originate their own changes and carry no token.
     auth_context: Option<AuthContext>,
     mutations: Vec<RealmPlacementMutation>,
-    txn_id: Option<TxnId>,
-    state: MutatePlacementState,
-    output: Option<Result<RealmConfigDocument, MutatePlacementError>>,
+    /// Whether the caller's check passed and the write runs.
+    checked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -730,38 +729,6 @@ struct StrategyRemovalCheck {
     document_value: Value,
     reducer_state_value: Option<Value>,
     strategy_id: Ulid,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum MutatePlacementState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    ReadRegistryReferences {
-        check: StrategyRemovalCheck,
-    },
-    ReadPendingReferences {
-        check: StrategyRemovalCheck,
-    },
-    ReadPendingEvents {
-        check: StrategyRemovalCheck,
-        next_start_after: Option<Key>,
-    },
-    WriteDocumentState {
-        document: RealmConfigDocument,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain,
-    SchedulePlacementRevalidation,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -792,8 +759,6 @@ pub enum MutatePlacementError {
         "forcing transition {transition_id} bucket {bucket} needs at least one verified completion proof"
     )]
     ForceWithoutProof { transition_id: Ulid, bucket: u32 },
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -803,6 +768,23 @@ pub enum MutatePlacementError {
         got: &'static str,
     },
 }
+
+impl From<IoError> for MutatePlacementError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "MutatePlacement".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type PlacementTurn = Result<Next<RealmConfigDocument>, MutatePlacementError>;
 
 impl MutatePlacementOperation {
     /// Node-internal entry: the node originates the mutation itself, so only the
@@ -828,12 +810,115 @@ impl MutatePlacementOperation {
             actor,
             auth_context: None,
             mutations,
-            txn_id: None,
-            state: MutatePlacementState::Init,
-            output: None,
+            checked: false,
         }
     }
 
+    /// The write transaction of the mutations.
+    fn write(&self) -> PlacementWrite {
+        PlacementWrite {
+            actor: self.actor.clone(),
+            authorized: self.auth_context.is_some(),
+            mutations: self.mutations.clone(),
+            stage: Stage::Read,
+            check: None,
+            pages: None,
+            pending: None,
+            document: None,
+            deletes: Vec::new(),
+        }
+    }
+
+    fn run_write(&mut self) -> PlacementTurn {
+        self.checked = true;
+        Ok(Next::Call(IoCall::child(self.write())))
+    }
+}
+
+impl Operation for MutatePlacementOperation {
+    type Output = RealmConfigDocument;
+    type Error = MutatePlacementError;
+
+    /// An SSI conflict is ordinary contention that every caller re-drives, so
+    /// only an exhausted retry belongs on the error stream.
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            MutatePlacementError::StorageError(StorageError::TransactionConflict)
+        )
+    }
+
+    fn first(&mut self) -> PlacementTurn {
+        let Some(auth_context) = self.auth_context.clone() else {
+            return self.run_write();
+        };
+        if auth_context.realm_id != self.actor.realm_id {
+            return Err(MutatePlacementError::Unauthorized {
+                node_id: self.actor.node_id,
+            });
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context,
+                path: policy_admin_path(self.actor.realm_id),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> PlacementTurn {
+        if self.checked {
+            return result
+                .child::<RealmConfigDocument, MutatePlacementError>()?
+                .map(Next::Done);
+        }
+        let unauthorized = MutatePlacementError::Unauthorized {
+            node_id: self.actor.node_id,
+        };
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => self.run_write(),
+            Ok(false) => Err(unauthorized),
+            Err(error) => {
+                warn!(error = %error, "Realm placement authorization check failed");
+                match error {
+                    AuthorizationError::StorageError(error) => Err(error.into()),
+                    _ => Err(unauthorized),
+                }
+            }
+        }
+    }
+}
+
+/// What the placement write transaction waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Read,
+    /// Scans the materialized metadata registry for references to a removed strategy.
+    Registry,
+    /// Scans the pending projections, then reads their create events.
+    Pending,
+    PendingEvents,
+    Write,
+    Delete,
+}
+
+/// Reads the realm config and its admin state, checks a strategy removal for references, then
+/// stores the mutated config and its queued admin events in one write transaction.
+#[derive(Debug, PartialEq)]
+struct PlacementWrite {
+    actor: Actor,
+    /// A caller's request is served by management nodes only.
+    authorized: bool,
+    mutations: Vec<RealmPlacementMutation>,
+    stage: Stage,
+    check: Option<StrategyRemovalCheck>,
+    pages: Option<PrefixPages>,
+    pending: Option<Vec<Key>>,
+    document: Option<RealmConfigDocument>,
+    deletes: Vec<(KeySpace, Key)>,
+}
+
+impl PlacementWrite {
     fn document_ref(&self) -> DocumentTarget {
         DocumentTarget::RealmConfig {
             realm_id: self.actor.realm_id,
@@ -846,34 +931,11 @@ impl MutatePlacementOperation {
         }
     }
 
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = MutatePlacementState::ReadCurrent;
-        let document = self.document_ref();
-        let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
     fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, MutatePlacementError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(MutatePlacementError::MissingTransaction);
-        };
+    ) -> PlacementTurn {
         let Some(document_value) = document_value else {
             return Err(MutatePlacementError::ConfigMissing);
         };
@@ -954,28 +1016,23 @@ impl MutatePlacementOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
-        self.state = MutatePlacementState::WriteDocumentState {
-            document,
-            stale_conflict_deletes,
-        };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document);
+        self.deletes = stale_conflict_deletes;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn emit_reference_check(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, MutatePlacementError> {
+    ) -> PlacementTurn {
         let Some(document_value) = document_value else {
             return Err(MutatePlacementError::ConfigMissing);
         };
         // A caller's request is served by management nodes only; a node's own
         // mutations stay governed by the per-mutation node authorization.
-        if self.auth_context.is_some()
+        if self.authorized
             && !is_management(
                 &RealmConfigDocument::from_bytes(&document_value)?,
                 self.actor.node_id,
@@ -1005,48 +1062,34 @@ impl MutatePlacementOperation {
                 return self.emit_document_write(Some(document_value), reducer_state_value);
             }
         };
-        let check = StrategyRemovalCheck {
+        self.check = Some(StrategyRemovalCheck {
             document_value,
             reducer_state_value,
             strategy_id,
-        };
-        Ok(self.scan_registry_refs(check, None))
+        });
+        Ok(self.scan(Stage::Registry, METADATA_INDEX_KEYSPACE))
     }
 
-    fn scan_registry_refs(
-        &mut self,
-        check: StrategyRemovalCheck,
-        start_after: Option<Key>,
-    ) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(MutatePlacementError::MissingTransaction);
-        };
-        self.state = MutatePlacementState::ReadRegistryReferences { check };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: METADATA_INDEX_KEYSPACE.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
-            limit: STRATEGY_PAGE_SIZE,
-            txn_id: Some(txn_id),
-        })]
+    fn scan(&mut self, stage: Stage, space: &str) -> Next<RealmConfigDocument> {
+        let pages = PrefixPages::new(space, Key::from(Vec::new()), STRATEGY_PAGE_SIZE);
+        let call = pages.call();
+        self.pages = Some(pages);
+        self.stage = stage;
+        Next::Call(call)
     }
 
-    fn scan_pending_refs(
-        &mut self,
-        check: StrategyRemovalCheck,
-        start_after: Option<Key>,
-    ) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(MutatePlacementError::MissingTransaction);
-        };
-        self.state = MutatePlacementState::ReadPendingReferences { check };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
-            limit: STRATEGY_PAGE_SIZE,
-            txn_id: Some(txn_id),
-        })]
+    fn pages(&mut self) -> Result<&mut PrefixPages, MutatePlacementError> {
+        self.pages.as_mut().ok_or(MutatePlacementError::NotFinished)
+    }
+
+    fn check(&self) -> Result<&StrategyRemovalCheck, MutatePlacementError> {
+        self.check.as_ref().ok_or(MutatePlacementError::NotFinished)
+    }
+
+    fn referenced(&self) -> Result<MutatePlacementError, MutatePlacementError> {
+        Ok(MutatePlacementError::StrategyReferenced {
+            strategy_id: self.check()?.strategy_id,
+        })
     }
 
     fn reference_matches(&self, record: &MetadataRegistryRecord, strategy_id: Ulid) -> bool {
@@ -1055,338 +1098,138 @@ impl MutatePlacementOperation {
             && record.placement.strategy_id == strategy_id
     }
 
-    fn write_after_check(&mut self, check: StrategyRemovalCheck) -> Effects {
-        match self.emit_document_write(Some(check.document_value), check.reducer_state_value) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
+    fn write_after_check(&mut self) -> PlacementTurn {
+        let check = self.check.take().ok_or(MutatePlacementError::NotFinished)?;
+        self.emit_document_write(Some(check.document_value), check.reducer_state_value)
+    }
+
+    fn registry_page(&mut self, rows: Vec<(Key, Value)>) -> PlacementTurn {
+        let strategy_id = self.check()?.strategy_id;
+        for (_, value) in rows {
+            let record: MetadataRegistryRecord =
+                postcard::from_bytes(&value).map_err(ConversionError::from)?;
+            if self.reference_matches(&record, strategy_id) {
+                return Err(self.referenced()?);
+            }
+        }
+        match self.pages()?.done() {
+            true => Ok(self.scan(Stage::Pending, PENDING_PROJECTION_KEYSPACE)),
+            false => Ok(Next::Call(self.pages()?.call())),
         }
     }
 
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(MutatePlacementError::MissingTransaction);
-        };
-        self.state = MutatePlacementState::CommitTransaction { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    fn pending_page(&mut self, rows: Vec<(Key, Value)>) -> PlacementTurn {
+        if rows.is_empty() {
+            return match self.pages()?.done() {
+                true => self.write_after_check(),
+                false => Ok(Next::Call(self.pages()?.call())),
+            };
+        }
+        let keys: Vec<Key> = rows.into_iter().map(|(key, _)| key).collect();
+        let reads = (keys.iter())
+            .map(|key| (EVENT_LOG_KEYSPACE.to_string(), key.clone()))
+            .collect();
+        self.pending = Some(keys);
+        self.stage = Stage::PendingEvents;
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn fail(&mut self, error: MutatePlacementError) -> Effects {
-        let cleanup = self.abort();
-        self.state = MutatePlacementState::Error;
-        self.output = Some(Err(error));
-        cleanup
+    fn pending_events(&mut self, values: Vec<Option<Value>>) -> PlacementTurn {
+        let strategy_id = self.check()?.strategy_id;
+        let keys = self
+            .pending
+            .take()
+            .ok_or(MutatePlacementError::NotFinished)?;
+        for (key, value) in keys.into_iter().zip(values) {
+            let Some(value) = value else {
+                return Err(self.referenced()?);
+            };
+            let Ok(event) = postcard::from_bytes::<MetadataEventRecord>(&value) else {
+                return Err(self.referenced()?);
+            };
+            let valid_target =
+                pending_projection_target(key.as_ref()).is_some_and(|(document_id, event_id)| {
+                    event.record.document_id == document_id && event.event_id == event_id
+                });
+            if !valid_target || self.reference_matches(&event.record, strategy_id) {
+                return Err(self.referenced()?);
+            }
+        }
+        match self.pages()?.done() {
+            true => self.write_after_check(),
+            false => {
+                self.stage = Stage::Pending;
+                Ok(Next::Call(self.pages()?.call()))
+            }
+        }
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(MutatePlacementError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    /// Failed drain or revalidation timers leave the outbox and the placement sync retryable.
+    fn finish(&mut self) -> PlacementTurn {
+        let output = self
+            .document
+            .take()
+            .ok_or(MutatePlacementError::NotFinished)?;
+        let calls = vec![
+            IoCall::Effect(Box::new(schedule_drain_effect())),
+            IoCall::Effect(Box::new(schedule_revalidation(
+                self.actor.realm_id,
+                self.actor.node_id,
+            ))),
+        ];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl EffectOperation for MutatePlacementOperation {
+impl Operation for PlacementWrite {
     type Output = RealmConfigDocument;
     type Error = MutatePlacementError;
 
-    /// An SSI conflict is ordinary contention that every caller re-drives, so
-    /// only an exhausted retry belongs on the error stream.
-    fn expected_error(error: &Self::Error) -> bool {
-        matches!(
-            error,
-            MutatePlacementError::StorageError(StorageError::TransactionConflict)
-        )
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn start(&mut self) -> Effects {
-        let Some(auth_context) = self.auth_context.clone() else {
-            self.state = MutatePlacementState::StartTransaction;
-            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            })];
-        };
-        if auth_context.realm_id != self.actor.realm_id {
-            return self.fail(MutatePlacementError::Unauthorized {
-                node_id: self.actor.node_id,
-            });
-        }
-        self.state = MutatePlacementState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context,
-                path: policy_admin_path(self.actor.realm_id),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+    fn first(&mut self) -> PlacementTurn {
+        let document = self.document_ref();
+        let target = self.admin_target();
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match &self.state {
-            MutatePlacementState::Auth => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => {
-                            self.state = MutatePlacementState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false,
-                            })]
-                        }
-                        Ok(false) => self.fail(MutatePlacementError::Unauthorized {
-                            node_id: self.actor.node_id,
-                        }),
-                        Err(error) => {
-                            warn!(error = %error, "Realm placement authorization check failed");
-                            match error {
-                                AuthorizationError::StorageError(error) => {
-                                    self.fail(MutatePlacementError::StorageError(error))
-                                }
-                                _ => self.fail(MutatePlacementError::Unauthorized {
-                                    node_id: self.actor.node_id,
-                                }),
-                            }
-                        }
-                    }
-                }
-                other => self.unexpected_event("authorization result", other.label()),
-            },
-            MutatePlacementState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", other.label()),
-            },
-            MutatePlacementState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "storage batch read result with realm config and reducer state",
-                            "a batch read with other rows",
-                        );
-                    };
-                    match self
-                        .emit_reference_check(document_value.clone(), reducer_state_value.clone())
-                    {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", other.label()),
-            },
-            MutatePlacementState::ReadRegistryReferences { check } => {
-                let check = check.clone();
-                match event {
-                    Event::Storage(StorageEvent::IterResult {
-                        values,
-                        next_start_after,
-                    }) => {
-                        for (_, value) in values {
-                            let record: MetadataRegistryRecord = match postcard::from_bytes(&value)
-                            {
-                                Ok(record) => record,
-                                Err(error) => {
-                                    return self.fail(ConversionError::from(error).into());
-                                }
-                            };
-                            if self.reference_matches(&record, check.strategy_id) {
-                                return self.fail(MutatePlacementError::StrategyReferenced {
-                                    strategy_id: check.strategy_id,
-                                });
-                            }
-                        }
-                        match next_start_after {
-                            Some(start_after) => self.scan_registry_refs(check, Some(start_after)),
-                            None => self.scan_pending_refs(check, None),
-                        }
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("metadata registry scan result", other.label()),
-                }
+    fn next(&mut self, result: IoResult) -> PlacementTurn {
+        match self.stage {
+            Stage::Read => {
+                let [document, reducer] = values::<2>(result)?;
+                self.emit_reference_check(document, reducer)
             }
-            MutatePlacementState::ReadPendingReferences { check } => {
-                let check = check.clone();
-                match event {
-                    Event::Storage(StorageEvent::IterResult {
-                        values,
-                        next_start_after,
-                    }) => {
-                        if values.is_empty() {
-                            return match next_start_after {
-                                Some(start_after) => {
-                                    self.scan_pending_refs(check, Some(start_after))
-                                }
-                                None => self.write_after_check(check),
-                            };
-                        }
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(MutatePlacementError::MissingTransaction);
-                        };
-                        self.state = MutatePlacementState::ReadPendingEvents {
-                            check,
-                            next_start_after,
-                        };
-                        smallvec![Effect::Storage(StorageEffect::BatchRead {
-                            reads: values
-                                .into_iter()
-                                .map(|(key, _)| (EVENT_LOG_KEYSPACE.to_string(), key))
-                                .collect(),
-                            txn_id: Some(txn_id),
-                        })]
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("pending projection scan result", other.label()),
-                }
+            Stage::Registry => {
+                let rows = self.pages()?.take(result)?;
+                self.registry_page(rows)
             }
-            MutatePlacementState::ReadPendingEvents {
-                check,
-                next_start_after,
-            } => {
-                let check = check.clone();
-                let next_start_after = next_start_after.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                        for (key, value) in values {
-                            let Some(value) = value else {
-                                return self.fail(MutatePlacementError::StrategyReferenced {
-                                    strategy_id: check.strategy_id,
-                                });
-                            };
-                            let event: MetadataEventRecord = match postcard::from_bytes(&value) {
-                                Ok(event) => event,
-                                Err(_) => {
-                                    return self.fail(MutatePlacementError::StrategyReferenced {
-                                        strategy_id: check.strategy_id,
-                                    });
-                                }
-                            };
-                            let valid_target = pending_projection_target(key.as_ref()).is_some_and(
-                                |(document_id, event_id)| {
-                                    event.record.document_id == document_id
-                                        && event.event_id == event_id
-                                },
-                            );
-                            if !valid_target
-                                || self.reference_matches(&event.record, check.strategy_id)
-                            {
-                                return self.fail(MutatePlacementError::StrategyReferenced {
-                                    strategy_id: check.strategy_id,
-                                });
-                            }
-                        }
-                        match next_start_after {
-                            Some(start_after) => self.scan_pending_refs(check, Some(start_after)),
-                            None => self.write_after_check(check),
-                        }
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("pending create event reads", other.label()),
-                }
+            Stage::Pending => {
+                let rows = self.pages()?.take(result)?;
+                self.pending_page(rows)
             }
-            MutatePlacementState::WriteDocumentState {
-                document,
-                stale_conflict_deletes,
-            } => {
-                let document = document.clone();
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(MutatePlacementError::MissingTransaction);
-                        };
-                        if !stale_conflict_deletes.is_empty() {
-                            self.state = MutatePlacementState::DeleteAdminConflicts { document };
-                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                                deletes: stale_conflict_deletes,
-                                txn_id: Some(txn_id),
-                            })];
-                        }
-                        self.emit_commit_transaction(document)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch write result", other.label()),
-                }
+            Stage::PendingEvents => self.pending_events(result.values()?),
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
             }
-            MutatePlacementState::DeleteAdminConflicts { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                        self.emit_commit_transaction(document)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch delete result", other.label()),
-                }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.finish()
             }
-            MutatePlacementState::CommitTransaction { .. } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = MutatePlacementState::ScheduleSyncDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", other.label()),
-            },
-            MutatePlacementState::ScheduleSyncDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = MutatePlacementState::SchedulePlacementRevalidation;
-                    smallvec![schedule_revalidation(
-                        self.actor.realm_id,
-                        self.actor.node_id,
-                    )]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = MutatePlacementState::SchedulePlacementRevalidation;
-                    smallvec![schedule_revalidation(
-                        self.actor.realm_id,
-                        self.actor.node_id,
-                    )]
-                }
-                other => self
-                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
-            },
-            MutatePlacementState::SchedulePlacementRevalidation => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = MutatePlacementState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule placement revalidation after realm placement mutation");
-                    self.state = MutatePlacementState::Finish;
-                    smallvec![]
-                }
-                other => {
-                    self.unexpected_event("placement revalidation timer schedule", other.label())
-                }
-            },
-            MutatePlacementState::Finish
-            | MutatePlacementState::Error
-            | MutatePlacementState::Init => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            MutatePlacementState::Finish | MutatePlacementState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(MutatePlacementError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
         }
     }
 }

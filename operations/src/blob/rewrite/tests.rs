@@ -4,7 +4,6 @@
 
 use super::*;
 use aruna_core::effects::StorageEffect;
-use aruna_core::operation::SubOperation;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::encryption::{

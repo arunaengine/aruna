@@ -727,8 +727,8 @@ mod link_tests {
     fn wakes(calls: &[IoCall], key: TaskKey) -> bool {
         calls.iter().any(|call| {
             matches!(call, IoCall::Effect(effect)
-                if matches!(**effect, Effect::Task(TaskEffect::ShortenTimer { key: woken, .. })
-                    if woken == key))
+                if matches!(&**effect, Effect::Task(TaskEffect::ShortenTimer { key: woken, .. })
+                    if *woken == key))
         })
     }
 

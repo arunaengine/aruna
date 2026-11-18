@@ -3,25 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent, StorageEvent, VaultSignEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::events::{Event, NetEvent, VaultSignEvent};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{PrefixPages, done, event, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_PREDECESSORS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecordError,
     VaultRecords, VaultRevision, head_rows, record_rows, user_record_prefix,
 };
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_core::vault_format::key_fingerprint;
 use aruna_core::{NodeId, UserId};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
@@ -140,6 +139,27 @@ struct Unsigned {
     heads: Vec<VaultRevision>,
 }
 
+fn record_target(config: &AppendVaultConfig) -> DocumentTarget {
+    let AppendVaultConfig {
+        realm_id,
+        user_id,
+        record_id,
+        ..
+    } = *config;
+    match config.change {
+        VaultChange::PublishKey { .. } => DocumentTarget::UserKey {
+            realm_id,
+            user_id,
+            record_id,
+        },
+        VaultChange::Save { .. } | VaultChange::Delete => DocumentTarget::VaultRevision {
+            realm_id,
+            user_id,
+            revision_id: record_id,
+        },
+    }
+}
+
 /// Whether `signed` is `unsigned` with valid origin signatures added.
 fn same_records(unsigned: &VaultRecords, signed: &VaultRecords) -> bool {
     match (unsigned, signed) {
@@ -169,37 +189,29 @@ fn same_records(unsigned: &VaultRecords, signed: &VaultRecords) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum AppendState {
-    Init,
-    StartTransaction,
-    ReadConfig,
-    ReadFence(Box<Planned>),
-    ReadRows(Box<Planned>),
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Config,
+    Fence(Box<Planned>),
+    Rows(Box<Planned>),
     Sign(Box<Unsigned>),
     Delete(Vec<(KeySpace, Key, Value)>),
     Write,
-    Commit,
-    ScheduleDrain,
-    Finish,
-    Error,
 }
 
-impl AppendState {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Init => "init",
-            Self::StartTransaction => "start transaction",
-            Self::ReadConfig => "read config",
-            Self::ReadFence(_) => "read fence",
-            Self::ReadRows(_) => "read rows",
-            Self::Sign(_) => "sign",
-            Self::Delete(_) => "delete retired heads",
-            Self::Write => "write",
-            Self::Commit => "commit",
-            Self::ScheduleDrain => "schedule drain",
-            Self::Finish => "finish",
-            Self::Error => "error",
+type AppendTurn = Result<Next<VaultAppended>, AppendVaultError>;
+
+impl From<IoError> for AppendVaultError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "AppendVault".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
         }
     }
 }
@@ -209,9 +221,9 @@ impl AppendState {
 #[derive(Debug, PartialEq)]
 pub struct AppendVaultOperation {
     config: AppendVaultConfig,
-    txn_id: Option<TxnId>,
-    state: AppendState,
-    output: Option<Result<VaultAppended, AppendVaultError>>,
+    stage: Stage,
+    rows: PrefixPages,
+    output: Option<VaultAppended>,
     delete_heads: Vec<Ulid>,
     delete_markers: Vec<VaultRevision>,
     delete_live: bool,
@@ -219,10 +231,16 @@ pub struct AppendVaultOperation {
 
 impl AppendVaultOperation {
     pub fn new(config: AppendVaultConfig) -> Self {
+        let limit = match config.change {
+            VaultChange::PublishKey { .. } => MAX_KEY_RECORDS,
+            VaultChange::Save { .. } | VaultChange::Delete => MAX_VAULT_HEADS,
+        };
+        let space = record_target(&config).storage_keyspace();
+        let rows = PrefixPages::new(space, user_record_prefix(config.user_id), limit);
         Self {
             config,
-            txn_id: None,
-            state: AppendState::Init,
+            stage: Stage::Config,
+            rows,
             output: None,
             delete_heads: Vec::new(),
             delete_markers: Vec::new(),
@@ -231,33 +249,10 @@ impl AppendVaultOperation {
     }
 
     fn target(&self) -> DocumentTarget {
-        let AppendVaultConfig {
-            realm_id,
-            user_id,
-            record_id,
-            ..
-        } = self.config;
-        match self.config.change {
-            VaultChange::PublishKey { .. } => DocumentTarget::UserKey {
-                realm_id,
-                user_id,
-                record_id,
-            },
-            VaultChange::Save { .. } | VaultChange::Delete => DocumentTarget::VaultRevision {
-                realm_id,
-                user_id,
-                revision_id: record_id,
-            },
-        }
+        record_target(&self.config)
     }
 
-    fn txn(&self) -> Result<TxnId, AppendVaultError> {
-        self.txn_id
-            .ok_or(StorageError::TransactionNotFound)
-            .map_err(Into::into)
-    }
-
-    fn plan(&mut self, value: Option<Value>) -> Result<Effects, AppendVaultError> {
+    fn plan(&mut self, value: Option<Value>) -> AppendTurn {
         let value = value.ok_or(AppendVaultError::RealmConfigMissing)?;
         let config = RealmConfigDocument::from_bytes(&value)?;
         let plan = plan_target_placement(&config, &self.target(), Default::default())?
@@ -273,44 +268,20 @@ impl AppendVaultOperation {
             generation: fence::write_generation(&config, &plan.placement).unwrap_or_default(),
         });
         if planned.generation == 0 {
-            return self.read_rows(planned, None);
+            return self.read_rows(planned);
         }
-        let (key_space, key) = fence::fence_read(&self.config.realm_id, &planned.placement);
-        let txn_id = Some(self.txn()?);
-        self.state = AppendState::ReadFence(planned);
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space,
-            key,
-            txn_id,
-        })])
+        let read = fence::fence_read(&self.config.realm_id, &planned.placement);
+        self.stage = Stage::Fence(planned);
+        Ok(Next::Call(IoCall::Read(vec![read])))
     }
 
-    fn read_rows(
-        &mut self,
-        planned: Box<Planned>,
-        start: Option<Key>,
-    ) -> Result<Effects, AppendVaultError> {
-        let limit = match self.config.change {
-            VaultChange::PublishKey { .. } => MAX_KEY_RECORDS,
-            VaultChange::Save { .. } | VaultChange::Delete => MAX_VAULT_HEADS,
-        };
-        let txn_id = Some(self.txn()?);
-        self.state = AppendState::ReadRows(planned);
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: self.target().storage_keyspace().to_string(),
-            prefix: Some(user_record_prefix(self.config.user_id)),
-            start: start.map(IterStart::After),
-            limit,
-            txn_id,
-        })])
+    fn read_rows(&mut self, planned: Box<Planned>) -> AppendTurn {
+        self.stage = Stage::Rows(planned);
+        Ok(Next::Call(self.rows.call()))
     }
 
     /// Builds the record from the rows read in this transaction and asks for its signature.
-    fn append(
-        &mut self,
-        planned: Box<Planned>,
-        rows: Vec<(Key, Value)>,
-    ) -> Result<Effects, AppendVaultError> {
+    fn append(&mut self, planned: Box<Planned>, rows: Vec<(Key, Value)>) -> AppendTurn {
         let AppendVaultConfig {
             node_id,
             realm_id,
@@ -372,13 +343,10 @@ impl AppendVaultOperation {
     }
 
     /// Chains delete markers so each names at most `MAX_PREDECESSORS` heads.
-    fn delete_heads(&mut self, planned: Box<Planned>) -> Result<Effects, AppendVaultError> {
+    fn delete_heads(&mut self, planned: Box<Planned>) -> AppendTurn {
         if !self.delete_live {
-            self.output = Some(Ok(VaultAppended::Heads(std::mem::take(
-                &mut self.delete_markers,
-            ))));
-            self.state = AppendState::Finish;
-            return Ok(self.abort());
+            let markers = std::mem::take(&mut self.delete_markers);
+            return Ok(Next::Done(VaultAppended::Heads(markers)));
         }
         let mut heads = std::mem::take(&mut self.delete_heads)
             .into_iter()
@@ -418,23 +386,19 @@ impl AppendVaultOperation {
         planned: Box<Planned>,
         records: VaultRecords,
         heads: Vec<VaultRevision>,
-    ) -> Result<Effects, AppendVaultError> {
+    ) -> AppendTurn {
         let effect = Effect::Net(NetEffect::VaultSign(Box::new(records.clone())));
-        self.state = AppendState::Sign(Box::new(Unsigned {
+        self.stage = Stage::Sign(Box::new(Unsigned {
             planned,
             records,
             heads,
         }));
-        Ok(smallvec![effect])
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }
 
     /// Emits the rows and outbox entries of the signed records. The adapter may only add
     /// signatures, so any other difference fails the write.
-    fn write_signed(
-        &mut self,
-        unsigned: Unsigned,
-        signed: VaultRecords,
-    ) -> Result<Effects, AppendVaultError> {
+    fn write_signed(&mut self, unsigned: Unsigned, signed: VaultRecords) -> AppendTurn {
         let Unsigned {
             planned,
             records,
@@ -496,177 +460,99 @@ impl AppendVaultOperation {
                 }
             }
         };
-        self.output = Some(Ok(output));
-        self.write_rows(writes, deletes)
-    }
-
-    fn write_rows(
-        &mut self,
-        writes: Vec<(KeySpace, Key, Value)>,
-        deletes: Vec<(KeySpace, Key)>,
-    ) -> Result<Effects, AppendVaultError> {
-        let txn_id = Some(self.txn()?);
+        self.output = Some(output);
         if deletes.is_empty() {
-            self.state = AppendState::Write;
-            return Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id
-            })]);
+            self.stage = Stage::Write;
+            return Ok(Next::Call(IoCall::Write(writes)));
         }
-        self.state = AppendState::Delete(writes);
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id
-        })])
+        self.stage = Stage::Delete(writes);
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
-    fn handle(&mut self, state: AppendState, event: Event) -> Result<Effects, AppendVaultError> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if matches!(state, AppendState::Commit) {
-                self.txn_id = None;
-            }
-            return Err(error.into());
+    /// Notes the heads a delete retires; a save or key publish reads one page only.
+    fn take_rows(&mut self, planned: Box<Planned>, result: IoResult) -> AppendTurn {
+        let rows = self.rows.take(result)?;
+        if !matches!(self.config.change, VaultChange::Delete) {
+            return self.append(planned, rows);
         }
-        match (state, event) {
-            (
-                AppendState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = AppendState::ReadConfig;
-                let target = DocumentTarget::RealmConfig {
-                    realm_id: self.config.realm_id,
-                };
-                Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: target.storage_keyspace().to_string(),
-                    key: target.storage_key(),
-                    txn_id: Some(txn_id),
-                })])
+        for (_, value) in &rows {
+            let head = VaultRevision::from_bytes(value)?;
+            self.delete_heads.push(head.revision_id);
+            self.delete_live |= head.payload.is_some();
+            if head.payload.is_none() && self.delete_markers.len() < MAX_VAULT_HEADS {
+                self.delete_markers.push(head);
             }
-            (AppendState::ReadConfig, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.plan(value)
-            }
-            (
-                AppendState::ReadFence(planned),
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
-                if !fence::admits(value.as_ref(), planned.generation) {
-                    return Err(AppendVaultError::PlacementFenced);
-                }
-                self.read_rows(planned, None)
-            }
-            (
-                AppendState::ReadRows(planned),
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                if matches!(self.config.change, VaultChange::Delete) {
-                    for (_, value) in &values {
-                        let head = VaultRevision::from_bytes(value)?;
-                        self.delete_heads.push(head.revision_id);
-                        self.delete_live |= head.payload.is_some();
-                        if head.payload.is_none() && self.delete_markers.len() < MAX_VAULT_HEADS {
-                            self.delete_markers.push(head);
-                        }
-                    }
-                    if let Some(start) = next_start_after {
-                        return self.read_rows(planned, Some(start));
-                    }
-                }
-                self.append(planned, values)
-            }
-            (AppendState::Sign(unsigned), Event::Net(NetEvent::VaultSign(event))) => match event {
-                VaultSignEvent::Signed(signed) => self.write_signed(*unsigned, *signed),
-                VaultSignEvent::Unavailable(reason) => Err(AppendVaultError::Unsigned(reason)),
-            },
-            (
-                AppendState::Delete(writes),
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => {
-                self.state = AppendState::Write;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: Some(self.txn()?),
-                })])
-            }
-            (AppendState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.state = AppendState::Commit;
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::CommitTransaction {
-                        txn_id: self.txn()?
-                    }
-                )])
-            }
-            (AppendState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = AppendState::ScheduleDrain;
-                Ok(smallvec![schedule_drain_effect()])
-            }
-            (AppendState::ScheduleDrain, Event::Task(event)) => {
-                if let TaskEvent::Error { message, .. } = event {
-                    warn!(error = %message, "Vault outbox drain was not scheduled; the outbox stays retryable");
-                }
-                self.state = AppendState::Finish;
-                Ok(smallvec![])
-            }
-            (state, event) => Err(AppendVaultError::UnexpectedEvent {
-                state: state.label().to_string(),
-                expected: "the event of the current step",
-                got: event.label(),
-            }),
         }
-    }
-
-    fn fail(&mut self, error: AppendVaultError) -> Effects {
-        let cleanup = self.abort();
-        self.state = AppendState::Error;
-        self.output = Some(Err(error));
-        cleanup
+        if !self.rows.done() {
+            return self.read_rows(planned);
+        }
+        self.append(planned, rows)
     }
 }
 
-impl EffectOperation for AppendVaultOperation {
+impl Operation for AppendVaultOperation {
     type Output = VaultAppended;
     type Error = AppendVaultError;
 
-    fn start(&mut self) -> Effects {
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> AppendTurn {
         if let VaultChange::Save { payload, .. } = &self.config.change
             && payload.len() > aruna_core::structs::identity::user::vault::MAX_VAULT_BYTES
         {
-            return self.fail(VaultRecordError::TooLarge.into());
+            return Err(VaultRecordError::TooLarge.into());
         }
-        self.state = AppendState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        let target = DocumentTarget::RealmConfig {
+            realm_id: self.config.realm_id,
+        };
+        Ok(Next::Call(IoCall::Read(vec![(
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+        )])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let state = std::mem::replace(&mut self.state, AppendState::Error);
-        if matches!(state, AppendState::Finish | AppendState::Error) {
-            self.state = state;
-            return smallvec![];
-        }
-        match self.handle(state, event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, AppendState::Finish | AppendState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(AppendVaultError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn next(&mut self, result: IoResult) -> AppendTurn {
+        match std::mem::replace(&mut self.stage, Stage::Config) {
+            Stage::Config => {
+                let [value] = values::<1>(result)?;
+                self.plan(value)
+            }
+            Stage::Fence(planned) => {
+                let [value] = values::<1>(result)?;
+                if !fence::admits(value.as_ref(), planned.generation) {
+                    return Err(AppendVaultError::PlacementFenced);
+                }
+                self.read_rows(planned)
+            }
+            Stage::Rows(planned) => self.take_rows(planned, result),
+            Stage::Sign(unsigned) => match event(result)? {
+                Event::Net(NetEvent::VaultSign(VaultSignEvent::Signed(signed))) => {
+                    self.write_signed(*unsigned, *signed)
+                }
+                Event::Net(NetEvent::VaultSign(VaultSignEvent::Unavailable(reason))) => {
+                    Err(AppendVaultError::Unsigned(reason))
+                }
+                other => Err(AppendVaultError::UnexpectedEvent {
+                    state: "sign".to_string(),
+                    expected: "Event::Net(NetEvent::VaultSign)",
+                    got: other.label(),
+                }),
+            },
+            Stage::Delete(writes) => {
+                done(result)?;
+                self.stage = Stage::Write;
+                Ok(Next::Call(IoCall::Write(writes)))
+            }
+            Stage::Write => {
+                done(result)?;
+                let output = self.output.take().ok_or(AppendVaultError::NotFinished)?;
+                Ok(Next::Then {
+                    output,
+                    calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],
+                })
+            }
         }
     }
 
@@ -678,13 +564,6 @@ impl EffectOperation for AppendVaultOperation {
                 | AppendVaultError::TooManyKeys
         )
     }
-
-    fn is_conflict(error: &Self::Error) -> bool {
-        matches!(
-            error,
-            AppendVaultError::Storage(StorageError::TransactionConflict)
-        )
-    }
 }
 
 #[cfg(test)]
@@ -694,8 +573,6 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use aruna_core::structs::identity::user::vault::user_record_key;
-    use aruna_core::task::TaskKey;
-    use std::time::Duration;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -703,10 +580,6 @@ mod tests {
 
     fn user() -> UserId {
         UserId::local(Ulid::from_bytes([7; 16]), RealmId::from_bytes([3; 32]))
-    }
-
-    fn txn() -> TxnId {
-        Ulid::from_bytes([6; 16])
     }
 
     /// Four servers and two vault replicas, so the realm has holders and non-holders.
@@ -744,21 +617,10 @@ mod tests {
         })
     }
 
-    /// Runs the operation up to the row read; `None` when it ended before that.
-    fn read_rows(operation: &mut AppendVaultOperation, config: Value) -> Option<Effects> {
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: txn(),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(&[][..]),
-            value: Some(config),
-        }));
-        matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::Iter { .. }))
-        )
-        .then_some(effects)
+    /// Runs the operation up to the row read.
+    fn read_rows(operation: &mut AppendVaultOperation, config: Value) -> AppendTurn {
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+        operation.next(IoResult::Values(vec![Some(config)]))
     }
 
     fn head(seed: u8, payload: Option<&str>) -> (Key, Value) {
@@ -779,19 +641,28 @@ mod tests {
         )
     }
 
-    fn rows(operation: &mut AppendVaultOperation, values: Vec<(Key, Value)>) -> Effects {
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        }))
+    fn rows(operation: &mut AppendVaultOperation, rows: Vec<(Key, Value)>) -> AppendTurn {
+        operation.next(IoResult::Page { rows, next: None })
+    }
+
+    fn sign_request(turn: &AppendTurn) -> VaultRecords {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => match &**effect {
+                Effect::Net(NetEffect::VaultSign(records)) => (**records).clone(),
+                _ => panic!("expected a signing request"),
+            },
+            _ => panic!("expected a signing request"),
+        }
+    }
+
+    fn answer_sign(operation: &mut AppendVaultOperation, event: VaultSignEvent) -> AppendTurn {
+        let event = Event::Net(NetEvent::VaultSign(event));
+        operation.next(IoResult::Event(Box::new(event)))
     }
 
     /// Answers the signing request as the adapter of the named node would.
-    fn signed(operation: &mut AppendVaultOperation, effects: Effects) -> Effects {
-        let Some(Effect::Net(NetEffect::VaultSign(records))) = effects.first() else {
-            panic!("expected a signing request, got {effects:?}");
-        };
-        let mut records = (**records).clone();
+    fn signed(operation: &mut AppendVaultOperation, turn: AppendTurn) -> AppendTurn {
+        let mut records = sign_request(&turn);
         let sign = |node_id: NodeId, bytes: Vec<u8>| {
             (1..=4)
                 .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
@@ -807,17 +678,20 @@ mod tests {
                 key.signature = Some(sign(key.node_id, key.signing_bytes().unwrap()));
             }),
         }
-        let event = VaultSignEvent::Signed(Box::new(records));
-        operation.step(Event::Net(NetEvent::VaultSign(event)))
+        answer_sign(operation, VaultSignEvent::Signed(Box::new(records)))
     }
 
-    fn written(effects: &Effects) -> Vec<(KeySpace, Key)> {
-        match effects.first() {
-            Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) => writes
-                .iter()
-                .map(|(key_space, key, _)| (key_space.clone(), key.clone()))
-                .collect(),
-            other => panic!("expected a batch write, got {other:?}"),
+    fn written(turn: AppendTurn) -> Vec<(KeySpace, Key, Value)> {
+        match turn {
+            Ok(Next::Call(IoCall::Write(writes))) => writes,
+            _ => panic!("expected a write"),
+        }
+    }
+
+    fn deleted(turn: AppendTurn) -> Vec<(KeySpace, Key)> {
+        match turn {
+            Ok(Next::Call(IoCall::Delete(deletes))) => deletes,
+            _ => panic!("expected a delete"),
         }
     }
 
@@ -832,22 +706,22 @@ mod tests {
                 predecessors: vec![previous],
             },
         );
-        read_rows(&mut operation, config).expect("a holder reads the heads");
-        let effects = rows(
+        let turn = read_rows(&mut operation, config);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+        let turn = rows(
             &mut operation,
             vec![head(1, Some("old")), head(2, Some("other"))],
         );
-        let effects = signed(&mut operation, effects);
+        let turn = signed(&mut operation, turn);
         let previous_row = user_record_key(user(), previous);
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::BatchDelete { deletes, .. }))
-                if deletes == &vec![(VAULT_REVISION_KEYSPACE.to_string(), previous_row.clone())]
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        let writes = written(&effects);
+        assert_eq!(
+            deleted(turn),
+            vec![(VAULT_REVISION_KEYSPACE.to_string(), previous_row.clone())]
+        );
+        let writes: Vec<_> = written(operation.next(IoResult::Done))
+            .into_iter()
+            .map(|(key_space, key, _)| (key_space, key))
+            .collect();
         let own_row = user_record_key(user(), Ulid::from_bytes([9; 16]));
         assert!(writes.contains(&(VAULT_REVISION_KEYSPACE.to_string(), own_row)));
         assert!(writes.contains(&(VAULT_RETIRED_KEYSPACE.to_string(), previous_row)));
@@ -857,20 +731,14 @@ mod tests {
                 .any(|(key_space, _)| key_space == aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE),
             "the record is queued for the other holders in the same transaction"
         );
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: txn(),
-        }));
-        operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: Duration::ZERO,
-        }));
-        assert!(operation.is_complete());
-        let VaultAppended::Heads(heads) = operation.finalize().unwrap() else {
-            panic!("a save answers heads");
+        let Ok(Next::Then {
+            output: VaultAppended::Heads(heads),
+            calls,
+        }) = operation.next(IoResult::Done)
+        else {
+            panic!("a save answers heads with the drain wake");
         };
+        assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
         let ids: Vec<_> = heads.iter().map(|head| head.revision_id).collect();
         assert_eq!(ids, [Ulid::from_bytes([2; 16]), Ulid::from_bytes([9; 16])]);
         assert!(heads[1].origin_signed());
@@ -888,11 +756,8 @@ mod tests {
         for altered in [Some(true), Some(false), None] {
             let mut operation = operation(holders[0], change.clone());
             read_rows(&mut operation, config.clone()).unwrap();
-            let effects = rows(&mut operation, Vec::new());
-            let Some(Effect::Net(NetEffect::VaultSign(records))) = effects.first() else {
-                panic!("expected a signing request");
-            };
-            let VaultRecords::Keys(mut keys) = (**records).clone() else {
+            let turn = rows(&mut operation, Vec::new());
+            let VaultRecords::Keys(mut keys) = sign_request(&turn) else {
                 panic!("expected a key record");
             };
             if altered == Some(true) {
@@ -903,13 +768,8 @@ mod tests {
                 Some(_) => VaultSignEvent::Signed(Box::new(VaultRecords::Keys(keys))),
                 None => VaultSignEvent::Unavailable("no key".to_string()),
             };
-            let effects = operation.step(Event::Net(NetEvent::VaultSign(event)));
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ));
-            assert!(matches!(
-                operation.finalize(),
+                answer_sign(&mut operation, event),
                 Err(AppendVaultError::Unsigned(_))
             ));
         }
@@ -923,10 +783,8 @@ mod tests {
             .find(|node| !holders.contains(node))
             .unwrap();
         let mut operation = operation(outsider, VaultChange::Delete);
-        assert!(read_rows(&mut operation, config).is_none());
-        assert!(operation.is_complete());
         assert_eq!(
-            operation.finalize(),
+            read_rows(&mut operation, config),
             Err(AppendVaultError::NotHolder { holders })
         );
     }
@@ -937,23 +795,13 @@ mod tests {
         let mut operation = operation(holders[0], VaultChange::Delete);
         read_rows(&mut operation, config.clone()).unwrap();
         // Only delete markers left: nothing to write.
-        let effects = rows(&mut operation, vec![head(1, None)]);
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-        ));
-        assert!(
-            matches!(operation.finalize(), Ok(VaultAppended::Heads(heads)) if heads.len() == 1)
-        );
+        let turn = rows(&mut operation, vec![head(1, None)]);
+        assert!(matches!(turn, Ok(Next::Done(VaultAppended::Heads(heads))) if heads.len() == 1));
 
         let mut operation = self::operation(holders[0], VaultChange::Delete);
         read_rows(&mut operation, config).unwrap();
-        let effects = rows(&mut operation, vec![head(1, None), head(2, Some("sealed"))]);
-        let effects = signed(&mut operation, effects);
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::BatchDelete { deletes, .. })) if deletes.len() == 2
-        ));
+        let turn = rows(&mut operation, vec![head(1, None), head(2, Some("sealed"))]);
+        assert_eq!(deleted(signed(&mut operation, turn)).len(), 2);
     }
 
     #[test]
@@ -970,45 +818,29 @@ mod tests {
                 .map(|id| head(id, (id == count).then_some("sealed")))
                 .collect();
             read_rows(&mut operation, config).unwrap();
-            let AppendState::ReadRows(planned) = &mut operation.state else {
+            let Stage::Rows(planned) = &mut operation.stage else {
                 panic!("expected scan");
             };
             planned.generation = 7;
-            let mut effects = smallvec![];
+            let mut turn = Err(AppendVaultError::NotFinished);
             for (index, page) in original.chunks(MAX_VAULT_HEADS).enumerate() {
                 let next = (index * MAX_VAULT_HEADS + page.len() < original.len())
                     .then(|| page.last().unwrap().0.clone());
-                effects = operation.step(Event::Storage(StorageEvent::IterResult {
-                    values: page.to_vec(),
-                    next_start_after: next.clone(),
-                }));
+                turn = operation.next(IoResult::Page {
+                    rows: page.to_vec(),
+                    next: next.clone(),
+                });
                 if let Some(next) = next {
-                    assert!(matches!(effects.first(),
-                        Some(Effect::Storage(StorageEffect::Iter {
-                            start: Some(IterStart::After(start)), limit, txn_id, ..
-                        })) if start == &next && *limit == MAX_VAULT_HEADS && *txn_id == Some(txn())));
+                    assert!(matches!(&turn,
+                        Ok(Next::Call(IoCall::Page { after: Some(after), limit, .. }))
+                            if after == &next && *limit == MAX_VAULT_HEADS));
                 }
             }
-            let effects = signed(&mut operation, effects);
-            let Some(Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id })) =
-                effects.first()
-            else {
-                panic!("expected snapshot deletes");
-            };
-            assert_eq!(*txn_id, Some(txn()));
-            let deletes = deletes.clone();
+            let deletes = deleted(signed(&mut operation, turn));
             assert!(original.iter().all(|(key, _)| {
                 deletes.contains(&(VAULT_REVISION_KEYSPACE.to_string(), key.clone()))
             }));
-            let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                entries: Vec::new(),
-            }));
-            let Some(Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })) =
-                effects.first()
-            else {
-                panic!("expected atomic writes");
-            };
-            assert_eq!(*txn_id, Some(txn()));
+            let writes = written(operation.next(IoResult::Done));
             let outbox: Vec<_> = writes
                 .iter()
                 .filter(|(space, _, _)| space == SYNC_OUTBOX_KEYSPACE)
@@ -1065,7 +897,7 @@ mod tests {
             for (_, key) in &deletes {
                 live.remove(key);
             }
-            for (space, key, value) in writes {
+            for (space, key, value) in &writes {
                 if space == VAULT_REVISION_KEYSPACE {
                     live.insert(key.clone(), value.clone());
                 }
@@ -1078,12 +910,10 @@ mod tests {
                     .payload
                     .is_none()
             );
-            let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
-            assert!(
-                matches!(effects.first(), Some(Effect::Storage(StorageEffect::CommitTransaction { txn_id })) if *txn_id == txn())
-            );
+            assert!(matches!(
+                operation.next(IoResult::Done),
+                Ok(Next::Then { .. })
+            ));
         }
     }
 
@@ -1100,25 +930,19 @@ mod tests {
         let full = (0..MAX_KEY_RECORDS)
             .map(|index| (Key::from(vec![index as u8]), Value::from(&[][..])))
             .collect();
-        rows(&mut operation, full);
-        assert_eq!(operation.finalize(), Err(AppendVaultError::TooManyKeys));
+        assert_eq!(
+            rows(&mut operation, full),
+            Err(AppendVaultError::TooManyKeys)
+        );
     }
 
     #[test]
     fn rejects_unexpected_event() {
         let (_, holders) = config_bytes();
         let mut operation = operation(holders[0], VaultChange::Delete);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: txn(),
-        }));
-        let effects = rows(&mut operation, Vec::new());
+        operation.first().unwrap();
         assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-        ));
-        assert!(matches!(
-            operation.finalize(),
+            rows(&mut operation, Vec::new()),
             Err(AppendVaultError::UnexpectedEvent { .. })
         ));
     }

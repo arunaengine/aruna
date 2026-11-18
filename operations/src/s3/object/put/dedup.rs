@@ -19,7 +19,7 @@ impl PutObjectOperation {
     }
 
     /// Reads the key's current version in the version transaction, before the usual lookup.
-    pub(super) fn read_current(&mut self) -> Option<Effects> {
+    pub(super) fn read_current(&mut self) -> Option<Turn> {
         if !self.dedups() {
             return None;
         }
@@ -29,43 +29,21 @@ impl PutObjectOperation {
         let Ok(head) = head else {
             return Some(self.start_hash_lookup());
         };
-        self.state = PutObjectState::ReadDedupHead;
-        Some(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            key: head.into(),
-            txn_id: self.txn_id,
-        })])
+        let read = read_row(BLOB_HEAD_KEYSPACE, head);
+        Some(self.call(PutObjectState::ReadDedupHead, read))
     }
 
-    pub(super) fn dedup_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
+    pub(super) fn dedup_read(&mut self, value: Option<Value>) -> Turn {
         match (&self.state, value) {
             (PutObjectState::ReadDedupHead, Some(value)) => {
-                let pointer = match CurrentVersionPointer::from_bytes(&value) {
-                    Ok(pointer) => pointer,
-                    Err(error) => return self.emit_error(error.into()),
-                };
+                let pointer = CurrentVersionPointer::from_bytes(&value)?;
                 let request = &self.config.request;
                 let key = VersionKey::new(&request.bucket, &request.key, pointer.version_id);
-                match key.to_bytes() {
-                    Ok(key) => {
-                        self.state = PutObjectState::ReadDedupVersion;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                            key: key.into(),
-                            txn_id: self.txn_id,
-                        })]
-                    }
-                    Err(error) => self.emit_error(error.into()),
-                }
+                let read = read_row(BLOB_VERSIONS_KEYSPACE, key.to_bytes()?);
+                self.call(PutObjectState::ReadDedupVersion, read)
             }
             (PutObjectState::ReadDedupVersion, Some(value)) => {
-                let version = match BlobVersion::from_bytes(&value) {
-                    Ok(version) => version,
-                    Err(error) => return self.emit_error(error.into()),
-                };
+                let version = BlobVersion::from_bytes(&value)?;
                 let written = self.get_written_location();
                 let same = written.is_some_and(|written| {
                     let hash = written.get_blake3();
@@ -77,20 +55,16 @@ impl PutObjectOperation {
                     .filter(|key| same && plain_class(key))
                 {
                     Some(key) => {
-                        self.state = PutObjectState::ReadDedupLocation;
-                        smallvec![blob_location_read(&key, self.txn_id)]
+                        let read = read_row(BLOB_LOCATIONS_KEYSPACE, key.to_bytes());
+                        self.call(PutObjectState::ReadDedupLocation, read)
                     }
                     None => self.start_hash_lookup(),
                 }
             }
             (PutObjectState::ReadDedupLocation, Some(value)) => {
-                let existing = match BackendLocation::from_bytes(&value) {
-                    Ok(existing) => existing,
-                    Err(error) => return self.emit_error(error.into()),
-                };
-                let Some(written) = self.get_written_location().cloned() else {
-                    return self.emit_error(PutObjectError::MissingOutput);
-                };
+                let existing = BackendLocation::from_bytes(&value)?;
+                let written = self.get_written_location().cloned();
+                let written = written.ok_or(PutObjectError::MissingOutput)?;
                 let usable = existing.is_external()
                     && !existing.staging
                     && !existing.partial
@@ -99,19 +73,15 @@ impl PutObjectOperation {
                     return self.start_hash_lookup();
                 }
                 // The kept file's backend version decides a same-path reuse and its claim.
-                self.state = PutObjectState::ReadDedupProvider;
-                self.output = Some(Ok(existing.clone()));
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BACKEND_VERSION_KEYSPACE.to_string(),
-                    key: version_key(existing.ulid),
-                    txn_id: self.txn_id,
-                })]
+                let read = read_row(BACKEND_VERSION_KEYSPACE, version_key(existing.ulid));
+                self.output = Some(existing);
+                self.call(PutObjectState::ReadDedupProvider, read)
             }
             (PutObjectState::ReadDedupProvider, value) => {
                 let kept = self.get_output().cloned();
                 let (Some(kept), Some(written)) = (kept, self.get_written_location().cloned())
                 else {
-                    return self.emit_error(PutObjectError::MissingOutput);
+                    return Err(PutObjectError::MissingOutput);
                 };
                 let fresh = self.plain.as_ref().and_then(|plain| plain.version.clone());
                 let other = value.map(|value| String::from_utf8_lossy(&value).into_owned());
@@ -125,23 +95,14 @@ impl PutObjectOperation {
                     return self.reuse(written, kept);
                 };
                 // A version a release is deleting takes no new reader.
-                match claim_key(&kept, &other) {
-                    Ok(claim) => {
-                        self.state = PutObjectState::ReadDedupClaim;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: DELETE_CLAIM_KEYSPACE.to_string(),
-                            key: claim,
-                            txn_id: self.txn_id,
-                        })]
-                    }
-                    Err(error) => self.emit_error(error.into()),
-                }
+                let read = read_row(DELETE_CLAIM_KEYSPACE, claim_key(&kept, &other)?);
+                self.call(PutObjectState::ReadDedupClaim, read)
             }
             (PutObjectState::ReadDedupClaim, None) => {
                 let kept = self.get_output().cloned();
                 let (Some(kept), Some(written)) = (kept, self.get_written_location().cloned())
                 else {
-                    return self.emit_error(PutObjectError::MissingOutput);
+                    return Err(PutObjectError::MissingOutput);
                 };
                 self.reuse(written, kept)
             }
@@ -153,10 +114,10 @@ impl PutObjectOperation {
         }
     }
 
-    fn reuse(&mut self, written: BackendLocation, existing: BackendLocation) -> Effects {
+    fn reuse(&mut self, written: BackendLocation, existing: BackendLocation) -> Turn {
         self.dedup = Some(written);
-        self.output = Some(Ok(existing));
-        self.create_blob_location()
+        self.output = Some(existing);
+        self.read_object_lookup()
     }
 
     /// The release of the written file, committed with the version that reads the older one.

@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
 use crate::s3::imports::cron::is_running;
 use crate::s3::imports::validate_folder;
 use crate::s3::purge_fence::fence_key;
