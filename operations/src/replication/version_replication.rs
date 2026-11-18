@@ -5,11 +5,10 @@
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::permission_rules::PermissionRules;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::groups::backends::{RecordReadError, parse_read};
+use crate::groups::backends::RecordReadError;
 use crate::groups::storage_routing::load_group_inputs;
 use crate::placement::policy::{
     GateContext, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision, write_gate,
@@ -19,23 +18,25 @@ use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectMetadata, VersionReplicationManifest,
     VersionReplicationMessage, VersionReplicationRequest,
 };
+use crate::s3::object::put::abe::keyed;
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
-use aruna_core::calls::ChildOutcome;
-use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
-    SYNC_REFERENCE_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    S3_BUCKET_KEYSPACE, SYNC_REFERENCE_KEYSPACE,
 };
 use aruna_core::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use aruna_core::native_reference::NATIVE_RELATIONSHIP_ID;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::unmatched_checksum;
 use aruna_core::structs::execution::source_access::{
     ObservationMatch, ResolvedSourceAccess, SourceMetadata,
@@ -70,9 +71,8 @@ use aruna_core::structs::storage::routing::{GroupRoutingInputs, RoutingError};
 use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key};
+use aruna_core::types::{GroupId, Key, Value};
 use serde::Serialize;
-use smallvec::smallvec;
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
 use thiserror::Error;
@@ -289,8 +289,13 @@ enum ReplicateScopeState {
     ReadSingleVersion,
     IterateVersions,
     RunVersionReplication,
-    Finish,
-    Error,
+}
+
+type ScopeTurn = Result<Next<ReplicateScopeResult>, ReplicateScopeError>;
+type ObjectTurn = Result<Next<ReplicationSuboperationResult>, ReplicateObjectError>;
+
+fn blob_next<T>(effect: BlobEffect) -> Next<T> {
+    Next::Call(Effect::Blob(effect).into())
 }
 
 #[derive(Debug, PartialEq)]
@@ -313,261 +318,211 @@ pub struct ReplicateScopeOperation {
     /// that may materialize reference bytes here.
     gate_context: Option<GateContext>,
     result: ReplicateScopeResult,
-    output: Option<Result<ReplicateScopeResult, ReplicateScopeError>>,
     /// A holder's permitted plaintext request, checked by the caller before each run.
     plaintext: bool,
 }
 
-impl EffectOperation for ReplicateScopeOperation {
+impl From<IoError> for ReplicateScopeError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+impl Operation for ReplicateScopeOperation {
     type Output = ReplicateScopeResult;
     type Error = ReplicateScopeError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> ScopeTurn {
         self.read_bucket()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> ScopeTurn {
         match self.state {
             ReplicateScopeState::Init => self.read_bucket(),
-            ReplicateScopeState::ReadBucket => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(ReplicateScopeError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: (event).label(),
-                    });
-                };
-                let Some(value) = value else {
-                    return self.fail(ReplicateScopeError::BucketNotFound);
-                };
-                let bucket_info = match BucketInfo::from_bytes(value.as_ref()) {
-                    Ok(bucket_info) => bucket_info,
-                    Err(err) => return self.fail(err.into()),
-                };
-                debug!(
-                    bucket = %self.input.bucket,
-                    target = ?self.input.target,
-                    target_node = %self.input.target_node_id,
-                    group_id = %bucket_info.group_id,
-                    mode = ?self.input.mode,
-                    "Loaded source bucket for replication"
-                );
-                self.source_group_id = Some(bucket_info.group_id);
-                self.resolve_target()
-            }
-            ReplicateScopeState::ResolveObjectTarget => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = &event else {
-                    return self.fail(ReplicateScopeError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: (event).label(),
-                    });
-                };
-                let ReplicateScopeTarget::Object { key } = &self.input.target else {
-                    return self.fail(ReplicateScopeError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "ReplicateScopeTarget::Object",
-                        received: (event).label(),
-                    });
-                };
-                debug!(
-                    bucket = %self.input.bucket,
-                    key = %key,
-                    target_node = %self.input.target_node_id,
-                    current_version_exists = value.is_some(),
-                    "Resolved exact object replication target"
-                );
-                self.start_iteration(Some(key.clone()), true)
-            }
-            ReplicateScopeState::ReadSingleVersion => {
-                let Event::Storage(StorageEvent::ReadResult { key, value }) = event else {
-                    return self.fail(ReplicateScopeError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: (event).label(),
-                    });
-                };
-
-                if let Some(value) = value {
-                    let version_key = match VersionKey::from_bytes(key.as_ref()) {
-                        Ok(version_key) => version_key,
-                        Err(err) => return self.fail(err.into()),
-                    };
-                    let version = match BlobVersion::from_bytes(value.as_ref()) {
-                        Ok(version) => version,
-                        Err(err) => return self.fail(err.into()),
-                    };
-                    debug!(
-                        bucket = %version_key.bucket,
-                        key = %version_key.key,
-                        version_id = %version_key.version_id,
-                        target_node = %self.input.target_node_id,
-                        is_materialized = version.is_materialized(),
-                        is_deleted = version.is_deleted(),
-                        has_source_binding = version.source_binding().is_some(),
-                        "Loaded single version for replication"
-                    );
-                    if self.should_enqueue_version(version.is_deleted()) {
-                        if let Err(error) = self.enqueue_version_request(version_key) {
-                            return self.fail(error);
-                        }
-                    } else {
-                        debug!(
-                            bucket = %version_key.bucket,
-                            key = %version_key.key,
-                            version_id = %version_key.version_id,
-                            target_node = %self.input.target_node_id,
-                            "Filtered single version from replication"
-                        );
-                    }
-                }
-
-                self.run_next_replication()
-            }
-            ReplicateScopeState::IterateVersions => {
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    return self.fail(ReplicateScopeError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::IterResult)",
-                        received: (event).label(),
-                    });
-                };
-
-                let page_len = values.len();
-                let examined = self.examined_versions.saturating_add(page_len);
-                if examined > MAX_SCOPE_VERSIONS {
-                    return self.fail(ReplicateScopeError::ScopeLimit {
-                        limit: MAX_SCOPE_VERSIONS,
-                    });
-                }
-                self.examined_versions = examined;
-                let pending_before = self.pending_versions.len();
-
-                for (key, value) in values {
-                    let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
-                        continue;
-                    };
-                    let Ok(version) = BlobVersion::from_bytes(value.as_ref()) else {
-                        continue;
-                    };
-                    if version_key.bucket != self.input.bucket {
-                        continue;
-                    }
-
-                    if let Some(prefix) = self.iteration_prefix.as_ref() {
-                        let matches = if self.exact_object_exists {
-                            version_key.key == *prefix
-                        } else {
-                            version_key.key.starts_with(prefix)
-                        };
-                        if !matches {
-                            continue;
-                        }
-                    }
-
-                    if !self.should_enqueue_version(version.is_deleted()) {
-                        continue;
-                    }
-
-                    if let Err(error) = self.enqueue_version_request(version_key) {
-                        return self.fail(error);
-                    }
-                }
-
-                debug!(
-                    bucket = %self.input.bucket,
-                    target = ?self.input.target,
-                    target_node = %self.input.target_node_id,
-                    page_len,
-                    enqueued_in_page = self.pending_versions.len().saturating_sub(pending_before),
-                    next_page = next_start_after.is_some(),
-                    "Processed replication iteration page"
-                );
-
-                if let Some(cursor) = next_start_after {
-                    self.next_start_after = Some(cursor);
-                    self.request_iteration_page()
-                } else {
-                    self.run_next_replication()
-                }
-            }
+            ReplicateScopeState::ReadBucket => self.accept_bucket(result.value()?),
+            ReplicateScopeState::ResolveObjectTarget => self.accept_object(result.value()?),
+            ReplicateScopeState::ReadSingleVersion => self.accept_single(result.value()?),
+            ReplicateScopeState::IterateVersions => self.accept_page(result.page()?),
             ReplicateScopeState::RunVersionReplication => {
-                let Event::SubOperation(SubOperationEvent::ReplicationItemResult { result }) =
-                    event
-                else {
-                    return self.fail(ReplicateScopeError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::SubOperation(SubOperationEvent::ReplicationItemResult)",
-                        received: (event).label(),
-                    });
-                };
-
-                match &result {
-                    Ok(ReplicationSuboperationResult::Replicated) => self.result.replicated += 1,
-                    Ok(ReplicationSuboperationResult::Skipped) => self.result.skipped += 1,
-                    Ok(ReplicationSuboperationResult::AwaitingKey(key)) => {
-                        if !self.result.awaiting.contains(key) {
-                            self.result.awaiting.push(*key);
-                        }
-                    }
-                    Ok(ReplicationSuboperationResult::ReplicatedBytes(bytes)) => {
-                        self.result.replicated = self.result.replicated.saturating_add(1);
-                        self.result.replicated_bytes =
-                            self.result.replicated_bytes.saturating_add(*bytes);
-                    }
-                    Err(error) => {
-                        self.result.failed += 1;
-                        self.result.failure = Some(error.failure);
-                        self.result.last_error = Some(error.message.clone());
-                    }
-                }
-
-                debug!(
-                    bucket = %self.input.bucket,
-                    target = ?self.input.target,
-                    target_node = %self.input.target_node_id,
-                    result = ?result,
-                    replicated = self.result.replicated,
-                    replicated_bytes = self.result.replicated_bytes,
-                    skipped = self.result.skipped,
-                    failed = self.result.failed,
-                    "Completed version replication suboperation"
-                );
-
-                self.run_next_replication()
+                let item = result.child::<ReplicationSuboperationResult, ReplicateObjectError>()?;
+                self.accept_item(item.map_err(|error| ReplicationItemError {
+                    failure: error.failure_category(),
+                    message: error.to_string(),
+                }))
             }
-            ReplicateScopeState::Finish => smallvec![],
-            ReplicateScopeState::Error => smallvec![],
         }
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ReplicateScopeState::Finish | ReplicateScopeState::Error
-        )
+impl ReplicateScopeOperation {
+    fn accept_bucket(&mut self, value: Option<Value>) -> ScopeTurn {
+        let Some(value) = value else {
+            return self.fail(ReplicateScopeError::BucketNotFound);
+        };
+        let bucket_info = match BucketInfo::from_bytes(value.as_ref()) {
+            Ok(bucket_info) => bucket_info,
+            Err(err) => return self.fail(err.into()),
+        };
+        debug!(
+            bucket = %self.input.bucket,
+            target = ?self.input.target,
+            target_node = %self.input.target_node_id,
+            group_id = %bucket_info.group_id,
+            mode = ?self.input.mode,
+            "Loaded source bucket for replication"
+        );
+        self.source_group_id = Some(bucket_info.group_id);
+        self.resolve_target()
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        // A finished operation carries its result, a failed one its error; any
-        // other state is an explicit premature-finalization failure rather than
-        // a successful absence.
-        if matches!(
-            self.state,
-            ReplicateScopeState::Finish | ReplicateScopeState::Error
-        ) {
-            self.output.unwrap_or(Err(ReplicateScopeError::NotFinished))
+    fn accept_object(&mut self, value: Option<Value>) -> ScopeTurn {
+        let ReplicateScopeTarget::Object { key } = &self.input.target else {
+            return self.fail(ReplicateScopeError::NotFinished);
+        };
+        let key = key.clone();
+        debug!(
+            bucket = %self.input.bucket,
+            key = %key,
+            target_node = %self.input.target_node_id,
+            current_version_exists = value.is_some(),
+            "Resolved exact object replication target"
+        );
+        self.start_iteration(Some(key), true)
+    }
+
+    fn accept_single(&mut self, value: Option<Value>) -> ScopeTurn {
+        let ReplicateScopeTarget::Version { key, version_id } = &self.input.target else {
+            return self.fail(ReplicateScopeError::NotFinished);
+        };
+        let version_key = VersionKey::new(&self.input.bucket, key, *version_id);
+        if let Some(value) = value {
+            let version = match BlobVersion::from_bytes(value.as_ref()) {
+                Ok(version) => version,
+                Err(err) => return self.fail(err.into()),
+            };
+            debug!(
+                bucket = %version_key.bucket,
+                key = %version_key.key,
+                version_id = %version_key.version_id,
+                target_node = %self.input.target_node_id,
+                is_materialized = version.is_materialized(),
+                is_deleted = version.is_deleted(),
+                has_source_binding = version.source_binding().is_some(),
+                "Loaded single version for replication"
+            );
+            if self.should_enqueue_version(version.is_deleted()) {
+                if let Err(error) = self.enqueue_version_request(version_key) {
+                    return self.fail(error);
+                }
+            } else {
+                debug!(
+                    bucket = %version_key.bucket,
+                    key = %version_key.key,
+                    version_id = %version_key.version_id,
+                    target_node = %self.input.target_node_id,
+                    "Filtered single version from replication"
+                );
+            }
+        }
+        self.run_next_replication()
+    }
+
+    fn accept_page(&mut self, (values, next): (Vec<(Key, Value)>, Option<Key>)) -> ScopeTurn {
+        let page_len = values.len();
+        let examined = self.examined_versions.saturating_add(page_len);
+        if examined > MAX_SCOPE_VERSIONS {
+            return self.fail(ReplicateScopeError::ScopeLimit {
+                limit: MAX_SCOPE_VERSIONS,
+            });
+        }
+        self.examined_versions = examined;
+        let pending_before = self.pending_versions.len();
+
+        for (key, value) in values {
+            let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
+                continue;
+            };
+            let Ok(version) = BlobVersion::from_bytes(value.as_ref()) else {
+                continue;
+            };
+            if version_key.bucket != self.input.bucket {
+                continue;
+            }
+
+            if let Some(prefix) = self.iteration_prefix.as_ref() {
+                let matches = if self.exact_object_exists {
+                    version_key.key == *prefix
+                } else {
+                    version_key.key.starts_with(prefix)
+                };
+                if !matches {
+                    continue;
+                }
+            }
+
+            if !self.should_enqueue_version(version.is_deleted()) {
+                continue;
+            }
+
+            if let Err(error) = self.enqueue_version_request(version_key) {
+                return self.fail(error);
+            }
+        }
+
+        debug!(
+            bucket = %self.input.bucket,
+            target = ?self.input.target,
+            target_node = %self.input.target_node_id,
+            page_len,
+            enqueued_in_page = self.pending_versions.len().saturating_sub(pending_before),
+            next_page = next.is_some(),
+            "Processed replication iteration page"
+        );
+
+        if let Some(cursor) = next {
+            self.next_start_after = Some(cursor);
+            self.request_iteration_page()
         } else {
-            Err(ReplicateScopeError::NotFinished)
+            self.run_next_replication()
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn accept_item(
+        &mut self,
+        result: Result<ReplicationSuboperationResult, ReplicationItemError>,
+    ) -> ScopeTurn {
+        match &result {
+            Ok(ReplicationSuboperationResult::Replicated) => self.result.replicated += 1,
+            Ok(ReplicationSuboperationResult::Skipped) => self.result.skipped += 1,
+            Ok(ReplicationSuboperationResult::AwaitingKey(key)) => {
+                if !self.result.awaiting.contains(key) {
+                    self.result.awaiting.push(*key);
+                }
+            }
+            Ok(ReplicationSuboperationResult::ReplicatedBytes(bytes)) => {
+                self.result.replicated = self.result.replicated.saturating_add(1);
+                self.result.replicated_bytes = self.result.replicated_bytes.saturating_add(*bytes);
+            }
+            Err(error) => {
+                self.result.failed += 1;
+                self.result.failure = Some(error.failure);
+                self.result.last_error = Some(error.message.clone());
+            }
+        }
+
+        debug!(
+            bucket = %self.input.bucket,
+            target = ?self.input.target,
+            target_node = %self.input.target_node_id,
+            result = ?result,
+            replicated = self.result.replicated,
+            replicated_bytes = self.result.replicated_bytes,
+            skipped = self.result.skipped,
+            failed = self.result.failed,
+            "Completed version replication suboperation"
+        );
+
+        self.run_next_replication()
     }
 }
 
@@ -646,7 +601,6 @@ impl ReplicateScopeOperation {
                 failure: None,
                 awaiting: Vec::new(),
             },
-            output: None,
             plaintext: false,
         }
     }
@@ -777,12 +731,10 @@ impl ReplicateScopeOperation {
             ReplicateScopeState::ReadSingleVersion => "ReadSingleVersion",
             ReplicateScopeState::IterateVersions => "IterateVersions",
             ReplicateScopeState::RunVersionReplication => "RunVersionReplication",
-            ReplicateScopeState::Finish => "Finish",
-            ReplicateScopeState::Error => "Error",
         }
     }
 
-    fn fail(&mut self, err: ReplicateScopeError) -> Effects {
+    fn fail(&self, err: ReplicateScopeError) -> ScopeTurn {
         debug!(
             bucket = %self.input.bucket,
             target = ?self.input.target,
@@ -791,12 +743,10 @@ impl ReplicateScopeOperation {
             error = %err,
             "Scope replication failed"
         );
-        self.state = ReplicateScopeState::Error;
-        self.output = Some(Err(err));
-        smallvec![]
+        Err(err)
     }
 
-    fn read_bucket(&mut self) -> Effects {
+    fn read_bucket(&mut self) -> ScopeTurn {
         debug!(
             bucket = %self.input.bucket,
             target = ?self.input.target,
@@ -805,14 +755,11 @@ impl ReplicateScopeOperation {
             "Entering ReadBucket state"
         );
         self.state = ReplicateScopeState::ReadBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
+        let key = self.input.bucket.as_bytes().to_vec();
+        Ok(Next::Call(read_row(S3_BUCKET_KEYSPACE, key)))
     }
 
-    fn resolve_target(&mut self) -> Effects {
+    fn resolve_target(&mut self) -> ScopeTurn {
         match self.input.target.clone() {
             ReplicateScopeTarget::Bucket => self.start_iteration(None, false),
             ReplicateScopeTarget::Prefix(prefix) => self.start_iteration(Some(prefix), false),
@@ -822,11 +769,7 @@ impl ReplicateScopeOperation {
                     Ok(lookup) => lookup,
                     Err(err) => return self.fail(err.into()),
                 };
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
-                    key: lookup.into(),
-                    txn_id: None,
-                })]
+                Ok(Next::Call(read_row(BLOB_HEAD_KEYSPACE, lookup)))
             }
             ReplicateScopeTarget::Version { key, version_id } => {
                 self.read_single_version(&key, version_id)
@@ -838,7 +781,7 @@ impl ReplicateScopeOperation {
         &mut self,
         prefix_filter: Option<String>,
         exact_object_exists: bool,
-    ) -> Effects {
+    ) -> ScopeTurn {
         debug!(
             bucket = %self.input.bucket,
             target = ?self.input.target,
@@ -855,31 +798,26 @@ impl ReplicateScopeOperation {
         self.request_iteration_page()
     }
 
-    fn request_iteration_page(&mut self) -> Effects {
+    fn request_iteration_page(&mut self) -> ScopeTurn {
         let prefix = match VersionKey::bucket_prefix(&self.input.bucket) {
             Ok(prefix) => prefix,
             Err(err) => return self.fail(err.into()),
         };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: self.next_start_after.clone().map(IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: self.next_start_after.clone(),
             limit: ITER_PAGE_SIZE,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn read_single_version(&mut self, key: &str, version_id: Ulid) -> Effects {
+    fn read_single_version(&mut self, key: &str, version_id: Ulid) -> ScopeTurn {
         self.state = ReplicateScopeState::ReadSingleVersion;
         let version_key = match VersionKey::new(&self.input.bucket, key, version_id).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: version_key.into(),
-            txn_id: None,
-        })]
+        Ok(Next::Call(read_row(BLOB_VERSIONS_KEYSPACE, version_key)))
     }
 
     fn enqueue_version_request(
@@ -952,7 +890,7 @@ impl ReplicateScopeOperation {
         self.input.replicate_delete_markers || !is_deleted
     }
 
-    fn run_next_replication(&mut self) -> Effects {
+    fn run_next_replication(&mut self) -> ScopeTurn {
         if self.reference_advance.is_some() && self.pending_versions.len() > 1 {
             return self.fail(ReplicateObjectError::InvalidReferenceAdvance.into());
         }
@@ -967,9 +905,7 @@ impl ReplicateScopeOperation {
                 failed = self.result.failed,
                 "Scope replication finished"
             );
-            self.state = ReplicateScopeState::Finish;
-            self.output = Some(Ok(self.result.clone()));
-            return smallvec![];
+            return Ok(Next::Done(self.result.clone()));
         };
 
         debug!(
@@ -1009,18 +945,7 @@ impl ReplicateScopeOperation {
             None => operation,
         };
         let operation = operation.with_plaintext(self.plaintext);
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            operation,
-            |result| Event::SubOperation(SubOperationEvent::ReplicationItemResult {
-                result: match result {
-                    Ok(value) => Ok(value),
-                    Err(error) => Err(ReplicationItemError {
-                        failure: error.failure_category(),
-                        message: error.to_string(),
-                    }),
-                },
-            }),
-        ))]
+        Ok(Next::Call(IoCall::child(operation)))
     }
 }
 
@@ -1118,8 +1043,6 @@ enum ReplicateObjectState {
     AwaitApplyComplete,
     WriteReferenceState,
     CloseConnection,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1163,7 +1086,8 @@ pub struct ReplicateObjectOperation {
     /// materialized locally.
     gate_context: Option<GateContext>,
     routing: NodeRouting,
-    result: Result<ReplicationSuboperationResult, ReplicateObjectError>,
+    /// What the item reports once its stream is closed.
+    result: ReplicationSuboperationResult,
     /// A permitted plaintext request: encrypted items may reach a plain target.
     plaintext: bool,
     /// What the target asked for; it decides how an encrypted source sends.
@@ -1218,7 +1142,7 @@ impl ReplicateObjectOperation {
             pending_copy: None,
             gate_context: None,
             routing: NodeRouting::default(),
-            result: Ok(ReplicationSuboperationResult::Replicated),
+            result: ReplicationSuboperationResult::Replicated,
             plaintext: false,
             negotiated: None,
             pending_archive: None,
@@ -1289,12 +1213,28 @@ impl ReplicateObjectOperation {
             ReplicateObjectState::AwaitApplyComplete => "AwaitApplyComplete",
             ReplicateObjectState::WriteReferenceState => "WriteReferenceState",
             ReplicateObjectState::CloseConnection => "CloseConnection",
-            ReplicateObjectState::Finish => "Finish",
-            ReplicateObjectState::Error => "Error",
         }
     }
 
-    fn fail(&mut self, err: ReplicateObjectError) -> Effects {
+    fn invalid(&self, expected: &'static str, received: &'static str) -> ObjectTurn {
+        self.fail(ReplicateObjectError::InvalidStateEvent {
+            state: self.state_name(),
+            expected,
+            received,
+        })
+    }
+
+    fn read(
+        &mut self,
+        state: ReplicateObjectState,
+        space: &str,
+        key: impl Into<Key>,
+    ) -> ObjectTurn {
+        self.state = state;
+        Ok(Next::Call(read_row(space, key)))
+    }
+
+    fn fail(&self, err: ReplicateObjectError) -> ObjectTurn {
         debug!(
             bucket = %self.request.bucket,
             key = %self.request.key,
@@ -1304,13 +1244,10 @@ impl ReplicateObjectOperation {
             error = %err,
             "Version replication failed"
         );
-        self.state = ReplicateObjectState::Error;
-        self.result = Err(err);
-        self.abort()
+        Err(err)
     }
 
-    fn read_version(&mut self) -> Effects {
-        self.state = ReplicateObjectState::ReadVersion;
+    fn read_version(&mut self) -> ObjectTurn {
         let key = match VersionKey::new(
             &self.request.bucket,
             &self.request.key,
@@ -1322,46 +1259,47 @@ impl ReplicateObjectOperation {
             Err(err) => return self.fail(err.into()),
         };
 
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
+        self.read(
+            ReplicateObjectState::ReadVersion,
+            BLOB_VERSIONS_KEYSPACE,
+            key,
+        )
     }
 
-    fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
-        self.state = ReplicateObjectState::ReadBlobLocation;
-        smallvec![blob_location_read(&key, None)]
+    fn read_blob_location(&mut self, key: BlobLocationKey) -> ObjectTurn {
+        self.read(
+            ReplicateObjectState::ReadBlobLocation,
+            BLOB_LOCATIONS_KEYSPACE,
+            key.to_bytes(),
+        )
     }
 
-    fn read_multipart_summary(&mut self) -> Effects {
-        self.state = ReplicateObjectState::ReadMultipartSummary;
+    fn read_multipart_summary(&mut self) -> ObjectTurn {
         let key = match MultipartObjectKey::summary(self.request.version_id).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
 
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
+        self.read(
+            ReplicateObjectState::ReadMultipartSummary,
+            OBJECT_METADATA_KEYSPACE,
+            key,
+        )
     }
 
-    fn read_multipart_parts(&mut self) -> Effects {
+    fn read_multipart_parts(&mut self) -> ObjectTurn {
         self.state = ReplicateObjectState::ReadMultipartParts;
         let prefix = match MultipartObjectKey::part_prefix(self.request.version_id) {
             Ok(prefix) => prefix,
             Err(err) => return self.fail(err.into()),
         };
 
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: self.parts_next_start.clone().map(IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: OBJECT_METADATA_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: self.parts_next_start.clone(),
             limit: ITER_PAGE_SIZE,
-            txn_id: None,
-        })]
+        }))
     }
 
     fn validate_multipart_parts(&self) -> Result<(), ReplicateObjectError> {
@@ -1380,21 +1318,20 @@ impl ReplicateObjectOperation {
         Ok(())
     }
 
-    fn read_current_lookup(&mut self) -> Effects {
-        self.state = ReplicateObjectState::ReadCurrentLookup;
+    fn read_current_lookup(&mut self) -> ObjectTurn {
         let key = match BlobHeadKey::new(&self.request.bucket, &self.request.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
 
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
+        self.read(
+            ReplicateObjectState::ReadCurrentLookup,
+            BLOB_HEAD_KEYSPACE,
+            key,
+        )
     }
 
-    fn skip_version(&mut self) -> Effects {
+    fn skip_version(&mut self) -> ObjectTurn {
         debug!(
             bucket = %self.request.bucket,
             key = %self.request.key,
@@ -1404,9 +1341,7 @@ impl ReplicateObjectOperation {
             mode = ?self.request.mode,
             "Skipping version replication"
         );
-        self.result = Ok(ReplicationSuboperationResult::Skipped);
-        self.state = ReplicateObjectState::Finish;
-        smallvec![]
+        Ok(Next::Done(ReplicationSuboperationResult::Skipped))
     }
 
     fn reference_matches(&self, metadata: &SourceMetadata) -> Option<bool> {
@@ -1424,7 +1359,7 @@ impl ReplicateObjectOperation {
         })
     }
 
-    fn resolve_reference(&mut self, version: ReplicationVersion) -> Effects {
+    fn resolve_reference(&mut self, version: ReplicationVersion) -> ObjectTurn {
         if self.sync.is_none() && self.request.mode != ReplicationMode::OnDemand {
             return self.skip_version();
         }
@@ -1461,20 +1396,14 @@ impl ReplicateObjectOperation {
 
         self.replication_version = Some(version);
         self.state = ReplicateObjectState::ResolveReferenceAccess;
-        smallvec![resolve_binding_effect(ResolveBindingInput {
+        let resolve = resolve_binding_effect(ResolveBindingInput {
             source,
             group_id: None,
-        },)]
+        });
+        Ok(Next::Call(resolve.into()))
     }
 
-    fn accept_reference_encryption(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn accept_reference_encryption(&mut self, value: Option<Value>) -> ObjectTurn {
         let settings = match BucketEncryption::from_row(value.as_deref()) {
             Ok(settings) => settings,
             Err(err) => return self.fail(err.into()),
@@ -1490,10 +1419,12 @@ impl ReplicateObjectOperation {
         }
         self.reference_access = Some(access.clone());
         self.state = ReplicateObjectState::HeadReferenceSource;
-        smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+        Ok(Next::Call(
+            Effect::StagingSource(StagingSourceEffect::Head { access }).into(),
+        ))
     }
 
-    fn accept_reference_access(&mut self, event: Event) -> Effects {
+    fn accept_reference_access(&mut self, event: Event) -> ObjectTurn {
         match event {
             Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Ok(access),
@@ -1518,12 +1449,11 @@ impl ReplicateObjectOperation {
                 );
                 // Reference content of an encrypting bucket is never read or materialized here.
                 self.pending_access = Some(access);
-                self.state = ReplicateObjectState::CheckReferenceEncryption;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-                    key: self.request.bucket.as_bytes().into(),
-                    txn_id: None,
-                })]
+                self.read(
+                    ReplicateObjectState::CheckReferenceEncryption,
+                    BUCKET_ENCRYPTION_KEYSPACE,
+                    self.request.bucket.as_bytes().to_vec(),
+                )
             }
             Event::SubOperation(SubOperationEvent::VersionAccessResolved { result: Err(_) }) => {
                 debug!(
@@ -1539,11 +1469,10 @@ impl ReplicateObjectOperation {
                     self.skip_version()
                 }
             }
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
-                received: (other).label(),
-            }),
+            other => self.invalid(
+                "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
+                other.label(),
+            ),
         }
     }
 
@@ -1561,7 +1490,7 @@ impl ReplicateObjectOperation {
         )?)
     }
 
-    fn accept_reference_head(&mut self, event: Event) -> Effects {
+    fn accept_reference_head(&mut self, event: Event) -> ObjectTurn {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
                 match self.reference_matches(&metadata) {
@@ -1574,32 +1503,23 @@ impl ReplicateObjectOperation {
                     Ok(key) => key,
                     Err(error) => return self.fail(error),
                 };
-                self.state = ReplicateObjectState::ReadReferenceState;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: SYNC_REFERENCE_KEYSPACE.to_string(),
-                    key: key.into(),
-                    txn_id: None,
-                })]
+                self.read(
+                    ReplicateObjectState::ReadReferenceState,
+                    SYNC_REFERENCE_KEYSPACE,
+                    key,
+                )
             }
             Event::StagingSource(StagingSourceEvent::Error { .. }) => {
                 self.fail(ReplicationError::ReplicationFailed.into())
             }
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::StagingSource(StagingSourceEvent::HeadResult)",
-                received: (other).label(),
-            }),
+            other => self.invalid(
+                "Event::StagingSource(StagingSourceEvent::HeadResult)",
+                other.label(),
+            ),
         }
     }
 
-    fn accept_reference_state(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn accept_reference_state(&mut self, value: Option<Value>) -> ObjectTurn {
         if self.reference_advance.is_some() {
             return self.read_current_lookup();
         }
@@ -1635,28 +1555,28 @@ impl ReplicateObjectOperation {
 
     /// This node materializes the reference locally, so it routes with its own
     /// snapshot: the group default and bucket rules load before the read.
-    fn load_routing(&mut self, access: ResolvedSourceAccess) -> Effects {
+    fn load_routing(&mut self, access: ResolvedSourceAccess) -> ObjectTurn {
         self.reference_access = Some(access);
         self.state = ReplicateObjectState::LoadRouting;
-        smallvec![load_group_inputs(self.request.source_group_id)]
+        Ok(Next::Call(
+            load_group_inputs(self.request.source_group_id).into(),
+        ))
     }
 
-    fn read_bucket_rules(&mut self) -> Effects {
-        self.state = ReplicateObjectState::ReadBucketRules;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.request.bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
+    fn read_bucket_rules(&mut self) -> ObjectTurn {
+        self.read(
+            ReplicateObjectState::ReadBucketRules,
+            S3_BUCKET_KEYSPACE,
+            self.request.bucket.as_bytes().to_vec(),
+        )
     }
 
-    fn accept_routing_loaded(&mut self, event: Event) -> Effects {
+    fn accept_routing_loaded(&mut self, event: Event) -> ObjectTurn {
         let Event::SubOperation(SubOperationEvent::GroupRoutingLoaded { result }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
-                received: (event).label(),
-            });
+            return self.invalid(
+                "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
+                event.label(),
+            );
         };
         match result {
             Ok(inputs) => self.group_inputs = inputs,
@@ -1670,18 +1590,9 @@ impl ReplicateObjectOperation {
     /// A bucket without a record simply has no rules; an unreadable or
     /// undecodable one fails the write instead of rerouting it, matching the
     /// snapshot the local write surface assembles.
-    fn accept_bucket_rules(&mut self, event: Event) -> Effects {
-        if !matches!(
-            event,
-            Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-        ) {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        }
-        match parse_read(event, BucketInfo::from_bytes) {
+    fn accept_bucket_rules(&mut self, value: Option<Value>) -> ObjectTurn {
+        let record = value.as_deref().map(BucketInfo::from_bytes).transpose();
+        match record.map_err(RecordReadError::Conversion) {
             Ok(record) => {
                 self.bucket_group = record.as_ref().map(|info| info.group_id);
                 let info = record.map(|info| (info.storage_routing, info.compression));
@@ -1694,7 +1605,7 @@ impl ReplicateObjectOperation {
 
     /// A reference materializes real bytes on this node, so it passes the same
     /// destination gate an ordinary write does, before the source is read.
-    fn read_reference_source(&mut self) -> Effects {
+    fn read_reference_source(&mut self) -> ObjectTurn {
         match write_gate(
             self.gate_context.as_ref(),
             &self.version_policies,
@@ -1703,21 +1614,16 @@ impl ReplicateObjectOperation {
             Ok(None) => self.open_reference_source(),
             Ok(Some(gate)) => {
                 self.state = ReplicateObjectState::ReferencePolicyGate;
-                let child =
-                    boxed_suboperation(gate, |outcome| Event::Child(ChildOutcome::new(outcome)));
-                smallvec![Effect::SubOperation(child)]
+                Ok(Next::Call(IoCall::child(gate)))
             }
             Err(error) => self.fail(error.into()),
         }
     }
 
-    fn accept_reference_gate(&mut self, event: Event) -> Effects {
-        let Event::Child(outcome) = event else {
-            return self.fail(PolicyGateError::InvalidEvent.into());
-        };
-        let Some(outcome) = outcome.take::<PolicyGateOutcome, ReadPolicyError>() else {
-            return self.fail(PolicyGateError::InvalidEvent.into());
-        };
+    fn accept_reference_gate(
+        &mut self,
+        outcome: Result<PolicyGateOutcome, ReadPolicyError>,
+    ) -> ObjectTurn {
         let decision = outcome
             .map_err(PolicyGateError::from)
             .and_then(gate_decision);
@@ -1727,7 +1633,7 @@ impl ReplicateObjectOperation {
         }
     }
 
-    fn open_reference_source(&mut self) -> Effects {
+    fn open_reference_source(&mut self) -> ObjectTurn {
         let Some(access) = self.reference_access.take() else {
             return self.fail(ReplicateObjectError::UnresolvedReferenceVersion);
         };
@@ -1738,14 +1644,15 @@ impl ReplicateObjectOperation {
             _ => None,
         };
         self.state = ReplicateObjectState::ReadReferenceSource;
-        smallvec![Effect::StagingSource(StagingSourceEffect::Read {
+        let read = StagingSourceEffect::Read {
             access,
             range: None,
             expected,
-        })]
+        };
+        Ok(Next::Call(Effect::StagingSource(read).into()))
     }
 
-    fn accept_reference_read(&mut self, event: Event) -> Effects {
+    fn accept_reference_read(&mut self, event: Event) -> ObjectTurn {
         match event {
             Event::StagingSource(StagingSourceEvent::ReadResult {
                 metadata: source_metadata,
@@ -1791,14 +1698,14 @@ impl ReplicateObjectOperation {
                     };
                 self.reference_metadata = Some(source_metadata);
                 self.state = ReplicateObjectState::WriteReferenceBlob;
-                smallvec![Effect::Blob(BlobEffect::Write {
+                Ok(blob_next(BlobEffect::Write {
                     bucket: self.request.bucket.clone(),
                     key: self.request.key.clone(),
                     resolved,
                     created_by,
                     blob: stream,
                     size: None,
-                })]
+                }))
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 debug!(
@@ -1815,15 +1722,14 @@ impl ReplicateObjectOperation {
                     self.skip_version()
                 }
             }
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::StagingSource(StagingSourceEvent::ReadResult)",
-                received: (other).label(),
-            }),
+            other => self.invalid(
+                "Event::StagingSource(StagingSourceEvent::ReadResult)",
+                other.label(),
+            ),
         }
     }
 
-    fn accept_reference_write(&mut self, event: Event) -> Effects {
+    fn accept_reference_write(&mut self, event: Event) -> ObjectTurn {
         match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => {
                 let Some(version) = self.replication_version.take() else {
@@ -1873,11 +1779,7 @@ impl ReplicateObjectOperation {
             Event::Blob(BlobEvent::Error(_)) => {
                 self.fail(ReplicationError::ReplicationFailed.into())
             }
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::WriteFinished)",
-                received: (other).label(),
-            }),
+            other => self.invalid("Event::Blob(BlobEvent::WriteFinished)", other.label()),
         }
     }
 
@@ -2143,12 +2045,14 @@ impl ReplicateObjectOperation {
         }
     }
 
-    fn send_manifest(&mut self) -> Effects {
+    fn send_manifest(&mut self) -> ObjectTurn {
         self.state = ReplicateObjectState::SendManifest;
         let Some(stream_id) = self.stream_id else {
             return self.fail(ReplicationError::ConnectionMissing.into());
         };
-        let manifest = self.manifest.clone().expect("manifest available");
+        let Some(manifest) = self.manifest.clone() else {
+            return self.fail(ReplicateObjectError::NotFinished);
+        };
         let message = match manifest.reference_advance {
             Some(advance) => VersionReplicationMessage::ReferenceAdvance { manifest, advance },
             None => VersionReplicationMessage::VersionManifest(manifest),
@@ -2158,26 +2062,26 @@ impl ReplicateObjectOperation {
             Err(err) => return self.fail(err.into()),
         };
 
-        smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
+        Ok(blob_next(BlobEffect::SendMessage { stream_id, payload }))
     }
 
-    fn await_negotiation(&mut self) -> Effects {
+    fn await_negotiation(&mut self) -> ObjectTurn {
         self.state = ReplicateObjectState::AwaitNegotiation;
         let Some(stream_id) = self.stream_id else {
             return self.fail(ReplicationError::ConnectionMissing.into());
         };
-        smallvec![Effect::Blob(BlobEffect::ReadMessage { stream_id })]
+        Ok(blob_next(BlobEffect::ReadMessage { stream_id }))
     }
 
-    fn await_apply_complete(&mut self) -> Effects {
+    fn await_apply_complete(&mut self) -> ObjectTurn {
         self.state = ReplicateObjectState::AwaitApplyComplete;
         let Some(stream_id) = self.stream_id else {
             return self.fail(ReplicationError::ConnectionMissing.into());
         };
-        smallvec![Effect::Blob(BlobEffect::ReadMessage { stream_id })]
+        Ok(blob_next(BlobEffect::ReadMessage { stream_id }))
     }
 
-    fn approve_apply(&mut self) -> Effects {
+    fn approve_apply(&mut self) -> ObjectTurn {
         let Some(stream_id) = self.stream_id else {
             return self.fail(ReplicationError::ConnectionMissing.into());
         };
@@ -2186,27 +2090,27 @@ impl ReplicateObjectOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.state = ReplicateObjectState::SendApproval;
-        smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
+        Ok(blob_next(BlobEffect::SendMessage { stream_id, payload }))
     }
 
-    fn close_connection(&mut self) -> Effects {
+    fn close_connection(&mut self) -> ObjectTurn {
         self.state = ReplicateObjectState::CloseConnection;
         let Some(stream_id) = self.stream_id else {
             return self.fail(ReplicationError::ConnectionMissing.into());
         };
-        smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
+        Ok(blob_next(BlobEffect::CloseConnection { stream_id }))
     }
 
-    fn cleanup_reference_blob(&mut self) -> Effects {
+    fn cleanup_reference_blob(&mut self) -> ObjectTurn {
         if let Some(location) = self.cleanup_reference_blob.take() {
             self.state = ReplicateObjectState::CleanupReferenceBlob;
-            smallvec![Effect::Blob(BlobEffect::Delete { location })]
+            Ok(blob_next(BlobEffect::Delete { location }))
         } else {
             self.close_connection()
         }
     }
 
-    fn write_reference_state(&mut self) -> Effects {
+    fn write_reference_state(&mut self) -> ObjectTurn {
         if self.sync.is_none() {
             return self.cleanup_reference_blob();
         }
@@ -2227,115 +2131,93 @@ impl ReplicateObjectOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.state = ReplicateObjectState::WriteReferenceState;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: SYNC_REFERENCE_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        })]
+        let row = (
+            SYNC_REFERENCE_KEYSPACE.to_string(),
+            key.into(),
+            value.into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
-// Phase: manifest preparation
-// Reading the stored version, resolving and materializing reference sources,
-// multipart metadata and the current-version lookup that builds the manifest.
-impl EffectOperation for ReplicateObjectOperation {
+impl From<IoError> for ReplicateObjectError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+// The phase order is documented on [`ReplicateObjectState`].
+impl Operation for ReplicateObjectOperation {
     type Output = ReplicationSuboperationResult;
     type Error = ReplicateObjectError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> ObjectTurn {
         self.read_version()
     }
 
-    /// One accepted event per protocol phase. The phase order is documented
-    /// on [`ReplicateObjectState`].
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> ObjectTurn {
+        use ReplicateObjectState as State;
         match self.state {
             // Manifest preparation: read the version and materialize references.
-            ReplicateObjectState::Init => self.read_version(),
-            ReplicateObjectState::ReadVersion => self.accept_version_read(event),
-            ReplicateObjectState::ReadSourceRoot => self.accept_root_read(event),
-            ReplicateObjectState::ReadBlobLocation => self.accept_blob_location(event),
-            ReplicateObjectState::CheckManagedCopy => self.accept_managed_copy(event),
-            ReplicateObjectState::ResolveReferenceAccess => self.accept_reference_access(event),
-            ReplicateObjectState::CheckReferenceEncryption => {
-                self.accept_reference_encryption(event)
+            State::Init => self.read_version(),
+            State::ReadVersion => self.accept_version_read(result.value()?),
+            State::ReadSourceRoot => self.accept_root_read(result.event()?),
+            State::ReadBlobLocation => self.accept_blob_location(result.value()?),
+            State::CheckManagedCopy => self.accept_managed_copy(result.values()?),
+            State::ResolveReferenceAccess => self.accept_reference_access(result.event()?),
+            State::CheckReferenceEncryption => self.accept_reference_encryption(result.value()?),
+            State::HeadReferenceSource => self.accept_reference_head(result.event()?),
+            State::ReadReferenceState => self.accept_reference_state(result.value()?),
+            State::LoadRouting => self.accept_routing_loaded(result.event()?),
+            State::ReadBucketRules => self.accept_bucket_rules(result.value()?),
+            State::ReadReferenceSource => self.accept_reference_read(result.event()?),
+            State::ReferencePolicyGate => {
+                self.accept_reference_gate(result.child::<PolicyGateOutcome, ReadPolicyError>()?)
             }
-            ReplicateObjectState::HeadReferenceSource => self.accept_reference_head(event),
-            ReplicateObjectState::ReadReferenceState => self.accept_reference_state(event),
-            ReplicateObjectState::LoadRouting => self.accept_routing_loaded(event),
-            ReplicateObjectState::ReadBucketRules => self.accept_bucket_rules(event),
-            ReplicateObjectState::ReadReferenceSource => self.accept_reference_read(event),
-            ReplicateObjectState::ReferencePolicyGate => self.accept_reference_gate(event),
-            ReplicateObjectState::WriteReferenceBlob => self.accept_reference_write(event),
-            ReplicateObjectState::ReadMultipartSummary => self.accept_multipart_summary(event),
-            ReplicateObjectState::ReadMultipartParts => self.accept_multipart_parts(event),
-            ReplicateObjectState::ReadCurrentLookup => self.accept_current_lookup(event),
-            ReplicateObjectState::ReadPendingSource => self.accept_pending_source(event),
-            ReplicateObjectState::AdmitPendingSource => self.accept_pending_admission(event),
-            ReplicateObjectState::SchedulePromotion => self.accept_promotion_scheduled(event),
-            ReplicateObjectState::AdmitSourceKey => self.accept_source_admission(event),
+            State::WriteReferenceBlob => self.accept_reference_write(result.event()?),
+            State::ReadMultipartSummary => self.accept_multipart_summary(result.value()?),
+            State::ReadMultipartParts => self.accept_multipart_parts(result.page()?),
+            State::ReadCurrentLookup => self.accept_current_lookup(result.value()?),
+            State::ReadPendingSource => self.accept_pending_source(result.value()?),
+            State::AdmitPendingSource => self.accept_pending_admission(result.event()?),
+            State::SchedulePromotion => self.accept_promotion_scheduled(result.event()?),
+            State::AdmitSourceKey => self.accept_source_admission(result.event()?),
             // Connection: open the stream to the target node.
-            ReplicateObjectState::OpenConnection => self.accept_connection_established(event),
+            State::OpenConnection => self.accept_connection_established(result.event()?),
             // Negotiation: send the manifest and accept the target's decision.
-            ReplicateObjectState::SendManifest => self.accept_manifest_sent(event),
-            ReplicateObjectState::AwaitNegotiation => self.accept_negotiation_response(event),
+            State::SendManifest => self.accept_manifest_sent(result.event()?),
+            State::AwaitNegotiation => self.accept_negotiation_response(result.event()?),
             // Transfer: push the blob the target requested.
-            ReplicateObjectState::CheckSourceEncryption => self.accept_source_encryption(event),
-            ReplicateObjectState::TransferBlob => self.accept_blob_transfer(event),
-            ReplicateObjectState::SendApproval => self.accept_approval_sent(event),
+            State::CheckSourceEncryption => self.accept_source_encryption(result.value()?),
+            State::TransferBlob => self.accept_blob_transfer(result.event()?),
+            State::SendApproval => self.accept_approval_sent(result.event()?),
             // Apply acknowledgement: the target reports the replica applied.
-            ReplicateObjectState::AwaitApplyComplete => self.accept_apply_response(event),
+            State::AwaitApplyComplete => self.accept_apply_response(result.event()?),
             // Close/cleanup: drop local reference bytes and close the stream.
-            ReplicateObjectState::CleanupReferenceBlob => self.accept_blob_cleanup(event),
-            ReplicateObjectState::WriteReferenceState => self.accept_state_write(event),
-            ReplicateObjectState::CloseConnection => self.accept_connection_closed(event),
-            ReplicateObjectState::Finish => smallvec![],
-            ReplicateObjectState::Error => smallvec![],
+            State::CleanupReferenceBlob => self.accept_blob_cleanup(result.event()?),
+            State::WriteReferenceState => {
+                result.done()?;
+                self.cleanup_reference_blob()
+            }
+            State::CloseConnection => self.accept_connection_closed(result.event()?),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ReplicateObjectState::Finish | ReplicateObjectState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        // Only a terminal state carries an outcome; an unstarted or in-flight
-        // operation must not report a successful default.
-        match self.state {
-            ReplicateObjectState::Finish => self.result,
-            ReplicateObjectState::Error => match self.result {
-                Ok(_) => Err(ReplicateObjectError::VersionNotFound),
-                Err(err) => Err(err),
-            },
-            _ => Err(ReplicateObjectError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        let mut effects = smallvec![];
+    /// A failed push drops its local reference bytes and closes its stream.
+    fn abort(&mut self) -> Vec<IoCall> {
+        let mut calls = Vec::new();
         if let Some(location) = self.cleanup_reference_blob.take() {
-            effects.push(Effect::Blob(BlobEffect::Delete { location }));
+            calls.push(Effect::Blob(BlobEffect::Delete { location }).into());
         }
         if let Some(stream_id) = self.stream_id {
-            effects.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }));
+            calls.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }).into());
         }
-        effects
+        calls
     }
 }
 
 impl ReplicateObjectOperation {
-    fn accept_version_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn accept_version_read(&mut self, value: Option<Value>) -> ObjectTurn {
         let Some(value) = value else {
             return self.fail(ReplicateObjectError::VersionNotFound);
         };
@@ -2348,12 +2230,12 @@ impl ReplicateObjectOperation {
         if let Some(digest) = named_root(&version) {
             self.compact_version = Some(version);
             self.state = ReplicateObjectState::ReadSourceRoot;
-            return smallvec![Effect::Storage(read_root(digest, None))];
+            return Ok(Next::Call(Effect::Storage(read_root(digest, None)).into()));
         }
         self.take_version(version)
     }
 
-    fn accept_root_read(&mut self, event: Event) -> Effects {
+    fn accept_root_read(&mut self, event: Event) -> ObjectTurn {
         let Some(version) = self.compact_version.take() else {
             return self.fail(ReplicateObjectError::VersionNotFound);
         };
@@ -2369,7 +2251,7 @@ impl ReplicateObjectOperation {
         }
     }
 
-    fn take_version(&mut self, version: BlobVersion) -> Effects {
+    fn take_version(&mut self, version: BlobVersion) -> ObjectTurn {
         let is_materialized = version.is_materialized();
         let is_deleted = version.is_deleted();
         let has_source_binding = version.source_binding().is_some();
@@ -2447,25 +2329,17 @@ impl ReplicateObjectOperation {
             }
             // Its content hash is known only after promotion with its key.
             BlobVersionState::PendingContent { archive, .. } => {
-                self.state = ReplicateObjectState::ReadPendingSource;
                 self.pending_archive = Some(archive.clone());
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: PENDING_LOCATION_KEYSPACE.to_string(),
-                    key: archive.to_bytes().into(),
-                    txn_id: None,
-                })]
+                self.read(
+                    ReplicateObjectState::ReadPendingSource,
+                    PENDING_LOCATION_KEYSPACE,
+                    archive.to_bytes(),
+                )
             }
         }
     }
 
-    fn accept_blob_location(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn accept_blob_location(&mut self, value: Option<Value>) -> ObjectTurn {
         let Some(value) = value else {
             return self.fail(ReplicateObjectError::VersionNotFound);
         };
@@ -2506,24 +2380,18 @@ impl ReplicateObjectOperation {
             ),
             location.backend.clone(),
         );
-        let effect = match serve_reads(&key, None) {
-            Ok(effect) => effect,
+        let reads = match serve_reads(&key, None) {
+            Ok(Effect::Storage(StorageEffect::BatchRead { reads, .. })) => reads,
+            Ok(_) => return self.fail(ReplicateObjectError::NotFinished),
             Err(error) => return self.fail(error.into()),
         };
         self.pending_copy = Some(key);
         self.state = ReplicateObjectState::CheckManagedCopy;
-        smallvec![effect]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn accept_managed_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: (event).label(),
-            });
-        };
-        let (copy, subject) = match split_serve_reads(values) {
+    fn accept_managed_copy(&mut self, values: Vec<Option<Value>>) -> ObjectTurn {
+        let (copy, subject) = match split_serve_reads(keyed(&values)) {
             Ok(split) => split,
             Err(error) => return self.fail(error.into()),
         };
@@ -2545,14 +2413,7 @@ impl ReplicateObjectOperation {
         self.read_multipart_summary()
     }
 
-    fn accept_multipart_summary(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn accept_multipart_summary(&mut self, value: Option<Value>) -> ObjectTurn {
         self.multipart_summary = value
             .as_ref()
             .and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok());
@@ -2565,19 +2426,10 @@ impl ReplicateObjectOperation {
         }
     }
 
-    fn accept_multipart_parts(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
-
+    fn accept_multipart_parts(
+        &mut self,
+        (values, next_start_after): (Vec<(Key, Value)>, Option<Key>),
+    ) -> ObjectTurn {
         for (_, value) in values {
             let part = match MultipartObjectPart::from_bytes(value.as_ref()) {
                 Ok(part) => part,
@@ -2600,14 +2452,7 @@ impl ReplicateObjectOperation {
         }
     }
 
-    fn accept_current_lookup(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn accept_current_lookup(&mut self, value: Option<Value>) -> ObjectTurn {
         let current_lookup = value
             .as_ref()
             .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
@@ -2627,22 +2472,21 @@ impl ReplicateObjectOperation {
             return self.fail(err);
         }
         self.state = ReplicateObjectState::OpenConnection;
-        smallvec![Effect::Blob(BlobEffect::OpenConnection {
+        Ok(blob_next(BlobEffect::OpenConnection {
             node_id: self.request.target_node_id,
-        })]
+        }))
     }
 }
 
 // Phase: connection
 // Opening the outbound stream to the target node.
 impl ReplicateObjectOperation {
-    fn accept_connection_established(&mut self, event: Event) -> Effects {
+    fn accept_connection_established(&mut self, event: Event) -> ObjectTurn {
         let Event::Blob(BlobEvent::ConnectionEstablished { stream_id }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::ConnectionEstablished)",
-                received: (event).label(),
-            });
+            return self.invalid(
+                "Event::Blob(BlobEvent::ConnectionEstablished)",
+                event.label(),
+            );
         };
         self.stream_id = Some(stream_id);
         debug!(
@@ -2661,13 +2505,9 @@ impl ReplicateObjectOperation {
 // Sending the manifest and accepting one of the target's negotiation
 // decisions.
 impl ReplicateObjectOperation {
-    fn accept_manifest_sent(&mut self, event: Event) -> Effects {
+    fn accept_manifest_sent(&mut self, event: Event) -> ObjectTurn {
         let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: (event).label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::MessageSent)", event.label());
         };
         debug!(
             bucket = %self.request.bucket,
@@ -2680,13 +2520,10 @@ impl ReplicateObjectOperation {
         self.await_negotiation()
     }
 
-    fn accept_negotiation_response(&mut self, event: Event) -> Effects {
+    fn accept_negotiation_response(&mut self, event: Event) -> ObjectTurn {
+        let received = event.label();
         let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::MessageReceived)",
-                received: (event).label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::MessageReceived)", event.label());
         };
 
         let message = match VersionReplicationMessage::from_bytes(&payload) {
@@ -2694,15 +2531,10 @@ impl ReplicateObjectOperation {
             Err(err) => return self.fail(err.into()),
         };
         let VersionReplicationMessage::VersionNegotiationResponse(result) = message else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "VersionReplicationMessage::VersionNegotiationResponse",
-                received: (Event::Blob(BlobEvent::MessageReceived {
-                    stream_id: self.stream_id.expect("stream id available"),
-                    payload,
-                }))
-                .label(),
-            });
+            return self.invalid(
+                "VersionReplicationMessage::VersionNegotiationResponse",
+                received,
+            );
         };
 
         match result {
@@ -2715,7 +2547,7 @@ impl ReplicateObjectOperation {
                     decision = ?result,
                     "Target reported version already replicated"
                 );
-                self.result = Ok(ReplicationSuboperationResult::Skipped);
+                self.result = ReplicationSuboperationResult::Skipped;
                 self.write_reference_state()
             }
             ReplicationNegotiationResult::NeedVersionOnly => {
@@ -2781,26 +2613,18 @@ impl ReplicateObjectOperation {
     }
 
     /// Rereads the source bucket's encryption before any content leaves this node.
-    fn read_source_encryption(&mut self) -> Effects {
-        self.state = ReplicateObjectState::CheckSourceEncryption;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: self.request.bucket.as_bytes().into(),
-            txn_id: None,
-        })]
+    fn read_source_encryption(&mut self) -> ObjectTurn {
+        self.read(
+            ReplicateObjectState::CheckSourceEncryption,
+            BUCKET_ENCRYPTION_KEYSPACE,
+            self.request.bucket.as_bytes().to_vec(),
+        )
     }
 
     /// Any copy of an encrypting bucket, and every sealed copy, needs a key admission. A plain
     /// target takes it only as a permitted plaintext copy; an encrypting target gets a sealed
     /// copy granted to its key, or plaintext it seals itself.
-    fn accept_source_encryption(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn accept_source_encryption(&mut self, value: Option<Value>) -> ObjectTurn {
         let settings = match BucketEncryption::from_row(value.as_deref()) {
             Ok(settings) => settings,
             Err(err) => return self.fail(err.into()),
@@ -2827,29 +2651,29 @@ impl ReplicateObjectOperation {
         }
         self.admit_key = Some(key);
         self.state = ReplicateObjectState::AdmitSourceKey;
-        smallvec![Effect::Blob(BlobEffect::AdmitRead {
+        Ok(blob_next(BlobEffect::AdmitRead {
             key,
             archive: ArchiveKey::of(&location),
-        })]
+        }))
     }
 
-    fn replicate_plain(&mut self, location: BackendLocation) -> Effects {
+    fn replicate_plain(&mut self, location: BackendLocation) -> ObjectTurn {
         let (Some(replication_id), Some(stream_id)) = (self.blob_replication_id, self.stream_id)
         else {
             return self.fail(ReplicateObjectError::MissingBlobHash);
         };
         self.state = ReplicateObjectState::TransferBlob;
-        smallvec![Effect::Blob(BlobEffect::Replicate {
+        Ok(blob_next(BlobEffect::Replicate {
             replication_id,
             stream_id,
             location,
             keep_alive: true,
-        })]
+        }))
     }
 
     /// A sealed copy goes to an encrypting target granted to its key; anything else is sent as
     /// plaintext. A locked key ends this item until the next unlock.
-    fn accept_source_admission(&mut self, event: Event) -> Effects {
+    fn accept_source_admission(&mut self, event: Event) -> ObjectTurn {
         let key = self.admit_key.take();
         let lease = match event {
             Event::Blob(BlobEvent::ReadAdmitted { lease }) if Some(lease.key) == key => lease,
@@ -2863,11 +2687,7 @@ impl ReplicateObjectOperation {
                 return self.fail(ReplicateObjectError::Blob(error));
             }
             other => {
-                return self.fail(ReplicateObjectError::InvalidStateEvent {
-                    state: self.state_name(),
-                    expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                    received: (other).label(),
-                });
+                return self.invalid("Event::Blob(BlobEvent::ReadAdmitted)", other.label());
             }
         };
         if self.negotiated == Some(ReplicationNegotiationResult::NeedVersionOnly) {
@@ -2891,18 +2711,18 @@ impl ReplicateObjectOperation {
             _ => (None, None),
         };
         self.state = ReplicateObjectState::TransferBlob;
-        smallvec![Effect::Blob(BlobEffect::ReplicateLeased {
+        Ok(blob_next(BlobEffect::ReplicateLeased {
             replication_id,
             stream_id,
             location,
             lease: Box::new(lease),
             regrant,
             object,
-        })]
+        }))
     }
 
     /// Ends the item without an error; its job waits for the next unlock of `key`.
-    fn await_key(&mut self, key: BucketKeyRef) -> Effects {
+    fn await_key(&mut self, key: BucketKeyRef) -> ObjectTurn {
         debug!(
             bucket = %self.request.bucket,
             key = %self.request.key,
@@ -2911,35 +2731,21 @@ impl ReplicateObjectOperation {
             generation = key.generation,
             "Replication waits for a locked source key"
         );
-        self.result = Ok(ReplicationSuboperationResult::AwaitingKey(key));
+        self.result = ReplicationSuboperationResult::AwaitingKey(key);
         match self.stream_id {
             Some(_) => self.close_connection(),
-            None => {
-                self.state = ReplicateObjectState::Finish;
-                smallvec![]
-            }
+            None => Ok(Next::Done(self.result.clone())),
         }
     }
 
-    fn accept_approval_sent(&mut self, event: Event) -> Effects {
+    fn accept_approval_sent(&mut self, event: Event) -> ObjectTurn {
         match event {
             Event::Blob(BlobEvent::MessageSent { .. }) => self.await_apply_complete(),
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: (other).label(),
-            }),
+            other => self.invalid("Event::Blob(BlobEvent::MessageSent)", other.label()),
         }
     }
 
-    fn accept_pending_source(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
+    fn accept_pending_source(&mut self, value: Option<Value>) -> ObjectTurn {
         let location = match value.map(|value| BackendLocation::from_bytes(&value)) {
             Some(Ok(location)) => location,
             Some(Err(error)) => return self.fail(error.into()),
@@ -2952,58 +2758,47 @@ impl ReplicateObjectOperation {
         };
         self.admit_key = Some(key);
         self.state = ReplicateObjectState::AdmitPendingSource;
-        smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })]
+        Ok(blob_next(BlobEffect::AdmitRead { key, archive }))
     }
 
     /// A locked pending source waits for the unlock, which promotes it first. An unlocked one is
     /// promoted now and this item retries afterwards.
-    fn accept_pending_admission(&mut self, event: Event) -> Effects {
+    fn accept_pending_admission(&mut self, event: Event) -> ObjectTurn {
         let Some(key) = self.admit_key.take() else {
             return self.fail(ReplicateObjectError::PendingSource);
         };
         match event {
             Event::Blob(BlobEvent::ReadAdmitted { .. }) => {
                 self.state = ReplicateObjectState::SchedulePromotion;
-                smallvec![Effect::Task(TaskEffect::ShortenTimer {
+                let wake = TaskEffect::ShortenTimer {
                     key: TaskKey::PromotePending {
                         bucket_id: key.bucket_id,
                         generation: key.generation,
                     },
                     after: std::time::Duration::ZERO,
-                })]
+                };
+                Ok(Next::Call(Effect::Task(wake).into()))
             }
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 self.await_key(key)
             }
             Event::Blob(BlobEvent::Error(error)) => self.fail(ReplicateObjectError::Blob(error)),
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                received: (other).label(),
-            }),
+            other => self.invalid("Event::Blob(BlobEvent::ReadAdmitted)", other.label()),
         }
     }
 
-    fn accept_promotion_scheduled(&mut self, event: Event) -> Effects {
+    fn accept_promotion_scheduled(&mut self, event: Event) -> ObjectTurn {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }) => {
                 self.fail(ReplicateObjectError::PendingSource)
             }
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Task(TaskEvent::TimerScheduled)",
-                received: (other).label(),
-            }),
+            other => self.invalid("Event::Task(TaskEvent::TimerScheduled)", other.label()),
         }
     }
 
-    fn accept_blob_transfer(&mut self, event: Event) -> Effects {
+    fn accept_blob_transfer(&mut self, event: Event) -> ObjectTurn {
         let Event::Blob(BlobEvent::ReplicationFinished { .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::ReplicationFinished)",
-                received: (event).label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::ReplicationFinished)", event.label());
         };
         debug!(
             bucket = %self.request.bucket,
@@ -3020,13 +2815,10 @@ impl ReplicateObjectOperation {
 // Phase: apply acknowledgement
 // Waiting for the target to report the replica applied or rejected.
 impl ReplicateObjectOperation {
-    fn accept_apply_response(&mut self, event: Event) -> Effects {
+    fn accept_apply_response(&mut self, event: Event) -> ObjectTurn {
+        let received = event.label();
         let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::MessageReceived)",
-                received: (event).label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::MessageReceived)", event.label());
         };
 
         match VersionReplicationMessage::from_bytes(&payload) {
@@ -3046,23 +2838,16 @@ impl ReplicateObjectOperation {
                 } else {
                     0
                 };
-                self.result = Ok(ReplicationSuboperationResult::ReplicatedBytes(
-                    replicated_bytes,
-                ));
+                self.result = ReplicationSuboperationResult::ReplicatedBytes(replicated_bytes);
                 self.write_reference_state()
             }
             Ok(VersionReplicationMessage::VersionApplyRejected(reason)) => {
                 self.fail(ReplicationError::ReplicationRejected(reason).into())
             }
-            Ok(_) => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "VersionReplicationMessage::VersionApplyComplete|VersionApplyRejected",
-                received: (Event::Blob(BlobEvent::MessageReceived {
-                    stream_id: self.stream_id.expect("stream id available"),
-                    payload,
-                }))
-                .label(),
-            }),
+            Ok(_) => self.invalid(
+                "VersionReplicationMessage::VersionApplyComplete|VersionApplyRejected",
+                received,
+            ),
             Err(err) => self.fail(err.into()),
         }
     }
@@ -3072,41 +2857,23 @@ impl ReplicateObjectOperation {
 // Dropping locally materialized reference bytes, recording the reference
 // fingerprint and closing the stream.
 impl ReplicateObjectOperation {
-    fn accept_blob_cleanup(&mut self, event: Event) -> Effects {
+    fn accept_blob_cleanup(&mut self, event: Event) -> ObjectTurn {
         match event {
             Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
                 self.close_connection()
             }
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::DeleteFinished|Error)",
-                received: (other).label(),
-            }),
+            other => self.invalid(
+                "Event::Blob(BlobEvent::DeleteFinished|Error)",
+                other.label(),
+            ),
         }
     }
 
-    fn accept_state_write(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => self.cleanup_reference_blob(),
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: (other).label(),
-            }),
-        }
-    }
-
-    fn accept_connection_closed(&mut self, event: Event) -> Effects {
+    fn accept_connection_closed(&mut self, event: Event) -> ObjectTurn {
         let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-            return self.fail(ReplicateObjectError::InvalidStateEvent {
-                state: self.state_name(),
-                expected: "Event::Blob(BlobEvent::ConnectionClosed)",
-                received: (event).label(),
-            });
+            return self.invalid("Event::Blob(BlobEvent::ConnectionClosed)", event.label());
         };
-        self.state = ReplicateObjectState::Finish;
-        smallvec![]
+        Ok(Next::Done(self.result.clone()))
     }
 }
 

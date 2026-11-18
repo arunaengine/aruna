@@ -25,7 +25,7 @@ use aruna_core::keyspaces::{
     OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -169,7 +169,8 @@ async fn refused_copy_absent() {
         target_node_id: target_node,
         auth_context: make_manifest(ReplicationItemKind::Materialized).auth_context,
         mode: ReplicationMode::OnDemand,
-    });
+    })
+    .into_machine();
     let mut effects = source.start();
     while matches!(effects.as_slice(), [Effect::Storage(_)]) {
         let Effect::Storage(effect) = effects.remove(0) else {
