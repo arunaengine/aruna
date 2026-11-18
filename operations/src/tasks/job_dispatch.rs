@@ -11,9 +11,10 @@ use aruna_core::structs::execution::job::{JobError, JobPayload, JobResultPayload
 use aruna_core::time::unix_timestamp_millis;
 
 use super::job_context::JobContext;
-use super::job_host::{run_backend_import, run_staging_job};
+use super::job_host::{run_backend_import, run_hosted, run_staging_job};
 use crate::driver::drive;
 use crate::jobs::executor::JobRunOutcome;
+use crate::jobs::persistent_id::{MintPidOperation, RegisterIdentifiersOperation};
 use crate::notifications::email_job::EmailJobOperation;
 use crate::notifications::settings::{BACKOFF_START_MS, DeliveryOutcome};
 use crate::notifications::webhook_job::WebhookJobOperation;
@@ -80,7 +81,11 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             .await,
         ),
         JobPayload::MintPersistentId(spec) => {
-            Box::pin(crate::jobs::persistent_id::run_mint_pid(ctx, spec)).await
+            let realm_id = ctx.driver.serving_realm(spec.minted_by.realm_id);
+            let node = (realm_id, local_node(ctx));
+            let now_ms = unix_timestamp_millis();
+            let job = MintPidOperation::new(spec, node, ctx.final_attempt, now_ms);
+            Box::pin(run_hosted(ctx, job)).await
         }
         JobPayload::StoragePurge(spec) => {
             Box::pin(crate::jobs::workflow::purge::run_storage_purge(
@@ -97,10 +102,11 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
         JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
         JobPayload::BackendImport(spec) => Box::pin(run_backend_import(ctx, spec)).await,
         JobPayload::RegisterIdentifiers(spec) => {
-            Box::pin(crate::jobs::persistent_id::run_register_identifiers(
-                ctx, spec,
-            ))
-            .await
+            let queued_at_ms = ctx.job_id.timestamp_ms();
+            let now_ms = unix_timestamp_millis();
+            let job =
+                RegisterIdentifiersOperation::new(spec, local_node(ctx), queued_at_ms, now_ms);
+            Box::pin(run_hosted(ctx, job)).await
         }
         JobPayload::WebhookDelivery(spec) => {
             let now_ms = unix_timestamp_millis();
@@ -126,6 +132,11 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             "execution payload dispatched through the in-process seam",
         )),
     }
+}
+
+/// This node when it is on the network.
+fn local_node(ctx: &JobContext) -> Option<NodeId> {
+    ctx.driver.node_and_realm().map(|(node_id, _)| node_id)
 }
 
 /// The node a delivery job decides for.
