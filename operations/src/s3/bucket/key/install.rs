@@ -883,7 +883,7 @@ mod tests {
     #[tokio::test]
     async fn unlock_resumes_rewrite() {
         use crate::blob::migration::queue::{ProcessTransitionsOperation, RECHECK};
-        use crate::jobs::key_wake::read_row;
+        use crate::tests::records::read_row;
         use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
         use crate::tests::incoming::{RecordingTaskHandler, freeze_clock};
         use aruna_core::handle::Handle;

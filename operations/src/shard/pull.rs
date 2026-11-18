@@ -5,6 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentNetEvent, DocumentReconcileResult};
+use aruna_core::document_apply::ApplyError;
 use aruna_core::effects::ShardNetEffect;
 use aruna_core::events::ShardNetEvent;
 use aruna_core::operation::Operation;
@@ -18,13 +19,21 @@ use crate::node::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
 use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::shard::{shard_answer, shard_call};
+use crate::sync::reconcile::SyncTopicsOperation;
 
-/// Pulls `topics` from `peers` and answers whether what arrived was applied.
+#[derive(Debug, PartialEq)]
+enum PullStage {
+    Fetch,
+    Reconcile(NodeId, RealmId),
+    Apply,
+}
+
+/// Fetches `topics` from `peers`, reconciles them and answers whether what arrived was applied.
 #[derive(Debug, PartialEq)]
 pub(crate) struct PullTopicsOperation {
     topics: Vec<TopicId>,
     peers: Vec<NodeId>,
-    applying: bool,
+    stage: PullStage,
 }
 
 impl PullTopicsOperation {
@@ -32,7 +41,7 @@ impl PullTopicsOperation {
         Self {
             topics,
             peers,
-            applying: false,
+            stage: PullStage::Fetch,
         }
     }
 }
@@ -49,20 +58,26 @@ impl Operation for PullTopicsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
-        if self.applying {
-            return Ok(Next::Done(result.child::<bool, IoError>()??));
-        }
-        match shard_answer(result)? {
-            ShardNetEvent::Pulled {
-                node_id,
-                realm_id,
-                sync,
-            } => {
-                self.applying = true;
-                let apply = ApplyPulledOperation::new(node_id, Some(realm_id), *sync);
+        match std::mem::replace(&mut self.stage, PullStage::Apply) {
+            PullStage::Fetch => match shard_answer(result)? {
+                ShardNetEvent::Pulled {
+                    node_id,
+                    realm_id,
+                    sync,
+                } => {
+                    self.stage = PullStage::Reconcile(node_id, realm_id);
+                    let reconcile = SyncTopicsOperation::after_fetch(realm_id, *sync);
+                    Ok(Next::Call(IoCall::child(reconcile)))
+                }
+                _ => Ok(Next::Done(false)),
+            },
+            PullStage::Reconcile(node_id, realm_id) => {
+                let reconciled = result.child::<DocumentReconcileResult, ApplyError>()?;
+                let sync = DocumentNetEvent::reconciled(reconciled);
+                let apply = ApplyPulledOperation::new(node_id, Some(realm_id), sync);
                 Ok(Next::Call(IoCall::child(apply)))
             }
-            _ => Ok(Next::Done(false)),
+            PullStage::Apply => Ok(Next::Done(result.child::<bool, IoError>()??)),
         }
     }
 }
@@ -240,14 +255,38 @@ mod tests {
             peers: vec![node()],
         });
         assert_eq!(pull.first(), Ok(Next::Call(call)));
+        let fetched = DocumentNetEvent::DocumentsSynced {
+            topics: vec![topic()],
+        };
         let turn = pull.next(answer(ShardNetEvent::Pulled {
             node_id: node(),
             realm_id: realm(),
-            sync: Box::new(reconciled(0)),
+            sync: Box::new(fetched.clone()),
         }));
+        let reconcile = SyncTopicsOperation::after_fetch(realm(), fetched);
+        assert_eq!(turn, Ok(Next::Call(IoCall::child(reconcile))));
+        let reconciled = DocumentReconcileResult::default();
+        let turn = pull.next(child::<_, ApplyError>(Ok(reconciled)));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         let done = pull.next(child::<bool, IoError>(Ok(true)));
         assert_eq!(done, Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn failed_reconcile_unapplied() {
+        let mut pull = PullTopicsOperation::new(vec![topic()], vec![node()]);
+        pull.stage = PullStage::Reconcile(node(), realm());
+        let failed = ApplyError::Failed("down".to_string());
+        let turn = pull.next(child::<DocumentReconcileResult, _>(Err(failed)));
+        let sync = DocumentNetEvent::Error {
+            target: None,
+            error: "down".to_string(),
+        };
+        let Ok(Next::Call(IoCall::Child(_))) = turn else {
+            panic!("a failed reconcile still reaches the apply step: {sync:?}");
+        };
+        let mut apply = ApplyPulledOperation::new(node(), Some(realm()), sync);
+        assert_eq!(apply.first(), Ok(Next::Done(false)));
     }
 
     #[test]

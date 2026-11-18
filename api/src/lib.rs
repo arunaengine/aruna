@@ -14,6 +14,8 @@ pub mod error;
 pub mod forwarded;
 pub mod https;
 mod job_service;
+#[cfg(test)]
+mod job_test_calls;
 pub mod jobs;
 mod lookup;
 pub mod mcp;

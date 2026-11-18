@@ -336,6 +336,18 @@ pub enum SessionRequest {
         path: String,
         limit: u64,
     },
+    /// What the session recorded about the objects it brought in and touched.
+    Ledger,
+    /// Drops the session from the registry; it must have ended.
+    Close,
+}
+
+/// What a session recorded about the objects it brought in and touched.
+#[derive(Debug, Default, PartialEq)]
+pub struct SessionLedger {
+    pub inputs: Vec<StagedInput>,
+    pub pending: Vec<PendingInput>,
+    pub touched: Vec<TouchedObject>,
 }
 
 /// The live session's answer to one request.
@@ -359,6 +371,7 @@ pub enum SessionAnswer {
     },
     Body(Map<String, Value>),
     Refused(SessionError),
+    Ledger(SessionLedger),
 }
 
 #[cfg(test)]

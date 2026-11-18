@@ -8,37 +8,17 @@ use aruna_core::plugin_runs::{SourceKind, journal_entries};
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
-use crate::plugin_host::worker::match_journal;
-use crate::plugin_host::worker::tests::{created, installed, scoped, synced};
 use crate::plugins::calls::*;
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::flow_support::matcher::{config, forwarded, journal};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::store::Txn;
+use crate::plugins::test_support::{created, installed, scoped, synced};
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 use aruna_core::plugin_runs::journal_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-
-/// Journals `event` on this node as a committing transaction would.
-pub(crate) async fn journal(fixture: &Fixture, event: &SourceEvent) {
-    let rows = (journal_entries(event).unwrap().into_iter())
-        .map(|(_, key, value)| (key.to_vec(), value.to_vec()))
-        .collect();
-    (Txn::direct(&fixture.ctx))
-        .write(EVENT_JOURNAL_KEYSPACE, rows)
-        .await
-        .unwrap();
-}
-
-/// The forward rows of `install` on this node, in journal order.
-pub(crate) async fn forwarded(fixture: &Fixture, install: &PluginInstall) -> Vec<String> {
-    let txn = Txn::direct(&fixture.ctx);
-    let prefix = install.install_id.to_bytes();
-    let rows = txn.scan(PLUGIN_OUTBOX_KEYSPACE, &prefix).await.unwrap();
-    (rows.into_iter())
-        .map(|(_, value)| decode::<ForwardRow>(&value).unwrap().event.resource)
-        .collect()
-}
 
 pub(crate) async fn gap(
     fixture: &Fixture,
@@ -57,12 +37,6 @@ async fn pending(fixture: &Fixture) -> usize {
         .await
         .unwrap()
         .len()
-}
-
-pub(crate) async fn config(fixture: &Fixture) -> RealmConfigDocument {
-    read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap()
 }
 
 #[tokio::test]

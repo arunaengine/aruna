@@ -5,7 +5,6 @@
 
 use std::time::Duration;
 
-use aruna_compute::ExecutorRegistry;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{DEADLINE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE};
 use aruna_core::operation::Operation;
@@ -20,9 +19,7 @@ use super::witness_arm::{
     ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange, WitnessDeadline,
     deadline_index_key, deadline_key,
 };
-pub(crate) use super::witness_round::suppressed;
 pub use super::witness_round::{RoundOutcome, WitnessNode, WitnessRoundOperation};
-use crate::driver::DriverContext;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::store_call::RowRead;
 
@@ -30,18 +27,6 @@ use crate::jobs::store::store_call::RowRead;
 const WITNESS_DRAIN_BATCH: usize = 64;
 /// Spacing between drain passes while deadlines remain.
 pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
-
-/// This node as witness rounds see it; `None` without a network.
-pub fn witness_node(context: &DriverContext) -> Option<WitnessNode> {
-    let (local, realm_id) = context.node_and_realm()?;
-    let registry: Option<&ExecutorRegistry> = context.compute_handle.as_deref();
-    Some(WitnessNode {
-        local,
-        realm_id,
-        fresh: context.fresh_heartbeats(),
-        limits: registry.map(ExecutorRegistry::limits).unwrap_or_default(),
-    })
-}
 
 fn deadline_family(key: &[u8]) -> Option<JobFamilyId> {
     if key.len() != DEADLINE_KEY_BYTES {
@@ -231,12 +216,16 @@ impl Operation for WitnessDrainOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
+    use crate::driver::{DriverContext, drive};
     use crate::storage_read::iter_prefix_page;
     use crate::tests::records::{Family, context};
     use aruna_core::calls::ChildOutcome;
 
-    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
         IoResult::Child(ChildOutcome::new(result))
     }
 

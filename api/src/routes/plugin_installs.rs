@@ -11,11 +11,11 @@ use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::plugin_host::read_config;
 use aruna_operations::plugins::account::PluginAccount;
 use aruna_operations::plugins::grants::GrantError;
 use aruna_operations::plugins::install::{
@@ -439,6 +439,14 @@ pub async fn remove(
     let remove = RemoveInstall::new(caller(&state, &auth), install_id);
     drive(remove, &state.get_ctx()).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The realm config as this node holds it.
+pub(crate) async fn read_config(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+) -> Result<RealmConfigDocument, InstallError> {
+    Ok(drive(GetConfigOperation::new(realm_id), ctx).await?)
 }
 
 /// The caller of an install change made now.

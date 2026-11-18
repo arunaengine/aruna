@@ -13,7 +13,7 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use serde::de::DeserializeOwned;
 use ulid::Ulid;
 
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 fn decoded<T: DeserializeOwned>(result: IoResult) -> Result<Option<T>, StorageReadError> {
     value(result)?

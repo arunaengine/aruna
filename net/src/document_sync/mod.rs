@@ -399,12 +399,6 @@ impl DocumentSyncService {
         self.node.clone()
     }
 
-    #[cfg(test)]
-    fn local_node_id(&self) -> Result<NodeId> {
-        NodeId::from_bytes(self.node.peer_id().as_bytes())
-            .map_err(|error| NetError::Bootstrap(error.to_string()))
-    }
-
     pub fn database(&self) -> fjall::OptimisticTxDatabase {
         self.db.clone()
     }
@@ -424,29 +418,6 @@ impl DocumentSyncService {
 
 pub(crate) fn node_to_peer(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
-}
-
-#[cfg(test)]
-fn group_sync_topics<F>(
-    topic_ids: &[::irokle::TopicId],
-    mut select: F,
-) -> BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<::irokle::TopicId>)>
-where
-    F: FnMut(::irokle::TopicId) -> PeerSelection,
-{
-    let mut groups: BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<::irokle::TopicId>)> =
-        BTreeMap::new();
-    for topic_id in topic_ids.iter().copied() {
-        let selection = select(topic_id);
-        let selected = selection.peers.clone();
-        if let Some((group, topics)) = groups.get_mut(&selected) {
-            group.truncated |= selection.truncated;
-            topics.push(topic_id);
-        } else {
-            groups.insert(selected, (selection, vec![topic_id]));
-        }
-    }
-    groups
 }
 
 fn select_sync_peers(

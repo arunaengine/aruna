@@ -255,7 +255,7 @@ fn same_version(
 /// Sends the artifact to every other management node at once, the chunks of one node one after
 /// another; answers the nodes that confirmed a complete, synced copy. A node that refuses or
 /// fails a chunk gets no more.
-pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Vec<u8>) -> CopyArtifact {
+pub fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Vec<u8>) -> CopyArtifact {
     CopyArtifact {
         peers,
         digest,

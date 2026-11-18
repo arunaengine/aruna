@@ -66,7 +66,7 @@ impl InstallScope {
 }
 
 /// Refuses what this version of Aruna cannot run yet: container work.
-pub(crate) fn check_supported(manifest: &Manifest) -> Result<(), GrantError> {
+pub fn check_supported(manifest: &Manifest) -> Result<(), GrantError> {
     if manifest.requested().contains(&Permission::JobsRun) {
         return Err(GrantError::Unsupported("jobs.run cannot be granted yet"));
     }
@@ -80,7 +80,7 @@ pub fn writes(manifest: &Manifest) -> bool {
 
 /// `read`, and `write` when requested, on the whole group, and every declared service and
 /// readable secret.
-pub(crate) fn default_grants(manifest: &Manifest, scope: &InstallScope) -> Grants {
+pub fn default_grants(manifest: &Manifest, scope: &InstallScope) -> Grants {
     let whole = BTreeSet::from([format!("{}/**", scope.group())]);
     let mut grants = Grants::from([(Grant::Read, whole.clone())]);
     if writes(manifest) {
@@ -107,7 +107,7 @@ fn declared(manifest: &Manifest, scope: &InstallScope) -> Grants {
 
 /// The default grants with the admin's choices applied: `read` or `write` keeps only the listed
 /// patterns, and an empty list removes it.
-pub(crate) fn narrow_grants(
+pub fn narrow_grants(
     manifest: &Manifest,
     scope: &InstallScope,
     choices: &BTreeMap<String, Vec<String>>,
@@ -165,7 +165,7 @@ fn resource_grants(
 }
 
 /// The granted patterns a call of `permission` may use.
-pub(crate) fn patterns_for(grants: &Grants, permission: Permission) -> BTreeSet<String> {
+pub fn patterns_for(grants: &Grants, permission: Permission) -> BTreeSet<String> {
     (permission.grants().iter())
         .filter_map(|grant| grants.get(grant))
         .flatten()
@@ -187,7 +187,7 @@ pub fn covers(pattern: &str, target: &str) -> bool {
 }
 
 /// Whether a held pattern reaches every path of `pattern`: a subtree only by a subtree.
-pub(crate) fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
+pub fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
     let (base, subtree) = match pattern.strip_suffix("/**") {
         Some(base) => (base, true),
         None => (pattern, false),
@@ -217,7 +217,7 @@ pub fn within(pattern: &str, root: &str) -> bool {
 }
 
 /// The accesses a permission's actions need on its patterns, as the plan's table checks them.
-pub(crate) fn accesses(permission: Permission) -> &'static [Access] {
+pub fn accesses(permission: Permission) -> &'static [Access] {
     match permission {
         Permission::ObjectsCopy => &[Access::READ, Access::WRITE],
         Permission::MetadataWrite
@@ -233,7 +233,7 @@ pub(crate) fn accesses(permission: Permission) -> &'static [Access] {
 }
 
 /// The access the role needs on a grant's patterns.
-pub(crate) fn grant_access(grant: Grant) -> Access {
+pub fn grant_access(grant: Grant) -> Access {
     match grant {
         Grant::Write => Access::WRITE,
         Grant::Read | Grant::Services | Grant::Secrets => Access::READ,
@@ -241,7 +241,7 @@ pub(crate) fn grant_access(grant: Grant) -> Access {
 }
 
 /// The account role's paths: each granted pattern with the access its grant needs.
-pub(crate) fn role_paths(grants: &Grants) -> HashMap<String, Access> {
+pub fn role_paths(grants: &Grants) -> HashMap<String, Access> {
     let mut paths = HashMap::new();
     for (grant, patterns) in grants {
         for pattern in patterns {
@@ -255,7 +255,7 @@ pub(crate) fn role_paths(grants: &Grants) -> HashMap<String, Access> {
 }
 
 /// `plugin-write` when any path needs WRITE, else `plugin-read`.
-pub(crate) fn role_name(paths: &HashMap<String, Access>) -> &'static str {
+pub fn role_name(paths: &HashMap<String, Access>) -> &'static str {
     match paths.values().any(|access| *access == Access::WRITE) {
         true => WRITE_ROLE,
         false => READ_ROLE,
@@ -265,7 +265,7 @@ pub(crate) fn role_name(paths: &HashMap<String, Access>) -> &'static str {
 /// What an update to `manifest` keeps of `granted`: `read`, `write` while the new version still
 /// writes, and the services and secrets it declares. It grants nothing new; the second value
 /// lists what the new version requires but nobody granted yet.
-pub(crate) fn carry_grants(
+pub fn carry_grants(
     granted: &Grants,
     manifest: &Manifest,
     scope: &InstallScope,
@@ -302,7 +302,7 @@ pub fn parse_grants(stored: &BTreeMap<String, Vec<String>>) -> Grants {
 /// The full permission path of an object path a plugin gives: a path below the realm as it is,
 /// or `bucket/key` (a prefix ends in `/`) on this node. Expanded before any grant check, so a
 /// path the plugin did not mean is never checked.
-pub(crate) fn object_path(
+pub fn object_path(
     (realm_id, local): (RealmId, NodeId),
     group: GroupId,
     text: &str,
@@ -328,14 +328,14 @@ pub(crate) fn object_path(
 
 /// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
 /// text stays as it is.
-pub(crate) fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
+pub fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
     let realm = install.account.realm_id;
     let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
     path.strip_prefix(&root).unwrap_or(path).to_string()
 }
 
 /// The scope of an install, for its generated grant paths.
-pub(crate) fn install_scope(install: &PluginInstall) -> InstallScope {
+pub fn install_scope(install: &PluginInstall) -> InstallScope {
     InstallScope {
         realm_id: install.account.realm_id,
         group_id: install.group_id,
@@ -344,7 +344,7 @@ pub(crate) fn install_scope(install: &PluginInstall) -> InstallScope {
 }
 
 /// The install's account restricted to `patterns`, at the access `permission` needs.
-pub(crate) fn restricted_account(
+pub fn restricted_account(
     (install, realm_id): (&PluginInstall, RealmId),
     patterns: &BTreeSet<String>,
     permission: Permission,

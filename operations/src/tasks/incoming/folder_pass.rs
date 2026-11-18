@@ -11,7 +11,7 @@ use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 
-use crate::device::drain::DrainOutcome;
+use crate::device::drain::{DrainOutcome, publish_pending};
 use crate::device::sync::folders::{finish_binding, finish_unbind, list_folders};
 use crate::device::sync::reconcile::ReconcilePlan;
 use crate::device::sync::{ReconcileFolderError, folder_gate, folder_pass, sync_timers};
@@ -23,7 +23,11 @@ pub async fn reconcile_folder(
     folder: &SyncedFolder,
 ) -> Result<ReconcilePlan, ReconcileFolderError> {
     let _pass = folder_gate(folder.folder_id).lock().await;
-    drive(folder_pass(context, folder.clone()), context).await
+    drive(
+        folder_pass(context.node_and_realm(), folder.clone()),
+        context,
+    )
+    .await
 }
 
 /// Reconciles every active folder once, and finishes interrupted binds and unbinds.
@@ -41,7 +45,7 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
             // An unbind finishes here, also after a cancelled call or a restart.
             FolderState::Deleting => {
                 let _pass = folder_gate(folder_id).lock().await;
-                let unbind = finish_unbind(context, folder_id, node_id);
+                let unbind = finish_unbind(context.node_and_realm(), folder_id, node_id);
                 if let Err(error) = drive(unbind, context).await {
                     warn!(folder = %folder_id, reason = %error, "Could not finish the unbind");
                 }
@@ -73,7 +77,7 @@ pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
 
 /// Arms the device timers a starting node needs; a realm node with no folders schedules nothing.
 pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &TaskHandle) {
-    let timers = drive(sync_timers(context), context)
+    let timers = drive(sync_timers(context.node_and_realm()), context)
         .await
         .unwrap_or_default();
     if timers.folders
@@ -89,5 +93,20 @@ pub async fn restore_sync_timers(context: &Arc<DriverContext>, task_handle: &Tas
             .await
     {
         warn!(%message, "Failed to restore the synced-folder upload timer");
+    }
+}
+
+/// Re-arms the publish drain when the queue still holds entries.
+pub(super) async fn restore_publish_timer(context: &DriverContext, task_handle: &TaskHandle) {
+    match drive(publish_pending(), context).await {
+        Ok(false) => {}
+        Ok(true) => {
+            let key = TaskKey::DrainDeviceIntake;
+            let armed = task_handle.schedule_idle_timer(key, Duration::ZERO).await;
+            if let TaskEvent::Error { message, .. } = armed {
+                warn!(%message, "Failed to restore the device publish timer");
+            }
+        }
+        Err(error) => warn!(%error, "Failed to scan the device publish queue"),
     }
 }

@@ -15,14 +15,14 @@ use aruna_operations::driver::drive;
 use aruna_operations::harvest::read_connector::{
     ConnectorView, GetRepositoryOperation, ReadConnectorError,
 };
-use aruna_operations::jobs::export::crate_jsonld;
+use aruna_operations::jobs::export::CrateJsonOperation;
 use aruna_operations::jobs::repository::check::{CrateCheck, RequirementCheck, profile_failure};
 use aruna_operations::jobs::repository::link_queue::OwnerHoldsOperation;
 use aruna_operations::jobs::repository::link_store::{
     ApplyChangeOperation, ListLinksOperation, ReadLinkOperation,
 };
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
-use aruna_operations::jobs::repository::{Action, NodeScope, TransferError, seal_token, supports};
+use aruna_operations::jobs::repository::{Action, TransferError, seal_token, supports};
 use aruna_operations::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
 use axum::Json;
 use axum::extract::{Path, State};
@@ -372,10 +372,10 @@ pub(crate) async fn requirements(
     let context = state.get_ctx();
     let metadata_bytes = state.rocrate_limits().metadata_bytes;
     let checked = async {
-        let (jsonld, _) =
-            Box::pin(crate_jsonld(&context, auth, document_id, metadata_bytes)).await?;
-        let check = CrateCheck::new(view.connector.kind, &view.connector.endpoint, &jsonld)?;
         let local = context.net_handle.as_ref().map(|net| net.node_id());
+        let read = CrateJsonOperation::new(local, auth.clone(), document_id, metadata_bytes);
+        let (jsonld, _) = Box::pin(drive(read, &context)).await?;
+        let check = CrateCheck::new(view.connector.kind, &view.connector.endpoint, &jsonld)?;
         let assess = ProfileAssessOperation::against(local, check.profile_iri, jsonld.clone());
         let status = Box::pin(drive(assess, &context))
             .await
@@ -486,7 +486,7 @@ pub(in crate::routes) async fn change(
     change: LinkChange,
 ) -> ServerResult<Option<RepositoryLink>> {
     let context = state.get_ctx();
-    let operation = ApplyChangeOperation::new(NodeScope::of(&context), link.clone(), change);
+    let operation = ApplyChangeOperation::new(context.node_scope(), link.clone(), change);
     drive(operation, context.as_ref()).await.map_err(link_error)
 }
 
@@ -497,7 +497,7 @@ async fn responses(
 ) -> ServerResult<Vec<RepositoryLinkResponse>> {
     let context = state.get_ctx();
     let mut views = Vec::new();
-    let scope = NodeScope::of(&context);
+    let scope = context.node_scope();
     for (link, queued) in drive(ListLinksOperation::new(document_id), context.as_ref())
         .await
         .map_err(link_error)?
@@ -622,7 +622,7 @@ pub async fn create_link(
     }
     let link_id = Ulid::generate();
     let secret = seal_token(
-        &context,
+        &context.node_scope(),
         auth.user_id,
         &view,
         Some(link_id),
@@ -668,7 +668,7 @@ pub async fn create_link(
         link: Box::new(link.clone()),
         secret: Some(secret),
     };
-    let operation = ApplyChangeOperation::new(NodeScope::of(&context), link, change);
+    let operation = ApplyChangeOperation::new(context.node_scope(), link, change);
     let created = drive(operation, context.as_ref())
         .await
         .map_err(link_error)?

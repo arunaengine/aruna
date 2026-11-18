@@ -987,7 +987,7 @@ async fn act_on_entry(
     }
     let context = state.get_ctx();
     let action = apply_action(
-        &context,
+        context.node_and_realm(),
         ApplyActionInput {
             folder_id,
             kind: action_kind(request.action),
@@ -1101,7 +1101,7 @@ async fn act_on_folder(
         ));
     }
     let action = apply_action(
-        &context,
+        context.node_and_realm(),
         ApplyActionInput {
             folder_id,
             kind: ActionKind::Replace,

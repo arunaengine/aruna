@@ -7,6 +7,7 @@ use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::storage::dataset_location::DatasetLocation;
+use aruna_operations::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::git::location;
 use axum::Json;
@@ -66,9 +67,12 @@ pub async fn get_location(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<StorageLocation>> {
-    let effective = location::get(&state.get_ctx(), &auth, id)
-        .await
-        .map_err(map_error)?;
+    let effective = drive(
+        location::get(state.get_ctx().node_id(), &auth, id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(StorageLocation::new(effective)))
 }
 
@@ -90,12 +94,15 @@ pub async fn put_location(
     Json(request): Json<StorageLocationRequest>,
 ) -> ServerResult<Json<StorageLocation>> {
     let chosen = request.location()?;
-    let chosen = location::set(&state.get_ctx(), &auth, id, chosen)
-        .await
-        .map_err(|error| match error {
-            GitError::Invalid => ServerError::BadRequest,
-            error => map_error(error),
-        })?;
+    let chosen = drive(
+        location::set(state.get_ctx().node_id(), &auth, id, chosen),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| match error {
+        GitError::Invalid => ServerError::BadRequest,
+        error => map_error(error),
+    })?;
     Ok(Json(StorageLocation::new((chosen, false))))
 }
 

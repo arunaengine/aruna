@@ -22,7 +22,7 @@ use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Whether a head found no such object or version.
-pub(crate) fn absent(error: &HeadObjectError) -> bool {
+pub fn absent(error: &HeadObjectError) -> bool {
     matches!(
         error,
         HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion | HeadObjectError::DeleteMarker
@@ -32,7 +32,7 @@ pub(crate) fn absent(error: &HeadObjectError) -> bool {
 /// The bucket and key on `local` of an object path below the install's group data; a bucket of
 /// another node or another group is refused.
 #[derive(Debug, PartialEq)]
-pub(crate) struct LocalObject {
+pub struct LocalObject {
     realm_id: RealmId,
     local: NodeId,
     group_id: GroupId,
@@ -41,11 +41,7 @@ pub(crate) struct LocalObject {
 }
 
 impl LocalObject {
-    pub(crate) fn new(
-        (realm_id, local): (RealmId, NodeId),
-        install: &PluginInstall,
-        path: &str,
-    ) -> Self {
+    pub fn new((realm_id, local): (RealmId, NodeId), install: &PluginInstall, path: &str) -> Self {
         Self {
             realm_id,
             local,
@@ -106,7 +102,7 @@ impl Operation for LocalObject {
 /// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
 /// when it is marked; `None` when there is no such object, so nothing is read either.
 #[derive(Debug, PartialEq)]
-pub(crate) struct Unmarked {
+pub struct Unmarked {
     bucket: String,
     key: String,
     version: Option<Ulid>,
@@ -114,7 +110,7 @@ pub(crate) struct Unmarked {
 }
 
 impl Unmarked {
-    pub(crate) fn new((bucket, key): (&str, &str), version: Option<Ulid>) -> Self {
+    pub fn new((bucket, key): (&str, &str), version: Option<Ulid>) -> Self {
         Self {
             bucket: bucket.to_string(),
             key: key.to_string(),

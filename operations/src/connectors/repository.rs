@@ -15,7 +15,7 @@ use ulid::Ulid;
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
 use crate::storage_read::{parse_storage_iter, parse_storage_read};
 
-pub use crate::storage_read::StorageReadError;
+pub use aruna_core::errors::StorageReadError;
 
 pub const LIST_CONNECTOR_SIZE: usize = 128;
 pub const REFERENCE_PAGE_SIZE: usize = 128;

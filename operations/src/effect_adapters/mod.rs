@@ -5,6 +5,7 @@
 mod audit;
 mod blob;
 mod compute;
+mod git;
 pub(crate) mod job;
 mod metadata;
 mod net;
@@ -113,16 +114,8 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::Shard(effect)) => {
             Box::pin(shard::dispatch_shard(*effect, context)).await
         }
-        Effect::Net(NetEffect::AuthorizeWritePeer { peer, auth_token }) => {
-            let auth_token = auth_token.map(|token| *token);
-            Box::pin(metadata::dispatch_peer_check(peer, auth_token, context)).await
-        }
         Effect::Net(NetEffect::RevocationClaims(token)) => {
             Box::pin(metadata::dispatch_revocation_claims(*token, context)).await
-        }
-        // A routed harvest write drives metadata operations through the handles the runner holds.
-        Effect::Net(NetEffect::HarvestWrite(write)) => {
-            metadata::dispatch_harvest_write(*write, context).await
         }
         // Notification frames and inbox wakes need the net handle the runner holds.
         Effect::Net(NetEffect::Notification(request)) => {
@@ -217,6 +210,7 @@ async fn dispatch_unboxed(
         Effect::Compute(effect) => {
             Event::Compute(Box::new(compute::dispatch_compute(*effect, context).await))
         }
+        Effect::Git(call) => Event::Git(Box::new(git::dispatch_git(*call, context).await)),
         Effect::Job(effect) => Box::pin(job::dispatch_job(effect, context, depth, deadline)).await,
     };
 
@@ -258,6 +252,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
         Effect::Job(_) => "job",
+        Effect::Git(_) => "git",
     }
 }
 

@@ -740,7 +740,7 @@ async fn global_origin(
     let deadline = tokio::time::Instant::now() + RESOLVE_BUDGET;
     let found = match resolved(
         drive_until(
-            resolve_version(state.get_ctx().as_ref(), version_id, deadline),
+            resolve_version(state.get_ctx().node_and_realm(), version_id, deadline),
             state.get_ctx().as_ref(),
             deadline,
         )

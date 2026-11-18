@@ -13,8 +13,6 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::store::state::read_job_record;
-use aruna_operations::plugin_host::read_config;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, StartRun};
 use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for};
@@ -42,6 +40,7 @@ use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError};
 use crate::routes::management_relay::relay_to_node;
 use crate::routes::plugin_installs::parse_id;
+use crate::routes::plugin_installs::read_config;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 100;
@@ -655,7 +654,7 @@ async fn work_view(
     row: WorkRow,
 ) -> Result<WorkView, String> {
     let record = match (row.job, &row.summary) {
-        (Some(job), None) => read_job_record(ctx, job, None).await?,
+        (Some(job), None) => crate::job_service::read_job_record(ctx, job).await?,
         _ => None,
     };
     let run = match row.notified {
@@ -1303,7 +1302,7 @@ mod tests {
         use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
         use aruna_core::structured_id::{BucketId, PlacementHandle};
         use aruna_operations::driver::drive;
-        use aruna_operations::jobs::store::query::insert_job;
+        use crate::job_test_calls::insert_job;
         use aruna_operations::plugins::work::{
             Identity, WorkChange, WorkRow, reserve, update_work,
         };

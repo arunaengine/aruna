@@ -1,22 +1,6 @@
-//! The view of this node that the submission operations start from.
+//! Tests the submission rules of external jobs from the ingress node's view.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
-
-use aruna_core::time::unix_timestamp_millis;
-
-use super::submit_external::IngressNode;
-use crate::driver::DriverContext;
-
-/// This node as the submission operations see it; `None` without a network.
-pub fn ingress_node(context: &DriverContext) -> Option<IngressNode> {
-    let (local, realm_id) = context.node_and_realm()?;
-    Some(IngressNode {
-        local,
-        realm_id,
-        now_ms: unix_timestamp_millis(),
-        fresh: context.fresh_heartbeats(),
-    })
-}
 
 #[cfg(test)]
 mod tests {

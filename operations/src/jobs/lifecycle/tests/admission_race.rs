@@ -27,7 +27,7 @@ use crate::jobs::lifecycle::launch_admit::{
 use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::store::state::read_job_record;
+use crate::jobs::store::test_calls::read_job_record;
 use crate::storage_read::iter_prefix_page;
 use crate::tests::records::{Family, REALM, context};
 use aruna_core::structs::execution::job::record_keys::kind_prefix;

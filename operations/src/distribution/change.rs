@@ -27,13 +27,12 @@ use ulid::Ulid;
 
 use super::create::{AdmitPendingOperation, CreateError, CreationReport};
 use super::forward::PublishRefusal;
-use crate::document_repository::{config_of, realm_config};
-use super::here::{Heard, Here, here};
 use super::sharding::{RangeSampleOperation, split_point};
-use super::status_view::{Reach, ReadViewOperation, StatusError};
+use super::status_view::{Reach, ReadViewOperation, StatusError, node_reach};
 use super::submit::SendAdminOperation;
-use crate::driver::DriverContext;
+use crate::document_repository::{config_of, realm_config};
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::heartbeat::{Heard, Here};
 
 /// The caller of an admin change: its own token context and, for a remote publisher, the
 /// bearer token forwarded there.
@@ -65,7 +64,7 @@ fn needs_coordinator(
     let Some(node_id) = snapshot.member(range.coordinator).map(|m| m.node_id) else {
         return Ok(());
     };
-    match heard.reach(node_id) {
+    match node_reach(heard, node_id) {
         Reach::Reachable => Ok(()),
         reach => Err(CreateError::Blocked(format!(
             "range {range_id} of distributed bucket {} is degraded: its coordinator node \
@@ -210,13 +209,13 @@ pub struct ChangeOperation<T> {
 type Changing<T> = Result<Next<T>, CreateError>;
 
 fn change<T>(
-    context: &DriverContext,
+    here: Here,
     (auth, bearer): Caller<'_>,
     set_id: Ulid,
     change: Change,
 ) -> ChangeOperation<T> {
     ChangeOperation {
-        here: here(context),
+        here,
         auth: auth.clone(),
         bearer,
         set_id,
@@ -231,78 +230,73 @@ fn change<T>(
 /// Adds a member on `input.node_id`, then creates and admits its bucket there under the
 /// caller's bearer token. The member catches up from the coordinators before it is ready.
 pub fn join_member(
-    context: &DriverContext,
+    here: Here,
     caller: Caller<'_>,
     set_id: Ulid,
     input: JoinInput,
 ) -> ChangeOperation<CreationReport> {
-    change(context, caller, set_id, Change::Join(input))
+    change(here, caller, set_id, Change::Join(input))
 }
 
 /// Marks a member leaving; a coordinator transfers its ranges first.
 pub fn leave_member(
-    context: &DriverContext,
+    here: Here,
     caller: Caller<'_>,
     set_id: Ulid,
     member_id: Ulid,
 ) -> ChangeOperation<DistributionRevision> {
-    change(context, caller, set_id, Change::Leave(member_id))
+    change(here, caller, set_id, Change::Leave(member_id))
 }
 
 /// Opens a fenced transfer of one range to a ready copy replica of it; the former coordinator
 /// stays a replica or leaves the range as `role` says.
 pub fn transfer_range(
-    context: &DriverContext,
+    here: Here,
     caller: Caller<'_>,
     set_id: Ulid,
     (range_id, to, role): (Ulid, Ulid, TransferRole),
 ) -> ChangeOperation<DistributionRevision> {
-    change(
-        context,
-        caller,
-        set_id,
-        Change::Transfer(range_id, to, role),
-    )
+    change(here, caller, set_id, Change::Transfer(range_id, to, role))
 }
 
 /// Adds a copy of one range on a ready `copy` member, then admits the member again under the
 /// caller's bearer token: its node opens the range against its capacity and the expected
 /// `sizes`. The range's coordinator fills the copy.
 pub fn add_copy(
-    context: &DriverContext,
+    here: Here,
     caller: Caller<'_>,
     set_id: Ulid,
     (range_id, member_id, sizes): (Ulid, Ulid, &[RangeSize]),
 ) -> ChangeOperation<CreationReport> {
     let add = Change::AddCopy(range_id, member_id, sizes.to_vec());
-    change(context, caller, set_id, add)
+    change(here, caller, set_id, add)
 }
 
 /// Splits one range by hand; `dry_run` only plans the split.
 pub fn split_range(
-    context: &DriverContext,
+    here: Here,
     caller: Caller<'_>,
     set_id: Ulid,
     (range_id, split_key, dry_run): (Ulid, Option<String>, bool),
 ) -> ChangeOperation<(SplitPlan, Option<DistributionRevision>)> {
     let split = Change::Split(range_id, split_key, dry_run);
-    change(context, caller, set_id, split)
+    change(here, caller, set_id, split)
 }
 
 pub fn change_settings(
-    context: &DriverContext,
+    here: Here,
     caller: Caller<'_>,
     set_id: Ulid,
     settings: DistributionSettings,
 ) -> ChangeOperation<DistributionRevision> {
     let request = DistributionRequest::ChangeSettings { settings };
-    change(context, caller, set_id, Change::Request(request))
+    change(here, caller, set_id, Change::Request(request))
 }
 
 /// Replaces the set's bucket metadata, if `expected` is set only while it is still that; the
 /// publisher checks group admin of the set's owner.
 pub fn change_metadata(
-    context: &DriverContext,
+    here: Here,
     caller: Caller<'_>,
     set_id: Ulid,
     (metadata, expected): (Option<BucketMetadata>, Option<BucketMetadata>),
@@ -311,17 +305,17 @@ pub fn change_metadata(
         metadata: metadata.map(Box::new),
         expected: expected.map(Box::new),
     };
-    change(context, caller, set_id, Change::Request(request))
+    change(here, caller, set_id, Change::Request(request))
 }
 
 /// Prepares the deletion of the set with every admitted member as its identity. It commits
 /// once every coordinator fenced its ranges; then every member purges its bucket.
 pub fn delete_set(
-    context: &DriverContext,
+    here: Here,
     caller: Caller<'_>,
     set_id: Ulid,
 ) -> ChangeOperation<DistributionRevision> {
-    change(context, caller, set_id, Change::Delete)
+    change(here, caller, set_id, Change::Delete)
 }
 
 impl<T: ChangeAnswer> ChangeOperation<T> {

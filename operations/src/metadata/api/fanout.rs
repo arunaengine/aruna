@@ -552,15 +552,14 @@ pub async fn lookup_identifier_distributed(
     let local_call: MetadataNodeCall<Matches> = metadata_node_call(
         (context.clone(), auth, realm_id, identifier.clone()),
         |(context, auth, realm_id, (kind, value, endpoint)), _| async move {
-            crate::metadata::identifier_lookup::lookup_local(
-                &context,
-                realm_id,
-                auth.as_ref(),
+            use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
+            let query = IdentifierQuery {
                 kind,
-                &value,
-                endpoint.as_deref(),
-            )
-            .await
+                value,
+                endpoint,
+            };
+            crate::driver::drive(IdentifierLookupOperation::new(realm_id, auth, query), &context)
+                .await
             .map_err(|_| MetadataReadError::Unavailable)
         },
     );

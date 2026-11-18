@@ -29,7 +29,7 @@ use super::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::graph_deleted::GraphDeletedOperation;
-use crate::metadata::repository::{iter_registry_effect, parse_registry_iter};
+use crate::metadata::repository::parse_registry_iter;
 
 impl MetadataVisibilityCache {
     pub(super) fn new() -> Self {
@@ -555,6 +555,7 @@ pub(super) fn effect_rejects_deleted(effect: &MetadataEffect) -> bool {
             | MetadataEffect::ExportRoCrate { .. }
             | MetadataEffect::ExportRoCrateSummary { .. }
             | MetadataEffect::ExportSummaryAt { .. }
+            | MetadataEffect::DescribeTitle { .. }
             | MetadataEffect::ExportRoCratePage { .. }
             | MetadataEffect::PlanBatch { .. }
             | MetadataEffect::MergeBatch { .. }
@@ -717,52 +718,6 @@ pub(super) fn records_for_group(
             .cloned()
             .collect(),
     )
-}
-
-/// The live registry records of one group, at most `limit` of them.
-pub(crate) async fn list_group_records(
-    context: &DriverContext,
-    group_id: GroupId,
-    limit: usize,
-) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
-    let (metadata, _) = handles(context)?;
-    let inner = &metadata.inner;
-    let limit = limit.min(REGISTRY_CANDIDATE_LIMIT);
-    if let Some((records, true)) = inner.visibility_cache.records_group_any(group_id)
-        && records.len() <= limit
-    {
-        return Ok(records);
-    }
-
-    let mut records = Vec::new();
-    let mut start_after = None;
-    loop {
-        let event = inner
-            .storage_handle
-            .send_effect(iter_registry_effect(group_id, start_after, None))
-            .await;
-        let (page, next_start_after) = parse_registry_iter(event).map_err(|error| {
-            MetadataError::Backend(format!("metadata group iteration failed: {error:?}"))
-        })?;
-        if records.len().saturating_add(page.len()) > limit {
-            return Err(MetadataError::Backend(
-                "metadata candidate limit exceeded".to_string(),
-            ));
-        }
-        records.extend(page);
-        match next_start_after {
-            Some(cursor) => start_after = Some(cursor),
-            None => break,
-        }
-    }
-
-    let (deleted_graphs, _) = list_deleted_iris(inner, REGISTRY_CANDIDATE_LIMIT).await?;
-    Ok(Arc::new(
-        records
-            .into_iter()
-            .filter(|record| !deleted_graphs.contains(&record.graph_iri))
-            .collect(),
-    ))
 }
 
 #[tracing::instrument(

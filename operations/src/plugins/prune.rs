@@ -26,7 +26,7 @@ const AUDIT_CURSOR: &[u8] = b"c";
 
 /// One page of at most `page` use audit rows past their retention, deleted with its cursor in
 /// one transaction; answers how many records went and whether older rows may follow.
-pub(crate) fn prune_uses(now_ms: u64, page: usize) -> PruneUses {
+pub fn prune_uses(now_ms: u64, page: usize) -> PruneUses {
     PruneUses {
         cutoff: now_ms.saturating_sub(USE_AUDIT_RETENTION),
         page,
@@ -114,7 +114,7 @@ impl Operation for PruneUses {
 
 /// Deletes the webhook delivery ids past their retention, and every one of a removing
 /// install; answers how many went.
-pub(crate) fn prune_hooks(config: &RealmConfigDocument, now_ms: u64) -> PruneHooks {
+pub fn prune_hooks(config: &RealmConfigDocument, now_ms: u64) -> PruneHooks {
     let mut removing: Vec<Ulid> = (config.installs.iter())
         .filter(|install| install.state == InstallState::Removing)
         .map(|install| install.install_id)
@@ -233,13 +233,13 @@ fn received(key: &[u8]) -> Option<u64> {
 /// Deletes the use audit rows past their retention, a page per transaction; answers how many
 /// records went.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PruneAudit {
+pub struct PruneAudit {
     now_ms: u64,
     pruned: usize,
 }
 
 impl PruneAudit {
-    pub(crate) fn new(now_ms: u64) -> Self {
+    pub fn new(now_ms: u64) -> Self {
         Self { now_ms, pruned: 0 }
     }
 

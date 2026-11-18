@@ -5,7 +5,7 @@
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::delete_document::DeleteDocumentError;
-use crate::metadata::handle::MetadataRequestDelivery;
+use crate::metadata::message_kind::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::UpdateDocumentError;
@@ -108,7 +108,7 @@ pub(crate) fn retry_disposition(delivery: MetadataRequestDelivery) -> RetryDispo
 pub(crate) fn unexpected_response(response: MetadataTransportMessage) -> MetadataWriteError {
     MetadataWriteError::Undeliverable(format!(
         "unexpected forwarded metadata response: {}",
-        crate::metadata::handle::transport_message_kind(&response)
+        crate::metadata::message_kind::transport_message_kind(&response)
     ))
 }
 

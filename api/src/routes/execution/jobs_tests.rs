@@ -34,11 +34,10 @@ use aruna_operations::jobs::command::{
 };
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::put_job_entry;
-use aruna_operations::jobs::store::query::insert_job;
-use aruna_operations::jobs::store::state::{
-    ClaimOutcome, claim_job, complete_job, transition_to_running,
-};
+use crate::job_test_calls::put_job_entry;
+use crate::job_test_calls::insert_job;
+use aruna_operations::jobs::store::state::ClaimOutcome;
+use crate::job_test_calls::{claim_job, complete_job, transition_to_running};
 use aruna_storage::FjallStorage;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

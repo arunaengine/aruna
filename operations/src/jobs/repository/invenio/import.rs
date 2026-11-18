@@ -9,7 +9,7 @@ use aruna_core::operation::Operation;
 use aruna_core::repository::invenio::{
     crate_versions, import_crate, pull_crate, record_id, record_identifiers, validate_id,
 };
-use aruna_core::repository::remote::{ArchiveSpool, RemoteAnswer, RemoteCall};
+use aruna_core::repository::remote::{ArchiveSpool, NodeScope, RemoteAnswer, RemoteCall};
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryPull};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
@@ -23,7 +23,7 @@ use super::export::record_from;
 use super::{Session, invalid, json as json_body, reply};
 use crate::jobs::repository::connector::{ConnectOperation, ConnectRequest};
 use crate::jobs::repository::pull::{PullProgress, PullRunningOperation};
-use crate::jobs::repository::{JobScope, NodeScope, TransferError, not_supported, remote_call};
+use crate::jobs::repository::{JobScope, TransferError, not_supported, remote_call};
 
 /// Record files sit under `versions/{id}/files/`; in reference mode they are descriptors.
 pub(crate) fn is_reference(path: &str) -> bool {

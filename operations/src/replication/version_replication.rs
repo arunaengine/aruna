@@ -19,10 +19,10 @@ use crate::replication::protocol::{
     VersionReplicationMessage, VersionReplicationRequest,
 };
 use crate::s3::object::put::abe::keyed;
-use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::errors::StorageReadError;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::id::NodeId;

@@ -41,7 +41,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .await?;
     let mapping =
-        aruna_operations::metadata::persistent_id::read_mapping(&fixture.context, doc_id(1))
+        crate::metadata_calls::read_mapping(&fixture.context, doc_id(1))
             .await?
             .expect("created document has a mapping");
     let identifiers = mapping
@@ -74,7 +74,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
         None,
         aruna_core::structs::secondary_id::IdentifierOrigin::Published,
     )?;
-    let denied = aruna_operations::metadata::persistent_id::forward::add_identifiers_routed(
+    let denied = crate::metadata_calls::add_identifiers_routed(
         &fixture.context,
         fixture.actor.realm_id,
         doc_id(1),
@@ -561,7 +561,7 @@ async fn start_update(
     assert_eq!(link.pull_reason(), Some("update_available"));
     let pull = Box::pin(start_pull(&fixture.context, &link)).await?;
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&fixture.context, pull, None)
+        crate::job_calls::read_job_record(&fixture.context, pull, None)
             .await?
             .ok_or("pull job missing")?;
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {

@@ -83,6 +83,15 @@ async fn run_effect(
             error: MetadataError::HandleMissing,
         };
     };
+    if matches!(effect, MetadataEffect::FlushGraph) {
+        return match graph.flush_persistence().await {
+            Ok(()) => MetadataEvent::GraphFlushed,
+            Err(error) => MetadataEvent::Error {
+                graph_iri: None,
+                error,
+            },
+        };
+    }
     let graph_iri = effect.graph_iri();
     let _graph_fence = match graph_iri.as_deref() {
         Some(graph_iri) if effect.mutates_graph() => {

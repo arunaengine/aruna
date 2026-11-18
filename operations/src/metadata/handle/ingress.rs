@@ -25,8 +25,7 @@ use super::query::query_local_graphs;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
-    read_budget, transport_message_kind, write_body_at, write_message_at, write_stream_body,
-    write_transport_message,
+    read_budget, write_body_at, write_message_at, write_stream_body, write_transport_message,
 };
 use super::{
     MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,
@@ -38,6 +37,7 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
+use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
@@ -929,13 +929,18 @@ impl MetadataHandle {
                 .await
             }
             forward @ MetadataTransportMessage::ForwardPersistentId { .. } => {
-                Box::pin(async {
-                    crate::metadata::persistent_id::forward::apply_forwarded_pid(
-                        context, peer, forward,
-                    )
-                    .await
-                })
-                .await
+                use crate::metadata::persistent_id::forward::ServePidOperation;
+                let Some((node_id, realm_id)) = context.node_and_realm() else {
+                    return MetadataTransportMessage::ForwardedWriteUnavailable;
+                };
+                match ServePidOperation::new(peer, (realm_id, node_id), forward) {
+                    Some(serve) => Box::pin(drive(serve, context))
+                        .await
+                        .unwrap_or_else(|error| {
+                            reject(format!("persistent id request failed: {error}"))
+                        }),
+                    None => reject("unexpected forwarded persistent id message"),
+                }
             }
             MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
                 let result = match context.net_handle.as_ref() {
@@ -1023,7 +1028,8 @@ impl MetadataHandle {
             }
             admit @ MetadataTransportMessage::ForwardAdmitMember { .. } => {
                 Box::pin(async {
-                    let serve = crate::distribution::forward::serve_admission(context, peer, admit);
+                    let serve =
+                        crate::distribution::forward::serve_admission(context.here(), peer, admit);
                     crate::driver::drive(serve, context)
                         .await
                         .unwrap_or_else(|error| {
@@ -1035,7 +1041,11 @@ impl MetadataHandle {
             publish @ (MetadataTransportMessage::ForwardDistributionRequest { .. }
             | MetadataTransportMessage::SubmitDistributionStatement { .. }) => {
                 Box::pin(async {
-                    let serve = crate::distribution::forward::serve_publish(context, peer, publish);
+                    let serve = crate::distribution::forward::serve_publish(
+                        context.node_and_realm(),
+                        peer,
+                        publish,
+                    );
                     crate::driver::drive(serve, context)
                         .await
                         .unwrap_or_else(|error| {
@@ -1046,19 +1056,46 @@ impl MetadataHandle {
             }
             fetch @ MetadataTransportMessage::FetchRealmDocuments { .. } => {
                 Box::pin(async {
-                    crate::device::forward::serve_realm_documents(context, peer, fetch).await
+                    drive(
+                        crate::device::forward::serve_realm_documents(
+                            context.node_and_realm(),
+                            peer,
+                            fetch,
+                        ),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
             fetch @ MetadataTransportMessage::FetchGraphState { .. } => {
                 Box::pin(async {
-                    crate::device::forward::serve_graph_state(context, peer, fetch).await
+                    drive(
+                        crate::device::forward::serve_graph_state(
+                            context.node_and_realm(),
+                            peer,
+                            fetch,
+                        ),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
             forward @ MetadataTransportMessage::ForwardApplyBatch { .. } => {
                 Box::pin(async {
-                    crate::device::forward::apply_device_batch(context, peer, forward).await
+                    drive(
+                        crate::device::forward::apply_device_batch(
+                            context.node_and_realm(),
+                            peer,
+                            forward,
+                        ),
+                        context,
+                    )
+                    .await
+                    .unwrap_or_else(|error| crate::forward::transport::reject(error.to_string()))
                 })
                 .await
             }
@@ -1151,16 +1188,21 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::identifier_lookup::lookup_local(
-                            context.as_ref(),
-                            *net_handle.realm_id(),
-                            auth.as_ref(),
-                            kind,
-                            &value,
-                            endpoint.as_deref(),
-                        )
-                        .await
-                        .map_err(|_| MetadataReadError::Unavailable),
+                        Some(net_handle) => {
+                            use crate::metadata::identifier_lookup::{
+                                IdentifierLookupOperation, IdentifierQuery,
+                            };
+                            let query = IdentifierQuery {
+                                kind,
+                                value,
+                                endpoint,
+                            };
+                            let lookup =
+                                IdentifierLookupOperation::new(*net_handle.realm_id(), auth, query);
+                            drive(lookup, context.as_ref())
+                                .await
+                                .map_err(|_| MetadataReadError::Unavailable)
+                        }
                         None => Err(MetadataReadError::Unavailable),
                     },
                     Err(error) => Err(error),
@@ -1173,15 +1215,15 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::api::links::links_local(
-                            context.as_ref(),
-                            *net_handle.realm_id(),
-                            auth.as_ref(),
-                            *request,
-                        )
-                        .await
-                        .map(Box::new)
-                        .map_err(crate::forward::transport::read_error),
+                        Some(net_handle) => {
+                            use crate::metadata::api::links::local::LinksLocalOperation;
+                            let realm_id = *net_handle.realm_id();
+                            let links = LinksLocalOperation::new(realm_id, auth, *request);
+                            drive(links, context.as_ref())
+                                .await
+                                .map(Box::new)
+                                .map_err(crate::forward::transport::read_error)
+                        }
                         None => Err(MetadataReadError::Unavailable),
                     },
                     Err(error) => Err(error),
@@ -1214,17 +1256,15 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::api::links::set_preview_local(
-                            context.as_ref(),
-                            *net_handle.realm_id(),
-                            auth.as_ref(),
-                            set_id,
-                            None,
-                            limit,
-                        )
-                        .await
-                        .map(Box::new)
-                        .map_err(crate::forward::transport::read_error),
+                        Some(net_handle) => {
+                            use crate::metadata::api::links::local::SetPreviewOperation;
+                            let scope = (*net_handle.realm_id(), auth);
+                            let preview = SetPreviewOperation::new(scope, set_id, None, limit);
+                            drive(preview, context.as_ref())
+                                .await
+                                .map(Box::new)
+                                .map_err(crate::forward::transport::read_error)
+                        }
                         None => Err(MetadataReadError::Unavailable),
                     },
                     Err(error) => Err(error),

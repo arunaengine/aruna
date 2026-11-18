@@ -26,6 +26,10 @@ pub enum HoldScope {
     DocumentWrite(ulid::Ulid),
     /// Drawing placement handles and provisioning bindings on this node.
     PlacementHandles,
+    /// The local repository of one document: projections, snapshots and pushes.
+    GitRepository(ulid::Ulid),
+    /// Publishing local runs on this node, so a repeated request cannot mint a second crate.
+    RunPublish,
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the

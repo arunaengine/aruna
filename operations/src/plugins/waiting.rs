@@ -37,7 +37,7 @@ enum SettlePhase {
 }
 
 impl SettleWaiting {
-    pub(crate) fn new(
+    pub fn new(
         key: Vec<u8>,
         waiting: WaitingRow,
         verdict: Option<Verdict>,
@@ -125,7 +125,7 @@ enum RecheckPhase {
 /// Decides each waiting event that is ready or expired; answers how many left the waiting set.
 ///
 #[derive(Debug, PartialEq)]
-pub(crate) struct RecheckWaiting {
+pub struct RecheckWaiting {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     now_ms: u64,
@@ -135,7 +135,7 @@ pub(crate) struct RecheckWaiting {
 }
 
 impl RecheckWaiting {
-    pub(crate) fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
+    pub fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
         let scan = Scan::new(PLUGIN_WAITING_KEYSPACE, Vec::new());
         Self {
             config,

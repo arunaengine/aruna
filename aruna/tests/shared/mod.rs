@@ -37,10 +37,10 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::driver::node_facts;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::inbound::initialize_incoming_fixture;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::node::info::facts::NodeFacts;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
 use aruna_operations::realm::announce_presence::{
@@ -867,7 +867,7 @@ async fn spawn_seed_at(
             api: None,
             s3: None,
         },
-        NodeFacts::gather(context.as_ref()),
+        node_facts(context.as_ref()),
         false,
     );
     drive(seed, context.as_ref())
@@ -1016,7 +1016,7 @@ async fn spawn_joiner_mode(
             api: config.api_public_url.clone(),
             s3: config.s3_public_url.clone(),
         },
-        NodeFacts::gather(joiner_context.as_ref()),
+        node_facts(joiner_context.as_ref()),
         false,
     );
     drive(seed, joiner_context.as_ref())

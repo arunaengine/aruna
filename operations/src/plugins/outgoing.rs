@@ -27,7 +27,7 @@ type Pairs<'a> = &'a [(String, String)];
 
 /// The request a run asks for, with the connection's address resolved from the settings the run
 /// was admitted with; a work row keeps it, so its job needs no run. No credential header is kept.
-pub(crate) fn request_context(
+pub fn request_context(
     manifest: &Manifest,
     (connection, method): (&str, Method),
     settings: &str,
@@ -97,9 +97,7 @@ fn guest_header(name: &str) -> bool {
 }
 
 /// The manifest's name of a method the guest called.
-pub(crate) fn declared_method(
-    method: aruna_plugins::broker::Method,
-) -> aruna_plugins::connection::Method {
+pub fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::connection::Method {
     use aruna_plugins::broker::Method as Called;
     use aruna_plugins::connection::Method;
     match method {
@@ -113,7 +111,7 @@ pub(crate) fn declared_method(
 }
 
 /// The stored form of a whole answer, read back by [`stored_whole`].
-pub(crate) fn whole_text(reply: &Response) -> String {
+pub fn whole_text(reply: &Response) -> String {
     let headers: Vec<(&str, &str)> = (reply.headers.iter())
         .map(|field| (field.name.as_str(), field.value.as_str()))
         .collect();
@@ -122,7 +120,7 @@ pub(crate) fn whole_text(reply: &Response) -> String {
 }
 
 /// The stored reply of a sent request whose answer did not fit the call.
-pub(crate) fn too_large(status: u16) -> String {
+pub fn too_large(status: u16) -> String {
     serde_json::json!({ "status": status, "too_large": true }).to_string()
 }
 
@@ -140,7 +138,7 @@ fn refuse_large(value: &Value) -> Result<(), HostError> {
 }
 
 /// A whole answer read back from its stored form; a stored too-large marker is refused.
-pub(crate) fn stored_whole(reply: &str) -> Result<Response, HostError> {
+pub fn stored_whole(reply: &str) -> Result<Response, HostError> {
     let broken = || unavailable("a stored whole answer does not decode");
     let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
     refuse_large(&value)?;
@@ -173,10 +171,10 @@ fn invalid(why: &str) -> HostError {
 
 /// Sends one request of a plugin connection and answers what the service said.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SendConnection(Option<ConnectionCall>);
+pub struct SendConnection(Option<ConnectionCall>);
 
 impl SendConnection {
-    pub(crate) fn new(request: OutgoingRequest, body: Vec<u8>) -> Self {
+    pub fn new(request: OutgoingRequest, body: Vec<u8>) -> Self {
         Self(Some(ConnectionCall { request, body }))
     }
 }

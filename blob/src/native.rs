@@ -15,11 +15,13 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_net::NetHandle;
 use aruna_net::streams::{BiStream, RecvStream, SendStream};
+use futures::StreamExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
+use tracing::warn;
 
 /// Bound on each frame and body write of the protocol.
 pub const NATIVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -93,6 +95,51 @@ pub async fn send_request(
     .map_err(|_| StagingSourceError::ReadError("native response timed out".to_string()))?
     .map_err(StagingSourceError::ReadError)?;
     Ok((response, stream))
+}
+
+/// The request a peer sent on its native reference stream; a failure is only logged.
+pub async fn read_request(stream: &mut BiStream, peer: NodeId) -> Option<NativeReferenceRequest> {
+    match timeout(NATIVE_IO_TIMEOUT, read_frame(&mut stream.1)).await {
+        Ok(Ok(request)) => Some(request),
+        Ok(Err(error)) => {
+            warn!(%peer, %error, "Failed to read native reference request");
+            None
+        }
+        Err(_) => {
+            warn!(%peer, "Timed out reading native reference request");
+            None
+        }
+    }
+}
+
+/// Writes `response` and any `body`, then finishes the stream; a failed write ends the answer.
+pub async fn write_answer(
+    mut stream: BiStream,
+    peer: NodeId,
+    response: &NativeReferenceResponse,
+    body: Option<BackendStream<Result<bytes::Bytes, StreamError>>>,
+) {
+    let written = timeout(NATIVE_IO_TIMEOUT, write_frame(&mut stream.0, response));
+    if !matches!(written.await, Ok(Ok(()))) {
+        return;
+    }
+    if let Some(mut body) = body {
+        while let Some(chunk) = body.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    warn!(%peer, %error, "Failed to read native reference source");
+                    stream.0.reset(1u32.into()).ok();
+                    return;
+                }
+            };
+            let written = timeout(NATIVE_IO_TIMEOUT, stream.0.write_all(&chunk));
+            if !matches!(written.await, Ok(Ok(()))) {
+                return;
+            }
+        }
+    }
+    stream.0.finish().ok();
 }
 
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {

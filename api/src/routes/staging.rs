@@ -35,7 +35,7 @@ use aruna_operations::auth::request_authorization::rules_operation;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
 use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::jobs::staging::ReadCheckpointOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
@@ -1535,7 +1535,7 @@ async fn snapshot_blob(
 
     let result = drive(
         stage_snapshot_blob(
-            &state.get_ctx(),
+            &node_routing(&state.get_ctx()),
             MaterializeSnapshotInput {
                 job_id: None,
                 group_id,

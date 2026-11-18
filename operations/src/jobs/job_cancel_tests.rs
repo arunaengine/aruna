@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{ComputeResources, EffectiveResources, ExecutionSpec};
+use aruna_core::structs::execution::job::{
+    ComputeResources, EffectiveResources, ExecutionSpec, SubmissionId,
+};
 use ulid::Ulid;
 
 use super::*;
@@ -28,7 +30,7 @@ fn flagging() -> CancelOwnedOperation {
 
 fn family() -> JobFamilyId {
     JobFamilyId {
-        submission_id: Ulid::from_bytes([7u8; 16]),
+        submission_id: SubmissionId([7u8; 32]),
         request_digest: [8u8; 32],
     }
 }

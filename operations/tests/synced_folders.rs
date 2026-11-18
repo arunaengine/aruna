@@ -79,7 +79,11 @@ async fn await_uploads(realm: &Topology) -> TestResult<()> {
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "the device never published its queued uploads",
         || async {
-            drive(drain_sync_outbox(&device.context), &device.context).await?;
+            drive(
+                drain_sync_outbox(device.context.node_and_realm()),
+                &device.context,
+            )
+            .await?;
             Ok(drive(list_transfers(), &device.context).await?.len())
         },
     )
@@ -1001,7 +1005,7 @@ async fn resolves_conflicts() -> TestResult<()> {
         actor: realm.user_id,
     };
     let applied = drive(
-        apply_action(&device.context, action.clone()),
+        apply_action(device.context.node_and_realm(), action.clone()),
         &device.context,
     )
     .await?;
@@ -1009,7 +1013,11 @@ async fn resolves_conflicts() -> TestResult<()> {
     assert_eq!(std::fs::read(&file)?, b"the realm's edit");
 
     // The same request twice must not replace the new bytes again.
-    let replayed = drive(apply_action(&device.context, action), &device.context).await?;
+    let replayed = drive(
+        apply_action(device.context.node_and_realm(), action),
+        &device.context,
+    )
+    .await?;
     assert_eq!(replayed.outcome, ActionOutcome::Stale);
     assert_eq!(std::fs::read(&file)?, b"the realm's edit");
     Ok(())

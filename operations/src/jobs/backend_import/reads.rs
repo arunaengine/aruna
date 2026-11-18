@@ -29,8 +29,8 @@ use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
 use super::{
-    Claim, Exact, Hashed, ImportJob, ImportRun, ItemError, LIST_PAGE, PageReads, TWIN_SCAN,
-    etag_differs, free_path, hash_failure, item, parse, read_listed, write_intents,
+    Claim, Exact, Hashed, ImportJob, ItemError, LIST_PAGE, PageReads, TWIN_SCAN, etag_differs,
+    free_path, hash_failure, item, parse, read_listed, write_intents,
 };
 use crate::jobs::blob_request::BlobRequest;
 use crate::jobs::import_listing::{ListingNote, NoteError, NoteListingOperation};
@@ -781,6 +781,3 @@ impl Operation for TakenPathsOperation {
         }
     }
 }
-
-/// The shared run data a child needs beside its job.
-pub(super) type RunRef<'a> = (&'a ImportJob, &'a ImportRun);

@@ -45,11 +45,11 @@ fn mark_key((bucket, key, version_id): Version<'_>) -> Result<Vec<u8>, StoreErro
 
 /// The row that marks `version`, written in the transaction that reserves it, before any byte
 /// is written.
-pub(crate) fn mark_row(version: Version<'_>, mark: &Mark) -> Result<Row, StoreError> {
+pub fn mark_row(version: Version<'_>, mark: &Mark) -> Result<Row, StoreError> {
     Ok(row(PLUGIN_WORK_KEYSPACE, mark_key(version)?, encode(mark)?))
 }
 
-pub(crate) fn is_marked(version: Version<'_>) -> Result<IsMarked, StoreError> {
+pub fn is_marked(version: Version<'_>) -> Result<IsMarked, StoreError> {
     Ok(IsMarked(mark_key(version)?))
 }
 
@@ -153,7 +153,7 @@ struct SweptMark {
 /// can write no more, as its row is settled or gone, and only then the version is absent. The
 /// delete reads the row again, so it conflicts with a settlement or reservation.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SweepMarks {
+pub struct SweepMarks {
     after: Option<Vec<u8>>,
     more: bool,
     rows: VecDeque<(Vec<u8>, Vec<u8>)>,
@@ -163,7 +163,7 @@ pub(crate) struct SweepMarks {
 }
 
 impl SweepMarks {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             after: None,
             more: false,

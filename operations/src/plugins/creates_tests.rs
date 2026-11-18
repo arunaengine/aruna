@@ -10,11 +10,11 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::metadata::create_document::CreateDocumentPayload;
-use crate::plugin_host::worker::tests::installed;
 use crate::plugins::cleanup::sweep_events;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
 use crate::plugins::store::Txn;
+use crate::plugins::test_support::installed;
 
 fn pinned(fixture: &Fixture, name: &str) -> PinnedCreate {
     PinnedCreate {
@@ -159,4 +159,114 @@ async fn reinstall_starts_fresh() {
     assert_eq!(drive(sweep_events(&config, now), &fixture.ctx).await, Ok(1));
     let again = drive(claim_key((&reinstalled, "9"), first.clone()), &fixture.ctx).await;
     assert_eq!(again, Ok((first, Claim::Fresh)));
+}
+
+mod finish_create {
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+
+    use super::*;
+    use crate::jobs::repository::test_support::registry_record;
+    use crate::plugins::fixtures::{self, is_child, node};
+    use crate::plugins::rows::tests::child_result;
+
+    fn minted() -> PinnedCreate {
+        PinnedCreate {
+            group_id: fixtures::install().group_id,
+            path: "a".to_string(),
+            document_id: Ulid::from_parts(2, 2),
+            target: node(3),
+            payload: CreateDocumentPayload::RoCrate {
+                jsonld: "{}".to_string(),
+            },
+            message: None,
+        }
+    }
+
+    fn finish(minted: Result<Box<PinnedCreate>, String>) -> FinishCreate {
+        let caller = fixtures::caller();
+        let ready = ReadyCreate {
+            actor: caller.actor,
+            granted: Granted {
+                install: fixtures::install(),
+                auth: caller.auth,
+            },
+            minted,
+        };
+        let intent = CallIntent {
+            ordinal: 0,
+            digest: [1; 32],
+        };
+        FinishCreate::new(ready, None, "key", (Ulid::from_parts(3, 3), intent))
+    }
+
+    fn claimed(claim: Claim) -> FinishCreate {
+        let mut create = finish(Ok(Box::new(minted())));
+        assert!(is_child(&create.first()));
+        let stored = child_result(Ok::<_, StoreError>((minted(), claim)));
+        assert!(is_child(&create.next(stored)));
+        create
+    }
+
+    fn settled() -> IoResult {
+        child_result(Ok::<(), StoreError>(()))
+    }
+
+    fn recorded(create: &mut FinishCreate) -> Result<Next<String>, CallFailure> {
+        create.next(child_result(Ok::<_, CallFailure>("reply".to_string())))
+    }
+
+    #[test]
+    fn fresh_key_creates() {
+        let mut create = claimed(Claim::Fresh);
+        assert_eq!(create.phase, CreatePhase::Create);
+        let done = child_result(Ok::<_, CreateAuthorizedError>(registry_record()));
+        assert!(is_child(&create.next(done)));
+        assert!(matches!(create.phase, CreatePhase::Settle(_)));
+        assert!(is_child(&create.next(settled())));
+        assert_eq!(recorded(&mut create), Ok(Next::Done("reply".to_string())));
+    }
+
+    #[test]
+    fn earlier_key_adopts() {
+        let mut create = claimed(Claim::Earlier);
+        assert_eq!(create.phase, CreatePhase::Lookup);
+        let found = child_result(Ok::<_, MetadataApiError>(registry_record()));
+        assert!(is_child(&create.next(found)));
+        assert!(matches!(create.phase, CreatePhase::Settle(_)));
+    }
+
+    #[test]
+    fn missing_document_resent() {
+        let mut create = claimed(Claim::Earlier);
+        let gone = Err::<MetadataRegistryRecord, _>(MetadataApiError::NotFound);
+        assert!(is_child(&create.next(child_result(gone))));
+        assert_eq!(create.phase, CreatePhase::Create);
+    }
+
+    #[test]
+    fn unreachable_stays_unknown() {
+        let mut create = claimed(Claim::Earlier);
+        let down = Err::<MetadataRegistryRecord, _>(MetadataApiError::ServiceUnavailable);
+        assert!(is_child(&create.next(child_result(down))));
+        assert_eq!(create.phase, CreatePhase::Record);
+    }
+
+    #[test]
+    fn refusal_settles_key() {
+        let mut create = claimed(Claim::Fresh);
+        let denied = Err::<MetadataRegistryRecord, _>(CreateAuthorizedError::Forbidden);
+        assert!(is_child(&create.next(child_result(denied))));
+        assert!(matches!(create.phase, CreatePhase::Settle(_)));
+    }
+
+    #[test]
+    fn failed_mint_recorded() {
+        let mut create = finish(Err("no".to_string()));
+        let first = create.first();
+        assert!(matches!(first, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(create.phase, CreatePhase::Record);
+        let lost = create.next(IoResult::Done);
+        assert!(lost.is_err());
+    }
 }

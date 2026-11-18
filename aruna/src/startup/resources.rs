@@ -21,7 +21,6 @@ use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
-use aruna_operations::plugin_host::plugin_work::PluginWorkHandler;
 use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_storage::FjallPersistPolicy;
@@ -32,6 +31,7 @@ use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
 use crate::config::{Config, open_storage, resolve_config};
+use crate::plugin_host::plugin_work::PluginWorkHandler;
 use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
 
@@ -579,7 +579,7 @@ async fn open_managed_keys(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::time::unix_timestamp_millis;
-    use aruna_operations::jobs::key_wake::wake_unlocked;
+    use aruna_operations::jobs::key_wake::WakeUnlockedOperation;
     use aruna_operations::s3::bucket::key::startup::OpenManagedOperation;
 
     let keys = drive(OpenManagedOperation::new(), driver_ctx).await?;
@@ -602,7 +602,8 @@ async fn open_managed_keys(
     for key in keys.opened {
         let now_ms = unix_timestamp_millis();
         let limits = &config.rocrate_limits;
-        if let Err(error) = wake_unlocked(driver_ctx, key, now_ms, origin, limits).await {
+        let wake = WakeUnlockedOperation::new(key, now_ms, origin, limits);
+        if let Err(error) = drive(wake, driver_ctx).await {
             warn!(
                 bucket_id = %key.bucket_id,
                 generation = key.generation,
@@ -682,7 +683,8 @@ fn spawn_usage_rebuild(
             }
         }
         info!("Usage counters rebuilt");
-        let publish = PublishUsageOperation::new(&context, (node_id, realm_id), true, true);
+        let serving = context.node_and_realm().map(|(_, realm_id)| realm_id);
+        let publish = PublishUsageOperation::new((node_id, realm_id), serving, true, true);
         if let Err(error) = drive(publish, context.as_ref()).await {
             warn!(error = %error, "Usage snapshots were not published after the rebuild");
         }

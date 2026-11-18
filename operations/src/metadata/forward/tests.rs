@@ -14,7 +14,7 @@ use crate::forward::transport::RetryDisposition;
 use crate::forward::transport::retry_disposition;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::handle::MetadataRequestDelivery;
+use crate::metadata::message_kind::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::MetaResourceId;
@@ -389,4 +389,26 @@ fn frozen_holders_intersect() {
 
     assert_eq!(holder_intersection(&current, &frozen), vec![node(2)]);
     assert!(holder_intersection(&[node(1)], &[node(2)]).is_empty());
+}
+
+#[test]
+fn summary_refusals_unreadable() {
+    use super::read::summary_answer;
+    use crate::metadata::api::MetadataApiError;
+    use aruna_core::structs::storage::dataset_description::DescriptionError;
+    for error in [
+        MetadataApiError::NotFound,
+        MetadataApiError::Forbidden,
+        MetadataApiError::Unauthorized,
+        MetadataApiError::BadRequest,
+    ] {
+        assert_eq!(
+            summary_answer(Err(error)),
+            Err(DescriptionError::Unreadable)
+        );
+    }
+    assert_eq!(
+        summary_answer(Err(MetadataApiError::ServiceUnavailable)),
+        Err(DescriptionError::Unavailable)
+    );
 }

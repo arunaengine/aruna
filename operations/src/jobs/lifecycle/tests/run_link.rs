@@ -8,9 +8,9 @@ use aruna_core::structs::execution::job::{JobId, RunCrateStatus};
 use ulid::Ulid;
 
 use super::admission_race::{commit_receipt, config, envelope, seed};
-use crate::jobs::store::attempt::{put_crate_outcome, read_crate_status, read_run_link};
+use crate::jobs::store::test_calls::{put_crate_outcome, read_crate_status, read_run_link};
 use crate::jobs::store::row_calls::delete_rows;
-use crate::jobs::store::state::read_job_record;
+use crate::jobs::store::test_calls::read_job_record;
 use crate::tests::records::{Family, context};
 use aruna_core::structs::execution::job::prune_delete_entries;
 

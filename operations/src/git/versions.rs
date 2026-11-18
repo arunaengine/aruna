@@ -8,7 +8,7 @@ use super::project::Projection;
 use super::push::record_made;
 use super::snapshot::{execute, read_view, refresh};
 use super::state::GitState;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CommitInfo, FileChange, GitEffect, GitEvent, RefUpdate, ZERO_OID, refs_clash, valid_ref,
@@ -88,7 +88,11 @@ pub(super) async fn open(
     id: Ulid,
     permission: Permission,
 ) -> Result<(MetadataRegistryRecord, Projection, Guard), GitError> {
-    let (document, _) = super::repository(context, auth, id, permission).await?;
+    let (document, _) = drive(
+        super::repository(context.node_id(), auth, id, permission),
+        context,
+    )
+    .await?;
     let guard = store.lock(id).await;
     let projection = refresh(context, store, &document).await?;
     Ok((document, projection, guard))
@@ -102,7 +106,11 @@ async fn read(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<Projection, GitError> {
-    let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
+    let (document, _) = drive(
+        super::repository(context.node_id(), auth, id, Permission::READ),
+        context,
+    )
+    .await?;
     Ok(read_view(context, store, &document).await?.0)
 }
 
@@ -540,13 +548,16 @@ pub async fn change_ref(
         new: new.clone(),
     };
     let nothing = (Bytes::new(), Vec::new());
-    record_made(
+    drive(
+        record_made(
+            context.node_id(),
+            auth,
+            &document,
+            vec![update],
+            nothing,
+            (Vec::new(), None),
+        ),
         context,
-        auth,
-        &document,
-        vec![update],
-        nothing,
-        (Vec::new(), None),
     )
     .await?;
     Ok(Named { name, version: new })

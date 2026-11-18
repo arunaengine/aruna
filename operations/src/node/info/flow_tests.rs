@@ -14,11 +14,9 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::types::GroupId;
 use aruna_tasks::TaskHandle;
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, node_facts};
 use crate::jobs::demand::{DemandSnapshotOperation, merge_view};
 use crate::jobs::lifecycle::held::HeldReservations;
-use crate::node::info::facts::NodeFacts;
-use crate::node::info::facts::{class_labels, permille_of};
 use crate::node::info::flows::DepartureStateOperation;
 use crate::node::info::flows::{
     GroupDemandOperation, ObservePlacementOperation, OperatorDrainOperation, RefreshInfoOperation,
@@ -60,11 +58,9 @@ use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef, PlacementStrategy};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::AdvertisementEpoch;
-use aruna_core::structs::storage::node_info::CLASS_LABEL_PREFIX;
 use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::node_info::NodeUtilization;
-use aruna_core::structs::storage::routing::BackendCatalog;
 use aruna_core::types::Key;
 use aruna_core::types::Value;
 use aruna_storage::FjallStorage;
@@ -89,7 +85,7 @@ async fn seed_info_document(
     realm_id: RealmId,
     urls: NodeUrls,
 ) -> Result<(), String> {
-    let seed = SeedInfoOperation::new(realm_id, node_id, urls, NodeFacts::gather(ctx), false);
+    let seed = SeedInfoOperation::new(realm_id, node_id, urls, node_facts(ctx), false);
     (drive(seed, ctx).await).map_err(|error| error.to_string())
 }
 
@@ -99,7 +95,7 @@ async fn publish_node_info(
     realm_id: RealmId,
     urls: NodeUrls,
 ) -> Result<(), String> {
-    let seed = SeedInfoOperation::new(realm_id, node_id, urls, NodeFacts::gather(ctx), true);
+    let seed = SeedInfoOperation::new(realm_id, node_id, urls, node_facts(ctx), true);
     (drive(seed, ctx).await).map_err(|error| error.to_string())
 }
 
@@ -110,7 +106,7 @@ async fn refresh_info_heartbeat(
     sequence: u64,
     jobs: Option<RunningJobs>,
 ) -> Result<(), String> {
-    let facts = NodeFacts::gather(ctx);
+    let facts = node_facts(ctx);
     let refresh = RefreshInfoOperation::new(realm_id, node_id, sequence, jobs, facts);
     (drive(refresh, ctx).await).map_err(|error| error.to_string())
 }
@@ -121,7 +117,7 @@ async fn observe_placement(
     node_id: NodeId,
     now_ms: u64,
 ) -> Result<Option<SubjectScanResult>, SubjectScanError> {
-    let facts = NodeFacts::gather(ctx);
+    let facts = node_facts(ctx);
     drive(
         ObservePlacementOperation::new(realm_id, node_id, now_ms, facts),
         ctx,
@@ -135,7 +131,7 @@ async fn set_operator_drain(
     realm_id: RealmId,
     draining: bool,
 ) -> Result<bool, String> {
-    let facts = NodeFacts::gather(ctx);
+    let facts = node_facts(ctx);
     let drain = OperatorDrainOperation::new(realm_id, node_id, draining, facts);
     (drive(drain, ctx).await).map_err(|error| error.to_string())
 }
@@ -156,7 +152,7 @@ async fn set_departure_state(
     realm_id: RealmId,
     departing: bool,
 ) -> Result<bool, String> {
-    let facts = NodeFacts::gather(ctx);
+    let facts = node_facts(ctx);
     let departure = DepartureStateOperation::new(realm_id, node_id, departing, facts);
     (drive(departure, ctx).await).map_err(|error| error.to_string())
 }
@@ -255,24 +251,6 @@ async fn read_outbox(ctx: &DriverContext) -> Vec<DocumentOutboxRecord> {
             .collect(),
         other => panic!("unexpected outbox iter result: {other:?}"),
     }
-}
-
-#[test]
-fn classes_become_labels() {
-    // Operator-only classes are advertised too: placement is operator domain.
-    let catalog = BackendCatalog::new("hot".to_string())
-        .with_backend("hot".to_string(), Some("hot".to_string()))
-        .with_reserved("tape".to_string(), Some("archive".to_string()))
-        .with_backend("plain".to_string(), None);
-
-    let labels = class_labels(&catalog);
-
-    assert_eq!(labels.len(), 2);
-    assert_eq!(
-        labels.get(&format!("{CLASS_LABEL_PREFIX}hot")),
-        Some(&"true".to_string())
-    );
-    assert!(labels.contains_key(&format!("{CLASS_LABEL_PREFIX}archive")));
 }
 
 #[test]
@@ -602,25 +580,6 @@ async fn write_registry(ctx: &DriverContext, record: &MetadataRegistryRecord) {
         event,
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
-}
-
-#[test]
-fn permille_exact_values() {
-    assert_eq!(permille_of(1.0, 4), 250);
-    assert_eq!(permille_of(3.0, 4), 750);
-    assert_eq!(permille_of(0.0, 8), 0);
-    assert_eq!(permille_of(4.0, 4), 1000);
-}
-
-#[test]
-fn permille_clamps_high() {
-    assert_eq!(permille_of(9.0, 4), 1000);
-    assert_eq!(permille_of(10.0, 2), 1000);
-}
-
-#[test]
-fn permille_zero_cores() {
-    assert_eq!(permille_of(5.0, 0), 0);
 }
 
 #[tokio::test]

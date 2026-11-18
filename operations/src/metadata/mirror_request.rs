@@ -15,7 +15,7 @@ use aruna_core::structs::SyncRelationship;
 use aruna_core::types::GroupId;
 
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::metadata::handle::transport_message_kind;
+use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
 

@@ -40,7 +40,7 @@ use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::raw_events::{RawReadError, RawRevisionState};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::revision_read::{RawStateOperation, RawViewOperation, RawViewOutput};
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
 const SCHEMA_ENCODING_FORMAT: &str = "http://schema.org/encodingFormat";

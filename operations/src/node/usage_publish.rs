@@ -24,7 +24,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::distribution::replica_shares::{GroupShare, ReplicaSharesOperation};
-use crate::driver::DriverContext;
 use crate::node::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
 use crate::s3::usage::{
     LoadCountersError, global_shard_rows, global_sum, schedule_snapshot_publish,
@@ -302,18 +301,8 @@ pub struct PublishUsageOperation {
 }
 
 impl PublishUsageOperation {
-    pub fn new(
-        context: &DriverContext,
-        (node_id, realm_id): (NodeId, RealmId),
-        full: bool,
-        refresh: bool,
-    ) -> Self {
-        let serving_realm = context.node_and_realm().map(|(_, realm_id)| realm_id);
-        Self::on_realm((node_id, realm_id), serving_realm, full, refresh)
-    }
-
     /// A publish for a node that serves `serving_realm`, when it runs a net transport.
-    pub(super) fn on_realm(
+    pub fn new(
         keys: (NodeId, RealmId),
         serving_realm: Option<RealmId>,
         full: bool,

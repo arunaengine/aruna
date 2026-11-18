@@ -5,11 +5,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use aruna_core::compute::offer::ExecutorOffer;
 use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind, ResourceEnvelope};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
-use aruna_core::structs::storage::node_info::NODE_LABEL_KEY;
 
-use crate::executor::{BackendCaps, ExecutorBackend};
+use crate::executor::ExecutorBackend;
 use crate::session::SessionRegistry;
 
 /// Container-facing S3 endpoint the workspace credential targets. Injected into
@@ -146,9 +146,8 @@ impl ExecutorRegistry {
         let backend = self
             .get(kind)
             .ok_or_else(|| BackendError::Unavailable(format!("no {} backend", kind.as_wire())))?;
-        let current =
-            ExecutorCapability::new(kind.as_wire(), site(subject, &backend.capabilities()))
-                .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
+        let current = ExecutorCapability::new(kind.as_wire(), backend.capabilities().site(subject))
+            .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
         match current.subject.generation == stored_generation
             && &current.subject_digest == stored_digest
         {
@@ -162,79 +161,17 @@ impl ExecutorRegistry {
     }
 }
 
-/// The execution site one backend advertises. A backend whose workers are
-/// neither the controller nor a declared worker site cannot prove placement, so
-/// it advertises no location and no site labels rather than the controller's.
-fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
-    let mut site = match (caps.local_site, &caps.worker_site) {
-        (true, _) => PlacementSubject {
-            local_to_controller: true,
-            ..subject.clone()
-        },
-        (false, Some(site)) => {
-            let mut labels = site.labels.clone();
-            aruna_core::structs::storage::node_info::stamp_location(&mut labels, &site.location);
-            PlacementSubject {
-                local_to_controller: false,
-                location: site.location.clone(),
-                labels,
-                ..subject.clone()
-            }
-        }
-        (false, None) => PlacementSubject {
-            local_to_controller: false,
-            location: String::new(),
-            labels: BTreeMap::new(),
-            ..subject.clone()
-        },
-    };
-    // The node runs every backend it offers, so a submission can pin it by its id.
-    site.labels
-        .insert(NODE_LABEL_KEY.to_string(), subject.node_id.to_string());
-    site
-}
-
-/// One enabled backend's wire kind and capabilities, as plain data.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutorOffer {
-    kind: String,
-    caps: BackendCaps,
-}
-
-impl ExecutorOffer {
-    pub fn new(kind: String, caps: BackendCaps) -> Self {
-        Self { kind, caps }
-    }
-
-    /// The advertisement of this backend under `subject`, at the site it actually runs on.
-    pub fn capability(
-        &self,
-        subject: &PlacementSubject,
-        policy_draining: bool,
-    ) -> Result<ExecutorCapability, PlacementPolicyError> {
-        let caps = &self.caps;
-        let mut capability = ExecutorCapability::new(self.kind.clone(), site(subject, caps))?;
-        capability.file_staging = caps.file_staging;
-        capability.direct_s3 = caps.direct_s3;
-        capability.s3_mount = caps.s3_mount;
-        capability.network_policy = caps.network_policy;
-        capability.session = caps.session;
-        capability.limits = caps.limits;
-        capability.policy_draining = policy_draining;
-        Ok(capability)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::{BackendCaps, ExecutorBackend, WorkerSite};
+    use crate::executor::ExecutorBackend;
+    use aruna_core::compute::offer::{BackendCaps, WorkerSite};
     use aruna_core::compute::{
         AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
         LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
         TombstoneSpec, UserSpec,
     };
-    use aruna_core::structs::storage::node_info::LOCATION_LABEL_KEY;
+    use aruna_core::structs::storage::node_info::{LOCATION_LABEL_KEY, NODE_LABEL_KEY};
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 

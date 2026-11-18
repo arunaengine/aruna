@@ -20,7 +20,7 @@ use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::record_reads::RecordMaterializedOperation;
 use crate::metadata::revision_read::{MetadataRawView, RawDisplayOperation};
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataApiError>;
 
@@ -153,6 +153,7 @@ pub struct RawExportOperation {
     request: ExportMetadataRequest,
     stage: RawStage,
     record: Option<MetadataRegistryRecord>,
+    now_ms: u64,
 }
 
 impl RawExportOperation {
@@ -162,6 +163,7 @@ impl RawExportOperation {
             realm_id,
             request,
             record: None,
+            now_ms: 0,
         }
     }
 
@@ -176,6 +178,7 @@ impl RawExportOperation {
         let mut readable =
             RecordReadableOperation::new(self.realm_id, self.request.auth.clone(), record.clone());
         self.record = Some(record);
+        readable.stamp(self.now_ms);
         let turn = readable.first()?;
         self.stage = RawStage::Readable(readable);
         self.readable_turn(turn)
@@ -219,6 +222,14 @@ impl Operation for RawExportOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::ReadSnapshot
+    }
+
+    /// The embedded read check times the caller's permission on the runner's clock.
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        if let RawStage::Readable(readable) = &mut self.stage {
+            readable.stamp(now_ms);
+        }
     }
 
     fn first(&mut self) -> ExportTurn {

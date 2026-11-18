@@ -11,13 +11,14 @@ use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{JobDeletes, JobId, JobWrites};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use ulid::Ulid;
 
 use super::MUTATE_MAX_ATTEMPTS;
 use super::store::JobMutationError;
-use super::store::job_rows::PutRowsOperation;
+use super::store::job_rows::{PutEntryOperation, PutRowsOperation};
 
 /// Why a job's stored state could not be read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -30,18 +31,24 @@ impl From<IoError> for StateReadError {
     }
 }
 
-/// Reads the state row a job keeps under its id, such as its checkpoint; a missing row stays
-/// distinct from a malformed one.
+/// Reads one state row of a job, such as its checkpoint; a missing row stays distinct from a
+/// malformed one.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReadStateOperation<T> {
-    job_id: JobId,
+    key: Key,
     state: PhantomData<fn() -> T>,
 }
 
 impl<T> ReadStateOperation<T> {
+    /// Reads the row the job keeps under its id.
     pub(crate) fn new(job_id: JobId) -> Self {
+        Self::at(job_state_key(job_id))
+    }
+
+    /// Reads the row under `key`.
+    pub(crate) fn at(key: Key) -> Self {
         Self {
-            job_id,
+            key,
             state: PhantomData,
         }
     }
@@ -55,8 +62,7 @@ where
     type Error = StateReadError;
 
     fn first(&mut self) -> Result<Next<Option<T>>, StateReadError> {
-        let key = ByteView::from(self.job_id.to_bytes().to_vec());
-        let row = (JOB_STATE_KEYSPACE.to_string(), key);
+        let row = (JOB_STATE_KEYSPACE.to_string(), self.key.clone());
         Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
@@ -67,6 +73,84 @@ where
             .transpose()
             .map_err(|error| StateReadError(error.to_string()))?;
         Ok(Next::Done(state))
+    }
+}
+
+/// One encoded row of `T` under `key` in the job state key space.
+pub(crate) fn state_row<T: serde::Serialize>(
+    key: Key,
+    row: &T,
+) -> Result<(String, Key, Value), String> {
+    let value = postcard::to_allocvec(row).map_err(|error| error.to_string())?;
+    Ok((JOB_STATE_KEYSPACE.to_string(), key, ByteView::from(value)))
+}
+
+/// The state row a job keeps under its id, as [`ReadStateOperation`] reads it.
+pub(crate) fn job_state_key(job_id: JobId) -> Key {
+    ByteView::from(job_id.to_bytes().to_vec())
+}
+
+/// Writes one report entry of a running job, again after each conflict the write loses.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SettledEntryOperation {
+    job_id: JobId,
+    token: Ulid,
+    entry_key: Vec<u8>,
+    value: Value,
+    attempt: u32,
+    waiting: bool,
+}
+
+impl SettledEntryOperation {
+    pub(crate) fn new(job_id: JobId, token: Ulid, entry_key: &[u8], value: Value) -> Self {
+        Self {
+            job_id,
+            token,
+            entry_key: entry_key.to_vec(),
+            value,
+            attempt: 0,
+            waiting: false,
+        }
+    }
+
+    fn write(&self) -> Next<()> {
+        let value = self.value.clone();
+        let entry = PutEntryOperation::new(self.job_id, self.token, &self.entry_key, value);
+        Next::Call(IoCall::child(entry))
+    }
+}
+
+impl Operation for SettledEntryOperation {
+    type Output = ();
+    type Error = JobMutationError;
+
+    fn first(&mut self) -> Result<Next<()>, JobMutationError> {
+        Ok(self.write())
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, JobMutationError> {
+        if self.waiting {
+            let IoResult::Woke = result else {
+                let got = result.label();
+                let expected = "IoResult::Woke";
+                return Err(IoError::Unexpected { expected, got }.into());
+            };
+            self.waiting = false;
+            return Ok(self.write());
+        }
+        match result.child::<(), JobMutationError>()? {
+            Ok(()) => Ok(Next::Done(())),
+            Err(JobMutationError::Conflict) if self.attempt + 1 < MUTATE_MAX_ATTEMPTS => {
+                let pause = Duration::from_millis(1 << self.attempt.min(MAX_PAUSE_SHIFT));
+                self.attempt += 1;
+                self.waiting = true;
+                Ok(Next::Call(IoCall::Delay(pause)))
+            }
+            Err(JobMutationError::Conflict) => Err(JobMutationError::Storage(
+                "job entry write exhausted conflict retries".to_string(),
+            )),
+            Err(error) => Err(error),
+        }
     }
 }
 

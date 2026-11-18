@@ -367,3 +367,32 @@ mod tests {
         );
     }
 }
+
+/// Who this node hears from: itself, and each node's heartbeat age and wall receive time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Heard {
+    pub local: Option<NodeId>,
+    pub nodes: std::collections::BTreeMap<NodeId, (u64, u64)>,
+}
+
+impl Heard {
+    /// What the held heartbeats say, seen from `local`.
+    pub fn of<'a>(
+        local: Option<NodeId>,
+        held: impl IntoIterator<Item = (NodeId, &'a HeldHeartbeat)>,
+    ) -> Self {
+        let nodes = (held.into_iter())
+            .map(|(node_id, held)| (node_id, (held.age_ms, held.received_at_ms)))
+            .collect();
+        Self { local, nodes }
+    }
+}
+
+/// The node an operation runs on, read once by the input that starts it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Here {
+    pub ids: crate::structs::identity::realm::NodeRealm,
+    /// The bytes this node's backends can hold, when all of them state a quota.
+    pub capacity: Option<u64>,
+    pub heard: Heard,
+}

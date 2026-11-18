@@ -23,7 +23,7 @@ use aruna_operations::jobs::repository::link_queue::{
 use aruna_operations::jobs::repository::link_store::{ApplyChangeOperation, ListLinksOperation};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::StartPullOperation;
-use aruna_operations::jobs::repository::{NodeScope, RecordReference, TransferError, seal_token};
+use aruna_operations::jobs::repository::{RecordReference, TransferError, seal_token};
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -32,7 +32,7 @@ pub(super) async fn change_link(
     link: &RepositoryLink,
     change: LinkChange,
 ) -> Result<Option<RepositoryLink>, LinkError> {
-    let operation = ApplyChangeOperation::new(NodeScope::of(context), link.clone(), change);
+    let operation = ApplyChangeOperation::new(context.node_scope(), link.clone(), change);
     drive(operation, context).await
 }
 
@@ -56,8 +56,7 @@ pub(super) async fn start_push(
     event_id: Ulid,
     publish: bool,
 ) -> Result<JobId, LinkError> {
-    let operation =
-        StartPushOperation::new(NodeScope::of(context), link.clone(), event_id, publish);
+    let operation = StartPushOperation::new(context.node_scope(), link.clone(), event_id, publish);
     drive(operation, context).await
 }
 
@@ -66,18 +65,18 @@ pub(super) async fn start_pull(
     link: &RepositoryLink,
 ) -> Result<JobId, LinkError> {
     drive(
-        StartPullOperation::new(NodeScope::of(context), link.clone()),
+        StartPullOperation::new(context.node_scope(), link.clone()),
         context,
     )
     .await
 }
 
 pub(super) async fn drain_links(context: &DriverContext) -> Result<Option<Duration>, LinkError> {
-    drive(DrainLinksOperation::new(NodeScope::of(context)), context).await
+    drive(DrainLinksOperation::new(context.node_scope()), context).await
 }
 
 pub(super) async fn owner_holds(context: &DriverContext, link: &RepositoryLink) -> bool {
-    let holds = OwnerHoldsOperation::new(NodeScope::of(context), link);
+    let holds = OwnerHoldsOperation::new(context.node_scope(), link);
     drive(holds, context).await.unwrap_or(true)
 }
 
@@ -87,7 +86,7 @@ pub(super) async fn remote_state(
     link: &RepositoryLink,
 ) -> Result<RemoteState, TransferError> {
     drive(
-        RemoteStateOperation::new(NodeScope::of(context), link.clone()),
+        RemoteStateOperation::new(context.node_scope(), link.clone()),
         context,
     )
     .await
@@ -101,7 +100,7 @@ pub(super) async fn seal_credential(
 ) -> Result<RepositoryCredential, TransferError> {
     let connector = ConnectorViewOperation::new(destination.group_id, destination.connector_id);
     let view = drive(connector, context).await?;
-    seal_token(context, auth.user_id, &view, None, token)
+    seal_token(&context.node_scope(), auth.user_id, &view, None, token)
 }
 
 pub(super) async fn seal_link_token(
@@ -113,7 +112,7 @@ pub(super) async fn seal_link_token(
     token: &str,
 ) -> Result<RepositoryCredential, TransferError> {
     let view = drive(ConnectorViewOperation::new(group_id, connector_id), context).await?;
-    seal_token(context, user, &view, Some(link_id), token)
+    seal_token(&context.node_scope(), user, &view, Some(link_id), token)
 }
 
 pub(super) async fn search(
@@ -125,7 +124,7 @@ pub(super) async fn search(
 ) -> Result<Value, TransferError> {
     let operation = SearchRecordsOperation::new(
         kind,
-        NodeScope::of(context),
+        context.node_scope(),
         auth.clone(),
         query.clone(),
         limit,
@@ -144,7 +143,7 @@ pub(super) async fn resolve(
 ) -> Result<String, TransferError> {
     let operation = ResolveRecordOperation::new(
         kind,
-        NodeScope::of(context),
+        context.node_scope(),
         auth.clone(),
         group_id,
         connector_id,

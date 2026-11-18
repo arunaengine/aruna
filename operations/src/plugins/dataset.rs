@@ -38,7 +38,7 @@ fn dataset_mut(crate_json: &mut Value) -> Result<&mut Value, HostError> {
 }
 
 /// The fields of a crate's dataset entity, as a plugin reads and patches them.
-pub(crate) fn dataset_of(jsonld: &str) -> Result<String, HostError> {
+pub fn dataset_of(jsonld: &str) -> Result<String, HostError> {
     let mut crate_json: Value =
         serde_json::from_str(jsonld).map_err(|_| unavailable("the stored crate is not JSON"))?;
     let dataset = dataset_mut(&mut crate_json)?;
@@ -49,7 +49,7 @@ pub(crate) fn dataset_of(jsonld: &str) -> Result<String, HostError> {
 /// The change a patch makes to a crate's dataset entity: its id, types and name, and each
 /// patched field with its value after a JSON merge patch, `null` removing one. Other fields and
 /// other entities are not part of it, so they stay as they are.
-pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostError> {
+pub fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostError> {
     let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
     let patch: Value = serde_json::from_str(patch).map_err(|_| invalid("the patch is not JSON"))?;
     let Value::Object(changes) = patch else {
@@ -80,7 +80,7 @@ pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostEr
 }
 
 /// The `File` entities of an exported page, each as the plain JSON object a plugin writes.
-pub(crate) fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
+pub fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
     let page: Value =
         serde_json::from_str(jsonld).map_err(|_| unavailable("the stored page is not JSON"))?;
     let graph = (page.get("@graph").and_then(Value::as_array))
@@ -101,7 +101,7 @@ pub(crate) fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
 
 /// A file entity as a change stores it: one object with an `@id` that is neither the root nor
 /// the descriptor, typed `File`, naming other entities by `@id` alone.
-pub(crate) fn file_entity(file: &str) -> Result<String, HostError> {
+pub fn file_entity(file: &str) -> Result<String, HostError> {
     let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
     let file: Value = serde_json::from_str(file).map_err(|_| invalid("the file is not JSON"))?;
     let Value::Object(fields) = &file else {
@@ -144,7 +144,7 @@ fn nested_entity(fields: &serde_json::Map<String, Value>) -> bool {
 
 /// The crate a plugin create stores: the metadata descriptor and the dataset entity as its root.
 /// Plain object values become JSON literals as in a patch; nested entities are refused.
-pub(crate) fn dataset_crate(dataset: &str) -> Result<String, HostError> {
+pub fn dataset_crate(dataset: &str) -> Result<String, HostError> {
     let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
     let dataset: Value =
         serde_json::from_str(dataset).map_err(|_| invalid("the dataset is not JSON"))?;
@@ -207,7 +207,7 @@ fn plain_objects(dataset: &mut Value) {
 }
 
 /// Applies a JSON merge patch to `target`.
-pub(crate) fn merge_into(target: &mut Value, patch: Value) {
+pub fn merge_into(target: &mut Value, patch: Value) {
     let Value::Object(changes) = patch else {
         *target = patch;
         return;
@@ -253,7 +253,7 @@ fn literal_objects(change: &mut Value) {
 /// Refuses a `contentUrl` that names nothing readers can resolve, such as a short bucket path:
 /// it must be an absolute IRI such as an `s3://` address, an object path below the realm, or a
 /// reference inside the crate.
-pub(crate) fn content_urls(file: &Value) -> Result<(), HostError> {
+pub fn content_urls(file: &Value) -> Result<(), HostError> {
     let urls = match file.get("contentUrl") {
         Some(Value::Array(urls)) => urls.iter().collect(),
         Some(url) => vec![url],
@@ -275,7 +275,7 @@ pub(crate) fn content_urls(file: &Value) -> Result<(), HostError> {
 }
 
 /// The establishing revision a write expects, against the one the document is at.
-pub(crate) fn same_revision(exported: Ulid, expected: Ulid) -> Result<(), HostError> {
+pub fn same_revision(exported: Ulid, expected: Ulid) -> Result<(), HostError> {
     match exported.cmp(&expected) {
         std::cmp::Ordering::Equal => Ok(()),
         std::cmp::Ordering::Less => Err(unavailable(format!(
@@ -289,7 +289,7 @@ pub(crate) fn same_revision(exported: Ulid, expected: Ulid) -> Result<(), HostEr
 }
 
 /// The document id a plugin gave as its resource.
-pub(crate) fn parse_document(resource: &str) -> Result<Ulid, HostError> {
+pub fn parse_document(resource: &str) -> Result<Ulid, HostError> {
     Ulid::from_string(resource).map_err(|_| {
         HostError::new(
             ErrorKind::Invalid,

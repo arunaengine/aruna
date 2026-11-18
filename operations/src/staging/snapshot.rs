@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::descriptor::build_source_binding;
-use crate::driver::{DriverContext, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::s3::object::put::{
@@ -27,7 +26,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
@@ -87,10 +85,10 @@ impl From<IoError> for MaterializeSnapshotError {
 
 /// Reads a staged source and stores it as an object; a retry finds the object it already made.
 pub fn stage_snapshot_blob(
-    context: &DriverContext,
+    routing: &NodeRouting,
     input: MaterializeSnapshotInput,
 ) -> StageSnapshotOperation {
-    StageSnapshotOperation::routed(input, &node_routing(context))
+    StageSnapshotOperation::routed(input, routing)
 }
 
 /// What the pending call of staging a snapshot answers.
@@ -112,6 +110,8 @@ pub struct StageSnapshotOperation {
     source: Option<(SourceConnector, SourceMetadata)>,
     version_source: Option<VersionSourceBinding>,
     snapshot: Option<RoutingSnapshot>,
+    /// The runner's clock, which dates the policy gate.
+    now_ms: u64,
 }
 
 type SnapshotTurn = Result<Next<MaterializeSnapshotResult>, MaterializeSnapshotError>;
@@ -129,6 +129,7 @@ impl StageSnapshotOperation {
             source: None,
             version_source: None,
             snapshot: None,
+            now_ms: 0,
         }
     }
 
@@ -230,6 +231,10 @@ impl Operation for StageSnapshotOperation {
     type Output = MaterializeSnapshotResult;
     type Error = MaterializeSnapshotError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> SnapshotTurn {
         let read = ReadSourceOperation::new(ReadSourceInput {
             group_id: self.input.group_id,
@@ -256,8 +261,7 @@ impl Operation for StageSnapshotOperation {
                 self.step = SnapshotStep::Gate;
                 // The staging source is external, so it carries no refs of its own: only the
                 // destination default governs the snapshot.
-                let now = unix_timestamp_millis();
-                let gate = GateOperation::new(self.input.realm_id, now);
+                let gate = GateOperation::new(self.input.realm_id, self.now_ms);
                 Ok(Next::Call(IoCall::child(gate)))
             }
             SnapshotStep::Gate => {
@@ -283,7 +287,7 @@ impl From<SnapshotReuseError> for MaterializeSnapshotError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
+    use crate::driver::{drive, node_routing};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use axum::Router;
     use axum::routing::get;
@@ -356,17 +360,24 @@ mod tests {
     }
 
     fn staging(input: MaterializeSnapshotInput) -> StageSnapshotOperation {
-        let bucket = BucketRules::Named(input.bucket.clone());
         let routing = aruna_core::structs::storage::routing::NodeRouting::default();
-        StageSnapshotOperation {
-            routing: Some(SnapshotOperation::new(&routing, input.group_id, bucket)),
-            input,
-            step: SnapshotStep::Read,
-            read: None,
-            source: None,
-            version_source: None,
-            snapshot: None,
-        }
+        StageSnapshotOperation::routed(input, &routing)
+    }
+
+    // The policy gate is dated by the runner's clock, never by one read here.
+    #[test]
+    fn gate_uses_stamp() {
+        let input = plain_input(None);
+        let (realm_id, group_id) = (input.realm_id, input.group_id);
+        let answer = read_answer(&input);
+        let mut stage = staging(input);
+        stage.first().unwrap();
+        stage.next(answer).unwrap();
+        stage.stamp(7);
+        let routing = aruna_core::structs::storage::routing::RoutingSnapshot::single(group_id);
+        let gate = stage.next(child(Ok::<_, RoutingInputsError>(routing)));
+        let expected = IoCall::child(GateOperation::new(realm_id, 7));
+        assert_eq!(gate, Ok(Next::Call(expected)));
     }
 
     // Only a retry looks for the object an earlier attempt made.
@@ -449,15 +460,21 @@ mod tests {
             expected_checksums: Vec::new(),
         };
 
-        let first = drive(stage_snapshot_blob(context, input.clone()), context)
-            .await
-            .unwrap();
-        let second = drive(stage_snapshot_blob(context, input.clone()), context)
-            .await
-            .unwrap();
+        let first = drive(
+            stage_snapshot_blob(&node_routing(context), input.clone()),
+            context,
+        )
+        .await
+        .unwrap();
+        let second = drive(
+            stage_snapshot_blob(&node_routing(context), input.clone()),
+            context,
+        )
+        .await
+        .unwrap();
         let mut manual = input;
         manual.retry_key = None;
-        let third = drive(stage_snapshot_blob(context, manual), context)
+        let third = drive(stage_snapshot_blob(&node_routing(context), manual), context)
             .await
             .unwrap();
         server.abort();

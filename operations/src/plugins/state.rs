@@ -66,7 +66,7 @@ fn version_key(install_id: Ulid) -> Vec<u8> {
 }
 
 /// Reads the install's value at `key`.
-pub(crate) fn read_state(install_id: Ulid, key: &str) -> ReadState {
+pub fn read_state(install_id: Ulid, key: &str) -> ReadState {
     ReadState {
         key: value_key(install_id, key),
     }
@@ -101,7 +101,7 @@ impl Operation for ReadState {
 /// Writes the value if the stored version is still `expected` (`None`: no value yet) and the
 /// install stays within its bytes, and settles the call's intent with the new version. Versions
 /// never repeat within an install, so one read before a removal never matches a later value.
-pub(crate) fn put_state(run_id: Ulid, install_id: Ulid, put: StateWrite) -> PutState {
+pub fn put_state(run_id: Ulid, install_id: Ulid, put: StateWrite) -> PutState {
     PutState {
         run_id,
         install_id,
@@ -198,7 +198,7 @@ impl Operation for PutState {
 
 /// Removes the value if the stored version is still `expected`, frees its bytes, and settles the
 /// call's intent; an absent value is a conflict, as it was not at that version.
-pub(crate) fn remove_state(run_id: Ulid, install_id: Ulid, remove: StateRemoval) -> RemoveState {
+pub fn remove_state(run_id: Ulid, install_id: Ulid, remove: StateRemoval) -> RemoveState {
     RemoveState {
         run_id,
         install_id,

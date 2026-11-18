@@ -12,7 +12,7 @@ use crate::jobs::records::pages::ServePageOperation;
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
-use crate::metadata::after_sync::{AfterSyncOperation, run_maintenance};
+use crate::metadata::after_sync::AfterSyncOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
@@ -20,22 +20,26 @@ use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::PlacementReconcileOutcome;
 use crate::placement::process_placements::ReconcilePlacementsOperation;
-use crate::plugin_host::peer::serve_peer;
+use crate::plugins::peer::AnswerPeer;
 use crate::replication::catch_up::WakeBootstrapOperation;
 use crate::replication::incoming::stream::{
     BaoAdmission, BaoAdmissionOperation, BaoPeerStream, ServeBaoOperation,
 };
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
+use crate::staging::native_source::PrepareReferenceOperation;
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
 use crate::triggers::{PeerInput, peer_operation};
 use aruna_blob::blob::{InboundError, refuse_stream};
+use aruna_blob::native;
 use aruna_core::alpn::Alpn;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
+use aruna_core::native_reference::{NativeAuthority, NativeReferenceResponse};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::task::TaskKey;
@@ -201,8 +205,13 @@ async fn peer_request(
     peer: NodeId,
     message: MetadataTransportMessage,
 ) -> Result<MetadataTransportMessage, MetadataTransportMessage> {
-    let message = match Box::pin(serve_peer(context, peer, message)).await {
-        Ok(answer) => return Ok(answer),
+    let node = (context.net_handle.as_ref()).map(|net| (*net.realm_id(), net.node_id()));
+    let message = match AnswerPeer::new(node, peer, message, unix_timestamp_millis()) {
+        Ok(answer) => {
+            let kind = answer.answer();
+            let served = Box::pin(drive(answer, context)).await;
+            return Ok(served.unwrap_or_else(|_| kind.unavailable()));
+        }
         Err(message) => message,
     };
     match message {
@@ -216,7 +225,7 @@ async fn peer_request(
                 .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
         MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-            let node = crate::jobs::lifecycle::target::launch_node(context, &launch);
+            let node = crate::tasks::job_node::launch_node(context, &launch);
             let serve = ServeLaunchOperation::new(peer, *launch, node);
             Ok(Box::pin(drive(serve, context.as_ref()))
                 .await
@@ -227,7 +236,7 @@ async fn peer_request(
             submission_id,
             request,
         } => {
-            let node = crate::jobs::lifecycle::ingress::ingress_node(context);
+            let node = crate::tasks::job_node::ingress_node(context);
             let admit = crate::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
                 peer,
                 auth_token,
@@ -242,7 +251,7 @@ async fn peer_request(
             auth_token,
             request,
         } => {
-            let result = match crate::jobs::lifecycle::ingress::ingress_node(context) {
+            let result = match crate::tasks::job_node::ingress_node(context) {
                 Some(node) => {
                     let serve = crate::jobs::lifecycle::serve_inputs::ServeInputsOperation::new(
                         peer, auth_token, &node, *request,
@@ -698,7 +707,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     Box::pin(self.handle_metadata_stream(stream, node_id)).await;
                 }
                 Alpn::NativeReference => {
-                    Box::pin(crate::sync::native_serve::handle_native_stream(
+                    Box::pin(answer_native_stream(
                         self.context.as_ref(),
                         stream,
                         node_id,
@@ -796,6 +805,30 @@ fn schedule_sync_maintenance(
             run_maintenance(&context, "periodic", cycle).await;
         }
     });
+}
+
+/// Answers one native reference stream with what its request prepared.
+async fn answer_native_stream(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
+    let Some(request) = native::read_request(&mut stream, peer).await else {
+        return;
+    };
+    let relationship = matches!(request.authority, NativeAuthority::Relationship(_));
+    let prepare = PrepareReferenceOperation::new(context.node_and_realm(), peer, request);
+    let (response, body) = match drive(prepare, context).await {
+        Ok(prepared) => {
+            // Only a caller read names the group; a sync relationship knows its own bucket.
+            let response = match prepared.group_id.filter(|_| !relationship) {
+                None => NativeReferenceResponse::Content(prepared.metadata),
+                Some(group_id) => NativeReferenceResponse::Described {
+                    metadata: prepared.metadata,
+                    group_id,
+                },
+            };
+            (response, prepared.body)
+        }
+        Err(reject) => (NativeReferenceResponse::Rejected(reject), None),
+    };
+    native::write_answer(stream, peer, &response, body).await;
 }
 
 /// Serves one inbound notification stream: reads a request frame, runs the operation the trigger
@@ -945,6 +978,34 @@ async fn serve_shard_stream(
         warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
     }
     close_shard_stream(&mut stream).await;
+}
+
+
+/// Reconciles the metadata store with document sync and prunes deleted graphs.
+async fn run_maintenance(context: &DriverContext, source: &'static str, attempt: usize) {
+    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+        return;
+    };
+    if let Err(error) = metadata_handle.reconcile_document_sync(context).await {
+        warn!(
+            source,
+            attempt,
+            error = ?error,
+            "Metadata document sync reconciliation failed"
+        );
+    }
+    match metadata_handle.prune_deleted_graphs(context).await {
+        Ok(pruned) if pruned > 0 => {
+            debug!(source, attempt, pruned, "Metadata graph prune completed")
+        }
+        Ok(_) => {}
+        Err(error) => warn!(
+            source,
+            attempt,
+            error = ?error,
+            "Metadata graph prune failed"
+        ),
+    }
 }
 
 #[cfg(test)]

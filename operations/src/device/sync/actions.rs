@@ -5,7 +5,6 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
@@ -19,15 +18,14 @@ use aruna_core::structs::{
 use aruna_core::task::TaskKey;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
+use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::device::sync_status::ArmTimerOperation;
-use crate::driver::DriverContext;
 
 use super::download::{Blob, FetchError, FetchRemoteOperation};
-use super::folder_reads::{list_entries, read_bound};
-use super::folders::FolderError;
+use super::folders::{FolderError, list_entries, read_bound};
 use super::materialize::{
     MaterializeEntryOperation, MaterializeError, MaterializeInput, MaterializeOutcome,
 };
@@ -79,9 +77,12 @@ impl From<IoError> for ActionError {
 }
 
 /// Runs one owner action; the realm comes from this node's network identity.
-pub fn apply_action(context: &DriverContext, input: ApplyActionInput) -> ApplyActionOperation {
+pub fn apply_action(
+    ids: Option<(NodeId, RealmId)>,
+    input: ApplyActionInput,
+) -> ApplyActionOperation {
     ApplyActionOperation {
-        realm_id: context.net_handle.as_ref().map(|net| *net.realm_id()),
+        realm_id: ids.map(|(_, realm_id)| realm_id),
         input,
         step: ActionStep::Folder,
         folder: None,

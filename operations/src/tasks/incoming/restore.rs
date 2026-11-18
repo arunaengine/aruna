@@ -45,7 +45,7 @@ async fn durable_rearm_loop(
             warn!(%error, "Failed to restore connector reference pruning");
         }
         restore_outbox_timer(&context).await;
-        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest(&context, &task_handle).await;
@@ -212,7 +212,7 @@ async fn install_task_handler(
 ) -> TaskQueues {
     let handler_context = context.clone();
     if context.compute_handle.is_some() {
-        jobs_runtime.set_reconciler(crate::jobs::workflow::reconcile::ComputeReconciler::new(
+        jobs_runtime.set_reconciler(crate::tasks::job_runner::ComputeReconciler::new(
             context.clone(),
             Arc::downgrade(&jobs_runtime),
         ));
@@ -275,13 +275,17 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }
         // Before the first refresh: a queued edit is the one local change no
         // holder would hand back.
-        crate::device::edit::replay_queued_edits(&context).await;
+        if context.metadata_handle.is_some() {
+            drive(crate::device::edit::replay_queued_edits(), &context)
+                .await
+                .ok();
+        }
         if stopped() {
             return;
         }
@@ -397,8 +401,8 @@ impl OperationsTaskHandler {
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
         let publish = crate::node::usage_publish::PublishUsageOperation::new(
-            &self.context,
             (node_id, realm_id),
+            Some(realm_id),
             false,
             true,
         );
@@ -428,7 +432,7 @@ impl OperationsTaskHandler {
                 node_id,
                 sequence,
                 Some(self.jobs_runtime.running_jobs()),
-                crate::node::info::facts::NodeFacts::gather(&self.context),
+                node_facts(&self.context),
             );
             if let Err(error) = drive(refresh, &self.context).await {
                 warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
@@ -509,12 +513,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.context.bulk();
-        match drive(
-            PruneBatchOperation::new(crate::jobs::repository::NodeScope::of(&bulk)),
-            &bulk,
-        )
-        .await
-        {
+        match drive(PruneBatchOperation::new(bulk.node_scope()), &bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
                     .await;
@@ -663,7 +662,7 @@ impl OperationsTaskHandler {
     /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
     pub(super) async fn drain_link_queue(&self) {
         let drain = crate::jobs::repository::link_queue::DrainLinksOperation::new(
-            crate::jobs::repository::NodeScope::of(&self.context),
+            self.context.node_scope(),
         );
         let after = match drive(drain, &self.context).await {
             Ok(after) => after,
@@ -793,8 +792,11 @@ impl OperationsTaskHandler {
                     warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
                     continue;
                 };
-                if let Err(error) =
-                    release_job(&self.context, record.job_id, token, unix_timestamp_millis()).await
+                if let Err(error) = drive(
+                    job_calls::release_job(record.job_id, token, unix_timestamp_millis()),
+                    self.context.as_ref(),
+                )
+                .await
                 {
                     warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
                 }

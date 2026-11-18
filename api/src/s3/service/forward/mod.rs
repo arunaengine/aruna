@@ -24,13 +24,16 @@ use aruna_core::structs::storage::distribution::delegation::{
     COPY_CONTEXT_HEADER, COPY_READ_HEADER, CopyContext, DELEGATION_HEADER, Payload, TRAILER_BYTES,
     body_digest, request_digest,
 };
+use aruna_core::structs::storage::distribution::delegation::{DelegationError, SignedDelegation};
 use aruna_core::structs::storage::distribution::upload::UploadTag;
 use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
-use aruna_operations::distribution::delegate::{DelegationInput, issue_delegation};
+use aruna_operations::distribution::accept_delegation::DelegateError;
+use aruna_operations::distribution::delegate::{DelegationInput, unsigned_delegation};
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::routing::{route_read, route_upload, route_write};
 use aruna_operations::distribution::routing::{upload_route, upload_tag, upload_tags};
 use aruna_operations::distribution::status::node_reach;
+use aruna_operations::driver::DriverContext;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -140,6 +143,21 @@ pub(super) enum ForwardBody {
 pub(super) struct TrailerChecksum {
     pub algorithm: String,
     pub value: ChecksumValue,
+}
+
+/// Signs a delegation for one request with this node's key; `now` is Unix seconds.
+fn issue_delegation(
+    context: &DriverContext,
+    input: DelegationInput,
+    now: u64,
+) -> Result<SignedDelegation, DelegateError> {
+    let net = (context.net_handle.as_ref()).ok_or(DelegateError::Unavailable)?;
+    let delegation = unsigned_delegation((net.node_id(), *net.realm_id()), input, now);
+    let bytes = (delegation.signing_bytes()).map_err(|_| DelegationError::Encoding)?;
+    Ok(SignedDelegation {
+        signature: net.sign(&bytes),
+        delegation,
+    })
 }
 
 /// The client's trailing checksum to forward, read from its verified trailer once the body
@@ -494,7 +512,7 @@ impl ArunaS3Service {
         let Some(base) = urls.and_then(|urls| urls.s3) else {
             return Err(unreachable_error(
                 forward,
-                &node_reach(self.state.as_ref(), forward.node_id).hint(),
+                &node_reach(&self.state.heard(), forward.node_id).hint(),
             ));
         };
         let (payload, extra) = match &request.body {
@@ -551,7 +569,7 @@ impl ArunaS3Service {
         let refused = |error: &dyn std::fmt::Display| {
             s3_error!(InternalError, "Could not delegate the write: {error}")
         };
-        let signed = issue_delegation(self.state.as_ref(), input, unix_secs(SystemTime::now()))
+        let signed = issue_delegation(&self.state, input, unix_secs(SystemTime::now()))
             .map_err(|error| refused(&error))?;
         let delegation = signed.encode().map_err(|error| refused(&error))?;
         let nonce = signed.delegation.nonce;
@@ -584,7 +602,7 @@ impl ArunaS3Service {
                 );
                 return Err(unreachable_error(
                     forward,
-                    &node_reach(self.state.as_ref(), forward.node_id).hint(),
+                    &node_reach(&self.state.heard(), forward.node_id).hint(),
                 ));
             }
         };

@@ -22,7 +22,6 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::backend_import::intent_key;
 use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, VersionKey};
-use aruna_core::structs::storage::delete_audit::BlobAuditRecord;
 use aruna_core::structs::storage::format::EncodingClass;
 
 #[test]

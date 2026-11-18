@@ -15,7 +15,7 @@ use aruna_core::structs::placement::compute_config::{
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::driver::node_facts;
 use aruna_operations::node::info::flows::{GroupDemandOperation, OperatorDrainOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,
@@ -728,7 +728,7 @@ pub async fn set_compute_drain(
         auth.realm_id,
         state.get_node_id(),
         request.draining,
-        NodeFacts::gather(&context),
+        node_facts(&context),
     );
     let changed = drive(drain, context.as_ref())
         .await

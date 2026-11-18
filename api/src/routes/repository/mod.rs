@@ -120,7 +120,7 @@ pub async fn search_records(
     let context = state.get_ctx();
     let search = aruna_operations::jobs::repository::invenio::query::SearchRecordsOperation::new(
         kind,
-        aruna_operations::jobs::repository::NodeScope::of(&context),
+        context.node_scope(),
         auth.clone(),
         query,
         state.rocrate_limits().metadata_bytes,
@@ -273,7 +273,7 @@ pub async fn import_record(
     Json(request): Json<RepositoryImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
     use aruna_operations::jobs::repository::invenio::query::ResolveRecordOperation;
-    use aruna_operations::jobs::repository::{NodeScope, RecordReference, TransferError};
+    use aruna_operations::jobs::repository::{RecordReference, TransferError};
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),
@@ -305,7 +305,7 @@ pub async fn import_record(
             let context = state.get_ctx();
             let resolve = ResolveRecordOperation::new(
                 kind,
-                NodeScope::of(&context),
+                context.node_scope(),
                 caller,
                 group_id,
                 connector_id,

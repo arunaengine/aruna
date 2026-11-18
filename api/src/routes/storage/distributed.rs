@@ -699,9 +699,12 @@ pub async fn create_distributed(
     ensure_group_admin(&state, &auth, group_id).await?;
     let input = create_input(group_id, request)?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
-    let report = drive(create_set(&state.get_ctx(), &auth, bearer, input), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let report = drive(
+        create_set(state.get_ctx().here(), &auth, bearer, input),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok((StatusCode::CREATED, Json(admission_response(report))))
 }
 
@@ -742,9 +745,18 @@ pub async fn retry_admission(
     owned_status(&state, group_id, set_id).await?;
     let sizes = range_sizes(&state, bearer.as_ref(), set_id).await?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
-    let report = drive(admit_pending(&state.get_ctx(), &auth, bearer, (set_id, None), &sizes), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let report = drive(
+        admit_pending(
+            state.get_ctx().here(),
+            &auth,
+            bearer,
+            (set_id, None),
+            &sizes,
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok(Json(admission_response(report)))
 }
 
@@ -754,11 +766,14 @@ pub(crate) async fn owned_status(
     group_id: Ulid,
     set_id: Ulid,
 ) -> ServerResult<DistributionStatus> {
-    let status = drive(read_status(&state.get_ctx(), state.get_realm_id(), set_id), &state.get_ctx())
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .filter(|status| status.owner_group == group_id)
-        .ok_or(ServerError::NotFound)?;
+    let status = drive(
+        read_status(state.get_ctx().heard(), state.get_realm_id(), set_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .filter(|status| status.owner_group == group_id)
+    .ok_or(ServerError::NotFound)?;
     Ok(status)
 }
 
@@ -812,7 +827,16 @@ pub async fn get_distributed(
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
     let context = state.get_ctx();
-    if let Ok(progress) = drive(add_progress(&context, &status), &context).await {
+    if let Ok(progress) = drive(
+        add_progress(
+            context.node_id(),
+            context.storage_handle.range_indexes().is_some(),
+            &status,
+        ),
+        &context,
+    )
+    .await
+    {
         status = progress;
     }
     Ok(Json(status_response(status)))
@@ -866,7 +890,16 @@ pub async fn get_bucket_distribution(
     let binding = info.distribution.ok_or(ServerError::NotFound)?;
     let mut status = owned_status(&state, info.group_id, binding.set_id).await?;
     let context = state.get_ctx();
-    if let Ok(progress) = drive(add_progress(&context, &status), &context).await {
+    if let Ok(progress) = drive(
+        add_progress(
+            context.node_id(),
+            context.storage_handle.range_indexes().is_some(),
+            &status,
+        ),
+        &context,
+    )
+    .await
+    {
         status = progress;
     }
     Ok(Json(status_response(status)))

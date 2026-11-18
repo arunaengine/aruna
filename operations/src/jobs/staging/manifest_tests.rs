@@ -129,7 +129,7 @@ async fn manifest_read_authorized() {
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    crate::jobs::store::query::insert_job(&context, &record)
+    crate::jobs::store::test_calls::insert_job(&context, &record)
         .await
         .unwrap();
     let driver = DriverContext {

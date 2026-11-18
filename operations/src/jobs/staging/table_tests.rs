@@ -242,7 +242,7 @@ impl Fixture {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::query::insert_job(&self.driver, &record)
+        crate::jobs::store::test_calls::insert_job(&self.driver, &record)
             .await
             .unwrap();
         JobContext {
@@ -261,7 +261,7 @@ impl Fixture {
 
     async fn run(&self, seed: u8) -> (u64, u64) {
         let ctx = self.context(seed).await;
-        match crate::jobs::host::run_staging_job(&ctx, &self.spec).await {
+        match crate::tasks::job_host::run_staging_job(&ctx, &self.spec).await {
             JobRunOutcome::Succeeded(JobResultPayload::Staging {
                 completed_items,
                 failed_items,
@@ -576,7 +576,7 @@ async fn paused_job_stops() {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             stop.cancel();
         };
-        let run = crate::jobs::host::run_staging_job(&ctx, &fixture.spec);
+        let run = crate::tasks::job_host::run_staging_job(&ctx, &fixture.spec);
         let (outcome, ()) = tokio::join!(run, stopping);
         match cancel {
             true => assert!(matches!(outcome, JobRunOutcome::Cancelled)),
@@ -850,7 +850,7 @@ async fn record_pages_resume() {
         }
         stop.cancel();
     };
-    let run = crate::jobs::host::run_staging_job(&ctx, &specs[0]);
+    let run = crate::tasks::job_host::run_staging_job(&ctx, &specs[0]);
     let (outcome, ()) = tokio::join!(run, watch);
     assert!(matches!(outcome, JobRunOutcome::Interrupted));
     let resumed = JobContext {
@@ -860,8 +860,8 @@ async fn record_pages_resume() {
     let mut other = fixture.context_for(&specs[1], 51).await;
     other.range_turns = resumed.range_turns.clone();
     let (first, second) = tokio::join!(
-        crate::jobs::host::run_staging_job(&resumed, &specs[0]),
-        crate::jobs::host::run_staging_job(&other, &specs[1]),
+        crate::tasks::job_host::run_staging_job(&resumed, &specs[0]),
+        crate::tasks::job_host::run_staging_job(&other, &specs[1]),
     );
     let counts = |outcome| match outcome {
         JobRunOutcome::Succeeded(JobResultPayload::Staging {
@@ -1054,7 +1054,7 @@ async fn import_records(
     let started = std::time::Instant::now();
     // Each job runs as its own task, as on a node.
     let runs = runs.into_iter().map(|(job, spec)| {
-        tokio::spawn(async move { crate::jobs::host::run_staging_job(&job, &spec).await })
+        tokio::spawn(async move { crate::tasks::job_host::run_staging_job(&job, &spec).await })
     });
     let outcomes = futures_util::future::join_all(runs).await;
     let elapsed = started.elapsed().as_secs_f64();

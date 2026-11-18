@@ -20,8 +20,6 @@ use aruna_operations::jobs::lifecycle::outbox::timers::{
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::warmup::spawn_metadata_warmup;
 use aruna_operations::node::recovery_run::RecoveryConfig;
-use aruna_operations::plugin_host::repair::spawn_repair;
-use aruna_operations::plugin_host::worker::spawn_worker;
 use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
@@ -29,6 +27,8 @@ use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use crate::application::{Service, ServiceExit};
+use crate::plugin_host::repair::spawn_repair;
+use crate::plugin_host::worker::spawn_worker;
 use crate::startup::realm::CoreAnnouncement;
 use crate::startup::sweeps::{spawn_cutoff_sweep, spawn_session_sweep};
 use crate::startup::test_hooks;

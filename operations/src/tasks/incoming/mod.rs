@@ -52,9 +52,7 @@ use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenO
 use crate::blob::holders::RefreshHoldersOperation;
 use crate::blob::reclaim_sweep::{RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, ReclaimSweepOperation};
 use crate::blob::sweep_timer::ArmSweepOperation;
-use crate::device::drain::{
-    DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, restore_publish_timer,
-};
+use crate::device::drain::{DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
     UPLOAD_DEFER_AFTER,
@@ -65,17 +63,16 @@ use crate::driver::{DriverContext, drive, drive_retry};
 use crate::forward::realm::RelayAdminOperation;
 use crate::jobs::JOB_PRUNE_PAGE;
 use crate::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
-use crate::jobs::executor::PayloadHandler;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
 use crate::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
 use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
-use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation, witness_node};
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
 use crate::jobs::prune::{
     JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
 };
 use crate::jobs::runtime::JobsRuntime;
-use crate::jobs::store::state::release_job;
+use crate::jobs::store::job_calls;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, NEXT_BATCH_AFTER,
@@ -86,6 +83,8 @@ use crate::metadata::projection::{
     DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
     ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation, max_clock_skew,
 };
+use crate::tasks::job_context::PayloadHandler;
+use crate::tasks::job_node::witness_node;
 
 /// Replays the whole event log into the registry projection, one page at a time.
 async fn replay_event_log(
@@ -133,7 +132,7 @@ async fn restore_graph_prune(
         Err(error) => warn!(error = ?error, "Failed to scan metadata graph prune jobs"),
     }
 }
-use crate::node::info::facts::NodeFacts;
+use crate::driver::node_facts;
 use crate::node::info::flows::ObservePlacementOperation;
 use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
@@ -171,7 +170,7 @@ use crate::tasks::task_persistence::{
 use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
-use folder_pass::restore_sync_timers;
+use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 mod drained;
 pub mod folder_pass;
@@ -755,7 +754,7 @@ impl OperationsTaskHandler {
         }
         let fetched = drive(
             crate::device::realm_documents::fetch_realm_documents(
-                &self.context,
+                self.context.node_and_realm(),
                 REALM_DOCUMENTS_BUDGET,
             ),
             &self.context,
@@ -788,7 +787,7 @@ impl OperationsTaskHandler {
     /// Refreshes the metadata replicas this device keeps, on the same beat the
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
-        let pass = crate::device::refresh::refresh_replicas(&self.context);
+        let pass = crate::device::refresh::refresh_replicas(self.context.node_and_realm());
         if drive(pass, &self.context).await.unwrap_or(0) > 0 {
             let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
             if let Err(error) = drive(note, &self.context).await {
@@ -861,7 +860,7 @@ impl OperationsTaskHandler {
                     realm_id,
                     node_id,
                     unix_timestamp_millis(),
-                    NodeFacts::gather(&self.context),
+                    node_facts(&self.context),
                 );
                 if let Err(error) = drive(observe, &self.context).await {
                     warn!(error = %error, "Placement subject reconcile failed");
@@ -1044,13 +1043,25 @@ impl OperationsTaskHandler {
             TaskKey::MaintainRanges => Box::pin(async move {
                 use crate::distribution::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
-                let mut after = match crate::driver::drive(maintain_ranges(context), context).await
+                let mut after = match crate::driver::drive(
+                    maintain_ranges(
+                        context.node_and_realm(),
+                        &context.fresh_heartbeats(),
+                        context.here().capacity,
+                    ),
+                    context,
+                )
+                .await
                 {
                     Ok(pass) => {
                         let (after, imports) = pass.finish();
                         for start in imports {
-                            let started = crate::jobs::handed_imports::start_kept(context, start);
-                            if let Err(error) = started.await {
+                            let started = crate::jobs::handed_imports::StartKeptOperation::new(
+                                start,
+                                context.node_and_realm(),
+                                unix_timestamp_millis(),
+                            );
+                            if let Err(error) = crate::driver::drive(started, context).await {
                                 warn!(%error, "Handed over imports could not start");
                             }
                         }
@@ -1113,7 +1124,7 @@ impl OperationsTaskHandler {
                 self.refresh_device_replicas().await;
             }),
             TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let drain = crate::device::sync::drain_sync_outbox(&self.context);
+                let drain = crate::device::sync::drain_sync_outbox(self.context.node_and_realm());
                 let outcome = drive(drain, &self.context).await;
                 let after = match outcome.unwrap_or(DrainOutcome::Deferred) {
                     DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
@@ -1126,7 +1137,12 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::DrainDeviceIntake => Box::pin(async move {
-                let after = match crate::device::drain::drain_publish_queue(&self.context).await {
+                let drain =
+                    crate::device::drain::drain_publish_queue(self.context.node_and_realm());
+                let after = match drive(drain, &self.context)
+                    .await
+                    .unwrap_or(DrainOutcome::Deferred)
+                {
                     DrainOutcome::Deferred => Some(PUBLISH_DEFER_AFTER),
                     DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
                     DrainOutcome::Idle => None,

@@ -15,14 +15,34 @@ use url::Url;
 
 use super::ImportMode;
 use crate::UserId;
-use crate::metadata::MetadataValidationViolation;
+use crate::credential_encryption::CredentialEncryptionKey;
+use crate::id::NodeId;
 use crate::structs::checksum::Hasher;
 use crate::structs::execution::job::{ArtifactRef, RoCrateLimits};
 use crate::structs::execution::source_access::SourceMetadata;
-use crate::structs::identity::auth::{Actor, AuthContext};
+use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::BackendLocation;
-use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-use crate::types::GroupId;
+
+/// What an operation needs to know about this node; the caller reads it before the run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeScope {
+    pub node: Option<(NodeId, RealmId)>,
+    pub credential_key: Option<CredentialEncryptionKey>,
+    pub has_blob: bool,
+    pub has_tasks: bool,
+}
+
+impl NodeScope {
+    /// This node, or `fallback` on a node without a net transport.
+    pub fn node_or(&self, fallback: NodeId) -> NodeId {
+        self.node.map_or(fallback, |(node, _)| node)
+    }
+
+    /// The realm this node serves, or `fallback` on a node without a net transport.
+    pub fn realm_or(&self, fallback: RealmId) -> RealmId {
+        self.node.map_or(fallback, |(_, realm)| realm)
+    }
+}
 
 /// Why a running job must stop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,45 +330,4 @@ pub enum RemoteFailure {
     Permanent(String),
     #[error("{0}")]
     Retryable(String),
-}
-
-/// One metadata write of a harvest job, routed to the document's holders.
-#[derive(Clone, Debug, PartialEq)]
-pub enum HarvestWrite {
-    Create {
-        actor: Actor,
-        owner: AuthContext,
-        group_id: GroupId,
-        document_id: Ulid,
-        document_path: String,
-        jsonld: String,
-    },
-    Update {
-        actor: Actor,
-        owner: AuthContext,
-        record: Option<Box<MetadataRegistryRecord>>,
-        document_id: Ulid,
-        jsonld: String,
-    },
-    Delete {
-        actor: Actor,
-        owner: AuthContext,
-        record: Option<Box<MetadataRegistryRecord>>,
-        document_id: Ulid,
-    },
-}
-
-/// How a routed harvest write failed, sorted for the job's retry decision.
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
-pub enum HarvestWriteFailure {
-    #[error("document already exists")]
-    AlreadyExists,
-    #[error("metadata document not found")]
-    NotFound,
-    #[error("{0}")]
-    Retryable(String),
-    #[error("{0}")]
-    Permanent(String),
-    #[error("the record was rejected by validation")]
-    Rejected(Vec<MetadataValidationViolation>),
 }

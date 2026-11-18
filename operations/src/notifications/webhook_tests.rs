@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::query::find_dedup_plan;
+use crate::jobs::store::test_calls::find_dedup_plan;
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::tests::staging::setup_driver_context;
 use aruna_core::calls::ChildOutcome;

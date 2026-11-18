@@ -29,19 +29,19 @@ const DONE_PREFIX: &[u8] = b"d/";
 const PROGRESS_PREFIX: &[u8] = b"p/";
 
 /// The chunks an artifact of `total` bytes has.
-pub(crate) fn chunk_count(total: u64) -> u32 {
+pub fn chunk_count(total: u64) -> u32 {
     total.div_ceil(CHUNK as u64) as u32
 }
 
 /// The exact length of chunk `index` of an artifact of `total` bytes.
-pub(crate) fn chunk_len(total: u64, index: u32) -> u64 {
+pub fn chunk_len(total: u64, index: u32) -> u64 {
     total
         .saturating_sub(u64::from(index) * CHUNK as u64)
         .min(CHUNK as u64)
 }
 
 /// The `index`-th chunk of `bytes`, ready to send.
-pub(crate) fn chunk_of(digest: &str, bytes: &[u8], index: u32) -> Chunk {
+pub fn chunk_of(digest: &str, bytes: &[u8], index: u32) -> Chunk {
     Chunk {
         digest: digest.to_string(),
         index,
@@ -57,7 +57,7 @@ fn chunk_bytes(bytes: &[u8], index: u32) -> &[u8] {
 }
 
 /// Whether a chunk fits its artifact: a size within the limit, an index and the exact length.
-pub(crate) fn chunk_fits(chunk: &Chunk) -> bool {
+pub fn chunk_fits(chunk: &Chunk) -> bool {
     let sized = (1..=MAX_ARTIFACT as u64).contains(&chunk.total);
     let placed = chunk.index < chunk_count(chunk.total);
     sized && placed && chunk.bytes.0.len() as u64 == chunk_len(chunk.total, chunk.index)
@@ -272,10 +272,10 @@ impl Admission {
 
 /// The length of this node's complete copy of a digest, if it has one.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CopyTotal(String);
+pub struct CopyTotal(String);
 
 impl CopyTotal {
-    pub(crate) fn new(digest: &str) -> Self {
+    pub fn new(digest: &str) -> Self {
         Self(digest.to_string())
     }
 }
@@ -296,7 +296,7 @@ impl Operation for CopyTotal {
 
 /// Reads every chunk of a copy in order; a missing chunk or wrong length is a storage fault.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadCopy {
+pub struct ReadCopy {
     digest: String,
     total: u64,
     index: u32,
@@ -304,7 +304,7 @@ pub(crate) struct ReadCopy {
 }
 
 impl ReadCopy {
-    pub(crate) fn new(digest: &str, total: u64) -> Self {
+    pub fn new(digest: &str, total: u64) -> Self {
         Self {
             digest: digest.to_string(),
             total,
@@ -342,14 +342,14 @@ impl Operation for ReadCopy {
 
 /// One chunk of this node's complete copy and the copy's length.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadChunk {
+pub struct ReadChunk {
     digest: String,
     index: u32,
     total: Option<u64>,
 }
 
 impl ReadChunk {
-    pub(crate) fn new(digest: &str, index: u32) -> Self {
+    pub fn new(digest: &str, index: u32) -> Self {
         Self {
             digest: digest.to_string(),
             index,
@@ -385,7 +385,7 @@ impl Operation for ReadChunk {
 /// Writes the done row and drops the progress row in one transaction, then syncs: only then may
 /// a copy count. A crash leaves either the unfinished copy or the complete one.
 #[derive(Debug, PartialEq)]
-pub(crate) struct FinishCopy {
+pub struct FinishCopy {
     digest: String,
     total: u64,
     now_ms: u64,
@@ -453,12 +453,7 @@ pub struct StoreCopy<'a> {
 }
 
 impl<'a> StoreCopy<'a> {
-    pub(crate) fn new(
-        config: &RealmConfigDocument,
-        digest: &str,
-        bytes: &'a [u8],
-        now_ms: u64,
-    ) -> Self {
+    pub fn new(config: &RealmConfigDocument, digest: &str, bytes: &'a [u8], now_ms: u64) -> Self {
         Self {
             kept: kept_digests(config),
             digest: digest.to_string(),
@@ -541,7 +536,7 @@ impl Operation for StoreCopy<'_> {
 
 /// What keeping one chunk left behind.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ChunkStored {
+pub enum ChunkStored {
     /// More chunks are missing.
     Held,
     /// Every chunk is here; the whole copy still has to be checked.
@@ -562,7 +557,7 @@ enum ChunkPhase {
 /// Keeps one chunk of a copy another management node sends. A resend to a done copy restarts its
 /// retention before it is acknowledged.
 #[derive(Debug, PartialEq)]
-pub(crate) struct StoreChunk {
+pub struct StoreChunk {
     kept: BTreeSet<String>,
     chunk: Chunk,
     now_ms: u64,
@@ -570,7 +565,7 @@ pub(crate) struct StoreChunk {
 }
 
 impl StoreChunk {
-    pub(crate) fn new(config: &RealmConfigDocument, chunk: Chunk, now_ms: u64) -> Self {
+    pub fn new(config: &RealmConfigDocument, chunk: Chunk, now_ms: u64) -> Self {
         Self {
             kept: kept_digests(config),
             chunk,
@@ -667,7 +662,7 @@ impl Operation for StoreChunk {
 
 /// Checks a copy whose chunks all arrived against its digest and as a plugin, then completes it.
 #[derive(Debug, PartialEq)]
-pub(crate) struct CompleteCopy {
+pub struct CompleteCopy {
     digest: String,
     total: u64,
     now_ms: u64,
@@ -675,7 +670,7 @@ pub(crate) struct CompleteCopy {
 }
 
 impl CompleteCopy {
-    pub(crate) fn new(digest: String, total: u64, now_ms: u64) -> Self {
+    pub fn new(digest: String, total: u64, now_ms: u64) -> Self {
         Self {
             digest,
             total,
@@ -721,7 +716,7 @@ enum SweepPhase {
 /// Published and pinned copies stay, and a stale progress row next to a done row only loses
 /// itself. Answers how many copies it deleted.
 #[derive(Debug, PartialEq)]
-pub(crate) struct SweepCopies {
+pub struct SweepCopies {
     kept: BTreeSet<String>,
     now_ms: u64,
     deletes: VecDeque<Vec<Vec<u8>>>,
@@ -730,7 +725,7 @@ pub(crate) struct SweepCopies {
 }
 
 impl SweepCopies {
-    pub(crate) fn new(config: &RealmConfigDocument, now_ms: u64) -> Self {
+    pub fn new(config: &RealmConfigDocument, now_ms: u64) -> Self {
         Self {
             kept: kept_digests(config),
             now_ms,
@@ -824,7 +819,7 @@ impl Operation for SweepCopies {
 
 /// This node's complete copy within the memory budget, or `None` without one.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ReadLocal {
+pub struct ReadLocal {
     digest: String,
     memory: Option<HeldMemory>,
 }
@@ -851,7 +846,7 @@ fn held_memory(total: u64) -> Result<HeldMemory, ArtifactError> {
 }
 
 impl ReadLocal {
-    pub(crate) fn new(digest: &str) -> Self {
+    pub fn new(digest: &str) -> Self {
         Self {
             digest: digest.to_string(),
             memory: None,
@@ -886,7 +881,7 @@ impl Operation for ReadLocal {
 /// Keeps one chunk of a copy another management node sends. Once every chunk is here and the
 /// whole artifact checks out, the copy is done; `true` means it is done and synced now.
 #[derive(Debug, PartialEq)]
-pub(crate) struct KeepChunk {
+pub struct KeepChunk {
     store: Option<StoreChunk>,
     digest: String,
     total: u64,
@@ -896,7 +891,7 @@ pub(crate) struct KeepChunk {
 }
 
 impl KeepChunk {
-    pub(crate) fn new(config: &RealmConfigDocument, chunk: Chunk, now_ms: u64) -> Self {
+    pub fn new(config: &RealmConfigDocument, chunk: Chunk, now_ms: u64) -> Self {
         Self {
             digest: chunk.digest.clone(),
             total: chunk.total,

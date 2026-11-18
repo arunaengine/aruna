@@ -70,6 +70,8 @@ pub enum Effect {
     Compute(Box<crate::compute::effect::ComputeEffect>),
     /// A request to the host of a running job; never persisted.
     Job(crate::jobs::JobEffect),
+    /// One call to this node's Git store; never persisted.
+    Git(Box<crate::git::GitCall>),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at
@@ -850,18 +852,9 @@ pub enum NetEffect {
     /// Signs this node's statement that it is ready for a group deletion plan; answers
     /// `NetEvent::DeletePlanSigned`.
     SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),
-    /// Checks a forwarded caller's credential and that the sending peer is a realm member;
-    /// answers `NetEvent::WritePeerChecked`.
-    AuthorizeWritePeer {
-        peer: NodeId,
-        auth_token: Option<Box<crate::metadata::AuthToken>>,
-    },
     /// Verifies a token that may already be revoked and reads its claims; answers
     /// `NetEvent::RevocationClaims`.
     RevocationClaims(Box<crate::metadata::AuthToken>),
-    /// Routes one harvest metadata write to the document's holders; answers
-    /// `NetEvent::HarvestWrite`.
-    HarvestWrite(Box<crate::repository::remote::HarvestWrite>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
@@ -923,7 +916,7 @@ pub enum ShardNetEffect {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,
     },
-    /// Pulls these topics from peers and applies what arrived.
+    /// Fetches these topics from peers; the caller reconciles and applies what arrived.
     Pull {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,

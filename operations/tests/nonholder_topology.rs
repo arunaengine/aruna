@@ -6,6 +6,7 @@ use crate::topology;
 use aruna_operations::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
 use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 
+use crate::job_calls::find_dedup_job;
 use crate::job_calls::{JobClassBudget, drain_job_batch};
 use crate::job_calls::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, read_record_routed,
@@ -33,32 +34,30 @@ use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
 use aruna_operations::jobs::lifecycle::ids::{SubmissionScope, submission_of};
-use aruna_operations::jobs::lifecycle::ingress::ingress_node;
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::query::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
 use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use aruna_operations::metadata::api::read::query_metadata_document;
 use aruna_operations::metadata::api::read_types::{ApiQueryMode, DocumentQueryRequest};
 use aruna_operations::metadata::create_document::{
     CreateDocumentOperation, CreateDocumentPayload, mint_forward_document, mint_local_document,
     resolve_metadata_id,
 };
 use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
-use aruna_operations::metadata::forward::write::{
-    create_with_id, route_metadata_delete, route_metadata_update,
-};
+use crate::metadata_calls::{create_with_id, route_metadata_delete};
+use crate::metadata_calls::route_metadata_update;
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
+use aruna_operations::tasks::job_node::ingress_node;
 use std::cell::RefCell;
 use ulid::Ulid;
 
@@ -1079,20 +1078,16 @@ async fn document_sparql_routes() -> TestResult<()> {
     )
     .await?;
 
-    let execution = query_metadata_document(
-        bystander.context.as_ref(),
-        realm.realm_id,
-        bystander.node_id(),
-        DocumentQueryRequest {
-            document_id,
-            auth: None,
-            bearer_token: Some(realm.bearer_string()),
-            query: "ASK { ?s ?p ?o }".to_string(),
-            mode: Some(ApiQueryMode::Distributed),
-            allow_partial: false,
-        },
-    )
-    .await?;
+    let request = DocumentQueryRequest {
+        document_id,
+        auth: None,
+        bearer_token: Some(realm.bearer_string()),
+        query: "ASK { ?s ?p ?o }".to_string(),
+        mode: Some(ApiQueryMode::Distributed),
+        allow_partial: false,
+    };
+    let query = DocumentQueryOperation::new(realm.realm_id, bystander.node_id(), request);
+    let execution = drive(query, bystander.context.as_ref()).await?;
     assert!(
         matches!(execution.results, MetadataQueryResults::Boolean(true)),
         "non-holder query did not route to a holder graph"

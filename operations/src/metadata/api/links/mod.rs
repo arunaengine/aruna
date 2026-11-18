@@ -6,225 +6,28 @@
 // Every metadata node answers from its own postings within one budget; results merge by
 // document id and say whether they are complete.
 
+pub mod local;
 pub mod types;
 
+use self::local::{LinksLocalOperation, SetPreviewOperation};
+
 use self::types::{
-    LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
-    PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, merge_pages, merge_previews,
+    LINKS_MAX_LIMIT, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery, PART_OF_LIMIT, PartOf,
+    PartTarget, SetPreview, SetPreviewPage, merge_pages, merge_previews,
 };
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
-
-use aruna_core::structs::storage::data::link::LinkPosting;
 use aruna_core::types::GroupId;
 
 use super::fanout::run_metadata_fanout;
-use super::preflight::reference_document_title;
-use super::read::{can_read_record, load_live_record};
 use super::{
-    ApiQueryMode, AuthContext, BTreeMap, Event, MetadataApiError, MetadataFanoutOperation,
+    ApiQueryMode, AuthContext, Event, MetadataApiError, MetadataFanoutOperation,
     MetadataFanoutScope, MetadataNodeCall, MetadataReadError, NodeId, RealmId, Span, StorageEffect,
     StorageEvent, Ulid, fanout_bearer, map_read_error, metadata_node_call,
 };
 use crate::driver::DriverContext;
-use crate::metadata::data_links::{
-    LinkBudget, key_prefixes, read_postings, set_postings, truncated_documents,
-    unsettled_documents, unverified_versions,
-};
 use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-
-const NODE_SEEKS: usize = 1100;
-const NODE_ROWS: usize = 4096;
-const UNSETTLED_CAP: usize = 1024;
-
-/// Answers a link lookup from this node's postings within one shared budget.
-pub async fn links_local(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth: Option<&AuthContext>,
-    request: LinkNodeRequest,
-) -> Result<LinkNodePage, MetadataApiError> {
-    let internal = |error: crate::metadata::data_links::DataLinkError| {
-        MetadataApiError::Internal(error.to_string())
-    };
-    let storage = &context.storage_handle;
-    let limit = request.limit.clamp(1, LINKS_MAX_LIMIT);
-    let mut budget = LinkBudget {
-        seeks: NODE_SEEKS,
-        rows: NODE_ROWS,
-    };
-    let mut page = LinkNodePage::default();
-    let mut links = Vec::new();
-    for query in request.queries {
-        match query {
-            LinkQuery::Exact(link) => links.push(link),
-            LinkQuery::KeyPrefixes { scope, key } => {
-                let (found, complete) = key_prefixes(storage, &scope, &key, &mut budget)
-                    .await
-                    .map_err(internal)?;
-                page.cut |= !complete;
-                links.extend(found);
-            }
-        }
-    }
-    let mut matches = BTreeMap::<Ulid, Vec<(DataLink, LinkPosting)>>::new();
-    // Each identifier is read up to its last returned document; beyond the smallest such end
-    // another identifier may still hold unread documents.
-    let mut end: Option<Ulid> = None;
-    for link in links {
-        let (postings, more) =
-            read_postings(storage, &link.key(), request.after, limit, &mut budget)
-                .await
-                .map_err(internal)?;
-        if more {
-            match postings.last() {
-                Some((last, _)) => end = Some(end.map_or(*last, |end| end.min(*last))),
-                None => page.cut = true,
-            }
-        }
-        for (document_id, posting) in postings {
-            if request.parts_only && !posting.part {
-                continue;
-            }
-            matches
-                .entry(document_id)
-                .or_default()
-                .push((link.clone(), posting));
-        }
-    }
-    page.cut |= budget.exhausted();
-    if let Some((nth, _)) = matches.iter().nth(limit - 1)
-        && matches.len() > limit
-    {
-        end = Some(end.map_or(*nth, |end| end.min(*nth)));
-    }
-    page.next = end;
-    let documents: BTreeMap<_, _> = match end {
-        Some(end) => matches.into_iter().filter(|(id, _)| *id <= end).collect(),
-        None => matches,
-    };
-    let confirm = request.confirm;
-    describe(context, (realm_id, auth, confirm), documents, &mut page).await?;
-    let (pending, failed) = unsettled_documents(storage, UNSETTLED_CAP)
-        .await
-        .map_err(internal)?;
-    page.pending_materializations = pending;
-    page.failed_materializations = failed;
-    page.truncated_documents = truncated_documents(storage, UNSETTLED_CAP)
-        .await
-        .map_err(internal)?;
-    Ok(page)
-}
-
-/// Adds the readable documents of `matches` to `page`: postings of an older document event
-/// are dropped, unreadable documents only set `hidden`, and `confirmed` for `confirm`.
-async fn describe(
-    context: &DriverContext,
-    (realm_id, auth, confirm): (RealmId, Option<&AuthContext>, Option<Ulid>),
-    matches: BTreeMap<Ulid, Vec<(DataLink, LinkPosting)>>,
-    page: &mut LinkNodePage,
-) -> Result<(), MetadataApiError> {
-    for (document_id, postings) in matches {
-        let record = match load_live_record(context, document_id).await {
-            Ok(record) => record,
-            Err(MetadataApiError::NotFound) => continue,
-            Err(error) => return Err(error),
-        };
-        let current: Vec<_> = postings
-            .into_iter()
-            .filter(|(_, posting)| posting.cursor == record.last_event_id)
-            .collect();
-        if current.is_empty() {
-            continue;
-        }
-        if !can_read_record(context, realm_id, auth, &record).await? {
-            page.hidden = true;
-            page.confirmed |= confirm == Some(document_id);
-            continue;
-        }
-        page.documents.push(LinkDocument {
-            document_id,
-            group_id: record.group_id.to_string(),
-            document_path: record.document_path.clone(),
-            graph_iri: record.graph_iri.clone(),
-            title: reference_document_title(context, &record).await,
-            links: current
-                .into_iter()
-                .map(|(link, posting)| LinkHit {
-                    id: link.to_id(),
-                    part: posting.part,
-                    subject_iris: posting.subjects,
-                })
-                .collect(),
-        });
-    }
-    Ok(())
-}
-
-/// Reads one page of the postings that name `set_id` on this node.
-pub async fn set_preview_local(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth: Option<&AuthContext>,
-    set_id: Ulid,
-    after: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<SetPreviewPage, MetadataApiError> {
-    let internal = |error: crate::metadata::data_links::DataLinkError| {
-        MetadataApiError::Internal(error.to_string())
-    };
-    let storage = &context.storage_handle;
-    let scope = LinkScope::Set { realm_id, set_id };
-    let limit = limit.clamp(1, LINKS_MAX_LIMIT);
-    let (rows, next) = set_postings(storage, &scope, set_id, after, limit)
-        .await
-        .map_err(internal)?;
-    let mut matches = BTreeMap::<Ulid, Vec<(DataLink, LinkPosting)>>::new();
-    let scope_key = scope.key();
-    for (key, document_id, posting) in rows {
-        let length = key
-            .starts_with(&scope_key)
-            .then(|| scope.length_of(&key))
-            .flatten();
-        let link = match length {
-            Some(length) => {
-                let start = scope_key.len() + 2;
-                let prefix = key
-                    .get(start..start + usize::from(length))
-                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                    .unwrap_or_default();
-                scope.link(&prefix)
-            }
-            None => DataLink::SetVersion {
-                realm_id,
-                set_id,
-                version_id: version_of(&key).unwrap_or_default(),
-            },
-        };
-        matches
-            .entry(document_id)
-            .or_default()
-            .push((link, posting));
-    }
-    let mut preview = SetPreviewPage {
-        next,
-        ..SetPreviewPage::default()
-    };
-    describe(context, (realm_id, auth, None), matches, &mut preview.page).await?;
-    preview.unverified = unverified_versions(storage, UNSETTLED_CAP)
-        .await
-        .map_err(internal)?;
-    let (pending, failed) = unsettled_documents(storage, UNSETTLED_CAP)
-        .await
-        .map_err(internal)?;
-    preview.page.pending_materializations = pending;
-    preview.page.failed_materializations = failed;
-    preview.page.truncated_documents = truncated_documents(storage, UNSETTLED_CAP)
-        .await
-        .map_err(internal)?;
-    Ok(preview)
-}
 
 /// Asks every metadata node for its first page of the documents that link `set_id`.
 pub async fn set_preview_distributed(
@@ -242,7 +45,8 @@ pub async fn set_preview_distributed(
     let local_call: MetadataNodeCall<SetPreviewPage> = metadata_node_call(
         (context.clone(), auth, realm_id),
         move |(context, auth, realm_id), _| async move {
-            set_preview_local(&context, realm_id, auth.as_ref(), set_id, None, limit)
+            let preview = SetPreviewOperation::new((realm_id, auth), set_id, None, limit);
+            crate::driver::drive(preview, &context)
                 .await
                 .map_err(crate::forward::transport::read_error)
         },
@@ -284,13 +88,6 @@ fn record_preview_result(span: &Span, result: &Result<SetPreviewPage, MetadataRe
     span.record("result", outcome);
 }
 
-/// The version id of a set-version posting key: the 16 bytes before the document.
-fn version_of(key: &[u8]) -> Option<Ulid> {
-    let end = key.len().checked_sub(16)?;
-    let bytes: [u8; 16] = key.get(end.checked_sub(16)?..end)?.try_into().ok()?;
-    Some(Ulid::from_bytes(bytes))
-}
-
 /// Asks every metadata node and merges their pages by document id.
 pub async fn links_distributed(
     context: &DriverContext,
@@ -308,7 +105,8 @@ pub async fn links_distributed(
     let local_call: MetadataNodeCall<LinkNodePage> = metadata_node_call(
         (context.clone(), auth, realm_id, request.clone()),
         |(context, auth, realm_id, request), _| async move {
-            links_local(&context, realm_id, auth.as_ref(), request)
+            let links = LinksLocalOperation::new(realm_id, auth, request);
+            crate::driver::drive(links, &context)
                 .await
                 .map_err(crate::forward::transport::read_error)
         },

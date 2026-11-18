@@ -12,7 +12,6 @@ use aruna_core::plugin_runs::HookRequest;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::plugin_host::read_config;
 use aruna_operations::plugins::dispatch::{HookAuthorization, VerifyHook};
 use aruna_operations::plugins::hooks::{AdmitHook, HookError};
 use axum::body::{Body, Bytes};
@@ -26,6 +25,7 @@ use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError};
 use crate::routes::management_relay::{RELAY_HOP_HEADER, passed_hops};
+use crate::routes::plugin_installs::read_config;
 use crate::routes::storage::relay::{capped_body, relay_url};
 use crate::server::state::ServerState;
 

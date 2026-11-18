@@ -14,7 +14,7 @@ use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConf
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::attempt::put_crate_outcome;
+use crate::jobs::store::test_calls::put_crate_outcome;
 
 async fn read_run(
     context: &DriverContext,
@@ -35,7 +35,11 @@ fn link(created_by: UserId, run_crate: Option<Ulid>) -> RunLink {
     }
 }
 
-fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
     IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
 }
 

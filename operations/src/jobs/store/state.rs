@@ -8,7 +8,6 @@ pub use super::job_calls::{
     ClaimOutcome, ExecutionCompleteOutcome, ReleaseOutcome, RenewOutcome, RequeueOutcome,
 };
 use super::row_calls;
-pub(crate) use super::row_calls::artifact_tombstone_key;
 use super::*;
 
 /// Read a job record, retaining malformed rows for offline recovery.
@@ -22,30 +21,6 @@ pub async fn read_job_record(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn preserve_artifact_tombstone(
-    context: &DriverContext,
-    job_id: JobId,
-    owner: UserId,
-    expires_at_ms: u64,
-) -> Result<(), String> {
-    drive(
-        row_calls::preserve_artifact_tombstone(job_id, owner, expires_at_ms),
-        context,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-pub(crate) async fn read_artifact_tombstone(
-    context: &DriverContext,
-    job_id: JobId,
-    now_ms: u64,
-) -> Result<Option<UserId>, String> {
-    drive(row_calls::read_artifact_tombstone(job_id, now_ms), context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 /// Claim a queued job, or cancel it directly if it never ran and is cancel-requested.
 pub async fn claim_job(
     context: &DriverContext,
@@ -55,19 +30,6 @@ pub async fn claim_job(
 ) -> Result<ClaimOutcome, JobMutationError> {
     drive(
         job_calls::claim_job(job_id, holder_node_id, now_ms),
-        context,
-    )
-    .await
-}
-
-pub async fn transition_to_running(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    drive(
-        job_calls::transition_to_running(job_id, token, now_ms),
         context,
     )
     .await
@@ -141,89 +103,6 @@ pub async fn complete_execution(
     .await
 }
 
-/// Complete an execution that finished successfully after cancellation was
-/// requested. It carries the same durable-output invariant as an ordinary
-/// success, because it publishes the same terminal result.
-pub async fn complete_cancelled(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    result: JobResultPayload,
-    final_progress: JobProgress,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    drive(
-        job_calls::complete_cancelled(
-            job_id,
-            token,
-            RunSuccess {
-                result,
-                progress: final_progress,
-                now_ms,
-            },
-        ),
-        context,
-    )
-    .await
-}
-
-/// The signed output record the attempt already stored, if any. It shares the
-/// attempt-control key, so pruning the job removes both.
-pub async fn read_output_record(
-    context: &DriverContext,
-    job_id: JobId,
-    attempt_epoch: u64,
-) -> Result<Option<JobRecordEnvelope>, JobMutationError> {
-    drive(
-        row_calls::read_output_record(job_id, attempt_epoch),
-        context,
-    )
-    .await
-}
-
-/// Make this execution's signed output record durable and name its digest on
-/// the attempt control in one transaction, so terminal success can never
-/// observe the digest without the record it names.
-pub async fn persist_output_record(
-    context: &DriverContext,
-    job_id: JobId,
-    control: &AttemptControl,
-    digest: [u8; 32],
-    envelope: Vec<u8>,
-) -> Result<(), JobMutationError> {
-    drive(
-        job_calls::persist_output_record(job_id, control, digest, envelope),
-        context,
-    )
-    .await
-}
-
-pub async fn fail_job(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    error: JobError,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    drive(job_calls::fail_job(job_id, token, error, now_ms), context).await
-}
-
-/// Ends the attempts of a job whose outcome cannot be known: `Indeterminate` and locally
-/// exhausted, so nothing tries it again here and nothing claims it failed.
-pub async fn exhaust_job(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    error: JobError,
-    now_ms: u64,
-) -> Result<JobRecord, JobMutationError> {
-    drive(
-        job_calls::exhaust_job(job_id, token, error, now_ms),
-        context,
-    )
-    .await
-}
-
 pub async fn cancel_running_job(
     context: &DriverContext,
     job_id: JobId,
@@ -255,22 +134,6 @@ pub async fn requeue_job(
     .await
 }
 
-/// Re-queue after a transient failure of an execution that advanced a durable checkpoint:
-/// attempts count consecutive failures without progress, so this one starts a new count.
-pub async fn requeue_progressed(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    now_ms: u64,
-    error: JobError,
-) -> Result<RequeueOutcome, JobMutationError> {
-    drive(
-        job_calls::requeue_progressed(job_id, token, now_ms, error),
-        context,
-    )
-    .await
-}
-
 /// Hand a lease back without spending an attempt: clear the claim, re-queue, make it
 /// due now. Guarded by `token`, so a job another node already took over is left alone.
 /// Distinct from `requeue_job`, whose attempt increment is unconditional.
@@ -281,24 +144,6 @@ pub async fn release_job(
     now_ms: u64,
 ) -> Result<ReleaseOutcome, JobMutationError> {
     drive(job_calls::release_job(job_id, token, now_ms), context).await
-}
-
-/// Requeue a dependency-blocked job without spending an attempt. Unlike a
-/// shutdown release, this records the reason and delays the next claim so a
-/// lagging projection is not hot-polled.
-pub async fn defer_job(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    now_ms: u64,
-    retry_after_ms: u64,
-    error: JobError,
-) -> Result<ReleaseOutcome, JobMutationError> {
-    drive(
-        job_calls::defer_job(job_id, token, now_ms, retry_after_ms, error),
-        context,
-    )
-    .await
 }
 
 /// Hand an external execution to reconciliation without re-queuing it.
