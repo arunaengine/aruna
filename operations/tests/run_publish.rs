@@ -24,7 +24,7 @@ use aruna_operations::device::publish_run::{
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::prune::prune_job_batch;
+use crate::job_calls::prune_job_batch;
 use aruna_operations::jobs::store::attempt::{put_crate_status, read_crate_status, read_run_link};
 use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::read_job_record;
@@ -448,7 +448,7 @@ async fn crate_redrive_links() -> TestResult<()> {
     assert_eq!((link.group_id, link.created_by), (group_id, realm.user_id));
 
     // The node prunes on its own schedule; a run inside its retention survives a pass.
-    prune_job_batch(server.context.as_ref(), &[]).await?;
+    prune_job_batch(server.context.as_ref()).await?;
     put_crate_status(
         &server.context,
         job_id,

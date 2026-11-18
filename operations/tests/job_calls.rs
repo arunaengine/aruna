@@ -2,18 +2,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::UserId;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::JOB_PRUNE_PAGE;
+pub use aruna_operations::jobs::drain::JobClassBudget;
+use aruna_operations::jobs::drain::{DrainError, DrainJobsOperation, JobDrainResult};
 pub use aruna_operations::jobs::job_cancel::RoutedCancelOutcome;
 use aruna_operations::jobs::job_cancel::{CancelOwnedOperation, RoutedCancelOperation};
 use aruna_operations::jobs::job_reads::OwnedJobOperation;
 pub use aruna_operations::jobs::job_reports::JobReportLookup;
 use aruna_operations::jobs::job_reports::{ReportQuery, ReportRouteOperation};
 use aruna_operations::jobs::job_routes::{RecordRouteOperation, StatusRouteOperation};
+use aruna_operations::jobs::prune::{JobPruneOutcome, PruneJobsOperation};
 use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
 use aruna_operations::jobs::runtime::JobsRuntime;
 
@@ -100,4 +107,20 @@ pub async fn cancel_job_routed(
         runtime.request_cancel(running);
     }
     Ok(report.outcome)
+}
+
+pub async fn drain_job_batch(
+    context: &DriverContext,
+    owner: NodeId,
+    budget: JobClassBudget,
+    _reconciler: Option<()>,
+) -> Result<JobDrainResult, DrainError> {
+    let drain = DrainJobsOperation::new(owner, budget, unix_timestamp_millis());
+    drive(drain, context).await
+}
+
+/// One prune pass with nothing kept back by a payload handler.
+pub async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome, String> {
+    let prune = PruneJobsOperation::new(unix_timestamp_millis(), JOB_PRUNE_PAGE, BTreeSet::new());
+    drive(prune, context).await.map_err(|error| error.0)
 }

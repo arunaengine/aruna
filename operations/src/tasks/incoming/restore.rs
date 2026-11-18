@@ -55,8 +55,8 @@ async fn durable_rearm_loop(
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
         crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
         restore_notification_prune(&context, &task_handle).await;
-        restore_drain_timer(&context, &task_handle).await;
-        restore_prune_timer(&context, &task_handle).await;
+        arm_drain_timer(&context).await;
+        arm_prune_timer(&context).await;
         restore_mirror_timer(&context).await;
         crate::jobs::repository::link_queue::restore_link_timer(&context, &task_handle).await;
     }
@@ -325,7 +325,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_prune_timer(&context, &task_handle).await;
+        arm_prune_timer(&context).await;
         if stopped() {
             return;
         }
@@ -660,7 +660,10 @@ impl OperationsTaskHandler {
     /// reservation row keeps the obligation durable, so the retry re-arms until
     /// every one of them is published and its capacity released.
     pub(super) async fn settle_job_terminals(&self) {
-        let pending = match settle_terminals(self.context.as_ref()).await {
+        let context = self.context.as_ref();
+        let settle =
+            SettleTerminalsOperation::new(context.node_and_realm(), unix_timestamp_millis());
+        let pending = match drive(settle, context).await {
             Ok(pending) => pending,
             Err(error) => {
                 warn!(task_id = ?TaskKey::SettleJobTerminals, error = %error, "Failed to settle terminal job publications");
@@ -720,15 +723,8 @@ impl OperationsTaskHandler {
                 .available_slots_for(JobExecutionClass::ExternalAttempt),
         };
 
-        let reconciler = self.jobs_runtime.reconciler();
-        let result = match drain_job_batch(
-            &self.context,
-            owner_node_id,
-            budget,
-            reconciler.as_ref(),
-        )
-        .await
-        {
+        let drain = DrainJobsOperation::new(owner_node_id, budget, unix_timestamp_millis());
+        let mut result = match drive(drain, self.context.as_ref()).await {
             Ok(result) => result,
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to drain job queue");
@@ -737,6 +733,15 @@ impl OperationsTaskHandler {
                 return;
             }
         };
+
+        // A node without a reconciler leaves the attempt alone: it cannot observe the container.
+        if let Some(reconciler) = self.jobs_runtime.reconciler() {
+            for record in std::mem::take(&mut result.lost_attempts) {
+                reconciler
+                    .reconcile_lost_attempt(self.context.as_ref(), record)
+                    .await;
+            }
+        }
 
         for record in result.claimed {
             if self
@@ -783,7 +788,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn prune_jobs(&self) {
         let handlers = self.jobs_runtime.handlers();
-        let after = match prune_job_batch(&self.context, &handlers).await {
+        let after = match prune_job_page(&self.context, &handlers).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after
@@ -1034,5 +1039,40 @@ async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle
             .await
     {
         warn!(message = %message, "Failed to restore node usage publish timer");
+    }
+}
+
+/// One prune pass; the payload handlers decide first which due jobs stay for now.
+async fn prune_job_page(
+    context: &DriverContext,
+    handlers: &[Arc<dyn PayloadHandler>],
+) -> Result<JobPruneOutcome, String> {
+    let now_ms = unix_timestamp_millis();
+    let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
+        .await
+        .map_err(|error| error.0)?;
+    let mut kept = BTreeSet::new();
+    for (job_id, payload) in due {
+        for handler in handlers {
+            if handler.keeps_job(context, &payload).await? {
+                kept.insert(job_id);
+            }
+        }
+    }
+    let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
+    drive(prune, context).await.map_err(|error| error.0)
+}
+
+async fn arm_drain_timer(context: &DriverContext) {
+    let timer = DrainTimerOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(timer, context).await {
+        warn!(error = %error, "Failed to restore job drain timer");
+    }
+}
+
+async fn arm_prune_timer(context: &DriverContext) {
+    let timer = PruneTimerOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(timer, context).await {
+        warn!(error = %error, "Failed to restore job prune timer");
     }
 }

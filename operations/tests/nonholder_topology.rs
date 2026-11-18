@@ -27,7 +27,7 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
+use crate::job_calls::{JobClassBudget, drain_job_batch};
 use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
 use aruna_operations::jobs::lifecycle::ids::{SubmissionScope, submission_of};
 use aruna_operations::jobs::lifecycle::ingress::ingress_node;

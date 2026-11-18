@@ -10,8 +10,9 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::task::TaskEvent;
 use aruna_operations::distribution::index_feed::spawn_index_feed;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::drain::restore_drain_timer;
+use aruna_operations::jobs::drain::DrainTimerOperation;
 use aruna_operations::jobs::lifecycle::outbox::timers::{
     LifecycleTimersOperation, lifecycle_timers,
 };
@@ -198,7 +199,10 @@ pub(crate) async fn start(
                     .await;
             }
             StartupPhase::RestoreDrainTimer => {
-                restore_drain_timer(&driver_ctx, &task_handle).await;
+                let timer = DrainTimerOperation::new(unix_timestamp_millis());
+                if let Err(error) = drive(timer, &driver_ctx).await {
+                    warn!(error = %error, "Failed to restore job drain timer");
+                }
             }
             StartupPhase::RestoreLifecycleTimers => {
                 let timers = drive(LifecycleTimersOperation, &driver_ctx)

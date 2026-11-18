@@ -261,7 +261,7 @@ async fn summary_follows_job() {
 #[tokio::test]
 async fn settles_before_pruning() {
     // A finished job's row keeps its summary; until then the job record is held.
-    use crate::jobs::prune::prune_job_batch;
+    use crate::jobs::prune::tests::prune_job_batch;
     use crate::jobs::store::query::insert_job;
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
@@ -330,7 +330,7 @@ async fn settles_before_pruning() {
 async fn prunes_settled_rows() {
     // A settled row goes once it aged and its run is pruned, since no rerun can ask for it; until
     // then it answers its paths, also after its job record was pruned.
-    use crate::jobs::prune::prune_job_batch;
+    use crate::jobs::prune::tests::prune_job_batch;
     use crate::jobs::store::query::insert_job;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     let fixture = Fixture::new().await;
