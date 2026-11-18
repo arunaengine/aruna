@@ -271,6 +271,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         )),
         NetEffect::WakeInbox(_)
         | NetEffect::Heartbeat(_)
+        | NetEffect::HeartbeatSilence(_)
         | NetEffect::DashboardChanged
         | NetEffect::RecordSuppression(_)
         | NetEffect::RegisterInterest { .. }
@@ -617,6 +618,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",
+        NetEffect::HeartbeatSilence(_) => "heartbeat_silence",
         NetEffect::DashboardChanged => "dashboard_changed",
         NetEffect::RecordSuppression(_) => "record_suppression",
         NetEffect::RegisterInterest { .. } => "register_interest",

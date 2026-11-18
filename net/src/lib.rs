@@ -1075,6 +1075,14 @@ impl Handle for NetHandle {
             Effect::Net(NetEffect::JobControl(job)) => Event::Net(NetEvent::JobControl(
                 job_control::exchange(self, job.owner, job.request).await,
             )),
+            // The heartbeat table belongs to this handle.
+            Effect::Net(NetEffect::HeartbeatSilence(nodes)) => {
+                let silence = nodes
+                    .into_iter()
+                    .map(|node| (node, self.heartbeat_silence(node).as_millis() as u64))
+                    .collect();
+                Event::Net(NetEvent::HeartbeatSilence(silence))
+            }
             Effect::Net(net_effect) => {
                 let (tx, rx) = oneshot::channel();
                 if self
@@ -1118,6 +1126,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Notification(_)) => "notification",
         Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",
+        Effect::Net(NetEffect::HeartbeatSilence(_)) => "heartbeat_silence",
         Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
         Effect::Net(NetEffect::RecordSuppression(_)) => "record_suppression",
         Effect::Net(NetEffect::RegisterInterest { .. }) => "register_interest",

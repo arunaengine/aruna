@@ -485,6 +485,8 @@ pub enum NetEvent {
     DocumentSync(DocumentNetEvent),
     Stream(StreamEvent),
     JobControl(JobControlEvent),
+    /// Milliseconds since each asked node's last heartbeat, or since this node started.
+    HeartbeatSilence(std::collections::BTreeMap<NodeId, u64>),
     AuditPages(AuditPageBatch),
     PolicyFetch(PolicyFetchEvent),
     PolicySign(PolicySignEvent),

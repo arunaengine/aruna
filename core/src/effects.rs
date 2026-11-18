@@ -797,6 +797,8 @@ pub enum NetEffect {
     WritePeerAuth(Box<WritePeerRequest>),
     /// Reads a dataset's summary from its holders; answers `NetEvent::DatasetSummary`.
     DatasetSummary(Box<crate::structs::storage::dataset_description::DatasetSummaryRequest>),
+    /// Asks how long each node has been silent; answers `NetEvent::HeartbeatSilence`.
+    HeartbeatSilence(Vec<NodeId>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.
