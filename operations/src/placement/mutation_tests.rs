@@ -9,6 +9,7 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::drive;
 use crate::realm::mutate_placement::tests::{actor, context, seed_config, strategy};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::NodePlacementEntry;
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -113,4 +114,113 @@ fn kick_needs_rows() {
         next: None,
     };
     assert_eq!(kick.next(empty), Ok(Next::Done(())));
+}
+
+fn realm_config() -> RealmConfigDocument {
+    RealmConfigDocument::new(RealmId::from_bytes([21; 32]), Vec::new(), 2)
+}
+
+fn drain_config(draining: bool) -> MutatePlacementConfig {
+    let node_id = actor(RealmId::from_bytes([21; 32])).node_id;
+    mutation_config(RealmPlacementMutation::UpsertNode(NodePlacementEntry {
+        node_id,
+        location: String::new(),
+        weight: 1,
+        full: false,
+        draining,
+        labels: Default::default(),
+    }))
+}
+
+fn mutated_with(
+    config: MutatePlacementConfig,
+    local: Option<NodeId>,
+) -> PlacementMutationOperation {
+    let mut operation = PlacementMutationOperation::new(config, None, local);
+    operation.first().unwrap();
+    operation
+}
+
+fn local_node() -> NodeId {
+    actor(RealmId::from_bytes([21; 32])).node_id
+}
+
+#[test]
+fn local_drain_kicks() {
+    let mut operation = mutated_with(drain_config(true), Some(local_node()));
+    assert!(matches!(
+        operation.next(outcome(Ok(realm_config()))),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let kicked = IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<(), IoError>(())));
+    assert_eq!(operation.next(kicked), Ok(Next::Done(realm_config())));
+}
+
+#[test]
+fn failed_kick_ignored() {
+    let mut operation = mutated_with(drain_config(true), Some(local_node()));
+    operation.next(outcome(Ok(realm_config()))).unwrap();
+    let failed = Err::<(), _>(IoError::Conflict);
+    let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(failed));
+    assert_eq!(operation.next(failed), Ok(Next::Done(realm_config())));
+}
+
+#[test]
+fn remote_drain_skips() {
+    let mut operation = mutated_with(drain_config(true), None);
+    assert_eq!(
+        operation.next(outcome(Ok(realm_config()))),
+        Ok(Next::Done(realm_config()))
+    );
+}
+
+#[test]
+fn undrained_node_skips() {
+    let mut operation = mutated_with(drain_config(false), Some(local_node()));
+    assert_eq!(
+        operation.next(outcome(Ok(realm_config()))),
+        Ok(Next::Done(realm_config()))
+    );
+}
+
+fn kicking_rows() -> KickDrainOperation {
+    let mut kick = KickDrainOperation::default();
+    kick.first().unwrap();
+    let rows = vec![(Key::from(vec![1]), aruna_core::types::Value::from(vec![2]))];
+    let page = IoResult::Page { rows, next: None };
+    let Ok(Next::Call(IoCall::Effect(effect))) = kick.next(page) else {
+        panic!("expected the timer effect");
+    };
+    assert_eq!(
+        *effect,
+        Effect::Task(TaskEffect::ScheduleIdleTimer {
+            key: TaskKey::DrainSyncOutbox,
+            after: Duration::ZERO,
+        })
+    );
+    kick
+}
+
+#[test]
+fn waiting_rows_arm() {
+    let armed = Event::Task(TaskEvent::TimerScheduled {
+        key: TaskKey::DrainSyncOutbox,
+        after: Duration::ZERO,
+    });
+    assert_eq!(
+        kicking_rows().next(IoResult::Event(Box::new(armed))),
+        Ok(Next::Done(()))
+    );
+}
+
+#[test]
+fn timer_failure_ignored() {
+    let failed = Event::Task(TaskEvent::Error {
+        key: None,
+        message: "task handle unavailable".to_string(),
+    });
+    assert_eq!(
+        kicking_rows().next(IoResult::Event(Box::new(failed))),
+        Ok(Next::Done(()))
+    );
 }
