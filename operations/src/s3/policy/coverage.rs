@@ -574,113 +574,31 @@ impl Operation for CoverageScan {
                 self.authority = (record, fence);
                 self.scan_page()
             }
-            ScanState::StartTransaction => {
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.fail(CoverageError::InvalidEvent);
-                };
-                self.txn_id = Some(txn_id);
-                self.state = ScanState::ReadBucket;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_BUCKET_KEYSPACE.to_string(),
-                    key: self.input.bucket.as_bytes().to_vec().into(),
-                    txn_id: self.txn_id,
-                })]
-            }
-            ScanState::ReadBucket => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(CoverageError::InvalidEvent);
-                };
-                let Some(value) = value else {
-                    return self.fail(CoverageError::NoSuchBucket);
-                };
-                let bucket = match BucketInfo::from_bytes(value.as_ref()) {
-                    Ok(bucket) => bucket,
-                    Err(error) => return self.fail(error.into()),
-                };
-                self.generation = bucket.placement_policy_generation;
-                self.target_refs = bucket.placement_policies;
-                self.binding = bucket.distribution;
-                match self.binding.as_ref() {
-                    // Read in the same transaction as the heads, so both describe one moment.
-                    Some(binding) => {
-                        self.state = ScanState::ReadRecord;
-                        smallvec![authority_read(binding.set_id, self.txn_id)]
-                    }
-                    None => self.scan_page(),
-                }
-            }
-            ScanState::ReadRecord => match authority_rows(event) {
-                Ok(rows) => {
-                    self.authority = rows;
-                    self.scan_page()
-                }
-                Err(error) => self.fail(error.into()),
-            },
-            ScanState::ScanPage => self.handle_page(event),
-            ScanState::ReadVersions => self.handle_versions(event),
-            ScanState::ReadHeads => self.handle_heads(event),
-            ScanState::ReadCopies => self.handle_copies(event),
-            ScanState::CommitTransaction => {
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.fail(CoverageError::InvalidEvent);
-                };
-                self.txn_id = None;
-                self.state = ScanState::Finish;
-                smallvec![]
-            }
-            ScanState::Finish => smallvec![],
-            ScanState::Error => self.abort(),
+            ScanState::ScanPage => self.page_read(result.page()?),
+            ScanState::ReadVersions => self.versions_read(result.values()?),
+            ScanState::ReadHeads => self.heads_read(result.values()?),
+            ScanState::ReadCopies => self.copies_read(result.values()?),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ScanState::Finish | ScanState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(result) => result,
-            None => Err(CoverageError::InvalidEvent),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
-    }
-
-    fn expected_error(error: &Self::Error) -> bool {
-        matches!(
-            error,
-            CoverageError::Unauthorized | CoverageError::NoSuchBucket
-        )
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{
-        AttachmentGap, CopyState, CoverageError, CoverageInput, CoverageLimit, CoverageReport,
-        CoverageScope, PolicyCoverageOperation,
-    };
+    use super::*;
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::id::NodeId;
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::policy::PlacementPolicyRef;
-    use aruna_core::structs::storage::blob::{
-        BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
-        ManagedCopyRecord, ManagedCopyState, VersionKey,
-    };
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ManagedCopyState};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
-    use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::time::UNIX_EPOCH;
-    use ulid::Ulid;
 
     const BUCKET: &str = "bucket";
 
@@ -752,8 +670,8 @@ mod pure_tests {
         .expect("record builds")
     }
 
-    fn operation(scope: CoverageScope) -> PolicyCoverageOperation {
-        PolicyCoverageOperation::new(CoverageInput {
+    fn input(scope: CoverageScope) -> CoverageInput {
+        CoverageInput {
             bucket: BUCKET.to_string(),
             scope,
             start_after: None,
@@ -764,39 +682,45 @@ mod pure_tests {
                 path_restrictions: None,
                 session: None,
             },
-        })
+        }
     }
 
-    fn authorized(allowed: bool) -> Event {
-        Event::SubOperation(SubOperationEvent::AuthorizationResult {
-            allowed: Ok(allowed),
-        })
+    /// A scan that read `bucket` and asks for what comes next.
+    fn scan(scope: CoverageScope, bucket: &BucketInfo) -> (CoverageScan, CoverageTurn) {
+        let mut scan = CoverageScan::new(input(scope));
+        assert_eq!(scan.transaction(), TransactionMode::ReadSnapshot);
+        scan.first().unwrap();
+        let turn = scan.next(batch(vec![Some(bucket.to_bytes().expect("bucket"))]));
+        (scan, turn)
     }
 
-    fn read(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: value.map(Into::into),
-        })
+    fn report_of(turn: CoverageTurn) -> CoverageReport {
+        match turn {
+            Ok(Next::Done(report)) => report,
+            other => panic!("expected the report, got {other:?}"),
+        }
     }
 
-    fn batch(values: Vec<Option<Vec<u8>>>) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: values
-                .into_iter()
-                .map(|value| (Key::from(Vec::new()), value.map(Into::into)))
+    fn authorized(allowed: bool) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(allowed)))
+    }
+
+    fn batch(read: Vec<Option<Vec<u8>>>) -> IoResult {
+        IoResult::Values(
+            read.into_iter()
+                .map(|value| value.map(Into::into))
                 .collect(),
-        })
+        )
     }
 
-    fn page(entries: Vec<(&str, Ulid)>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: entries
+    fn page(entries: Vec<(&str, Ulid)>) -> IoResult {
+        IoResult::Page {
+            rows: entries
                 .into_iter()
                 .map(|(key, version_id)| {
                     (
                         Key::from(BlobHeadKey::new(BUCKET, key).to_bytes().expect("key")),
-                        Key::from(
+                        Value::from(
                             CurrentVersionPointer::new(version_id)
                                 .to_bytes()
                                 .expect("pointer"),
@@ -804,8 +728,18 @@ mod pure_tests {
                     )
                 })
                 .collect(),
-            next_start_after: None,
-        })
+            next: None,
+        }
+    }
+
+    /// One page of a version row, for the historical scope.
+    fn version_page(version_id: Ulid) -> IoResult {
+        let key = VersionKey::new(BUCKET, "object", version_id);
+        let value = version(Vec::new()).to_bytes().expect("version");
+        IoResult::Page {
+            rows: vec![(key.to_bytes().expect("key").into(), value.into())],
+            next: None,
+        }
     }
 
     /// Runs a head scan over one page and returns the report.
@@ -815,22 +749,13 @@ mod pure_tests {
         copy: Option<ManagedCopyRecord>,
     ) -> CoverageReport {
         let version_id = Ulid::from_bytes([9u8; 16]);
-        let mut operation = operation(CoverageScope::CurrentHeads);
-        operation.start();
-        operation.step(authorized(true));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        operation.step(read(Some(bucket(default).to_bytes().expect("bucket"))));
-        operation.step(page(vec![("object", version_id)]));
-        operation.step(batch(vec![Some(version.to_bytes().expect("version"))]));
-        operation.step(batch(vec![
+        let (mut scan, _) = scan(CoverageScope::CurrentHeads, &bucket(default));
+        scan.next(page(vec![("object", version_id)])).unwrap();
+        scan.next(batch(vec![Some(version.to_bytes().expect("version"))]))
+            .unwrap();
+        report_of(scan.next(batch(vec![
             copy.map(|record| record.to_bytes().expect("record")),
-        ]));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        operation.finalize().expect("report returned")
+        ])))
     }
 
     /// A head scan of a bucket bound to member 1 of the two-shard test set, which writes the keys
@@ -840,40 +765,20 @@ mod pure_tests {
         fence: Option<Vec<u8>>,
         owned: usize,
     ) -> CoverageReport {
-        use crate::distribution::test_record::{authority_rows, binding, record};
+        use crate::distribution::test_record::{binding, record};
         let (snapshot, bytes) = record(true);
         let mut bound = bucket(vec![policy_ref(1)]);
         bound.distribution = Some(binding(&snapshot, 1, 5));
-        let mut operation = operation(CoverageScope::CurrentHeads);
-        operation.start();
-        operation.step(authorized(true));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        let effects = operation.step(read(Some(bound.to_bytes().expect("bucket"))));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead {
-                txn_id: Some(_),
-                ..
-            })]
-        ));
-        operation.step(authority_rows(Some(bytes), fence));
-        let effects = operation.step(page(entries));
-        if owned > 0 {
-            let version = version(vec![policy_ref(1)]).to_bytes().expect("version");
-            operation.step(batch(vec![Some(version); owned]));
-            operation.step(batch(vec![None; owned]));
-        } else {
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-            ));
+        let (mut scan, turn) = scan(CoverageScope::CurrentHeads, &bound);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        scan.next(batch(vec![Some(bytes), fence])).unwrap();
+        let turn = scan.next(page(entries));
+        if owned == 0 {
+            return report_of(turn);
         }
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        operation.finalize().expect("report returned")
+        let version = version(vec![policy_ref(1)]).to_bytes().expect("version");
+        scan.next(batch(vec![Some(version); owned])).unwrap();
+        report_of(scan.next(batch(vec![None; owned])))
     }
 
     #[test]
@@ -985,35 +890,10 @@ mod pure_tests {
     fn historical_skips_head() {
         // A version that is still the head is not a historical gap.
         let version_id = Ulid::from_bytes([9u8; 16]);
-        let mut operation = operation(CoverageScope::Historical);
-        operation.start();
-        operation.step(authorized(true));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        operation.step(read(Some(
-            bucket(vec![policy_ref(1)]).to_bytes().expect("bucket"),
-        )));
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                Key::from(
-                    VersionKey::new(BUCKET, "object", version_id)
-                        .to_bytes()
-                        .expect("key"),
-                ),
-                Key::from(version(Vec::new()).to_bytes().expect("version")),
-            )],
-            next_start_after: None,
-        }));
-        operation.step(batch(vec![Some(
-            CurrentVersionPointer::new(version_id)
-                .to_bytes()
-                .expect("pointer"),
-        )]));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        let report = operation.finalize().expect("report returned");
+        let (mut scan, _) = scan(CoverageScope::Historical, &bucket(vec![policy_ref(1)]));
+        scan.next(version_page(version_id)).unwrap();
+        let pointer = CurrentVersionPointer::new(version_id).to_bytes();
+        let report = report_of(scan.next(batch(vec![Some(pointer.expect("pointer"))])));
 
         assert_eq!(report.observed, 0);
         assert!(report.gaps.is_empty());
@@ -1023,45 +903,44 @@ mod pure_tests {
     #[test]
     fn denies_non_admin() {
         // Coverage names policy refs, so it is an administrative read.
-        let mut operation = operation(CoverageScope::CurrentHeads);
-        operation.start();
-        let effects = operation.step(authorized(false));
+        let mut operation = PolicyCoverageOperation::new(input(CoverageScope::CurrentHeads));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(
+            operation.next(authorized(false)),
+            Err(CoverageError::Unauthorized)
+        );
+    }
 
-        assert!(effects.is_empty(), "no transaction is opened");
-        assert_eq!(operation.finalize(), Err(CoverageError::Unauthorized));
+    #[test]
+    fn scans_when_allowed() {
+        let mut operation = PolicyCoverageOperation::new(input(CoverageScope::CurrentHeads));
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(authorized(true)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+    }
+
+    #[test]
+    fn missing_bucket_refused() {
+        let mut scan = CoverageScan::new(input(CoverageScope::CurrentHeads));
+        scan.first().unwrap();
+        assert_eq!(
+            scan.next(batch(vec![None])),
+            Err(CoverageError::NoSuchBucket)
+        );
     }
 
     #[test]
     fn historical_flags_predecessor() {
-        let mut operation = operation(CoverageScope::Historical);
-        operation.start();
-        operation.step(authorized(true));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        operation.step(read(Some(
-            bucket(vec![policy_ref(1)]).to_bytes().expect("bucket"),
-        )));
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                Key::from(
-                    VersionKey::new(BUCKET, "object", Ulid::from_bytes([9u8; 16]))
-                        .to_bytes()
-                        .expect("key"),
-                ),
-                Key::from(version(Vec::new()).to_bytes().expect("version")),
-            )],
-            next_start_after: None,
-        }));
-        operation.step(batch(vec![Some(
-            CurrentVersionPointer::new(Ulid::from_bytes([8u8; 16]))
-                .to_bytes()
-                .expect("pointer"),
-        )]));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        let report = operation.finalize().expect("report returned");
+        let (mut scan, _) = scan(CoverageScope::Historical, &bucket(vec![policy_ref(1)]));
+        scan.next(version_page(Ulid::from_bytes([9u8; 16])))
+            .unwrap();
+        let pointer = CurrentVersionPointer::new(Ulid::from_bytes([8u8; 16])).to_bytes();
+        let report = report_of(scan.next(batch(vec![Some(pointer.expect("pointer"))])));
 
         assert_eq!(report.observed, 1);
         assert_eq!(report.gaps.len(), 1);
