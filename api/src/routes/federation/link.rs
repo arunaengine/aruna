@@ -86,7 +86,8 @@ pub(crate) async fn bearer_auth_time(
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Option<u64>> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
-    let claims = state.decode_token(bearer.as_str())
+    let claims = state
+        .decode_token(bearer.as_str())
         .await
         .map_err(|_| ServerError::Unauthorized)?;
     Ok(claims.auth_time)

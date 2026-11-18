@@ -9,8 +9,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::auth::error::AuthorizeError;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::driver::drive;
 use axum::Extension;
@@ -32,7 +32,6 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use ulid::Ulid;
-use aruna_operations::auth::request_authorization::AuthorizeOperation;
 
 const HTTP_TIMEOUT_SECS: u64 = 5;
 const CONNECT_TIMEOUT_SECS: u64 = 2;
@@ -453,10 +452,7 @@ pub(crate) async fn claims_for_revocation(
     state: &ServerState,
     token: &str,
 ) -> Result<TokenClaims, TokenError> {
-    state
-        .decode_revoked(token)
-        .await
-        .map_err(Into::into)
+    state.decode_revoked(token).await.map_err(Into::into)
 }
 
 pub async fn auth_middleware(
@@ -672,7 +668,16 @@ pub(crate) async fn ensure_permission_with(
 ) -> ServerResult<()> {
     aruna_core::telemetry::time_stage(
         "permission",
-        drive(AuthorizeOperation::new(state.get_realm_id(), auth, &path, &required_permission, extras), &state.get_ctx()),
+        drive(
+            AuthorizeOperation::new(
+                state.get_realm_id(),
+                auth,
+                &path,
+                &required_permission,
+                extras,
+            ),
+            &state.get_ctx(),
+        ),
     )
     .await
     .map_err(map_authorize_error)

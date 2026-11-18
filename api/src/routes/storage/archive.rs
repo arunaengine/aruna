@@ -43,8 +43,8 @@ use crate::routes::storage::objects::BearerRelay;
 use crate::s3::service::{ArunaS3Service, ReadAnswer};
 use crate::server::state::ServerState;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::driver::drive;
 use aruna_operations::auth::bearer_token::GrantValidOperation;
+use aruna_operations::driver::drive;
 
 /// Bytes buffered between the archive writer and the response body.
 const PIPE_BYTES: usize = 128 * 1024;
@@ -338,7 +338,12 @@ pub async fn download_link(
     let link = links
         .redeem(&query.ticket, now)
         .ok_or(ServerError::NotFound)?;
-    match drive(GrantValidOperation::new(&link.grant, &link.auth.user_id), &state.get_ctx()).await {
+    match drive(
+        GrantValidOperation::new(&link.grant, &link.auth.user_id),
+        &state.get_ctx(),
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => return Err(ServerError::Unauthorized),
         Err(_) => {

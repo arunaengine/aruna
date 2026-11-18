@@ -23,6 +23,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
+use aruna_operations::auth::request_authorization::AuthorizeEitherOperation;
 use aruna_operations::device::realm_documents::install_group_docs;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
@@ -34,7 +35,7 @@ use aruna_operations::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOpe
 use aruna_operations::groups::create_group::{
     CreateGroupConfig, CreateGroupError, CreateGroupOperation,
 };
-use aruna_operations::groups::forward::{ForwardGroupCreateOperation, ForwardGroupError};
+use aruna_operations::groups::forward::{ForwardGroupError, ForwardGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::groups::remove_member::{
     RemoveFromError, RemoveFromInput, RemoveFromOperation,
@@ -45,6 +46,7 @@ use aruna_operations::groups::remove_role::{
 use aruna_operations::groups::update_group::{
     GroupChange, UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
 };
+use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::stats::count_group_purpose;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -64,8 +66,6 @@ use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
-use aruna_operations::auth::request_authorization::AuthorizeEitherOperation;
-use aruna_operations::metadata::api::MetadataApiError;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -488,7 +488,7 @@ pub async fn create_group(
             .ok_or(ServerError::Unauthorized)?;
         let local = ctx.node_and_realm().map(|(node_id, _)| node_id);
         let forward =
-            ForwardGroupCreateOperation::new(realm_id, local, auth_token, name, Ulid::generate());
+            ForwardGroupOperation::new(realm_id, local, auth_token, name, Ulid::generate());
         let forwarded = aruna_operations::driver::drive(forward, &ctx)
             .await
             .map_err(|err| match err {
@@ -893,7 +893,15 @@ pub(crate) async fn ensure_group_admin(
     let realm_id = auth.realm_id;
     let group_admin = format!("/{realm_id}/g/{group_id}/admin");
     let realm_admin = format!("/{realm_id}/admin/groups");
-    drive(AuthorizeEitherOperation::new(state.get_realm_id(), auth, (&group_admin, &realm_admin), &Permission::WRITE), &state.get_ctx())
+    drive(
+        AuthorizeEitherOperation::new(
+            state.get_realm_id(),
+            auth,
+            (&group_admin, &realm_admin),
+            &Permission::WRITE,
+        ),
+        &state.get_ctx(),
+    )
     .await
     .map_err(crate::auth::map_authorize_error)
 }
@@ -1149,13 +1157,14 @@ pub async fn get_deletion_blockers(
         auth,
         group_id,
     );
-    let replies = aruna_operations::driver::drive(check, &ctx)
-        .await
-        .map_err(|error| match error {
-            GroupDeletionError::Unauthorized => ServerError::Forbidden,
-            GroupDeletionError::NotFound => ServerError::NotFound,
-            error => ServerError::ServiceUnavailableReason(error.to_string()),
-        })?;
+    let replies =
+        aruna_operations::driver::drive(check, &ctx)
+            .await
+            .map_err(|error| match error {
+                GroupDeletionError::Unauthorized => ServerError::Forbidden,
+                GroupDeletionError::NotFound => ServerError::NotFound,
+                error => ServerError::ServiceUnavailableReason(error.to_string()),
+            })?;
     let nodes = replies
         .into_iter()
         .map(|(node, result)| {

@@ -10,10 +10,10 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::auth::permission_rules::PermissionRules;
-use aruna_operations::driver::DriverContext;
-use s3s::{S3Result, s3_error};
-use aruna_operations::driver::drive;
 use aruna_operations::auth::request_authorization::rules_operation;
+use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::drive;
+use s3s::{S3Result, s3_error};
 
 /// Navigable key prefixes and the rules deciding each concrete key's access.
 #[derive(Clone, Debug, Default, PartialEq)]

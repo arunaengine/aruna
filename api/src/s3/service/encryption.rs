@@ -12,6 +12,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketKeyError, EncryptionMode};
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::replication::plaintext::EncryptionCheckOperation;
@@ -23,7 +24,6 @@ use s3s::dto::{
     ServerSideEncryptionRule,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
-use aruna_operations::auth::request_authorization::AuthorizeOperation;
 
 impl ArunaS3Service {
     pub(super) async fn bucket_encrypted(&self, bucket: &str) -> S3Result<bool> {
@@ -64,7 +64,10 @@ impl ArunaS3Service {
             session: None,
         };
         let path = group_admin_path(self.realm_id, info.group_id);
-        drive(AuthorizeOperation::new(self.realm_id, &auth, &path, &Permission::WRITE, extras), &self.state)
+        drive(
+            AuthorizeOperation::new(self.realm_id, &auth, &path, &Permission::WRITE, extras),
+            &self.state,
+        )
         .await
         .map_err(map_authorize_error)?;
         let operation = KeyStatusOperation::new(bucket.to_string(), self.realm_id, info.group_id);

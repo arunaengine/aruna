@@ -2093,9 +2093,12 @@ async fn authenticate_tes(
     };
     let context = state.get_ctx();
     let owner = &access.user_identity;
-    let cutoff = drive(UserCutoffOperation::new(state.get_realm_id(), owner), &context)
-        .await
-        .map_err(unavailable)?;
+    let cutoff = drive(
+        UserCutoffOperation::new(state.get_realm_id(), owner),
+        &context,
+    )
+    .await
+    .map_err(unavailable)?;
     let deactivated = drive(AccountDeactivatedOperation::new(owner), &context)
         .await
         .map_err(unavailable)?;

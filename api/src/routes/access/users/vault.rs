@@ -159,7 +159,7 @@ pub(super) async fn append(
         &state.get_ctx(),
     )
     .await
-        .map_err(map_route_error)
+    .map_err(map_route_error)
 }
 
 pub(super) async fn read(

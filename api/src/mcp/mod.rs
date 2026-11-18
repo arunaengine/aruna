@@ -5,6 +5,8 @@
 use crate::auth::require_unrestricted_auth;
 use crate::cors::CorsConfig;
 use crate::server::state::ServerState;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
+use aruna_operations::driver::drive;
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -20,8 +22,6 @@ use rmcp::transport::streamable_http_server::tower::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use aruna_operations::driver::drive;
-use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 
 mod compute;
 mod context;
@@ -241,9 +241,12 @@ pub(crate) async fn authorize_self(
         Some(auth),
         extras,
     );
-    drive(EnforcePolicyOperation::new(realm_id, request.clone()), &state.get_ctx())
-        .await
-        .map_err(|_| crate::error::ServerError::Forbidden)
+    drive(
+        EnforcePolicyOperation::new(realm_id, request.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|_| crate::error::ServerError::Forbidden)
 }
 
 fn error_result(body: crate::error::ErrorResponse) -> CallToolResult {

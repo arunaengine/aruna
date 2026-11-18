@@ -332,9 +332,12 @@ async fn share_policies(
     }));
     let permission = required_permission(request.mode.into());
     let policy = policy_request_with(path, &permission, Some(auth), extras);
-    drive(EnforcePolicyOperation::new(state.get_realm_id(), policy.clone()), &state.get_ctx())
-        .await
-        .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))
+    drive(
+        EnforcePolicyOperation::new(state.get_realm_id(), policy.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))
 }
 
 fn share_error(error: ShareError) -> ServerError {

@@ -10,7 +10,8 @@ use crate::server::state::ServerState;
 use aruna_core::jobs::{JobTarget, RunningJobView};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_operations::auth::request_authorization::BucketAccess;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
+use aruna_operations::driver::drive;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -19,8 +20,6 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
-use aruna_operations::driver::drive;
-use aruna_operations::auth::request_authorization::BucketAccessOperation;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(get_running_jobs))
@@ -203,9 +202,12 @@ async fn may_read(
         return permission_granted(state, auth, path, Permission::READ).await;
     };
     let context = state.get_ctx();
-    let access = drive(BucketAccessOperation::new(auth, (realm_id, group_id, node_id), bucket), &context)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let access = drive(
+        BucketAccessOperation::new(auth, (realm_id, group_id, node_id), bucket),
+        &context,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     // A prefix shows only when the caller may read every key the job may touch below it.
     let path = path.as_deref().unwrap_or_default();
     Ok(match exact {

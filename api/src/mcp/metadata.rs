@@ -11,6 +11,8 @@ use super::{
 use crate::lookup::actor;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
 use aruna_operations::metadata::api::read::{
     query_metadata, query_metadata_document, references_metadata,
@@ -32,7 +34,6 @@ use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ulid::Ulid;
-use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct IdInput {
@@ -725,7 +726,10 @@ async fn authorize_document(
     extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let (context, realm_id) = (server.state.get_ctx(), server.state.get_realm_id());
-    drive(AuthorizeDocumentOperation::new(realm_id, auth, document, extras), &context)
+    drive(
+        AuthorizeDocumentOperation::new(realm_id, auth, document, extras),
+        &context,
+    )
     .await
     .map_err(crate::auth::map_authorize_error)
 }
