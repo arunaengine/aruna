@@ -106,8 +106,6 @@ mod tests {
     };
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::effects::StorageEffect;
-    use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
@@ -117,7 +115,7 @@ mod tests {
         Charge, RangeAccount, account_key, generation_key, pending_key,
     };
     use aruna_core::structs::storage::usage::UsageCounters;
-    use aruna_core::types::Value;
+    use aruna_core::types::{GroupId, Value};
 
     /// What this member holds of `bucket`'s set as copies: every range with an account here, one
     /// being purged included, less the ranges it coordinates. Zero for an ordinary bucket.

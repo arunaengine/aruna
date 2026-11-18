@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
 use aruna_core::federation::Signed;
 use aruna_core::structs::execution::job::{ExportSelection, JobId};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};

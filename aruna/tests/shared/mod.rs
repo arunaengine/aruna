@@ -871,8 +871,8 @@ async fn spawn_seed_at(
         false,
     );
     drive(seed, context.as_ref())
-    .await
-    .map_err(std::io::Error::other)?;
+        .await
+        .map_err(std::io::Error::other)?;
     let documents =
         prepare_core_documents(context.as_ref(), net.node_id(), realm_id, true, true).await?;
     publish_core_documents(context.as_ref(), net.node_id(), realm_id, true, documents).await?;
@@ -1013,8 +1013,8 @@ async fn spawn_joiner_mode(
         false,
     );
     drive(seed, joiner_context.as_ref())
-    .await
-    .map_err(std::io::Error::other)?;
+        .await
+        .map_err(std::io::Error::other)?;
     let documents = prepare_core_documents(
         joiner_context.as_ref(),
         config.node_id,

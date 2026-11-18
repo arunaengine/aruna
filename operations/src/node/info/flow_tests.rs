@@ -6,12 +6,13 @@ use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
 use aruna_core::compute::quota::ResourceTotals;
-use aruna_core::handle::Handle;
+use aruna_core::events::Event;
 use aruna_core::heartbeat::RunningJobs;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::types::GroupId;
+use aruna_tasks::TaskHandle;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::demand::{DemandSnapshotOperation, merge_view};
@@ -20,10 +21,12 @@ use crate::node::info::facts::NodeFacts;
 use crate::node::info::facts::{class_labels, permille_of};
 use crate::node::info::flows::DepartureStateOperation;
 use crate::node::info::flows::{
-    GroupDemandOperation, OperatorDrainOperation, RefreshInfoOperation, SeedInfoOperation,
+    GroupDemandOperation, ObservePlacementOperation, OperatorDrainOperation, RefreshInfoOperation,
+    SeedInfoOperation,
 };
 use crate::node::info::inputs::{HeldDocumentsOperation, advertises_executors, held_placement_set};
 use crate::node::info::write::PUBLISH_OWED_KEY;
+use crate::placement::policy::{SubjectScanError, SubjectScanResult};
 use aruna_core::compute::quota::ComputeDemandSnapshot;
 use aruna_core::compute::quota::ComputeReservationSnapshot;
 use aruna_core::compute::quota::{
@@ -110,6 +113,20 @@ async fn refresh_info_heartbeat(
     let facts = NodeFacts::gather(ctx);
     let refresh = RefreshInfoOperation::new(realm_id, node_id, sequence, jobs, facts);
     (drive(refresh, ctx).await).map_err(|error| error.to_string())
+}
+
+async fn observe_placement(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    now_ms: u64,
+) -> Result<Option<SubjectScanResult>, SubjectScanError> {
+    let facts = NodeFacts::gather(ctx);
+    drive(
+        ObservePlacementOperation::new(realm_id, node_id, now_ms, facts),
+        ctx,
+    )
+    .await
 }
 
 async fn set_operator_drain(

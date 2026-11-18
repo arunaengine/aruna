@@ -353,9 +353,12 @@ async fn local_submit(
         workspace_mode,
         retention_ms: state.rocrate_limits().artifact_retention_ms,
     };
-    let result = drive(LocalRunOperation::on_node(config, &context), context.as_ref())
-        .await
-        .map_err(JobRequestError::from_local)?;
+    let result = drive(
+        LocalRunOperation::on_node(config, &context),
+        context.as_ref(),
+    )
+    .await
+    .map_err(JobRequestError::from_local)?;
     // A replay answers with the state the device already reduced for that job.
     let state = read_owned_job(&context, auth.user_id, result.job_id)
         .await

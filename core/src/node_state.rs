@@ -401,7 +401,7 @@ mod urls_tests {
     use super::*;
 
     #[test]
-    fn missing_node_no_urls() {
+    fn missing_node_urls() {
         let node_id = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let mut operation = NodeUrlsOperation::new(node_id);
         let read = IoCall::Read(info_reads(std::iter::once(node_id)));

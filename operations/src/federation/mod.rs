@@ -5,7 +5,7 @@
 pub mod access;
 pub mod grant;
 #[cfg(test)]
-mod grant_flows;
+mod grant_tests;
 pub mod import;
 pub mod link;
 pub mod login;

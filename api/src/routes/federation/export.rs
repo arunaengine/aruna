@@ -194,7 +194,12 @@ pub async fn create_export(
     let with_files = !request.files.is_empty();
     let path = &record.permission_path;
     let context = state.get_ctx();
-    match drive(export_access(&auth, path, audience, with_files), context.as_ref()).await {
+    match drive(
+        export_access(&auth, path, audience, with_files),
+        context.as_ref(),
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) | Err(_) => return Err(grant_refused(GrantError::Denied)),
     }

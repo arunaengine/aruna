@@ -282,10 +282,9 @@ enum PublishStep {
 
 type PublishTurn = Result<Next<PublishedUsage>, UsagePublishError>;
 
-/// Rebuilds this node's snapshot documents from live counters and distributes them over the sync
-/// layer: dirty mode refreshes marked groups, full mode all groups plus the global. Markers clear
-/// only after durable replication, and with `refresh` after the realm summary too, never if
-/// re-dirtied. A failure after the write marks the scopes so the publish retries.
+/// Rebuilds this node's snapshots from live counters and replicates them: dirty mode refreshes
+/// marked groups, full mode all groups plus the global. Markers clear only after replication (and
+/// with `refresh` the realm summary), never if re-dirtied; a later failure marks a retry.
 #[derive(Debug, PartialEq)]
 pub struct PublishUsageOperation {
     node_id: NodeId,
@@ -780,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_shares_then_counters() {
+    fn reads_shares_counters() {
         let mut read = UsageReadOperation::new(false, vec![GROUP]);
         assert_eq!(read.transaction(), TransactionMode::ReadSnapshot);
         assert!(matches!(read.first(), Ok(Next::Call(IoCall::Page { .. }))));

@@ -849,28 +849,6 @@ pub(crate) mod tests {
         .await
     }
 
-    async fn authorize_import(
-        context: &DriverContext,
-        auth: &AuthContext,
-        destination: &ImportDestination,
-        source: Option<RealmId>,
-        node_id: NodeId,
-    ) -> Result<(), ImportError> {
-        let authorize =
-            AuthorizeImportOperation::new(auth.clone(), destination.clone(), source, node_id);
-        drive(authorize, context).await
-    }
-
-    async fn reusable_upload(
-        context: &DriverContext,
-        intent: &ImportIntent,
-        grant: &ExportGrant,
-        import_key: &str,
-    ) -> Result<Option<Ulid>, ImportError> {
-        let reuse = ReusableUploadOperation::new(intent.clone(), grant.clone(), import_key);
-        drive(reuse, context).await
-    }
-
     async fn bound_upload(
         context: &DriverContext,
         principal: UserId,
@@ -988,7 +966,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn import_needs_both_paths() {
+    fn import_checks_paths() {
         let mut operation = authorizing();
         assert!(matches!(
             operation.first(),
@@ -1025,7 +1003,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn gone_upload_without_job() {
+    fn gone_upload_stale() {
         let mut operation = stale_check();
         let read = read_row(
             ROCRATE_UPLOAD_KEYSPACE,

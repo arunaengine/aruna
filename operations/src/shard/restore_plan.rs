@@ -11,7 +11,7 @@ use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 
-use crate::node::recovery::RecoveryError;
+use crate::shard::recovery::RecoveryError;
 use aruna_core::placement::{draining_former_holders, resolve_shard_holders};
 
 /// Shared realm-scoped topics every node subscribes to (placement is inert on

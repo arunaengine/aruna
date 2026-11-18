@@ -7,9 +7,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::node_state::NodeUrlsOperation;
 use aruna_core::plugin_runs::HookRequest;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::node_state::NodeUrlsOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::plugins::dispatch::{admit_hook, checks_authorization};
 use aruna_operations::plugins::hooks::HookError;
@@ -240,7 +240,8 @@ async fn relay(
         .await
         .ok()
         .flatten()
-        .and_then(|urls| urls.api) else {
+        .and_then(|urls| urls.api)
+    else {
         return unavailable();
     };
     let mut sent = relayed(headers, keep);

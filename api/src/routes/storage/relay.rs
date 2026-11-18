@@ -9,13 +9,13 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::node_state::NodeUrlsOperation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::read_coordinator;
 use aruna_operations::distribution::routing::{route_read, route_write};
 use aruna_operations::distribution::status::node_reach;
-use aruna_core::node_state::NodeUrlsOperation;
 use aruna_operations::driver::drive;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -301,7 +301,13 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
     body: &impl Serialize,
 ) -> ServerResult<(StatusCode, T)> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
-    let urls = drive(NodeUrlsOperation::new(forward.node_id), state.get_ctx().as_ref()).await.ok().flatten();
+    let urls = drive(
+        NodeUrlsOperation::new(forward.node_id),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .ok()
+    .flatten();
     let Some(base) = urls.and_then(|urls| urls.api) else {
         return Err(unreachable(
             forward,
@@ -406,7 +412,10 @@ pub(crate) async fn get_node(
     bearer: Option<&ValidatedBearer>,
     sent: HeaderMap,
 ) -> ServerResult<Option<reqwest::Response>> {
-    let urls = drive(NodeUrlsOperation::new(node_id), state.get_ctx().as_ref()).await.ok().flatten();
+    let urls = drive(NodeUrlsOperation::new(node_id), state.get_ctx().as_ref())
+        .await
+        .ok()
+        .flatten();
     let Some(base) = urls.and_then(|urls| urls.api) else {
         return Ok(None);
     };

@@ -711,7 +711,12 @@ pub async fn create_task(
             retention_ms: state.rocrate_limits().artifact_retention_ms,
         };
         let context = state.get_ctx();
-        return match drive(LocalRunOperation::on_node(config, &context), context.as_ref()).await {
+        return match drive(
+            LocalRunOperation::on_node(config, &context),
+            context.as_ref(),
+        )
+        .await
+        {
             Ok(result) => tes_json_response(
                 StatusCode::OK,
                 TesTaskResponse {

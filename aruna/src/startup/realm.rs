@@ -16,9 +16,9 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::projector::replay_until_stopped;
 use aruna_operations::node::info::facts::NodeFacts;
 use aruna_operations::node::info::flows::SeedInfoOperation;
-use aruna_operations::shard::restore::prepare_shard_policy;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
+use aruna_operations::shard::restore::prepare_shard_policy;
 use tracing::{info, warn};
 
 use crate::bootstrap::{

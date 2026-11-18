@@ -7,7 +7,9 @@ pub mod client;
 pub mod incoming;
 pub(crate) mod manifest;
 pub mod protocol;
+pub mod recovery;
 pub mod restore;
+pub mod restore_plan;
 pub mod verify;
 
 use aruna_core::document::{ShardManifest, shard_topic_id};

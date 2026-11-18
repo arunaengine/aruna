@@ -396,10 +396,13 @@ pub async fn submit_import(
     // An import of another realm's export keeps one plan across the sessions that retry it.
     let auth = match &source {
         ImportRoCrateSource::Upload { upload_id }
-            if drive(ReadImportOperation::new(*upload_id), state.get_ctx().as_ref())
-                .await
-                .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?
-                .is_some() =>
+            if drive(
+                ReadImportOperation::new(*upload_id),
+                state.get_ctx().as_ref(),
+            )
+            .await
+            .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?
+            .is_some() =>
         {
             AuthContext {
                 session: None,

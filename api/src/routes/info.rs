@@ -2068,10 +2068,13 @@ pub(crate) async fn distinct_buckets(
 pub(crate) async fn realm_totals(state: &ServerState) -> Option<(u64, u64)> {
     let context = state.get_ctx();
     let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
-    drive(DataTotalsOperation::new(state.get_node_id(), realm_id), context.as_ref())
-        .await
-        .inspect_err(|error| warn!(error = %error, "realm usage unavailable for the realm totals"))
-        .ok()
+    drive(
+        DataTotalsOperation::new(state.get_node_id(), realm_id),
+        context.as_ref(),
+    )
+    .await
+    .inspect_err(|error| warn!(error = %error, "realm usage unavailable for the realm totals"))
+    .ok()
 }
 
 pub async fn load_realm_usage(

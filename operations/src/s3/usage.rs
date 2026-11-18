@@ -1165,7 +1165,6 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-
     async fn publish_usage_snapshots(
         ctx: &DriverContext,
         node_id: NodeId,
