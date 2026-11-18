@@ -25,7 +25,6 @@ use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Value;
 use bytes::Bytes;
-use serde_json::Value as JsonValue;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -59,9 +58,11 @@ use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
 
 use super::lifecycle::alias::AliasFamilyOperation;
 use super::lifecycle::cancel::{self, cancel_family};
+use super::lifecycle::family_reads::{
+    FamilyResponderOperation, FamilyStatusOperation, SessionJobOperation,
+};
 use super::lifecycle::ids::session_of;
-use super::lifecycle::routing::{family_responder, family_status};
-use super::route::{JobRouteOperation, JobRouteOutcome};
+use super::route::{JobRouteOperation, JobRouteOutcome, RoutedJobStatus};
 
 use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 
@@ -665,7 +666,11 @@ async fn route_record(
             .map_err(JobRouteError::Internal);
     };
     let request = auth_token.map(|auth_token| JobRequest::Record { auth_token, job_id });
-    let responder = family_responder(context, job_id).await?;
+    let responder = drive(
+        FamilyResponderOperation::new(job_id, aruna_core::time::unix_timestamp_millis()),
+        context,
+    )
+    .await?;
     let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
         .with_responder(responder);
     match drive(operation, context).await? {
@@ -720,12 +725,6 @@ fn owner_unreachable(error: JobRouteError) -> JobRouteError {
         }
         error => error,
     }
-}
-
-#[derive(Debug)]
-pub struct RoutedJobStatus {
-    pub job: JobStatusView,
-    pub run_crate: Option<JsonValue>,
 }
 
 pub(crate) async fn local_status(
@@ -862,7 +861,13 @@ pub async fn read_job_routed(
     let user_id = auth.user_id;
     // An external job is answered from the family projection, which any node
     // that reduced the family can do; only other jobs keep owner routing.
-    if let Some(status) = family_status(context, auth, job_id).await {
+    if let Some(status) = drive(
+        FamilyStatusOperation::new(auth, job_id, aruna_core::time::unix_timestamp_millis()),
+        context,
+    )
+    .await
+    .transpose()
+    {
         return status;
     }
     let Some(net) = context.net_handle.as_ref() else {
@@ -1015,7 +1020,12 @@ pub async fn read_report_routed(
         .await?
         .is_some()
     {
-        match super::lifecycle::routing::session_job(context, user_id, job_id).await {
+        match drive(
+            SessionJobOperation::new(user_id, job_id, aruna_core::time::unix_timestamp_millis()),
+            context,
+        )
+        .await
+        {
             Ok((_, Some(physical))) => physical,
             Ok((record, None)) => return Ok(JobReportLookup::Pending(record.state)),
             Err(JobRouteError::NotFound) => return Ok(JobReportLookup::NotFound),
@@ -1038,7 +1048,11 @@ pub async fn read_report_routed(
         last_key: last_key.clone(),
         limit: wire_limit,
     });
-    let responder = family_responder(context, job_id).await?;
+    let responder = drive(
+        FamilyResponderOperation::new(job_id, aruna_core::time::unix_timestamp_millis()),
+        context,
+    )
+    .await?;
     let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
         .with_responder(responder);
     match drive(operation, context).await? {
@@ -1198,7 +1212,12 @@ pub async fn read_artifact_routed(
         };
         return Ok((lookup, read));
     }
-    let owner = match family_responder(context, job_id).await? {
+    let owner = match drive(
+        FamilyResponderOperation::new(job_id, aruna_core::time::unix_timestamp_millis()),
+        context,
+    )
+    .await?
+    {
         Some(responder) => responder,
         None => resolve_job_owner(context, job_id).await?,
     };
@@ -1383,7 +1402,13 @@ async fn family_cancel(
     };
     let published = cancel_family(context, &auth, job_id, auth_token).await?;
     Some(match published {
-        Ok(()) => match family_status(context, &auth, job_id).await {
+        Ok(()) => match drive(
+            FamilyStatusOperation::new(&auth, job_id, aruna_core::time::unix_timestamp_millis()),
+            context,
+        )
+        .await
+        .transpose()
+        {
             Some(Ok(status)) => Ok(match status.job.state.is_terminal() {
                 true => RoutedCancelOutcome::AlreadyTerminal(status.job),
                 false => RoutedCancelOutcome::Requested(status.job),
@@ -1444,7 +1469,11 @@ pub async fn cancel_job_routed(
         return cancelled;
     }
     let request = auth_token.map(|auth_token| JobRequest::Cancel { auth_token, job_id });
-    let responder = family_responder(context, job_id).await?;
+    let responder = drive(
+        FamilyResponderOperation::new(job_id, aruna_core::time::unix_timestamp_millis()),
+        context,
+    )
+    .await?;
     let operation = JobRouteOperation::new(*net.realm_id(), net.node_id(), job_id, request)
         .with_responder(responder);
     match drive(operation, context).await? {

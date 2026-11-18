@@ -16,8 +16,8 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::alias::AliasFamilyOperation;
+use super::family_reads::FamilyProjectionOperation;
 use super::publish::publish_terminal;
-use super::routing::family_projection;
 use super::updates::{SETTLE_RETRY_AFTER, schedule_terminal_settle};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -47,7 +47,12 @@ pub async fn cancel_family(
         Ok(None) => return None,
         Err(error) => return Some(Err(error)),
     };
-    let (projected, spec) = match family_projection(context, job_id).await {
+    let (projected, spec) = match drive(
+        FamilyProjectionOperation::new(job_id, unix_timestamp_millis()),
+        context,
+    )
+    .await
+    {
         Ok(Some(projected)) => projected,
         Ok(None) => return None,
         Err(error) => return Some(Err(error)),
@@ -115,7 +120,8 @@ pub async fn publish_deletion(
     auth: &AuthContext,
     job_id: JobId,
 ) -> Result<(), JobRouteError> {
-    let Some((_, spec)) = family_projection(context, job_id).await? else {
+    let read = FamilyProjectionOperation::new(job_id, unix_timestamp_millis());
+    let Some((_, spec)) = drive(read, context).await? else {
         return Ok(());
     };
     if spec.created_by != auth.user_id {
