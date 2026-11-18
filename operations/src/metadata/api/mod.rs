@@ -93,7 +93,6 @@ pub mod export_types;
 pub mod fanout;
 pub mod fanout_types;
 mod head_versions;
-mod join;
 pub mod links;
 pub mod list;
 pub mod list_types;
