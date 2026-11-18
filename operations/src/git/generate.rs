@@ -10,6 +10,7 @@ use aruna_core::git::{
     GitChange, GitCheckpoint, GitEffect, GitEvent, GitPack, GitRecord, GitSnapshot, GitStatus,
     LinkedObject, RefUpdate, STATUS, StoredObject, ZERO_OID,
 };
+use aruna_core::git_state::Projection;
 use aruna_core::keyspaces::{COMMIT_MESSAGE_KEYSPACE, EVENT_LOG_KEYSPACE};
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::operation::Operation;
@@ -22,10 +23,10 @@ use bytes::Bytes;
 use serde_json::Value;
 use ulid::Ulid;
 
-use super::calls::{git_call, git_event};
+use super::calls::{StageTimes, git_call, git_event};
 use super::changes::summary;
 use super::linked::linked;
-use super::project::{Projection, author};
+use super::project::author;
 use super::publish::PublishRecordOperation;
 use super::versions::{copied, plain};
 use super::{GitError, objects, publish, records};
@@ -130,6 +131,7 @@ pub(super) fn generate(
         aruna: String::new(),
         main: None,
         marked: None,
+        stages: StageTimes::default(),
     }
 }
 
@@ -149,6 +151,7 @@ pub(super) struct GenerateOperation {
     aruna: String,
     main: Option<String>,
     marked: Option<GitPack>,
+    stages: StageTimes,
 }
 
 type GenerateTurn = Result<Next<()>, GitError>;
@@ -169,6 +172,7 @@ impl GenerateOperation {
             ..author(self.user)
         };
         self.step = GenerateStep::Linked;
+        self.stages.start("git_linked");
         let find = linked(self.ids, &self.document, &self.jsonld, &linker);
         Ok(Next::Call(IoCall::child(find)))
     }
@@ -184,6 +188,11 @@ impl GenerateOperation {
         Ok(Next::Call(IoCall::child(records::save(
             STATUS, key, &status,
         ))))
+    }
+
+    fn store_written(&mut self) -> GenerateTurn {
+        self.stages.start("git_status");
+        self.store_status(Some(self.aruna.clone()), None)
     }
 
     fn publish(&mut self, pack: Option<Bytes>) -> GenerateTurn {
@@ -214,6 +223,7 @@ impl GenerateOperation {
         let extras = (pack, Vec::new());
         let record = publish::publish_with(node, &self.document, self.user, change, extras);
         self.step = GenerateStep::Publish;
+        self.stages.start("git_publish");
         Ok(Next::Call(IoCall::child(record)))
     }
 
@@ -240,12 +250,21 @@ impl Operation for GenerateOperation {
     type Output = ();
     type Error = GitError;
 
+    fn abort(&mut self) -> Vec<IoCall> {
+        self.stages.report()
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.stages.stamp(now_ms);
+    }
+
     fn first(&mut self) -> GenerateTurn {
         let load = records::load::<MetadataEventRecord>(EVENT_LOG_KEYSPACE, self.event_key());
         Ok(Next::Call(IoCall::child(load)))
     }
 
     fn next(&mut self, result: IoResult) -> GenerateTurn {
+        self.stages.stop();
         match self.step {
             GenerateStep::Event => {
                 if let Some(event) = result.child::<Option<MetadataEventRecord>, GitError>()?? {
@@ -267,6 +286,7 @@ impl Operation for GenerateOperation {
                     }
                     None => {
                         self.step = GenerateStep::Subject;
+                        self.stages.start("git_subject");
                         let read = subject(&self.document, &self.refs, &self.jsonld, self.user);
                         Ok(Next::Call(IoCall::child(read)))
                     }
@@ -315,17 +335,17 @@ impl Operation for GenerateOperation {
                         let mark = objects::mark_imported((self.id(), self.user), &pack);
                         Ok(Next::Call(IoCall::child(mark)))
                     }
-                    None => self.store_status(Some(self.aruna.clone()), None),
+                    None => self.store_written(),
                 }
             }
             GenerateStep::Mark => {
                 // A failure only costs one more index run in the cache.
                 result.child::<(), IoError>()?.ok();
-                self.store_status(Some(self.aruna.clone()), None)
+                self.store_written()
             }
             GenerateStep::Status => {
                 result.child::<(), GitError>()??;
-                Ok(Next::Done(()))
+                Ok(self.stages.finish((), Vec::new()))
             }
         }
     }

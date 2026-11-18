@@ -5,7 +5,7 @@
 use aruna_core::git::GitChange;
 
 use super::super::testing::{
-    asks_child, asks_store, auth, child, dataset, node, projection, ran, realm, record,
+    asks_child, asks_store, auth, child, dataset, finished, node, projection, ran, realm, record,
 };
 use super::*;
 
@@ -67,7 +67,8 @@ fn failure_stored_status() {
     let failed = ran(GitEvent::GenerateFailed("no ISA".to_string()));
     assert!(asks_child(&run.next(failed)));
     assert_eq!(run.step, GenerateStep::Status);
-    assert_eq!(run.next(child(Ok::<(), GitError>(()))), Ok(Next::Done(())));
+    // The link search was timed, so its report follows the outcome.
+    assert_eq!(finished(run.next(child(Ok::<(), GitError>(())))), ((), 1));
 }
 
 // New commits are packed, published and noted as imported before the status is stored.
@@ -101,4 +102,31 @@ fn checkpoint_publishes() {
     let ids = Some((node(1), realm()));
     let mut fold = checkpoint(ids, &dataset(), &projection(&[]));
     assert!(fold.first().is_ok());
+}
+
+// Each stage is timed from its call to its answer on the runner's clock.
+#[test]
+fn stages_use_stamps() {
+    let source = (event_id(), "{}".to_string());
+    let ids = Some((node(1), realm()));
+    let mut run = generate(ids, &dataset(), &projection(&[]), source, None);
+    run.first().unwrap();
+    let event = child(Ok::<Option<MetadataEventRecord>, GitError>(None));
+    run.next(event).unwrap();
+    run.stamp(10);
+    let none = child(Ok::<Option<String>, GitError>(None));
+    assert!(asks_child(&run.next(none)));
+    run.stamp(25);
+    let written = child(Ok::<_, GitError>("Edit".to_string()));
+    assert!(asks_child(&run.next(written)));
+    let reports = run.abort();
+    assert_eq!(reports.len(), 1);
+    let IoCall::Effect(effect) = &reports[0] else {
+        panic!("expected the stage report");
+    };
+    let aruna_core::effects::Effect::Git(call) = &**effect else {
+        panic!("expected a Git call");
+    };
+    let expected = aruna_core::git::GitCall::Stages(vec![("git_subject", 15), ("git_linked", 0)]);
+    assert_eq!(**call, expected);
 }

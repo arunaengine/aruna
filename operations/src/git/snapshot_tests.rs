@@ -3,14 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::super::testing::{
-    self, answered, asks_child, asks_store, auth, child, dataset_of, git_node, node, projection,
-    ran, record,
+    self, answered, asks_child, asks_store, auth, child, dataset_of, finished, git_node, node,
+    projection, ran, record,
 };
 use super::*;
 use crate::driver::{DriverContext, drive};
+use aruna_core::calls::ChildOutcome;
+use aruna_core::effects::Effect;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
-use aruna_core::git::{GitAnswer, GitChange, GitRepository};
+use aruna_core::git::{GitAnswer, GitCall, GitChange, GitRepository};
 use aruna_core::metadata::{
     MetadataEventPayload, MetadataEventRecord, MetadataMaterializationRecord,
 };
@@ -268,21 +270,58 @@ fn unknown() -> IoResult {
     child(Ok::<Option<Projection>, GitError>(None))
 }
 
+fn kept(value: Option<Projection>) -> IoResult {
+    answered(GitAnswer::Projection(value.map(Box::new)))
+}
+
+/// The store call a turn makes.
+fn store_call<T: std::fmt::Debug, E: std::fmt::Debug>(turn: Result<Next<T>, E>) -> GitCall {
+    let Next::Call(IoCall::Effect(effect)) = turn.expect("a call") else {
+        panic!("expected an effect");
+    };
+    let Effect::Git(call) = *effect else {
+        panic!("expected a Git call");
+    };
+    *call
+}
+
 /// An update stepped to the answer of its graph read.
 fn updating(known: Projection) -> UpdateOperation {
     let mut run = update(&git_node(), &dataset_of(40), None, false);
+    run.stamp(100);
     assert!(asks_child(&run.first()));
+    run.stamp(140);
     assert!(asks_child(&run.next(projected(known))));
     assert!(asks_child(&run.next(child(Ok::<(), GitError>(())))));
+    run.stamp(150);
     run
 }
 
-// Without a ready graph an update ends with what it projected.
+fn graph_source() -> IoResult {
+    let graph = serde_json::json!({"@context": {}, "@graph": []}).to_string();
+    child(Ok::<Source, GitError>(Some((OLDER, graph))))
+}
+
+// Without a ready graph an update ends with what it projected, and reports its stages.
 #[test]
 fn update_without_graph() {
     let known = projection(&[]);
-    let answer = updating(known.clone()).next(child(Ok::<Source, GitError>(None)));
-    assert_eq!(answer, Ok(Next::Done(known)));
+    let mut run = updating(known.clone());
+    let none = child(Ok::<Source, GitError>(None));
+    assert_eq!(finished(run.next(none)), (known, 1));
+}
+
+// The project and source stages run from each call to its answer on the runner's clock.
+#[test]
+fn update_times_stages() {
+    let mut run = updating(projection(&[]));
+    let reports = run.abort();
+    let expected = GitCall::Stages(vec![("git_project", 40), ("git_source", 10)]);
+    let report = reports.into_iter().next().expect("the report");
+    assert_eq!(
+        store_call(Ok::<_, GitError>(Next::<()>::Call(report))),
+        expected
+    );
 }
 
 // Pushed metadata that cannot apply yet does not fail the update.
@@ -306,7 +345,26 @@ fn checkpoint_failure_tolerated() {
     assert!(asks_child(&run.next(child(Ok::<Source, GitError>(None)))));
     assert_eq!(run.step, UpdateStep::Checkpoint);
     let failed = child(Err::<GitRecord, _>(GitError::Unavailable));
-    assert_eq!(run.next(failed), Ok(Next::Done(known)));
+    assert_eq!(finished(run.next(failed)).0, known);
+}
+
+// The graph is canonicalized by the store, which times that stage itself.
+#[test]
+fn graph_canonicalized_there() {
+    let mut run = updating(projection(&[]));
+    let call = store_call(run.next(graph_source()));
+    assert!(matches!(call, GitCall::Canonicalize(_)));
+    assert_eq!(run.step, UpdateStep::Canonical);
+}
+
+// A new digest makes the first holder generate a snapshot.
+#[test]
+fn leader_generates() {
+    let mut run = updating(projection(&[]));
+    run.next(graph_source()).unwrap();
+    let digest = answered(GitAnswer::Canonical(Some([7; 32])));
+    assert!(asks_child(&run.next(digest)));
+    assert_eq!(run.step, UpdateStep::Generate);
 }
 
 // Another holder leaves a fresh revision to the first holder.
@@ -314,10 +372,10 @@ fn checkpoint_failure_tolerated() {
 fn follower_waits() {
     let mut known = projection(&[]);
     known.holders = vec![node(2), node(1)];
-    let graph = serde_json::json!({"@context": {}, "@graph": []}).to_string();
-    let source = Some((OLDER, graph));
-    let answer = updating(known.clone()).next(child(Ok::<Source, GitError>(source)));
-    assert_eq!(answer, Ok(Next::Done(known)));
+    let mut run = updating(known.clone());
+    run.next(graph_source()).unwrap();
+    let digest = answered(GitAnswer::Canonical(Some([7; 32])));
+    assert_eq!(finished(run.next(digest)).0, known);
 }
 
 #[test]
@@ -337,22 +395,18 @@ fn refresh_reuses_recent() {
     assert_eq!(answer, Ok(Next::Done(known)));
 }
 
-// A refresh is remembered only when no pushed metadata still waits.
+// A refresh is kept for later only when no pushed metadata still waits.
 #[test]
 fn refresh_remembers_settled() {
-    let refreshing = |document: &Document, rows| {
-        let mut run = refresh(&git_node(), document);
+    let refreshing = |rows| {
+        let mut run = refresh(&git_node(), &dataset_of(44));
         run.first().unwrap();
         assert!(asks_child(&run.next(unknown())));
         assert!(asks_child(&run.next(projected(projection(&[])))));
-        run.next(rows).unwrap();
+        finished(run.next(rows)).1
     };
-    let settled = dataset_of(44);
-    refreshing(&settled, no_rows());
-    assert!(last(settled.document_id).is_some());
-    let waiting = dataset_of(45);
-    refreshing(&waiting, one_row());
-    assert!(last(waiting.document_id).is_none());
+    assert_eq!(refreshing(no_rows()), 1);
+    assert_eq!(refreshing(one_row()), 0);
 }
 
 // A held refresh keeps the repository and only logs a failure.
@@ -365,6 +419,41 @@ fn held_refresh_logs() {
     assert!(asks_child(&run.first()));
     let failed = child(Err::<Projection, _>(GitError::Unavailable));
     assert_eq!(run.next(failed), Ok(Next::Done(())));
+}
+
+fn timed_answer(outcome: Option<Result<(), GitError>>) -> IoResult {
+    let event = match outcome {
+        Some(outcome) => Event::Child(ChildOutcome::new(outcome)),
+        None => Event::Delayed,
+    };
+    answered(GitAnswer::Timed {
+        event: Box::new(event),
+        stages: "git_process=1.0ms".to_string(),
+    })
+}
+
+fn timing() -> TimedWorkOperation {
+    let document = dataset_of(59);
+    let mut work = timed_work(document.document_id, held_refresh(&git_node(), &document));
+    work.stamp(100);
+    assert!(asks_store(&work.first()));
+    work.stamp(100 + SLOW_WORK_MS);
+    work
+}
+
+// Timed work answers with the outcome of what it ran, however long that took.
+#[test]
+fn timed_work_outcome() {
+    assert_eq!(
+        timing().next(timed_answer(Some(Ok(())))),
+        Ok(Next::Done(()))
+    );
+    let failed = timed_answer(Some(Err(GitError::Conflict)));
+    assert_eq!(timing().next(failed), Err(GitError::Conflict));
+    assert_eq!(
+        timing().next(timed_answer(None)),
+        Err(GitError::Unavailable)
+    );
 }
 
 /// A view stepped to the answer of its pending merges.
@@ -382,49 +471,39 @@ fn current_projection(document: &Document) -> Projection {
     known
 }
 
-// A current repository is served as it is and remembered.
+// A current repository is served as it is and kept for the next read.
 #[test]
 fn view_serves_current() {
     let document = dataset_of(47);
     let known = current_projection(&document);
     let answer = viewing(&document, known.clone()).next(no_rows());
-    assert_eq!(answer, Ok(Next::Done((known, false))));
-    assert!(last(document.document_id).is_some());
+    assert_eq!(finished(answer), ((known, false), 1));
 }
 
-// Waiting work starts one refresh beside the read, which is answered as pending.
+// Waiting work asks for one refresh beside the read, which is answered as pending.
 #[test]
 fn view_starts_refresh() {
     let document = dataset_of(48);
     let known = current_projection(&document);
     let mut run = viewing(&document, known.clone());
-    let Ok(Next::Call(IoCall::Effect(effect))) = run.next(one_row()) else {
-        panic!("expected the background start");
+    let call = store_call(run.next(one_row()));
+    let GitCall::RefreshOnce { document_id, .. } = call else {
+        panic!("expected the background refresh");
     };
-    assert!(matches!(*effect, Effect::Background(_)));
-    assert_eq!(run.next(IoResult::Done), Ok(Next::Done((known, true))));
-}
-
-// A refresh already running is not started again.
-#[test]
-fn running_refresh_kept() {
-    let document = dataset_of(49);
-    let _running = RefreshClaim::take(document.document_id).unwrap();
-    let known = current_projection(&document);
-    let answer = viewing(&document, known.clone()).next(one_row());
-    assert_eq!(answer, Ok(Next::Done((known, true))));
+    assert_eq!(document_id, document.document_id);
+    let started = answered(GitAnswer::RefreshStarted(false));
+    assert_eq!(run.next(started), Ok(Next::Done((known, true))));
 }
 
 // While another run holds the repository, the last projection is served as pending.
 #[test]
 fn busy_serves_last() {
-    let document = dataset_of(50);
     let known = projection(&[]);
-    remember(Some(node(1)), &document, false, &known);
-    let mut run = read_view(&git_node(), &document);
+    let mut run = read_view(&git_node(), &dataset_of(50));
     assert!(asks_store(&run.first()));
-    let busy = answered(GitAnswer::Busy(true));
-    assert_eq!(run.next(busy), Ok(Next::Done((known, true))));
+    assert!(asks_store(&run.next(answered(GitAnswer::Busy(true)))));
+    let answer = run.next(kept(Some(known.clone())));
+    assert_eq!(answer, Ok(Next::Done((known, true))));
 }
 
 // A free repository, or one never projected here, is viewed under its hold.
@@ -435,9 +514,8 @@ fn idle_read_views() {
     assert!(asks_child(&free.next(answered(GitAnswer::Busy(false)))));
     let mut first_time = read_view(&git_node(), &dataset_of(52));
     first_time.first().unwrap();
-    assert!(asks_child(
-        &first_time.next(answered(GitAnswer::Busy(true)))
-    ));
+    first_time.next(answered(GitAnswer::Busy(true))).unwrap();
+    assert!(asks_child(&first_time.next(kept(None))));
     let viewed = (projection(&[]), false);
     let answer = first_time.next(child(Ok::<_, GitError>(viewed.clone())));
     assert_eq!(answer, Ok(Next::Done(viewed)));
@@ -452,13 +530,32 @@ fn capture_needs_store() {
     assert_eq!(run.next(none), Ok(Next::Done(())));
 }
 
+// A capture runs as timed work and passes its outcome on.
+#[test]
+fn capture_runs_timed() {
+    let mut run = capture(&git_node(), &dataset_of(53), None);
+    run.first().unwrap();
+    assert!(asks_child(&run.next(answered(GitAnswer::Configured(true)))));
+    let failed = child(Err::<(), _>(GitError::Unavailable));
+    assert_eq!(run.next(failed), Err(GitError::Unavailable));
+}
+
 // A node that does not hold the document is done; other failures defer the job.
 #[test]
-fn capture_outcomes() {
+fn held_capture_outcomes() {
     let finish = |error: GitError| {
-        let mut run = capture(&git_node(), &dataset_of(54), None);
-        run.first().unwrap();
-        assert!(asks_child(&run.next(answered(GitAnswer::Configured(true)))));
+        let document = dataset_of(54);
+        let mut run = HeldCaptureOperation {
+            node: git_node(),
+            record: document.clone(),
+            revision: None,
+            forgotten: false,
+        };
+        let scope = HoldScope::GitRepository(document.document_id);
+        assert_eq!(run.hold_scope(), Some(scope));
+        let call = store_call(run.first());
+        assert_eq!(call, GitCall::Forget(document.document_id));
+        assert!(asks_child(&run.next(answered(GitAnswer::Noted))));
         run.next(child(Err::<Projection, _>(error)))
     };
     assert_eq!(finish(GitError::NotHolder), Ok(Next::Done(())));
@@ -481,7 +578,8 @@ fn busy_status_pending() {
     let mut run = super::status(&git_node(), &auth(), document.document_id);
     assert!(asks_child(&run.first()));
     assert!(asks_store(&run.next(opened(&document))));
-    assert!(asks_child(&run.next(answered(GitAnswer::Busy(true)))));
+    assert!(asks_store(&run.next(answered(GitAnswer::Busy(true)))));
+    assert!(asks_child(&run.next(kept(None))));
     let answer = run.next(child(Ok::<Option<GitStatus>, GitError>(None)));
     let Ok(Next::Done((None, seen, None, _, true))) = answer else {
         panic!("expected the pending status");

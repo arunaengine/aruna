@@ -2,22 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
-
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::git::{
     CHECKPOINT_AFTER, GitEffect, GitEvent, GitRecord, GitStatus, PENDING, PendingMerge, STATUS,
 };
+use aruna_core::git_state::{GitState, Projection};
 use aruna_core::keyspaces::{MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{
     MaterializationState, MaterializationStatusRecord, MetadataEffect, MetadataEvent,
     MetadataRawRevision,
 };
-use aruna_core::operation::{HoldScope, Operation, boxed_suboperation};
+use aruna_core::operation::{HoldScope, Operation, Runnable, boxed_suboperation};
 use aruna_core::repo_layout::{Layout, metadata_layout};
 use aruna_core::storage_entries::{document_job_prefix, materialization_status_key};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -28,12 +25,12 @@ use ulid::Ulid;
 
 use super::access::Repository;
 use super::calls::{
-    busy_call, configured_call, git_call, git_event, git_flag, has_store, metadata_call,
-    metadata_event,
+    StageTimes, busy_call, canonical_answer, canonical_call, configured_call, forget_call,
+    git_call, git_event, git_flag, has_store, kept_projection, last_call, metadata_call,
+    metadata_event, noted, refresh_once_call, remember_call, timed_call, timed_outcome,
 };
 use super::generate::{checkpoint, generate};
-use super::project::{Projection, forget, last, project, recent, remember};
-use super::state::GitState;
+use super::project::{inputs, project, recent};
 use super::{GitError, GitNode, document, pending, publish, records, repository};
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::revision_read::{MetadataRawView, RawDisplayOperation};
@@ -43,6 +40,8 @@ type PendingRows = Vec<(Vec<u8>, PendingMerge)>;
 
 /// How long other holders leave a new revision to the first holder before generating it.
 const FAILOVER_MS: u64 = 60_000;
+/// Background snapshot work at least this long is logged with its stages.
+const SLOW_WORK_MS: u64 = 300;
 
 fn overdue(now_ms: u64, document: &Document) -> bool {
     now_ms.saturating_sub(document.updated_at_ms) > FAILOVER_MS
@@ -174,6 +173,7 @@ enum UpdateStep {
     Project,
     Pending,
     Current,
+    Canonical,
     Misplaced,
     Generate,
     Reproject,
@@ -195,7 +195,7 @@ fn update(
         document: document.clone(),
         revision,
         materializing,
-        now_ms: 0,
+        stages: StageTimes::default(),
         step: UpdateStep::Project,
         projection: None,
         source: None,
@@ -208,7 +208,7 @@ struct UpdateOperation {
     document: Document,
     revision: Option<MetadataRawRevision>,
     materializing: bool,
-    now_ms: u64,
+    stages: StageTimes,
     step: UpdateStep,
     projection: Option<Projection>,
     source: Source,
@@ -245,22 +245,25 @@ impl UpdateOperation {
     }
 
     /// The graph's content decides, so a late older edit that changes it is captured too.
-    fn with_source(&mut self, source: Source) -> UpdateTurn {
-        let Some(source) = source else {
+    fn canonicalize(&mut self, source: Source) -> UpdateTurn {
+        let Some(jsonld) = source.as_ref().map(|(_, jsonld)| jsonld.clone()) else {
             return self.fold();
         };
-        let canonical = craqle::canonicalize_jsonld(&source.1);
-        let due = self.leading()? || overdue(self.now_ms, &self.document);
-        let Some(canonical) = canonical.ok().filter(|_| due) else {
+        self.source = source;
+        self.step = UpdateStep::Canonical;
+        Ok(Next::Call(canonical_call(jsonld)))
+    }
+
+    fn with_digest(&mut self, digest: Option<[u8; 32]>) -> UpdateTurn {
+        let due = self.leading()? || overdue(self.stages.now_ms(), &self.document);
+        let Some(digest) = digest.filter(|_| due) else {
+            self.source = None;
             return self.fold();
         };
-        let stale = self.projection()?.state.digest != Some(canonical.digest);
-        let jsonld = source.1.clone();
-        self.source = Some(source);
-        if stale {
-            return self.generate(Some(canonical.digest));
+        if self.projection()?.state.digest != Some(digest) {
+            return self.generate(Some(digest));
         }
-        match self.misplaced_call(&jsonld)? {
+        match self.misplaced_call()? {
             Some(call) => {
                 self.step = UpdateStep::Misplaced;
                 Ok(Next::Call(call))
@@ -271,7 +274,8 @@ impl UpdateOperation {
 
     /// Asks the layout of a main that Aruna made as an ARC although the metadata has no ARC
     /// markers, as earlier versions did for every dataset; such a main becomes a plain RO-Crate.
-    fn misplaced_call(&self, jsonld: &str) -> Result<Option<IoCall>, GitError> {
+    fn misplaced_call(&self) -> Result<Option<IoCall>, GitError> {
+        let (_, jsonld) = self.source.as_ref().ok_or(IoError::Unfinished)?;
         let state = &self.projection()?.state;
         let Some(main) = state.refs.get("refs/heads/main") else {
             return Ok(None);
@@ -301,9 +305,8 @@ impl UpdateOperation {
     }
 
     fn finish(&mut self) -> UpdateTurn {
-        Ok(Next::Done(
-            self.projection.take().ok_or(IoError::Unfinished)?,
-        ))
+        let projection = self.projection.take().ok_or(IoError::Unfinished)?;
+        Ok(self.stages.finish(projection, Vec::new()))
     }
 }
 
@@ -311,15 +314,21 @@ impl Operation for UpdateOperation {
     type Output = Projection;
     type Error = GitError;
 
+    fn abort(&mut self) -> Vec<IoCall> {
+        self.stages.report()
+    }
+
     fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
+        self.stages.stamp(now_ms);
     }
 
     fn first(&mut self) -> UpdateTurn {
+        self.stages.start("git_project");
         self.project(UpdateStep::Project)
     }
 
     fn next(&mut self, result: IoResult) -> UpdateTurn {
+        self.stages.stop();
         match self.step {
             UpdateStep::Project => {
                 self.projection = Some(result.child::<Projection, GitError>()??);
@@ -333,11 +342,13 @@ impl Operation for UpdateOperation {
                     warn!(%document_id, %error, "Pushed metadata waits");
                 }
                 self.step = UpdateStep::Current;
+                self.stages.start("git_source");
                 let revision = self.revision.as_ref();
                 let read = current(&self.document, revision, self.materializing);
                 Ok(Next::Call(IoCall::child(read)))
             }
-            UpdateStep::Current => self.with_source(result.child::<Source, GitError>()??),
+            UpdateStep::Current => self.canonicalize(result.child::<Source, GitError>()??),
+            UpdateStep::Canonical => self.with_digest(canonical_answer(result)?),
             UpdateStep::Misplaced => {
                 // A switch records no digest, so the next refresh confirms the new snapshot.
                 match git_event(result)? {
@@ -361,7 +372,10 @@ impl Operation for UpdateOperation {
                     self.finish()
                 }
             },
-            UpdateStep::Final => Ok(Next::Done(result.child::<Projection, GitError>()??)),
+            UpdateStep::Final => {
+                self.projection = Some(result.child::<Projection, GitError>()??);
+                self.finish()
+            }
         }
     }
 }
@@ -401,6 +415,12 @@ impl RefreshOperation {
     }
 }
 
+/// Keeps a projection for later refreshes under the state it was made in.
+fn keep_call(node: &GitNode, document: &Document, due: bool, projection: &Projection) -> IoCall {
+    let made = inputs(node.node(), document, due);
+    remember_call(document.document_id, made, projection)
+}
+
 impl Operation for RefreshOperation {
     type Output = Projection;
     type Error = GitError;
@@ -432,35 +452,17 @@ impl Operation for RefreshOperation {
             RefreshStep::Pending => {
                 // Pushed metadata that still waits must be retried by the next refresh.
                 let rows = result.child::<PendingRows, GitError>()?;
-                let projection = self.projection.take().ok_or(IoError::Unfinished)?;
-                if rows.is_ok_and(|rows| rows.is_empty()) {
-                    let due = self.overdue();
-                    remember(self.node.node(), &self.document, due, &projection);
+                let output = self.projection.take().ok_or(IoError::Unfinished)?;
+                if !rows.is_ok_and(|rows| rows.is_empty()) {
+                    return Ok(Next::Done(output));
                 }
-                Ok(Next::Done(projection))
+                let due = self.overdue();
+                let keep = keep_call(&self.node, &self.document, due, &output);
+                Ok(Next::Then {
+                    output,
+                    calls: vec![keep],
+                })
             }
-        }
-    }
-}
-
-/// Documents with a background refresh queued or running on this node.
-static REFRESHING: LazyLock<Mutex<HashSet<Ulid>>> = LazyLock::new(Default::default);
-
-/// Marks one document's background refresh as running until it is dropped.
-#[derive(Debug, PartialEq)]
-struct RefreshClaim(Ulid);
-
-impl RefreshClaim {
-    fn take(document_id: Ulid) -> Option<Self> {
-        let mut running = REFRESHING.lock().ok()?;
-        running.insert(document_id).then_some(Self(document_id))
-    }
-}
-
-impl Drop for RefreshClaim {
-    fn drop(&mut self) {
-        if let Ok(mut running) = REFRESHING.lock() {
-            running.remove(&self.0);
         }
     }
 }
@@ -470,7 +472,6 @@ pub(super) fn held_refresh(node: &GitNode, document: &Document) -> HeldRefreshOp
     HeldRefreshOperation {
         refresh: Some(refresh(node, document)),
         document_id: document.document_id,
-        claim: None,
     }
 }
 
@@ -478,7 +479,6 @@ pub(super) fn held_refresh(node: &GitNode, document: &Document) -> HeldRefreshOp
 pub(super) struct HeldRefreshOperation {
     refresh: Option<RefreshOperation>,
     document_id: Ulid,
-    claim: Option<RefreshClaim>,
 }
 
 impl Operation for HeldRefreshOperation {
@@ -498,21 +498,63 @@ impl Operation for HeldRefreshOperation {
         if let Err(error) = result.child::<Projection, GitError>()? {
             warn!(document_id = %self.document_id, %error, "Git refresh failed");
         }
-        self.claim = None;
+        Ok(Next::Done(()))
+    }
+}
+
+/// Runs background snapshot work under its own stage timers and logs them when it is slow.
+fn timed_work<O, K>(document_id: Ulid, work: O) -> TimedWorkOperation
+where
+    O: Runnable<K, Output = (), Error = GitError> + 'static,
+    K: 'static,
+{
+    TimedWorkOperation {
+        document_id,
+        call: Some(timed_call(work)),
+        now_ms: 0,
+        started_ms: 0,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct TimedWorkOperation {
+    document_id: Ulid,
+    call: Option<IoCall>,
+    now_ms: u64,
+    started_ms: u64,
+}
+
+impl Operation for TimedWorkOperation {
+    type Output = ();
+    type Error = GitError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<()>, GitError> {
+        self.started_ms = self.now_ms;
+        Ok(Next::Call(self.call.take().ok_or(IoError::Unfinished)?))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, GitError> {
+        let (outcome, stages) = timed_outcome::<(), GitError>(result)?;
+        let total_ms = self.now_ms.saturating_sub(self.started_ms);
+        if total_ms >= SLOW_WORK_MS {
+            tracing::info!(document_id = %self.document_id, total_ms, %stages,
+                "Slow Git snapshot work");
+        }
+        outcome.ok_or(GitError::Unavailable)??;
         Ok(Next::Done(()))
     }
 }
 
 /// Starts the full refresh once beside the caller, while a background slot is free. A lost
 /// run is found again by the next read; what it acts on is stored durably.
-fn background_call(node: &GitNode, document: &Document) -> Option<IoCall> {
-    let claim = RefreshClaim::take(document.document_id)?;
-    let run = HeldRefreshOperation {
-        claim: Some(claim),
-        ..held_refresh(node, document)
-    };
-    let child = boxed_suboperation(run, |_| Event::Delayed);
-    Some(Effect::Background(child).into())
+fn background_call(node: &GitNode, document: &Document) -> IoCall {
+    let id = document.document_id;
+    let run = timed_work(id, held_refresh(node, document));
+    refresh_once_call(id, boxed_suboperation(run, |_| Event::Delayed))
 }
 
 /// What the pending call of viewing a repository answers.
@@ -554,28 +596,21 @@ impl ViewOperation {
         overdue(self.now_ms, &self.document)
     }
 
-    fn finish(&mut self, pending: bool) -> ViewTurn {
-        let projection = self.projection.take().ok_or(IoError::Unfinished)?;
-        Ok(Next::Done((projection, pending)))
-    }
-
     fn settle(&mut self, waiting: bool) -> ViewTurn {
         let projection = self.projection.as_ref().ok_or(IoError::Unfinished)?;
         let pending = waiting
             || projection.state.revision != Some(self.document.last_event_id)
             || publish::uncovered(&projection.records).len() > CHECKPOINT_AFTER;
-        if !pending {
-            let due = self.overdue();
-            remember(self.node.node(), &self.document, due, projection);
-            return self.finish(false);
+        if pending {
+            self.step = ViewStep::Background;
+            return Ok(Next::Call(background_call(&self.node, &self.document)));
         }
-        match background_call(&self.node, &self.document) {
-            Some(call) => {
-                self.step = ViewStep::Background;
-                Ok(Next::Call(call))
-            }
-            None => self.finish(true),
-        }
+        let keep = keep_call(&self.node, &self.document, self.overdue(), projection);
+        let projection = self.projection.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Then {
+            output: (projection, false),
+            calls: vec![keep],
+        })
     }
 }
 
@@ -615,10 +650,21 @@ impl Operation for ViewOperation {
                 let rows = result.child::<PendingRows, GitError>()??;
                 self.settle(!rows.is_empty())
             }
-            // Whether a slot was free changes nothing: the next read asks again.
-            ViewStep::Background => self.finish(true),
+            // Whether a refresh started changes nothing: the next read asks again.
+            ViewStep::Background => {
+                let projection = self.projection.take().ok_or(IoError::Unfinished)?;
+                Ok(Next::Done((projection, true)))
+            }
         }
     }
+}
+
+/// What the pending call of a read view answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadStep {
+    Busy,
+    Last,
+    View,
 }
 
 /// [`view`] without waiting behind a running snapshot: while one holds the repository, the last
@@ -627,7 +673,7 @@ pub(super) fn read_view(node: &GitNode, document: &Document) -> ReadViewOperatio
     ReadViewOperation {
         node: node.clone(),
         document: document.clone(),
-        asked: false,
+        step: ReadStep::Busy,
     }
 }
 
@@ -635,7 +681,14 @@ pub(super) fn read_view(node: &GitNode, document: &Document) -> ReadViewOperatio
 pub(super) struct ReadViewOperation {
     node: GitNode,
     document: Document,
-    asked: bool,
+    step: ReadStep,
+}
+
+impl ReadViewOperation {
+    fn view(&mut self) -> ViewTurn {
+        self.step = ReadStep::View;
+        Ok(Next::Call(IoCall::child(view(&self.node, &self.document))))
+    }
 }
 
 impl Operation for ReadViewOperation {
@@ -647,16 +700,20 @@ impl Operation for ReadViewOperation {
     }
 
     fn next(&mut self, result: IoResult) -> ViewTurn {
-        if self.asked {
-            return Ok(Next::Done(result.child::<Viewed, GitError>()??));
+        match self.step {
+            ReadStep::Busy => {
+                if !git_flag(result)? {
+                    return self.view();
+                }
+                self.step = ReadStep::Last;
+                Ok(Next::Call(last_call(self.document.document_id)))
+            }
+            ReadStep::Last => match kept_projection(result)? {
+                Some(projection) => Ok(Next::Done((projection, true))),
+                None => self.view(),
+            },
+            ReadStep::View => Ok(Next::Done(result.child::<Viewed, GitError>()??)),
         }
-        self.asked = true;
-        if git_flag(result)?
-            && let Some(projection) = last(self.document.document_id)
-        {
-            return Ok(Next::Done((projection, true)));
-        }
-        Ok(Next::Call(IoCall::child(view(&self.node, &self.document))))
     }
 }
 
@@ -667,22 +724,53 @@ pub fn capture(
     revision: Option<&MetadataRawRevision>,
 ) -> CaptureOperation {
     CaptureOperation {
-        node: node.clone(),
-        record: record.clone(),
-        revision: revision.cloned(),
-        checked: false,
+        held: Some(HeldCaptureOperation {
+            node: node.clone(),
+            record: record.clone(),
+            revision: revision.cloned(),
+            forgotten: false,
+        }),
+        document_id: record.document_id,
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct CaptureOperation {
-    node: GitNode,
-    record: Document,
-    revision: Option<MetadataRawRevision>,
-    checked: bool,
+    held: Option<HeldCaptureOperation>,
+    document_id: Ulid,
 }
 
 impl Operation for CaptureOperation {
+    type Output = ();
+    type Error = GitError;
+
+    fn first(&mut self) -> Result<Next<()>, GitError> {
+        Ok(Next::Call(configured_call(self.document_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, GitError> {
+        let Some(held) = self.held.take() else {
+            result.child::<(), GitError>()??;
+            return Ok(Next::Done(()));
+        };
+        if !has_store(result)? {
+            return Ok(Next::Done(()));
+        }
+        let work = timed_work(self.document_id, held);
+        Ok(Next::Call(IoCall::child(work)))
+    }
+}
+
+/// Snapshots the materialized graph under the repository hold.
+#[derive(Debug, PartialEq)]
+struct HeldCaptureOperation {
+    node: GitNode,
+    record: Document,
+    revision: Option<MetadataRawRevision>,
+    forgotten: bool,
+}
+
+impl Operation for HeldCaptureOperation {
     type Output = ();
     type Error = GitError;
 
@@ -691,16 +779,13 @@ impl Operation for CaptureOperation {
     }
 
     fn first(&mut self) -> Result<Next<()>, GitError> {
-        Ok(Next::Call(configured_call(self.record.document_id)))
+        Ok(Next::Call(forget_call(self.record.document_id)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, GitError> {
-        if !self.checked {
-            self.checked = true;
-            if !has_store(result)? {
-                return Ok(Next::Done(()));
-            }
-            forget(self.record.document_id);
+        if !self.forgotten {
+            self.forgotten = true;
+            noted(result)?;
             let run = update(&self.node, &self.record, self.revision.take(), true);
             return Ok(Next::Call(IoCall::child(run)));
         }
@@ -726,6 +811,7 @@ pub type StatusView = (
 enum StatusStep {
     Repository,
     Busy,
+    Last,
     View,
     Status,
     Layout,
@@ -805,7 +891,11 @@ impl Operation for StatusOperation {
                     self.step = StatusStep::View;
                     return Ok(Next::Call(IoCall::child(run)));
                 }
-                let projection = last(self.id).unwrap_or_else(|| Projection {
+                self.step = StatusStep::Last;
+                Ok(Next::Call(last_call(self.id)))
+            }
+            StatusStep::Last => {
+                let projection = kept_projection(result)?.unwrap_or_else(|| Projection {
                     state: GitState::default(),
                     records: Default::default(),
                     holders: Vec::new(),
