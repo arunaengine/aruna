@@ -14,10 +14,11 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::store::state::read_job_record;
+use aruna_operations::plugin_host::read_config;
 use aruna_operations::plugins::decide::event_delivery;
-use aruna_operations::plugins::dispatch::{StartError, run_again, start_run};
-use aruna_operations::plugins::finished::{drop_completion, waits_for};
-use aruna_operations::plugins::install::{InstallError, read_config};
+use aruna_operations::plugins::dispatch::{StartError, StartRun};
+use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for};
+use aruna_operations::plugins::install::InstallError;
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
 use aruna_operations::plugins::work::{
@@ -501,16 +502,9 @@ pub async fn start(
         .unwrap_or_else(|| Value::Object(Default::default()))
         .to_string();
     let (realm, local, ctx) = (state.get_realm_id(), state.get_node_id(), state.get_ctx());
-    let started = start_run(
-        &ctx,
-        &auth,
-        realm,
-        local,
-        install.install_id,
-        &input,
-        unix_timestamp_millis(),
-    );
-    match started.await {
+    let now_ms = unix_timestamp_millis();
+    let start = StartRun::new(&auth, (realm, local), install.install_id, &input, now_ms);
+    match drive(start, &ctx).await {
         Ok(run) => (StatusCode::CREATED, Json(view(run))).into_response(),
         Err(error) => start_error(error),
     }
@@ -925,7 +919,8 @@ pub async fn retry(
         Err(response) => return response,
     };
     let ids = (served.install_id, run_id);
-    match run_again(&ctx, ids, &audit, unix_timestamp_millis()).await {
+    let retried = async { drive(retry_run(ids, &audit, unix_timestamp_millis())?, &ctx).await };
+    match retried.await {
         Ok(run) => Json(view(run)).into_response(),
         Err(error) => run_error(error),
     }
