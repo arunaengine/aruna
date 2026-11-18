@@ -2,13 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::accepted_create_matches;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
@@ -165,7 +166,7 @@ pub(crate) async fn existing_record(
     context: &Arc<DriverContext>,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, String> {
-    load_document_record(context.as_ref(), document_id)
+    drive(DocumentRecordOperation::new(document_id), context.as_ref())
         .await
         .map_err(|error| format!("metadata registry read failed: {error:?}"))
 }

@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::pinned::PinnedCreate;
+use super::route_create::RouteCreateOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
@@ -9,7 +11,7 @@ use crate::device::edit::accepts_edits;
 use crate::device::edit::apply_local_edit;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export::get_visible_document;
+use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::read::ensure_record_readable;
 use crate::metadata::api::read::load_live_record;
@@ -18,24 +20,21 @@ use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::create_document::CreateDocumentOperation;
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::create_document::CreateDocumentResult;
-use crate::metadata::create_document::mint_forward_document;
-use crate::metadata::create_document::mint_local_document;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::create_entry::create_metadata_document;
+use crate::metadata::create_document::{mint_forward_document, mint_local_document};
+use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
-use crate::metadata::profile::validation::current_validation_status;
-use crate::metadata::profile::validation::revalidate_current;
+use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
-use crate::metadata::update_entry::update_metadata_document;
+use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::notifications::watch::origin::EmitEventOperation;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
-use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataBatch;
@@ -49,8 +48,6 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
-use serde::Deserialize;
-use serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
@@ -82,54 +79,6 @@ use crate::forward::transport::retry_disposition;
 use crate::forward::transport::unexpected_response;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use aruna_core::StructuredId;
-
-/// Creates locally when the origin holds the bucket, otherwise at a holder.
-/// Definitely unsent requests may try another holder; ambiguous delivery is
-/// terminal so the create is not replayed.
-pub async fn route_metadata_create(
-    operation: CreateDocumentOperation,
-    context: Arc<DriverContext>,
-    auth_token: Option<AuthToken>,
-) -> Result<CreateDocumentResult, MetadataWriteError> {
-    let config = operation.config().clone();
-    let commit_message = operation.message().map(str::to_owned);
-    match create_metadata_document(operation, context.clone()).await {
-        Err(CreateDocumentError::HoldsNoBucket) => {}
-        Ok(created) => return Ok(created),
-        Err(error) => return Err(error.into()),
-    }
-
-    // Mint the forwarded id at the origin with the blind-hash bucket of the
-    // subject, so every candidate holder stamps the same bucket.
-    let realm_config = load_realm_config(&context, config.actor.realm_id)
-        .await
-        .ok_or_else(|| {
-            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
-        })?;
-    let document_id = if config.document_id.is_nil() {
-        mint_forward_document(
-            &realm_config,
-            &config.actor,
-            config.group_id,
-            &config.document_path,
-        )?
-    } else {
-        MetaResourceId::from_bytes(config.document_id.to_bytes()).map_err(|error| {
-            CreateDocumentError::PlacementBindingUnavailable(format!(
-                "forwarded document id is not a structured id: {error}"
-            ))
-        })?
-    };
-    let target = (document_id.as_ulid(), None);
-    forward_create(
-        &context,
-        &realm_config,
-        &config,
-        target,
-        (auth_token, commit_message),
-    )
-    .await
-}
 
 /// Sends the create of `document_id` to the holders of its bucket, or to the `pinned` one only,
 /// and checks the record the answering holder returns.
@@ -190,7 +139,7 @@ async fn forward_create(
 
 /// Errors of the shared authorized create flow. Every variant maps onto the
 /// same transport status the former REST-local sequence produced.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum CreateAuthorizedError {
     #[error("metadata document path must not be empty")]
     EmptyPath,
@@ -204,6 +153,13 @@ pub enum CreateAuthorizedError {
     Authorize(#[from] AuthorizeError),
     #[error(transparent)]
     Write(#[from] MetadataWriteError),
+}
+
+/// A runner failure leaves the create undelivered.
+impl From<aruna_core::calls::IoError> for CreateAuthorizedError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        Self::Write(error.into())
+    }
 }
 
 /// Shared metadata create used by REST and MCP: normalize the path, mint the document id, run
@@ -264,18 +220,21 @@ pub async fn create_metadata_authorized(
         )
         .await?;
     }
-    let created = route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor,
-            group_id,
-            document_id,
-            document_path: path,
-            public,
-            payload,
-        })
-        .with_message(commit_message),
-        context.clone(),
-        auth_token,
+    let created = drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path: path,
+                public,
+                payload,
+            })
+            .with_message(commit_message),
+            context.net_handle.as_ref().map(|net| net.node_id()),
+            auth_token,
+        ),
+        &context,
     )
     .await?;
     let event_id = created.event_id;
@@ -294,67 +253,6 @@ pub async fn create_metadata_authorized(
     let _ = drive(emit, context).await;
 
     Ok(record)
-}
-
-/// A create of a given document on one pinned node, kept so that a retry sends the very same
-/// arguments to the very same node.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PinnedCreate {
-    pub group_id: GroupId,
-    /// The normalized document path.
-    pub path: String,
-    pub document_id: Ulid,
-    /// This node, or the holder of the document's bucket chosen when the id was minted.
-    pub target: NodeId,
-    pub payload: CreateDocumentPayload,
-    pub message: Option<String>,
-}
-
-impl PinnedCreate {
-    /// Mints the id of a new private document at `path` and pins the node that creates it: this
-    /// node when it holds the id's bucket, else the first other holder of that bucket.
-    pub async fn mint(
-        context: &Arc<DriverContext>,
-        actor: &Actor,
-        (group_id, path): (GroupId, &str),
-        (payload, message): (CreateDocumentPayload, Option<String>),
-    ) -> Result<Self, CreateAuthorizedError> {
-        let path = MetadataRegistryRecord::normalize_document_path(path);
-        if path.is_empty() {
-            return Err(CreateAuthorizedError::EmptyPath);
-        }
-        let config = load_realm_config(context, actor.realm_id)
-            .await
-            .ok_or(MetadataApiError::ServiceUnavailable)?;
-        let user_origin =
-            is_user_origin(&config, actor.node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
-        let local = match user_origin {
-            true => Err(CreateDocumentError::HoldsNoBucket),
-            false => mint_local_document(&config, actor, group_id, &path),
-        };
-        let (document_id, target) = match local {
-            Ok(id) => (id.as_ulid(), actor.node_id),
-            Err(CreateDocumentError::HoldsNoBucket) => {
-                let id = mint_forward_document(&config, actor, group_id, &path)?.as_ulid();
-                let placement = resolve_metadata_id(&config, actor.realm_id, Some(group_id), id)?;
-                let holders = resolve_shard_holders(&config, &placement);
-                let target = holders.into_iter().find(|holder| *holder != actor.node_id);
-                let target = target.ok_or_else(|| {
-                    MetadataWriteError::Undeliverable("the document has no holder".to_string())
-                })?;
-                (id, target)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        Ok(Self {
-            group_id,
-            path,
-            document_id,
-            target,
-            payload,
-            message,
-        })
-    }
 }
 
 /// Creates the pinned document on its target only, authorized on the document's own path, so a
@@ -394,7 +292,14 @@ pub async fn create_with_id(
     let created = if local {
         let operation =
             CreateDocumentOperation::new_generated_id(config).with_message(create.message.clone());
-        create_metadata_document(operation, context.clone()).await?
+        drive(
+            CreateEntryOperation::new(
+                operation,
+                context.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            &context,
+        )
+        .await?
     } else {
         let realm_config = load_realm_config(context, realm_id)
             .await
@@ -491,16 +396,23 @@ pub async fn route_metadata_update(
     let local_holds = holders.contains(&local_node_id);
     let mut local_capacity = false;
     if local_holds && let Some(record) = record {
-        match update_metadata_document(
-            UpdateDocumentOperation::new(UpdateDocumentConfig {
-                actor: actor.clone(),
-                group_id: record.group_id,
-                document_id,
-                public: public.unwrap_or(record.public),
-                mutation: mutation.clone(),
-                expected_revision,
-            })
-            .with_message(commit_message.clone()),
+        match drive(
+            UpdateEntryOperation::new(
+                UpdateDocumentOperation::new(UpdateDocumentConfig {
+                    actor: actor.clone(),
+                    group_id: record.group_id,
+                    document_id,
+                    public: public.unwrap_or(record.public),
+                    mutation: mutation.clone(),
+                    expected_revision,
+                })
+                .with_message(commit_message.clone()),
+                context
+                    .as_ref()
+                    .net_handle
+                    .as_ref()
+                    .map(|net| net.node_id()),
+            ),
             context.as_ref(),
         )
         .await
@@ -768,13 +680,15 @@ pub(crate) async fn apply_forwarded_write(
                 Ok(auth)
                     if holds_metadata_id(&config, realm_id, net_handle.node_id(), *document_id) =>
                 {
-                    get_visible_document(
+                    drive(
+                        VisibleRecordOperation::new(
+                            realm_id,
+                            GetVisibleRequest {
+                                document_id: *document_id,
+                                auth,
+                            },
+                        ),
                         context.as_ref(),
-                        realm_id,
-                        GetVisibleRequest {
-                            document_id: *document_id,
-                            auth,
-                        },
                     )
                     .await
                     .map(Box::new)
@@ -830,9 +744,24 @@ pub(crate) async fn apply_forwarded_write(
                         };
                     }
                     if *revalidate {
-                        revalidate_current(context.as_ref(), &record).await
+                        drive(
+                            RevalidateOperation::new(
+                                context
+                                    .as_ref()
+                                    .net_handle
+                                    .as_ref()
+                                    .map(|net| net.node_id()),
+                                record.clone(),
+                            ),
+                            context.as_ref(),
+                        )
+                        .await
                     } else {
-                        current_validation_status(context.as_ref(), &record).await
+                        drive(
+                            ValidationStatusOperation::new(record.clone()),
+                            context.as_ref(),
+                        )
+                        .await
                     }
                     .map(Box::new)
                     .map_err(|_| MetadataReadError::Unavailable)
@@ -894,7 +823,15 @@ pub(crate) async fn apply_forwarded_write(
                 }
                 let operation = CreateDocumentOperation::new_forwarded(create_config.clone())
                     .with_message(commit_message);
-                match create_metadata_document(operation, context.clone()).await {
+                match drive(
+                    CreateEntryOperation::new(
+                        operation,
+                        context.net_handle.as_ref().map(|net| net.node_id()),
+                    ),
+                    &context,
+                )
+                .await
+                {
                     Ok(created) => MetadataTransportMessage::ForwardedRecord {
                         record: Box::new(created.record),
                     },
@@ -955,7 +892,19 @@ pub(crate) async fn apply_forwarded_write(
                     expected_revision,
                 })
                 .with_message(commit_message);
-                match update_metadata_document(operation, context.as_ref()).await {
+                match drive(
+                    UpdateEntryOperation::new(
+                        operation,
+                        context
+                            .as_ref()
+                            .net_handle
+                            .as_ref()
+                            .map(|net| net.node_id()),
+                    ),
+                    context.as_ref(),
+                )
+                .await
+                {
                     Ok(record) => MetadataTransportMessage::ForwardedRecord {
                         record: Box::new(record),
                     },

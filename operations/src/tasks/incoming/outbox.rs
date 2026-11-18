@@ -1115,9 +1115,12 @@ impl OperationsTaskHandler {
     ) -> Result<(), ()> {
         if !metadata_create_events.is_empty() {
             let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
-            if let Err(error) =
-                project_create_events(&self.context, metadata_create_events, local_node_id).await
-            {
+            let project = ProjectEventsOperation::new(
+                metadata_create_events,
+                local_node_id,
+                max_clock_skew(),
+            );
+            if let Err(error) = drive(project, &self.context).await {
                 warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
                 return Err(());
             }
@@ -1136,7 +1139,10 @@ impl OperationsTaskHandler {
             };
             create_event_targets.push((document_id, event_id));
         }
-        if let Err(error) = project_logged_events(&self.context, create_event_targets).await {
+        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
+        let project =
+            ProjectLoggedOperation::new(create_event_targets, false, local_node, max_clock_skew());
+        if let Err(error) = drive(project, &self.context).await {
             warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
             return Err(());
         }
@@ -1160,7 +1166,10 @@ impl OperationsTaskHandler {
                 metadata_graph_tombstones,
                 ..
             })) => {
-                process_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones).await;
+                let tombstones = TombstonesOperation::new(metadata_graph_tombstones);
+                if let Err(error) = drive(tombstones, self.context.as_ref()).await {
+                    warn!(error = ?error, "Failed to prune deleted metadata graphs");
+                }
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {

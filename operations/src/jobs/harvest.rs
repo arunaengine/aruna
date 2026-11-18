@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
+use crate::metadata::forward::route_create::RouteCreateOperation;
 use std::collections::HashSet;
 use std::future::Future;
 use std::time::{Duration, SystemTime};
@@ -47,11 +49,9 @@ use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::create_entry::mint_job_document;
-use crate::metadata::forward::write::{
-    route_metadata_create, route_metadata_delete, route_metadata_update,
-};
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::create_entry::DocumentMintOperation;
+use crate::metadata::forward::write::{route_metadata_delete, route_metadata_update};
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use aruna_core::metadata::AuthToken;
 
@@ -407,7 +407,7 @@ async fn read_stored(
     ctx: &JobContext,
     document_id: Ulid,
 ) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
-    load_document_record(&ctx.driver, document_id)
+    drive(DocumentRecordOperation::new(document_id), &ctx.driver)
         .await
         .map_err(|error| retryable(format!("harvest record read: {error:?}")))
 }
@@ -461,7 +461,8 @@ async fn mint_and_create(
     row: &mut HarvestProvenance,
 ) -> Result<(), HarvestFailure> {
     let document_path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let document_id = mint_job_document(&ctx.driver, actor, source.group_id, &document_path)
+    let mint = DocumentMintOperation::job(actor.clone(), source.group_id, document_path.clone());
+    let document_id = drive(mint, &ctx.driver)
         .await
         .map_err(|error| retryable(format!("harvest mint document id: {error}")))?
         .as_ulid();
@@ -482,19 +483,22 @@ async fn create_document(
     record: &OaiRecord,
 ) -> Result<(), HarvestFailure> {
     let document_path = authorize_write(ctx, source, realm_id, record, document_id).await?;
-    let created = Box::pin(route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor: actor.clone(),
-            group_id: source.group_id,
-            document_id,
-            document_path: document_path.clone(),
-            public: false,
-            payload: CreateDocumentPayload::RoCrate {
-                jsonld: dc_to_jsonld(record),
-            },
-        }),
-        ctx.driver.clone(),
-        Some(internal_token(source.created_by, realm_id)),
+    let created = Box::pin(drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor: actor.clone(),
+                group_id: source.group_id,
+                document_id,
+                document_path: document_path.clone(),
+                public: false,
+                payload: CreateDocumentPayload::RoCrate {
+                    jsonld: dc_to_jsonld(record),
+                },
+            }),
+            ctx.driver.net_handle.as_ref().map(|net| net.node_id()),
+            Some(internal_token(source.created_by, realm_id)),
+        ),
+        &ctx.driver,
     ))
     .await;
     match created {

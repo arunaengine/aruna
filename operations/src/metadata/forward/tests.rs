@@ -32,9 +32,9 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
-use super::read::device_raw_revision;
+use super::holder_reads::device_raw_revision;
+use super::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::read::keep_status;
-use super::read::{AuthFailure, ReadDecision, reduce_holder_reads};
 
 use crate::device::replica::ReplicaOrigin;
 use aruna_core::metadata::{ProfileValidationCompleteness, ProfileValidationState};

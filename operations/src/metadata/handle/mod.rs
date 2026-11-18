@@ -32,7 +32,6 @@ use ulid::Ulid;
 use self::peer_auth::load_auth_state;
 use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
-use super::profile::cache::ProfileCache;
 use super::query_cache::MetadataQueryCache;
 use crate::auth::bearer_token::{
     ArunaValidationState, IssuerKeyCache, realm_linked_owner, realm_token_revoked,
@@ -44,7 +43,7 @@ use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 
 mod effects;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};
-pub(crate) use self::effects::{export_rocrate_page, export_summary_jsonld, metadata_read_error};
+pub(crate) use self::effects::{export_summary_jsonld, metadata_read_error};
 pub use self::lifecycle::{list_cached_group, list_cached_records, warm_caches};
 pub(crate) use self::lifecycle::{list_group_records, prune_if_deleted};
 pub use self::query::query_authorized_local;
@@ -217,7 +216,6 @@ struct MetadataInner {
     net_handle: Option<NetHandle>,
     visibility_cache: MetadataVisibilityCache,
     query_cache: MetadataQueryCache,
-    profile_cache: ProfileCache,
     inbound_frame_bytes: Arc<tokio::sync::Semaphore>,
     peer_contacts: PeerContacts,
     sync_pulls: crate::metadata::device_pull::PullRegistry,
@@ -432,7 +430,6 @@ impl MetadataHandle {
                 net_handle,
                 visibility_cache: MetadataVisibilityCache::new(),
                 query_cache: MetadataQueryCache::new(),
-                profile_cache: ProfileCache::new(),
                 inbound_frame_bytes: Arc::new(tokio::sync::Semaphore::new(
                     super::protocol::INBOUND_FRAME_BYTES,
                 )),
@@ -498,12 +495,6 @@ impl MetadataHandle {
         self.inner.visibility_cache.upsert_registry_records(records);
     }
 
-    pub(crate) fn upsert_cached_at(&self, record: MetadataRegistryRecord, generation: u64) {
-        self.inner
-            .visibility_cache
-            .upsert_at(std::slice::from_ref(&record), Some(generation));
-    }
-
     pub(crate) fn remove_cached_record(&self, document_id: Ulid) {
         self.inner
             .visibility_cache
@@ -512,16 +503,6 @@ impl MetadataHandle {
 
     pub(in crate::metadata) fn query_cache(&self) -> &MetadataQueryCache {
         &self.inner.query_cache
-    }
-
-    pub(super) fn profile_cache(&self) -> &ProfileCache {
-        &self.inner.profile_cache
-    }
-
-    /// Profile revisions this node fetched for validation since start. A
-    /// second validation of the same revision must not raise it.
-    pub fn profile_loads(&self) -> u64 {
-        self.inner.profile_cache.loads()
     }
 
     pub(crate) fn visibility_generation(&self) -> u64 {

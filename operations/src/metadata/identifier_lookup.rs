@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::pin::pin;
 
 use aruna_core::keyspaces::SECONDARY_ID_KEYSPACE;
@@ -15,7 +16,7 @@ use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::read::can_read_record;
 use crate::metadata::persistent_id::read_mapping;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::secondary_ids::IdentifierMatch;
 use crate::storage_read::scan_pages;
 
@@ -46,7 +47,7 @@ pub async fn lookup_local(
     documents.dedup();
     let mut matches = Vec::new();
     for document_id in documents {
-        let record = load_document_record(ctx, document_id)
+        let record = drive(DocumentRecordOperation::new(document_id), ctx)
             .await
             .map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let Some(record) = record else {

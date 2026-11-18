@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::sync::Arc;
 
 use aruna_core::repository::{
@@ -26,7 +27,7 @@ use crate::jobs::executor::JobContext;
 use crate::jobs::service::submit_rocrate_import;
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 
 /// How often a check waits for a running pull before it looks again.
 const ACTIVE_RETRY_MS: u64 = 60_000;
@@ -119,7 +120,7 @@ pub async fn start_pull(
     if matches!(link.status, LinkStatus::Failed { .. }) {
         Box::pin(ensure_lineage(context, link)).await?;
     }
-    let document = load_document_record(context, link.document_id)
+    let document = drive(DocumentRecordOperation::new(link.document_id), context)
         .await
         .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?
         .ok_or(LinkError::NotHolder)?;

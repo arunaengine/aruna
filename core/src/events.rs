@@ -543,8 +543,10 @@ impl From<crate::calls::IoError> for PeerAuthRefusal {
 /// Why a peer request has no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRequestError {
-    /// The request failed before an answer arrived.
+    /// The request failed before an answer arrived; the peer may have acted on it.
     Failed(crate::metadata::MetadataError),
+    /// The request never left this node, so asking again or elsewhere replays nothing.
+    NotSent(crate::metadata::MetadataError),
     /// No answer arrived within the request's timeout.
     TimedOut,
 }
@@ -825,6 +827,10 @@ impl MetadataEvent {
                 SnapshotInstalled,
                 BatchPlanned,
                 BatchMerged,
+                CacheGeneration,
+                CachedGroup,
+                ProfileShapes,
+                ProfileChecked,
                 Error,
             }
         )

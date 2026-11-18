@@ -49,7 +49,7 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::StorageReadError;
 use crate::realm::load_config::load_realm_config;
 use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
@@ -764,7 +764,7 @@ async fn linked_push_job(
         return Ok(None);
     }
     // The report lists the dataset's files, so the admin also needs READ on the dataset.
-    let Some(document) = load_document_record(context, spec.document_id)
+    let Some(document) = drive(DocumentRecordOperation::new(spec.document_id), context)
         .await
         .map_err(|error| format!("{error:?}"))?
     else {
@@ -804,7 +804,7 @@ async fn joined_pid_job(
     let JobPayload::MintPersistentId(spec) = &record.payload else {
         return Ok(None);
     };
-    let Some(document) = load_document_record(context, spec.document_id)
+    let Some(document) = drive(DocumentRecordOperation::new(spec.document_id), context)
         .await
         .map_err(|error| format!("{error:?}"))?
     else {
@@ -1142,7 +1142,7 @@ pub async fn read_owned_artifact(
         return Err("artifact record does not match its blob location".to_string());
     }
     let document_path =
-        crate::metadata::record_reads::load_document_record(context, spec.document_id)
+        drive(DocumentRecordOperation::new(spec.document_id), context)
             .await
             .map_err(|error| match error {
                 StorageReadError::Storage(error) => error.to_string(),

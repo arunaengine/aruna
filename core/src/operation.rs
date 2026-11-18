@@ -22,6 +22,8 @@ pub enum HoldScope {
     PluginCopies,
     /// The changes of one plugin install on this node, so they never overlap here.
     PluginInstall(ulid::Ulid),
+    /// This node's writes to one metadata document, so its actor's dots stay in order.
+    DocumentWrite(ulid::Ulid),
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the

@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
+use aruna_operations::driver::drive;
+use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
 
 use std::time::Duration;
 
@@ -15,11 +17,11 @@ use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, GetVisibleRequest, RoCrateExportView,
 };
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::metadata::forward::read::{export_rocrate_routed, get_metadata_routed};
+use aruna_operations::metadata::forward::read::get_metadata_routed;
 use aruna_operations::metadata::forward::write::route_metadata_update;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::replay_event_log;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
+use aruna_operations::testing::replay_event_log;
 use topology::{TestNode, TestResult, Topology, wait_until};
 use ulid::Ulid;
 
@@ -103,19 +105,22 @@ async fn keeps_owner_exports() -> TestResult<()> {
         .create_document(origin, group_id, document_id, path, "notes")
         .await?;
     let export = || async {
-        export_rocrate_routed(
+        drive(
+            RoutedExportOperation::new(
+                device.context.net_handle.as_ref().map(|net| net.node_id()),
+                realm.realm_id,
+                ExportMetadataRequest {
+                    document_id,
+                    auth: Some(realm.auth_context()),
+                    view: RoCrateExportView::Full,
+                    limit: None,
+                    offset: None,
+                    after: None,
+                },
+                Some(realm.bearer_token()),
+                EXPORT_BYTES,
+            ),
             &device.context,
-            realm.realm_id,
-            ExportMetadataRequest {
-                document_id,
-                auth: Some(realm.auth_context()),
-                view: RoCrateExportView::Full,
-                limit: None,
-                offset: None,
-                after: None,
-            },
-            Some(realm.bearer_token()),
-            EXPORT_BYTES,
         )
         .await
         .is_ok()

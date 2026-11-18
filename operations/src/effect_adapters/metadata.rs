@@ -13,6 +13,7 @@ use tokio::time::{Instant, timeout};
 
 use crate::driver::DriverContext;
 use crate::metadata::forward::read::dataset_summary;
+use crate::metadata::handle::MetadataRequestDelivery;
 
 // A boxed future: the metadata effect path reads authorization through the runner again,
 // so its type must not contain the runner's own future.
@@ -69,7 +70,14 @@ pub(super) async fn dispatch_request(
         .await
         {
             Ok(Ok(answer)) => Ok(answer),
-            Ok(Err(error)) => Err(PeerRequestError::Failed(error.into_metadata_error())),
+            Ok(Err(error)) => match error.delivery() {
+                MetadataRequestDelivery::DefinitelyNotSent => {
+                    Err(PeerRequestError::NotSent(error.into_metadata_error()))
+                }
+                MetadataRequestDelivery::PossiblySent => {
+                    Err(PeerRequestError::Failed(error.into_metadata_error()))
+                }
+            },
             Err(_) => Err(PeerRequestError::TimedOut),
         },
     };

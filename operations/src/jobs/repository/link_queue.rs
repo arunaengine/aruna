@@ -8,88 +8,37 @@ use std::time::{Duration, SystemTime};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::LINK_QUEUE_KEYSPACE;
 use aruna_core::repository::{
     LinkFailure, LinkQueueEntry, LinkReview, LinkStatus, PushOutcome, REVIEW_POLL_MS,
     RepositoryLink,
 };
 use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, JobState};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
-use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 use ulid::Ulid;
 
 use super::TransferError;
-use super::link_store::{change_link, document_links, ensure_lineage, read_link};
+use super::link_reads::{LinkTimerOperation, QueueDeletedOperation};
+use super::link_store::{change_link, ensure_lineage, read_link};
 use super::links::{
-    ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation, id_key,
-    queue_row, schedule_drain,
+    ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::raw_revision::load_raw_revision;
-use crate::metadata::record_reads::load_document_record;
-use crate::metadata::repository::{parse_registry_read, read_document_registry};
+use crate::metadata::record_reads::DocumentRecordOperation;
+use crate::metadata::revision_read::RawViewOperation;
 use crate::realm::load_config::load_realm_config;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 use aruna_core::placement::holds_placement;
 
 const QUEUE_PAGE: usize = 256;
 const ERROR_RETRY_MS: u64 = 60_000;
-
-/// Push-check rows for the push links of changed documents that push or retry after unmet
-/// requirements; each change moves the due time.
-/// A deleted document queues all its links, so the check removes them.
-pub(crate) async fn queue_rows(
-    storage: &StorageHandle,
-    documents: impl IntoIterator<Item = Ulid>,
-) -> Result<Vec<(String, Key, Value)>, LinkError> {
-    let now_ms = unix_timestamp_millis();
-    let mut candidates = Vec::new();
-    for document_id in documents {
-        let links = document_links(storage, document_id).await?;
-        let gone = !links.is_empty() && document_gone(storage, document_id).await?;
-        for link in links {
-            let pushes = link.status == LinkStatus::Enabled || link.retries_on_change();
-            if gone || (pushes && link.pull().is_none()) {
-                candidates.push((link.link_id, document_id));
-            }
-        }
-    }
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let reads = candidates
-        .iter()
-        .map(|(link_id, _)| (LINK_QUEUE_KEYSPACE.to_string(), id_key(*link_id)))
-        .collect();
-    let queued = match storage
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(other.label().to_string())),
-    };
-    let mut rows = Vec::new();
-    for ((link_id, document_id), (_, existing)) in candidates.into_iter().zip(queued) {
-        let existing = existing.and_then(|bytes| postcard::from_bytes(&bytes).ok());
-        let entry = LinkQueueEntry::debounce(document_id, existing.as_ref(), now_ms);
-        rows.push(queue_row(link_id, &entry)?);
-    }
-    Ok(rows)
-}
 
 async fn scan_queue(
     context: &DriverContext,
@@ -171,7 +120,10 @@ async fn check_link(
         _ => return drop_entry().await,
     };
     // A deleted dataset takes its links and their sealed tokens along; remote records stay.
-    if document_gone(&context.storage_handle, entry.document_id).await? {
+    let record = drive(DocumentRecordOperation::new(entry.document_id), context)
+        .await
+        .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?;
+    if record.is_none() {
         change_link(context, &link, LinkChange::Delete).await?;
         return Ok(None);
     }
@@ -362,26 +314,16 @@ async fn push_revision(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<Option<(Ulid, Option<[u8; 32]>)>, LinkError> {
-    let raw = load_raw_revision(context, document_id, None)
+    let (_, raw) = drive(RawViewOperation::revision(document_id), context)
         .await
         .map_err(|error| LinkError::Unexpected(error.to_string()))?;
     if let Some(revision) = raw {
         return Ok(Some((revision.winning_event_id, revision.dataset_digest)));
     }
-    let record = load_document_record(context, document_id)
+    let record = drive(DocumentRecordOperation::new(document_id), context)
         .await
         .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?;
     Ok(record.map(|record| (record.last_event_id, None)))
-}
-
-/// Whether the dataset was deleted, which removes its registry record.
-async fn document_gone(storage: &StorageHandle, document_id: Ulid) -> Result<bool, LinkError> {
-    let event = storage
-        .send_effect(read_document_registry(document_id, None))
-        .await;
-    parse_registry_read(event)
-        .map(|record| record.is_none())
-        .map_err(|error| LinkError::Unexpected(format!("{error:?}")))
 }
 
 /// Deletes the queued check unless a change rewrote it since `queued` was read.
@@ -446,60 +388,20 @@ async fn write_row(context: &DriverContext, row: (String, Key, Value)) -> Result
 /// Queues checks for the links of the deleted document behind `graph_iri`; each check
 /// then removes its link and token.
 pub async fn queue_deleted(context: &DriverContext, graph_iri: &str) -> Result<(), LinkError> {
-    let document_id = graph_iri
-        .rsplit('/')
-        .next()
-        .and_then(|id| Ulid::from_string(id).ok())
-        .filter(|id| MetadataRegistryRecord::graph_iri_for(*id) == graph_iri);
-    let Some(document_id) = document_id else {
-        return Ok(());
-    };
-    let rows = queue_rows(&context.storage_handle, [document_id]).await?;
-    if rows.is_empty() {
-        return Ok(());
-    }
-    for row in rows {
-        write_row(context, row).await?;
-    }
-    if let Some(task_handle) = &context.task_handle {
-        restore_link_timer(context, task_handle).await;
-    }
-    Ok(())
+    drive(QueueDeletedOperation::new(graph_iri), context).await
 }
 
 /// Arms the drain for the earliest queued check; the queue itself is the durable state.
-pub async fn restore_link_timer(context: &DriverContext, task_handle: &TaskHandle) {
-    let now = unix_timestamp_millis();
-    let mut next = None;
-    let mut start = None;
-    loop {
-        let Ok((values, next_start)) = scan_queue(context, start).await else {
-            warn!("Failed to scan the repository link queue");
-            return;
-        };
-        for (_, value) in values {
-            let due = postcard::from_bytes::<LinkQueueEntry>(&value).map_or(now, |e| e.due_at_ms);
-            next = min_due_at(next, due);
-        }
-        match next_start {
-            Some(key) => start = Some(key),
-            None => break,
-        }
-    }
-    let Some(due) = next else {
-        return;
-    };
-    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-        .send_effect(schedule_drain(due_after(now, due)))
-        .await
-    {
-        warn!(%message, "Failed to arm the repository link queue");
+pub async fn restore_link_timer(context: &DriverContext, _task_handle: &TaskHandle) {
+    if let Err(error) = drive(LinkTimerOperation::new(), context).await {
+        warn!(%error, "Failed to scan the repository link queue");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::repository::links::{id_key, queue_row};
     use aruna_storage::FjallStorage;
 
     async fn stored(context: &DriverContext, link_id: Ulid) -> Option<LinkQueueEntry> {

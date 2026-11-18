@@ -292,7 +292,7 @@ impl FanoutOperation {
 }
 
 /// Decodes one member's answer; a missing, cut off or failed answer is an error text.
-fn read_answer(
+pub(crate) fn read_answer(
     peer: NodeId,
     result: Option<GroupResult>,
 ) -> Result<MetadataTransportMessage, String> {

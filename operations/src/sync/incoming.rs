@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::driver::{DriverContext, drive, drive_retry_until};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
-use crate::metadata::after_sync::{apply_metadata, run_maintenance};
+use crate::metadata::after_sync::{AfterSyncOperation, run_maintenance};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
@@ -413,7 +413,8 @@ async fn reconcile_inbound_topics(
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Watch interest refresh stopped after a document sync");
     }
-    let timings = apply_metadata(context, Some(net_handle.node_id()), targets, true).await;
+    let after = AfterSyncOperation::new(Some(net_handle.node_id()), targets, true);
+    let timings = drive(after, context).await.unwrap_or_default();
     info!(
         event = "pipeline.reconcile.summary",
         topics = topic_count,

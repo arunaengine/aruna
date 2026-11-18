@@ -16,13 +16,13 @@ use crate::metadata::protocol::GraphState;
 use crate::metadata::protocol::MAX_DEVICE_GROUPS;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::RealmDocuments;
-use crate::metadata::raw_revision::load_raw_view;
-use crate::metadata::record_reads::record_materialized_read;
+use crate::metadata::record_reads::RecordMaterializedOperation;
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
-use crate::metadata::update_entry::update_metadata_document;
+use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::node_name::ReadNamesOperation;
 use aruna_core::NodeId;
@@ -370,7 +370,7 @@ pub(super) async fn read_graph_state(
             return Err(SyncRefusal::Unavailable);
         }
     };
-    let raw = load_raw_view(context.as_ref(), document_id, None)
+    let raw = drive(RawDisplayOperation::new(document_id), context.as_ref())
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     // A document created as a scaffold has no authored text yet; its graph is what it shows.
@@ -408,7 +408,7 @@ async fn scaffold_display(
         .metadata_handle
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
-    if !record_materialized_read(context.as_ref(), record)
+    if !drive(RecordMaterializedOperation::new(record), context.as_ref())
         .await
         .map_err(|_| SyncRefusal::Unavailable)?
     {
@@ -555,17 +555,27 @@ pub(super) async fn run_device_batch(
         mutation: UpdateDocumentMutation::ApplyBatch { batch, authored },
         expected_revision: None,
     });
-    update_metadata_document(operation, context.as_ref())
-        .await
-        .map_err(|error| match error {
-            UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message)) => {
-                SyncRefusal::Invalid(message)
-            }
-            other => {
-                warn!(%document_id, error = %other, "A device edit did not apply");
-                SyncRefusal::Unavailable
-            }
-        })
+    drive(
+        UpdateEntryOperation::new(
+            operation,
+            context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
+        context.as_ref(),
+    )
+    .await
+    .map_err(|error| match error {
+        UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message)) => {
+            SyncRefusal::Invalid(message)
+        }
+        other => {
+            warn!(%document_id, error = %other, "A device edit did not apply");
+            SyncRefusal::Unavailable
+        }
+    })
 }
 
 #[cfg(test)]

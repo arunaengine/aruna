@@ -80,3 +80,107 @@ pub fn sign_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
     )
     .unwrap()
 }
+
+/// Replays the whole event log into the registry projection.
+pub async fn replay_event_log(
+    context: &DriverContext,
+) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
+    use crate::metadata::projection::{ReplayPageOperation, max_clock_skew};
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut after = None;
+    let mut projected = 0usize;
+    loop {
+        let page = ReplayPageOperation::new(after, local_node, max_clock_skew());
+        let (count, next) = crate::driver::drive(page, context).await?;
+        projected = projected.saturating_add(count);
+        match next {
+            Some(next) => after = Some(next),
+            None => return Ok(projected),
+        }
+    }
+}
+
+/// Runs one pass of the pending projection drain.
+pub async fn drain_projection_queue(
+    context: &DriverContext,
+) -> Result<
+    crate::metadata::projection::PendingProjectionResult,
+    crate::metadata::projection::MetadataProjectionError,
+> {
+    use crate::metadata::projection::{DrainProjectionOperation, max_clock_skew};
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
+    crate::driver::drive(drain, context).await
+}
+
+/// Projects carried events.
+pub async fn project_create_events(
+    context: &DriverContext,
+    events: Vec<aruna_core::metadata::MetadataEventRecord>,
+    local_node_id: Option<aruna_core::NodeId>,
+) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
+    use crate::metadata::projection::{ProjectEventsOperation, max_clock_skew};
+    let project = ProjectEventsOperation::new(events, local_node_id, max_clock_skew());
+    crate::driver::drive(project, context).await
+}
+
+/// Projects logged events by their document and event ids.
+pub async fn project_logged_events(
+    context: &DriverContext,
+    targets: impl IntoIterator<Item = (ulid::Ulid, ulid::Ulid)>,
+) -> Result<usize, crate::metadata::projection::MetadataProjectionError> {
+    use crate::metadata::projection::{ProjectLoggedOperation, max_clock_skew};
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let project = ProjectLoggedOperation::new(targets, false, local_node, max_clock_skew());
+    Ok(crate::driver::drive(project, context).await?.projected)
+}
+
+/// Projects one logged event.
+pub async fn project_logged_event(
+    context: &DriverContext,
+    document_id: ulid::Ulid,
+    event_id: ulid::Ulid,
+) -> Result<(), crate::metadata::projection::MetadataProjectionError> {
+    project_logged_events(context, [(document_id, event_id)])
+        .await
+        .map(|_| ())
+}
+
+/// Wakes the projection drain after `after`.
+pub async fn schedule_projection_drain(
+    context: &DriverContext,
+    after: std::time::Duration,
+) -> Result<(), crate::metadata::projection::MetadataProjectionError> {
+    let wake = crate::metadata::projection::ProjectionWakeOperation::new(after);
+    crate::driver::drive(wake, context).await
+}
+
+/// Runs one pass of the graph prune drain.
+pub async fn process_prune_batch(
+    context: &DriverContext,
+) -> Result<
+    crate::metadata::prune_queue::GraphDrainResult,
+    crate::metadata::prune_queue::MetadataGraphError,
+> {
+    let batch = crate::metadata::prune_queue::PruneBatchOperation::new();
+    crate::driver::drive(batch, context).await
+}
+
+/// Queues and runs the prunes for deleted graphs.
+pub async fn process_graph_tombstones(
+    context: &DriverContext,
+    tombstones: impl IntoIterator<Item = aruna_core::metadata::GraphLifecycleRecord>,
+) -> crate::metadata::prune_queue::TombstoneProcessingResult {
+    let tombstones = crate::metadata::prune_queue::TombstonesOperation::new(tombstones);
+    crate::driver::drive(tombstones, context)
+        .await
+        .unwrap_or_default()
+}
+
+/// Whether any graph prune job is queued.
+pub async fn prune_jobs_exist(
+    context: &DriverContext,
+) -> Result<bool, crate::metadata::prune_queue::MetadataGraphError> {
+    let due = crate::driver::drive(crate::metadata::prune_queue::jobs_queued(), context).await?;
+    Ok(!due.jobs.is_empty())
+}

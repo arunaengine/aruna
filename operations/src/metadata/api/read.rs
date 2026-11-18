@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::list::{load_group_records, load_pending_records};
 use super::preflight::{reference_document_title, resolve_graph_reference};
 use super::read_types::{
     ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
@@ -10,147 +9,21 @@ use super::read_types::{
 };
 use super::{
     AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
-    DISTRIBUTED_QUERY_DEADLINE, Event, GRAPH_LIFECYCLE_KEYSPACE, GraphLifecycleRecord, GroupId,
-    ListGroupOperation, MetadataApiError, MetadataFanoutScope, MetadataFanoutStats,
-    MetadataQueryResults, MetadataReadError, MetadataRegistryRecord, NodeId, Permission,
-    REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect,
-    StorageEvent, StorageReadError, TxnId, Ulid, check_policy_limit, graph_lifecycle_key,
-    map_query_error, merge_pending_records, parse_registry_read, query_fingerprint,
-    read_document_registry, replica_query_nodes, warn,
+    DISTRIBUTED_QUERY_DEADLINE, Event, GroupId, ListGroupOperation, MetadataApiError,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataQueryResults, MetadataReadError,
+    MetadataRegistryRecord, NodeId, Permission, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT,
+    REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect, StorageEvent, StorageReadError, TxnId, Ulid,
+    check_policy_limit, map_query_error, merge_pending_records, query_fingerprint,
+    replica_query_nodes, warn,
 };
 use crate::driver::{DriverContext, drive};
-use crate::metadata::record_reads::{load_document_record, record_materialized_read};
+use crate::metadata::record_reads::{DocumentRecordOperation, RecordMaterializedOperation};
 use crate::realm::load_config::load_realm_config;
 
 use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
-use aruna_core::handle::Handle;
-
-pub async fn query_metadata_document(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    request: DocumentQueryRequest,
-) -> Result<MetadataQueryExecution, MetadataApiError> {
-    ensure_query_form(&request.query)?;
-    let record = load_live_record(context, request.document_id).await?;
-    ensure_record_readable(context, realm_id, request.auth.as_ref(), &record, None).await?;
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    if request.mode == Some(ApiQueryMode::Local) {
-        ensure_record_materialized(context, &record).await?;
-        let results = crate::metadata::query_authorized_local(
-            context,
-            request.auth,
-            Some(vec![record.graph_iri]),
-            request.query,
-        )
-        .await
-        .map_err(map_query_error)?;
-        return Ok(MetadataQueryExecution {
-            results,
-            fanout_stats: MetadataFanoutStats {
-                nodes_queried: 1,
-                ..MetadataFanoutStats::default()
-            },
-        });
-    }
-
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        if !request.allow_partial {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-        ensure_record_materialized(context, &record).await?;
-        let results = crate::metadata::query_authorized_local(
-            context,
-            request.auth,
-            Some(vec![record.graph_iri]),
-            request.query,
-        )
-        .await
-        .map_err(map_query_error)?;
-        return Ok(MetadataQueryExecution {
-            results,
-            fanout_stats: MetadataFanoutStats {
-                nodes_queried: 1,
-                nodes_failed: 1,
-                discovery_failed: true,
-                ..MetadataFanoutStats::default()
-            },
-        });
-    };
-    let config_digest = config
-        .digest()
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let mut holders = replica_query_nodes(Some(&config), &record, local_node_id);
-    if let Some(index) = holders.iter().position(|holder| *holder == local_node_id) {
-        holders.swap(0, index);
-    }
-    let remote_auth = match request.bearer_token.as_deref() {
-        Some(token) => Some(AuthToken::bearer(token).map_err(|_| MetadataApiError::BadRequest)?),
-        None => request.auth.clone().map(AuthToken::internal),
-    };
-    let mut fanout_stats = MetadataFanoutStats::default();
-    let mut auth_error = None;
-    for holder in holders {
-        fanout_stats.nodes_queried += 1;
-        let result: Result<MetadataQueryResults, MetadataReadError> = if holder == local_node_id {
-            match ensure_record_materialized(context, &record).await {
-                Ok(()) => crate::metadata::query_authorized_local(
-                    context,
-                    request.auth.clone(),
-                    Some(vec![record.graph_iri.clone()]),
-                    request.query.clone(),
-                )
-                .await
-                .map_err(|_| MetadataReadError::Unavailable),
-                Err(_) => Err(MetadataReadError::Unavailable),
-            }
-        } else {
-            metadata
-                .request_document_query(
-                    holder,
-                    remote_auth.clone(),
-                    config_digest,
-                    request.document_id,
-                    request.query.clone(),
-                )
-                .await
-        };
-        match result {
-            Ok(results) => {
-                // First replica success answers the query; a lagging replica's
-                // NotFound must not override an in-hand result.
-                fanout_stats.nodes_failed = 0;
-                fanout_stats.failed_partitions.clear();
-                return Ok(MetadataQueryExecution {
-                    results,
-                    fanout_stats,
-                });
-            }
-            Err(MetadataReadError::Unauthorized) => {
-                auth_error.get_or_insert(MetadataApiError::Unauthorized);
-            }
-            Err(MetadataReadError::Forbidden) => {
-                auth_error.get_or_insert(MetadataApiError::Forbidden);
-            }
-            Err(MetadataReadError::NotFound) => {}
-            Err(MetadataReadError::Unavailable | MetadataReadError::TooLarge) => {
-                fanout_stats.nodes_failed += 1;
-                fanout_stats.failed_partitions.push(holder);
-                warn!(%holder, "Document query holder unavailable; trying the next replica");
-            }
-        }
-    }
-    if let Some(error) = auth_error {
-        return Err(error);
-    }
-    Err(MetadataApiError::ServiceUnavailable)
-}
 
 pub async fn query_metadata(
     context: &DriverContext,
@@ -298,80 +171,6 @@ async fn graph_record(
     }
 }
 
-pub(super) async fn load_claim_records(
-    context: &DriverContext,
-    realm_id: RealmId,
-    group_id: Option<GroupId>,
-) -> Result<Vec<MetadataRegistryRecord>, MetadataApiError> {
-    let group_ids = check_policy_limit(match group_id {
-        Some(group_id) => vec![group_id],
-        None => drive(
-            ListGroupOperation::with_pagination(REGISTRY_CANDIDATE_LIMIT + 1, 0),
-            context,
-        )
-        .await
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-        .into_iter()
-        .map(|group| group.group_id)
-        .collect(),
-    })?;
-    let mut pending = load_pending_records(context, group_id, REGISTRY_CANDIDATE_LIMIT).await?;
-    let mut records = Vec::new();
-    for group_id in group_ids {
-        let remaining = REGISTRY_CANDIDATE_LIMIT.saturating_sub(records.len());
-        let mut group_records = load_group_records(context, group_id, remaining).await?;
-        if let Some(pending_records) = pending.remove(&group_id) {
-            merge_pending_records(&mut group_records, pending_records);
-            if group_records.len() > remaining {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-        }
-        group_records.sort_by_key(|record| record.document_id);
-        records.extend(group_records);
-    }
-    for pending_records in pending.into_values() {
-        if records.len().saturating_add(pending_records.len()) > REGISTRY_CANDIDATE_LIMIT {
-            return Err(MetadataApiError::ServiceUnavailable);
-        }
-        records.extend(pending_records);
-    }
-    records.retain(|record| record.realm_id == realm_id);
-    Ok(records)
-}
-
-pub(super) async fn is_deleted(
-    context: &DriverContext,
-    graph_iri: &str,
-) -> Result<bool, MetadataApiError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: graph_lifecycle_key(graph_iri),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let record: GraphLifecycleRecord = postcard::from_bytes(&value)
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            if record.graph_iri != graph_iri {
-                return Err(MetadataApiError::Internal(
-                    "metadata graph lifecycle record mismatch".to_string(),
-                ));
-            }
-            Ok(record.is_deleted())
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-        other => Err(MetadataApiError::Internal(other.label().to_string())),
-    }
-}
-
 impl From<LiveRecordsError> for MetadataApiError {
     fn from(error: LiveRecordsError) -> Self {
         match error {
@@ -385,7 +184,7 @@ pub(crate) async fn load_live_record(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    match load_document_record(context, document_id).await {
+    match drive(DocumentRecordOperation::new(document_id), context).await {
         Ok(Some(record)) => drive(LiveRecordsOperation::new(vec![record], None), context)
             .await?
             .into_iter()
@@ -399,37 +198,11 @@ pub(crate) async fn load_live_record(
     }
 }
 
-pub(super) async fn load_record_txn(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: TxnId,
-) -> Result<MetadataRegistryRecord, MetadataApiError> {
-    let event = context
-        .storage_handle
-        .send_effect(read_document_registry(document_id, Some(txn_id)))
-        .await;
-    match parse_registry_read(event) {
-        Ok(Some(record)) => drive(
-            LiveRecordsOperation::new(vec![record], Some(txn_id)),
-            context,
-        )
-        .await?
-        .into_iter()
-        .next()
-        .ok_or(MetadataApiError::NotFound),
-        Ok(None) => Err(MetadataApiError::NotFound),
-        Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
-        Err(StorageReadError::Conversion(error)) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-    }
-}
-
 pub(super) async fn ensure_record_materialized(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Result<(), MetadataApiError> {
-    match record_materialized_read(context, record).await {
+    match drive(RecordMaterializedOperation::new(record), context).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(MetadataApiError::ServiceUnavailable),
         Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),

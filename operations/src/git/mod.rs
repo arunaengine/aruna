@@ -20,12 +20,13 @@ pub mod snapshot;
 pub mod state;
 pub mod versions;
 
+use crate::driver::drive;
 use self::changes::PropertyConflict;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, GitRepository, GitRequest};
@@ -84,7 +85,7 @@ pub async fn document(
     id: Ulid,
     permission: Permission,
 ) -> Result<MetadataRegistryRecord, GitError> {
-    let record = load_document_record(context, id)
+    let record = drive(DocumentRecordOperation::new(id), context)
         .await
         .map_err(|_| GitError::Unavailable)?
         .ok_or(GitError::NotFound)?;

@@ -46,14 +46,16 @@ async fn durable_rearm_loop(
         restore_watch_interest(&context, &task_handle).await;
         restore_info_timer(&task_handle).await;
         restore_notification_outbox(&context, &task_handle, None).await;
-        restore_projection_timer(&context.storage_handle, &task_handle).await;
+        if let Err(error) = drive(ProjectionTimerOperation::new(), &context).await {
+            warn!(%error, "Failed to scan metadata pending projection markers");
+        }
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
         // tick would scan the keyspace far more often than it can yield work.
         if ticks.is_multiple_of(DEAD_LETTER_TICKS) {
             sweep_dead_letters(&context.storage_handle).await;
         }
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
-        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
+        restore_graph_prune(&context, &task_handle).await;
         restore_notification_prune(&context, &task_handle).await;
         restore_drain_timer(&context, &task_handle).await;
         restore_prune_timer(&context, &task_handle).await;
@@ -296,7 +298,9 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_projection_timer(&context.storage_handle, &task_handle).await;
+        if let Err(error) = drive(ProjectionTimerOperation::new(), &context).await {
+            warn!(%error, "Failed to scan metadata pending projection markers");
+        }
         if stopped() {
             return;
         }
@@ -308,7 +312,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
+        restore_graph_prune(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -488,7 +492,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.context.bulk();
-        match crate::metadata::prune_queue::process_prune_batch(&bulk).await {
+        match drive(PruneBatchOperation::new(), &bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
                     .await;
@@ -500,7 +504,10 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match prune_jobs_exist(&bulk).await {
+            Ok(_) => match drive(jobs_queued(), &bulk)
+                .await
+                .map(|due| !due.jobs.is_empty())
+            {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_POLL_AFTER)
@@ -523,7 +530,9 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     pub(super) async fn drain_projection_queue(&self) {
-        match drain_projection_queue(&self.context).await {
+        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
+        let drain = DrainProjectionOperation::new(local_node, max_clock_skew());
+        match drive(drain, &self.context).await {
             Ok(result) if result.has_more => {
                 self.reschedule_timer(TaskKey::DrainProjectionQueue, std::time::Duration::ZERO)
                     .await;

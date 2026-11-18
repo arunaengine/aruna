@@ -62,7 +62,10 @@ pub async fn apply_local_edit(
     let authored = authored_source(mutation).ok_or_else(|| {
         DeviceEditError::Invalid("this mutation is not authored on a device".to_string())
     })?;
-    let _guard = crate::metadata::update_entry::document_lock(record.document_id).await;
+    let _guard = match context.graph_handle.as_ref() {
+        Some(graph) => Some(graph.hold_document(record.document_id).await),
+        None => None,
+    };
     let current = read_actor(context, record.document_id).await?;
     let mut draft_id = Ulid::generate();
     if let Some(current) = &current
@@ -134,7 +137,10 @@ pub(super) async fn reject_edit(
     document_id: Ulid,
     dot: ([u8; 32], u64),
 ) -> bool {
-    let _guard = crate::metadata::update_entry::document_lock(document_id).await;
+    let _guard = match context.graph_handle.as_ref() {
+        Some(graph) => Some(graph.hold_document(document_id).await),
+        None => None,
+    };
     let Ok(Some(mut current)) = read_actor(context, document_id).await else {
         return false;
     };

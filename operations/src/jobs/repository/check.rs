@@ -18,7 +18,7 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::{Action, TransferError, ensure_supported, not_supported};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::harvest::read_connector::ConnectorView;
 use crate::jobs::executor::JobContext;
 use crate::jobs::export::ExportCheckpoint;
@@ -26,7 +26,7 @@ use crate::jobs::import::archive::{
     ArchiveCompression, ArchiveEntry, ArchiveInspection, inspect_reader,
 };
 use crate::jobs::service::read_artifact_range;
-use crate::metadata::profile::validation::check_profile;
+use crate::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
 
 /// What a repository of `kind` needs from a crate: the requirement Profile findings, then the
 /// mapping rule findings, and what each crate entity becomes. Only the crate counts, so
@@ -86,8 +86,11 @@ pub(crate) async fn check_crate(
     let rules = descriptor.rules()?;
     let document: Value = serde_json::from_str(jsonld)
         .map_err(|_| TransferError::Permanent("invalid source crate".into()))?;
-    let status = Box::pin(check_profile(context, profile_iri, jsonld))
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let check = ProfileAssessOperation::against(local_node, profile_iri, jsonld.to_string());
+    let status = Box::pin(drive(check, context))
         .await
+        .map(profile_verdict)
         .map_err(|error| match error {
             MetadataError::InvalidInput(message) => TransferError::Permanent(message),
             error => TransferError::Retryable(format!("checking the requirements failed: {error}")),

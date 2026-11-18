@@ -14,7 +14,7 @@ pub(crate) const PAGE_MAX: usize = 1_000;
 /// Bytes a page's reader may add around each entity, which the page's size bound counts.
 pub(crate) const ENTRY_ROOM: usize = 8;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GetVisibleRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,
@@ -28,7 +28,7 @@ pub enum RoCrateExportView {
     Raw,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExportMetadataRequest {
     pub document_id: Ulid,
     pub auth: Option<AuthContext>,

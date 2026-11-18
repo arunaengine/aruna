@@ -23,7 +23,7 @@ use aruna_operations::jobs::import::upload::{
 };
 use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
-use aruna_operations::metadata::create_entry::mint_job_document;
+use aruna_operations::metadata::create_entry::DocumentMintOperation;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation,
@@ -439,15 +439,15 @@ pub async fn submit_import(
             user_id: spec.auth_context.user_id,
             realm_id: state.get_realm_id(),
         };
-        let document_id = mint_job_document(
-            state.get_ctx().as_ref(),
-            &actor,
+        let mint = DocumentMintOperation::job(
+            actor.clone(),
             spec.metadata.group_id,
-            &spec.metadata.path,
-        )
-        .await
-        .map_err(crate::metadata::map_create_error)?
-        .as_ulid();
+            spec.metadata.path.clone(),
+        );
+        let document_id = drive(mint, state.get_ctx().as_ref())
+            .await
+            .map_err(crate::metadata::map_create_error)?
+            .as_ulid();
         spec.document_id = document_id;
         fast_source_check(
             &state,

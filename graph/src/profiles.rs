@@ -19,12 +19,12 @@ const PROFILE_CACHE_ENTRIES: usize = 64;
 /// The key carries the revision, so a republished Profile is a different entry
 /// and a stale one is never served; usability is decided from the registry row.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(in crate::metadata) struct ProfileCacheKey {
+pub(crate) struct ProfileCacheKey {
     profile_id: Ulid,
     revision: Ulid,
 }
 
-pub(in crate::metadata) struct ProfileCache {
+pub(crate) struct ProfileCache {
     entries: Mutex<LruCache<ProfileCacheKey, Arc<Vec<String>>>>,
     loads: AtomicU64,
 }
@@ -36,7 +36,7 @@ impl Default for ProfileCache {
 }
 
 impl ProfileCache {
-    pub(in crate::metadata) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let capacity = NonZeroUsize::new(PROFILE_CACHE_ENTRIES).unwrap_or(NonZeroUsize::MIN);
         Self {
             entries: Mutex::new(LruCache::new(capacity)),
@@ -44,11 +44,7 @@ impl ProfileCache {
         }
     }
 
-    pub(in crate::metadata) fn get(
-        &self,
-        profile_id: Ulid,
-        revision: Ulid,
-    ) -> Option<Arc<Vec<String>>> {
+    pub(crate) fn get(&self, profile_id: Ulid, revision: Ulid) -> Option<Arc<Vec<String>>> {
         let key = ProfileCacheKey {
             profile_id,
             revision,
@@ -59,12 +55,7 @@ impl ProfileCache {
 
     /// Records one fetched revision. Every call means a fetch happened, which
     /// is what [`ProfileCache::loads`] reports.
-    pub(in crate::metadata) fn insert(
-        &self,
-        profile_id: Ulid,
-        revision: Ulid,
-        shapes: Arc<Vec<String>>,
-    ) {
+    pub(crate) fn insert(&self, profile_id: Ulid, revision: Ulid, shapes: Arc<Vec<String>>) {
         let key = ProfileCacheKey {
             profile_id,
             revision,
@@ -75,7 +66,7 @@ impl ProfileCache {
     }
 
     /// Profile revisions this node fetched since start.
-    pub(in crate::metadata) fn loads(&self) -> u64 {
+    pub(crate) fn loads(&self) -> u64 {
         self.loads.load(Ordering::Acquire)
     }
 }

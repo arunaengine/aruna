@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
+use aruna_operations::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
+use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 
 use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
@@ -49,13 +51,12 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentOperation, CreateDocumentPayload, mint_forward_document, mint_local_document,
     resolve_metadata_id,
 };
-use aruna_operations::metadata::forward::read::export_rocrate_routed;
+use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
 use aruna_operations::metadata::forward::write::{
-    PinnedCreate, create_with_id, route_metadata_create, route_metadata_delete,
-    route_metadata_update,
+    create_with_id, route_metadata_delete, route_metadata_update,
 };
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
-use aruna_operations::metadata::record_reads::load_document_record;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
@@ -925,10 +926,13 @@ async fn bystander_writes_forward() -> TestResult<()> {
         || registry_row_present(bystander, document_id),
     )
     .await?;
-    let record = load_document_record(bystander.context.as_ref(), document_id)
-        .await
-        .map_err(|error| format!("registry read failed: {error:?}"))?
-        .ok_or("the non-holder must carry the registry row")?;
+    let record = drive(
+        DocumentRecordOperation::new(document_id),
+        bystander.context.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("registry read failed: {error:?}"))?
+    .ok_or("the non-holder must carry the registry row")?;
     assert_eq!(record.placement, placement);
     let config = drive(
         GetConfigOperation::new(realm.realm_id),
@@ -972,10 +976,13 @@ async fn bystander_writes_forward() -> TestResult<()> {
     );
 
     let stale = realm.find(holders[0]);
-    let stale_record = load_document_record(stale.context.as_ref(), document_id)
-        .await
-        .map_err(|error| format!("registry read failed: {error:?}"))?
-        .ok_or("the holder must carry the registry row")?;
+    let stale_record = drive(
+        DocumentRecordOperation::new(document_id),
+        stale.context.as_ref(),
+    )
+    .await
+    .map_err(|error| format!("registry read failed: {error:?}"))?
+    .ok_or("the holder must carry the registry row")?;
     let deleted = stale
         .context
         .storage_handle
@@ -1176,17 +1183,20 @@ async fn user_create_forwards() -> TestResult<()> {
         None
     );
 
-    let created = route_metadata_create(
-        CreateDocumentOperation::new(document_config(
-            &realm,
-            user,
-            group_id,
-            document_id,
-            path,
-            topology_payload(),
-        )),
-        user.context.clone(),
-        Some(realm.bearer_token()),
+    let created = drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new(document_config(
+                &realm,
+                user,
+                group_id,
+                document_id,
+                path,
+                topology_payload(),
+            )),
+            user.context.net_handle.as_ref().map(|net| net.node_id()),
+            Some(realm.bearer_token()),
+        ),
+        &user.context,
     )
     .await?
     .record;
@@ -1231,12 +1241,19 @@ async fn export_routed(
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed export reached a holder",
         || async {
-            match export_rocrate_routed(
+            match drive(
+                RoutedExportOperation::new(
+                    bystander
+                        .context
+                        .net_handle
+                        .as_ref()
+                        .map(|net| net.node_id()),
+                    realm.realm_id,
+                    request.clone(),
+                    Some(token.clone()),
+                    RoCrateLimits::default().metadata_bytes,
+                ),
                 &bystander.context,
-                realm.realm_id,
-                request.clone(),
-                Some(token.clone()),
-                RoCrateLimits::default().metadata_bytes,
             )
             .await
             {
@@ -1327,9 +1344,12 @@ async fn delete_routed(node: &TestNode, realm: &Topology, document_id: Ulid) -> 
 }
 
 async fn registry_row_present(node: &TestNode, document_id: Ulid) -> bool {
-    load_document_record(node.context.as_ref(), document_id)
-        .await
-        .is_ok_and(|record| record.is_some())
+    drive(
+        DocumentRecordOperation::new(document_id),
+        node.context.as_ref(),
+    )
+    .await
+    .is_ok_and(|record| record.is_some())
 }
 
 /// A server mints into a bucket it holds; a create pinned to one holder by a non-holder answers
@@ -1348,7 +1368,8 @@ async fn pinned_create_repeats() -> TestResult<()> {
     let origin = realm.leading_node(group_id, path);
     let actor = realm.actor(origin);
     let minted = (payload.clone(), None);
-    let local = PinnedCreate::mint(&origin.context, &actor, (group_id, path), minted).await?;
+    let mint = PinnedMintOperation::new(actor.clone(), (group_id, path), minted);
+    let local = drive(mint, origin.context.as_ref()).await?;
     assert_eq!(local.target, origin.node_id());
 
     let user = realm.user_node();

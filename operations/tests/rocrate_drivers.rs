@@ -58,7 +58,7 @@ use aruna_operations::jobs::store::state::{
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::testing::replay_event_log;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::origin::read_origin;
 use aruna_operations::s3::object::put::{

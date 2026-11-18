@@ -5,7 +5,7 @@
 use super::state::{Ancestry, reduce};
 use super::{GitError, lfs, objects, records};
 use crate::driver::{DriverContext, drive};
-use crate::metadata::record_reads::load_document_record;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_core::UserId;
 use aruna_core::git::{
@@ -36,7 +36,7 @@ pub async fn remove_objects(context: &DriverContext) {
             continue;
         };
         let id = Ulid::from_bytes(id);
-        let settled = match load_document_record(context, id).await {
+        let settled = match drive(DocumentRecordOperation::new(id), context).await {
             // No dataset is left whose history could need the object.
             Ok(None) => Ok(Ok(())),
             Ok(Some(document)) => settled(context, &document, &object).await,

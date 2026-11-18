@@ -4,23 +4,17 @@
 
 use std::time::SystemTime;
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
+use aruna_core::keyspaces::{LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::repository::{
-    LinkStatus, RepositoryCredential, RepositoryLink, RepositoryRecord, link_key, link_prefix,
+    LinkStatus, RepositoryCredential, RepositoryLink, RepositoryRecord, link_key,
 };
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
-use aruna_storage::StorageHandle;
-use byteview::ByteView;
 use ulid::Ulid;
 
+use super::link_reads::{ListLinksOperation, StoredRowOperation};
 use super::links::{ChangeLinkOperation, LinkChange, LinkError, id_key};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::persistent_id::mapping_route;
-
-const LINK_PAGE: usize = 256;
 
 /// Applies a change on the link's owner node and replicates it to the document's holders.
 pub async fn change_link(
@@ -111,78 +105,12 @@ pub(super) async fn ensure_lineage(
     Ok(())
 }
 
-async fn send(storage: &StorageHandle, effect: StorageEffect) -> Result<Event, LinkError> {
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        event => Ok(event),
-    }
-}
-
 /// The document's links with whether each still has a push check queued.
 pub async fn list_links(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<Vec<(RepositoryLink, bool)>, LinkError> {
-    let links = document_links(&context.storage_handle, document_id).await?;
-    let reads = links
-        .iter()
-        .map(|link| (LINK_QUEUE_KEYSPACE.to_string(), id_key(link.link_id)))
-        .collect::<Vec<_>>();
-    if reads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let event = send(
-        &context.storage_handle,
-        StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        },
-    )
-    .await?;
-    let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-        return Err(LinkError::Unexpected(event.label().to_string()));
-    };
-    Ok(links
-        .into_iter()
-        .zip(values)
-        .map(|(link, (_, queued))| (link, queued.is_some()))
-        .collect())
-}
-
-/// All links of the document, read page by page.
-pub(crate) async fn document_links(
-    storage: &StorageHandle,
-    document_id: Ulid,
-) -> Result<Vec<RepositoryLink>, LinkError> {
-    let mut links = Vec::new();
-    let mut start = None;
-    loop {
-        let event = send(
-            storage,
-            StorageEffect::Iter {
-                key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
-                prefix: Some(ByteView::from(link_prefix(document_id))),
-                start: start.take().map(IterStart::After),
-                limit: LINK_PAGE,
-                txn_id: None,
-            },
-        )
-        .await?;
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return Err(LinkError::Unexpected(event.label().to_string()));
-        };
-        for (_, value) in values {
-            links.push(RepositoryLink::from_bytes(&value)?);
-        }
-        match next_start_after {
-            Some(next) => start = Some(next),
-            None => return Ok(links),
-        }
-    }
+    drive(ListLinksOperation::new(document_id), context).await
 }
 
 pub async fn read_link(
@@ -190,40 +118,21 @@ pub async fn read_link(
     document_id: Ulid,
     link_id: Ulid,
 ) -> Result<Option<RepositoryLink>, LinkError> {
-    let event = send(
-        &context.storage_handle,
-        StorageEffect::Read {
-            key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
-            key: ByteView::from(link_key(document_id, link_id)),
-            txn_id: None,
-        },
+    let key = link_key(document_id, link_id);
+    drive(
+        StoredRowOperation::new(REPOSITORY_LINK_KEYSPACE, key),
+        context,
     )
-    .await?;
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .map(|bytes| RepositoryLink::from_bytes(&bytes))
-            .transpose()?),
-        other => Err(LinkError::Unexpected(other.label().to_string())),
-    }
+    .await
 }
 
 pub(crate) async fn read_secret(
     context: &DriverContext,
     link_id: Ulid,
 ) -> Result<Option<RepositoryCredential>, LinkError> {
-    let event = send(
-        &context.storage_handle,
-        StorageEffect::Read {
-            key_space: LINK_SECRET_KEYSPACE.to_string(),
-            key: id_key(link_id),
-            txn_id: None,
-        },
+    drive(
+        StoredRowOperation::new(LINK_SECRET_KEYSPACE, id_key(link_id)),
+        context,
     )
-    .await?;
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
-            .transpose()?),
-        other => Err(LinkError::Unexpected(other.label().to_string())),
-    }
+    .await
 }

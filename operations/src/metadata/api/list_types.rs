@@ -30,7 +30,7 @@ pub enum MetadataListOrder {
     Recent,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ListVisibleRequest {
     pub group_id: Option<GroupId>,
     pub path_prefix: Option<String>,

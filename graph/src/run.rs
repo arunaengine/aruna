@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
+use aruna_core::profile_shapes::ProfileShaclReport;
 use aruna_core::telemetry::{duration_ms, record_duration_ms, record_elapsed_ms, record_error};
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleNode, CraqleRequestDurability, GraphId,
@@ -27,6 +28,71 @@ impl GraphHandle {
     /// Runs one store effect on the blocking pool and answers with its event. Searches,
     /// queries and best-effort sync need a read scope or the network and are refused here.
     pub async fn run(&self, effect: MetadataEffect) -> MetadataEvent {
+        let effect = match effect {
+            MetadataEffect::CheckStructure { jsonld } => {
+                let report = self.run_profile_shacl(move |engine| {
+                    let structural = engine.structural(&jsonld)?;
+                    Ok(ProfileShaclReport {
+                        results: Vec::new(),
+                        structural,
+                    })
+                });
+                let report = report.await.map(Box::new);
+                return MetadataEvent::ProfileChecked { report };
+            }
+            MetadataEffect::CheckProfile { shapes, jsonld } => {
+                let report =
+                    self.run_profile_shacl(move |engine| engine.evaluate(&shapes, &jsonld));
+                let report = report.await.map(Box::new);
+                return MetadataEvent::ProfileChecked { report };
+            }
+            MetadataEffect::CachedShapes {
+                profile_id,
+                revision,
+            } => {
+                let shapes = self.inner.profiles.get(profile_id, revision);
+                let shapes = shapes.map(|shapes| shapes.as_ref().clone());
+                return MetadataEvent::ProfileShapes { shapes };
+            }
+            MetadataEffect::CacheShapes {
+                profile_id,
+                revision,
+                shapes,
+            } => {
+                self.inner
+                    .profiles
+                    .insert(profile_id, revision, Arc::new(shapes));
+                return MetadataEvent::ProfileShapes { shapes: None };
+            }
+            // The registry cache stays with the metadata handle, which answers these first.
+            MetadataEffect::CacheGeneration
+            | MetadataEffect::CacheRecords { .. }
+            | MetadataEffect::UncacheRecord { .. }
+            | MetadataEffect::CachedGroup { .. } => {
+                return MetadataEvent::Error {
+                    graph_iri: None,
+                    error: MetadataError::InvalidEffect,
+                };
+            }
+            MetadataEffect::ExportSummaryAt { graph_iri, cursor } => {
+                if let Some(jsonld) = (self.inner.summaries).get(&graph_iri, cursor, Instant::now())
+                {
+                    return MetadataEvent::RoCrateSummaryResult {
+                        graph_iri,
+                        jsonld: jsonld.to_string(),
+                    };
+                }
+                let event = Box::pin(self.run(MetadataEffect::ExportRoCrateSummary {
+                    graph_iri: graph_iri.clone(),
+                }))
+                .await;
+                if let MetadataEvent::RoCrateSummaryResult { jsonld, .. } = &event {
+                    (self.inner.summaries).insert(&graph_iri, cursor, jsonld, Instant::now());
+                }
+                return event;
+            }
+            effect => effect,
+        };
         let graph_iri = effect.graph_iri();
         if matches!(
             effect,
@@ -872,7 +938,16 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::ExportVersioned { .. }) => export_effect(node, &auth, effect),
         MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::QueryGraphs { .. }
-        | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),
+        | MetadataEffect::SyncBestEffort { .. }
+        | MetadataEffect::CheckStructure { .. }
+        | MetadataEffect::CheckProfile { .. }
+        | MetadataEffect::CachedShapes { .. }
+        | MetadataEffect::CacheShapes { .. }
+        | MetadataEffect::CacheGeneration
+        | MetadataEffect::CacheRecords { .. }
+        | MetadataEffect::UncacheRecord { .. }
+        | MetadataEffect::CachedGroup { .. }
+        | MetadataEffect::ExportSummaryAt { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }

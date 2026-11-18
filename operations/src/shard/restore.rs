@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
-use crate::metadata::after_sync::apply_metadata;
+use crate::metadata::after_sync::AfterSyncOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
@@ -844,7 +844,14 @@ pub(crate) async fn apply_restored_reconcile(
     if let Err(error) = drive(refresh, context.as_ref()).await {
         warn!(%error, "Mail settings refresh stopped after the shard restore");
     }
-    apply_metadata(context, Some(node_id), result, false).await;
+    if let Err(error) = drive(
+        AfterSyncOperation::new(Some(node_id), result, false),
+        context,
+    )
+    .await
+    {
+        warn!(%error, "Metadata work after the shard restore stopped");
+    }
     true
 }
 

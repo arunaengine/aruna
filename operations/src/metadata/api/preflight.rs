@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::fanout::run_metadata_fanout;
-use super::list::load_pending_records;
+use super::list::PendingRecordsOperation;
 use super::preflight_types::{
     MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
     MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,
@@ -476,7 +476,8 @@ pub(crate) async fn references_preflight_local(
         crate::metadata::iri_index::iri_index_freshness(&context.storage_handle, &returned)
             .await
             .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-    let pending_for_realm = load_pending_records(context, None, REGISTRY_CANDIDATE_LIMIT)
+    let pending = PendingRecordsOperation::new(None, REGISTRY_CANDIDATE_LIMIT);
+    let pending_for_realm = crate::driver::drive(pending, context)
         .await?
         .into_values()
         .flatten()

@@ -221,10 +221,6 @@ fn path_config(
     (config, strategy.strategy_id)
 }
 
-fn holder_deadline() -> tokio::time::Instant {
-    tokio::time::Instant::now() + Duration::from_secs(30)
-}
-
 #[tokio::test]
 async fn shard_counts_match() {
     // The reported replica count per shard is what the merge waits for, so
@@ -241,7 +237,6 @@ async fn shard_counts_match() {
         8,
         Some(2),
         local,
-        holder_deadline(),
     )
     .expect("holder selection succeeds");
 
@@ -273,7 +268,6 @@ async fn everywhere_covers_shards() {
         8,
         None,
         local,
-        holder_deadline(),
     )
     .expect("holder selection succeeds");
 
@@ -300,7 +294,6 @@ async fn capped_shard_rejected() {
         64,
         Some(1),
         local,
-        holder_deadline(),
     );
 
     assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));

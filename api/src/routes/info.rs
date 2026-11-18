@@ -32,7 +32,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::PeerContacts;
-use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
+use aruna_operations::metadata::stats::{GroupCountOperation, count_realm_documents};
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
 use aruna_operations::placement::mutation::drive_placement_mutation;
@@ -1101,7 +1101,7 @@ pub(crate) async fn run_realm_info(
             None
         }
     };
-    let groups = match count_realm_groups(&state.get_ctx(), config.realm_id).await {
+    let groups = match drive(GroupCountOperation::new(config.realm_id), &state.get_ctx()).await {
         Ok(count) => Some(count),
         Err(error) => {
             warn!(error = %error, "group count unavailable for public realm overview");

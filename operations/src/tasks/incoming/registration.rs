@@ -19,7 +19,7 @@ use crate::driver::{DriverContext, drive};
 use crate::federation::publish::{PUBLISH_INTERVAL, Publication, PublishOperation};
 use crate::federation::registration::{RegistrationCounts, SendRegistrationOperation};
 use crate::federation::totals::DataTotalsOperation;
-use crate::metadata::stats::{count_realm_documents, count_realm_groups};
+use crate::metadata::stats::{GroupCountOperation, count_realm_documents};
 use crate::tasks::task_persistence::persist_task_effect;
 
 /// Runs the decision, reads the counts a registration reports and sends the signed request.
@@ -61,7 +61,7 @@ async fn realm_kpis(context: &DriverContext, realm_id: RealmId) -> RealmKpis {
             .inspect_err(|error| warn!(error = %error, "Dataset count unavailable"))
             .ok()
             .flatten(),
-        groups: count_realm_groups(context, realm_id)
+        groups: crate::driver::drive(GroupCountOperation::new(realm_id), context)
             .await
             .inspect_err(|error| warn!(error = %error, "Group count unavailable"))
             .ok(),

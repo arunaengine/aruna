@@ -400,7 +400,17 @@ impl MetadataHandle {
         let message = decode_message(frame)
             .map_err(|error| MetadataError::InvalidInput(error.to_string()))
             .map_err(MetadataRequestError::definitely_not_sent)?;
-        let answer = self.request_forwarded_write(node_id, message).await?;
+        let answer = match message {
+            // An export answers with a header and a separate body, read here as one answer.
+            MetadataTransportMessage::ForwardExportDocument { .. }
+            | MetadataTransportMessage::ForwardExportProfile { .. } => {
+                let result = send_export_request(&self.inner, node_id, message).await?;
+                MetadataTransportMessage::ExportAnswer {
+                    result: result.map(Box::new),
+                }
+            }
+            message => self.request_forwarded_write(node_id, message).await?,
+        };
         #[cfg(feature = "test-hooks")]
         if matches!(answer, MetadataTransportMessage::SyncMirrorCreated) && self.take_dropped_ack()
         {
@@ -576,21 +586,11 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::CheckNodeSecret { .. } => "check_node_secret",
         MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
         MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
+        MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
     }
 }
 
 impl MetadataHandle {
-    pub(crate) async fn request_export(
-        &self,
-        node_id: NodeId,
-        message: MetadataTransportMessage,
-    ) -> Result<
-        Result<super::super::api::export_types::ExportMetadataResult, MetadataReadError>,
-        MetadataRequestError,
-    > {
-        send_export_request(&self.inner, node_id, message).await
-    }
-
     #[tracing::instrument(
         name = "metadata.query.remote",
         level = "debug",

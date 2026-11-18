@@ -11,14 +11,13 @@ use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    PENDING_PROJECTION_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MetadataError, MetadataEventRecord, MetadataQueryResults,
-    MetadataRoCratePage, MetadataSearchHit,
+    MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataRoCratePage,
+    MetadataSearchHit,
 };
-use aruna_core::storage_entries::{event_log_key, graph_lifecycle_key, pending_projection_target};
+use aruna_core::storage_entries::{event_log_key, pending_projection_target};
 use aruna_core::structs::PathClaimRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -67,14 +66,12 @@ use super::search_cursor::{
     SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits, paginate,
     query_fingerprint, resume_fetch_limit,
 };
-use super::summary_cache::summary_cache;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::repository::{
     LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
-    parse_registry_read, read_document_registry,
 };
 use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -95,6 +92,7 @@ use aruna_core::placement::{
 mod bucket_page;
 mod distributed;
 pub mod distributed_types;
+pub mod document_query;
 pub mod export;
 pub mod export_types;
 pub mod fanout;
@@ -110,7 +108,9 @@ mod prefix_scan;
 pub mod preflight;
 pub mod preflight_types;
 pub mod read;
+pub(crate) mod read_access;
 pub mod read_types;
+pub(crate) mod readable;
 pub mod search;
 pub mod search_types;
 
@@ -140,7 +140,7 @@ const QUERY_MAX_NODES: usize = 32;
 
 const DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum MetadataApiError {
     #[error("bad request")]
     BadRequest,
@@ -169,6 +169,13 @@ pub enum MetadataApiError {
     /// Even the smallest page of the answer is larger than the asked byte bound.
     #[error("the answer is larger than the byte bound")]
     TooLarge,
+}
+
+/// A runner failure leaves the request unanswered, so the caller may retry.
+impl From<aruna_core::calls::IoError> for MetadataApiError {
+    fn from(_: aruna_core::calls::IoError) -> Self {
+        Self::ServiceUnavailable
+    }
 }
 
 fn map_event_error(error: MetadataError) -> MetadataApiError {

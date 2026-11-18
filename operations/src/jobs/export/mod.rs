@@ -60,7 +60,7 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use crate::metadata::forward::read::export_rocrate_routed;
+use crate::metadata::forward::routed_export::RoutedExportOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
@@ -722,19 +722,22 @@ async fn read_crate(
     // Route the raw revision from a document holder; a job on a job-control bucket
     // rarely holds the document's bucket. The holder re-checks READ for this peer.
     let routed = |view| {
-        export_rocrate_routed(
-            context,
-            auth.realm_id,
-            ExportMetadataRequest {
-                document_id,
-                auth: Some(auth.clone()),
-                view,
-                limit: None,
-                offset: None,
-                after: None,
-            },
-            Some(AuthToken::internal(auth.clone())),
-            metadata_bytes,
+        drive(
+            RoutedExportOperation::new(
+                context.net_handle.as_ref().map(|net| net.node_id()),
+                auth.realm_id,
+                ExportMetadataRequest {
+                    document_id,
+                    auth: Some(auth.clone()),
+                    view,
+                    limit: None,
+                    offset: None,
+                    after: None,
+                },
+                Some(AuthToken::internal(auth.clone())),
+                metadata_bytes,
+            ),
+            &context,
         )
     };
     Ok(match routed(RoCrateExportView::Raw).await {

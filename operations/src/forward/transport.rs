@@ -48,7 +48,7 @@ pub(crate) fn local_identity(context: &DriverContext) -> Option<(NodeId, RealmId
     Some((net.node_id(), *net.realm_id()))
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum MetadataWriteError {
     #[error("metadata write requires authentication")]
     Unauthorized,
@@ -67,6 +67,13 @@ pub enum MetadataWriteError {
     /// outbox that can only drain to a topic this node may not join.
     #[error("metadata write is undeliverable: {0}")]
     Undeliverable(String),
+}
+
+/// A runner failure leaves the write undelivered.
+impl From<aruna_core::calls::IoError> for MetadataWriteError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        Self::Undeliverable(error.to_string())
+    }
 }
 
 pub(crate) fn write_error(error: MetadataWriteError) -> MetadataApiError {

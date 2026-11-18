@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::record_reads::DocumentRecordOperation;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -421,8 +422,7 @@ pub async fn visible_page(
             if effective_ms >= from_ms
                 && effective_ms <= until_ms
                 && let Some(record) =
-                    crate::metadata::record_reads::load_document_record(context, document_id)
-                        .await?
+                    drive(DocumentRecordOperation::new(document_id), context).await?
                 && record.updated_at_ms == updated_at_ms
             {
                 let mut record = record;

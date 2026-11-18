@@ -273,8 +273,8 @@ async fn drain_retries_queueing() {
         &key,
         None,
     )
-        .await
-        .expect("dedup read");
+    .await
+    .expect("dedup read");
     assert!(queued.is_some(), "the retry queues the held record");
 }
 

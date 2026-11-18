@@ -42,12 +42,12 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::{project_create_events, replay_event_log};
+use aruna_operations::testing::{project_create_events, replay_event_log};
 use aruna_operations::metadata::send_metadata_effect;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
-use aruna_operations::metadata::update_entry::update_metadata_document;
+use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -850,7 +850,19 @@ async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 expected_revision: None,
             });
-            match update_metadata_document(operation, node.context.as_ref()).await {
+            match drive(
+                UpdateEntryOperation::new(
+                    operation,
+                    node.context
+                        .as_ref()
+                        .net_handle
+                        .as_ref()
+                        .map(|net| net.node_id()),
+                ),
+                node.context.as_ref(),
+            )
+            .await
+            {
                 Ok(_) => return Ok(()),
                 // Backpressure and write conflicts are both answered by retrying.
                 Err(

@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::metadata::forward::pinned::PinnedMintOperation;
+use crate::metadata::forward::routed_export::RoutedExportOperation;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -43,13 +45,12 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
-use crate::metadata::api::list::list_visible_documents;
+use crate::metadata::api::list::ListVisibleOperation;
 use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use crate::metadata::forward::read::{export_rocrate_routed, get_metadata_routed};
-use crate::metadata::forward::write::{
-    CreateAuthorizedError, PinnedCreate, create_with_id, route_metadata_update,
-};
+use crate::metadata::forward::read::get_metadata_routed;
+use crate::metadata::forward::pinned::PinnedCreate;
+use crate::metadata::forward::write::{CreateAuthorizedError, create_with_id, route_metadata_update};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::plugins::check::{Authorize, CallError, CheckCall, RunScope, matching};
 use crate::plugins::creates::{
@@ -198,12 +199,15 @@ impl RunBroker {
             after: None,
         };
         let token = Some(AuthToken::Internal(auth));
-        let export = export_rocrate_routed(
+        let export = drive(
+            RoutedExportOperation::new(
+                self.ctx.net_handle.as_ref().map(|net| net.node_id()),
+                self.scope.realm_id,
+                request,
+                token,
+                max_bytes as u64,
+            ),
             &self.ctx,
-            self.scope.realm_id,
-            request,
-            token,
-            max_bytes as u64,
         );
         match export.await.map_err(api_error)? {
             ExportMetadataResult::Full { record, jsonld }
@@ -609,7 +613,16 @@ impl Broker for RunBroker {
         // The holder counts the cursor and the room around each entity in this bound.
         let bound = cx.max_bytes as u64;
         let token = Some(AuthToken::Internal(auth));
-        let export = export_rocrate_routed(&self.ctx, self.scope.realm_id, request, token, bound);
+        let export = drive(
+            RoutedExportOperation::new(
+                self.ctx.net_handle.as_ref().map(|net| net.node_id()),
+                self.scope.realm_id,
+                request,
+                token,
+                bound,
+            ),
+            &self.ctx,
+        );
         let ExportMetadataResult::Page { record, page } = export.await.map_err(api_error)? else {
             return Err(unavailable("the document has no page export"));
         };
@@ -642,7 +655,8 @@ impl Broker for RunBroker {
             order: MetadataListOrder::Created,
             auth: Some(auth),
         };
-        let listed = list_visible_documents(&self.ctx, self.scope.realm_id, request).await;
+        let list = ListVisibleOperation::new(self.scope.realm_id, request);
+        let listed = drive(list, &self.ctx).await;
         let listed = listed.map_err(api_error)?;
         let full = listed.documents.len() >= PAGE;
         let mut resources = Vec::new();
@@ -752,8 +766,11 @@ impl Broker for RunBroker {
             install.plugin, install.install_id
         );
         let payload = (CreateDocumentPayload::RoCrate { jsonld }, Some(message));
-        let minted =
-            PinnedCreate::mint(&self.ctx, &actor, (install.group_id, &path), payload).await;
+        let minted = drive(
+            PinnedMintOperation::new(actor.clone(), (install.group_id, &path), payload),
+            &self.ctx,
+        )
+        .await;
         let outcome = match minted {
             Ok(minted) => {
                 let key = (&install, create.key.as_str());

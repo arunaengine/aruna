@@ -4,11 +4,16 @@
 
 use super::export::{seed_registry_cache, write_entry, write_pending_marker};
 use super::*;
+use crate::driver::drive;
+use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::live_records::LiveRecordsOperation;
 use aruna_core::StructuredId;
 use aruna_core::keyspaces::DOCUMENT_LIFECYCLE_KEYSPACE;
+use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
+use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::storage_entries::document_lifecycle_key;
+use aruna_core::storage_entries::graph_lifecycle_key;
 
 #[tokio::test]
 async fn filters_graph_delete() {
@@ -178,10 +183,10 @@ async fn group_scan_capped() {
         outbound_handle: None,
     };
 
-    let within = load_group_records(&context, group_id, 2)
+    let within = drive(GroupRecordsOperation::new(group_id, 2), &context)
         .await
         .expect("group scan succeeds");
-    let over = load_group_records(&context, group_id, 1).await;
+    let over = drive(GroupRecordsOperation::new(group_id, 1), &context).await;
 
     assert_eq!(within.len(), 2);
     assert!(matches!(over, Err(MetadataApiError::ServiceUnavailable)));
@@ -198,10 +203,17 @@ async fn pending_scan_capped() {
     write_pending_marker(&test, &first).await;
     write_pending_marker(&test, &second).await;
 
-    let within = load_pending_records(&test.context, Some(group_id), 2)
-        .await
-        .expect("pending scan succeeds");
-    let over = load_pending_records(&test.context, Some(group_id), 1).await;
+    let within = drive(
+        PendingRecordsOperation::new(Some(group_id), 2),
+        &test.context,
+    )
+    .await
+    .expect("pending scan succeeds");
+    let over = drive(
+        PendingRecordsOperation::new(Some(group_id), 1),
+        &test.context,
+    )
+    .await;
 
     assert_eq!(within.get(&group_id).map(Vec::len), Some(2));
     assert!(matches!(over, Err(MetadataApiError::ServiceUnavailable)));
@@ -217,13 +229,15 @@ async fn estimate_beyond_page() {
         seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
     }
 
-    let page = list_visible_documents(
+    let page = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                limit: Some(ESTIMATE_MIN_LIMIT),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            limit: Some(ESTIMATE_MIN_LIMIT),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -231,14 +245,16 @@ async fn estimate_beyond_page() {
     assert_eq!(page.total_returned, ESTIMATE_MIN_LIMIT);
     assert_eq!(page.total_estimate, Some(seeded));
 
-    let tail = list_visible_documents(
+    let tail = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                limit: Some(ESTIMATE_MIN_LIMIT),
+                offset: Some(seeded - 1),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            limit: Some(ESTIMATE_MIN_LIMIT),
-            offset: Some(seeded - 1),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -256,26 +272,30 @@ async fn lookup_omits_estimate() {
         seed_registry_cache(&test, &public_record(group_id, Ulid::generate())).await;
     }
 
-    let lookup = list_visible_documents(
+    let lookup = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                limit: Some(ESTIMATE_MIN_LIMIT - 1),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            limit: Some(ESTIMATE_MIN_LIMIT - 1),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
     assert_eq!(lookup.total_returned, 3);
     assert_eq!(lookup.total_estimate, None);
 
-    let browse = list_visible_documents(
+    let browse = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                limit: Some(ESTIMATE_MIN_LIMIT),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            limit: Some(ESTIMATE_MIN_LIMIT),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -293,10 +313,9 @@ async fn estimate_skips_private() {
     private.public = false;
     seed_registry_cache(&test, &private).await;
 
-    let result = list_visible_documents(
+    let result = drive(
+        ListVisibleOperation::new(TEST_REALM_ID, summary_request(group_id, false)),
         &test.context,
-        TEST_REALM_ID,
-        summary_request(group_id, false),
     )
     .await
     .expect("listing succeeds");
@@ -344,10 +363,9 @@ async fn cross_shard_unknown() {
     seed_registry_cache(&test, &first).await;
     seed_registry_cache(&test, &second).await;
 
-    let listed = list_visible_documents(
+    let listed = drive(
+        ListVisibleOperation::new(TEST_REALM_ID, summary_request(group_id, false)),
         &test.context,
-        TEST_REALM_ID,
-        summary_request(group_id, false),
     )
     .await
     .unwrap();
@@ -501,13 +519,15 @@ async fn hidden_ids_match() {
     let missing = public_record(group_id, Ulid::generate());
 
     for document_id in [public.document_id, private.document_id, missing.document_id] {
-        let result = get_visible_document(
+        let result = drive(
+            VisibleRecordOperation::new(
+                TEST_REALM_ID,
+                GetVisibleRequest {
+                    document_id,
+                    auth: Some(auth_for(stranger)),
+                },
+            ),
             &test.context,
-            TEST_REALM_ID,
-            GetVisibleRequest {
-                document_id,
-                auth: Some(auth_for(stranger)),
-            },
         )
         .await;
         assert!(matches!(result, Err(MetadataApiError::NotFound)));
@@ -540,13 +560,15 @@ async fn policy_hides_record() {
     seed_registry_cache(&test, &hidden).await;
     seed_registry_cache(&test, &visible).await;
 
-    let page = list_visible_documents(
+    let page = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                auth: Some(auth_for(stranger)),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            auth: Some(auth_for(stranger)),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -581,13 +603,15 @@ async fn stranger_sees_public() {
         seed_registry_cache(&test, &hidden).await;
     }
 
-    let page = list_visible_documents(
+    let page = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                auth: Some(auth_for(stranger)),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            auth: Some(auth_for(stranger)),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -595,14 +619,16 @@ async fn stranger_sees_public() {
     assert_eq!(page.total_returned, 1);
     assert_eq!(page.total_estimate, Some(1));
 
-    let beyond = list_visible_documents(
+    let beyond = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                offset: Some(1),
+                auth: Some(auth_for(stranger)),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            offset: Some(1),
-            auth: Some(auth_for(stranger)),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -635,23 +661,24 @@ async fn anonymous_sees_public() {
     hidden.public = false;
     seed_registry_cache(&test, &hidden).await;
 
-    let anonymous = list_visible_documents(
+    let anonymous = drive(
+        ListVisibleOperation::new(TEST_REALM_ID, summary_request(group_id, false)),
         &test.context,
-        TEST_REALM_ID,
-        summary_request(group_id, false),
     )
     .await
     .expect("listing succeeds");
     assert_eq!(listed_ids(&anonymous), vec![visible.document_id]);
     assert_eq!(anonymous.total_estimate, Some(1));
 
-    let signed = list_visible_documents(
+    let signed = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                auth: Some(auth_for(member)),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            auth: Some(auth_for(member)),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -688,27 +715,25 @@ async fn foreign_policy_identity() {
         session: None,
     };
 
-    let listed = list_visible_documents(
+    let listed = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                auth: Some(auth.clone()),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            auth: Some(auth.clone()),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
     assert_eq!(listed_ids(&listed), vec![record.document_id]);
 
-    let candidates = local_path_candidates(
-        &test.context,
-        TEST_REALM_ID,
-        group_id,
-        &record.document_path,
-        Some(&auth),
-    )
-    .await
-    .expect("path lookup succeeds");
+    let path = (group_id, record.document_path.as_str());
+    let local = LocalPathOperation::new(TEST_REALM_ID, path, Some(auth.clone()), None);
+    let candidates = drive(local, &test.context)
+        .await
+        .expect("path lookup succeeds");
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].record.is_some());
 }
@@ -742,13 +767,15 @@ async fn estimate_counts_exact() {
     seed_registry_cache(&test, &allowed).await;
     seed_registry_cache(&test, &denied).await;
 
-    let page = list_visible_documents(
+    let page = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                auth: Some(auth_for(member)),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            auth: Some(auth_for(member)),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -756,14 +783,16 @@ async fn estimate_counts_exact() {
     assert_eq!(page.total_estimate, Some(1));
 
     // A targeted lookup still reports no estimate for the same caller.
-    let lookup = list_visible_documents(
+    let lookup = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                limit: Some(ESTIMATE_MIN_LIMIT - 1),
+                auth: Some(auth_for(member)),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            limit: Some(ESTIMATE_MIN_LIMIT - 1),
-            auth: Some(auth_for(member)),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -783,13 +812,15 @@ async fn estimate_honours_prefix() {
     other.document_path = "other/excluded".to_string();
     seed_registry_cache(&test, &other).await;
 
-    let result = list_visible_documents(
+    let result = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                path_prefix: Some("datasets".to_string()),
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            path_prefix: Some("datasets".to_string()),
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -825,13 +856,15 @@ async fn orders_recent_first() {
     let group_id = Ulid::generate();
     let records = seed_timed_records(&test, group_id).await;
 
-    let page = list_visible_documents(
+    let page = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                order: MetadataListOrder::Recent,
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            order: MetadataListOrder::Recent,
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -844,15 +877,17 @@ async fn orders_recent_first() {
         ]
     );
 
-    let second = list_visible_documents(
+    let second = drive(
+        ListVisibleOperation::new(
+            TEST_REALM_ID,
+            ListVisibleRequest {
+                limit: Some(1),
+                offset: Some(1),
+                order: MetadataListOrder::Recent,
+                ..summary_request(group_id, false)
+            },
+        ),
         &test.context,
-        TEST_REALM_ID,
-        ListVisibleRequest {
-            limit: Some(1),
-            offset: Some(1),
-            order: MetadataListOrder::Recent,
-            ..summary_request(group_id, false)
-        },
     )
     .await
     .expect("listing succeeds");
@@ -866,10 +901,9 @@ async fn default_keeps_created() {
     let group_id = Ulid::generate();
     let records = seed_timed_records(&test, group_id).await;
 
-    let page = list_visible_documents(
+    let page = drive(
+        ListVisibleOperation::new(TEST_REALM_ID, summary_request(group_id, false)),
         &test.context,
-        TEST_REALM_ID,
-        summary_request(group_id, false),
     )
     .await
     .expect("listing succeeds");
