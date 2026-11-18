@@ -35,7 +35,6 @@ pub mod runs;
 pub mod runtime;
 pub mod service;
 pub mod session;
-pub mod source_read;
 pub mod staging;
 pub mod store;
 pub mod submit;
