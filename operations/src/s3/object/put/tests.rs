@@ -2222,3 +2222,476 @@ mod sealed {
 }
 
 /// Routing resolves the backend before any byte moves; the version transaction fences it.
+mod routing {
+    use super::*;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use aruna_core::structs::storage::routing::{GroupRoutingInputs, StorageRoutingRule};
+    use std::collections::BTreeSet;
+
+    fn config(snapshot: RoutingSnapshot) -> PutObjectConfig {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        PutObjectConfig {
+            user_id: UserId::local(Ulid::from_parts(1, 1), realm_id),
+            group_id: snapshot.group_id,
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "archive/one".to_string(),
+                content_length: Some(3),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                    &b"abc"[..],
+                ))),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: snapshot,
+        }
+    }
+
+    fn snapshot() -> RoutingSnapshot {
+        RoutingSnapshot::new(
+            Ulid::from_parts(2, 2),
+            BackendCatalog::new("default")
+                .with_backend("default", None)
+                .with_backend("tape", Some("archive".to_string())),
+        )
+    }
+
+    /// Answers the bucket, purge fence and encryption reads of an ungoverned plain bucket.
+    fn begin(operation: &mut PutObjectOperation) -> Turn {
+        operation.first().unwrap();
+        operation.next(values(vec![None])).unwrap();
+        operation.next(values(vec![None])).unwrap();
+        operation.next(values(vec![None]))
+    }
+
+    fn resolved(turn: &Turn) -> &aruna_core::structs::storage::blob::ResolvedBackend {
+        match asked(turn) {
+            Effect::Blob(BlobEffect::Write { resolved, .. }) => resolved,
+            other => panic!("expected one blob write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamps_resolved_backend() {
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: "archive/".to_string(),
+            exact: false,
+            target: RoutingTarget::Class("archive".to_string()),
+        }]);
+
+        let turn = begin(&mut PutObjectOperation::new(config(snapshot)));
+
+        let resolved = resolved(&turn);
+        assert_eq!(resolved.backend, BackendRef::Node("tape".to_string()));
+        assert_eq!(resolved.storage_class.as_deref(), Some("archive"));
+    }
+
+    #[test]
+    fn missing_class_stamps() {
+        // A class this node does not offer reroutes the write, never fails it.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Class("glacier".to_string()),
+        }]);
+
+        let turn = begin(&mut PutObjectOperation::new(config(snapshot)));
+
+        let resolved = resolved(&turn);
+        assert_eq!(resolved.backend, BackendRef::Node("default".to_string()));
+        assert_eq!(resolved.storage_class, None);
+    }
+
+    #[test]
+    fn unknown_backend_aborts() {
+        // A named backend is binding: nothing may be written when it is gone.
+        let snapshot = snapshot().with_bucket_rules(vec![StorageRoutingRule {
+            key_prefix: String::new(),
+            exact: false,
+            target: RoutingTarget::Backend(BackendRef::Node("ghost".to_string())),
+        }]);
+
+        let turn = begin(&mut PutObjectOperation::new(config(snapshot)));
+
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::RoutingFailed(RoutingError::UnknownBackend(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn refuses_disabled_backend() {
+        // A disabled backend refuses writes: the version does not commit a location on it,
+        // and the written blob is rolled back.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let snapshot = snapshot()
+            .with_group_inputs(GroupRoutingInputs {
+                default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
+                backend_ids: BTreeSet::from([backend_id]),
+                ..Default::default()
+            })
+            .with_bucket_rules(Vec::new());
+        let mut operation = PutObjectOperation::new(config(snapshot));
+        begin(&mut operation).unwrap();
+        let written = BackendLocation {
+            backend: BackendRef::Group(backend_id),
+            backend_path: "bucket/object".to_string(),
+            ulid: Ulid::from_bytes([6u8; 16]),
+            blob_size: 3,
+            ..test_location(UserId::default())
+        };
+        let finished = BlobEvent::WriteFinished {
+            location: written.clone(),
+        };
+        let turn = operation.next(event(Event::Blob(finished)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+
+        let mut child = operation.publish_child();
+        child.first().unwrap();
+        child.next(values(vec![None])).unwrap();
+        child.next(values(vec![None, None])).unwrap();
+        let turn = child.next(values(vec![None]));
+        assert_eq!(read_spaces(&turn), [STORAGE_BACKEND_KEYSPACE]);
+        let disabled = GroupStorage {
+            backend_id,
+            group_id: Ulid::from_bytes([7u8; 16]),
+            name: "tenant".to_string(),
+            kind: GroupBackendKind::S3,
+            public_config: HashMap::new(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            updated_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: UserId::default(),
+            disabled: true,
+            cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
+        };
+        let turn = child.next(values(vec![Some(disabled.to_bytes().unwrap().into())]));
+        let error = turn.unwrap_err();
+        assert_eq!(error, BackendFenceError::Unavailable.into());
+
+        operation.next(published(Err(error))).unwrap_err();
+        assert_rolls_back(&operation.abort(), &written);
+    }
+}
+
+/// No byte-materialization call and no registration happens before the destination passed
+/// the shared placement gate, which runs as a child.
+mod decisions {
+    use super::*;
+    use crate::placement::policy::PolicyCacheStats;
+    use aruna_core::structs::placement::policy::{
+        PlacementDecision, PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
+    };
+    use std::collections::BTreeMap;
+
+    const BODY: &[u8] = b"payload";
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    /// A rule that admits exactly one location.
+    fn policy(location: &str) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([1u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn gate(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: PlacementSubject {
+                node_id: node(9),
+                generation: 1,
+                location: location.to_string(),
+                labels: BTreeMap::new(),
+                executor_kind: None,
+                local_to_controller: true,
+            },
+            now_ms: 1_000,
+            admitting: true,
+        }
+    }
+
+    fn bucket(refs: Vec<PlacementPolicyRef>, generation: u64) -> Value {
+        let info = BucketInfo {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_at: UNIX_EPOCH,
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: refs,
+            placement_policy_generation: generation,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        info.to_bytes().expect("bucket encodes").into()
+    }
+
+    fn operation(location: &str) -> PutObjectOperation {
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            group_id,
+            realm_id: realm(),
+            node_id: node(9),
+            request: PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "governed.txt".to_string(),
+                content_length: Some(BODY.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(BODY))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(group_id),
+        })
+        .with_gate(gate(location))
+    }
+
+    fn decided(decision: PlacementDecision, foreign_owner: Option<Ulid>) -> IoResult {
+        let outcome = PolicyGateOutcome {
+            decision,
+            foreign_owner,
+            stats: PolicyCacheStats::default(),
+        };
+        IoResult::Child(ChildOutcome::new(Ok::<_, ReadPolicyError>(outcome)))
+    }
+
+    /// Answers the bucket read with `refs`; a governed write asks the gate next.
+    fn gated(operation: &mut PutObjectOperation, refs: Vec<PlacementPolicyRef>) {
+        operation.first().unwrap();
+        let turn = operation.next(values(vec![Some(bucket(refs, 1))]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, PutObjectState::PolicyGate);
+    }
+
+    #[test]
+    fn denies_before_write() {
+        // The rule admits another location, so nothing may be written at all.
+        let rule = policy("us-east");
+        let mut operation = operation("eu-west");
+        gated(&mut operation, vec![rule.policy_ref()]);
+        let policy_ids = vec![rule.policy().policy_id];
+        let denied = PlacementDecision::Denied {
+            policy_ids: policy_ids.clone(),
+        };
+
+        let turn = operation.next(decided(denied, None));
+
+        assert_eq!(
+            turn.err(),
+            Some(PolicyGateError::Denied { policy_ids }.into())
+        );
+    }
+
+    #[test]
+    fn unresolved_blocks_write() {
+        // A rule that cannot be obtained blocks; it is never read as a grant.
+        let rule = policy("eu-west");
+        let mut operation = operation("eu-west");
+        gated(&mut operation, vec![rule.policy_ref()]);
+        let unavailable = PlacementDecision::Unavailable {
+            policy_ids: vec![rule.policy().policy_id],
+        };
+
+        let turn = operation.next(decided(unavailable, None));
+
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::PolicyGate(
+                PolicyGateError::Unavailable { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn missing_subject_blocks() {
+        // A node that advertises no subject may hold nothing governed.
+        let mut operation = operation("eu-west");
+        operation.gate_context = None;
+        operation.first().unwrap();
+        let refs = vec![PlacementPolicyRef {
+            policy_id: Ulid::from_bytes([1u8; 16]),
+            digest: [4u8; 32],
+        }];
+
+        let turn = operation.next(values(vec![Some(bucket(refs, 1))]));
+
+        assert_eq!(turn.err(), Some(PolicyGateError::NoSubject.into()));
+    }
+
+    #[test]
+    fn planned_needs_hint() {
+        // A planned id in a distributed bucket must already carry the set hint.
+        use aruna_core::structs::storage::distribution::hint::with_hint;
+        let set_id = Ulid::from_bytes([5u8; 16]);
+        let planned = |id: Ulid| {
+            let mut operation = operation("eu-west");
+            operation.config.preassigned_version_id = Some(id);
+            operation.first().unwrap();
+            operation.next(values(vec![None])).unwrap();
+            let mut info = BucketInfo::from_bytes(&bucket(Vec::new(), 0)).unwrap();
+            info.distribution = Some(DistributionBinding {
+                set_id,
+                member_id: Ulid::from_bytes([6u8; 16]),
+                incarnation: 1,
+                revision: Default::default(),
+            });
+            operation.next(values(vec![Some(info.to_bytes().unwrap().into())]))
+        };
+        let hint = SetHint::of_set(set_id);
+        let plain = Ulid::from_parts(1, 0);
+        assert_ne!(SetHint::of_version(plain), hint);
+        assert_eq!(
+            planned(plain).err(),
+            Some(PutObjectError::InvalidPreassignedVersion)
+        );
+        assert!(planned(with_hint(plain, hint)).is_ok());
+    }
+
+    #[test]
+    fn ungoverned_skips_gate() {
+        // An ungoverned write reaches the blob write with no policy round trip; an allowed
+        // governed write reaches it after the gate.
+        let mut plain = operation("eu-west");
+        plain.first().unwrap();
+        plain
+            .next(values(vec![Some(bucket(Vec::new(), 0))]))
+            .unwrap();
+        plain.next(values(vec![None])).unwrap();
+        let turn = plain.next(values(vec![None]));
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::Write { .. })
+        ));
+
+        let rule = policy("eu-west");
+        let mut governed = operation("eu-west");
+        gated(&mut governed, vec![rule.policy_ref()]);
+        let turn = governed.next(decided(PlacementDecision::Allowed, None));
+        assert_eq!(read_spaces(&turn), [PURGE_FENCE_KEYSPACE]);
+    }
+
+    #[test]
+    fn inherited_ref_gates() {
+        // Staging, imports and job outputs carry their source's refs into an otherwise
+        // ungoverned destination; a sender may never drop one.
+        let rule = policy("us-east");
+        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
+        operation.first().unwrap();
+        let turn = operation.next(values(vec![Some(bucket(Vec::new(), 0))]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // A copy inherits a rule another group owns; the subject satisfies it, so only the
+        // ownership refuses the write.
+        let rule = policy("eu-west");
+        let mut operation = operation("eu-west").with_inherited_policies(vec![rule.policy_ref()]);
+        gated(&mut operation, Vec::new());
+        let owner = Ulid::from_bytes([8u8; 16]);
+
+        let turn = operation.next(decided(PlacementDecision::Allowed, Some(owner)));
+
+        assert!(matches!(
+            turn,
+            Err(PutObjectError::PolicyGate(
+                PolicyGateError::ForeignPolicy { .. }
+            ))
+        ));
+    }
+
+    fn location() -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "/data".to_string(),
+            storage_bucket: "aruna".to_string(),
+            backend_path: "objects/one".to_string(),
+            ulid: Ulid::from_bytes([5u8; 16]),
+            format: StoredFormat::default(),
+            created_by: UserId::local(Ulid::from_bytes([3u8; 16]), realm()),
+            created_at: UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: BODY.len() as u64,
+            hashes: HashMap::from([("blake3".to_string(), vec![6u8; 32])]),
+        }
+    }
+
+    fn subject_row(generation: u64) -> Value {
+        let mut record = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
+            crate::tests::policy::subject(node(9), "eu-west"),
+        )
+        .expect("subject is valid");
+        record.subject.generation = generation;
+        record.to_bytes().expect("record encodes").into()
+    }
+
+    /// The version transaction of a write the gate admitted under `refs`, answered up to its
+    /// bucket and subject reread.
+    fn reread(refs: Vec<PlacementPolicyRef>, bucket_now: Value, subject: Option<Value>) -> Turn {
+        let mut operation = operation("eu-west");
+        operation.first().unwrap();
+        let turn = operation.next(values(vec![Some(bucket(refs.clone(), 1))]));
+        if !refs.is_empty() {
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+            operation
+                .next(decided(PlacementDecision::Allowed, None))
+                .unwrap();
+        }
+        operation.next(values(vec![None])).unwrap();
+        operation.next(values(vec![None])).unwrap();
+        let finished = BlobEvent::WriteFinished {
+            location: location(),
+        };
+        operation.next(event(Event::Blob(finished))).unwrap();
+        let mut child = operation.publish_child();
+        child.first().unwrap();
+        child.next(values(vec![None])).unwrap();
+        child.next(values(vec![Some(bucket_now), subject]))
+    }
+
+    #[test]
+    fn drift_aborts_commit() {
+        // A default changed while the bytes streamed was never evaluated, so the version must
+        // not commit the refs it would now inherit.
+        let changed = bucket(vec![policy("us-east").policy_ref()], 1);
+        let turn = reread(Vec::new(), changed, None);
+        assert_eq!(turn.err(), Some(PolicyGateError::Drift.into()));
+    }
+
+    #[test]
+    fn subject_advance_aborts() {
+        // The subject that admitted the write moved on while the bytes streamed.
+        let rule = policy("eu-west");
+        let same = bucket(vec![rule.policy_ref()], 1);
+        let turn = reread(vec![rule.policy_ref()], same, Some(subject_row(2)));
+        assert_eq!(turn.err(), Some(PolicyGateError::Drift.into()));
+    }
+}
