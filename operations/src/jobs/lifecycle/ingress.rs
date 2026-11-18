@@ -1330,15 +1330,18 @@ async fn admit_with_quota(
     for attempt in 0..ADMISSION_ATTEMPTS {
         let (quota_refusal, quota_revision) = match has_claim(context, &identity.family()).await? {
             true => (None, None),
-            false => crate::jobs::quota::quota_refusal(
-                context,
-                config,
-                local,
-                request.spec.group_id,
-                &effective_resources(&request.spec),
-            )
-            .await
-            .map_err(SubmitJobError::PlacementUnavailable)?,
+            false => {
+                let check = crate::jobs::quota::QuotaCheckOperation::new(
+                    config.clone(),
+                    local,
+                    request.spec.group_id,
+                    effective_resources(&request.spec),
+                    context.fresh_heartbeats(),
+                );
+                drive(check, context)
+                    .await
+                    .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?
+            }
         };
         let admitted = drive(
             AdmitSubmissionOperation::new(AdmitSubmissionConfig {
