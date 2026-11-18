@@ -11,7 +11,7 @@ use crate::s3::abe_copies::{
     CompleteCopiesError, CompleteCopiesOperation, CopyEnvelopeOperation, CopyOutcome, copy_row,
 };
 use crate::s3::abe_rekey::{PageEnd, PageScope, RekeyPage};
-use crate::s3::object::put::abe::envelope_write;
+use crate::s3::object::put::abe::located_rows;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;
 use aruna_core::keyspaces::{
@@ -124,12 +124,13 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
     })
     .unwrap();
     let source = VersionKey::new("bucket", SOURCE, source_id);
-    let rows = (&HashMap::new(), u64::MAX, None);
-    let (Effect::Storage(effect), _) = envelope_write(&envelope, &source, &location, rows).unwrap()
-    else {
-        panic!("expected a storage write")
+    let rows = (&HashMap::new(), u64::MAX);
+    let (writes, _) = located_rows(&envelope, &source, &location, rows).unwrap();
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
     };
-    storage.send_storage_effect(effect).await;
+    storage.send_storage_effect(write).await;
     let sealed = Sealed {
         secret,
         public,

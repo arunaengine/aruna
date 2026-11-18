@@ -18,8 +18,8 @@ use crate::placement::policy::{
 };
 use crate::s3::abe_copies::{copy_row, still_active};
 use crate::s3::abe_rekey::RekeyProgress;
-use crate::s3::object::put::abe::{abe_reads, envelope_write, keyed, parse_abe};
-use crate::s3::purge_fence::{PurgeFenceError, check_publication, publication_read};
+use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
+use crate::s3::purge_fence::{PurgeFenceError, check_published, publication_rows};
 use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
 };
@@ -426,8 +426,8 @@ impl SealedCopyOperation {
     /// The publication fence is the first read of the transaction.
     fn begin(&mut self) -> Next<SealedCopyResult> {
         self.step = Step::Fence;
-        let fence = publication_read(&self.input.bucket, self.authority.as_ref(), None);
-        Next::Call(fence.into())
+        let rows = publication_rows(&self.input.bucket, self.authority.as_ref());
+        Next::Call(IoCall::Read(rows))
     }
 
     /// The default and subject the gate admitted must still hold when the copy commits.
@@ -554,7 +554,7 @@ impl SealedCopyOperation {
         let pointer = stamp_head(pointer, self.binding.as_ref(), self.epoch);
         self.head = Some(pointer.clone());
         self.step = Step::WriteHead;
-        let write = write_head_effect(&self.alias_context(), pointer, None)?;
+        let write = write_head_effect(&self.alias_context(), pointer)?;
         Ok(Next::Call(write.into()))
     }
 
@@ -566,7 +566,7 @@ impl SealedCopyOperation {
         };
         self.step = Step::WriteIndex;
         let context = self.alias_context();
-        let write = add_index_effect(&context, hash, self.version_id, None)?;
+        let write = add_index_effect(&context, hash, self.version_id)?;
         Ok(Next::Call(write.into()))
     }
 
@@ -581,7 +581,7 @@ impl SealedCopyOperation {
             self.version_id,
             unix_timestamp_millis(),
         );
-        let effect = write_version_effect(&self.dest_version(), &version, None)?;
+        let effect = write_version_effect(&self.dest_version(), &version)?;
         let effect = journaled(effect, &uploaded)?;
         self.version = Some(version);
         self.step = Step::WriteVersion;
@@ -592,7 +592,7 @@ impl SealedCopyOperation {
     fn write_owner(&mut self) -> Turn {
         let owner = CopyOwner::new(self.archive(), self.dest_version());
         self.step = Step::WriteOwner;
-        Ok(Next::Call(owner_write_effect(&owner, None)?.into()))
+        Ok(Next::Call(owner_write_effect(&owner)?.into()))
     }
 
     /// Fences the copy's own envelope or writes its pending row; a source without either skips.
@@ -633,13 +633,13 @@ impl SealedCopyOperation {
         envelope.anchored(&parameters, epoch).map_err(abe)?;
         let version = self.version.as_ref().ok_or(SealedCopyError::InvalidState)?;
         let limit = RoCrateLimits::default().metadata_bytes;
-        let rows = (&version.metadata, limit, None);
-        let (effect, charge) =
-            envelope_write(envelope, &self.dest_version(), &self.input.location, rows)
+        let rows = (&version.metadata, limit);
+        let (writes, charge) =
+            located_rows(envelope, &self.dest_version(), &self.input.location, rows)
                 .map_err(abe)?;
         self.envelope_bytes = charge;
         self.step = Step::WriteEnvelope;
-        Ok(Next::Call(effect.into()))
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     /// The alias reuses the old object key, so a re-key pass of its prefix starts again.
@@ -798,7 +798,7 @@ impl Operation for SealedCopyOperation {
             Step::CreateEnvelope => self.envelope_created(result.event()?),
             Step::Fence => {
                 let (bucket, key) = (&self.input.bucket, &self.input.dest_key);
-                check_publication(result.event()?, bucket, key, self.authority.as_ref())?;
+                check_published(result.values()?, bucket, key, self.authority.as_ref())?;
                 self.step = Step::Drift;
                 Ok(Next::Call(drift_reads(&self.input.bucket, None).into()))
             }

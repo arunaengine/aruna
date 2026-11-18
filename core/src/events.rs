@@ -159,10 +159,6 @@ pub enum SubOperationEvent {
     },
     /// A key request run failed and may succeed on retry.
     KeyRequestsFailed,
-    /// A kept bucket key audit record was stored and its retry timer row removed.
-    AuditStored {
-        result: Result<(), String>,
-    },
     /// The key directory answer for one user.
     KeysLooked {
         lookup: crate::structs::storage::holders::KeyLookup,
@@ -1084,7 +1080,6 @@ impl Event {
                     VaultHeld,
                     KeyRequestsOpened,
                     KeyRequestsFailed,
-                    AuditStored,
                     KeysLooked,
                     CopySealed,
                     CopyWoken,

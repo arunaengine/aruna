@@ -5,7 +5,6 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::IoCall;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
@@ -20,7 +19,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::holders::{HolderReport, HolderState, KeyLookup, admin_users};
 use aruna_core::structs::storage::multipart::MultipartUpload;
-use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -65,19 +64,9 @@ pub struct BucketState {
     pub admins: BTreeSet<UserId>,
 }
 
-/// Reads a bucket, its settings and the realm and group authorization documents together, so
-/// implicit authority comes from the snapshot the change commits against (D30).
-pub fn authority_read(
-    bucket: &str,
-    realm_id: RealmId,
-    group_id: GroupId,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    let reads = authority_keys(bucket, realm_id, group_id);
-    Effect::Storage(StorageEffect::BatchRead { reads, txn_id })
-}
-
-/// The rows of an `authority_read`, in the order `parse_authority` expects.
+/// A bucket, its settings and the realm and group authorization documents, read together so
+/// implicit authority comes from the snapshot the change commits against (D30), in the order
+/// `parse_authority` expects.
 pub(crate) fn authority_keys(
     bucket: &str,
     realm_id: RealmId,
@@ -172,19 +161,7 @@ pub(crate) fn authority_rows(
     ]
 }
 
-/// Reads a bucket record and its encryption settings in one transaction.
-pub fn settings_read(bucket: &str, txn_id: Option<TxnId>) -> Effect {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    Effect::Storage(StorageEffect::BatchRead {
-        reads: vec![
-            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
-            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
-        ],
-        txn_id,
-    })
-}
-
-/// The bucket record and settings a `settings_read` returned; the bucket must belong to `group_id`.
+/// The bucket record and settings read together; the bucket must belong to `group_id`.
 pub fn parse_settings(
     values: Vec<(Key, Option<Value>)>,
     group_id: GroupId,
