@@ -277,6 +277,10 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     if let NetEffect::GrantedRead(read) = effect {
         return Event::Net(NetEvent::GrantedRead(granted_read(*read, context).await));
     }
+    if let NetEffect::AvoidHolder { node_id, now_ms } = effect {
+        context.avoid_holder(node_id, now_ms);
+        return Event::Net(NetEvent::HolderAvoided);
+    }
     if let NetEffect::DelegatedRead(read) = effect {
         let answer = delegated_read(*read, context).await;
         return Event::Net(NetEvent::DelegatedRead(answer));
@@ -321,6 +325,7 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                 StatementSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
             NetEffect::GrantSign(_) => Event::Net(NetEvent::GrantSign(None)),
+            NetEffect::DelegationSign(_) => Event::Net(NetEvent::DelegationSign(None)),
             NetEffect::ExecutionSign(_) => Event::Net(NetEvent::ExecutionSign(
                 ExecutionSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),

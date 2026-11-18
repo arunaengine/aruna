@@ -6,6 +6,7 @@ use super::group::{BackendClaim, GroupHold};
 use super::{BackendRegistry, BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
+use crate::member_read::get_member;
 use crate::native;
 use crate::opendal::init_operator;
 use aruna_core::NodeId;
@@ -101,6 +102,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::CloseConnection { .. } => (EffectClass::Control, "close_connection"),
         BlobEffect::Read { .. } => (EffectClass::Read, "read"),
         BlobEffect::CollectStream { .. } => (EffectClass::Read, "collect_stream"),
+        BlobEffect::MemberGet(_) => (EffectClass::Read, "member_get"),
         BlobEffect::ReadRange { .. } => (EffectClass::Read, "read_range"),
         BlobEffect::ReadHiddenRange { .. } => (EffectClass::Read, "read_hidden_range"),
         BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
@@ -850,6 +852,9 @@ impl BlobHandler {
             BlobEffect::CollectStream { blob } => BlobEvent::StreamCollected {
                 bytes: collect_stream(blob).await,
             },
+            BlobEffect::MemberGet(request) => {
+                BlobEvent::MemberAnswered(Box::new(get_member(*request).await))
+            }
             BlobEffect::ReconcileReservation { location } => {
                 match Box::pin(self.reconcile_reservation(location)).await {
                     Ok(done) => BlobEvent::ReservationReconciled { done },

@@ -198,6 +198,8 @@ pub enum BlobEvent {
     StreamCollected {
         bytes: Result<Vec<u8>, String>,
     },
+    /// What another member answered a forwarded read.
+    MemberAnswered(Box<crate::member_read::MemberAnswer>),
     /// Whether the reservation is settled; `false` keeps it for a later pass.
     ReservationReconciled {
         done: bool,
@@ -523,6 +525,12 @@ pub enum NetEvent {
     ),
     /// The signed read grant, or `None` when this node cannot sign it.
     GrantSign(Option<Box<crate::structs::storage::read_grant::SignedGrant>>),
+    /// The signed delegation, or `None` when this node cannot sign it.
+    DelegationSign(
+        Option<Box<crate::structs::storage::distribution::delegation::SignedDelegation>>,
+    ),
+    /// The holder is skipped in holder choices for a while.
+    HolderAvoided,
     /// The caller a forwarded token stands for, or why it is not accepted from that peer.
     WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
     /// The JSON-LD summary of a dataset, or why it could not be read.
@@ -926,6 +934,7 @@ impl Event {
                     DeleteFinished,
                     ReservationReleased,
                     StreamCollected,
+                    MemberAnswered,
                     ReservationReconciled,
                     HiddenSpooled,
                     HiddenRead,
@@ -1035,6 +1044,8 @@ impl Event {
                     DatasetSummary,
                     WritePeerAuth,
                     GrantSign,
+                    DelegationSign,
+                    HolderAvoided,
                     Shard,
                     TopicPeers,
                     DeletePlanSigned,

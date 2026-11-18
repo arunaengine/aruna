@@ -172,6 +172,8 @@ pub enum BlobEffect {
     CollectStream {
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
+    /// Sends one GET to another member and streams its answer; answered by `MemberAnswered`.
+    MemberGet(Box<crate::member_read::MemberGet>),
     /// Settles the reservation a write left behind; answered by `ReservationReconciled`.
     ReconcileReservation {
         location: BackendLocation,
@@ -832,6 +834,15 @@ pub enum NetEffect {
     /// Signs a read grant; only a grant naming this node as issuer. Answers
     /// `NetEvent::GrantSign`.
     GrantSign(Box<crate::structs::storage::read_grant::ReadGrant>),
+    /// Signs a delegation; only one naming this node as issuer. Answers
+    /// `NetEvent::DelegationSign`.
+    DelegationSign(Box<crate::structs::storage::distribution::delegation::Delegation>),
+    /// Skips a holder that failed in holder choices for a while; answers
+    /// `NetEvent::HolderAvoided`.
+    AvoidHolder {
+        node_id: crate::NodeId,
+        now_ms: u64,
+    },
     /// Checks a forwarded caller's token for a write from `peer`; answers
     /// `NetEvent::WritePeerAuth`.
     WritePeerAuth(Box<WritePeerRequest>),
