@@ -7,9 +7,14 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::secrets::{Delivery, ResponseExposure};
 
 use super::*;
+use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::plugins::bound::select;
 use crate::plugins::bound::tests::{ORIGIN, bound, edit_config, secret};
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::install::{ensure_rules, read_config, retire_rules};
+use crate::plugins::rows::tests::child_result;
+use aruna_core::time::unix_timestamp_millis;
 
 fn rule(consumer: &SecretConsumer, response: ResponseExposure) -> UseRule {
     UseRule {
@@ -359,4 +364,109 @@ async fn equal_rules_collapse() {
             (vec!["/api".to_string()], ResponseExposure::Full),
         ]
     );
+}
+
+fn edit_actor(install: &PluginInstall) -> Actor {
+    Actor {
+        node_id: install.receiver,
+        user_id: install.granted_by,
+        realm_id: install.account.realm_id,
+    }
+}
+
+fn stamp() -> RuleStamp {
+    (
+        5,
+        [
+            Ulid::from_parts(7, 1),
+            Ulid::from_parts(7, 2),
+            Ulid::from_parts(7, 3),
+        ],
+    )
+}
+
+fn edit_of(install: &PluginInstall, guard: RuleGuard) -> EditRules {
+    let name = SecretName::try_from("api".to_string()).unwrap();
+    let ours = consumer(install);
+    let actor = edit_actor(install);
+    EditRules::new(
+        &actor,
+        (install.group_id, &name),
+        (&ours, Vec::new()),
+        guard,
+        stamp(),
+    )
+}
+
+fn config_with(install: Option<&PluginInstall>) -> IoResult {
+    let realm = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1))
+        .account
+        .realm_id;
+    let mut config = RealmConfigDocument::new(realm, Vec::new(), 3);
+    config.installs.extend(install.cloned());
+    child_result(Ok::<_, GetConfigError>(config))
+}
+
+#[test]
+fn stale_guard_writes_nothing() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let current = RuleGuard::Revision {
+        install_id: install.install_id,
+        revision: install.revision + 1,
+    };
+    let mut edit = edit_of(&install, current);
+    assert!(matches!(edit.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(
+        edit.next(config_with(Some(&install))),
+        Ok(Next::Done(false))
+    );
+    let retired = RuleGuard::Retired {
+        install_id: install.install_id,
+    };
+    let mut gone = edit_of(&install, retired);
+    let read = gone.next(config_with(None));
+    assert!(
+        matches!(read, Ok(Next::Call(IoCall::Child(_)))),
+        "a gone install may be cleaned"
+    );
+}
+
+#[test]
+fn missing_entry_refused() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let guard = RuleGuard::Retired {
+        install_id: install.install_id,
+    };
+    let mut edit = edit_of(&install, guard);
+    edit.next(config_with(None)).unwrap();
+    let none = child_result(Ok::<Option<SecretEntry>, EntryError>(None));
+    assert_eq!(edit.next(none), Err(RuleError::Missing));
+}
+
+fn bound_group(install: &mut PluginInstall) {
+    let binding = SecretBinding::parse("group:api").unwrap();
+    install.secrets.insert("slot".to_string(), binding);
+}
+
+#[test]
+fn retiring_skips_missing() {
+    let mut install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    bound_group(&mut install);
+    let actor = edit_actor(&install);
+    let mut retire = RetireRules::new(&actor, &install, vec![stamp()]);
+    assert!(matches!(retire.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let missing = child_result(Err::<bool, _>(RuleError::Missing));
+    assert_eq!(retire.next(missing), Ok(Next::Done(())));
+}
+
+/// Sets the rules of one consumer on a group secret, now.
+pub(crate) async fn edit_rules(
+    ctx: &DriverContext,
+    actor: &Actor,
+    target: (GroupId, &SecretName),
+    rules: (&SecretConsumer, Vec<UseRule>),
+    guard: RuleGuard,
+) -> Result<bool, RuleError> {
+    let stamp = (unix_timestamp_millis(), [(); 3].map(|_| Ulid::generate()));
+    drive(EditRules::new(actor, target, rules, guard, stamp), ctx).await
 }

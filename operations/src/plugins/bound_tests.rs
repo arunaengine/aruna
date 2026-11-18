@@ -16,8 +16,12 @@ use super::*;
 use crate::driver::drive;
 use crate::plugins::install::tests::{Fixture, REALM_KEY};
 use crate::plugins::install::{pick_version, read_config, read_manifest};
+use crate::plugins::secret_use::slot_kind;
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
+use aruna_core::plugins::Refusal;
+use aruna_core::secrets::UseRule;
+use ulid::Ulid;
 
 pub(crate) const TOKEN: &str = "canary-release-4f1e";
 pub(crate) const ORIGIN: &str = "https://api.example.org";

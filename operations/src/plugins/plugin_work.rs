@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::errors::ConversionError;
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::{
     JobError, JobPayload, JobResultPayload, PluginWorkAction, PluginWorkSpec,
 };
@@ -20,12 +20,10 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use futures_util::future::BoxFuture;
 
-use super::account::ReadUser;
-use super::check::{CopyGrants, check_identity};
-use super::install::read_config;
+use super::check::CopyGrants;
 use super::objects::{LocalObject, Unmarked};
 use super::work::holds_job;
-use super::work::{WorkRow, read_work};
+use super::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome, PayloadHandler};
 use crate::jobs::key_wake::version_wait;
@@ -76,9 +74,14 @@ impl PayloadHandler for PluginWorkHandler {
 
 /// Runs `spec` once. A refused check is final; state that cannot be read now is deferred.
 pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunOutcome {
-    let (install, config, row) = match admit_work(ctx, spec).await {
+    let admit = AdmitWork::new(spec, ctx.owner_node_id);
+    let AdmittedWork {
+        install,
+        config,
+        row,
+    } = match drive(admit, &ctx.driver).await {
         Ok(admitted) => admitted,
-        Err(outcome) => return outcome,
+        Err(refusal) => return not_admitted(refusal),
     };
     match &spec.action {
         PluginWorkAction::Copy { .. } => copy_work(ctx, spec, (&install, &config)).await,
@@ -113,36 +116,15 @@ pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunO
     }
 }
 
-/// The install, account and binding checks of one attempt, before any grant check, and the row.
-async fn admit_work(
-    ctx: &JobContext,
-    spec: &PluginWorkSpec,
-) -> Result<(PluginInstall, RealmConfigDocument, WorkRow), JobRunOutcome> {
-    let deferred = |message: String| JobRunOutcome::Deferred(JobError::retryable(message));
-    let config = read_config(&ctx.driver, spec.realm_id).await;
-    let config = config.map_err(|error| deferred(error.to_string()))?;
-    let row = drive(read_work(spec.install_id, spec.work_id), &ctx.driver).await;
-    let row = row.map_err(|error| deferred(error.to_string()))?;
-    let Some(row) = row else {
-        return Err(permanent("the plugin work is no longer recorded"));
-    };
-    let user = drive(ReadUser(row.account), &ctx.driver).await;
-    let user = user.map_err(|error| deferred(error.0))?;
-    let place = (&config, spec.realm_id, ctx.owner_node_id);
-    let binding = (spec.install_id, row.binding.digest.as_str());
-    let install = check_identity(place, binding, user.as_ref()).map_err(refused)?;
-    if install.account != row.account {
-        return Err(permanent("the plugin work belongs to an earlier install"));
-    }
-    // A pause, or an update waiting for approval, holds the work until the install is active.
-    match install.state {
-        InstallState::Active if !install.paused => Ok((install.clone(), config, row)),
-        InstallState::Active | InstallState::Paused | InstallState::Blocked => {
-            let message = format!("the install is {}", install.state.as_str());
-            let message = JobError::retryable(message);
-            Err(JobRunOutcome::DeferredFor(message, PAUSED_RETRY))
+/// The outcome of an attempt that was not admitted.
+fn not_admitted(refusal: WorkRefusal) -> JobRunOutcome {
+    match refusal {
+        WorkRefusal::Deferred(message) => JobRunOutcome::Deferred(JobError::retryable(message)),
+        WorkRefusal::Held(message) => {
+            JobRunOutcome::DeferredFor(JobError::retryable(message), PAUSED_RETRY)
         }
-        state => Err(permanent(format!("the install is {}", state.as_str()))),
+        WorkRefusal::Permanent(message) => permanent(message),
+        WorkRefusal::Refused(error) => refused(error),
     }
 }
 

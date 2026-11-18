@@ -1,4 +1,4 @@
-//! An async transaction over plugin rows, kept for the replication queue until it moves to plans.
+//! An async access to plugin rows for tests that seed or inspect them.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

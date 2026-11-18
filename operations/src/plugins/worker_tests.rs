@@ -583,7 +583,7 @@ async fn retries_hide_values() {
         run: run.clone(),
     };
     let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope);
-    broker.shows(SecretFields::new(
+    broker.shown.lock().unwrap().push(SecretFields::new(
         [("token".to_string(), Secret::new(VALUE))].into(),
     ));
     // A retryable error that names a value handed to the code keeps the run without it.

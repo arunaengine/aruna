@@ -321,7 +321,8 @@ async fn probe_with(
 #[tokio::test]
 async fn narrowed_rules_refuse() {
     use crate::plugins::bound::tests::hold_keys;
-    use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
+    use crate::plugins::rules::tests::edit_rules;
+    use crate::plugins::rules::{RuleGuard, consumer};
     let fixture = Fixture::keyed().await;
     let install = secured_install(&fixture).await;
     let sender = fake(200, r#"{"id":7,"meta":{"name":"n"}}"#);
@@ -417,7 +418,8 @@ async fn whole_answers_gated() {
             broker.connection_send(&cx, request).await
         }
     };
-    use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
+    use crate::plugins::rules::tests::edit_rules;
+    use crate::plugins::rules::{RuleGuard, consumer};
     let name = aruna_core::secrets::SecretName::try_from("api-key".to_string()).unwrap();
     let guard = RuleGuard::Revision {
         install_id: install.install_id,

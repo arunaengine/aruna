@@ -535,7 +535,7 @@ async fn secret_values_granted() {
     use crate::plugins::account::{AccountChange, EnsureRole};
     use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, secret};
     use crate::plugins::grants::role_paths;
-    use crate::plugins::rules::ensure_rules;
+    use crate::plugins::install::ensure_rules;
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     secret(&fixture, &install).await;

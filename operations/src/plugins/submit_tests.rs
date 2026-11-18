@@ -619,7 +619,8 @@ async fn reply_rechecked() {
 
     use crate::plugins::bound::tests::{ORIGIN, hold_keys, rule_for, secret_with};
     use crate::plugins::broker::RunBroker;
-    use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
+    use crate::plugins::rules::tests::edit_rules;
+    use crate::plugins::rules::{RuleGuard, consumer};
     use crate::plugins::work::{WorkChange, reserve, update_work};
     let fixture = Fixture::keyed().await;
     fetcher(&fixture).await;

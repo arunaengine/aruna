@@ -14,6 +14,7 @@ use crate::jobs::executor::ProgressReporter;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::work::{Identity, WorkKind, WorkRow, reserve};
+use aruna_core::plugin_installs::InstallState;
 
 pub(crate) fn job_context(ctx: &DriverContext, fixture: &Fixture) -> JobContext {
     JobContext {

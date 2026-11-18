@@ -152,22 +152,21 @@ impl Operation for PruneJournal {
     }
 }
 
-/// The journal rows this node has not matched yet, at most a hundred.
 #[cfg(test)]
-pub(crate) async fn pending_events(ctx: &crate::driver::DriverContext) -> Vec<SourceEvent> {
-    let page = journal_page(aruna_core::plugin_runs::PENDING_ROW, None, 100);
-    let (rows, _) = crate::driver::drive(page, ctx).await.unwrap();
-    rows.into_iter().map(|(_, event)| event).collect()
-}
-
-#[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::plugins::rows::tests::page_result;
     use crate::plugins::rows::{scan_rows, write_rows};
     use crate::plugins::runs::tests::opened;
     use aruna_core::plugin_runs::{SourceKind, journal_entries};
+
+    /// The journal rows this node has not matched yet, at most a hundred.
+    pub(crate) async fn pending_events(ctx: &crate::driver::DriverContext) -> Vec<SourceEvent> {
+        let page = journal_page(aruna_core::plugin_runs::PENDING_ROW, None, 100);
+        let (rows, _) = drive(page, ctx).await.unwrap();
+        rows.into_iter().map(|(_, event)| event).collect()
+    }
 
     fn event(journaled_ms: u64) -> SourceEvent {
         SourceEvent {

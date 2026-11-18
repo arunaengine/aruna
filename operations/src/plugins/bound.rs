@@ -4,64 +4,24 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_SECRETS_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
-use aruna_core::plugins::{NodeCheckError, Refusal, ReleaseError};
-use aruna_core::realm_vault::{RealmSealed, RealmSecretRef, RealmVaultRecord};
+use aruna_core::plugins::{NodeCheckError, ReleaseError};
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
-use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings, UseRule};
+use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_plugins::trigger::TriggerKind;
-use ulid::Ulid;
 
 use super::entry::ReadEntry;
-use super::install::{pick_version, read_manifest};
 use super::rows::read_rows;
+use super::secret_use::{OpenSealed, Sealed, SelectSecret, Selected};
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
-use crate::secrets::node::{record_key, value_entry};
-use crate::secrets::owner::sealed_value;
-
-/// The current entry of a bound secret in the serving node's view.
-pub struct Selected {
-    pub kind: SecretKind,
-    pub settings: SecretSettings,
-    pub rules: Vec<UseRule>,
-    pub incarnation: Option<Ulid>,
-    pub value_id: Ulid,
-    pub sealed: Sealed,
-}
-
-pub enum Sealed {
-    Owner(Box<SecretEntry>),
-    Realm(RealmVaultRecord),
-    /// The node vault entry of a node secret, by its value id.
-    Node(Ulid),
-}
-
-/// The kind the install's manifest declares for `slot`.
-pub(crate) fn slot_kind(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    slot: &str,
-) -> Result<SecretKind, ReleaseError> {
-    let unavailable = |error: String| ReleaseError::Unavailable(error);
-    let plugin = pick_version(config, &install.plugin, Some(&install.digest));
-    let manifest = read_manifest(&plugin.map_err(|error| unavailable(error.to_string()))?);
-    let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
-    let declared = manifest.secrets.get(slot).map(|slot| slot.kind);
-    let name = serde_json::to_value(declared).ok();
-    let name = name
-        .as_ref()
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    SecretKind::parse(name).map_err(|_| ReleaseError::Refused(Refusal::Entry))
-}
+use crate::secrets::node::record_key;
 
 /// The current entry of a group or realm secret, or `None` when it is absent or incomplete.
 pub async fn select(
@@ -70,58 +30,8 @@ pub async fn select(
     install: &PluginInstall,
     binding: &SecretBinding,
 ) -> Result<Option<Selected>, ReleaseError> {
-    if binding.scope == BoundScope::Node {
-        let key = record_key(&binding.name);
-        let row = drive(read_rows(vec![(NODE_SECRETS_KEYSPACE, key)]), ctx).await;
-        let row = row.map_err(|error| ReleaseError::Unavailable(error.to_string()))?;
-        let row = row.into_iter().next().flatten();
-        let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
-        return Ok(record.map(|record| Selected {
-            kind: record.kind,
-            settings: record.settings,
-            rules: record.uses,
-            incarnation: None,
-            value_id: record.value_id,
-            sealed: Sealed::Node(record.value_id),
-        }));
-    }
-    if binding.scope == BoundScope::Realm {
-        let Some(record) = config
-            .secrets
-            .iter()
-            .find(|record| record.name == binding.name)
-        else {
-            return Ok(None);
-        };
-        let entry = RealmSecretRef::named(record.value_id).entry;
-        let sealed = config.vault.iter().find(|held| held.entry == entry);
-        return Ok(sealed.map(|sealed| Selected {
-            kind: record.kind.clone(),
-            settings: record.settings.clone(),
-            rules: record.uses.clone(),
-            incarnation: None,
-            value_id: record.value_id,
-            sealed: Sealed::Realm(sealed.clone()),
-        }));
-    }
-    let owner = SecretOwner::Group(install.group_id);
-    let Some(entry) = read_entry(ctx, config.realm_id, &owner, &binding.name).await? else {
-        return Ok(None);
-    };
-    let (Some(info), Some(value), Some(kind)) = (&entry.info, &entry.value, entry.kind()) else {
-        return Ok(None);
-    };
-    let SecretBody::Info(info) = &info.body else {
-        return Ok(None);
-    };
-    Ok(Some(Selected {
-        kind: kind.clone(),
-        settings: info.settings.clone(),
-        rules: info.uses.clone(),
-        incarnation: Some(entry.lifecycle.stamp.write_id),
-        value_id: value.stamp.write_id,
-        sealed: Sealed::Owner(Box::new(entry.clone())),
-    }))
+    let select = SelectSecret::new(Arc::new(config.clone()), install, binding);
+    drive(select, ctx).await.map_err(|failure| failure.0)
 }
 
 /// Drives the register reader of one name on the node's own storage.
@@ -140,37 +50,8 @@ pub async fn open(
     realm_id: RealmId,
     sealed: &Sealed,
 ) -> Result<SecretBytes, ReleaseError> {
-    let failed = |error: String| ReleaseError::Unavailable(error);
-    let sealed = match sealed {
-        Sealed::Owner(entry) => {
-            sealed_value(realm_id, entry).map_err(|error| failed(error.to_string()))?
-        }
-        Sealed::Realm(record) => RealmSealed::Record {
-            realm_id,
-            record: record.clone(),
-        },
-        Sealed::Node(value_id) => {
-            let entry = value_entry(*value_id);
-            let read = StorageEffect::VaultRead {
-                entry,
-                txn_id: None,
-            };
-            return match ctx.storage_handle.send_storage_effect(read).await {
-                Event::Storage(StorageEvent::VaultResult {
-                    secret: Some(secret),
-                    ..
-                }) => Ok(secret),
-                other => Err(failed(format!("the node vault answered {}", other.label()))),
-            };
-        }
-    };
-    let open = StorageEffect::RealmOpen(Box::new(sealed));
-    match ctx.storage_handle.send_storage_effect(open).await {
-        Event::Storage(StorageEvent::RealmOpened { result }) => {
-            result.map_err(|error| failed(error.to_string()))
-        }
-        other => Err(failed(format!("the realm keys answered {}", other.label()))),
-    }
+    let open = OpenSealed::new(realm_id, sealed.clone());
+    drive(open, ctx).await.map_err(|failure| failure.0)
 }
 
 /// The vault kind a manifest slot kind names.

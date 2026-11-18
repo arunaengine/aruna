@@ -7,12 +7,14 @@ use super::*;
 use crate::driver::drive;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use crate::plugins::account::{EnsureAccount, EnsureRole, ReadUser};
+use crate::plugins::account::{EnsureAccount, EnsureRole};
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
+use crate::plugins::rows::read_rows;
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
+use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::storage_entries::reducer_state_key;
@@ -267,7 +269,10 @@ impl Fixture {
     }
 
     pub(crate) async fn account(&self, install: &PluginInstall) -> Option<User> {
-        drive(ReadUser(install.account), &self.ctx).await.unwrap()
+        let row = (USER_KEYSPACE, install.account.to_bytes().to_vec());
+        let rows = drive(read_rows(vec![row]), &self.ctx).await.unwrap();
+        let row = rows.into_iter().next().flatten();
+        row.map(|bytes| User::from_bytes(&bytes).unwrap())
     }
 
     pub(crate) async fn roles(&self) -> HashMap<Ulid, Role> {

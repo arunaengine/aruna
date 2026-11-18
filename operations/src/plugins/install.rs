@@ -37,7 +37,7 @@ use super::grants::{
 };
 use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
-use super::rules::{ensure_rules, retire_rules};
+use super::rules::{EnsureRules, RetireRules, RuleStamp};
 use super::settings::{SettingError, check_settings};
 use super::sweep::{ORPHAN_GRACE_MS, plugin_accounts};
 use crate::auth::enforcement::enforce_policies;
@@ -810,6 +810,33 @@ pub(crate) async fn sweep_orphans(
         }
     }
     Ok(swept)
+}
+
+/// The stamps of up to `count` rule edits made now.
+fn rule_stamps(count: usize) -> Vec<RuleStamp> {
+    let now_ms = unix_timestamp_millis();
+    let ids = || [(); 3].map(|_| Ulid::generate());
+    (0..count).map(|_| (now_ms, ids())).collect()
+}
+
+/// Ensures the install's rules on every group secret it binds, for its current revision.
+pub(crate) async fn ensure_rules(
+    ctx: &DriverContext,
+    actor: &Actor,
+    install: &PluginInstall,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let stamps = rule_stamps(install.secrets.len());
+    let ensure = EnsureRules::new(actor, install, manifest, stamps)?;
+    drive(ensure, ctx).await.map_err(|error| error.0)
+}
+
+/// Removes the rules of a removing, abandoned or removed install from its group secrets.
+pub(crate) async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginInstall) {
+    let stamps = rule_stamps(install.secrets.len());
+    if let Err(error) = drive(RetireRules::new(actor, install, stamps), ctx).await {
+        warn!(%error, "Could not remove a plugin install's use rules");
+    }
 }
 
 #[cfg(test)]

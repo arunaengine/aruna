@@ -92,7 +92,7 @@ pub struct RunBroker {
     /// The secrets this run holds, reused while their value is unchanged.
     held: tokio::sync::Mutex<HeldSecrets>,
     /// The values handed to the code, removed from the text the run keeps.
-    shown: Mutex<Vec<SecretFields>>,
+    pub(super) shown: Mutex<Vec<SecretFields>>,
     scope: RunScope,
     /// A call at a known ordinal came with other arguments than before.
     changed: AtomicBool,
@@ -1330,13 +1330,6 @@ impl RunBroker {
                 ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
                 ReleaseError::Unavailable(why) => unavailable(why),
             })
-    }
-
-    /// Records fields as handed to the code, as `secret_value` does.
-    #[cfg(test)]
-    pub(crate) fn shows(&self, fields: SecretFields) {
-        let shown = self.shown.lock();
-        (shown.unwrap_or_else(|poisoned| poisoned.into_inner())).push(fields);
     }
 
     /// Text the run keeps with every form of a value handed to the code removed, as extra

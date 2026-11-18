@@ -44,17 +44,22 @@ pub mod replay;
 pub mod rows;
 pub mod rules;
 pub mod runs;
+pub(crate) mod secret_use;
 pub mod settings;
 pub mod state;
-pub mod store;
 pub mod submit;
 pub mod sweep;
 mod transfers;
 pub mod waiting;
 pub mod work;
+pub(crate) mod work_calls;
 pub mod worker;
 
 use aruna_plugins::broker::{ErrorKind, HostError};
+
+#[cfg(test)]
+#[path = "store_tests.rs"]
+pub(crate) mod store;
 
 #[cfg(test)]
 #[path = "delivery_tests.rs"]
