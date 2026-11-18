@@ -1,14 +1,11 @@
-//! Sends the decided registration or withdrawal to the registry and arms its timer at startup.
+//! Decides and sends the realm's registry publication and arms its timer at startup.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::Duration;
-
-use aruna_blob::blob::BlobHandle;
 use aruna_core::NodeId;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::federation::{FederationError, RealmKpis, Registration, Signed, Withdrawal};
+use aruna_core::federation::RealmKpis;
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
@@ -17,18 +14,15 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::warn;
-use url::Url;
 
-use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::federation::publish::{PUBLISH_INTERVAL, Publication, PublishOperation, still_due};
+use crate::federation::publish::{PUBLISH_INTERVAL, Publication, PublishOperation};
+use crate::federation::registration::{RegistrationCounts, SendRegistrationOperation};
 use crate::federation::totals::realm_totals;
 use crate::metadata::stats::{count_realm_documents, count_realm_groups};
 use crate::tasks::task_persistence::persist_task_effect;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Runs the decision and sends the signed request through the screened egress client.
+/// Runs the decision, reads the counts a registration reports and sends the signed request.
 pub(crate) async fn publish_registration(
     context: &DriverContext,
     realm_id: RealmId,
@@ -39,114 +33,28 @@ pub(crate) async fn publish_registration(
         .await
         .map_err(|error| error.to_string())?;
     let now = unix_timestamp_secs();
-    let sign_error = |error: FederationError| error.to_string();
-    let captured = publication.clone();
-    let (method, registry_url, body, totals) = match publication {
-        Publication::Nothing => return Ok(()),
-        Publication::Register {
-            registry_url,
-            descriptor,
-            nodes_configured,
-        } => {
-            let kpis = realm_kpis(context, realm_id, nodes_configured).await;
-            let registration = Registration {
-                descriptor,
-                kpis,
-                observed_at: now,
-                issued_at: now,
-            };
-            let signed = Signed::sign(registration, capabilities).map_err(sign_error)?;
-            let body = serde_json::to_vec(&signed).map_err(|error| error.to_string())?;
-            let totals = signed_totals(context, realm_id, node_id, capabilities).await;
-            (reqwest::Method::PUT, registry_url, body, totals)
-        }
-        Publication::Withdraw { registry_url, .. } => {
-            let withdrawal = Withdrawal {
-                realm_id,
-                issued_at: now,
-            };
-            let signed = Signed::sign(withdrawal, capabilities).map_err(sign_error)?;
-            let body = serde_json::to_vec(&signed).map_err(|error| error.to_string())?;
-            (reqwest::Method::DELETE, registry_url, body, None)
-        }
+    let counts = match publication {
+        Publication::Register { .. } => RegistrationCounts {
+            kpis: realm_kpis(context, realm_id).await,
+            totals: realm_totals(context, realm_id, node_id)
+                .await
+                .inspect_err(|error| warn!(error = %error, "Realm totals unavailable"))
+                .ok(),
+        },
+        Publication::Nothing | Publication::Withdraw { .. } => RegistrationCounts::default(),
     };
-    let blob = context
-        .blob_handle
-        .as_ref()
-        .ok_or("no blob handle for registry egress")?;
-    let url = realm_url(&registry_url, &realm_id)?;
-    // The KPI counts take time; settings may have changed since the decision.
-    let current = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    if !still_due(&current, node_id, &captured) {
-        return Ok(());
-    }
-    send(blob, method, url.clone(), body).await?;
-    // Best effort: a registry from before the totals route keeps the registration.
-    if let Some(body) = totals {
-        let sent = async { send(blob, reqwest::Method::PUT, totals_url(url)?, body).await };
-        if let Err(error) = sent.await {
-            warn!(error = %error, "Registry refused the realm totals");
-        }
-    }
-    Ok(())
+    let send = SendRegistrationOperation::new(
+        (realm_id, node_id),
+        capabilities.clone(),
+        publication,
+        counts,
+        now,
+    );
+    (drive(send, context).await).map_err(|error| error.to_string())
 }
 
-/// The signed realm totals as a request body; `None` when a total is unknown.
-async fn signed_totals(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    capabilities: &NodeCapabilities,
-) -> Option<Vec<u8>> {
-    let totals = realm_totals(context, realm_id, node_id)
-        .await
-        .inspect_err(|error| warn!(error = %error, "Realm totals unavailable"))
-        .ok()?;
-    let signed = Signed::sign(totals, capabilities)
-        .inspect_err(|error| warn!(error = %error, "Signing realm totals failed"))
-        .ok()?;
-    serde_json::to_vec(&signed).ok()
-}
-
-/// Sends one signed JSON body through the screened egress client.
-async fn send(
-    blob: &BlobHandle,
-    method: reqwest::Method,
-    url: Url,
-    body: Vec<u8>,
-) -> Result<(), String> {
-    let response = blob
-        .repository_request(method, url)
-        .map_err(|error| error.to_string())?
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .timeout(REQUEST_TIMEOUT)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("registry answered {}", response.status()));
-    }
-    Ok(())
-}
-
-/// The totals route below a realm's registry route.
-fn totals_url(mut realm_url: Url) -> Result<Url, String> {
-    realm_url
-        .path_segments_mut()
-        .map_err(|()| "registry URL cannot take a path".to_string())?
-        .push("totals");
-    Ok(realm_url)
-}
-
-/// The realm's totals; a count that fails is unknown (`None`), never zero.
-async fn realm_kpis(
-    context: &DriverContext,
-    realm_id: RealmId,
-    nodes_configured: Option<u64>,
-) -> RealmKpis {
+/// The realm's counts; a count that fails is unknown (`None`), never zero.
+async fn realm_kpis(context: &DriverContext, realm_id: RealmId) -> RealmKpis {
     RealmKpis {
         live_datasets: count_realm_documents(context, realm_id)
             .await
@@ -157,18 +65,8 @@ async fn realm_kpis(
             .await
             .inspect_err(|error| warn!(error = %error, "Group count unavailable"))
             .ok(),
-        nodes_configured,
+        nodes_configured: None,
     }
-}
-
-/// The registry route of one realm below the configured registry base URL.
-fn realm_url(registry_url: &Url, realm_id: &RealmId) -> Result<Url, String> {
-    let mut base = registry_url.clone();
-    if !base.path().ends_with('/') {
-        base.set_path(&format!("{}/", base.path()));
-    }
-    base.join(&format!("v1/realms/{realm_id}"))
-        .map_err(|error| error.to_string())
 }
 
 /// Arms the registration timer at startup without postponing a restored due time. The due
@@ -194,24 +92,6 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use tempfile::tempdir;
 
-    #[test]
-    fn realm_url_joins() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let url = realm_url(
-            &Url::parse("https://r.example.org/base").unwrap(),
-            &realm_id,
-        );
-        let url = url.unwrap();
-        assert_eq!(
-            url.as_str(),
-            format!("https://r.example.org/base/v1/realms/{realm_id}")
-        );
-        assert_eq!(
-            totals_url(url).unwrap().as_str(),
-            format!("https://r.example.org/base/v1/realms/{realm_id}/totals")
-        );
-    }
-
     #[tokio::test]
     async fn failed_count_unknown() {
         // A count that fails is reported as `null`; a count that works reports zero as zero.
@@ -228,7 +108,7 @@ mod tests {
             outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([7; 32]);
-        let kpis = realm_kpis(&context, realm_id, Some(2)).await;
+        let kpis = realm_kpis(&context, realm_id).await;
         assert_eq!(kpis.groups, Some(0));
         context
             .storage_handle
@@ -239,11 +119,11 @@ mod tests {
                 txn_id: None,
             })
             .await;
-        let kpis = realm_kpis(&context, realm_id, Some(2)).await;
+        let kpis = realm_kpis(&context, realm_id).await;
         let expected = serde_json::json!({
             "live_datasets": null,
             "groups": null,
-            "nodes_configured": 2
+            "nodes_configured": null
         });
         assert_eq!(serde_json::to_value(kpis).unwrap(), expected);
     }

@@ -3,12 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::events::Event;
 use aruna_core::federation::Signed;
 use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::rows::{decode, done, encode, encoded_row, read_row, values};
 use aruna_core::structs::execution::job::{
     JobRecord, RoCrateUploadRecord, job_record_key, parse_dedup_value,
@@ -55,6 +56,15 @@ impl RecordChange {
             | RecordChange::ConsumeConfirmation { record_key: key } => key,
         }
     }
+}
+
+/// Runs `change` as a child that a lost transaction conflict reruns.
+pub(crate) fn change_call(change: RecordChange) -> IoCall {
+    let seed = change.key().to_vec();
+    let build = move || RecordOperation::new(change.clone());
+    IoCall::Child(boxed_retry(build, &seed, |result| {
+        Event::Child(ChildOutcome::new(result))
+    }))
 }
 
 /// A bound upload the caller found stale, checked again inside the binding transaction.
