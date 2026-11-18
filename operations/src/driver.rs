@@ -65,6 +65,20 @@ pub struct DriverContext {
 }
 
 impl DriverContext {
+    /// A context that reaches storage alone, for code that holds only the storage handle.
+    pub fn for_storage(storage_handle: storage::StorageHandle) -> Self {
+        Self {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        }
+    }
+
     /// The realm this node serves; `fallback` on a node without a net transport.
     pub fn serving_realm(
         &self,

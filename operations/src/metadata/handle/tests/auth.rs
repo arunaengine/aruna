@@ -5,8 +5,6 @@
 use super::super::WritePeerError;
 use super::super::peer_auth::{authorize_peer, remote_auth_context, replay_authority};
 use super::*;
-use crate::auth::bearer_token::decode_bearer_token;
-use crate::auth::bearer_token::validate_bearer_token;
 use crate::metadata::handle::peer_auth::{bucket_search_auth, search_reader_auth};
 use crate::metadata::protocol::MetadataReadError;
 use crate::testing::sign_token;
@@ -285,10 +283,10 @@ async fn revocation_blind_decode() {
     let state = AuthValidationState::new(storage, Some(realm_id));
 
     assert!(matches!(
-        validate_bearer_token(&state, &token).await,
+        state.validate(&token).await,
         Err(ArunaBearerError::TokenRevoked)
     ));
-    let claims = decode_bearer_token(&RevocationBlindValidation(&state), &token)
+    let claims = state.decode(&token, true)
         .await
         .expect("revoked token still decodes for revocation");
     assert_eq!(claims.sub, user_id.to_string());
@@ -296,7 +294,7 @@ async fn revocation_blind_decode() {
     let (_untrusted_dir, untrusted_storage) = auth_storage();
     let untrusted = AuthValidationState::new(untrusted_storage, Some(realm_id));
     assert!(
-        decode_bearer_token(&RevocationBlindValidation(&untrusted), &token)
+        untrusted.decode(&token, true)
             .await
             .is_err()
     );

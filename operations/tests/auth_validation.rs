@@ -8,15 +8,17 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::auth::bearer_token::{ArunaValidationState, validate_bearer_token};
+use aruna_core::calls::Next;
+use aruna_core::operation::Operation;
+use aruna_operations::auth::bearer_token::{
+    DecodeTokenOperation, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
+};
 use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::testing::sign_token;
-use async_trait::async_trait;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use jsonwebtoken::errors::ErrorKind;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use ulid::Ulid;
 
 struct TestAuthState {
@@ -25,7 +27,6 @@ struct TestAuthState {
     now: u64,
     revoked_hashes: HashSet<String>,
     trusted_realms: HashSet<RealmId>,
-    revocation_reads: AtomicUsize,
 }
 
 impl Default for TestAuthState {
@@ -34,67 +35,56 @@ impl Default for TestAuthState {
             now: unix_timestamp_secs(),
             revoked_hashes: HashSet::new(),
             trusted_realms: HashSet::new(),
-            revocation_reads: AtomicUsize::new(0),
         }
     }
 }
 
-#[async_trait]
-impl ArunaValidationState for TestAuthState {
-    async fn is_token_revoked(
-        &self,
-        _realm_id: &RealmId,
-        token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        self.revocation_reads.fetch_add(1, Ordering::Relaxed);
-        Ok(self.revoked_hashes.contains(token_hash))
-    }
-
-    async fn user_cutoff(
-        &self,
-        _realm_id: &RealmId,
-        _user_id: &aruna_core::UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        Ok(None)
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        self.trusted_realms.contains(realm_id)
-    }
-
-    fn now_secs(&self) -> u64 {
-        self.now
+impl TestAuthState {
+    /// Verifies `token` against this state; a listed revocation needs no storage.
+    fn validate(&self, token: &str) -> Result<AuthContext, ArunaBearerError> {
+        let checks = TokenChecks {
+            trust: IssuerTrust::Listed(self.trusted_realms.clone()),
+            revocation: RevocationCheck::Listed(self.revoked_hashes.iter().cloned().collect()),
+            linked_realm: None,
+            keys: None,
+        };
+        let mut decode = DecodeTokenOperation::new(token, checks);
+        decode.stamp(self.now * 1000);
+        match decode.first()? {
+            Next::Done(claims) => claims_auth(claims),
+            _ => Err(ArunaBearerError::RevocationUnavailable),
+        }
     }
 }
 
-#[tokio::test]
-async fn validates_management_token() {
+#[test]
+fn validates_management_token() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let claims = token_claims(realm_id, user_id);
     let token = sign_token(&realm_signing_key, &claims);
     let state = trusted_state(realm_id);
 
-    let auth = validate_bearer_token(&state, &token).await.unwrap();
+    let auth = state.validate(&token).unwrap();
 
     assert_eq!(auth.user_id, user_id);
     assert_eq!(auth.realm_id, realm_id);
 }
 
-#[tokio::test]
-async fn rejects_revoked_token() {
+#[test]
+fn rejects_revoked_token() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let claims = token_claims(realm_id, user_id);
     let token = sign_token(&realm_signing_key, &claims);
     let mut state = trusted_state(realm_id);
     state.revoked_hashes.insert(bearer_token_hash(&token));
 
-    let error = validate_bearer_token(&state, &token).await.unwrap_err();
+    let error = state.validate(&token).unwrap_err();
 
     assert!(matches!(error, ArunaBearerError::TokenRevoked));
 }
 
-#[tokio::test]
-async fn rejects_bad_signature() {
+#[test]
+fn rejects_bad_signature() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let claims = token_claims(realm_id, user_id);
     let token = sign_token(&realm_signing_key, &claims);
@@ -108,14 +98,13 @@ async fn rejects_bad_signature() {
     invalid.replace_range(signature..signature + 1, replacement);
     let state = trusted_state(realm_id);
 
-    let error = validate_bearer_token(&state, &invalid).await.unwrap_err();
+    let error = state.validate(&invalid).unwrap_err();
 
     assert!(matches!(error, ArunaBearerError::JwtError(_)));
-    assert_eq!(state.revocation_reads.load(Ordering::Relaxed), 0);
 }
 
-#[tokio::test]
-async fn rejects_expired_token() {
+#[test]
+fn rejects_expired_token() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let state = trusted_state(realm_id);
     let mut claims = token_claims(realm_id, user_id);
@@ -123,7 +112,7 @@ async fn rejects_expired_token() {
     claims.exp = state.now.saturating_sub(3600);
     let token = sign_token(&realm_signing_key, &claims);
 
-    let error = validate_bearer_token(&state, &token).await.unwrap_err();
+    let error = state.validate(&token).unwrap_err();
 
     match error {
         ArunaBearerError::Expired => {}
@@ -134,20 +123,20 @@ async fn rejects_expired_token() {
     }
 }
 
-#[tokio::test]
-async fn rejects_untrusted_realm() {
+#[test]
+fn rejects_untrusted_realm() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let claims = token_claims(realm_id, user_id);
     let token = sign_token(&realm_signing_key, &claims);
     let state = TestAuthState::default();
 
-    let error = validate_bearer_token(&state, &token).await.unwrap_err();
+    let error = state.validate(&token).unwrap_err();
 
     assert!(matches!(error, ArunaBearerError::RealmNotTrusted));
 }
 
-#[tokio::test]
-async fn validates_delegation_signature() {
+#[test]
+fn validates_delegation_signature() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let issuer_signing_key = signing_key();
     let issuer_pubkey = public_key_base64(&issuer_signing_key);
@@ -158,14 +147,14 @@ async fn validates_delegation_signature() {
     let token = sign_token(&issuer_signing_key, &claims);
     let state = trusted_state(realm_id);
 
-    let auth = validate_bearer_token(&state, &token).await.unwrap();
+    let auth = state.validate(&token).unwrap();
 
     assert_eq!(auth.user_id, user_id);
     assert_eq!(auth.realm_id, realm_id);
 }
 
-#[tokio::test]
-async fn rejects_invalid_delegation() {
+#[test]
+fn rejects_invalid_delegation() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let issuer_signing_key = signing_key();
     let issuer_pubkey = public_key_base64(&issuer_signing_key);
@@ -180,13 +169,13 @@ async fn rejects_invalid_delegation() {
     let token = sign_token(&issuer_signing_key, &claims);
     let state = trusted_state(realm_id);
 
-    let error = validate_bearer_token(&state, &token).await.unwrap_err();
+    let error = state.validate(&token).unwrap_err();
 
     assert!(matches!(error, ArunaBearerError::PublicKeyError(_)));
 }
 
-#[tokio::test]
-async fn rejects_mixed_delegation() {
+#[test]
+fn rejects_mixed_delegation() {
     let (realm_signing_key, realm_id, user_id) = realm_fixture();
     let issuer_pubkey = public_key_base64(&signing_key());
     let state = trusted_state(realm_id);
@@ -194,19 +183,19 @@ async fn rejects_mixed_delegation() {
     let mut issuer_only = token_claims(realm_id, user_id);
     issuer_only.issuer_pubkey = Some(issuer_pubkey.clone());
     let token = sign_token(&realm_signing_key, &issuer_only);
-    let error = validate_bearer_token(&state, &token).await.unwrap_err();
+    let error = state.validate(&token).unwrap_err();
     assert!(matches!(error, ArunaBearerError::InvalidServerToken));
 
     let mut delegation_only = token_claims(realm_id, user_id);
     delegation_only.delegation_signature =
         Some(realm_signing_key.sign(issuer_pubkey.as_bytes()).to_string());
     let token = sign_token(&realm_signing_key, &delegation_only);
-    let error = validate_bearer_token(&state, &token).await.unwrap_err();
+    let error = state.validate(&token).unwrap_err();
     assert!(matches!(error, ArunaBearerError::InvalidServerToken));
 }
 
-#[tokio::test]
-async fn rejects_context_conversion() {
+#[test]
+fn rejects_context_conversion() {
     let (realm_signing_key, realm_id, _) = realm_fixture();
     let (_, other_realm_id, other_user_id) = realm_fixture();
     let claims = token_claims(realm_id, other_user_id);
@@ -214,7 +203,7 @@ async fn rejects_context_conversion() {
     let token = sign_token(&realm_signing_key, &claims);
     let state = trusted_state(realm_id);
 
-    let error = validate_bearer_token(&state, &token).await.unwrap_err();
+    let error = state.validate(&token).unwrap_err();
 
     assert!(matches!(error, ArunaBearerError::AuthContextConversion(_)));
 }
