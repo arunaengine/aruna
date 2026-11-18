@@ -380,346 +380,6 @@ impl UploadPartOperation {
         let Some(location) = self.written_location.take() else {
             return;
         };
-        let Some(effect) = self.cleanup.queue(BlobCleanupWork::DeleteBlob {
-            location: location.clone(),
-        }) else {
-            return self.emit_pending_error();
-        };
-        self.rollback_location = None;
-        self.state = UploadPartState::QueueCleanupRow;
-        smallvec![effect]
-    }
-
-    /// Hands one row to the durable cleanup queue outside any transaction. The
-    /// row keeps the location until storage accepts it, so a refused write can
-    /// still be retried rather than losing the only record of the bytes.
-    fn queue_cleanup_work(&mut self, work: BlobCleanupWork) -> Effects {
-        let Some(effect) = self.cleanup.queue(work) else {
-            return self.release_or_error();
-        };
-        self.state = UploadPartState::QueueCleanupRow;
-        smallvec![effect]
-    }
-
-    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
-        match self.cleanup.handle_queued(event) {
-            CleanupStep::Retry(effect) => smallvec![effect],
-            CleanupStep::Accepted => {
-                if self.rollback_location.is_some() || self.written_location.is_some() {
-                    return self.abort();
-                }
-                self.release_or_error()
-            }
-            CleanupStep::Exhausted | CleanupStep::Closed => self.release_or_error(),
-            CleanupStep::Invalid => self.emit_error(UploadPartError::InvalidOperationState),
-        }
-    }
-
-    fn emit_pending_error(&mut self) -> Effects {
-        if let Some(error) = self.cleanup.take_error() {
-            return self.emit_error(error);
-        }
-        if self.output.is_some() {
-            self.state = UploadPartState::Error;
-            return smallvec![];
-        }
-        self.emit_error(UploadPartError::UploadPartFailed)
-    }
-
-    fn release_or_error(&mut self) -> Effects {
-        let Some(effect) = self.cleanup.release_effect() else {
-            return self.emit_pending_error();
-        };
-        self.state = UploadPartState::ReleaseReservation;
-        smallvec![effect]
-    }
-
-    /// The part is durably committed, so a refused release must not fail the
-    /// request: the reconciliation row that committed with the part record
-    /// clears this reservation on the next cleanup drain.
-    fn defer_release(&mut self) -> Effects {
-        let Some(id) = self.cleanup.take_release() else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-        warn!(
-            event = "upload_part.release_deferred",
-            release_id = %id,
-            "Deferring the part reservation to reconciliation"
-        );
-        if matches!(self.output, Some(Ok(_))) {
-            self.state = UploadPartState::Finish;
-            return smallvec![];
-        }
-        self.emit_pending_error()
-    }
-
-    fn handle_release(&mut self, event: Event) -> Effects {
-        let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
-            if !self.cleanup.error_pending() {
-                return self.defer_release();
-            }
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-        if self.cleanup.release_id() != Some(id) {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        }
-        self.cleanup.clear_release();
-        if self.cleanup.error_pending() {
-            self.emit_pending_error()
-        } else {
-            self.state = UploadPartState::Finish;
-            smallvec![]
-        }
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-
-        self.txn_id = Some(txn_id);
-        self.state = UploadPartState::CheckPurgeFence;
-        smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
-    }
-
-    fn fence_checked(&mut self, event: Event) -> Effects {
-        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
-            return self.cleanup_failed_write(error.into());
-        }
-        // The pin was taken at creation, so the part write must still prove the
-        // tenant backend is enabled before its record joins the transaction.
-        match self
-            .written_location
-            .as_ref()
-            .and_then(|location| fence_backend(&location.backend, self.txn_id))
-        {
-            Some(effect) => {
-                self.state = UploadPartState::FenceBackend;
-                smallvec![effect]
-            }
-            None => self.reread_upload(),
-        }
-    }
-
-    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
-        match check_fence(event) {
-            Ok(()) => self.reread_upload(),
-            Err(error) => self.cleanup_failed_write(error.into()),
-        }
-    }
-
-    fn reread_upload(&mut self) -> Effects {
-        self.state = UploadPartState::ReReadUpload;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: self.input.upload_id.to_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn handle_upload_reread(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-
-        let Some(value) = value else {
-            return self.cleanup_failed_write(UploadPartError::NoSuchUpload);
-        };
-        let record = match MultipartUpload::from_bytes(value.as_ref()) {
-            Ok(record) => record,
-            Err(err) => return self.cleanup_failed_write(err.into()),
-        };
-        if let Err(err) = validate_upload(
-            &record,
-            &self.input.bucket,
-            &self.input.key,
-            StatusCheck::Open,
-        ) {
-            return self.cleanup_failed_write(err.into());
-        }
-
-        self.state = UploadPartState::ReadExistingPart;
-        let key =
-            match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
-                Ok(key) => key,
-                Err(err) => return self.cleanup_failed_write(err.into()),
-            };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: UPLOAD_PART_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn existing_part_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-
-        if let Some(value) = value {
-            let existing = match MultipartPart::from_bytes(value.as_ref()) {
-                Ok(existing) => existing,
-                Err(err) => return self.cleanup_failed_write(err.into()),
-            };
-            self.replaced_location = Some(existing.location);
-        }
-
-        let Some(location) = self.written_location.clone() else {
-            return self.emit_error(UploadPartError::UploadPartFailed);
-        };
-        let record = MultipartPart {
-            part_number: self.input.part_number,
-            location,
-            created_at: SystemTime::now(),
-            backend_etag: self.backend_etag.clone(),
-            piece: self.piece.clone(),
-        };
-        let key =
-            match MultipartPartKey::new(self.input.upload_id, self.input.part_number).to_bytes() {
-                Ok(key) => key,
-                Err(err) => return self.cleanup_failed_write(err.into()),
-            };
-        let value = match record.to_bytes() {
-            Ok(value) => value,
-            Err(err) => return self.cleanup_failed_write(err.into()),
-        };
-
-        self.state = UploadPartState::WritePartRecord;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: UPLOAD_PART_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn part_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-        self.write_cleanup_row()
-    }
-
-    fn write_cleanup_row(&mut self) -> Effects {
-        let Some(location) = self.written_location.clone() else {
-            return self.emit_error(UploadPartError::UploadPartFailed);
-        };
-        let key = location.ulid.to_bytes().to_vec().into();
-        let work = BlobCleanupWork::ReconcileWrite {
-            location,
-            owner: WriteOwner::UploadPart {
-                upload_id: self.input.upload_id,
-                part_number: self.input.part_number,
-            },
-        };
-        let value = match work.to_bytes() {
-            Ok(value) => value,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(UploadPartError::NoTransactionFound);
-        };
-
-        self.state = UploadPartState::WriteCleanupRow;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string(),
-            key,
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_cleanup_row(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {
-                if self.replaced_location.is_some() {
-                    return self.write_replaced_row();
-                }
-                let Some(txn_id) = self.txn_id else {
-                    return self.emit_error(UploadPartError::NoTransactionFound);
-                };
-                self.state = UploadPartState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.cleanup_failed_write(error.into())
-            }
-            _ => self.emit_error(UploadPartError::InvalidOperationState),
-        }
-    }
-
-    fn write_replaced_row(&mut self) -> Effects {
-        let Some(location) = self.replaced_location.clone() else {
-            return self.emit_error(UploadPartError::UploadPartFailed);
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(UploadPartError::NoTransactionFound);
-        };
-        let work = BlobCleanupWork::DeleteBlob { location };
-        let value = match work.to_bytes() {
-            Ok(value) => value,
-            Err(error) => return self.emit_error(error.into()),
-        };
-
-        self.replaced_location = None;
-        self.state = UploadPartState::WriteReplacedRow;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: Ulid::generate().to_bytes().to_vec().into(),
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_replaced_row(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.emit_error(UploadPartError::NoTransactionFound);
-                };
-                self.state = UploadPartState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.cleanup_failed_write(error.into())
-            }
-            _ => self.emit_error(UploadPartError::InvalidOperationState),
-        }
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.handle_commit_failure(event);
-        };
-        self.txn_id = None;
-        // The committed part record owns the blob now, so the rollback must not
-        // still hold it.
-        let Some(location) = self.written_location.take() else {
-            return self.emit_error(UploadPartError::UploadPartFailed);
-        };
-        self.cleanup.set_release(location.ulid);
-        self.output = Some(Ok(UploadPartResult { location }));
-        self.release_or_error()
-    }
-
-    /// A commit whose outcome is unknown may already own the part bytes, so only
-    /// a proven refusal rolls them back. The rest go to the reconciliation
-    /// queue: the committed part record is what decides their fate.
-    fn handle_commit_failure(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::Error { error }) = event else {
-            return self.emit_error(UploadPartError::InvalidOperationState);
-        };
-        self.txn_id = None;
-        if matches!(error, StorageError::TransactionConflict) && self.conflicts < CONFLICT_RETRIES {
-            return self.restart_after_conflict();
-        }
-        if error.proves_no_commit() {
-            return self.cleanup_failed_write(UploadPartError::StorageError(error));
-        }
-        let Some(location) = self.written_location.take() else {
-            return self.emit_error(error.into());
-        };
-        self.cleanup.set_release(location.ulid);
         warn!(
             event = "upload_part.commit_outcome_unknown",
             backend = %location.backend,
@@ -727,59 +387,80 @@ impl UploadPartOperation {
             error = %error,
             "Queuing the written part for reconciliation"
         );
-        self.cleanup.set_error(error.into());
-        self.queue_cleanup_work(BlobCleanupWork::ReconcileWrite {
-            location,
-            owner: WriteOwner::UploadPart {
-                upload_id: self.input.upload_id,
-                part_number: self.input.part_number,
-            },
-        })
+        self.release = Some(location.ulid);
+        self.reconcile = Some(location);
     }
 
-    /// A refused commit discarded its writes, so only the part record segment
-    /// reopens: the part bytes are already on the backend and must not be
-    /// streamed again.
-    fn restart_after_conflict(&mut self) -> Effects {
-        self.conflicts += 1;
-        self.txn_id = None;
-        self.replaced_location = None;
-        self.state = UploadPartState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    /// The committed record owns the blob now. A refused release does not fail the request:
+    /// the reconciliation row committed with the record clears the reservation later.
+    fn committed(&mut self) -> PartTurn {
+        let location = self.written_location.take().ok_or(IoError::Unexpected {
+            expected: "the written part",
+            got: "none",
+        })?;
+        let release = ReleaseWrite::new(location.ulid, None);
+        self.finished = Some(UploadPartResult { location });
+        self.call(PartStep::Release, IoCall::child(release))
+    }
+
+    fn released(&mut self, released: Result<(), StorageError>) -> PartTurn {
+        if let Err(error) = released {
+            warn!(
+                event = "upload_part.release_deferred",
+                %error,
+                "Deferring the part reservation to reconciliation"
+            );
+        }
+        let finished = self.finished.take().ok_or(IoError::Unexpected {
+            expected: "the committed part",
+            got: "none",
+        })?;
+        Ok(Next::Done(finished))
+    }
+
+    fn reconcile_row(&self, location: BackendLocation) -> Option<IoCall> {
+        let key = location.ulid.to_bytes().to_vec().into();
+        let work = reconcile_work(location, self.input.upload_id, self.input.part_number);
+        match work.to_bytes() {
+            Ok(value) => {
+                let row = (BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into());
+                Some(IoCall::Write(vec![row]))
+            }
+            Err(error) => {
+                warn!(%error, "A part reconciliation row could not be encoded");
+                None
+            }
+        }
     }
 }
 
-impl EffectOperation for UploadPartOperation {
+fn reconcile_work(location: BackendLocation, upload_id: Ulid, part_number: u16) -> BlobCleanupWork {
+    BlobCleanupWork::ReconcileWrite {
+        location,
+        owner: WriteOwner::UploadPart {
+            upload_id,
+            part_number,
+        },
+    }
+}
+
+impl Operation for UploadPartOperation {
     type Output = UploadPartResult;
     type Error = UploadPartError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> PartTurn {
+        let fence = read_row(PURGE_FENCE_KEYSPACE, fence_key(&self.input.bucket));
+        self.call(PartStep::CheckFence, fence)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            UploadPartState::Init => self.handle_init(),
-            UploadPartState::CheckPurgeWrite => self.check_write_fence(event),
-            UploadPartState::ReadUpload => self.handle_upload_read(event),
-            UploadPartState::ReadSavedParts => self.write_piece(event),
-            UploadPartState::WritePart => self.handle_write_finished(event),
-            UploadPartState::CleanupFailedWrite => self.write_cleanup_failed(event),
-            UploadPartState::QueueCleanupRow => self.handle_cleanup_queued(event),
-            UploadPartState::WriteCleanupRow => self.handle_cleanup_row(event),
-            UploadPartState::StartTransaction => self.handle_transaction_started(event),
-            UploadPartState::CheckPurgeFence => self.fence_checked(event),
-            UploadPartState::FenceBackend => self.handle_backend_fenced(event),
-            UploadPartState::ReReadUpload => self.handle_upload_reread(event),
-            UploadPartState::ReadExistingPart => self.existing_part_read(event),
-            UploadPartState::WritePartRecord => self.part_written(event),
-            UploadPartState::WriteReplacedRow => self.handle_replaced_row(event),
-            UploadPartState::CommitTransaction => self.handle_transaction_committed(event),
-            UploadPartState::ReleaseReservation => self.handle_release(event),
-            UploadPartState::Finish => smallvec![],
-            UploadPartState::Error => self.abort(),
+    fn next(&mut self, result: IoResult) -> PartTurn {
+        match self.step {
+            PartStep::CheckFence => self.fence_checked(result.value()?),
+            PartStep::ReadUpload => self.upload_read(values::<4>(result)?),
+            PartStep::ReadSaved => self.write_piece(result.page()?.0),
+            PartStep::WritePart => self.write_finished(result.event()?),
+            PartStep::Publish => self.published(result.child::<(), UploadPartError>()?),
+            PartStep::Release => self.released(result.child::<(), StorageError>()?),
         }
     }
 
