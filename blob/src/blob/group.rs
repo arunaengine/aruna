@@ -170,6 +170,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::ServeSourceRead { .. }
         | BlobEffect::SpoolHidden { .. }
         | BlobEffect::SpoolLocal { .. }
+        | BlobEffect::Remote(_)
         | BlobEffect::ListHidden { .. }
         | BlobEffect::OpenConnection { .. }
         | BlobEffect::SendMessage { .. }
