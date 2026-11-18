@@ -395,24 +395,27 @@ pub(super) async fn stage_item(
         .map_err(|error| ItemFailure::Stage(error.to_string()))?,
         StagingStrategy::Snapshot => {
             let quota_ceiling = current_quota(ctx, spec).await?;
-            stage_snapshot_blob(
+            drive(
+                stage_snapshot_blob(
+                    &ctx.driver,
+                    MaterializeSnapshotInput {
+                        job_id: Some(ctx.job_id.as_ulid()),
+                        group_id: spec.group_id,
+                        user_id: spec.auth_context.user_id,
+                        realm_id: spec.auth_context.realm_id,
+                        node_id: spec.node_id,
+                        connector_id: spec.connector_id,
+                        source_path: source_path.to_string(),
+                        bucket: spec.bucket.clone(),
+                        key: target_key.to_string(),
+                        quota_ceiling,
+                        retry_key: Some(ctx.job_id.to_string()),
+                        expected_bucket,
+                        restrictions: spec.auth_context.path_restrictions.clone(),
+                        expected_checksums,
+                    },
+                ),
                 &ctx.driver,
-                MaterializeSnapshotInput {
-                    job_id: Some(ctx.job_id.as_ulid()),
-                    group_id: spec.group_id,
-                    user_id: spec.auth_context.user_id,
-                    realm_id: spec.auth_context.realm_id,
-                    node_id: spec.node_id,
-                    connector_id: spec.connector_id,
-                    source_path: source_path.to_string(),
-                    bucket: spec.bucket.clone(),
-                    key: target_key.to_string(),
-                    quota_ceiling,
-                    retry_key: Some(ctx.job_id.to_string()),
-                    expected_bucket,
-                    restrictions: spec.auth_context.path_restrictions.clone(),
-                    expected_checksums,
-                },
             )
             .await
             .map(|result| (result.location.blob_size, result.version_id))

@@ -1530,24 +1530,27 @@ async fn snapshot_blob(
 
     let quota_ceiling = resolve_quota_ceiling(&state, group_id).await?;
 
-    let result = stage_snapshot_blob(
+    let result = drive(
+        stage_snapshot_blob(
+            &state.get_ctx(),
+            MaterializeSnapshotInput {
+                job_id: None,
+                group_id,
+                user_id: auth.user_id,
+                realm_id: state.get_realm_id(),
+                node_id: state.get_node_id(),
+                connector_id,
+                source_path: request.source_path,
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                quota_ceiling,
+                retry_key: None,
+                expected_bucket: bucket_info,
+                restrictions: auth.path_restrictions.clone(),
+                expected_checksums: Vec::new(),
+            },
+        ),
         &state.get_ctx(),
-        MaterializeSnapshotInput {
-            job_id: None,
-            group_id,
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-            node_id: state.get_node_id(),
-            connector_id,
-            source_path: request.source_path,
-            bucket: request.bucket.clone(),
-            key: request.key.clone(),
-            quota_ceiling,
-            retry_key: None,
-            expected_bucket: bucket_info,
-            restrictions: auth.path_restrictions.clone(),
-            expected_checksums: Vec::new(),
-        },
     )
     .await
     .map_err(map_snapshot_error)?;
