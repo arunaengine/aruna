@@ -67,7 +67,7 @@ async fn download_counts_bytes() {
 }
 
 #[tokio::test]
-async fn download_stops_at_bound() {
+async fn download_stops_bound() {
     let url = server(OK).await;
     let outbound = handle(EgressPolicy::loopback());
     let opened = outbound.open_download(request("GET", &url), Some(2)).await;
@@ -102,7 +102,7 @@ async fn screen_refuses_host() {
 }
 
 #[tokio::test]
-async fn closed_port_not_connected() {
+async fn closed_port_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
