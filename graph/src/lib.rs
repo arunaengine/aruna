@@ -22,6 +22,7 @@ use crate::persist::flush_metadata_persistence;
 
 mod convert;
 mod persist;
+mod profiles;
 mod read;
 mod run;
 mod shacl;
@@ -105,6 +106,8 @@ struct GraphInner {
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
     profile_shacl: Option<Arc<ProfileShaclEngine>>,
+    /// Shape sources of the Profile revisions this node fetched.
+    profiles: crate::profiles::ProfileCache,
     /// Striped holds that serialize this node's writes to one document.
     document_holds: [Arc<tokio::sync::Mutex<()>>; DOCUMENT_HOLDS],
 }
@@ -165,9 +168,16 @@ impl GraphHandle {
                 deferred_persist_requested: AtomicBool::new(false),
                 deferred_persist_running: AtomicBool::new(false),
                 profile_shacl,
+                profiles: crate::profiles::ProfileCache::new(),
                 document_holds: std::array::from_fn(|_| Arc::default()),
             }),
         })
+    }
+
+    /// Profile revisions this node fetched for validation since start. A second validation of
+    /// the same revision must not raise it.
+    pub fn profile_loads(&self) -> u64 {
+        self.inner.profiles.loads()
     }
 
     /// Waits for the write hold of one document; the caller keeps it until it drops the guard.

@@ -1371,6 +1371,17 @@ pub enum MetadataEffect {
         shapes: crate::profile_shapes::ProfileShapes,
         jsonld: String,
     },
+    /// The shape sources this node keeps of one Profile revision.
+    CachedShapes {
+        profile_id: Ulid,
+        revision: Ulid,
+    },
+    /// Keeps the fetched shape sources of one Profile revision.
+    CacheShapes {
+        profile_id: Ulid,
+        revision: Ulid,
+        shapes: Vec<String>,
+    },
 }
 
 impl MetadataEffect {
@@ -1403,6 +1414,8 @@ impl MetadataEffect {
             MetadataEffect::InstallSnapshot { .. } => "install_snapshot",
             MetadataEffect::CheckStructure { .. } => "check_structure",
             MetadataEffect::CheckProfile { .. } => "check_profile",
+            MetadataEffect::CachedShapes { .. } => "cached_shapes",
+            MetadataEffect::CacheShapes { .. } => "cache_shapes",
         }
     }
 
@@ -1438,7 +1451,9 @@ impl MetadataEffect {
                 .and_then(|graph_iris| graph_iris.first().cloned()),
             MetadataEffect::ListGraphs
             | MetadataEffect::CheckStructure { .. }
-            | MetadataEffect::CheckProfile { .. } => None,
+            | MetadataEffect::CheckProfile { .. }
+            | MetadataEffect::CachedShapes { .. }
+            | MetadataEffect::CacheShapes { .. } => None,
         }
     }
 
@@ -1545,6 +1560,10 @@ pub enum MetadataEvent {
     BatchMerged {
         graph_iri: String,
         applied: bool,
+    },
+    /// The kept shape sources of one Profile revision, if any; a store answers with `None`.
+    ProfileShapes {
+        shapes: Option<Vec<String>>,
     },
     /// The verdict of a structure or Profile check, or why there is none.
     ProfileChecked {

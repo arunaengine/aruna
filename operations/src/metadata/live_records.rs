@@ -5,14 +5,20 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::keyspaces::{DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE};
+use aruna_core::keyspaces::{
+    DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+};
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataLifecycleRecord, REGISTRY_CANDIDATE_LIMIT,
 };
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::{document_lifecycle_key, graph_lifecycle_key};
+use aruna_core::rows::{read_row, value};
+use aruna_core::storage_entries::{
+    document_lifecycle_key, graph_lifecycle_key, metadata_document_key,
+};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, TxnId, Value};
+use ulid::Ulid;
 use thiserror::Error;
 
 use crate::metadata::call_results::read_values;
@@ -111,6 +117,60 @@ impl Operation for LiveRecordsOperation {
     }
 }
 
+/// The registry record of one document unless its graph or document lifecycle marks it deleted.
+#[derive(Debug, PartialEq)]
+pub struct LiveRecordOperation {
+    document_id: Ulid,
+    lifecycle: Option<LiveRecordsOperation>,
+}
+
+type LiveTurn = Result<Next<Option<MetadataRegistryRecord>>, LiveRecordsError>;
+
+impl LiveRecordOperation {
+    pub fn new(document_id: Ulid) -> Self {
+        Self {
+            document_id,
+            lifecycle: None,
+        }
+    }
+
+    fn lifecycle_turn(turn: Next<Vec<MetadataRegistryRecord>>) -> LiveTurn {
+        match turn {
+            Next::Call(call) => Ok(Next::Call(call)),
+            Next::Wait => Ok(Next::Wait),
+            Next::Done(live) | Next::Then { output: live, .. } => {
+                Ok(Next::Done(live.into_iter().next()))
+            }
+        }
+    }
+}
+
+impl Operation for LiveRecordOperation {
+    type Output = Option<MetadataRegistryRecord>;
+    type Error = LiveRecordsError;
+
+    fn first(&mut self) -> LiveTurn {
+        let key = metadata_document_key(self.document_id);
+        Ok(Next::Call(read_row(DOCUMENT_INDEX_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> LiveTurn {
+        if let Some(lifecycle) = self.lifecycle.as_mut() {
+            let turn = lifecycle.next(result)?;
+            return Self::lifecycle_turn(turn);
+        }
+        let Some(bytes) = value(result)? else {
+            return Ok(Next::Done(None));
+        };
+        let record: MetadataRegistryRecord = postcard::from_bytes(&bytes)
+            .map_err(|error| LiveRecordsError::Invalid(error.to_string()))?;
+        let mut lifecycle = LiveRecordsOperation::new(vec![record], None);
+        let turn = lifecycle.first()?;
+        self.lifecycle = Some(lifecycle);
+        Self::lifecycle_turn(turn)
+    }
+}
+
 /// The graph and the document lifecycle key of every record, in record order.
 fn lifecycle_reads(records: &[MetadataRegistryRecord]) -> Vec<(String, Key)> {
     records
@@ -183,7 +243,6 @@ mod call_tests {
     use crate::metadata::timestamp_sweep::state_machine_tests::{document, record_bytes};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::MetadataDeleteRecord;
-    use ulid::Ulid;
 
     fn record(seed: u8) -> MetadataRegistryRecord {
         postcard::from_bytes(&record_bytes(document(seed), 10)).expect("record decodes")
@@ -321,5 +380,38 @@ mod call_tests {
             LiveRecordsError::from(IoError::Aborted),
             LiveRecordsError::Io(IoError::Aborted)
         );
+    }
+
+    #[test]
+    fn live_record_checks() {
+        let stored = record(1);
+        let mut read = LiveRecordOperation::new(stored.document_id);
+        assert_eq!(
+            read.first(),
+            Ok(Next::Call(read_row(
+                DOCUMENT_INDEX_KEYSPACE,
+                metadata_document_key(stored.document_id)
+            )))
+        );
+        let row = Some(postcard::to_allocvec(&stored).unwrap().into());
+        assert_eq!(
+            read.next(IoResult::Values(vec![row])),
+            Ok(Next::Call(IoCall::Read(lifecycle_reads(std::slice::from_ref(&stored)))))
+        );
+        assert_eq!(
+            read.next(IoResult::Values(vec![None, None])),
+            Ok(Next::Done(Some(stored.clone())))
+        );
+
+        let mut deleted = LiveRecordOperation::new(stored.document_id);
+        deleted.first().unwrap();
+        let row = Some(postcard::to_allocvec(&stored).unwrap().into());
+        deleted.next(IoResult::Values(vec![row])).unwrap();
+        let graph = Some(postcard::to_allocvec(&tombstone(&stored)).unwrap().into());
+        assert_eq!(deleted.next(IoResult::Values(vec![graph, None])), Ok(Next::Done(None)));
+
+        let mut missing = LiveRecordOperation::new(stored.document_id);
+        missing.first().unwrap();
+        assert_eq!(missing.next(IoResult::Values(vec![None])), Ok(Next::Done(None)));
     }
 }

@@ -401,7 +401,17 @@ impl MetadataHandle {
         let message = decode_message(frame)
             .map_err(|error| MetadataError::InvalidInput(error.to_string()))
             .map_err(MetadataRequestError::definitely_not_sent)?;
-        let answer = self.request_forwarded_write(node_id, message).await?;
+        let answer = match message {
+            // An export answers with a header and a separate body, read here as one answer.
+            MetadataTransportMessage::ForwardExportDocument { .. }
+            | MetadataTransportMessage::ForwardExportProfile { .. } => {
+                let result = send_export_request(&self.inner, node_id, message).await?;
+                MetadataTransportMessage::ExportAnswer {
+                    result: result.map(Box::new),
+                }
+            }
+            message => self.request_forwarded_write(node_id, message).await?,
+        };
         encode_message(&answer)
             .map_err(MetadataError::Backend)
             .map_err(MetadataRequestError::possibly_sent)
@@ -570,6 +580,7 @@ pub(crate) fn transport_message_kind(message: &MetadataTransportMessage) -> &'st
         MetadataTransportMessage::CheckNodeSecret { .. } => "check_node_secret",
         MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
         MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
+        MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
     }
 }
 

@@ -45,6 +45,22 @@ impl GraphHandle {
                 let report = report.await.map(Box::new);
                 return MetadataEvent::ProfileChecked { report };
             }
+            MetadataEffect::CachedShapes {
+                profile_id,
+                revision,
+            } => {
+                let shapes = self.inner.profiles.get(profile_id, revision);
+                let shapes = shapes.map(|shapes| shapes.as_ref().clone());
+                return MetadataEvent::ProfileShapes { shapes };
+            }
+            MetadataEffect::CacheShapes {
+                profile_id,
+                revision,
+                shapes,
+            } => {
+                self.inner.profiles.insert(profile_id, revision, Arc::new(shapes));
+                return MetadataEvent::ProfileShapes { shapes: None };
+            }
             effect => effect,
         };
         let graph_iri = effect.graph_iri();
@@ -894,7 +910,9 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
         | MetadataEffect::QueryGraphs { .. }
         | MetadataEffect::SyncBestEffort { .. }
         | MetadataEffect::CheckStructure { .. }
-        | MetadataEffect::CheckProfile { .. } => unreachable!("handled asynchronously"),
+        | MetadataEffect::CheckProfile { .. }
+        | MetadataEffect::CachedShapes { .. }
+        | MetadataEffect::CacheShapes { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }

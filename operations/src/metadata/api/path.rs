@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::forward::read::{AuthFailure, ReadDecision, reduce_holder_reads};
+use super::super::forward::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::path_types::select_path_holders;
 use super::path_types::{MetadataLookupRequest, MetadataLookupResult, PathShardView};
 use super::path_types::{merge_path_views, reduce_path_candidates};

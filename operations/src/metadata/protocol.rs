@@ -726,6 +726,11 @@ pub enum MetadataTransportMessage {
     ForwardedGraphPending {
         expected: Ulid,
     },
+    /// An export answer with its body already read; the transport hands it to the operation
+    /// that asked, and it never crosses the wire.
+    ExportAnswer {
+        result: Result<Box<crate::metadata::api::export_types::ExportMetadataResult>, MetadataReadError>,
+    },
 }
 
 /// PKCS8 PEM of the realm signing key; Debug never prints it.

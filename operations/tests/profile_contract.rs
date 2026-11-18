@@ -1157,9 +1157,9 @@ async fn cache_skips_refetch() -> Result<(), Box<dyn std::error::Error>> {
     let jsonld = crate_json(draft_id, Some(&profile_public_iri(profile_id)), true, true);
     let metadata = test
         .context
-        .metadata_handle
+        .graph_handle
         .as_ref()
-        .ok_or("metadata handle is configured")?;
+        .ok_or("graph handle is configured")?;
 
     let before = metadata.profile_loads();
     preview_submission(test.context.as_ref(), Some(group_id), &jsonld).await?;
