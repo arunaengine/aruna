@@ -1040,7 +1040,15 @@ impl OperationsTaskHandler {
             TaskKey::MaintainRanges => Box::pin(async move {
                 use crate::distribution::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
-                let mut after = match crate::driver::drive(maintain_ranges(context), context).await
+                let mut after = match crate::driver::drive(
+                    maintain_ranges(
+                        context.node_and_realm(),
+                        &context.fresh_heartbeats(),
+                        context.here().capacity,
+                    ),
+                    context,
+                )
+                .await
                 {
                     Ok(pass) => {
                         let (after, imports) = pass.finish();

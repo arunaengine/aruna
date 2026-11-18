@@ -725,7 +725,7 @@ impl AuthProvider {
             .and_then(|value| SignedDelegation::decode(value).ok())
             .ok_or_else(|| denied("malformed delegation"))?;
         let now = aruna_core::time::unix_timestamp_secs();
-        let accepted = match accept_delegation(&self.driver_ctx, &signed, now) {
+        let accepted = match accept_delegation(self.driver_ctx.node_and_realm(), &signed, now) {
             Ok(accept) => drive(accept, &self.driver_ctx).await,
             Err(error) => Err(error),
         };

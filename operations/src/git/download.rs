@@ -133,7 +133,7 @@ async fn set_holders(context: &DriverContext, object: &StoredObject) -> Vec<Node
     match &object.global {
         Some(GlobalId::Version { version_id, .. }) => {
             let deadline = Instant::now() + RESOLVE_BUDGET;
-            let resolve = resolve_version(context, *version_id, deadline);
+            let resolve = resolve_version(context.node_and_realm(), *version_id, deadline);
             version_found(drive_until(resolve, context, deadline).await)
                 .map(|resolved| resolved.holders)
                 .unwrap_or_default()

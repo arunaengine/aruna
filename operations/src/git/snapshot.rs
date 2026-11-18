@@ -284,7 +284,7 @@ async fn located(
             }
             _ => {
                 let deadline = Instant::now() + RESOLVE_BUDGET;
-                let resolve = resolve_version(context, *version_id, deadline);
+                let resolve = resolve_version(context.node_and_realm(), *version_id, deadline);
                 let holders = version_found(drive_until(resolve, context, deadline).await);
                 if let Some(resolved) = holders {
                     found.extend(resolved.holders.iter().take(4).filter_map(|holder| {

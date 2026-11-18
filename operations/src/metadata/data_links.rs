@@ -485,7 +485,14 @@ pub(crate) async fn retry_unverified(context: &DriverContext) -> Result<bool, Da
             Some(set_id) => Some(Some(*set_id)),
             None => {
                 let deadline = Instant::now() + RESOLVE_BUDGET;
-                match resolved(drive_until(resolve_version(context, version_id, deadline), context, deadline).await) {
+                match resolved(
+                    drive_until(
+                        resolve_version(context.node_and_realm(), version_id, deadline),
+                        context,
+                        deadline,
+                    )
+                    .await,
+                ) {
                     GlobalResolution::Found(found) => Some(Some(found.set_id)),
                     GlobalResolution::NotFound => Some(None),
                     GlobalResolution::Unavailable | GlobalResolution::Ambiguous => None,
