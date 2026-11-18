@@ -7,7 +7,10 @@ use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
+use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::RANGE_INDEX_KEYSPACE;
+use aruna_core::operation::{EffectOperation, Runnable, SubOperation};
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::slot_key;
 use aruna_core::structs::storage::distribution::capacity::OBJECT_METADATA_BYTES;
@@ -69,13 +72,8 @@ async fn bucket(handle: &StorageHandle, member: Ulid, bound: u128, created: u128
     bound_bucket(handle, (BUCKET, set_id(), member), bound, created).await;
 }
 
-async fn bound_bucket(
-    handle: &StorageHandle,
-    (name, set_id, member): (&str, Ulid, Ulid),
-    bound: u128,
-    created: u128,
-) {
-    let info = BucketInfo {
+fn bound_info(set_id: Ulid, member: Ulid, bound: u128) -> BucketInfo {
+    BucketInfo {
         group_id: Ulid::from_bytes([3; 16]),
         created_at: SystemTime::UNIX_EPOCH,
         created_by: UserId::local(Ulid::from_bytes([5; 16]), realm()),
@@ -90,7 +88,16 @@ async fn bound_bucket(
             incarnation: bound,
             revision: Default::default(),
         }),
-    };
+    }
+}
+
+async fn bound_bucket(
+    handle: &StorageHandle,
+    (name, set_id, member): (&str, Ulid, Ulid),
+    bound: u128,
+    created: u128,
+) {
+    let info = bound_info(set_id, member, bound);
     let key: Key = name.as_bytes().into();
     let writes = vec![
         (
@@ -125,7 +132,7 @@ async fn run_with(
     config: AdmitConfig,
     sign: bool,
 ) -> Result<SignedStatement, AdmitError> {
-    let mut operation = AdmitOperation::new(config);
+    let mut operation = AdmitOperation::new(config).into_machine();
     drive_until(handle, &mut operation, sign, |_| false).await;
     operation.finalize()
 }
@@ -133,7 +140,7 @@ async fn run_with(
 /// Drives `operation` until `stop` matches the next effect or it ends.
 async fn drive_until(
     handle: &StorageHandle,
-    operation: &mut AdmitOperation,
+    operation: &mut impl EffectOperation,
     sign: bool,
     stop: impl Fn(&Effect) -> bool,
 ) -> VecDeque<Effect> {
@@ -142,9 +149,19 @@ async fn drive_until(
     queue
 }
 
+/// Runs a read the admission makes outside its transaction.
+async fn outside(handle: &StorageHandle, mut child: Box<dyn SubOperation>) -> Event {
+    let mut queue: VecDeque<Effect> = child.start().into_iter().collect();
+    while let Some(effect) = queue.pop_front() {
+        let event = send(handle, effect).await;
+        queue.extend(child.step(event));
+    }
+    child.finalize()
+}
+
 async fn resume(
     handle: &StorageHandle,
-    operation: &mut AdmitOperation,
+    operation: &mut impl EffectOperation,
     sign: bool,
     queue: &mut VecDeque<Effect>,
     stop: impl Fn(&Effect) -> bool,
@@ -163,6 +180,7 @@ async fn resume(
                 };
                 Event::Net(NetEvent::StatementSign(reply))
             }
+            Effect::SubOperation(child) => outside(handle, child).await,
             effect => send(handle, effect).await,
         };
         queue.extend(operation.step(event));
@@ -451,7 +469,7 @@ async fn concurrent_admissions_conflict() {
     let (other, other_member) = (Ulid::from_bytes([6; 16]), Ulid::from_bytes([7; 16]));
     bound_bucket(&handle, ("other", other, other_member), 43, 43).await;
     let capacity = Some(NEED + NEED / 2);
-    let mut first = AdmitOperation::new(sized(capacity));
+    let mut first = AdmitOperation::new(sized(capacity)).into_machine();
     let staged = |effect: &Effect| {
         matches!(
             effect,
@@ -478,4 +496,75 @@ async fn concurrent_admissions_conflict() {
     );
     assert_eq!(reserved(&handle, set_id().to_bytes().to_vec()).await, None);
     assert!(reserved(&handle, other.to_bytes().to_vec()).await.is_some());
+}
+
+/// The answer to the first read of `config`: a bucket bound to `member`, the bucket's creation
+/// row, no range accounts and no running usage rebuild.
+fn first_read(config: &AdmitConfig, member: Ulid) -> IoResult {
+    let creation = 42u128.to_be_bytes().to_vec();
+    let info = bound_info(set_id(), member, 42);
+    let mut values: Vec<Option<Value>> = vec![
+        Some(info.to_bytes().unwrap().into()),
+        Some(creation.into()),
+    ];
+    values.extend(config.ranges.iter().map(|_| None));
+    values.push(None);
+    IoResult::Values(values)
+}
+
+// A bucket bound to another member is refused before anything is written.
+#[test]
+fn foreign_binding_stops() {
+    let mut operation = AdmitOperation::new(config());
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let read = first_read(&config(), Ulid::from_bytes([99; 16]));
+    assert_eq!(
+        operation.next(read),
+        Err(AdmitError::BindingChanged(BUCKET.to_string()))
+    );
+}
+
+// With no capacity bound the ranges are opened, then the claim is signed.
+#[test]
+fn writes_then_signs() {
+    let mut unbounded = sized(None);
+    unbounded.coverage = MetadataCoverage::Assigned;
+    let mut operation = AdmitOperation::new(unbounded.clone());
+    operation.first().unwrap();
+    let written = operation.next(first_read(&unbounded, member_id()));
+    assert!(matches!(written, Ok(Next::Call(IoCall::Write(_)))));
+    let Ok(Next::Call(IoCall::Effect(sign))) = operation.next(IoResult::Done) else {
+        panic!("expected the signing request");
+    };
+    let Effect::Net(NetEffect::StatementSign(claim)) = *sign else {
+        panic!("expected the claim");
+    };
+    let signed = claim.statement.sign(&secret());
+    let answer = IoResult::Event(Box::new(Event::Net(NetEvent::StatementSign(
+        StatementSignEvent::Signed(Box::new(signed.clone())),
+    ))));
+    assert_eq!(operation.next(answer), Ok(Next::Done(signed)));
+}
+
+// The usage rows are read outside the transaction; a full node refuses the member.
+#[test]
+fn usage_read_outside() {
+    let bounded = sized(Some(0));
+    let mut operation = AdmitOperation::new(bounded.clone());
+    operation.first().unwrap();
+    let page = operation.next(first_read(&bounded, member_id()));
+    assert!(matches!(page, Ok(Next::Call(IoCall::Page { .. }))));
+    let usage = operation.next(IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    });
+    assert!(matches!(usage, Ok(Next::Call(IoCall::Child(_)))));
+    let values: Result<IoResult, IoError> =
+        Ok(IoResult::Values(vec![None; global_shard_keys().len()]));
+    let answer = IoResult::Child(ChildOutcome::new(values));
+    assert!(matches!(
+        operation.next(answer),
+        Err(AdmitError::InsufficientCapacity { .. })
+    ));
 }
