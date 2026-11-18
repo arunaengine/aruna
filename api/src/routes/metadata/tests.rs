@@ -69,7 +69,7 @@ use aruna_operations::metadata::projector::{
     drain_projection_queue, replay_event_log, schedule_projection_drain,
 };
 use aruna_operations::metadata::prune_queue::{process_graph_tombstones, prune_jobs_exist};
-use aruna_operations::metadata::repository::{write_document_lifecycle, write_graph_lifecycle};
+use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -984,8 +984,16 @@ async fn tombstone_hides_listing() {
             deleted_after_id: record.last_event_id,
         },
     };
+    let (key_space, key, value) =
+        aruna_core::storage_entries::graph_lifecycle_entry(&tombstone).unwrap();
+    let graph_lifecycle = Effect::Storage(StorageEffect::Write {
+        key_space,
+        key,
+        value,
+        txn_id: None,
+    });
     for effect in [
-        write_graph_lifecycle(&tombstone, None).unwrap(),
+        graph_lifecycle,
         write_document_lifecycle(&lifecycle, None).unwrap(),
     ] {
         match ctx.storage_handle.send_effect(effect).await {

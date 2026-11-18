@@ -4,17 +4,14 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     SHARE_EVENT_KEYSPACE, SHARE_LINK_KEYSPACE, SHARE_OWNER_KEYSPACE, SHARE_USE_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::{AfterConflict, Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::structs::storage::share::{ShareEvent, ShareLink, ShareUses, event_key, owner_key};
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -36,13 +33,6 @@ pub enum ShareStoreError {
 impl From<IoError> for ShareStoreError {
     fn from(error: IoError) -> Self {
         Self::Storage(error.into())
-    }
-}
-
-fn storage_error(event: Event) -> ShareStoreError {
-    match event {
-        Event::Storage(StorageEvent::Error { error }) => error.into(),
-        _ => ShareStoreError::UnexpectedEvent,
     }
 }
 
@@ -180,25 +170,14 @@ impl Operation for ListSharesOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LogState {
-    Begin,
-    Read(TxnId),
-    Write(TxnId),
-    Commit,
-    Done,
-    Failed,
-}
-
-/// Appends one access log entry and counts it in the link's use row, in one transaction; a
-/// conflicting writer makes it start over, so concurrent visits never lose a count.
+/// Appends one access log entry and counts it in the link's use row, in one transaction. Run it
+/// with a conflict retry: a lost conflict starts over, so concurrent visits never lose a count.
 #[derive(Debug, PartialEq)]
 pub struct LogShareOperation {
     share_id: Ulid,
     entry_id: Ulid,
     event: ShareEvent,
-    state: LogState,
-    error: Option<ShareStoreError>,
+    written: bool,
 }
 
 impl LogShareOperation {
@@ -208,24 +187,7 @@ impl LogShareOperation {
             share_id,
             entry_id,
             event,
-            state: LogState::Begin,
-            error: None,
-        }
-    }
-
-    fn begin(&mut self) -> Effects {
-        self.state = LogState::Begin;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn fail(&mut self, error: ShareStoreError, txn_id: Option<TxnId>) -> Effects {
-        self.state = LogState::Failed;
-        self.error = Some(error);
-        match txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+            written: false,
         }
     }
 
@@ -250,76 +212,33 @@ impl LogShareOperation {
     }
 }
 
-impl EffectOperation for LogShareOperation {
+impl Operation for LogShareOperation {
     type Output = ();
     type Error = ShareStoreError;
 
-    fn start(&mut self) -> Effects {
-        self.begin()
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (LogState::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.state = LogState::Read(txn_id);
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: SHARE_USE_KEYSPACE.to_string(),
-                    key: self.share_id.to_bytes().to_vec().into(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (LogState::Read(txn_id), Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                match self.writes(value.as_deref()) {
-                    Ok(writes) => {
-                        self.state = LogState::Write(txn_id);
-                        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                            writes,
-                            txn_id: Some(txn_id),
-                        })]
-                    }
-                    Err(error) => self.fail(error.into(), Some(txn_id)),
-                }
-            }
-            (LogState::Write(txn_id), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.state = LogState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (LogState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.state = LogState::Done;
-                smallvec![]
-            }
-            (
-                LogState::Commit,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            ) => self.begin(),
-            (LogState::Read(txn_id) | LogState::Write(txn_id), event) => {
-                self.fail(storage_error(event), Some(txn_id))
-            }
-            (_, event) => self.fail(storage_error(event), None),
+    fn first(&mut self) -> Result<Next<()>, ShareStoreError> {
+        Ok(Next::Call(rows::read_row(
+            SHARE_USE_KEYSPACE,
+            self.share_id.to_bytes().to_vec(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareStoreError> {
+        if self.written {
+            rows::done(result)?;
+            return Ok(Next::Done(()));
         }
+        let uses = rows::value(result)?;
+        self.written = true;
+        Ok(Next::Call(IoCall::Write(self.writes(uses.as_deref())?)))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, LogState::Done | LogState::Failed)
-    }
-
-    fn finalize(self) -> Result<(), ShareStoreError> {
-        match (self.state, self.error) {
-            (LogState::Done, _) => Ok(()),
-            (_, Some(error)) => Err(error),
-            _ => Err(ShareStoreError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            LogState::Read(txn_id) | LogState::Write(txn_id) => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
-        }
+    fn on_conflict(&mut self, _attempt: u32) -> AfterConflict<()> {
+        AfterConflict::Rerun
     }
 }
 

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::metadata::MetadataError;
 use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 
 fn node(seed: u8) -> NodeId {
@@ -94,7 +95,9 @@ fn misses_not_found() {
     operation.step(reply(
         node(2),
         1,
-        Err(PeerRequestError::Failed("down".into())),
+        Err(PeerRequestError::Failed(MetadataError::Backend(
+            "down".into(),
+        ))),
     ));
     operation.step(answer(node(3), 1, "missing"));
     assert_eq!(operation.finalize(), Ok(Fetched::NotFound));
@@ -102,7 +105,13 @@ fn misses_not_found() {
     let mut operation = fetch(Budget::Shared);
     operation.start();
     for peer in [node(1), node(2), node(3)] {
-        operation.step(reply(peer, 1, Err(PeerRequestError::Failed("down".into()))));
+        operation.step(reply(
+            peer,
+            1,
+            Err(PeerRequestError::Failed(MetadataError::Backend(
+                "down".into(),
+            ))),
+        ));
     }
     assert_eq!(
         operation.finalize(),

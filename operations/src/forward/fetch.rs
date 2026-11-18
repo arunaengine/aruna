@@ -11,6 +11,7 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect,
 use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
+use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -213,6 +214,40 @@ impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> EffectOperation
     fn abort(&mut self) -> Effects {
         smallvec![]
     }
+}
+
+/// The call that sends one encoded request to `peer`; [`peer_reply`] reads its answer.
+pub(crate) fn peer_call(peer: NodeId, frame: Vec<u8>, timeout: Duration) -> IoCall {
+    let request = MetadataRequestEffect {
+        peer,
+        frame,
+        timeout,
+    };
+    IoCall::Effect(Box::new(Effect::Net(NetEffect::MetadataRequest(Box::new(
+        request,
+    )))))
+}
+
+/// The decoded answer of `peer` to a [`peer_call`], or why there is none.
+pub(crate) fn peer_reply(
+    peer: NodeId,
+    result: IoResult,
+) -> Result<Result<MetadataTransportMessage, PeerRequestError>, IoError> {
+    let Event::Net(NetEvent::MetadataAnswer(answer)) = aruna_core::rows::event(result)? else {
+        return Err(IoError::Unexpected {
+            expected: "a peer answer",
+            got: "another event",
+        });
+    };
+    if answer.peer != peer {
+        return Ok(Err(PeerRequestError::Failed(MetadataError::Backend(
+            "the answer came from another peer".to_string(),
+        ))));
+    }
+    Ok(answer.result.and_then(|bytes| {
+        decode_message(&bytes)
+            .map_err(|error| PeerRequestError::Failed(MetadataError::Backend(error.to_string())))
+    }))
 }
 
 /// One peer's answer, or why there is none.

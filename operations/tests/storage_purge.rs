@@ -40,7 +40,7 @@ use aruna_core::structs::storage::storage_purge::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
@@ -97,9 +97,12 @@ async fn setup_context() -> TestContext {
     // Creating an upload asks the blob adapter whether the backend has a provider upload.
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
+    let net_handle = NetHandle::new(
+        aruna_operations::testing::local_net(),
+        storage_handle.clone(),
+    )
+    .await
+    .unwrap();
     let blob_handle = BlobHandler::new(
         BackendConfig {
             backend_type: Backend::FileSystem,

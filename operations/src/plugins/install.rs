@@ -40,7 +40,7 @@ use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
 use super::rules::{ensure_rules, retire_rules};
 use super::settings::{SettingError, check_settings};
 use super::sweep::{ORPHAN_GRACE_MS, plugin_accounts};
-use crate::auth::enforcement::enforce_policies;
+use crate::auth::policy_load::enforce_policies;
 use crate::auth::request_authorization::permission_rules;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::document_repository::GetConfigOperation;
