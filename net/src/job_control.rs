@@ -8,10 +8,12 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::events::JobControlEvent;
 use aruna_core::jobs::{JobRequest, JobResponse};
+use aruna_core::stream::BackendStream;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
+use tokio_util::io::ReaderStream;
 
 use crate::NetHandle;
 use crate::streams::{BiStream, RecvStream, SendStream};
@@ -28,13 +30,20 @@ pub struct JobReply {
 }
 
 /// Runs a job-control effect: an unreachable owner is reported so the routing
-/// operation can map it to `Unavailable` (503). The artifact body path stays out of band.
+/// operation can map it to `Unavailable` (503). A ranged artifact answers with its bytes.
 pub(crate) async fn exchange(
     net: &NetHandle,
     owner: NodeId,
     request: JobRequest,
 ) -> JobControlEvent {
     match send_request(net, owner, request).await {
+        Ok(JobReply {
+            response,
+            body: Some(stream),
+        }) => JobControlEvent::Streamed {
+            response: Box::new(response),
+            body: BackendStream::new(ReaderStream::new(stream.into_recv())),
+        },
         Ok(reply) => JobControlEvent::Response(Box::new(reply.response)),
         Err(error) => JobControlEvent::Unavailable(format!("job owner unavailable: {error}")),
     }

@@ -743,6 +743,11 @@ pub enum LaunchDecline {
 #[derive(Debug, PartialEq)]
 pub enum JobControlEvent {
     Response(Box<JobResponse>),
+    /// The owner's response and the artifact bytes that follow it on the stream.
+    Streamed {
+        response: Box<JobResponse>,
+        body: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
     Unavailable(String),
 }
 
