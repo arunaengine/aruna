@@ -1,116 +1,112 @@
-//! Checks admin document events against realm config, group rights and shape rules.
+//! Checks replicated admin events against the realm config, group rights and their shape.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::*;
-use aruna_core::user::validation::{MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
-impl ConfigValidationCache {
-    pub(in crate::document_sync) fn invalidate(&mut self) {
-        self.entry = None;
+use super::distribution::validate_distribution_authority;
+use super::reads::{
+    group_authorization, realm_authorization, realm_config, reducer_state, relay_allowed,
+};
+use super::{ApplyError, Step, invalid};
+use crate::admin_checks::{
+    AdminOperationFamily, family_matches_targets, foreign_actor_allowed, has_write_permission,
+    origin_may_publish, revocation_origin_full, service_owner, validate_event_scope,
+    validate_shape,
+};
+use crate::admin_documents::{AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget};
+use crate::config_authority::{AdminEventValidation, validate_config_authority};
+use crate::deferred_topics::DocumentSyncDependency;
+use crate::document::DocumentTarget;
+use crate::keyspaces::GROUP_KEYSPACE;
+use crate::operation::TransactionMode;
+use crate::reducer::AdminDocumentState;
+use crate::row_plan::{PlanRows, Planned, RowPlan};
+use crate::structs::identity::group::{Group, GroupAuthorizationDocument};
+use crate::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use crate::structs::identity::user::User;
+use crate::structs::placement::record::PlacementRef;
+use crate::sync_checks::published_by;
+use crate::user::validation::{MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
+
+/// The realm config and its reducer state, read once for a batch of admin events. Decoding both
+/// per event would be quadratic, and a buffered run applies nothing.
+#[derive(Debug, PartialEq)]
+pub struct ConfigSnapshot {
+    realm_id: RealmId,
+    config: Option<RealmConfigDocument>,
+    state: Option<AdminDocumentState>,
+}
+
+fn config_snapshot(
+    rows: &mut PlanRows,
+    cache: &mut Option<Arc<ConfigSnapshot>>,
+    realm_id: RealmId,
+) -> Step<Arc<ConfigSnapshot>> {
+    if let Some(snapshot) = cache.as_ref().filter(|cached| cached.realm_id == realm_id) {
+        return Ok(snapshot.clone());
+    }
+    let config = realm_config(rows, realm_id)?;
+    let state = reducer_state(rows, &AdminDocumentTarget::RealmConfig { realm_id })?;
+    let snapshot = Arc::new(ConfigSnapshot {
+        realm_id,
+        config,
+        state,
+    });
+    *cache = Some(snapshot.clone());
+    Ok(snapshot)
+}
+
+/// Decides one replicated admin event; the snapshot serves the next event of the batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidateAdminPlan {
+    pub topic_id: irokle::TopicId,
+    pub actor_id: irokle::ActorId,
+    pub target: DocumentTarget,
+    pub event: AdminDocumentEvent,
+    pub realm_id: RealmId,
+    pub placement: PlacementRef,
+    pub signature: iroh::Signature,
+    pub cache: Option<Arc<ConfigSnapshot>>,
+}
+
+impl RowPlan for ValidateAdminPlan {
+    type Output = (AdminEventValidation, Option<Arc<ConfigSnapshot>>);
+    type Error = ApplyError;
+
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<Self::Output>> {
+        let mut cache = self.cache.clone();
+        let validation = validate_admin_event(
+            rows,
+            self.topic_id,
+            self.actor_id,
+            &self.target,
+            &self.event,
+            self.realm_id,
+            &self.placement,
+            &self.signature,
+            &mut cache,
+        )?;
+        Ok(Planned::output((validation, cache)))
     }
 
-    pub(in crate::document_sync) async fn load(
-        &mut self,
-        storage: &StorageHandle,
-        realm_id: RealmId,
-    ) -> Result<(Option<&RealmConfigDocument>, Option<&AdminDocumentState>)> {
-        if self
-            .entry
-            .as_ref()
-            .is_none_or(|(cached, ..)| *cached != realm_id)
-        {
-            let config = read_realm_config(storage, realm_id).await?;
-            let state =
-                read_reducer_state(storage, &AdminDocumentTarget::RealmConfig { realm_id }).await?;
-            self.entry = Some((realm_id, config, state));
-        }
-        match &self.entry {
-            Some((_, config, state)) => Ok((config.as_ref(), state.as_ref())),
-            None => Ok((None, None)),
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::None
     }
 }
 
-pub(in crate::document_sync) async fn read_reducer_state(
-    storage: &StorageHandle,
-    target: &AdminDocumentTarget,
-) -> Result<Option<AdminDocumentState>> {
-    storage_read_from(
-        storage,
-        DOCUMENT_STATE_KEYSPACE.to_string(),
-        reducer_state_key(target),
-    )
-    .await?
-    .map(|bytes| decode_reducer_state(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))
-}
-
-pub(in crate::document_sync) async fn read_realm_config(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-) -> Result<Option<RealmConfigDocument>> {
-    storage_read_from(
-        storage,
-        DocumentTarget::RealmConfig { realm_id }
-            .storage_keyspace()
-            .to_string(),
-        DocumentTarget::RealmConfig { realm_id }.storage_key(),
-    )
-    .await?
-    .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))
-}
-
-pub(in crate::document_sync) async fn read_realm_authorization(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-) -> Result<Option<RealmAuthorizationDocument>> {
-    storage_read_from(
-        storage,
-        DocumentTarget::RealmAuthorization { realm_id }
-            .storage_keyspace()
-            .to_string(),
-        DocumentTarget::RealmAuthorization { realm_id }.storage_key(),
-    )
-    .await?
-    .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))
-}
-
-/// Whether the transport publisher of a relayed admin event is a realm node
-/// allowed to relay. User nodes are never relays, so they never appear here.
-pub(in crate::document_sync) async fn relay_publisher_allowed(
-    storage: &StorageHandle,
-    topic_id: ::irokle::TopicId,
-    publisher: ::irokle::ActorId,
-    realm_id: RealmId,
-) -> Result<bool> {
-    let Some(config) = read_realm_config(storage, realm_id).await? else {
-        return Ok(false);
-    };
-    Ok(config
-        .nodes
-        .iter()
-        .filter(|node| node.kind.is_sync_eligible())
-        .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-        .any(|node_id| published_by(topic_id, publisher, &node_id)))
-}
-
-pub(in crate::document_sync) async fn validate_realm_authority(
-    storage: &StorageHandle,
+pub fn validate_realm_authority(
+    rows: &mut PlanRows,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentState>,
-) -> Result<AdminEventValidation> {
+) -> Step<AdminEventValidation> {
     let AdminDocumentTarget::Realm { realm_id } = event.target else {
         return Ok(AdminEventValidation::Rejected(
             "admin event target is not a realm authorization document".to_string(),
         ));
     };
-    let current_config = read_realm_config(storage, realm_id).await?;
+    let current_config = realm_config(rows, realm_id)?;
     if let Some(config) = current_config.as_ref() {
         if config.realm_id != realm_id {
             return Ok(AdminEventValidation::Rejected(
@@ -131,7 +127,7 @@ pub(in crate::document_sync) async fn validate_realm_authority(
         );
     }
 
-    let current_auth = read_realm_authorization(storage, realm_id).await?;
+    let current_auth = realm_authorization(rows, realm_id)?;
     let bootstrap = previous_state.is_none()
         && current_auth.is_none()
         && event.actor.user_id.is_nil_in(realm_id)
@@ -142,7 +138,7 @@ pub(in crate::document_sync) async fn validate_realm_authority(
                     && role.name == "realm_admin"
                     && role.permissions == BTreeMap::from([(
                         format!("/{realm_id}/admin/**"),
-                        aruna_core::structs::identity::auth::Permission::WRITE,
+                        crate::structs::identity::auth::Permission::WRITE,
                     )])
         );
     Ok(if bootstrap {
@@ -155,18 +151,18 @@ pub(in crate::document_sync) async fn validate_realm_authority(
     })
 }
 
-pub(in crate::document_sync) async fn validate_user_authority(
-    storage: &StorageHandle,
+pub fn validate_user_authority(
+    rows: &mut PlanRows,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentState>,
-) -> Result<AdminEventValidation> {
+) -> Step<AdminEventValidation> {
     let AdminDocumentTarget::User { user_id } = event.target else {
         return Ok(AdminEventValidation::Rejected(
             "admin event target is not a user".to_string(),
         ));
     };
     let realm_id = user_id.realm_id;
-    let Some(config) = read_realm_config(storage, realm_id).await? else {
+    let Some(config) = realm_config(rows, realm_id)? else {
         return Ok(AdminEventValidation::Deferred {
             dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
             reason: "current realm config is unavailable".to_string(),
@@ -186,17 +182,14 @@ pub(in crate::document_sync) async fn validate_user_authority(
         ));
     };
 
-    let current_user = storage_read_from(
-        storage,
-        DocumentTarget::User { user_id }
-            .storage_keyspace()
-            .to_string(),
-        DocumentTarget::User { user_id }.storage_key(),
-    )
-    .await?
-    .map(|bytes| User::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let current_user = rows
+        .read(
+            DocumentTarget::User { user_id }.storage_keyspace(),
+            DocumentTarget::User { user_id }.storage_key(),
+        )?
+        .map(|bytes| User::from_bytes(&bytes))
+        .transpose()
+        .map_err(invalid)?;
     if current_user
         .as_ref()
         .is_some_and(|user| user.user_id != user_id)
@@ -244,7 +237,7 @@ pub(in crate::document_sync) async fn validate_user_authority(
     {
         false
     } else {
-        let Some(auth) = read_realm_authorization(storage, realm_id).await? else {
+        let Some(auth) = realm_authorization(rows, realm_id)? else {
             return Ok(AdminEventValidation::Deferred {
                 dependency: Some(DocumentSyncDependency::RealmAuthorization(realm_id)),
                 reason: "realm authorization state is unavailable".to_string(),
@@ -264,7 +257,7 @@ pub(in crate::document_sync) async fn validate_user_authority(
     let group_admin = if self_service || management_bootstrap || realm_admin || alias {
         false
     } else if let Some(group_id) = service_owner(event, previous_state, current_user.as_ref()) {
-        let Some(auth) = read_group_authorization(storage, group_id).await? else {
+        let Some(auth) = group_authorization(rows, group_id)? else {
             return Ok(AdminEventValidation::Deferred {
                 dependency: Some(DocumentSyncDependency::GroupAuthorization(group_id)),
                 reason: "group authorization state is unavailable".to_string(),
@@ -287,18 +280,18 @@ pub(in crate::document_sync) async fn validate_user_authority(
     Ok(AdminEventValidation::Accepted)
 }
 
-pub(in crate::document_sync) async fn validate_group_authority(
-    storage: &StorageHandle,
+pub fn validate_group_authority(
+    rows: &mut PlanRows,
     event: &AdminDocumentEvent,
     previous_state: Option<&AdminDocumentState>,
-) -> Result<AdminEventValidation> {
+) -> Step<AdminEventValidation> {
     let AdminDocumentTarget::Group { group_id } = event.target else {
         return Ok(AdminEventValidation::Rejected(
             "admin event target is not a group".to_string(),
         ));
     };
     let realm_id = event.actor.realm_id;
-    let Some(config) = read_realm_config(storage, realm_id).await? else {
+    let Some(config) = realm_config(rows, realm_id)? else {
         return Ok(AdminEventValidation::Deferred {
             dependency: Some(DocumentSyncDependency::RealmConfig(realm_id)),
             reason: "current realm config is unavailable".to_string(),
@@ -314,16 +307,11 @@ pub(in crate::document_sync) async fn validate_group_authority(
         return Ok(AdminEventValidation::Accepted);
     }
 
-    let group_value = storage_read_from(
-        storage,
-        GROUP_KEYSPACE.to_string(),
-        group_id.to_bytes().into(),
-    )
-    .await?;
+    let group_value = rows.read(GROUP_KEYSPACE, group_id.to_bytes().to_vec())?;
     let group = group_value
         .map(|bytes| Group::from_bytes(&bytes))
         .transpose()
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        .map_err(invalid)?;
 
     if let AdminDocumentOperation::GroupCreated {
         realm_id: event_realm_id,
@@ -370,16 +358,15 @@ pub(in crate::document_sync) async fn validate_group_authority(
         && certificate.plan.requested_by == event.actor.user_id
         && certificate.verify()
     {
-        use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
-        let prepared = storage_read_from(
-            storage,
-            aruna_core::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
-            group_id.to_bytes().into(),
-        )
-        .await?
-        .map(|value| GroupDeleteRecord::from_bytes(&value))
-        .transpose()
-        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        use crate::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
+        let prepared = rows
+            .read(
+                crate::keyspaces::GROUP_DELETE_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+            )?
+            .map(|value| GroupDeleteRecord::from_bytes(&value))
+            .transpose()
+            .map_err(invalid)?;
         if certificate.plan.matches_config(&config)
             || prepared.is_some_and(|record| {
                 record.plan == certificate.plan && record.phase == GroupDeletePhase::Preparing
@@ -433,7 +420,7 @@ pub(in crate::document_sync) async fn validate_group_authority(
             ));
         }
         if !previous.applied_event_ids.contains(&event.event_id) {
-            let path = aruna_core::join_request::decision_path(decision.request_id);
+            let path = crate::join_request::decision_path(decision.request_id);
             let observed = previous
                 .user_subject_ids
                 .get(&path)
@@ -450,7 +437,7 @@ pub(in crate::document_sync) async fn validate_group_authority(
                 ));
             }
         }
-        if decision.kind == aruna_core::join_request::JoinDecisionKind::Withdrawn {
+        if decision.kind == crate::join_request::JoinDecisionKind::Withdrawn {
             return Ok(if decision.user_id == event.actor.user_id {
                 AdminEventValidation::Accepted
             } else {
@@ -469,18 +456,15 @@ pub(in crate::document_sync) async fn validate_group_authority(
         return Ok(AdminEventValidation::Accepted);
     }
 
-    let realm_auth = read_realm_authorization(storage, realm_id).await?;
-    let group_auth = storage_read_from(
-        storage,
-        DocumentTarget::GroupAuthorization { group_id }
-            .storage_keyspace()
-            .to_string(),
-        DocumentTarget::GroupAuthorization { group_id }.storage_key(),
-    )
-    .await?
-    .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let realm_auth = realm_authorization(rows, realm_id)?;
+    let group_auth = rows
+        .read(
+            DocumentTarget::GroupAuthorization { group_id }.storage_keyspace(),
+            DocumentTarget::GroupAuthorization { group_id }.storage_key(),
+        )?
+        .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
+        .transpose()
+        .map_err(invalid)?;
     let Some(group_auth) = group_auth else {
         return Ok(AdminEventValidation::Rejected(
             "group authorization state is unavailable".to_string(),
@@ -552,48 +536,20 @@ pub(in crate::document_sync) async fn validate_group_authority(
     })
 }
 
-/// Per-batch snapshot of the realm-config document and reducer state for
-/// admin-event validation. Decoding both per event is quadratic, and a buffered
-/// run applies nothing, so the snapshot holds until the caller invalidates it.
-#[derive(Default)]
-pub(in crate::document_sync) struct ConfigValidationCache {
-    entry: Option<(
-        RealmId,
-        Option<RealmConfigDocument>,
-        Option<AdminDocumentState>,
-    )>,
-}
-
-pub(in crate::document_sync) async fn read_group_authorization(
-    storage: &StorageHandle,
-    group_id: GroupId,
-) -> Result<Option<GroupAuthorizationDocument>> {
-    let target = DocumentTarget::GroupAuthorization { group_id };
-    storage_read_from(
-        storage,
-        target.storage_keyspace().to_string(),
-        target.storage_key(),
-    )
-    .await?
-    .map(|bytes| GroupAuthorizationDocument::from_bytes(&bytes))
-    .transpose()
-    .map_err(|error| NetError::Bootstrap(error.to_string()))
-}
-
 /// Shared admission prerequisites for every replicated admin event: the topic
 /// binding, origin signature, relay permission, actor pairing, and observed
 /// clock. `Accepted` means the event may reach its family decision.
 #[allow(clippy::too_many_arguments)]
-async fn validate_admin_envelope(
-    storage: &StorageHandle,
-    topic_id: ::irokle::TopicId,
-    authenticated_actor_id: ::irokle::ActorId,
+fn validate_admin_envelope(
+    rows: &mut PlanRows,
+    topic_id: irokle::TopicId,
+    authenticated_actor_id: irokle::ActorId,
     target: &DocumentTarget,
     event: &AdminDocumentEvent,
     realm_id: RealmId,
     placement: &PlacementRef,
     origin_signature: &iroh::Signature,
-) -> Result<AdminEventValidation> {
+) -> Step<AdminEventValidation> {
     let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
 
     if target.sync_topic_id(realm_id, placement) != topic_id {
@@ -608,9 +564,7 @@ async fn validate_admin_envelope(
     // A relay hop must itself be a realm node allowed administrative traffic;
     // before config materializes only the origin may publish.
     let self_published = published_by(topic_id, authenticated_actor_id, &event.origin_node_id);
-    if !self_published
-        && !relay_publisher_allowed(storage, topic_id, authenticated_actor_id, realm_id).await?
-    {
+    if !self_published && !relay_allowed(rows, topic_id, authenticated_actor_id, realm_id)? {
         return reject("relayed admin event publisher is not a realm relay node");
     }
     if event.actor.user_id.realm_id != event.actor.realm_id
@@ -637,7 +591,7 @@ async fn validate_admin_envelope(
 fn accept_reducer_event(
     previous_state: Option<AdminDocumentState>,
     event: &AdminDocumentEvent,
-) -> Result<AdminEventValidation> {
+) -> Step<AdminEventValidation> {
     let mut reducer_state =
         previous_state.unwrap_or_else(|| AdminDocumentState::new(event.target.clone()));
     match reducer_state.apply(event) {
@@ -652,21 +606,21 @@ fn accept_reducer_event(
 /// origin's signature, never the transport publisher: a relay may carry an
 /// origin's event but cannot forge, re-target, or re-actor it.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::document_sync) async fn validate_admin_event(
-    storage: &StorageHandle,
-    topic_id: ::irokle::TopicId,
-    authenticated_actor_id: ::irokle::ActorId,
+pub fn validate_admin_event(
+    rows: &mut PlanRows,
+    topic_id: irokle::TopicId,
+    authenticated_actor_id: irokle::ActorId,
     target: &DocumentTarget,
     event: &AdminDocumentEvent,
     realm_id: RealmId,
     placement: &PlacementRef,
     origin_signature: &iroh::Signature,
-    config_cache: &mut ConfigValidationCache,
-) -> Result<AdminEventValidation> {
+    cache: &mut Option<Arc<ConfigSnapshot>>,
+) -> Step<AdminEventValidation> {
     let reject = |reason: &str| Ok(AdminEventValidation::Rejected(reason.to_string()));
 
     let admission = validate_admin_envelope(
-        storage,
+        rows,
         topic_id,
         authenticated_actor_id,
         target,
@@ -674,8 +628,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         realm_id,
         placement,
         origin_signature,
-    )
-    .await?;
+    )?;
     if !matches!(admission, AdminEventValidation::Accepted) {
         return Ok(admission);
     }
@@ -701,26 +654,25 @@ pub(in crate::document_sync) async fn validate_admin_event(
             else {
                 return reject("admin event target is not a realm config");
             };
-            let (current_config, cached_state) = config_cache.load(storage, event_realm_id).await?;
-            let authorized = validate_config_authority(current_config, event, cached_state);
+            let snapshot = config_snapshot(rows, cache, event_realm_id)?;
+            let authorized =
+                validate_config_authority(snapshot.config.as_ref(), event, snapshot.state.as_ref());
             if !matches!(authorized, AdminEventValidation::Accepted) {
                 return Ok(authorized);
             }
-            cached_state.cloned()
+            snapshot.state.clone()
         }
         family => {
-            let previous_state = read_reducer_state(storage, &event.target).await?;
+            let previous_state = reducer_state(rows, &event.target)?;
             let authorized = match family {
                 AdminOperationFamily::RealmAuthorization => {
-                    validate_realm_authority(storage, event, previous_state.as_ref()).await?
+                    validate_realm_authority(rows, event, previous_state.as_ref())?
                 }
                 AdminOperationFamily::Group => {
-                    validate_group_authority(storage, event, previous_state.as_ref()).await?
+                    validate_group_authority(rows, event, previous_state.as_ref())?
                 }
-                AdminOperationFamily::Distribution => {
-                    validate_distribution_authority(storage, event).await?
-                }
-                _ => validate_user_authority(storage, event, previous_state.as_ref()).await?,
+                AdminOperationFamily::Distribution => validate_distribution_authority(rows, event)?,
+                _ => validate_user_authority(rows, event, previous_state.as_ref())?,
             };
             if !matches!(authorized, AdminEventValidation::Accepted) {
                 return Ok(authorized);

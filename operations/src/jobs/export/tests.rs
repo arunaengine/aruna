@@ -10,8 +10,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
 
+use crate::inbound::initialize_incoming_fixture;
 use crate::jobs::executor::ProgressReporter;
-use crate::sync::incoming::initialize_incoming_fixture;
 use crate::tests::import::{
     RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
     read_metadata, rewrite_document, signature_entry, validate_document,

@@ -138,10 +138,8 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
         Ok(recorded) => return recorded,
         Err(effect) => effect,
     };
-    if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
-        return Event::Net(NetEvent::DocumentSync(
-            reconcile_topics(context, topics).await,
-        ));
+    if let NetEffect::DocumentSync(DocumentEffect::ReloadRealmPeers) = effect {
+        return Event::Net(NetEvent::DocumentSync(reload_peers(context).await));
     }
     if let Some(net_handle) = &context.net_handle {
         Box::pin(net_handle.send_effect(Effect::Net(effect))).await
@@ -181,24 +179,16 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     }
 }
 
-/// Reconciles through the handle, which also reloads realm peers after a realm config change.
-async fn reconcile_topics(
-    context: &DriverContext,
-    topics: Vec<irokle::TopicId>,
-) -> DocumentNetEvent {
+/// Rebuilds the peer set from the realm config a reconcile just applied.
+async fn reload_peers(context: &DriverContext) -> DocumentNetEvent {
     let Some(net_handle) = &context.net_handle else {
         return DocumentNetEvent::Error {
             target: None,
             error: "net handle unavailable".to_string(),
         };
     };
-    match Box::pin(net_handle.reconcile_sync_topics(topics)).await {
-        Ok(result) => DocumentNetEvent::DocumentsReconciled {
-            applied: result.applied(),
-            targets: result.targets,
-            metadata_create_events: result.metadata_create_events,
-            metadata_graph_tombstones: result.metadata_graph_tombstones,
-        },
+    match Box::pin(net_handle.reload_realm_peers()).await {
+        Ok(_) => DocumentNetEvent::RealmPeersReloaded,
         Err(error) => DocumentNetEvent::Error {
             target: None,
             error: error.to_string(),

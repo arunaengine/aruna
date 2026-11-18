@@ -1,4 +1,4 @@
-//! Read, write and transaction helpers that document sync runs against the storage actor.
+//! Read and write helpers that document sync runs against the storage actor.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -13,30 +13,6 @@ impl DocumentSyncService {
         storage_read_from(&self.storage, key_space, key).await
     }
 
-    pub(super) async fn storage_write(
-        &self,
-        key_space: String,
-        key: ByteView,
-        value: Value,
-    ) -> Result<()> {
-        match self
-            .storage
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(NetError::Dht(format!(
-                "unexpected storage event while applying document sync write: {other:?}"
-            ))),
-        }
-    }
-
     pub(super) async fn storage_batch_write(
         &self,
         writes: Vec<(String, ByteView, Value)>,
@@ -45,57 +21,16 @@ impl DocumentSyncService {
     }
 }
 
-pub(super) async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<()> {
-    match storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted })
-            if aborted == txn_id =>
-        {
-            Ok(())
-        }
-        // A conflicted commit consumes the transaction; the abort's goal is met.
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionNotFound,
-        }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(NetError::Dht(format!(
-            "unexpected storage event while aborting transaction: {other:?}"
-        ))),
-    }
-}
-
-pub(super) async fn abort_error(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    error: NetError,
-) -> NetError {
-    match abort_txn(storage, txn_id).await {
-        Ok(()) => error,
-        Err(abort) => NetError::Dht(format!("{error}; transaction abort failed: {abort}")),
-    }
-}
-
 pub(super) async fn storage_read_from(
     storage: &StorageHandle,
     key_space: String,
     key: ByteView,
 ) -> Result<Option<Value>> {
-    transaction_read(storage, key_space, key, None).await
-}
-
-pub(super) async fn transaction_read(
-    storage: &StorageHandle,
-    key_space: String,
-    key: ByteView,
-    txn_id: Option<TxnId>,
-) -> Result<Option<Value>> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space,
             key,
-            txn_id,
+            txn_id: None,
         })
         .await
     {
@@ -103,19 +38,6 @@ pub(super) async fn transaction_read(
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while applying document sync read: {other:?}"
-        ))),
-    }
-}
-
-pub(super) async fn start_storage_transaction(storage: &StorageHandle) -> Result<TxnId> {
-    match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(NetError::Dht(format!(
-            "unexpected storage event while starting document sync transaction: {other:?}"
         ))),
     }
 }
@@ -135,103 +57,6 @@ pub(crate) async fn batch_write_to(
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while applying document sync batch write: {other:?}"
-        ))),
-    }
-}
-
-pub(super) async fn replace_batch_in(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    deletes: Vec<(String, ByteView)>,
-    writes: Vec<(String, ByteView, Value)>,
-) -> Result<()> {
-    if !deletes.is_empty() {
-        match storage
-            .send_storage_effect(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(error.into());
-            }
-            other => {
-                return Err(NetError::Dht(format!(
-                    "unexpected storage event while applying document sync transactional batch delete: {other:?}"
-                )));
-            }
-        }
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(error.into());
-        }
-        other => {
-            return Err(NetError::Dht(format!(
-                "unexpected storage event while applying document sync transactional batch write: {other:?}"
-            )));
-        }
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(NetError::Dht(format!(
-            "unexpected storage event while committing document sync apply transaction: {other:?}"
-        ))),
-    }
-}
-
-/// Applies one batch and commits. A conflict aborts and reports `false`, so the caller tries
-/// again; any other failure aborts and is returned.
-pub(super) async fn commit_batch(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    deletes: Vec<(String, ByteView)>,
-    writes: Vec<(String, ByteView, Value)>,
-) -> Result<bool> {
-    match replace_batch_in(storage, txn_id, deletes, writes).await {
-        Ok(()) => Ok(true),
-        Err(NetError::Storage(StorageError::TransactionConflict)) => {
-            let _ = abort_txn(storage, txn_id).await;
-            Ok(false)
-        }
-        Err(error) => {
-            let _ = abort_txn(storage, txn_id).await;
-            Err(error)
-        }
-    }
-}
-
-#[cfg(test)]
-pub(super) async fn batch_delete_to(
-    storage: &StorageHandle,
-    deletes: Vec<(String, ByteView)>,
-) -> Result<()> {
-    match storage
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(NetError::Dht(format!(
-            "unexpected storage event while applying document sync batch delete: {other:?}"
         ))),
     }
 }

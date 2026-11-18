@@ -51,6 +51,7 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::inbound::{initialize_incoming_fixture, initialize_net_holder};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
@@ -66,8 +67,8 @@ use aruna_operations::realm::announce_presence::{
 };
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
-use aruna_operations::sync::incoming::{initialize_incoming_fixture, initialize_net_holder};
 use aruna_operations::tasks::incoming::start_task_queues;
+use aruna_operations::testing::sync_topics;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
@@ -915,14 +916,7 @@ impl Topology {
             realm_id: self.realm_id,
         }
         .sync_topic_id(self.realm_id, &PlacementRef::NIL);
-        node.net
-            .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentEffect::SyncDocuments {
-                    topics: vec![topic],
-                    peers: Vec::new(),
-                },
-            )))
-            .await;
+        let _ = sync_topics(node.context.as_ref(), vec![topic], Vec::new()).await;
 
         let actor = self.actor(self.node(0));
         let started = hang_cap(
@@ -1287,21 +1281,7 @@ async fn seed_config_topic(
         if node.node_id() == seeder.node_id() || !node.is_sync_eligible() {
             continue;
         }
-        match node
-            .net
-            .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentEffect::SyncDocuments {
-                    topics: vec![topic],
-                    peers: Vec::new(),
-                },
-            )))
-            .await
-        {
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
-                ..
-            })) => {}
-            other => return Err(format!("unexpected config topic seed sync: {other:?}").into()),
-        }
+        sync_topics(node.context.as_ref(), vec![topic], Vec::new()).await?;
     }
     Ok(())
 }
@@ -1363,14 +1343,7 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
         nodes
             .iter()
             .filter(|node| node.is_sync_eligible())
-            .map(|node| {
-                node.net.send_effect(Effect::Net(NetEffect::DocumentSync(
-                    DocumentEffect::SyncDocuments {
-                        topics: vec![topic],
-                        peers: Vec::new(),
-                    },
-                )))
-            }),
+            .map(|node| sync_topics(node.context.as_ref(), vec![topic], Vec::new())),
     )
     .await;
 }

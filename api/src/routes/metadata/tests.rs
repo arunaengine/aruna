@@ -63,13 +63,13 @@ use aruna_core::task::{PersistedTaskTimer, TaskKey};
 use aruna_graph::GraphHandle;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
+use aruna_operations::inbound::initialize_incoming_fixture;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::testing::{
     drain_projection_queue, replay_event_log, schedule_projection_drain,
 };

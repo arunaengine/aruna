@@ -38,6 +38,7 @@ use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::inbound::initialize_incoming_fixture;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::node::info::facts::NodeFacts;
 use aruna_operations::node::info::flows::SeedInfoOperation;
@@ -49,7 +50,6 @@ use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperat
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::s3::access::get::GetAccessOperation;
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;

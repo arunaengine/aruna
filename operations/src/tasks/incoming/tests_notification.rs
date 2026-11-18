@@ -152,7 +152,7 @@ async fn notification_delivers_holder() {
         compute_handle: None,
         outbound_handle: None,
     });
-    crate::sync::incoming::initialize_incoming_fixture(context_b.clone());
+    crate::inbound::initialize_incoming_fixture(context_b.clone());
 
     let context_a = Arc::new(DriverContext {
         storage_handle: storage_a.clone(),

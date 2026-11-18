@@ -55,9 +55,9 @@ use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
-use aruna_operations::sync::document_outbox::read_outbox_records;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use aruna_operations::tasks::incoming::OutboxDrainer;
+use aruna_operations::testing::{read_outbox_records, reconcile_topics};
 use tokio::time::sleep;
 use ulid::Ulid;
 
@@ -1152,10 +1152,11 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
             vec![nodes[0].net.node_id()],
         )
         .await?;
-    let delete_result = nodes[1]
-        .net
-        .reconcile_sync_topics(vec![shard_topic_of(&lifecycle_target)])
-        .await?;
+    let delete_result = reconcile_topics(
+        nodes[1].context.as_ref(),
+        vec![shard_topic_of(&lifecycle_target)],
+    )
+    .await?;
     assert_eq!(delete_result.metadata_create_events.len(), 0);
 
     let stale_target = DocumentTarget::MetadataCreateEvent {
@@ -1175,10 +1176,11 @@ async fn stale_create_loses() -> Result<(), Box<dyn std::error::Error>> {
         .net
         .sync_topic_peers(shard_topic_of(&stale_target), vec![nodes[0].net.node_id()])
         .await?;
-    let stale_result = nodes[1]
-        .net
-        .reconcile_sync_topics(vec![shard_topic_of(&stale_target)])
-        .await?;
+    let stale_result = reconcile_topics(
+        nodes[1].context.as_ref(),
+        vec![shard_topic_of(&stale_target)],
+    )
+    .await?;
 
     assert!(stale_result.metadata_create_events.is_empty());
     assert!(

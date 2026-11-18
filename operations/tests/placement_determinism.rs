@@ -33,6 +33,7 @@ use aruna_operations::realm::mutate_placement::{
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
+use aruna_operations::testing::sync_topics;
 use ulid::Ulid;
 
 use crate::convergence;
@@ -557,19 +558,8 @@ async fn seed_config_topic(
         }
     }
 
-    match nodes[0]
-        .net
-        .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentEffect::SyncDocuments {
-                topics: vec![topic],
-                peers: Vec::new(),
-            },
-        )))
-        .await
-    {
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
-        other => Err(format!("unexpected realm config seed sync event: {other:?}").into()),
-    }
+    sync_topics(nodes[0].context.as_ref(), vec![topic], Vec::new()).await?;
+    Ok(())
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

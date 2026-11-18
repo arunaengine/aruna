@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::{DriverContext, drive};
+use crate::inbound::initialize_incoming_fixture;
 use crate::jobs::store::query::find_dedup_plan;
 use crate::notifications::checks::{
     MAX_FUTURE_SKEW, validate_inbound_batch, validate_inbound_kind, validate_watch_event,
@@ -20,7 +21,6 @@ use crate::notifications::protocol::EVENT_BATCH_SIZE;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
 use crate::realm::load_config::load_realm_config;
-use crate::sync::incoming::initialize_incoming_fixture;
 use crate::tests::notifications::create_local_watch;
 use aruna_core::NodeId;
 use aruna_core::UserId;

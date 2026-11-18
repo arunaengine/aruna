@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::document::DocumentNetEvent;
 use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -20,7 +21,8 @@ use aruna_core::types::Key;
 use byteview::ByteView;
 use tracing::{debug, warn};
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::sync::reconcile::SyncTopicsOperation;
 use crate::sync::shard_placement::{
     decode_placement, new_placement, placement_prefix, sort_node_ids, write_placement_effect,
 };
@@ -160,9 +162,12 @@ async fn ensure_held_topics(
                 co_members = co_members.len(),
                 "Pulling newly held shard topics from co-holders"
             );
-            let event = net_handle
-                .sync_document_topics(missing.clone(), co_members.clone())
-                .await;
+            let sync = SyncTopicsOperation::new(
+                *net_handle.realm_id(),
+                missing.clone(),
+                co_members.clone(),
+            );
+            let event = DocumentNetEvent::reconciled(drive(sync, context).await);
             crate::shard::restore::apply_restored_reconcile(context, local_node_id, event).await;
             for topic in missing {
                 if net_handle.sync_topic_exists(topic).unwrap_or(false) {
@@ -248,9 +253,12 @@ pub(crate) async fn resolve_creatable_topics(
         }
     }
     if !to_adopt.is_empty() {
-        let event = net_handle
-            .sync_document_topics(to_adopt.clone(), co_members.to_vec())
-            .await;
+        let sync = SyncTopicsOperation::new(
+            *net_handle.realm_id(),
+            to_adopt.clone(),
+            co_members.to_vec(),
+        );
+        let event = DocumentNetEvent::reconciled(drive(sync, context).await);
         crate::shard::restore::apply_restored_reconcile(context, local_node_id, event).await;
         // Only keep topics whose genesis actually landed; an adopt that failed
         // must not fall through to a fresh create - retry it on the next pass.

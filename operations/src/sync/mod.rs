@@ -4,11 +4,10 @@
 
 pub mod announce;
 pub mod document_outbox;
-mod evicted;
-pub mod incoming;
+pub(crate) mod evicted;
 pub mod mirror_repair;
 pub mod outbox_record;
-mod reconcile;
+pub mod reconcile;
 pub mod replicate_documents;
 pub mod shard_placement;
 pub mod sync_quarantine;

@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::alpn::Alpn;
 use aruna_core::document::{
-    DocumentChange, DocumentChangeKind, DocumentEvent, DocumentNetEvent, DocumentSyncPublish,
-    DocumentSyncRevision, DocumentTarget,
+    DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent, DocumentNetEvent,
+    DocumentSyncPublish, DocumentSyncRevision, DocumentTarget,
 };
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -17,14 +17,14 @@ use aruna_core::structs::{
     QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
     SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
-use aruna_net::DocumentSyncService;
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::sync::sync_quarantine::{
     AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
     QuarantinePage, QuarantinePageRequest, ReadQuarantineOperation,
 };
-use aruna_operations::testing::{test_context, write_entries};
-use aruna_storage::{FjallPersistPolicy, StorageHandle};
+use aruna_operations::testing::{reconcile_topics, test_context, write_entries};
+use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use ulid::Ulid;
 
@@ -134,34 +134,22 @@ async fn capacity_blocks_releases() {
     let storage_dir = tempfile::tempdir().expect("storage dir");
     let storage = aruna_storage::FjallStorage::open(storage_dir.path().to_str().expect("path"))
         .expect("storage opens");
-    let doc_dir = tempfile::tempdir().expect("doc dir");
     let realm_id = RealmId::from_bytes([31; 32]);
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .secret_key(iroh::SecretKey::from_bytes(&[31; 32]))
-        .relay_mode(iroh::RelayMode::Disabled)
-        .alpns(vec![Alpn::DocumentSync.as_bytes().to_vec()])
-        .bind_addr(
-            "127.0.0.1:0"
-                .parse::<std::net::SocketAddr>()
-                .expect("bind address"),
-        )
-        .expect("bind address configures")
-        .bind()
-        .await
-        .expect("endpoint binds");
-    let service = DocumentSyncService::open_with_policy(
-        endpoint,
+    let net = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind address"),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
         storage.clone(),
-        doc_dir.path().join("document-sync"),
-        &[],
-        vec![Alpn::DocumentSync.as_bytes().to_vec()],
-        Default::default(),
-        FjallPersistPolicy::Buffer,
-        realm_id,
     )
-    .expect("document sync service opens");
-    let ctx = test_context(storage.clone());
-    let local_node = iroh::SecretKey::from_bytes(&[31; 32]).public();
+    .await
+    .expect("net handle");
+    let mut ctx = test_context(storage.clone());
+    ctx.net_handle = Some(net.clone());
+    let local_node = net.node_id();
 
     let seeded = fill_store(&storage).await;
     assert_eq!(
@@ -176,30 +164,37 @@ async fn capacity_blocks_releases() {
     };
     let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let event_id = Ulid::from_parts(9_001, 1);
-    let published = service
-        .publish_documents(
-            vec![DocumentSyncPublish::Upsert {
-                event_id,
-                target: target.clone(),
-                bytes: node_info_bytes(iroh::SecretKey::from_bytes(&[5; 32]).public()),
-                change: DocumentChange {
-                    base: None,
-                    current: DocumentSyncRevision {
-                        generation: 1,
-                        event_id,
-                        actor: local_node,
-                        updated_at_ms: 1,
+    let published = net
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentEffect::PublishDocuments {
+                documents: vec![DocumentSyncPublish::Upsert {
+                    event_id,
+                    target: target.clone(),
+                    bytes: node_info_bytes(iroh::SecretKey::from_bytes(&[5; 32]).public()),
+                    change: DocumentChange {
+                        base: None,
+                        current: DocumentSyncRevision {
+                            generation: 1,
+                            event_id,
+                            actor: local_node,
+                            updated_at_ms: 1,
+                        },
+                        kind: DocumentChangeKind::Upsert,
+                        placement: PlacementRef::NIL,
                     },
-                    kind: DocumentChangeKind::Upsert,
-                    placement: PlacementRef::NIL,
-                },
-                allow_genesis: true,
-            }],
-            Vec::new(),
-        )
+                    allow_genesis: true,
+                }],
+                peers: Vec::new(),
+            },
+        )))
         .await;
     assert!(
-        matches!(published, DocumentNetEvent::DocumentsPublished { .. }),
+        matches!(
+            published,
+            Event::Net(NetEvent::DocumentSync(
+                DocumentNetEvent::DocumentsPublished { .. }
+            ))
+        ),
         "publish failed: {published:?}"
     );
 
@@ -211,7 +206,9 @@ async fn capacity_blocks_releases() {
         limit: Some(4),
     };
     reset_cursor(&storage, topic_id.as_bytes()).await;
-    service.reconcile_documents_event().await;
+    reconcile_topics(&ctx, vec![topic_id])
+        .await
+        .expect("reconcile runs");
     assert!(
         list(&ctx, topic_page()).await.records.is_empty(),
         "a full store must not write evidence"
@@ -245,7 +242,9 @@ async fn capacity_blocks_releases() {
 
     // The event was never applied and its cursor never advanced, so the next
     // reconcile redelivers it and the reclaimed slot takes the evidence.
-    service.reconcile_documents_event().await;
+    reconcile_topics(&ctx, vec![topic_id])
+        .await
+        .expect("reconcile runs");
     let redelivered = list(&ctx, topic_page()).await;
     let record = redelivered
         .records
@@ -283,5 +282,5 @@ async fn capacity_blocks_releases() {
         "the pruned row stays gone"
     );
 
-    service.shutdown().await;
+    net.shutdown().await;
 }

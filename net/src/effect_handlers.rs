@@ -212,11 +212,19 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             aruna_core::DocumentEffect::SyncDocuments { topics, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
             }
-            aruna_core::DocumentEffect::ReconcileTopics { .. } => {
+            aruna_core::DocumentEffect::ReconcileBatch {
+                topic,
+                stored_cursor,
+            } => NetEvent::DocumentSync(document_sync.reconcile_batch_event(topic, stored_cursor)),
+            aruna_core::DocumentEffect::OverflowPage {
+                topic,
+                start,
+                applied,
+            } => NetEvent::DocumentSync(document_sync.overflow_page_event(topic, start, applied)),
+            aruna_core::DocumentEffect::ReloadRealmPeers => {
                 NetEvent::DocumentSync(aruna_core::document::DocumentNetEvent::Error {
                     target: None,
-                    error: "topic reconcile must be dispatched by the operations runner"
-                        .to_string(),
+                    error: "a peer reload must be dispatched by the operations runner".to_string(),
                 })
             }
         },

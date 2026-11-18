@@ -39,7 +39,7 @@ async fn durable_rearm_loop(
         if let Err(error) = drive(restore, &context).await {
             warn!(%error, "Failed to restore connector reference pruning");
         }
-        restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_outbox_timer(&context).await;
         restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
@@ -259,7 +259,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_outbox_timer(&context).await;
         if stopped() {
             return;
         }
@@ -879,6 +879,68 @@ pub async fn drain_notification_outbox(context: Arc<DriverContext>) {
         .await;
 }
 
+/// Re-arms the sync mirror repair timer; a failure waits for the next rearm tick.
+async fn restore_mirror_timer(context: &DriverContext) {
+    if let Err(error) = drive(RestoreTimerOperation::new(), context).await {
+        warn!(%error, "Failed to restore sync mirror repair timer");
+    }
+}
+
+/// Arms the outbox drain for waiting records; a failure waits for the next rearm tick.
+async fn restore_outbox_timer(context: &DriverContext) {
+    if let Err(error) = drive(OutboxTimerOperation::new(), context).await {
+        warn!(%error, "Failed to restore document sync outbox timer");
+    }
+}
+
+/// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never `ResetTimer`) so the
+/// durable-queue re-arm loop cannot push the deadline forward past the handler's own re-arm.
+async fn restore_info_timer(task_handle: &TaskHandle) {
+    let effect = Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::PublishNodeInfo,
+        after: aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
+    });
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await {
+        warn!(message = %message, "Failed to arm node info heartbeat timer");
+    }
+}
+
+/// Re-arms the debounced publish task when dirty markers survived a restart.
+async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle: &TaskHandle) {
+    let has_markers = match storage
+        .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
+            key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
+            prefix: Some(Key::from(
+                aruna_core::structs::storage::usage::DIRTY_PREFIX.to_vec(),
+            )),
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(error = %error, "Failed to scan node usage dirty markers");
+            return;
+        }
+        other => {
+            warn!(
+                event = other.label(),
+                "Unexpected event while scanning node usage dirty markers"
+            );
+            return;
+        }
+    };
+    if has_markers
+        && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+            .send_effect(crate::s3::usage::schedule_snapshot_publish())
+            .await
+    {
+        warn!(message = %message, "Failed to restore node usage publish timer");
+    }
+}
+
 #[cfg(test)]
 mod stop_tests {
     use super::*;
@@ -982,60 +1044,5 @@ mod stop_tests {
             "the later restore unit must not run after the stop"
         );
         drop(temp);
-    }
-}
-
-/// Re-arms the sync mirror repair timer; a failure waits for the next rearm tick.
-async fn restore_mirror_timer(context: &DriverContext) {
-    if let Err(error) = drive(RestoreTimerOperation::new(), context).await {
-        warn!(%error, "Failed to restore sync mirror repair timer");
-    }
-}
-
-/// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never `ResetTimer`) so the
-/// durable-queue re-arm loop cannot push the deadline forward past the handler's own re-arm.
-async fn restore_info_timer(task_handle: &TaskHandle) {
-    let effect = Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::PublishNodeInfo,
-        after: aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
-    });
-    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await {
-        warn!(message = %message, "Failed to arm node info heartbeat timer");
-    }
-}
-
-/// Re-arms the debounced publish task when dirty markers survived a restart.
-async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle: &TaskHandle) {
-    let has_markers = match storage
-        .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
-            key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
-            prefix: Some(Key::from(
-                aruna_core::structs::storage::usage::DIRTY_PREFIX.to_vec(),
-            )),
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to scan node usage dirty markers");
-            return;
-        }
-        other => {
-            warn!(
-                event = other.label(),
-                "Unexpected event while scanning node usage dirty markers"
-            );
-            return;
-        }
-    };
-    if has_markers
-        && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-            .send_effect(crate::s3::usage::schedule_snapshot_publish())
-            .await
-    {
-        warn!(message = %message, "Failed to restore node usage publish timer");
     }
 }

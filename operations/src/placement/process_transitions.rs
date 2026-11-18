@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::document::DocumentNetEvent;
 use aruna_core::document::shard_topic_id;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -29,10 +30,13 @@ use crate::realm::mutate_placement::{
 };
 use crate::shard::verify::converge_with_barrier;
 use crate::shard::{assemble_shard_manifest, frontier_root};
+use crate::sync::document_outbox::OutboxPagePlan;
+use crate::sync::reconcile::SyncTopicsOperation;
 use aruna_core::placement::fence::{fence_read, stored_generation};
 use aruna_core::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
+use aruna_core::row_plan::PlanOperation;
 
 /// Runs every transition step the local node owns. Returns whether a step is
 /// still outstanding, so the caller re-arms the placement retry.
@@ -253,14 +257,12 @@ async fn drain_blocker(
     for prefix in crate::sync::outbox_record::outbox_stream_prefixes() {
         let mut start_after: Option<Vec<u8>> = None;
         loop {
-            let batch = match crate::sync::document_outbox::read_outbox_records(
-                &context.storage_handle,
-                prefix,
-                start_after.take(),
-                256,
-            )
-            .await
-            {
+            let read = OutboxPagePlan {
+                prefix: prefix.to_vec(),
+                start_after: start_after.take(),
+                limit: 256,
+            };
+            let batch = match drive(PlanOperation::new(read), context).await {
                 Ok(batch) => batch,
                 Err(error) => {
                     debug!(error = %error, "Transition drain scan failed");
@@ -358,9 +360,8 @@ async fn completion_step(
     let topic = shard_topic_id(realm_id, placement);
     if !sources.is_empty() && !net_handle.sync_topic_exists(topic).unwrap_or(false) {
         // Join-only: this adopts an existing genesis and can never mint one.
-        let event = net_handle
-            .sync_document_topics(vec![topic], sources.clone())
-            .await;
+        let sync = SyncTopicsOperation::new(*net_handle.realm_id(), vec![topic], sources.clone());
+        let event = DocumentNetEvent::reconciled(drive(sync, context).await);
         crate::shard::restore::apply_restored_reconcile(context, local_node_id, event).await;
     }
 
@@ -1295,12 +1296,12 @@ mod tests {
         );
         assert_eq!(closed_generation(&context, realm_id, &placement).await, 1);
 
-        crate::sync::document_outbox::delete_outbox_records(
-            &context.storage_handle,
-            vec![predecessor],
-        )
-        .await
-        .expect("the row is deleted");
+        let delete = crate::sync::document_outbox::DeleteOutboxPlan {
+            keys: vec![predecessor],
+        };
+        drive(aruna_core::row_plan::PlanOperation::new(delete), &context)
+            .await
+            .expect("the row is deleted");
         let reported = drain_step(&context, realm_id, transition, &placement, node(1)).await;
         assert!(
             matches!(

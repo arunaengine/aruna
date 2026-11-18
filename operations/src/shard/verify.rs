@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::document::DocumentNetEvent;
 use aruna_core::document::shard_topic_id;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -26,6 +27,7 @@ use crate::shard::assemble_shard_manifest;
 use crate::shard::client::fetch_shard_manifest;
 use crate::shard::manifest::manifest_entry_digest;
 use crate::shard::restore::apply_restored_reconcile;
+use crate::sync::reconcile::SyncTopicsOperation;
 use crate::sync::shard_placement::{placement_key, placement_prefix};
 use aruna_core::placement::resolve_shard_holders;
 
@@ -270,9 +272,9 @@ pub async fn converge_with_barrier(
                 return Some((*co_holder, local.digest));
             }
             // Topic or entry digests differ: pull the co-holder's events and re-compare.
-            let event = net_handle
-                .sync_document_topics(vec![topic], vec![*co_holder])
-                .await;
+            let sync =
+                SyncTopicsOperation::new(*net_handle.realm_id(), vec![topic], vec![*co_holder]);
+            let event = DocumentNetEvent::reconciled(drive(sync, context).await);
             apply_restored_reconcile(context, node_id, event).await;
             remote = match fetch_shard_manifest(net_handle, *co_holder, realm_id, placement).await {
                 Ok(manifest) => manifest,
