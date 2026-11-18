@@ -6,6 +6,8 @@
 // The whole object is read again, bound to its ETag or checked against its digests, and
 // published like any kept copy; else nothing is kept.
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::on_use::{
     CACHE_CAPACITY_BYTES, FillClaim, PullPlan, claim_key,
 };
@@ -13,97 +15,175 @@ use aruna_core::time::unix_timestamp_millis;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::keep::{ClaimFillOperation, Claimed, KeptCopy, PublishKeptOperation, Published};
-use super::pull::{drop_copy, drop_evicted, fill_slot, release};
-use super::source_plan::{KeepPlanOperation, Plan, SourceKeep, SpoolSourceOperation};
-use crate::driver::{DriverContext, drive};
+use super::keep::{ClaimFillOperation, Claimed, KeepError, KeptCopy};
+use super::pull::{KeepCopyOperation, ReleaseClaimOperation};
+use super::source_plan::{
+    KeepPlanOperation, Plan, PlanError, SourceKeep, SpoolError, SpoolSourceOperation, SpooledCopy,
+};
+
+/// How keeping a reference goes on after its plan.
+#[derive(Debug, PartialEq)]
+pub enum KeepStart {
+    /// Nothing more to do; `true` once the copy is kept before the read is served.
+    Settled(bool),
+    /// The copy is kept in the background when a fill slot is free.
+    Background(KeepSourceOperation),
+}
 
 /// Keeps the reference's bytes per the member's strategy and range behaviour: before the read
-/// is served when it fills first (`true`), else in the background when a fill slot is free.
-pub async fn keep_first(context: &DriverContext, keep: SourceKeep) -> bool {
-    let plan = match drive(KeepPlanOperation::new(keep.clone()), context).await {
-        Ok(Some(plan)) => plan,
-        Ok(None) => return false,
-        Err(error) => {
-            warn!(%error, version_id = %keep.version_id, "A reference was not kept");
-            return false;
+/// is served when it fills first, else in the background.
+#[derive(Debug, PartialEq)]
+pub struct KeepFirstOperation {
+    keep: SourceKeep,
+    filling: bool,
+}
+
+impl KeepFirstOperation {
+    pub fn new(keep: SourceKeep) -> Self {
+        Self {
+            keep,
+            filling: false,
         }
-    };
-    if keep.ranged && plan.pull == PullPlan::FillFirst(plan.kind) {
-        return match keep_source(context, &keep, plan).await {
-            Ok(kept) => kept,
-            Err(reason) => {
-                warn!(reason, version_id = %keep.version_id, "A reference was not kept");
-                false
+    }
+}
+
+impl Operation for KeepFirstOperation {
+    type Output = KeepStart;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<KeepStart>, IoError> {
+        let plan = KeepPlanOperation::new(self.keep.clone());
+        Ok(Next::Call(IoCall::child(plan)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<KeepStart>, IoError> {
+        if self.filling {
+            let kept = result.child::<bool, IoError>()??;
+            return Ok(Next::Done(KeepStart::Settled(kept)));
+        }
+        let plan = match result.child::<Option<Plan>, PlanError>()? {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(Next::Done(KeepStart::Settled(false))),
+            Err(error) => {
+                let version_id = self.keep.version_id;
+                warn!(%error, %version_id, "A reference was not kept");
+                return Ok(Next::Done(KeepStart::Settled(false)));
             }
         };
-    }
-    let Some(slot) = fill_slot() else {
-        return false;
-    };
-    let context = context.clone();
-    tokio::spawn(async move {
-        let _slot = slot;
-        if let Err(reason) = keep_source(&context, &keep, plan).await {
-            warn!(reason, version_id = %keep.version_id, "A reference was not kept");
+        let first = self.keep.ranged && plan.pull == PullPlan::FillFirst(plan.kind);
+        let keep = KeepSourceOperation::new(self.keep.clone(), plan);
+        if first {
+            self.filling = true;
+            return Ok(Next::Call(IoCall::child(keep)));
         }
-    });
-    false
+        Ok(Next::Done(KeepStart::Background(keep)))
+    }
+}
+
+/// What the pending call of keeping a reference answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceStep {
+    Claim,
+    Spool,
+    Publish,
+    Release,
 }
 
 /// Claims, reads, verifies and publishes one kept copy of a reference; `true` once kept.
-async fn keep_source(
-    context: &DriverContext,
-    keep: &SourceKeep,
+#[derive(Debug, PartialEq)]
+pub struct KeepSourceOperation {
+    keep: SourceKeep,
     plan: Plan,
-) -> Result<bool, String> {
-    let claim = claim_key(plan.kind, plan.set_id, keep.version_id, plan.identity);
-    let claimed = FillClaim {
-        claim_id: Ulid::generate(),
-        claimed_at_ms: unix_timestamp_millis(),
-    };
-    match drive(ClaimFillOperation::new(claim.clone(), claimed), context).await {
-        Ok(Claimed::Claimed) => {}
-        Ok(Claimed::Busy) => return Ok(false),
-        Err(error) => return Err(error.to_string()),
+    claim: Vec<u8>,
+    step: SourceStep,
+}
+
+impl KeepSourceOperation {
+    fn new(keep: SourceKeep, plan: Plan) -> Self {
+        let claim = claim_key(plan.kind, plan.set_id, keep.version_id, plan.identity);
+        Self {
+            keep,
+            plan,
+            claim,
+            step: SourceStep::Claim,
+        }
     }
-    let spool = SpoolSourceOperation::new(keep.clone(), plan.clone());
-    let copy = match drive(spool, context).await {
-        Ok(copy) => copy,
-        Err(error) => {
-            release(context, claim).await;
-            return Err(error.to_string());
-        }
-    };
-    let (location, blake3, size) = copy;
-    let kept = KeptCopy {
-        kind: plan.kind,
-        set_id: plan.set_id,
-        version_id: keep.version_id,
-        identity: plan.identity,
-        blake3,
-        size,
-        location: location.clone(),
-        claim_key: claim.clone(),
-        capacity: CACHE_CAPACITY_BYTES,
-        order: Ulid::generate(),
-        member_id: plan.member_id,
-    };
-    match drop_evicted(
-        context,
-        drive(PublishKeptOperation::new(kept), context).await,
-    )
-    .await
-    {
-        Ok(Published::Kept { .. }) => Ok(true),
-        Ok(Published::Unkept) => {
-            drop_copy(context, &location).await;
-            Ok(false)
-        }
-        Err(error) => {
-            drop_copy(context, &location).await;
-            release(context, claim).await;
-            Err(error.to_string())
+
+    fn not_kept(&self, reason: &dyn std::fmt::Display) {
+        let version_id = self.keep.version_id;
+        warn!(%reason, %version_id, "A reference was not kept");
+    }
+
+    fn publish(&mut self, (location, blake3, size): SpooledCopy) -> Next<bool> {
+        let copy = KeptCopy {
+            kind: self.plan.kind,
+            set_id: self.plan.set_id,
+            version_id: self.keep.version_id,
+            identity: self.plan.identity,
+            blake3,
+            size,
+            location,
+            claim_key: self.claim.clone(),
+            capacity: CACHE_CAPACITY_BYTES,
+            order: Ulid::generate(),
+            member_id: self.plan.member_id,
+        };
+        self.step = SourceStep::Publish;
+        Next::Call(IoCall::child(KeepCopyOperation::new(copy)))
+    }
+}
+
+impl Operation for KeepSourceOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let claimed = FillClaim {
+            claim_id: Ulid::generate(),
+            claimed_at_ms: unix_timestamp_millis(),
+        };
+        let claim = ClaimFillOperation::new(self.claim.clone(), claimed);
+        Ok(Next::Call(IoCall::child(claim)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        match self.step {
+            SourceStep::Claim => match result.child::<Claimed, KeepError>()? {
+                Ok(Claimed::Claimed) => {
+                    let spool = SpoolSourceOperation::new(self.keep.clone(), self.plan.clone());
+                    self.step = SourceStep::Spool;
+                    Ok(Next::Call(IoCall::child(spool)))
+                }
+                Ok(Claimed::Busy) => Ok(Next::Done(false)),
+                Err(error) => {
+                    self.not_kept(&error);
+                    Ok(Next::Done(false))
+                }
+            },
+            SourceStep::Spool => match result.child::<SpooledCopy, SpoolError>()? {
+                Ok(copy) => Ok(self.publish(copy)),
+                Err(error) => {
+                    self.not_kept(&error);
+                    self.step = SourceStep::Release;
+                    let release = ReleaseClaimOperation::new(self.claim.clone());
+                    Ok(Next::Call(IoCall::child(release)))
+                }
+            },
+            SourceStep::Publish => match result.child::<bool, KeepError>()? {
+                Ok(kept) => Ok(Next::Done(kept)),
+                Err(error) => {
+                    self.not_kept(&error);
+                    Ok(Next::Done(false))
+                }
+            },
+            SourceStep::Release => {
+                result.child::<(), IoError>()??;
+                Ok(Next::Done(false))
+            }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "source_keep_tests.rs"]
+mod tests;

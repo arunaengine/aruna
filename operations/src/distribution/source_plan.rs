@@ -47,7 +47,7 @@ pub struct SourceKeep {
 
 /// What a keeping member keeps of one reference version.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Plan {
+pub struct Plan {
     pub(super) kind: KeptKind,
     pub(super) pull: PullPlan,
     pub(super) set_id: Ulid,
@@ -58,7 +58,7 @@ pub(super) struct Plan {
 
 #[derive(Debug, Error, PartialEq)]
 #[error("the keep plan could not be read: {0}")]
-pub(super) struct PlanError(String);
+pub struct PlanError(String);
 
 impl From<IoError> for PlanError {
     fn from(error: IoError) -> Self {

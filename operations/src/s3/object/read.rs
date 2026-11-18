@@ -39,8 +39,8 @@ use crate::blob::holders::GetHoldersOperation;
 use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
 use crate::blob::unlocked::{drop_mismatch, reject_archive};
 use crate::distribution::held::PullRequest;
-use crate::distribution::pull::{pinned_blob, pull_through};
-use crate::distribution::source_keep::keep_first;
+use crate::distribution::pull::{PullThroughOperation, fill_slot, pinned_blob};
+use crate::distribution::source_keep::{KeepFirstOperation, KeepStart};
 use crate::distribution::source_plan::SourceKeep;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
@@ -227,6 +227,40 @@ pub(crate) async fn read_source(
             pull_through(context, request).await
         }
         result => result,
+    }
+}
+
+/// Reads through the holders and runs the fill the read asks for beside it, while a slot is free.
+async fn pull_through(
+    context: &DriverContext,
+    request: PullRequest,
+) -> Result<GetObjectResult, GetObjectError> {
+    let pulled = drive(PullThroughOperation::new(request), context).await?;
+    if let (Some(fill), Some(slot)) = (pulled.fill, fill_slot()) {
+        let context = context.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let _ = drive(fill, &context).await;
+        });
+    }
+    Ok(pulled.result)
+}
+
+/// Keeps a reference's bytes; `true` once they are kept before the read is served.
+async fn keep_first(context: &DriverContext, keep: SourceKeep) -> bool {
+    match drive(KeepFirstOperation::new(keep), context).await {
+        Ok(KeepStart::Settled(kept)) => kept,
+        Ok(KeepStart::Background(source)) => {
+            if let Some(slot) = fill_slot() {
+                let context = context.clone();
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let _ = drive(source, &context).await;
+                });
+            }
+            false
+        }
+        Err(_) => false,
     }
 }
 

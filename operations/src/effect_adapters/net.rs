@@ -50,6 +50,10 @@ pub(super) async fn dispatch_heartbeat(effect: HeartbeatEffect, context: &Driver
         HeartbeatEffect::Store { peer, heartbeat } => {
             HeartbeatEvent::Stored(net_handle.record_heartbeat(peer, *heartbeat))
         }
+        HeartbeatEffect::Avoid { holder, now_ms } => {
+            net_handle.avoided_holders().avoid(holder, now_ms);
+            HeartbeatEvent::Avoided
+        }
         HeartbeatEffect::Holders { holders, now_ms } => {
             let avoid_list = net_handle.avoided_holders();
             let avoided = (holders.iter())
