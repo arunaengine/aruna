@@ -198,12 +198,9 @@ mod pure_tests {
                 got: "g".to_string(),
             }),
             delete(DeleteDocumentError::DocumentNotFound),
-            delete(DeleteDocumentError::MissingTransaction),
-            delete(DeleteDocumentError::UnexpectedEvent {
-                state: "s".to_string(),
-                expected: "e",
-                got: "g".to_string(),
-            }),
+            delete(DeleteDocumentError::Io(
+                aruna_core::calls::IoError::Unfinished,
+            )),
             // Settled values of the immutable binding set; a retry replays them.
             create(CreateDocumentError::PlacementBinding(
                 BindingError::Conflicted(handle()),
