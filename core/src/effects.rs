@@ -795,6 +795,9 @@ pub enum NetEffect {
     /// Reads one version from another node under a read grant; answers
     /// `NetEvent::GrantedRead`.
     GrantedRead(Box<crate::native_reference::GrantedReadEffect>),
+    /// Reads one version from another node under a delegation; answers
+    /// `NetEvent::DelegatedRead`.
+    DelegatedRead(Box<crate::native_reference::DelegatedReadEffect>),
     /// Signs a read grant; only a grant naming this node as issuer. Answers
     /// `NetEvent::GrantSign`.
     GrantSign(Box<crate::structs::storage::read_grant::ReadGrant>),

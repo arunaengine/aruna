@@ -1114,6 +1114,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
         Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
         Effect::Net(NetEffect::GrantedRead(_)) => "granted_read",
+        Effect::Net(NetEffect::DelegatedRead(_)) => "delegated_read",
         Effect::Net(NetEffect::DatasetSummary(_)) => "dataset_summary",
         Effect::Net(NetEffect::WritePeerAuth(_)) => "write_peer_auth",
         Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
