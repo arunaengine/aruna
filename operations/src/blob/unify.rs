@@ -434,253 +434,268 @@ fn versions_of(groups: &BTreeMap<([u8; 32], Vec<u8>), Vec<Member>>) -> Vec<Ulid>
     groups.values().flatten().map(|(id, ..)| *id).collect()
 }
 
-/// The second copies of `key` an import registered for one of `versions`: files with a
-/// version's content whose row names that version, with their index rows and that version.
-pub(crate) async fn second_copies(
-    context: &DriverContext,
-    routing: Option<&RoutingSnapshot>,
-    (bucket, key): (&str, &str),
-    versions: &[Ulid],
-) -> Result<Vec<(BackendLocation, Key, Ulid)>, String> {
-    let operation = SecondCopiesOperation::new(routing, (bucket, key), versions);
-    let operation = operation.map_err(|error| error.to_string())?;
-    let found = crate::driver::drive(operation, context).await;
-    found.map_err(|error| error.to_string())
+/// Which keys a duplicate preview covers and which part of them it shows.
+#[derive(Debug, Default, PartialEq)]
+pub struct PreviewQuery {
+    pub prefix: String,
+    pub filter: Option<String>,
+    pub after: Option<Cursor>,
+    pub limit: usize,
 }
 
-/// One preview page of the keys under `prefix` after `after` with copies, as far as the
+#[derive(Debug, PartialEq)]
+enum PreviewStep {
+    Routing,
+    TotalPage,
+    TotalKey,
+    ListPage,
+    ListKey(String),
+}
+
+/// One preview page of the keys under the prefix after `after` with copies, as far as the
 /// caller may read them, and the totals.
-pub async fn preview_page(
-    context: &DriverContext,
-    (bucket, prefix): (&str, &str),
-    access: &BucketAccess,
-    (filter, after, limit): (Option<&str>, Option<Cursor>, usize),
-) -> Result<UnifyPage, String> {
-    let routing = move_routing(context, bucket).await?;
-    let visible = |key: &str| access.allows(Some(key), &Permission::READ);
-    let readable = |key: &str| {
-        key.starts_with(prefix) && filter.is_none_or(|filter| key.contains(filter)) && visible(key)
-    };
-    let mut page = UnifyPage {
-        complete: true,
-        ..UnifyPage::default()
-    };
-    let mut walk = KeyWalk::new(context, bucket, None).capped(PAGE_SCAN);
-    let mut checked = 0;
-    while let Some((key, versions)) = walk.next().await? {
-        if walk.scanned > TOTAL_SCAN || checked == PREVIEW_CHECKS {
-            page.complete = false;
-            break;
+#[derive(Debug, PartialEq)]
+pub struct PreviewPageOperation {
+    routing: NodeRouting,
+    bucket: String,
+    access: Arc<BucketAccess>,
+    query: PreviewQuery,
+    step: PreviewStep,
+    snapshot: Option<Arc<RoutingSnapshot>>,
+    walk: KeyWalk,
+    checked: usize,
+    last: Option<Cursor>,
+    page: UnifyPage,
+}
+
+impl PreviewPageOperation {
+    pub fn new(
+        routing: NodeRouting,
+        bucket: &str,
+        access: Arc<BucketAccess>,
+        query: PreviewQuery,
+    ) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
+            access,
+            query,
+            step: PreviewStep::Routing,
+            snapshot: None,
+            walk: KeyWalk::new(bucket, None).capped(PAGE_SCAN),
+            checked: 0,
+            last: None,
+            page: UnifyPage {
+                complete: true,
+                ..UnifyPage::default()
+            },
         }
-        if walk.cut {
-            page.complete = false;
-        }
-        if !readable(&key) || walk.cut {
-            continue;
-        }
-        checked += 1;
-        let found = duplicates(context, routing.as_ref(), (bucket, &key), versions).await?;
-        page.keys += u64::from(!found.is_empty());
-        page.bytes += found.iter().map(Duplicate::freed).sum::<u64>();
     }
-    let walk = match &after {
-        Some((key, Some(_))) => KeyWalk::from_key(context, bucket, key),
-        Some((key, None)) => KeyWalk::new(context, bucket, Some(key)),
-        None => KeyWalk::new(context, bucket, None),
-    };
-    let mut walk = walk.capped(PAGE_SCAN);
-    let (mut last, mut checked) = (None, 0);
-    while let Some((key, versions)) = walk.next().await? {
-        if page.entries.len() == limit || walk.scanned > PAGE_SCAN || checked == PREVIEW_CHECKS {
-            page.next = last;
-            if page.next.is_none() {
-                return Err("too many keys in a row are hidden from the caller".to_string());
+
+    fn visible(&self, key: &str) -> bool {
+        self.access.allows(Some(key), &Permission::READ)
+    }
+
+    fn readable(&self, key: &str) -> bool {
+        key.starts_with(&self.query.prefix)
+            && (self.query.filter.as_deref()).is_none_or(|filter| key.contains(filter))
+            && self.visible(key)
+    }
+
+    fn call(&mut self, step: PreviewStep, call: IoCall) -> Turn<UnifyPage> {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn check_key(
+        &mut self,
+        step: PreviewStep,
+        key: &str,
+        versions: Vec<Reader>,
+    ) -> Turn<UnifyPage> {
+        self.checked += 1;
+        let scope = (self.bucket.as_str(), key);
+        let found = DuplicatesOperation::new(self.snapshot.clone(), scope, versions);
+        self.call(step, IoCall::child(found))
+    }
+
+    fn finish(&mut self) -> Turn<UnifyPage> {
+        Ok(Next::Done(std::mem::take(&mut self.page)))
+    }
+
+    fn walk_totals(&mut self) -> Turn<UnifyPage> {
+        loop {
+            match self.walk.advance()? {
+                WalkStep::Read(call) => return self.call(PreviewStep::TotalPage, call),
+                WalkStep::End => return self.start_list(),
+                WalkStep::Key(key, versions) => {
+                    if self.walk.scanned > TOTAL_SCAN || self.checked == PREVIEW_CHECKS {
+                        self.page.complete = false;
+                        return self.start_list();
+                    }
+                    if self.walk.cut {
+                        self.page.complete = false;
+                    }
+                    if !self.readable(&key) || self.walk.cut {
+                        continue;
+                    }
+                    return self.check_key(PreviewStep::TotalKey, &key, versions);
+                }
             }
-            return Ok(page);
         }
-        // A cursor may name any key the caller reads, also one the filter leaves out.
-        if visible(&key) {
-            last = Some((key.clone(), None));
+    }
+
+    fn start_list(&mut self) -> Turn<UnifyPage> {
+        let walk = match &self.query.after {
+            Some((key, Some(_))) => KeyWalk::from_key(&self.bucket, key),
+            Some((key, None)) => KeyWalk::new(&self.bucket, Some(key)),
+            None => KeyWalk::new(&self.bucket, None),
+        };
+        self.walk = walk.capped(PAGE_SCAN);
+        self.checked = 0;
+        self.walk_list()
+    }
+
+    fn walk_list(&mut self) -> Turn<UnifyPage> {
+        loop {
+            match self.walk.advance()? {
+                WalkStep::Read(call) => return self.call(PreviewStep::ListPage, call),
+                WalkStep::End => return self.finish(),
+                WalkStep::Key(key, versions) => {
+                    if self.page.entries.len() == self.query.limit
+                        || self.walk.scanned > PAGE_SCAN
+                        || self.checked == PREVIEW_CHECKS
+                    {
+                        self.page.next = self.last.take();
+                        if self.page.next.is_none() {
+                            return Err(MigrationError::Failed(
+                                "too many keys in a row are hidden from the caller".to_string(),
+                            ));
+                        }
+                        return self.finish();
+                    }
+                    // A cursor may name any key the caller reads, also one the filter leaves out.
+                    if self.visible(&key) {
+                        self.last = Some((key.clone(), None));
+                    }
+                    // A key with more versions than a page reads is skipped and leaves the page
+                    // incomplete.
+                    if self.walk.cut {
+                        self.page.complete = false;
+                    }
+                    if !self.readable(&key) || self.walk.cut {
+                        continue;
+                    }
+                    let step = PreviewStep::ListKey(key.clone());
+                    return self.check_key(step, &key, versions);
+                }
+            }
         }
-        // A key with more versions than a page reads is skipped and leaves the page incomplete.
-        if walk.cut {
-            page.complete = false;
-        }
-        if !readable(&key) || walk.cut {
-            continue;
-        }
-        checked += 1;
-        let found = duplicates(context, routing.as_ref(), (bucket, &key), versions).await?;
-        let skip = match &after {
+    }
+
+    fn listed(&mut self, key: String, found: Vec<Duplicate>) -> Turn<UnifyPage> {
+        let skip = match &self.query.after {
             Some((after, Some(shown))) if *after == key => *shown,
             _ => 0,
         };
         // A key with more contents than the page holds continues on the next page.
         for (index, duplicate) in found.into_iter().enumerate().skip(skip) {
-            if page.entries.len() == limit {
-                page.next = Some((key.clone(), Some(index)));
-                return Ok(page);
+            if self.page.entries.len() == self.query.limit {
+                self.page.next = Some((key, Some(index)));
+                return self.finish();
             }
-            page.entries.push(duplicate);
+            self.page.entries.push(duplicate);
+        }
+        self.walk_list()
+    }
+}
+
+impl Operation for PreviewPageOperation {
+    type Output = UnifyPage;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<UnifyPage> {
+        Ok(Next::Call(routing_call(self.routing.clone(), &self.bucket)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<UnifyPage> {
+        match std::mem::replace(&mut self.step, PreviewStep::TotalPage) {
+            PreviewStep::Routing => {
+                self.snapshot = routing_result(result)?.map(Arc::new);
+                self.walk_totals()
+            }
+            PreviewStep::TotalPage => {
+                self.walk.fill(result)?;
+                self.walk_totals()
+            }
+            PreviewStep::TotalKey => {
+                let found = result.child::<Vec<Duplicate>, MigrationError>()??;
+                self.page.keys += u64::from(!found.is_empty());
+                self.page.bytes += found.iter().map(Duplicate::freed).sum::<u64>();
+                self.walk_totals()
+            }
+            PreviewStep::ListPage => {
+                self.walk.fill(result)?;
+                self.walk_list()
+            }
+            PreviewStep::ListKey(key) => {
+                let found = result.child::<Vec<Duplicate>, MigrationError>()??;
+                self.listed(key, found)
+            }
         }
     }
-    Ok(page)
+}
+
+#[derive(Debug, PartialEq)]
+enum JobStage {
+    Routing,
+    Page,
+    Key(String, bool),
+    Unify(String, bool, Box<LinkedJob>),
 }
 
 /// Unifies the next keys after the job's cursor; keys the caller may not write or written
 /// after the start keep their files. Each key changes with the job's progress, and only while
 /// the job is stored as read, so a paused or aborted job changes nothing more.
-pub async fn job_page(
-    context: &DriverContext,
-    (bucket, prefix): (&str, &str),
-    access: &BucketAccess,
-    job: &LinkedJob,
-) -> Result<JobStep, String> {
-    let routing = move_routing(context, bucket).await?;
-    let mut current = job.clone();
-    let mut step = JobStep {
-        cursor: job.cursor.clone(),
-        ..JobStep::default()
-    };
-    let mut walk = KeyWalk::new(context, bucket, job.cursor.as_deref());
-    let mut unified = 0;
-    loop {
-        if unified == JOB_KEYS || walk.scanned > JOB_SCAN {
-            return Ok(step);
-        }
-        let Some((key, versions)) = walk.next().await? else {
-            step.finished = true;
-            return Ok(step);
-        };
-        if key.starts_with(prefix) {
-            let fresh = versions
-                .iter()
-                .all(|(id, _)| id.timestamp_ms() <= job.started_at_ms);
-            let found = duplicates(context, routing.as_ref(), (bucket, &key), versions).await?;
-            let allowed = access.allows(Some(&key), &Permission::WRITE) && fresh;
-            for found in found {
-                let Some(routing) = routing.as_ref().filter(|_| allowed) else {
-                    step.skipped += 1;
-                    continue;
-                };
-                // The key's progress is stored with it; the cursor names the key before it.
-                let mut next = current.clone();
-                next.cursor = step.cursor.clone();
-                next.done += 1;
-                (next.skipped, next.failed) =
-                    (next.skipped + step.skipped, next.failed + step.failed);
-                let fence = Some((&current, &next));
-                match unify(context, (bucket, routing.group_id), &found, fence).await? {
-                    Unified::Done => {
-                        (step.skipped, step.failed) = (0, 0);
-                        current = next;
-                    }
-                    Unified::Kept => step.skipped += 1,
-                    Unified::Changed => step.failed += 1,
-                    Unified::Stopped => {
-                        return Ok(JobStep {
-                            cursor: current.cursor.clone(),
-                            ..JobStep::default()
-                        });
-                    }
-                }
-                unified += 1;
-            }
-        }
-        step.cursor = Some(key);
-    }
+#[derive(Debug, PartialEq)]
+pub struct UnifyJobOperation {
+    routing: NodeRouting,
+    bucket: String,
+    prefix: String,
+    access: Arc<BucketAccess>,
+    started_at_ms: u64,
+    stage: JobStage,
+    snapshot: Option<Arc<RoutingSnapshot>>,
+    current: LinkedJob,
+    progress: JobStep,
+    walk: KeyWalk,
+    found: VecDeque<Duplicate>,
+    unified: usize,
 }
 
-/// What `unify` did with one key's copies.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Unified {
-    Done,
-    /// Another key or version records every copy, so the key keeps its files.
-    Kept,
-    /// The versions or the kept file changed meanwhile; nothing changed.
-    Changed,
-    /// The job was paused, aborted or replaced; nothing changed.
-    Stopped,
-}
-
-/// Points the versions of each copy only this key records at the kept file, with their copy
-/// registrations, and queues the copies' release, in one transaction that rereads them all.
-/// With `fence`, the bucket's job must still be stored as its first value and gets its second.
-pub async fn unify(
-    context: &DriverContext,
-    (bucket, group_id): (&str, GroupId),
-    found: &Duplicate,
-    fence: Option<(&LinkedJob, &LinkedJob)>,
-) -> Result<Unified, String> {
-    let rules = rules_on(context, group_id, &found.keep.backend).await?;
-    let storage = &context.storage_handle;
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a transaction: {}", other.label())),
-    };
-    let staged = Stage {
-        context,
-        txn_id,
-        bucket,
-        rules: &rules,
-        found,
-    };
-    let result = staged.run(fence).await;
-    let outcome = match result {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(error);
-        }
-    };
-    if outcome != Unified::Done {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return Ok(outcome);
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) if !error.proves_no_commit() => {
-            return Err(format!("the unification may not have committed: {error}"));
-        }
-        _ => return Ok(Unified::Changed),
-    }
-    if let Some(tasks) = context.task_handle.as_ref() {
-        use aruna_core::handle::Handle as _;
-        tasks.send_effect(schedule_cleanup_effect()).await;
-    }
-    Ok(Unified::Done)
-}
-
-/// The reads and writes of one `unify` transaction.
-struct Stage<'a> {
-    context: &'a DriverContext,
-    txn_id: Ulid,
-    bucket: &'a str,
-    rules: &'a [BackendImport],
-    found: &'a Duplicate,
-}
-
-impl Stage<'_> {
-    async fn batch(&self, reads: Vec<(String, Key)>) -> Result<Vec<Option<Value>>, String> {
-        let read = StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(self.txn_id),
-        };
-        match self.context.storage_handle.send_storage_effect(read).await {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                Ok(values.into_iter().map(|(_, value)| value).collect())
-            }
-            other => Err(format!("could not read the copies: {}", other.label())),
+impl UnifyJobOperation {
+    pub fn new(
+        routing: NodeRouting,
+        (bucket, prefix): (&str, &str),
+        access: Arc<BucketAccess>,
+        job: &LinkedJob,
+    ) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            access,
+            started_at_ms: job.started_at_ms,
+            stage: JobStage::Routing,
+            snapshot: None,
+            current: job.clone(),
+            progress: JobStep {
+                cursor: job.cursor.clone(),
+                ..JobStep::default()
+            },
+            walk: KeyWalk::new(bucket, job.cursor.as_deref()),
+            found: VecDeque::new(),
+            unified: 0,
         }
     }
 
