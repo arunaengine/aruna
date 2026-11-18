@@ -69,7 +69,7 @@ fn caller(actor: &Actor, auth: &AuthContext) -> InstallCaller {
     InstallCaller::new(actor, auth, unix_timestamp_millis())
 }
 
-pub(crate) async fn prepare_install(
+pub async fn prepare_install(
     ctx: &DriverContext,
     auth: &AuthContext,
     realm_id: RealmId,
@@ -79,7 +79,7 @@ pub(crate) async fn prepare_install(
     drive(PrepareInstall::new(auth, place, request), ctx).await
 }
 
-pub(crate) async fn install_plugin(
+pub async fn install_plugin(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -89,7 +89,7 @@ pub(crate) async fn install_plugin(
     drive(InstallPrepared::new(caller(actor, auth), prepared), ctx).await
 }
 
-pub(crate) async fn write_record(
+pub async fn write_record(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -110,7 +110,7 @@ pub(crate) async fn write_record(
     Ok(install)
 }
 
-pub(crate) async fn ensure_rules(
+pub async fn ensure_rules(
     ctx: &DriverContext,
     actor: &Actor,
     install: &PluginInstall,
@@ -120,7 +120,7 @@ pub(crate) async fn ensure_rules(
     drive(ensure, ctx).await.map_err(|error| error.0)
 }
 
-pub(crate) async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginInstall) {
+pub async fn retire_rules(ctx: &DriverContext, actor: &Actor, install: &PluginInstall) {
     let retire = RetireRules::new(actor, install, unix_timestamp_millis());
     drive(retire, ctx).await.expect("the rules are retired");
 }
@@ -129,7 +129,7 @@ fn repair_of(node: (NodeId, RealmId), install: &PluginInstall) -> RepairAccount 
     repair_account((node.1, node.0), install, unix_timestamp_millis())
 }
 
-pub(crate) async fn repair_install(
+pub async fn repair_install(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
@@ -138,7 +138,7 @@ pub(crate) async fn repair_install(
     Ok(drive(repair_of((node_id, realm_id), install), ctx).await?)
 }
 
-pub(crate) async fn repair_settled(
+pub async fn repair_settled(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
@@ -148,7 +148,7 @@ pub(crate) async fn repair_settled(
     drive(repair, ctx).await.expect("the repair finishes")
 }
 
-pub(crate) async fn sweep_orphans(
+pub async fn sweep_orphans(
     ctx: &DriverContext,
     node_id: NodeId,
     config: &RealmConfigDocument,
@@ -158,7 +158,7 @@ pub(crate) async fn sweep_orphans(
     drive(sweep, ctx).await.map_err(|error| error.0)
 }
 
-pub(crate) async fn set_grants(
+pub async fn set_grants(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -172,7 +172,7 @@ pub(crate) async fn set_grants(
     .await
 }
 
-pub(crate) async fn update_install(
+pub async fn update_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -184,7 +184,7 @@ pub(crate) async fn update_install(
     drive(UpdateInstall::new(who, install_id, digest, settings), ctx).await
 }
 
-pub(crate) async fn pause_install(
+pub async fn pause_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -193,7 +193,7 @@ pub(crate) async fn pause_install(
     drive(SetPaused::new(caller(actor, auth), install_id, true), ctx).await
 }
 
-pub(crate) async fn resume_install(
+pub async fn resume_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -202,7 +202,7 @@ pub(crate) async fn resume_install(
     drive(SetPaused::new(caller(actor, auth), install_id, false), ctx).await
 }
 
-pub(crate) async fn remove_install(
+pub async fn remove_install(
     ctx: &DriverContext,
     actor: &Actor,
     auth: &AuthContext,
@@ -211,7 +211,7 @@ pub(crate) async fn remove_install(
     drive(RemoveInstall::new(caller(actor, auth), install_id), ctx).await
 }
 
-pub(crate) async fn start_run(
+pub async fn start_run(
     ctx: &DriverContext,
     auth: &AuthContext,
     realm_id: RealmId,
@@ -224,7 +224,7 @@ pub(crate) async fn start_run(
     drive(start, ctx).await
 }
 
-pub(crate) async fn enqueue_timers(
+pub async fn enqueue_timers(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -233,7 +233,7 @@ pub(crate) async fn enqueue_timers(
     drive(EnqueueTimers::new(config, local, now_ms), ctx).await
 }
 
-pub(crate) async fn admit_hook(
+pub async fn admit_hook(
     ctx: &DriverContext,
     local: NodeId,
     (realm_id, install_id): (RealmId, Ulid),
@@ -246,7 +246,7 @@ pub(crate) async fn admit_hook(
     Ok(drive(admit, ctx).await?)
 }
 
-pub(crate) async fn checks_authorization(
+pub async fn checks_authorization(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     place: (NodeId, Ulid),
@@ -255,7 +255,7 @@ pub(crate) async fn checks_authorization(
     drive(check, ctx).await.ok().flatten()
 }
 
-pub(crate) async fn select(
+pub async fn select(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     install: &PluginInstall,
@@ -265,7 +265,7 @@ pub(crate) async fn select(
     drive(select, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn open(
+pub async fn open(
     ctx: &DriverContext,
     realm_id: RealmId,
     sealed: &Sealed,
@@ -274,7 +274,7 @@ pub(crate) async fn open(
     drive(open, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn bind_slots(
+pub async fn bind_slots(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     place: BindPlace,
@@ -285,7 +285,7 @@ pub(crate) async fn bind_slots(
     drive(bind, ctx).await
 }
 
-pub(crate) async fn check_node_binding(
+pub async fn check_node_binding(
     ctx: &DriverContext,
     place: (NodeId, NodeId),
     name: &SecretName,
@@ -295,7 +295,7 @@ pub(crate) async fn check_node_binding(
     drive(check, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn ask_release(
+pub async fn ask_release(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -305,7 +305,7 @@ pub(crate) async fn ask_release(
     drive(ask, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn release(
+pub async fn release(
     ctx: &DriverContext,
     (config, local, peer): (&RealmConfigDocument, NodeId, NodeId),
     request: &ReleaseRequest,
@@ -315,18 +315,18 @@ pub(crate) async fn release(
     drive(release, ctx).await.map_err(|failure| failure.0)
 }
 
-pub(crate) async fn has_local(ctx: &DriverContext, digest: &str) -> Result<bool, ArtifactError> {
+pub async fn has_local(ctx: &DriverContext, digest: &str) -> Result<bool, ArtifactError> {
     Ok(drive(CopyTotal::new(digest), ctx).await?.is_some())
 }
 
-pub(crate) async fn read_local(
+pub async fn read_local(
     ctx: &DriverContext,
     digest: &str,
 ) -> Result<Option<Assembled>, ArtifactError> {
     drive(ReadLocal::new(digest), ctx).await
 }
 
-pub(crate) async fn read_chunk(
+pub async fn read_chunk(
     ctx: &DriverContext,
     digest: &str,
     index: u32,
@@ -334,7 +334,7 @@ pub(crate) async fn read_chunk(
     drive(ReadChunk::new(digest, index), ctx).await
 }
 
-pub(crate) async fn store_local(
+pub async fn store_local(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     digest: &str,
@@ -344,7 +344,7 @@ pub(crate) async fn store_local(
     drive(StoreCopy::new(config, digest, bytes, now_ms), ctx).await
 }
 
-pub(crate) async fn store_chunk(
+pub async fn store_chunk(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     chunk: Chunk,
@@ -353,7 +353,7 @@ pub(crate) async fn store_chunk(
     drive(KeepChunk::new(config, chunk, now_ms), ctx).await
 }
 
-pub(crate) async fn sweep_copies(
+pub async fn sweep_copies(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     now_ms: u64,
@@ -361,7 +361,7 @@ pub(crate) async fn sweep_copies(
     drive(SweepCopies::new(config, now_ms), ctx).await
 }
 
-pub(crate) async fn fetch_artifact(
+pub async fn fetch_artifact(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     digest: &str,
@@ -375,7 +375,7 @@ pub(crate) async fn fetch_artifact(
     Ok(fetched.copy)
 }
 
-pub(crate) async fn publish_plugin(
+pub async fn publish_plugin(
     ctx: &DriverContext,
     actor: Actor,
     auth: AuthContext,
@@ -390,7 +390,7 @@ pub(crate) async fn publish_plugin(
     drive(FinishPublish::new(actor, auth, *plan, artifact), ctx).await
 }
 
-pub(crate) async fn job_row(
+pub async fn job_row(
     ctx: &DriverContext,
     install: &PluginInstall,
     id: &str,
@@ -398,7 +398,7 @@ pub(crate) async fn job_row(
     Ok(drive(JobRow::new(install, id), ctx).await?)
 }
 
-pub(crate) async fn job_status(
+pub async fn job_status(
     ctx: &DriverContext,
     place: (&PluginInstall, NodeId),
     id: &str,
@@ -406,7 +406,7 @@ pub(crate) async fn job_status(
     Ok(drive(JobState::new(place, id), ctx).await?)
 }
 
-pub(crate) async fn cancel_job(
+pub async fn cancel_job(
     ctx: &DriverContext,
     install: &PluginInstall,
     id: &str,
@@ -415,7 +415,7 @@ pub(crate) async fn cancel_job(
     Ok(drive(CancelWork::new(install, id, now_ms), ctx).await?)
 }
 
-pub(crate) async fn start_work(
+pub async fn start_work(
     ctx: &DriverContext,
     scope: &RunScope,
     request: WorkRequest,
@@ -425,11 +425,11 @@ pub(crate) async fn start_work(
     Ok(drive(start, ctx).await?)
 }
 
-pub(crate) async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
     drive(SettleWork::new(now_ms), ctx).await
 }
 
-pub(crate) async fn retire_work(
+pub async fn retire_work(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     now_ms: u64,
@@ -437,7 +437,7 @@ pub(crate) async fn retire_work(
     drive(RetireWork::new(config, now_ms), ctx).await
 }
 
-pub(crate) async fn job_outputs(
+pub async fn job_outputs(
     ctx: &DriverContext,
     place: (&PluginInstall, NodeId),
     id: &str,
@@ -446,7 +446,7 @@ pub(crate) async fn job_outputs(
     Ok(drive(JobOutputs::new(place, id, cursor), ctx).await?)
 }
 
-pub(crate) async fn match_journal(
+pub async fn match_journal(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -456,19 +456,19 @@ pub(crate) async fn match_journal(
     drive(MatchJournal::new(targets, now_ms, bound), ctx).await
 }
 
-pub(crate) async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunError> {
+pub async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunError> {
     drive(PruneRuns::new(now_ms), ctx).await
 }
 
-pub(crate) async fn prune_audit(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+pub async fn prune_audit(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
     drive(PruneAudit::new(now_ms), ctx).await
 }
 
-pub(crate) async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
+pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
     drive(SweepMarks::new(), ctx).await
 }
 
-pub(crate) async fn decide_batch(
+pub async fn decide_batch(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     nodes: (NodeId, NodeId),
@@ -480,7 +480,7 @@ pub(crate) async fn decide_batch(
 }
 
 /// Runs one outbox pass with `send` in place of the receivers.
-pub(crate) async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
+pub async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     now_ms: u64,
@@ -490,7 +490,7 @@ pub(crate) async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
     send_bounded(ctx, config, (now_ms, REQUEST_BYTES), backoff, send).await
 }
 
-pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
+pub async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     (now_ms, bound): (u64, usize),
@@ -526,7 +526,7 @@ pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
     Ok(decided)
 }
 
-pub(crate) async fn notify_work(
+pub async fn notify_work(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -535,7 +535,7 @@ pub(crate) async fn notify_work(
     drive(NotifyDue::new(Arc::new(config.clone()), local, now_ms), ctx).await
 }
 
-pub(crate) async fn recheck_waiting(
+pub async fn recheck_waiting(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -546,7 +546,7 @@ pub(crate) async fn recheck_waiting(
 }
 
 /// Starts the replays that are due, with `probe` in place of another node's clock.
-pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
+pub async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     local: NodeId,
@@ -585,7 +585,7 @@ pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
     Ok(started)
 }
 
-pub(crate) async fn run_replays(
+pub async fn run_replays(
     ctx: &DriverContext,
     now_ms: u64,
     pages: (usize, usize),
@@ -593,7 +593,7 @@ pub(crate) async fn run_replays(
     drive(RunReplays::new(now_ms, pages), ctx).await
 }
 
-pub(crate) async fn read_config(
+pub async fn read_config(
     ctx: &DriverContext,
     realm_id: RealmId,
 ) -> Result<RealmConfigDocument, InstallError> {

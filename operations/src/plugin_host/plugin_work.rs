@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -13,7 +12,6 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::{
     JobError, JobPayload, JobResultPayload, PluginWorkAction, PluginWorkSpec,
 };
-use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::VersionKey;
 use aruna_core::structs::storage::encryption::BucketKeyError;
@@ -25,6 +23,7 @@ use crate::jobs::executor::{JobContext, JobRunOutcome, PayloadHandler};
 use crate::jobs::key_wake::version_wait;
 use crate::plugins::check::CopyGrants;
 use crate::plugins::objects::{LocalObject, Unmarked};
+use crate::plugins::transfer_steps::account;
 use crate::plugins::work::holds_job;
 use crate::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
 
@@ -244,22 +243,6 @@ pub(super) async fn key_wait(
         Ok(Some(wait)) => JobRunOutcome::AwaitingKey(vec![wait]),
         Ok(None) => deferred("the source bucket was unlocked meanwhile".into()),
         Err(error) => deferred(error),
-    }
-}
-
-/// The install's account restricted to `patterns` with WRITE, which also reads.
-pub(super) fn account(install: &PluginInstall, patterns: &BTreeSet<String>) -> AuthContext {
-    let restrictions = (patterns.iter())
-        .map(|pattern| PathRestriction {
-            pattern: pattern.clone(),
-            permission: Access::WRITE,
-        })
-        .collect();
-    AuthContext {
-        user_id: install.account,
-        realm_id: install.account.realm_id,
-        path_restrictions: Some(restrictions),
-        session: None,
     }
 }
 

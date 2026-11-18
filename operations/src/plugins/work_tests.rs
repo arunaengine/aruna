@@ -13,12 +13,14 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::PayloadHandler;
 use crate::plugin_host::plugin_work::PluginWorkHandler;
-use crate::plugin_host::worker::tests::installed;
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::rows::{page_call, read_call, read_rows, write_rows};
 use crate::plugins::store::Txn;
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::test_support::edit_work;
+use crate::plugins::test_support::installed;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
@@ -39,28 +41,6 @@ fn call(ordinal: u32) -> Identity {
         run_id: Ulid::from_parts(9, 9),
         ordinal,
     }
-}
-
-/// Changes the row of work `ids` as a test needs; `None` when it is gone.
-pub(crate) async fn edit_work(
-    ctx: &DriverContext,
-    (install_id, work_id): (Ulid, Ulid),
-    change: impl FnOnce(&mut WorkRow),
-) -> Result<Option<WorkRow>, StoreError> {
-    let index = vec![(PLUGIN_WORK_KEYSPACE, index_key(install_id, work_id))];
-    let [key] = <[_; 1]>::try_from(drive(read_rows(index), ctx).await?).unwrap();
-    let Some(key) = key else {
-        return Ok(None);
-    };
-    let read = vec![(PLUGIN_WORK_KEYSPACE, key.clone())];
-    let [value] = <[_; 1]>::try_from(drive(read_rows(read), ctx).await?).unwrap();
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let mut row: WorkRow = decode(&value)?;
-    change(&mut row);
-    drive(write_rows(vec![row_of(key, &row)?]), ctx).await?;
-    Ok(Some(row))
 }
 
 fn job(nonce: u64) -> JobId {

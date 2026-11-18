@@ -11,13 +11,13 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugin_host::worker::tests::{created, installed};
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::store::Txn;
+use crate::plugins::test_support::{created, installed};
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 
 /// The batches a fake receiver got; it answers each event with `decide` and acknowledges gaps

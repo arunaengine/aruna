@@ -8,12 +8,12 @@ use aruna_core::plugin_runs::{SourceKind, journal_entries};
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
-use crate::plugin_host::worker::tests::{created, installed, scoped, synced};
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::store::Txn;
+use crate::plugins::test_support::{created, installed, scoped, synced};
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 use aruna_core::plugin_runs::journal_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};

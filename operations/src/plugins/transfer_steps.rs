@@ -12,6 +12,7 @@ use aruna_core::injection::{OutgoingRequest, expose_response};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::secrets::{ResponseExposure, SecretFields};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugins::broker::{Field, HostError, Response};
 use ulid::Ulid;
@@ -27,6 +28,22 @@ use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::put::PutObjectError;
+
+/// The install's account restricted to `patterns` with WRITE, which also reads.
+pub fn account(install: &PluginInstall, patterns: &BTreeSet<String>) -> AuthContext {
+    let restrictions = (patterns.iter())
+        .map(|pattern| PathRestriction {
+            pattern: pattern.clone(),
+            permission: Access::WRITE,
+        })
+        .collect();
+    AuthContext {
+        user_id: install.account,
+        realm_id: install.account.realm_id,
+        path_restrictions: Some(restrictions),
+        session: None,
+    }
+}
 
 /// How a transfer attempt ends.
 #[derive(Debug, PartialEq)]

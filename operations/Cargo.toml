@@ -14,7 +14,7 @@ autotests = false
 
 [features]
 # Test seams and shared test helpers; only dev-dependencies enable it.
-test-hooks = []
+test-hooks = ["dep:tempfile"]
 
 [dependencies]
 aruna-blob = { workspace = true }
@@ -72,6 +72,7 @@ oxttl = { workspace = true }
 percent-encoding = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 aruna-core = { workspace = true, features = ["test-hooks"] }

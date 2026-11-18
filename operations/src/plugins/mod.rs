@@ -56,15 +56,17 @@ pub(crate) mod work_calls;
 
 use aruna_plugins::broker::{ErrorKind, HostError};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[path = "calls_tests.rs"]
-pub(crate) mod calls;
+pub mod calls;
 #[cfg(test)]
 #[path = "fixtures_tests.rs"]
 pub(crate) mod fixtures;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[path = "store_tests.rs"]
-pub(crate) mod store;
+pub mod store;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_support;
 
 #[cfg(test)]
 #[path = "delivery_tests.rs"]

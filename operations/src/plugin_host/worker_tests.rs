@@ -19,6 +19,11 @@ use crate::plugins::rows::write_rows;
 use crate::plugins::runs::event_run;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, conclude, ended, read_run, save_run, unfinished};
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::test_support::{
+    connected, created, echoed_sync, install_artifact, installed, job_guest, publish_artifact,
+    scoped, secured, synced,
+};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     MAX_ATTEMPTS, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent, SourceKind,
@@ -29,132 +34,6 @@ use aruna_plugins::broker::Intent;
 use aruna_plugins::{InvokeError, Trigger};
 use std::time::Duration;
 use ulid::Ulid;
-
-const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
-
-fn leb(mut value: usize, out: &mut Vec<u8>) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        match value {
-            0 => return out.push(byte),
-            _ => out.push(byte | 0x80),
-        }
-    }
-}
-
-/// The fixture without its secret and connection, which installs refuse.
-fn runnable() -> Vec<u8> {
-    artifact(false, false)
-}
-
-/// The fixture whose `api` connection sends without a secret.
-pub(crate) fn connected() -> Vec<u8> {
-    artifact(true, false)
-}
-
-/// The fixture whose `api` connection injects its bearer slot `api`.
-pub(crate) fn secured() -> Vec<u8> {
-    artifact(true, true)
-}
-
-/// The runnable fixture, whose sync triggers `echo` handles; it answers the event.
-pub(crate) fn echoed_sync() -> Vec<u8> {
-    let (component, mut manifest) = bare();
-    (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
-    attach_manifest(component, &manifest).unwrap()
-}
-
-/// The runnable fixture with only its manual and `job_finished` triggers, so no timer or event
-/// of the test's own writes starts a run.
-pub(crate) fn job_guest() -> Vec<u8> {
-    use aruna_plugins::trigger::TriggerKind;
-    let (component, mut manifest) = bare();
-    (manifest.connections, manifest.secrets) = (BTreeMap::new(), BTreeMap::new());
-    let kept = [TriggerKind::Manual, TriggerKind::JobFinished];
-    manifest.triggers.retain(|kind, _| kept.contains(kind));
-    attach_manifest(component, &manifest).unwrap()
-}
-
-/// The fixture's component without its manifest section, and that manifest.
-fn bare() -> (&'static [u8], aruna_plugins::manifest::Manifest) {
-    let manifest = read_manifest(FIXTURE).unwrap();
-    let json = serde_json::to_vec(&manifest).unwrap();
-    let mut content = Vec::new();
-    leb("aruna-plugin".len(), &mut content);
-    content.extend_from_slice(b"aruna-plugin");
-    content.extend_from_slice(&json);
-    let mut section = vec![0u8];
-    leb(content.len(), &mut section);
-    section.extend_from_slice(&content);
-    (FIXTURE.strip_suffix(section.as_slice()).unwrap(), manifest)
-}
-
-fn artifact(connection: bool, secret: bool) -> Vec<u8> {
-    let (component, manifest) = bare();
-    let mut narrow = manifest;
-    match secret {
-        true => narrow.version = "0.2.1".to_string(),
-        false => narrow.secrets.clear(),
-    }
-    match (connection, secret) {
-        (true, true) => {}
-        (true, false) => (narrow.connections.values_mut()).for_each(|c| c.auth = None),
-        (false, _) => narrow.connections.clear(),
-    }
-    attach_manifest(component, &narrow).unwrap()
-}
-
-/// An install of the runnable fixture whose artifact this node keeps.
-pub(crate) async fn installed(fixture: &Fixture) -> PluginInstall {
-    install_artifact(fixture, runnable()).await
-}
-
-/// Publishes the fixture artifact `bytes` and keeps it on this node; answers its digest.
-pub(crate) async fn publish_artifact(fixture: &Fixture, bytes: &[u8]) -> String {
-    let manifest = read_manifest(bytes).unwrap();
-    let digest = ArtifactDigest::of(bytes).to_string();
-    let plugin = PublishedPlugin {
-        name: manifest.name.clone(),
-        version: manifest.version.clone(),
-        digest: digest.clone(),
-        size: bytes.len() as u64,
-        manifest: serde_json::to_string(&manifest).unwrap(),
-        published_by: fixture.actor.user_id,
-        published_at_ms: 1,
-    };
-    let publish = PublishEntryOperation::new(PublishEntryConfig {
-        actor: fixture.actor.clone(),
-        auth_context: fixture.auth(),
-        plugin,
-        copies: BTreeSet::from([fixture.actor.node_id]),
-    });
-    drive(publish, &fixture.ctx).await.unwrap();
-    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap();
-    store_local(&fixture.ctx, &config, &digest, bytes, 1)
-        .await
-        .unwrap();
-    digest
-}
-
-/// An install of the fixture artifact `bytes`, kept on this node.
-pub(crate) async fn install_artifact(fixture: &Fixture, bytes: Vec<u8>) -> PluginInstall {
-    let manifest = read_manifest(&bytes).unwrap();
-    let digest = publish_artifact(fixture, &bytes).await;
-    let settings = serde_json::json!({ "api_url": "https://api.example.org" });
-    let request = InstallRequest {
-        plugin: manifest.name,
-        group_id: fixture.group_id,
-        version: Some(digest),
-        settings: settings.as_object().cloned().unwrap_or_default(),
-        grants: BTreeMap::new(),
-        install_id: None,
-        secrets: BTreeMap::new(),
-    };
-    fixture.install(&request).await.unwrap()
-}
 
 /// A run of `install` that reaches the fixture's `handler` and is due now: `echo` through a
 /// dataset event, `spin` through the timer.
@@ -228,32 +107,6 @@ async fn finishes_runs() {
     assert!(drive(unfinished(), &fixture.ctx).await.unwrap().is_empty());
 }
 
-/// Grant choices that scope both `read` and `write` to `patterns`.
-pub(crate) fn scoped(patterns: Vec<String>) -> BTreeMap<String, Vec<String>> {
-    BTreeMap::from([
-        ("read".into(), patterns.clone()),
-        ("write".into(), patterns),
-    ])
-}
-
-/// A created dataset `resource` under the install's group metadata, and that metadata's base.
-pub(crate) fn created(install: &PluginInstall, resource: &str) -> (SourceEvent, String) {
-    let whole = &install.grants["read"][0];
-    let base = format!("{}/meta", whole.strip_suffix("/**").unwrap());
-    let event = SourceEvent {
-        kind: SourceKind::DatasetCreated,
-        group_id: install.group_id,
-        path: format!("{base}/{resource}"),
-        resource: resource.into(),
-        revision: "r1".into(),
-        source: format!("dataset_created/{resource}"),
-        anchor_ms: 1,
-        journaled_ms: 1,
-        actor: None,
-    };
-    (event, base)
-}
-
 #[tokio::test]
 async fn event_input() {
     let fixture = Fixture::new().await;
@@ -289,23 +142,6 @@ async fn event_input() {
         output.ends_with("change dataset_created D1 r1\""),
         "{output}"
     );
-}
-
-/// A completed sync job of the relationship `relationship` under `prefix` of the install's data.
-pub(crate) fn synced(install: &PluginInstall, prefix: &str, relationship: Ulid) -> SourceEvent {
-    let whole = &install.grants["read"][0];
-    let path = format!("{}/data/{prefix}", whole.strip_suffix("/**").unwrap());
-    let creator = install.account;
-    let kind = SourceKind::SyncCompleted;
-    let node = iroh::SecretKey::from_bytes(&[9; 32]).public();
-    let ids = (node, Ulid::from_parts(relationship.timestamp_ms(), 7));
-    SourceEvent::sync_job(
-        kind,
-        (install.group_id, path),
-        (relationship, creator),
-        ids,
-        1,
-    )
 }
 
 #[tokio::test]

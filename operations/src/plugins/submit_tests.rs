@@ -8,48 +8,17 @@ use aruna_core::plugin_installs::PluginInstall;
 use super::*;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::plugin_host::plugin_work::tests::copier;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::runs::tests::queued;
+use crate::plugins::test_support::copier;
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::test_support::{path, ready, request, scope};
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::test::seed_bucket;
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
-
-pub(crate) fn scope(fixture: &Fixture, install: &PluginInstall) -> RunScope {
-    let mut run = queued(install.install_id, 1);
-    (run.digest, run.group_id) = (install.digest.clone(), install.group_id);
-    RunScope {
-        realm_id: fixture.actor.realm_id,
-        local: fixture.actor.node_id,
-        run,
-    }
-}
-
-pub(crate) fn path(fixture: &Fixture, install: &PluginInstall, rest: &str) -> String {
-    let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
-    format!("/{realm}/g/{}/data/{node}/{rest}", install.group_id)
-}
-
-pub(crate) fn request(fixture: &Fixture, install: &PluginInstall, target: &str) -> CopyRequest {
-    CopyRequest {
-        source: path(fixture, install, "in/a.txt"),
-        source_version: None,
-        target: path(fixture, install, target),
-        ordinal: 0,
-    }
-}
-
-pub(crate) async fn ready(fixture: &Fixture) -> PluginInstall {
-    let install = copier(fixture).await;
-    let account = install.account;
-    for bucket in ["in", "out"] {
-        seed_bucket(&fixture.ctx, bucket, install.group_id, account, Vec::new()).await;
-    }
-    install
-}
 
 #[tokio::test]
 async fn repeat_finds_work() {

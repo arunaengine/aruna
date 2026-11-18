@@ -18,10 +18,11 @@ use async_trait::async_trait;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::plugin_host::worker::tests::{connected, install_artifact, worker_on};
+use crate::plugin_host::worker::tests::worker_on;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, read_run};
+use crate::plugins::test_support::{connected, install_artifact};
 
 /// Answers every request with `answer` and records what it was asked.
 pub(crate) struct Fake {
@@ -247,8 +248,8 @@ async fn undeclared_method() {
 /// The secured fixture installed with its slot bound to the group secret `api-key`, whose
 /// one rule lets this install inject it toward the fixture's address.
 async fn secured_install(fixture: &Fixture) -> PluginInstall {
-    use crate::plugin_host::worker::tests::{publish_artifact, secured};
     use crate::plugins::bound::tests::{edit_config, secret_with};
+    use crate::plugins::test_support::{publish_artifact, secured};
     install_artifact(fixture, connected()).await;
     let digest = publish_artifact(fixture, &secured()).await;
     let binding = aruna_core::plugin_installs::SecretBinding::parse("group:api-key").unwrap();

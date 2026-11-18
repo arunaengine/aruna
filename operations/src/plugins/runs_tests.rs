@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::plugins::calls::*;
 use crate::driver::{DriverContext, drive};
+use crate::plugins::calls::*;
 use crate::plugins::host_calls::call_intent;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::test_support::queued;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};
@@ -28,30 +30,6 @@ pub(crate) fn opened() -> (TempDir, DriverContext) {
         outbound_handle: None,
     };
     (dir, ctx)
-}
-
-/// A queued run of `install_id`; ids grow with `seq`.
-pub(crate) fn queued(install_id: Ulid, seq: u64) -> PluginRun {
-    PluginRun {
-        run_id: Ulid::from_parts(seq, 1),
-        install_id,
-        group_id: Ulid::from_parts(1, 9),
-        plugin: "announcer".into(),
-        version: "0.1.0".into(),
-        revision: 1,
-        digest: format!("sha256:{}", "ab".repeat(32)),
-        handler: "on_manual".into(),
-        settings: "{}".into(),
-        trigger: RunTrigger::Timer { occurrence_ms: seq },
-        state: RunState::Queued,
-        attempts: 0,
-        due_ms: seq,
-        created_ms: seq,
-        finished_ms: None,
-        message: None,
-        output: None,
-        log: Vec::new(),
-    }
 }
 
 #[tokio::test]

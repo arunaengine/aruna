@@ -18,112 +18,16 @@ use crate::plugins::calls::*;
 use crate::plugins::install::tests::{Fixture, REALM_KEY};
 use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::secret_use::slot_kind;
+#[allow(unused_imports)]
+pub(crate) use crate::plugins::test_support::{
+    ORIGIN, TOKEN, bound, edit_config, hold_keys, rule_for, secret, secret_with,
+};
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::{Refusal, ReleaseError};
 use aruna_core::secrets::UseRule;
 use ulid::Ulid;
-
-pub(crate) const TOKEN: &str = "canary-release-4f1e";
-pub(crate) const ORIGIN: &str = "https://api.example.org";
-
-/// Gives the fixture's storage the realm keys of `REALM_KEY`, as a management node holds them.
-pub(crate) fn hold_keys(ctx: &DriverContext) {
-    let key = SigningKey::from_bytes(&REALM_KEY);
-    ctx.storage_handle.open_realm(RealmKeys::derive(&key));
-}
-
-/// Writes the realm config as it is after `edit`.
-pub(crate) async fn edit_config(fixture: &Fixture, edit: impl FnOnce(&mut RealmConfigDocument)) {
-    let mut config = read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap();
-    edit(&mut config);
-    let target = DocumentTarget::RealmConfig {
-        realm_id: fixture.actor.realm_id,
-    };
-    let value = config.to_bytes(&fixture.actor).unwrap();
-    let key = target.storage_key().to_vec();
-    fixture
-        .write_row(target.storage_keyspace(), key, value)
-        .await;
-}
-
-/// An install moved to a version whose `catalog` connection injects the bearer slot `api_key`,
-/// with that slot bound to the group secret `api-key`.
-pub(crate) async fn bound(fixture: &Fixture) -> PluginInstall {
-    let slots = json!({
-        "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
-        "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" } }
-    });
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
-    let digest = fixture.publish("0.2.0", "cd", slots).await;
-    let binding = SecretBinding::parse("group:api-key").unwrap();
-    edit_config(fixture, |config| {
-        let install = (config.installs.iter_mut())
-            .find(|install| install.install_id == installed.install_id)
-            .unwrap();
-        (install.digest, install.version) = (digest, "0.2.0".to_string());
-        install.secrets = BTreeMap::from([("api_key".to_string(), binding)]);
-    })
-    .await;
-    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap();
-    config.installs.into_iter().next().unwrap()
-}
-
-/// The `inject` rule of `install` toward the fixture origins with `response`.
-pub(crate) fn rule_for(install: &PluginInstall, response: ResponseExposure) -> UseRule {
-    UseRule {
-        consumer: SecretConsumer::Plugin {
-            plugin_id: install.plugin.clone(),
-            install_id: install.install_id,
-        },
-        delivery: Delivery::Inject,
-        origins: vec![ORIGIN.to_string()],
-        paths: Vec::new(),
-        methods: Vec::new(),
-        response,
-        groups: Vec::new(),
-    }
-}
-
-/// The group secret `api-key` with one `inject` rule for `install` toward `ORIGIN`.
-pub(crate) async fn secret(fixture: &Fixture, install: &PluginInstall) {
-    secret_with(fixture, install, ResponseExposure::Status).await;
-}
-
-/// The group secret `api-key` whose one rule for `install` exposes `response`.
-pub(crate) async fn secret_with(
-    fixture: &Fixture,
-    install: &PluginInstall,
-    response: ResponseExposure,
-) {
-    let rule = rule_for(install, response);
-    let change = SecretChange::Create {
-        name: SecretName::try_from("api-key".to_string()).unwrap(),
-        kind: SecretKind::parse("bearer").unwrap(),
-        description: String::new(),
-        settings: SecretSettings::new(),
-        uses: vec![rule],
-        fields: SecretFields::new([("token".to_string(), Secret::new(TOKEN))].into()),
-    };
-    let input = OwnerChange {
-        realm_id: fixture.actor.realm_id,
-        node_id: fixture.actor.node_id,
-        owner: SecretOwner::Group(install.group_id),
-        actor: fixture.actor.user_id,
-        change,
-        readable: false,
-        now_ms: 1,
-        write_ids: [1, 2, 3].map(|part| Ulid::from_parts(77, part)),
-    };
-    drive(OwnerSecretOperation::new(input), &fixture.ctx)
-        .await
-        .unwrap();
-}
 
 #[tokio::test]
 async fn selects_group_secret() {

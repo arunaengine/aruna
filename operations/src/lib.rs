@@ -51,6 +51,8 @@ pub mod sync;
 pub mod tasks;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod testing_objects;
 pub mod triggers;
 pub mod users;
 
