@@ -43,7 +43,9 @@ use super::submission_rules::{
 };
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::pages::{load_chain, page_request};
 use crate::jobs::records::verify::FamilyView;
@@ -53,6 +55,7 @@ use crate::jobs::submit::SubmitJobError;
 use crate::jobs::submit_execution::validate_execution;
 use crate::metadata::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::peer_acts_for;
 use crate::s3::bucket::dataset::{bucket_metadata, dataset_description};
 use crate::s3::bucket::get::GetBucketOperation;
@@ -62,9 +65,6 @@ use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperat
 use aruna_core::jobs::{InputResolveRequest, SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::storage::release::MembershipQuery;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 /// Resolves inputs this node holds for an ingress, under a bearer validated here, so grants
 /// vouch only for an identity this node checked. Each answer is an input after its links with
@@ -739,7 +739,10 @@ async fn readable_metadata(
 ) -> Result<Option<CapturedDatabase>, String> {
     let path = bucket_permission_path(auth.realm_id, info.group_id, local, bucket);
     let extras = PolicyRequestExtras::rest();
-    let metadata = match drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras), context)
+    let metadata = match drive(
+        AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras),
+        context,
+    )
     .await
     {
         Ok(()) => bucket_metadata(context, bucket, info).await?,
@@ -795,9 +798,13 @@ async fn local_view(
         SubmitJobError::PlacementUnavailable("network handle unavailable".to_string())
     })?;
     let realm_id = *net.realm_id();
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok().ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
-    })?;
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+        .ok_or_else(|| {
+            SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
+        })?;
     Ok((config, net.node_id()))
 }
 
@@ -991,7 +998,16 @@ async fn authorize_group(
     request: &SubmissionRequest,
     local: NodeId,
 ) -> Result<(), AuthorizeError> {
-    drive(AuthorizeOperation::new(auth.realm_id, auth, &group_permission_path(auth.realm_id, request.spec.group_id, local), &Permission::WRITE, PolicyRequestExtras::rest()), context)
+    drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &group_permission_path(auth.realm_id, request.spec.group_id, local),
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
+        context,
+    )
     .await
 }
 

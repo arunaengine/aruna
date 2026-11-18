@@ -74,8 +74,8 @@ use resolve::{
 
 pub(crate) mod archive;
 mod resolve;
-use archive::*;
 use crate::auth::enforcement::PolicyBulkOperation;
+use archive::*;
 
 const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
 const REPORT_PATH: &str = aruna_core::repository::rules::CRATE_FILES[1];
@@ -1285,7 +1285,10 @@ async fn load_policies(
         return Ok(());
     }
     let realm_id = spec.auth_context.realm_id;
-    let mut loaded = drive(PolicyBulkOperation::new(pending.iter().map(|group_id| (realm_id, *group_id))), &ctx.driver)
+    let mut loaded = drive(
+        PolicyBulkOperation::new(pending.iter().map(|group_id| (realm_id, *group_id))),
+        &ctx.driver,
+    )
     .await
     .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
     for group_id in pending {

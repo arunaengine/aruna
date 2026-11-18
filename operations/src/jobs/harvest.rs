@@ -29,6 +29,8 @@ use ulid::Ulid;
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::driver::drive;
+use crate::forward::authorize::AuthorizeCreateOperation;
 use crate::forward::authorize::CreateScope;
 use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
@@ -54,8 +56,6 @@ use crate::metadata::forward::write::{
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use aruna_core::metadata::AuthToken;
-use crate::driver::drive;
-use crate::forward::authorize::AuthorizeCreateOperation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a
@@ -571,7 +571,21 @@ async fn authorize_write(
     document_id: Ulid,
 ) -> Result<String, HarvestFailure> {
     let path = harvest_document_path(&source.target_prefix, &record.header.identifier)?;
-    let checked = aruna_core::telemetry::time_stage("permission", drive(AuthorizeCreateOperation::new(realm_id, &owner_auth(source.created_by, realm_id), PolicyRequestExtras::default(), source.group_id, &path, document_id, CreateScope::Group), &ctx.driver))
+    let checked = aruna_core::telemetry::time_stage(
+        "permission",
+        drive(
+            AuthorizeCreateOperation::new(
+                realm_id,
+                &owner_auth(source.created_by, realm_id),
+                PolicyRequestExtras::default(),
+                source.group_id,
+                &path,
+                document_id,
+                CreateScope::Group,
+            ),
+            &ctx.driver,
+        ),
+    )
     .await;
     match checked {
         Ok(()) => Ok(path),

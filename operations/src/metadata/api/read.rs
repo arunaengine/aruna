@@ -23,13 +23,13 @@ use crate::metadata::record_reads::{load_document_record, record_materialized_re
 
 use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
+use crate::auth::enforcement::EnforcePolicyOperation;
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
-use aruna_core::handle::Handle;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::enforcement::EnforcePolicyOperation;
-use crate::document_repository::GetConfigOperation;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::handle::Handle;
 
 pub async fn query_metadata_document(
     context: &DriverContext,
@@ -63,7 +63,11 @@ pub async fn query_metadata_document(
         });
     }
 
-    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         if !request.allow_partial {
             return Err(MetadataApiError::ServiceUnavailable);
         }
@@ -462,7 +466,13 @@ pub(crate) async fn ensure_record_readable(
             Some(txn_id) => policies_in(context, realm_id, record.group_id, txn_id)
                 .await
                 .and_then(|evaluator| evaluator.evaluate(&request)),
-            None => drive(EnforcePolicyOperation::new(realm_id, request.clone()), context).await,
+            None => {
+                drive(
+                    EnforcePolicyOperation::new(realm_id, request.clone()),
+                    context,
+                )
+                .await
+            }
         };
         return result.map_err(|_| MetadataApiError::NotFound);
     }
@@ -496,12 +506,19 @@ pub(crate) async fn can_read_record(
     record: &MetadataRegistryRecord,
 ) -> Result<bool, MetadataApiError> {
     if record.public {
-        let allowed = drive(EnforcePolicyOperation::new(realm_id, crate::auth::request_policy::policy_request_with(
-                &record.permission_path,
-                &Permission::READ,
-                auth,
-                crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
-            ).clone()), context)
+        let allowed = drive(
+            EnforcePolicyOperation::new(
+                realm_id,
+                crate::auth::request_policy::policy_request_with(
+                    &record.permission_path,
+                    &Permission::READ,
+                    auth,
+                    crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
+                )
+                .clone(),
+            ),
+            context,
+        )
         .await
         .is_ok();
         return Ok(allowed);
@@ -515,7 +532,16 @@ pub(crate) async fn can_read_record(
 
     match aruna_core::telemetry::time_stage(
         "permission",
-        drive(AuthorizeOperation::new(realm_id, &auth, &record.permission_path, &Permission::READ, crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read")), context),
+        drive(
+            AuthorizeOperation::new(
+                realm_id,
+                &auth,
+                &record.permission_path,
+                &Permission::READ,
+                crate::auth::request_policy::PolicyRequestExtras::operation("metadata.read"),
+            ),
+            context,
+        ),
     )
     .await
     {
@@ -575,9 +601,12 @@ pub(super) async fn ensure_permission(
             .await
             .and_then(|evaluator| evaluator.evaluate(&request))
             .map_err(|_| MetadataApiError::Forbidden)?,
-        None => drive(EnforcePolicyOperation::new(realm_id, request.clone()), context)
-            .await
-            .map_err(|_| MetadataApiError::Forbidden)?,
+        None => drive(
+            EnforcePolicyOperation::new(realm_id, request.clone()),
+            context,
+        )
+        .await
+        .map_err(|_| MetadataApiError::Forbidden)?,
     }
     Ok(())
 }

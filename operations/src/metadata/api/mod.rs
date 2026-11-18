@@ -69,7 +69,6 @@ use super::search_cursor::{
 };
 use super::summary_cache::summary_cache;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::repository::{

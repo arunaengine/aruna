@@ -13,10 +13,10 @@ use thiserror::Error;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Why one source read is not allowed. Only `Denied` and `NotFound` are verdicts.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -96,7 +96,16 @@ async fn check(
     operation: &str,
 ) -> Result<(), SourceReadError> {
     let path = object_permission_path(auth.realm_id, group_id, node_id, bucket, key);
-    let verdict = Box::pin(drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, PolicyRequestExtras::operation(operation)), context))
+    let verdict = Box::pin(drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &path,
+            &Permission::READ,
+            PolicyRequestExtras::operation(operation),
+        ),
+        context,
+    ))
     .await;
     match verdict {
         Ok(()) => Ok(()),

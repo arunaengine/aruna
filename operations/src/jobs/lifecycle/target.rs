@@ -29,6 +29,7 @@ use super::fetch::FetchFamilyOperation;
 use super::ids::workspace_of;
 use super::launch_checks::{LaunchCheck, LaunchChecksOperation};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
@@ -37,10 +38,9 @@ use crate::jobs::records::pages::{planned_inputs, with_inputs};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::mint_local_job;
+use crate::realm::load_config::config_unavailable;
 use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::placement::resolve_shard_holders;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -58,7 +58,10 @@ pub async fn admit_launch(
     let net = context.net_handle.as_ref()?;
     let realm_id = *net.realm_id();
     let local = net.node_id();
-    let config = drive(GetConfigOperation::new(realm_id), context.as_ref()).await.inspect_err(config_unavailable).ok()?;
+    let config = drive(GetConfigOperation::new(realm_id), context.as_ref())
+        .await
+        .inspect_err(config_unavailable)
+        .ok()?;
     let envelope = launch.envelope().clone();
     let JobFamilyRecord::Launch(intent) = &envelope.record else {
         return Some(Err(LaunchDecline::Unauthorized));

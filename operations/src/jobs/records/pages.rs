@@ -17,13 +17,13 @@ use aruna_core::types::Key;
 use thiserror::Error;
 use tracing::debug;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
+use crate::driver::drive;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
-use crate::driver::drive;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PageReadError {
@@ -151,7 +151,11 @@ async fn family_holders(context: &DriverContext, submission: SubmissionId) -> Ve
     let Some(net) = context.net_handle.as_ref() else {
         return Vec::new();
     };
-    let Some(config) = drive(GetConfigOperation::new(*net.realm_id()), context).await.inspect_err(config_unavailable).ok() else {
+    let Some(config) = drive(GetConfigOperation::new(*net.realm_id()), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         return Vec::new();
     };
     let holders = (config.family_placement(submission))
@@ -282,7 +286,10 @@ pub async fn serve_page(
     digest: [u8; 32],
 ) -> Option<Box<InputPage>> {
     let realm_id = context.net_handle.as_ref().map(|net| *net.realm_id())?;
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()?;
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()?;
     if !is_sync_eligible(&config, peer) {
         return None;
     }

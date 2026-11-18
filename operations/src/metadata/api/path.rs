@@ -7,24 +7,23 @@ use super::path_types::select_path_holders;
 use super::path_types::{MetadataLookupRequest, MetadataLookupResult, PathShardView};
 use super::path_types::{merge_path_views, reduce_path_candidates};
 use super::{
-    AuthContext, AuthToken, DISTRIBUTED_QUERY_DEADLINE, GroupId, GroupPermissionRules, HashSet,
-    MetaResourceId, MetadataApiError, MetadataPathCandidate, MetadataPathResolution,
-    MetadataReadError, MetadataRegistryRecord, MetadataTransportMessage, NodeId, PathClaimRecord,
-    PlacementRef, QUERY_FANOUT_LIMIT, QUERY_MAX_NODES, REGISTRY_CANDIDATE_LIMIT, ROLE_NODE,
-    RealmConfigDocument, RealmId, holds_placement, meta_bucket_subject, metadata_read_request,
-    neg_log2_q48, registry_placement, registry_placement_for, registry_strategy, selector_hash,
-    stream,
+    AuthContext, AuthToken, DISTRIBUTED_QUERY_DEADLINE, GroupId, HashSet, MetaResourceId,
+    MetadataApiError, MetadataPathCandidate, MetadataPathResolution, MetadataReadError,
+    MetadataRegistryRecord, MetadataTransportMessage, NodeId, PathClaimRecord, PlacementRef,
+    QUERY_FANOUT_LIMIT, QUERY_MAX_NODES, REGISTRY_CANDIDATE_LIMIT, ROLE_NODE, RealmConfigDocument,
+    RealmId, holds_placement, meta_bucket_subject, metadata_read_request, neg_log2_q48,
+    registry_placement, registry_placement_for, registry_strategy, selector_hash, stream,
 };
 use crate::driver::DriverContext;
 
 use super::read::load_claim_records;
+use crate::auth::enforcement::PolicyBulkOperation;
+use crate::auth::request_authorization::GroupRulesOperation;
+use crate::document_repository::GetConfigOperation;
+use crate::driver::drive;
+use crate::realm::load_config::config_unavailable;
 use aruna_core::StructuredId;
 use futures_util::StreamExt;
-use crate::driver::drive;
-use crate::auth::request_authorization::GroupRulesOperation;
-use crate::auth::enforcement::PolicyBulkOperation;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 pub(super) fn select_forward_peers(
     config: &RealmConfigDocument,
@@ -279,18 +278,33 @@ pub(crate) async fn local_path_candidates(
     let mut records = load_claim_records(context, realm_id, Some(group_id)).await?;
     records.retain(|record| record.document_path == document_path);
     if let Some(net) = context.net_handle.as_ref() {
-        let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
+        let config = drive(GetConfigOperation::new(realm_id), context)
+            .await
+            .inspect_err(config_unavailable)
+            .ok()
             .ok_or(MetadataApiError::ServiceUnavailable)?;
         registry_strategy(&config).ok_or(MetadataApiError::ServiceUnavailable)?;
         records.retain(|record| {
             holds_placement(&config, &registry_placement(&config, record), net.node_id())
         });
     }
-    let permissions = drive(GroupRulesOperation::new(auth.filter(|auth| auth.realm_id == realm_id), records.iter().map(|record| record.group_id)), context)
-    .await;
-    let evaluators = drive(PolicyBulkOperation::new(records
-            .iter()
-            .map(|record| (record.realm_id, record.group_id))), context)
+    let permissions = drive(
+        GroupRulesOperation::new(
+            auth.filter(|auth| auth.realm_id == realm_id),
+            records.iter().map(|record| record.group_id),
+        ),
+        context,
+    )
+    .await
+    .unwrap_or_default();
+    let evaluators = drive(
+        PolicyBulkOperation::new(
+            records
+                .iter()
+                .map(|record| (record.realm_id, record.group_id)),
+        ),
+        context,
+    )
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let policy_auth = auth;
@@ -371,11 +385,16 @@ pub async fn lookup_metadata_path(
     if context.net_handle.is_none() {
         return resolve_local_path(context, realm_id, request).await;
     }
-    let config = tokio::time::timeout_at(deadline, async { drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() })
-        .await
-        .ok()
-        .flatten()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
+    let config = tokio::time::timeout_at(deadline, async {
+        drive(GetConfigOperation::new(realm_id), context)
+            .await
+            .inspect_err(config_unavailable)
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+    .ok_or(MetadataApiError::ServiceUnavailable)?;
     let local_node = context
         .net_handle
         .as_ref()

@@ -59,7 +59,7 @@ type CreatedGroup = (Group, GroupAuthorizationDocument);
 /// never originates a realm administrative event: the ingress authorizes the
 /// caller's own token and originates the event with the caller as actor.
 #[derive(Debug, PartialEq)]
-pub struct ForwardGroupCreateOperation {
+pub struct ForwardGroupOperation {
     realm_id: RealmId,
     local: Option<NodeId>,
     auth_token: Option<AuthToken>,
@@ -71,7 +71,7 @@ pub struct ForwardGroupCreateOperation {
     asked: Option<NodeId>,
 }
 
-impl ForwardGroupCreateOperation {
+impl ForwardGroupOperation {
     /// `request_id` spreads repeated creates of one name over the ingress nodes.
     pub fn new(
         realm_id: RealmId,
@@ -167,7 +167,7 @@ impl ForwardGroupCreateOperation {
     }
 }
 
-impl Operation for ForwardGroupCreateOperation {
+impl Operation for ForwardGroupOperation {
     type Output = CreatedGroup;
     type Error = ForwardGroupError;
 
@@ -213,14 +213,14 @@ fn unavailable() -> ApplyTurn {
 /// forwarded token, checked exactly as the local HTTP handler would; a User
 /// peer may only ever act for the owner its realm config binds it to.
 #[derive(Debug, PartialEq)]
-pub(crate) struct ApplyGroupCreateOperation {
+pub(crate) struct ApplyGroupOperation {
     local: Option<(NodeId, RealmId)>,
     peer: NodeId,
     message: MetadataTransportMessage,
     stage: ApplyStage,
 }
 
-impl ApplyGroupCreateOperation {
+impl ApplyGroupOperation {
     pub(crate) fn new(
         local: Option<(NodeId, RealmId)>,
         peer: NodeId,
@@ -265,7 +265,7 @@ impl ApplyGroupCreateOperation {
     }
 }
 
-impl Operation for ApplyGroupCreateOperation {
+impl Operation for ApplyGroupOperation {
     type Output = MetadataTransportMessage;
     type Error = IoError;
 
@@ -312,12 +312,10 @@ impl Operation for ApplyGroupCreateOperation {
             }
             ApplyStage::Create => Ok(Next::Done(
                 match result.child::<CreatedGroup, CreateGroupError>()? {
-                    Ok((group, authorization)) => {
-                        MetadataTransportMessage::ForwardedGroupCreated {
-                            group: Box::new(group),
-                            authorization: Box::new(authorization),
-                        }
-                    }
+                    Ok((group, authorization)) => MetadataTransportMessage::ForwardedGroupCreated {
+                        group: Box::new(group),
+                        authorization: Box::new(authorization),
+                    },
                     Err(CreateGroupError::GroupLimitReached { limit }) => {
                         MetadataTransportMessage::GroupCreateConflict {
                             reason: format!("owned group limit reached ({limit})"),

@@ -388,7 +388,16 @@ pub(crate) async fn open_connector(
     permission: Permission,
     credential: Option<&RepositoryCredential>,
 ) -> Result<(ConnectorView, Option<String>), TransferError> {
-    drive(AuthorizeOperation::new(auth.realm_id, auth, &format!("/{}/g/{group_id}/meta/**", auth.realm_id), &permission, PolicyRequestExtras::operation("metadata.repository")), context)
+    drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &format!("/{}/g/{group_id}/meta/**", auth.realm_id),
+            &permission,
+            PolicyRequestExtras::operation("metadata.repository"),
+        ),
+        context,
+    )
     .await
     .map_err(|error| match error {
         AuthorizeError::Storage(_)

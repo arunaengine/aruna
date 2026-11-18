@@ -9,19 +9,19 @@ use super::list_types::{
 };
 use super::read::ensure_record_materialized;
 use super::{
-    EVENT_LOG_KEYSPACE, Event, GroupId, GroupPermissionRules, HashMap, IterStart,
-    LIST_METADATA_SIZE, ListGroupOperation, MetadataApiError, MetadataEventRecord,
-    MetadataRegistryRecord, PENDING_PROJECTION_KEYSPACE, REGISTRY_CANDIDATE_LIMIT, RealmId,
-    StorageEffect, StorageEvent, event_log_key, iter_registry_effect, metadata_read_request,
-    parse_registry_iter, pending_projection_target, stream,
+    EVENT_LOG_KEYSPACE, Event, GroupId, HashMap, IterStart, LIST_METADATA_SIZE, ListGroupOperation,
+    MetadataApiError, MetadataEventRecord, MetadataRegistryRecord, PENDING_PROJECTION_KEYSPACE,
+    REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect, StorageEvent, event_log_key,
+    iter_registry_effect, metadata_read_request, parse_registry_iter, pending_projection_target,
+    stream,
 };
 use crate::driver::{DriverContext, drive};
 use aruna_core::handle::Handle;
 use futures_util::StreamExt;
 
-use crate::metadata::live_records::LiveRecordsOperation;
-use crate::auth::request_authorization::GroupRulesOperation;
 use crate::auth::enforcement::PolicyBulkOperation;
+use crate::auth::request_authorization::GroupRulesOperation;
+use crate::metadata::live_records::LiveRecordsOperation;
 
 // Bounded so a single summary page cannot saturate the craqle read permits.
 pub(super) const FANOUT_LIMIT: usize = 8;
@@ -84,17 +84,29 @@ pub async fn list_visible_documents(
         .auth
         .as_ref()
         .filter(|auth| auth.realm_id == realm_id);
-    let permissions = drive(GroupRulesOperation::new(auth, records
-            .iter()
-            .filter(|record| record.realm_id == realm_id)
-            .map(|record| record.group_id)), context)
-    .await;
+    let permissions = drive(
+        GroupRulesOperation::new(
+            auth,
+            records
+                .iter()
+                .filter(|record| record.realm_id == realm_id)
+                .map(|record| record.group_id),
+        ),
+        context,
+    )
+    .await
+    .unwrap_or_default();
     // RBAC/public visibility is additionally constrained by the metadata.read
     // request policies, loaded once per distinct group (fail-closed on error).
-    let evaluators = drive(PolicyBulkOperation::new(records
-            .iter()
-            .filter(|record| record.realm_id == realm_id)
-            .map(|record| (record.realm_id, record.group_id))), context)
+    let evaluators = drive(
+        PolicyBulkOperation::new(
+            records
+                .iter()
+                .filter(|record| record.realm_id == realm_id)
+                .map(|record| (record.realm_id, record.group_id)),
+        ),
+        context,
+    )
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let policy_auth = request.auth.as_ref();

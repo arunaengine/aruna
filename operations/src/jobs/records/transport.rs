@@ -20,13 +20,13 @@ use super::admit::Admission;
 use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use super::family::LoadFamilyOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
+use crate::realm::load_config::config_unavailable;
 use aruna_core::placement::holds_placement;
 use aruna_core::structs::execution::job::record_rows::PendingNeed;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 struct PageRequest {
     placement: PlacementRef,
@@ -104,7 +104,10 @@ async fn holder_view(
 ) -> Result<ServeAuthority, ServeError> {
     let net_handle = context.net_handle.as_ref().ok_or(ServeError::Unavailable)?;
     let realm_id = *net_handle.realm_id();
-    let config = drive(GetConfigOperation::new(realm_id), context.as_ref()).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(realm_id), context.as_ref())
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(ServeError::Unavailable)?;
     let eligible = config
         .sync_eligible_nodes()
@@ -290,7 +293,11 @@ pub async fn serve_launch_offer(
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     let realm_id = *net_handle.realm_id();
-    let Some(config) = drive(GetConfigOperation::new(realm_id), context.as_ref()).await.inspect_err(config_unavailable).ok() else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context.as_ref())
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+    else {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     if !config

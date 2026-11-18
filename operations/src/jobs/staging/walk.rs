@@ -42,6 +42,7 @@ use super::{
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::PermissionRules;
+use crate::auth::request_authorization::rules_operation;
 use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
 use crate::distribution::guard::{
     GuardError, authority_reads, authority_rows, write_target, write_targets,
@@ -60,7 +61,6 @@ use crate::staging::page::import::{
 };
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 use crate::storage_read::iter_prefix_page;
-use crate::auth::request_authorization::rules_operation;
 
 /// Entries one listing request reads.
 const STAGING_PAGE_SIZE: usize = 1000;

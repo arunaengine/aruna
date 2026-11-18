@@ -49,8 +49,8 @@ fn peer_says(peer: NodeId, message: &MetadataTransportMessage) -> IoResult {
     )))))
 }
 
-fn forwarding() -> ForwardGroupCreateOperation {
-    let mut operation = ForwardGroupCreateOperation::new(
+fn forwarding() -> ForwardGroupOperation {
+    let mut operation = ForwardGroupOperation::new(
         realm(),
         Some(node(9)),
         AuthToken::bearer("caller-token").unwrap(),
@@ -128,16 +128,15 @@ fn create_message() -> MetadataTransportMessage {
     }
 }
 
-fn applying(local: NodeId) -> (ApplyGroupCreateOperation, ApplyTurn) {
-    let mut operation =
-        ApplyGroupCreateOperation::new(Some((local, realm())), node(2), create_message());
+fn applying(local: NodeId) -> (ApplyGroupOperation, ApplyTurn) {
+    let mut operation = ApplyGroupOperation::new(Some((local, realm())), node(2), create_message());
     operation.first().unwrap();
     let turn = operation.next(config_answer());
     (operation, turn)
 }
 
 #[test]
-fn apply_needs_server_node() {
+fn apply_needs_server() {
     let (_, turn) = applying(node(9));
     assert_eq!(turn, unavailable());
 }

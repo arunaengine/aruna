@@ -61,10 +61,10 @@ use super::lifecycle::ids::session_of;
 use super::lifecycle::routing::{family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
-use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::document_repository::GetConfigOperation;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
@@ -85,9 +85,13 @@ pub(crate) async fn mint_local_job(
             "job owner does not match the serving node".to_string(),
         ));
     }
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok().ok_or_else(|| {
-        SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
-    })?;
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
+        .ok_or_else(|| {
+            SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
+        })?;
     mint_configured_job(&config, owner_node_id, subject)
 }
 
@@ -705,7 +709,10 @@ pub async fn resolve_job_owner(
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
     let realm_id = *net_handle.realm_id();
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
     config.job_owner(job_id).map_err(|error| match error {
         JobOwnerError::NotJobControl => JobRouteError::NotFound,
@@ -802,7 +809,12 @@ async fn linked_push_job(
     ];
     for (path, permission) in checks {
         let extras = PolicyRequestExtras::rest();
-        match drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, extras), context).await {
+        match drive(
+            AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, extras),
+            context,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => return Ok(None),
             Err(AuthorizeError::CheckFailed(error)) => return Err(error),
@@ -833,7 +845,16 @@ async fn joined_pid_job(
     else {
         return Ok(None);
     };
-    match drive(AuthorizeOperation::new(auth.realm_id, auth, &document.permission_path, &Permission::WRITE, PolicyRequestExtras::rest()), context)
+    match drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &document.permission_path,
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
+        context,
+    )
     .await
     {
         Ok(()) => {

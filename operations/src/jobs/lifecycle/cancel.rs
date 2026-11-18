@@ -19,7 +19,9 @@ use super::alias::AliasFamilyOperation;
 use super::publish::publish_terminal;
 use super::routing::family_projection;
 use super::updates::{SETTLE_RETRY_AFTER, schedule_terminal_settle};
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::protocol::send_job_request;
 use crate::jobs::records::admit::Admission;
@@ -30,10 +32,8 @@ use crate::jobs::route::JobRouteError;
 use crate::jobs::service::kick_drain;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::attempt::{CancelRequestOutcome, set_cancel_requested};
-use aruna_core::metadata::AuthToken;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::document_repository::GetConfigOperation;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::AuthToken;
 
 /// Cancels one external job through its family. `None` means the alias names no
 /// family here, so the caller keeps its ordinary local cancellation.
@@ -96,7 +96,16 @@ async fn cancel_authority(
         return Some(CancelAuthority::Submitter);
     }
     let local = context.net_handle.as_ref()?.node_id();
-    drive(AuthorizeOperation::new(spec.realm_id, auth, &group_permission_path(spec.realm_id, spec.group_id, local), &Permission::WRITE, PolicyRequestExtras::rest()), context)
+    drive(
+        AuthorizeOperation::new(
+            spec.realm_id,
+            auth,
+            &group_permission_path(spec.realm_id, spec.group_id, local),
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
+        context,
+    )
     .await
     .ok()
     .map(|()| CancelAuthority::GroupAdmin)
@@ -132,7 +141,10 @@ async fn publish_cancel(
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
     let realm_id = *net.realm_id();
     let local = net.node_id();
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
     let family = aruna_core::structs::execution::job::JobFamilyId {
         submission_id: spec.submission_id,
