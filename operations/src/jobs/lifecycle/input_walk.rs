@@ -445,3 +445,170 @@ impl Operation for RangeHolderOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{node, user};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::InputMode;
+    use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
+    use aruna_core::structs::storage::format::Compression;
+
+    fn caller() -> InputCaller {
+        InputCaller {
+            created_by: user(),
+            realm_id: RealmId([1u8; 32]),
+            local: node(1),
+        }
+    }
+
+    fn input(key: &str, dest_key: &str) -> InputSelection {
+        InputSelection {
+            source: InputSource::S3 {
+                bucket: "b".to_string(),
+                key: key.to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: dest_key.to_string(),
+            mode: InputMode::Snapshot,
+            container_path: Some("/in/".to_string()),
+            name: None,
+            description: None,
+        }
+    }
+
+    fn bucket(distribution: Option<DistributionBinding>) -> BucketInfo {
+        BucketInfo {
+            group_id: Ulid::from_parts(2, 2),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user(),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution,
+        }
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    // An input on another node ends the walk at once; an unreadable head ends it unchanged.
+    #[test]
+    fn walk_stops_without_link() {
+        let mut remote = input("a", "a");
+        remote.source_node_id = Some(node(2));
+        let mut elsewhere = FollowLinkOperation::new(caller(), remote.clone());
+        assert_eq!(elsewhere.first(), Ok(Next::Done((remote, None))));
+
+        let mut missing = FollowLinkOperation::new(caller(), input("a", "a"));
+        assert!(matches!(missing.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let head = child(Err::<HeadObjectResult, _>(HeadObjectError::NoSuchKey));
+        assert_eq!(missing.next(head), Ok(Next::Done((input("a", "a"), None))));
+    }
+
+    fn directory() -> ExpandDirectoryOperation {
+        ExpandDirectoryOperation::new(caller(), input("dir/", "out/"))
+    }
+
+    fn listed(token: Option<ListContinuationToken>) -> IoResult {
+        child(Ok::<_, ListBucketError>(ListBucketResult {
+            objects: Vec::new(),
+            common_prefixes: Vec::new(),
+            continuation_token: token,
+        }))
+    }
+
+    // A directory lists its bucket; an empty one and a distributed one are refused.
+    #[test]
+    fn directory_needs_objects() {
+        let mut empty = directory();
+        empty.first().expect("bucket read");
+        let found = child(Ok::<_, GetBucketError>(bucket(None)));
+        assert!(matches!(
+            empty.next(found),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert!(matches!(
+            empty.next(listed(None)),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+
+        let binding = DistributionBinding {
+            set_id: Ulid::from_parts(3, 3),
+            member_id: Ulid::from_parts(4, 4),
+            incarnation: 1,
+            revision: DistributionRevision::default(),
+        };
+        let mut distributed = directory();
+        distributed.first().expect("bucket read");
+        let found = child(Ok::<_, GetBucketError>(bucket(Some(binding))));
+        assert!(matches!(
+            distributed.next(found),
+            Err(SubmitJobError::InvalidWorkspace(_))
+        ));
+    }
+
+    // Every listed file is read-checked before it becomes an input below the directory path;
+    // folder markers are skipped and a denied file refuses the directory.
+    #[test]
+    fn directory_checks_each_file() {
+        let version = Ulid::from_parts(5, 5);
+        let mut walk = directory();
+        walk.group_id = Some(Ulid::from_parts(2, 2));
+        walk.objects = VecDeque::from([
+            ("dir/".to_string(), version),
+            ("dir/sub/".to_string(), version),
+            ("dir/a".to_string(), version),
+        ]);
+        assert!(matches!(walk.advance(), Ok(Next::Call(IoCall::Child(_)))));
+        let allowed = child(Ok::<GroupId, SourceReadError>(Ulid::from_parts(2, 2)));
+        let Ok(Next::Done(files)) = walk.next(allowed) else {
+            panic!("the only file is an input");
+        };
+        assert_eq!(files[0].dest_key, "out/a");
+        assert_eq!(files[0].container_path.as_deref(), Some("/in/a"));
+
+        let mut denied = directory();
+        denied.objects = VecDeque::from([("dir/a".to_string(), version)]);
+        denied.advance().expect("read check");
+        let refused = child(Err::<GroupId, _>(SourceReadError::Denied));
+        assert!(matches!(
+            denied.next(refused),
+            Err(SubmitJobError::InputDenied(_))
+        ));
+    }
+
+    // A plain bucket keeps the input here; a distributed one points it at the coordinator.
+    #[test]
+    fn holder_follows_coordinator() {
+        let mut plain = RangeHolderOperation::new(input("a", "a"), node(1));
+        plain.first().expect("bucket read");
+        let found = child(Ok::<_, GetBucketError>(bucket(None)));
+        assert_eq!(plain.next(found), Ok(Next::Done(input("a", "a"))));
+
+        let binding = DistributionBinding {
+            set_id: Ulid::from_parts(3, 3),
+            member_id: Ulid::from_parts(4, 4),
+            incarnation: 1,
+            revision: DistributionRevision::default(),
+        };
+        let mut routed = RangeHolderOperation::new(input("a", "a"), node(1));
+        routed.first().expect("bucket read");
+        let found = child(Ok::<_, GetBucketError>(bucket(Some(binding))));
+        routed.next(found).expect("coordinator read");
+        let route = Some((Ulid::from_parts(6, 6), node(2)));
+        let Ok(Next::Done(pinned)) = routed.next(child(Ok::<_, GuardError>(route))) else {
+            panic!("the coordinator answers");
+        };
+        assert_eq!(pinned.source_node_id, Some(node(2)));
+    }
+}
