@@ -51,7 +51,7 @@ pub struct MetadataQueryExecution {
     pub fanout_stats: MetadataFanoutStats,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataReferencesRequest {
     pub auth: Option<AuthContext>,
     pub iri: String,
@@ -62,7 +62,7 @@ pub struct MetadataReferencesRequest {
     pub after: Option<Ulid>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataReferenceEntry {
     pub document_id: String,
     pub group_id: String,
@@ -73,7 +73,7 @@ pub struct MetadataReferenceEntry {
     pub title: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataReferencesExecution {
     pub references: Vec<MetadataReferenceEntry>,
     /// The last document read when more may follow; `None` on the last page.

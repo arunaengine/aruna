@@ -105,6 +105,7 @@ pub mod preflight;
 pub mod preflight_types;
 pub mod read;
 pub(crate) mod read_access;
+pub mod references;
 pub mod read_types;
 pub(crate) mod readable;
 pub mod search;

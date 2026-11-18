@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::preflight::{reference_document_title, resolve_graph_reference};
 use super::read_types::{
     MetadataQueryExecution, MetadataQueryRequest, MetadataReferenceEntry,
     MetadataReferencesExecution, MetadataReferencesRequest,
@@ -55,115 +54,6 @@ pub async fn query_metadata(
         results,
         fanout_stats,
     })
-}
-
-/// Postings one references page may read, so a page never scans the index.
-const REFERENCE_BUDGET: LinkBudget = LinkBudget {
-    seeks: 1100,
-    rows: 4096,
-};
-
-/// Reads one local page of the documents naming `iri` as an object, by document id after
-/// `after`; each must be live at the posting's cursor and readable. An empty first page for a
-/// known graph IRI, or `resolve`, returns one predicate-less summary.
-pub async fn references_metadata(
-    context: &DriverContext,
-    realm_id: RealmId,
-    request: MetadataReferencesRequest,
-) -> Result<MetadataReferencesExecution, MetadataApiError> {
-    if request.iri.trim().is_empty() || oxrdf::NamedNode::new(&request.iri).is_err() {
-        return Err(MetadataApiError::BadRequest);
-    }
-    if request
-        .predicate
-        .as_deref()
-        .is_some_and(|iri| oxrdf::NamedNode::new(iri).is_err())
-    {
-        return Err(MetadataApiError::BadRequest);
-    }
-    let limit = request
-        .limit
-        .unwrap_or(REFERENCES_LIMIT)
-        .clamp(1, REFERENCES_MAX_LIMIT);
-
-    if request.resolve {
-        let registry = graph_record(context, &request.iri).await?;
-        let entry =
-            resolve_graph_reference(context, realm_id, &request, registry.as_slice()).await?;
-        return Ok(MetadataReferencesExecution {
-            references: entry.into_iter().collect(),
-            next_after: None,
-        });
-    }
-
-    let read = crate::metadata::iri_index::BacklinksOperation::new(
-        (&request.iri, request.predicate.as_deref()),
-        (request.after, limit),
-        REFERENCE_BUDGET,
-    );
-    let (page, _) = drive(read, context)
-        .await
-        .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-
-    let mut references = Vec::new();
-    for (document_id, postings) in page.documents {
-        let record = match load_live_record(context, document_id).await {
-            Ok(record) => record,
-            Err(MetadataApiError::NotFound) => continue,
-            Err(error) => return Err(error),
-        };
-        let current: Vec<_> = postings
-            .into_iter()
-            .filter(|posting| posting.document_cursor == record.last_event_id)
-            .collect();
-        if current.is_empty()
-            || !can_read_record(context, realm_id, request.auth.as_ref(), &record).await?
-        {
-            continue;
-        }
-        let title = reference_document_title(context, &record).await;
-        for posting in current {
-            references.push(MetadataReferenceEntry {
-                document_id: record.document_id.to_string(),
-                group_id: record.group_id.to_string(),
-                document_path: record.document_path.clone(),
-                graph_iri: record.graph_iri.clone(),
-                predicate: Some(posting.predicate_iri),
-                subject_iris: posting.subject_iris,
-                title: title.clone(),
-            });
-        }
-    }
-
-    if references.is_empty() && request.after.is_none() && page.next.is_none() {
-        let registry = graph_record(context, &request.iri).await?;
-        if let Some(entry) =
-            resolve_graph_reference(context, realm_id, &request, registry.as_slice()).await?
-        {
-            references.push(entry);
-        }
-    }
-
-    Ok(MetadataReferencesExecution {
-        references,
-        next_after: page.next,
-    })
-}
-
-/// The live record whose graph IRI is `iri`, by one point read of the document it names; never
-/// a walk over the registry.
-async fn graph_record(
-    context: &DriverContext,
-    iri: &str,
-) -> Result<Option<MetadataRegistryRecord>, MetadataApiError> {
-    let Some(document_id) = MetadataRegistryRecord::graph_document(iri) else {
-        return Ok(None);
-    };
-    match load_live_record(context, document_id).await {
-        Ok(record) => Ok((record.graph_iri == iri).then_some(record)),
-        Err(MetadataApiError::NotFound) => Ok(None),
-        Err(error) => Err(error),
-    }
 }
 
 impl From<LiveRecordsError> for MetadataApiError {

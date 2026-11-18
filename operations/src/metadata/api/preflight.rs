@@ -577,33 +577,6 @@ pub(super) fn visible_prefix(
     (selected, saturated)
 }
 
-pub(super) async fn resolve_graph_reference(
-    context: &DriverContext,
-    realm_id: RealmId,
-    request: &MetadataReferencesRequest,
-    registry: &[MetadataRegistryRecord],
-) -> Result<Option<MetadataReferenceEntry>, MetadataApiError> {
-    let Some(record) = registry
-        .iter()
-        .find(|record| record.graph_iri == request.iri)
-    else {
-        return Ok(None);
-    };
-    if !can_read_record(context, realm_id, request.auth.as_ref(), record).await? {
-        return Ok(None);
-    }
-    let title = reference_document_title(context, record).await;
-    Ok(Some(MetadataReferenceEntry {
-        document_id: record.document_id.to_string(),
-        group_id: record.group_id.to_string(),
-        document_path: record.document_path.clone(),
-        graph_iri: record.graph_iri.clone(),
-        predicate: None,
-        subject_iris: Vec::new(),
-        title,
-    }))
-}
-
 pub(super) async fn reference_document_title(
     context: &DriverContext,
     record: &MetadataRegistryRecord,

@@ -15,7 +15,8 @@ use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
-use aruna_operations::metadata::api::read::{query_metadata, references_metadata};
+use aruna_operations::metadata::api::read::query_metadata;
+use aruna_operations::metadata::api::references::ReferencesOperation;
 use aruna_operations::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
 };
@@ -538,18 +539,14 @@ impl McpServer {
             tool_extras("find_references", &input)?,
         )
         .await?;
-        let execution = references_metadata(
-            self.state.get_ctx().as_ref(),
-            self.state.get_realm_id(),
-            MetadataReferencesRequest {
+        let execution = drive(ReferencesOperation::new(self.state.get_realm_id(), MetadataReferencesRequest {
                 auth: Some(auth),
                 iri: input.iri,
                 predicate: input.predicate,
                 limit: input.limit,
                 resolve: false,
                 after: None,
-            },
-        )
+            }), self.state.get_ctx().as_ref())
         .await
         .map_err(crate::metadata::map_api_error)
         .map_err(references_error)?;
