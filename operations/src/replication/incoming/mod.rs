@@ -330,15 +330,6 @@ impl ReceivedBlob {
         }
     }
 
-    /// The copy is already owned by this node, so no abort may delete it.
-    #[cfg(test)]
-    fn owned(location: BackendLocation) -> Self {
-        Self {
-            location,
-            cleanup_on_abort: false,
-        }
-    }
-
     /// Takes the copy that must be deleted if this operation aborts now,
     /// clearing the outstanding cleanup.
     fn take_cleanup(&mut self) -> Option<BackendLocation> {
@@ -545,15 +536,6 @@ impl IncomingVersionOperation {
 
     pub fn with_manifest_policy(mut self, path: Option<String>) -> Self {
         self.manifest_policy = path;
-        self
-    }
-
-    /// Replaces the clock the enqueue phase samples. Production keeps the
-    /// default; tests fix it so a long apply can prove the candidate carries
-    /// the enqueue time rather than the construction time.
-    #[cfg(test)]
-    pub fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
-        self.clock = EnqueueClock(clock);
         self
     }
 }
