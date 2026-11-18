@@ -580,7 +580,11 @@ async fn offer(context: &DriverContext, offered: Offer) -> RoundOutcome {
 /// Admits a launch planned onto this node, with the answer a remote target would give.
 async fn admit_here(context: &DriverContext, launch: LaunchFrame) -> OfferOutcome {
     let context = std::sync::Arc::new(context.clone());
-    match super::target::admit_launch(&context, launch).await {
+    let Some(node) = super::target::launch_node(&context, &launch) else {
+        return OfferOutcome::Unavailable;
+    };
+    let admit = super::launch_admit::AdmitLaunchOperation::new(launch, node);
+    match drive(admit, context.as_ref()).await.ok() {
         Some(Ok(receipt)) => match JobRecordFrame::new(receipt.into_inner()) {
             Ok(frame) => OfferOutcome::Accepted(frame),
             Err(_) => OfferOutcome::Unavailable,
