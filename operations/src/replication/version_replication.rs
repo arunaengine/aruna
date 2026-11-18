@@ -2880,14 +2880,35 @@ impl ReplicateObjectOperation {
 #[cfg(test)]
 mod tests {
     /// Answers an encryption settings read for a bucket without settings.
-    fn plain_settings() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: vec![3u8].into(),
-            value: None,
-        })
+    fn plain_settings() -> IoResult {
+        row(None)
     }
+
+    fn row(value: Option<Value>) -> IoResult {
+        IoResult::Values(vec![value])
+    }
+
+    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Page { rows, next }
+    }
+
+    fn event_result(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn blob(event: BlobEvent) -> IoResult {
+        event_result(Event::Blob(event))
+    }
+
+    fn asked<T: std::fmt::Debug, E: std::fmt::Debug>(turn: &Result<Next<T>, E>) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
+            other => panic!("expected an effect call, got {other:?}"),
+        }
+    }
+
     use super::{
-        MAX_SCOPE_VERSIONS, NATIVE_RELATIONSHIP_ID, NATIVE_SET_ID, Publication,
+        MAX_SCOPE_VERSIONS, NATIVE_RELATIONSHIP_ID, NATIVE_SET_ID, ObjectTurn, Publication,
         ReplicateObjectError, ReplicateObjectOperation, ReplicateObjectState, ReplicateScopeError,
         ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeState, ReplicateScopeTarget,
         ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
@@ -2896,7 +2917,8 @@ mod tests {
     use crate::driver::DriverContext;
     use crate::replication::protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::UserId;
-    use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::errors::BlobError;
     use aruna_core::events::{
         BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent,
@@ -2904,7 +2926,7 @@ mod tests {
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::ReferenceHandling;
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
@@ -2934,7 +2956,7 @@ mod tests {
         ReferenceAdvance, ReplicationMode, SyncOrigin,
     };
     use aruna_core::structs::storage::routing::GroupRoutingInputs;
-    use aruna_core::types::Effects;
+    use aruna_core::types::{Key, Value};
     use aruna_storage::FjallStorage;
     use bytes::Bytes;
     use futures_util::stream;
@@ -2944,14 +2966,14 @@ mod tests {
     use ulid::Ulid;
 
     /// Replays the routing loader and bucket-rules read the reference path adds.
-    fn load_routing(op: &mut ReplicateObjectOperation) -> Effects {
-        op.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
-            result: Ok(GroupRoutingInputs::default()),
-        }));
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8].into(),
-            value: None,
-        }))
+    fn load_routing(op: &mut ReplicateObjectOperation) -> ObjectTurn {
+        op.next(event_result(Event::SubOperation(
+            SubOperationEvent::GroupRoutingLoaded {
+                result: Ok(GroupRoutingInputs::default()),
+            },
+        )))
+        .unwrap();
+        op.next(row(None))
     }
 
     #[test]
@@ -3275,35 +3297,26 @@ mod tests {
             key: "dir/file.txt".to_string(),
         }));
 
-        op.start();
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(bucket_info().to_bytes().unwrap().into()),
-        }));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
+        op.first().unwrap();
+        let effects = op.next(row(Some(bucket_info().to_bytes().unwrap().into())));
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Read(_)))));
 
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(vec![2u8].into()),
-        }));
-        let Effect::Storage(StorageEffect::Iter { .. }) = &effects[0] else {
+        let effects = op.next(row(Some(vec![2u8].into())));
+        let Ok(Next::Call(IoCall::Page { .. })) = &effects else {
             panic!("expected iteration after exact object lookup")
         };
 
         let matching_version = Ulid::generate();
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
+        let effects = op.next(page(
+            vec![
                 version_entry("dir/file.txt", matching_version),
                 version_entry("dir/file.txt.bak", Ulid::generate()),
                 version_entry("dir/sub/file.txt", Ulid::generate()),
             ],
-            next_start_after: None,
-        }));
+            None,
+        ));
 
-        let Effect::SubOperation(_) = &effects[0] else {
+        let Ok(Next::Call(IoCall::Child(_))) = &effects else {
             panic!("expected only matching object version to be enqueued")
         };
         assert_eq!(op.pending_versions.len(), 0);
@@ -3316,15 +3329,12 @@ mod tests {
         let version_id = Ulid::from_bytes([1u8; 16]);
         let cursor: aruna_core::types::Key = vec![9u8].into();
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![version_entry("dir/file.txt", version_id); 2],
-            next_start_after: Some(cursor),
-        }));
-
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Iter { .. })
+        let effects = op.next(page(
+            vec![version_entry("dir/file.txt", version_id); 2],
+            Some(cursor),
         ));
+
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Page { .. }))));
         assert_eq!(op.pending_versions.len(), 1);
         assert_eq!(op.pending_keys.len(), 1);
     }
@@ -3344,103 +3354,65 @@ mod tests {
             })
             .collect();
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        }));
+        let effects = op.next(page(values, None));
 
-        assert!(effects.is_empty());
-        assert_eq!(op.state, ReplicateScopeState::Error);
         assert!(op.pending_versions.is_empty());
         assert_eq!(
-            op.output,
-            Some(Err(ReplicateScopeError::ScopeLimit {
+            effects,
+            Err(ReplicateScopeError::ScopeLimit {
                 limit: MAX_SCOPE_VERSIONS,
-            }))
+            })
         );
     }
 
-    /// Pure start/step/finalize coverage for the scope and one-version
-    /// operations. These tests use fixed inputs and no runtime, storage, or
-    /// network; they are part of the audited fast selection.
-    mod state_machine_tests {
+    /// Scope results with fixed inputs and no runtime, storage or network.
+    mod scope_results {
         use super::*;
 
+        // A failed push drops its local bytes and closes its stream.
         #[test]
-        fn scope_finalize_rejected() {
-            let op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
-            assert_eq!(op.finalize(), Err(ReplicateScopeError::NotFinished));
-        }
-
-        // An unstarted or in-flight version push must never finalize to the
-        // initialized `Replicated` default; only a terminal state carries a result.
-        #[test]
-        fn object_finalize_rejected() {
-            for state in [
-                ReplicateObjectState::Init,
-                ReplicateObjectState::SendManifest,
-                ReplicateObjectState::AwaitNegotiation,
-                ReplicateObjectState::TransferBlob,
-                ReplicateObjectState::AwaitApplyComplete,
-                ReplicateObjectState::CloseConnection,
-            ] {
-                let mut op =
-                    ReplicateObjectOperation::new(version_request(Ulid::from_parts(11, 11)));
-                op.state = state.clone();
-                assert_eq!(
-                    op.finalize(),
-                    Err(ReplicateObjectError::NotFinished),
-                    "{state:?} must reject finalization"
-                );
-            }
-        }
-
-        // A recorded failure survives finalization through the operation error
-        // boundary instead of being reported as a successful outcome.
-        #[test]
-        fn object_failure_returned() {
+        fn object_abort_cleans() {
             let mut op = ReplicateObjectOperation::new(version_request(Ulid::from_parts(12, 12)));
-            op.fail(ReplicateObjectError::VersionNotFound);
-            assert_eq!(op.finalize(), Err(ReplicateObjectError::VersionNotFound));
+            assert!(op.abort().is_empty());
+            let location = materialized_location();
+            let stream_id = Ulid::from_parts(13, 13);
+            op.cleanup_reference_blob = Some(location.clone());
+            op.stream_id = Some(stream_id);
+            let delete = Effect::Blob(BlobEffect::Delete { location });
+            let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+            assert_eq!(op.abort(), vec![delete.into(), close.into()]);
         }
 
         #[test]
         fn scope_failure_recorded() {
-            // Malformed or refused child output is recorded and still finalizes to
-            // the scope result, never to a successful absence.
+            // A refused child is recorded and still ends in the scope result.
             let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
             op.state = ReplicateScopeState::RunVersionReplication;
 
-            let effects = op.step(Event::SubOperation(
-                SubOperationEvent::ReplicationItemResult {
-                    result: Err(ReplicationItemError {
-                        failure: ReplicationFailure::AccessDenied,
-                        message: "denied".to_string(),
-                    }),
-                },
-            ));
+            let turn = op.accept_item(Err(ReplicationItemError {
+                failure: ReplicationFailure::AccessDenied,
+                message: "denied".to_string(),
+            }));
 
-            assert!(effects.is_empty());
-            assert_eq!(op.state, ReplicateScopeState::Finish);
             assert_eq!(op.result.failed, 1);
             assert_eq!(op.result.failure, Some(ReplicationFailure::AccessDenied));
-            let expected = op.result.clone();
-            assert_eq!(op.finalize(), Ok(expected));
+            assert_eq!(turn, Ok(Next::Done(op.result.clone())));
         }
 
         #[test]
-        fn scope_success_finalize() {
+        fn scope_reads_child() {
+            // A child's failure counts as a failed item, with its stable category.
             let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
             op.state = ReplicateScopeState::RunVersionReplication;
-
-            op.step(Event::SubOperation(
-                SubOperationEvent::ReplicationItemResult {
-                    result: Ok(ReplicationSuboperationResult::ReplicatedBytes(42)),
-                },
-            ));
-
-            let expected = op.result.clone();
-            assert_eq!(op.finalize(), Ok(expected));
+            let failed =
+                Err::<ReplicationSuboperationResult, _>(ReplicateObjectError::PlaintextRefused);
+            let turn = op.next(IoResult::Child(ChildOutcome::new(failed)));
+            assert_eq!(op.result.failed, 1);
+            assert_eq!(
+                op.result.failure,
+                Some(ReplicationFailure::PlaintextRefused)
+            );
+            assert_eq!(turn, Ok(Next::Done(op.result.clone())));
         }
     }
 
@@ -3450,20 +3422,20 @@ mod tests {
         op.state = ReplicateScopeState::IterateVersions;
         let cursor: aruna_core::types::Key = vec![9u8].into();
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![version_entry("dir/first", Ulid::from_bytes([1u8; 16]))],
-            next_start_after: Some(cursor.clone()),
-        }));
-        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
+        let effects = op.next(page(
+            vec![version_entry("dir/first", Ulid::from_bytes([1u8; 16]))],
+            Some(cursor.clone()),
+        ));
+        let Ok(Next::Call(IoCall::Page { after: start, .. })) = &effects else {
             panic!("expected next scope page")
         };
-        assert_eq!(start, &Some(IterStart::After(cursor)));
+        assert_eq!(start, &Some(cursor));
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![version_entry("dir/second", Ulid::from_bytes([2u8; 16]))],
-            next_start_after: None,
-        }));
-        assert!(matches!(effects[0], Effect::SubOperation(_)));
+        let effects = op.next(page(
+            vec![version_entry("dir/second", Ulid::from_bytes([2u8; 16]))],
+            None,
+        ));
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Child(_)))));
         assert_eq!(op.pending_versions.len(), 1);
     }
 
@@ -3484,14 +3456,8 @@ mod tests {
             })
             .collect();
         let cursor = vec![1u8].into();
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: first,
-            next_start_after: Some(cursor),
-        }));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Iter { .. })
-        ));
+        let effects = op.next(page(first, Some(cursor)));
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Page { .. }))));
 
         let second = (512..1024)
             .map(|index| {
@@ -3502,31 +3468,23 @@ mod tests {
             })
             .collect();
         let cursor = vec![2u8].into();
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: second,
-            next_start_after: Some(cursor),
-        }));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Iter { .. })
-        ));
+        let effects = op.next(page(second, Some(cursor)));
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Page { .. }))));
         assert_eq!(op.examined_versions, MAX_SCOPE_VERSIONS);
         assert!(op.pending_versions.is_empty());
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![version_entry(
+        let effects = op.next(page(
+            vec![version_entry(
                 "key-1024",
                 Ulid::from_bytes((MAX_SCOPE_VERSIONS as u128 + 1).to_be_bytes()),
             )],
-            next_start_after: None,
-        }));
-        assert!(effects.is_empty());
-        assert_eq!(op.state, ReplicateScopeState::Error);
+            None,
+        ));
         assert_eq!(
-            op.output,
-            Some(Err(ReplicateScopeError::ScopeLimit {
+            effects,
+            Err(ReplicateScopeError::ScopeLimit {
                 limit: MAX_SCOPE_VERSIONS,
-            }))
+            })
         );
     }
 
@@ -3540,14 +3498,14 @@ mod tests {
         let mut op = ReplicateScopeOperation::new(input).with_source_authorization(authorization);
         op.state = ReplicateScopeState::IterateVersions;
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![version_entry("dir/file.txt", Ulid::from_bytes([1u8; 16]))],
-            next_start_after: None,
-        }));
+        let effects = op.next(page(
+            vec![version_entry("dir/file.txt", Ulid::from_bytes([1u8; 16]))],
+            None,
+        ));
 
         assert_eq!(op.result.last_error, None);
         assert_eq!(op.result.failed, 0);
-        assert!(matches!(effects[0], Effect::SubOperation(_)));
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Child(_)))));
     }
 
     #[test]
@@ -3556,34 +3514,28 @@ mod tests {
             key: "dir/file".to_string(),
         }));
 
-        op.start();
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(bucket_info().to_bytes().unwrap().into()),
-        }));
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: None,
-        }));
-        let Effect::Storage(StorageEffect::Iter { .. }) = &effects[0] else {
+        op.first().unwrap();
+        op.next(row(Some(bucket_info().to_bytes().unwrap().into())))
+            .unwrap();
+        let effects = op.next(row(None));
+        let Ok(Next::Call(IoCall::Page { .. })) = &effects else {
             panic!("expected exact iteration after object miss")
         };
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
+        let effects = op.next(page(
+            vec![
                 version_entry("dir/file-a", Ulid::generate()),
                 version_entry("dir/file/b", Ulid::generate()),
                 version_entry("dir/other", Ulid::generate()),
             ],
-            next_start_after: None,
-        }));
+            None,
+        ));
 
-        assert!(effects.is_empty());
         assert_eq!(op.pending_versions.len(), 0);
         assert_eq!(op.result.replicated, 0);
         assert_eq!(op.result.skipped, 0);
         assert_eq!(op.result.failed, 0);
-        assert_eq!(op.state, ReplicateScopeState::Finish);
+        assert_eq!(effects, Ok(Next::Done(op.result.clone())));
     }
 
     #[test]
@@ -3591,15 +3543,11 @@ mod tests {
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket));
         op.state = ReplicateScopeState::RunVersionReplication;
 
-        op.step(Event::SubOperation(
-            SubOperationEvent::ReplicationItemResult {
-                result: Ok(ReplicationSuboperationResult::ReplicatedBytes(42)),
-            },
-        ));
+        op.accept_item(Ok(ReplicationSuboperationResult::ReplicatedBytes(42)))
+            .unwrap();
 
         assert_eq!(op.result.replicated, 1);
         assert_eq!(op.result.replicated_bytes, 42);
-        assert_eq!(op.state, ReplicateScopeState::Finish);
     }
 
     #[test]
@@ -3616,14 +3564,12 @@ mod tests {
 
         let effects = denied.run_next_replication();
 
-        assert!(effects.is_empty());
-        assert_eq!(denied.state, ReplicateScopeState::Finish);
         assert_eq!(denied.result.failed, 1);
         assert_eq!(
             denied.result.last_error.as_deref(),
             Some("source access denied")
         );
-        assert_eq!(denied.output, Some(Ok(denied.result.clone())));
+        assert_eq!(effects, Ok(Next::Done(denied.result.clone())));
 
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Bucket))
             .with_reference_advance(advance);
@@ -3634,13 +3580,11 @@ mod tests {
 
         let effects = op.run_next_replication();
 
-        assert!(effects.is_empty());
-        assert_eq!(op.state, ReplicateScopeState::Error);
         assert_eq!(
-            op.output,
-            Some(Err(ReplicateScopeError::ReplicateObjectError(
+            effects,
+            Err(ReplicateScopeError::ReplicateObjectError(
                 ReplicateObjectError::InvalidReferenceAdvance,
-            )))
+            ))
         );
     }
 
@@ -3650,74 +3594,50 @@ mod tests {
         let mut op = ReplicateObjectOperation::new(version_request(version_id));
         let location = materialized_location();
 
-        let effects = op.start();
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
+        let effects = op.first();
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Read(_)))));
 
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(
-                materialized_blob_version(&location, None)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
-        }));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
-
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![2u8].into(),
-            value: Some(location.to_bytes().unwrap().into()),
-        }));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
-
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![3u8].into(),
-            value: Some(
-                MultipartObjectSummary {
-                    checksum_type: MultipartChecksumType::Composite,
-                    part_count: 3,
-                    composite_hashes: Default::default(),
-                }
+        let effects = op.next(row(Some(
+            materialized_blob_version(&location, None)
                 .to_bytes()
                 .unwrap()
                 .into(),
-            ),
-        }));
-        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
+        )));
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Read(_)))));
+
+        let effects = op.next(row(Some(location.to_bytes().unwrap().into())));
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Read(_)))));
+
+        let effects = op.next(row(Some(
+            MultipartObjectSummary {
+                checksum_type: MultipartChecksumType::Composite,
+                part_count: 3,
+                composite_hashes: Default::default(),
+            }
+            .to_bytes()
+            .unwrap()
+            .into(),
+        )));
+        let Ok(Next::Call(IoCall::Page { after: start, .. })) = &effects else {
             panic!("expected multipart iter request")
         };
         assert!(start.is_none());
 
         let next_cursor: aruna_core::types::Key = vec![9u8].into();
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
+        let effects = op.next(page(
+            vec![
                 multipart_part_entry(version_id, 2),
                 multipart_part_entry(version_id, 1),
             ],
-            next_start_after: Some(next_cursor.clone()),
-        }));
-        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
+            Some(next_cursor.clone()),
+        ));
+        let Ok(Next::Call(IoCall::Page { after: start, .. })) = &effects else {
             panic!("expected paginated multipart iter request")
         };
-        assert_eq!(start, &Some(IterStart::After(next_cursor.clone())));
+        assert_eq!(start, &Some(next_cursor.clone()));
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![multipart_part_entry(version_id, 3)],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
+        let effects = op.next(page(vec![multipart_part_entry(version_id, 3)], None));
+        assert!(matches!(effects, Ok(Next::Call(IoCall::Read(_)))));
         assert_eq!(op.multipart_parts.len(), 3);
         assert_eq!(op.multipart_parts[0].part_number, 1);
         assert_eq!(op.multipart_parts[1].part_number, 2);
@@ -3730,42 +3650,31 @@ mod tests {
         let mut op = ReplicateObjectOperation::new(version_request(version_id));
         let location = materialized_location();
 
-        op.start();
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(
-                materialized_blob_version(&location, None)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
-        }));
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![2u8].into(),
-            value: Some(location.to_bytes().unwrap().into()),
-        }));
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![3u8].into(),
-            value: Some(
-                MultipartObjectSummary {
-                    checksum_type: MultipartChecksumType::Composite,
-                    part_count: 2,
-                    composite_hashes: Default::default(),
-                }
+        op.first().unwrap();
+        op.next(row(Some(
+            materialized_blob_version(&location, None)
                 .to_bytes()
                 .unwrap()
                 .into(),
-            ),
-        }));
+        )))
+        .unwrap();
+        op.next(row(Some(location.to_bytes().unwrap().into())))
+            .unwrap();
+        op.next(row(Some(
+            MultipartObjectSummary {
+                checksum_type: MultipartChecksumType::Composite,
+                part_count: 2,
+                composite_hashes: Default::default(),
+            }
+            .to_bytes()
+            .unwrap()
+            .into(),
+        )))
+        .unwrap();
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![multipart_part_entry(version_id, 1)],
-            next_start_after: None,
-        }));
-        assert!(effects.is_empty());
-        assert_eq!(op.state, ReplicateObjectState::Error);
+        let effects = op.next(page(vec![multipart_part_entry(version_id, 1)], None));
         assert_eq!(
-            op.result,
+            effects,
             Err(ReplicateObjectError::PartCountMismatch {
                 expected: 2,
                 actual: 1,
