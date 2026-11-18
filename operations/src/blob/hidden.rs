@@ -862,45 +862,41 @@ impl Operation for DeleteUnclaimedOperation {
         )))
     }
 
-async fn commit_txn(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    deadline: Instant,
-) -> Result<(), StorageError> {
-    let event = tokio::time::timeout(
-        time_left(deadline),
-        storage.send_storage_effect(StorageEffect::CommitTransaction { txn_id }),
-    )
-    .await
-    .map_err(|_| StorageError::Timeout)?;
-    match event {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error),
-        _ => Err(StorageError::InvalidEffect),
-    }
-}
-
-async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<(), String> {
-    let event = tokio::time::timeout(
-        SWEEP_IO_TIMEOUT,
-        storage.send_storage_effect(StorageEffect::AbortTransaction { txn_id }),
-    )
-    .await
-    .map_err(|_| "timed out aborting upload cleanup transaction".to_string())?;
-    match event {
-        Event::Storage(StorageEvent::TransactionAborted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected upload cleanup abort event: {}",
-            other.label()
-        )),
+    fn next(&mut self, result: IoResult) -> Turn<RecordCleanup> {
+        match std::mem::replace(&mut self.step, ClaimStep::Deleted) {
+            ClaimStep::Record => {
+                let Some(value) = result.value()? else {
+                    return Ok(Next::Done(RecordCleanup::Missing));
+                };
+                let record: RoCrateUploadRecord =
+                    postcard::from_bytes(value.as_ref()).map_err(failed)?;
+                match record.claimed_by {
+                    Some(job_id) => {
+                        self.step = ClaimStep::Job(Box::new(record));
+                        Ok(Next::Call(read_row(JOB_KEYSPACE, job_record_key(job_id))))
+                    }
+                    None => self.decide(&record, false),
+                }
+            }
+            ClaimStep::Job(record) => {
+                let claimed = job_live(result.value()?)?;
+                self.decide(&record, claimed)
+            }
+            ClaimStep::Deleted => {
+                result.done()?;
+                Ok(Next::Done(RecordCleanup::Deleted))
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::structs::execution::job::{
         ArtifactRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload, JobState,
         RoCrateCheckpointRefs, RoCrateLimits, RoCrateMediaType,
@@ -910,6 +906,8 @@ mod tests {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_storage::FjallStorage;
+    use aruna_storage::StorageHandle;
+    use byteview::ByteView;
     use serde::Serialize;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -1046,8 +1044,84 @@ mod tests {
         )
     }
 
-    fn deadline() -> Instant {
-        Instant::now() + SWEEP_BUDGET
+    async fn is_protected(
+        context: &DriverContext,
+        key: &HiddenBlobKey,
+        now_ms: u64,
+    ) -> Result<bool, MigrationError> {
+        drive(IsProtectedOperation::new(key.clone(), now_ms), context).await
+    }
+
+    async fn delete_unclaimed(
+        context: &DriverContext,
+        upload_id: Ulid,
+        now_ms: u64,
+    ) -> Result<RecordCleanup, MigrationError> {
+        drive(DeleteUnclaimedOperation::new(upload_id, now_ms), context).await
+    }
+
+    async fn sweep_uploads(
+        context: &DriverContext,
+        now_ms: u64,
+    ) -> Result<(usize, bool, bool), MigrationError> {
+        let scope = PageScope {
+            after: None,
+            now_ms,
+            started_ms: unix_timestamp_millis(),
+        };
+        let pass = drive(UploadsPageOperation::new(scope), context).await?;
+        Ok((pass.deleted, pass.next.is_some(), pass.pending))
+    }
+
+    async fn sweep_at(context: &DriverContext, now_ms: u64) -> Result<HiddenSweepOutcome, String> {
+        drive(ProcessHiddenOperation::new(now_ms), context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn load_cursor(context: &DriverContext) -> SweepCursor {
+        let read = StorageEffect::Read {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: HIDDEN_CURSOR_KEY.to_vec().into(),
+            txn_id: None,
+        };
+        match context.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                decode_cursor(value).expect("cursor decodes")
+            }
+            other => panic!("unexpected cursor read: {}", other.label()),
+        }
+    }
+
+    #[test]
+    fn missing_blob_handle_named() {
+        let mut delete = DeleteHiddenOperation::of_key(
+            HiddenBlobKey::new(
+                aruna_core::structs::storage::blob::BackendRef::node_default(),
+                "/data".to_string(),
+                "storage".to_string(),
+                format!("_jobs/{}/artifact_01", Ulid::from_bytes([7u8; 16])),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(delete.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+        let answer = delete.next(IoResult::Event(Box::new(missing)));
+        assert_eq!(answer, Err(no_blob_handle()));
+    }
+
+    #[test]
+    fn missing_upload_unclaimed() {
+        let mut claim = DeleteUnclaimedOperation::new(Ulid::from_bytes([1; 16]), 5);
+        assert!(matches!(claim.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = claim.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Ok(Next::Done(RecordCleanup::Missing)));
+    }
+
+    #[test]
+    fn expired_budget_stops() {
+        assert!(within_budget(0).is_err());
+        assert!(within_budget(unix_timestamp_millis()).is_ok());
     }
 
     fn hidden_location(namespace: Ulid, name: &str) -> BackendLocation {
@@ -1112,16 +1186,15 @@ mod tests {
     }
 
     async fn stored_upload(storage: &StorageHandle, upload_id: Ulid) -> bool {
-        read_value(
-            storage,
-            ROCRATE_UPLOAD_KEYSPACE,
-            ByteView::from(upload_id.to_bytes().to_vec()),
-            None,
-            deadline(),
-        )
-        .await
-        .expect("read upload")
-        .is_some()
+        let read = StorageEffect::Read {
+            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            key: upload_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        match storage.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
+            other => panic!("unexpected upload read: {}", other.label()),
+        }
     }
 
     // A kept copy is protected only while its attachment or cache entry names exactly it.
@@ -1151,17 +1224,9 @@ mod tests {
         );
         let cached = HiddenBlobKey::try_from(&cached).expect("hidden key");
 
-        assert!(is_protected(&context, &key, 0, deadline()).await.unwrap());
-        assert!(
-            !is_protected(&context, &leftover, 0, deadline())
-                .await
-                .unwrap()
-        );
-        assert!(
-            !is_protected(&context, &cached, 0, deadline())
-                .await
-                .unwrap()
-        );
+        assert!(is_protected(&context, &key, 0).await.unwrap());
+        assert!(!is_protected(&context, &leftover, 0).await.unwrap());
+        assert!(!is_protected(&context, &cached, 0).await.unwrap());
     }
 
     #[tokio::test]
@@ -1179,13 +1244,9 @@ mod tests {
         )
         .await;
 
+        assert!(is_protected(&context, &key, 9).await.expect("live upload"));
         assert!(
-            is_protected(&context, &key, 9, deadline())
-                .await
-                .expect("live upload")
-        );
-        assert!(
-            !is_protected(&context, &key, 10, deadline())
+            !is_protected(&context, &key, 10)
                 .await
                 .expect("expired upload")
         );
@@ -1209,12 +1270,12 @@ mod tests {
         .await;
 
         assert!(
-            is_protected(&context, &key, 9, deadline())
+            is_protected(&context, &key, 9)
                 .await
                 .expect("recorded blob")
         );
         assert!(
-            !is_protected(&context, &sibling, 9, deadline())
+            !is_protected(&context, &sibling, 9)
                 .await
                 .expect("unrecorded blob")
         );
@@ -1241,7 +1302,7 @@ mod tests {
         .await;
 
         assert!(
-            is_protected(&context, &scratch, 0, deadline())
+            is_protected(&context, &scratch, 0)
                 .await
                 .expect("running job")
         );
@@ -1257,12 +1318,12 @@ mod tests {
         .await;
 
         assert!(
-            is_protected(&context, &key, 0, deadline())
+            is_protected(&context, &key, 0)
                 .await
                 .expect("published artifact")
         );
         assert!(
-            !is_protected(&context, &scratch, 0, deadline())
+            !is_protected(&context, &scratch, 0)
                 .await
                 .expect("finished scratch blob")
         );
@@ -1282,21 +1343,21 @@ mod tests {
         .await;
 
         assert_eq!(
-            delete_unclaimed(&context.storage_handle, upload_id, 9, deadline())
+            delete_unclaimed(&context, upload_id, 9)
                 .await
                 .expect("live record"),
             RecordCleanup::Protected
         );
         assert!(stored_upload(&context.storage_handle, upload_id).await);
         assert_eq!(
-            delete_unclaimed(&context.storage_handle, upload_id, 10, deadline())
+            delete_unclaimed(&context, upload_id, 10)
                 .await
                 .expect("expired record"),
             RecordCleanup::Deleted
         );
         assert!(!stored_upload(&context.storage_handle, upload_id).await);
         assert_eq!(
-            delete_unclaimed(&context.storage_handle, upload_id, 10, deadline())
+            delete_unclaimed(&context, upload_id, 10)
                 .await
                 .expect("absent record"),
             RecordCleanup::Missing
@@ -1328,7 +1389,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            delete_unclaimed(&context.storage_handle, upload_id, 10, deadline())
+            delete_unclaimed(&context, upload_id, 10)
                 .await
                 .expect("claimed by a running job"),
             RecordCleanup::Protected
@@ -1343,7 +1404,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            delete_unclaimed(&context.storage_handle, upload_id, 10, deadline())
+            delete_unclaimed(&context, upload_id, 10)
                 .await
                 .expect("claimed by a finished job"),
             RecordCleanup::Deleted
@@ -1365,8 +1426,7 @@ mod tests {
         )
         .await;
 
-        let mut cursor = None;
-        let outcome = sweep_uploads(&mismatched, 10, &mut cursor, deadline())
+        let outcome = sweep_uploads(&mismatched, 10)
             .await
             .expect("scan completes");
         assert_eq!(outcome, (0, false, true));
@@ -1383,13 +1443,7 @@ mod tests {
             record,
         )
         .await;
-        let mut cursor = None;
-        assert!(
-            sweep_uploads(&keyed, 10, &mut cursor, deadline())
-                .await
-                .expect("scan completes")
-                .2
-        );
+        assert!(sweep_uploads(&keyed, 10).await.expect("scan completes").2);
         assert!(
             !stored_upload(&keyed.storage_handle, victim).await,
             "a correctly keyed stale row is claimed"
@@ -1404,10 +1458,7 @@ mod tests {
         let first = sweep_at(&context, 0).await.expect("cleanup phase");
         assert!(first.cleanup_pending, "the cycle is unfinished");
         assert!(matches!(
-            load_cursor(&context.storage_handle, deadline())
-                .await
-                .expect("cursor")
-                .phase,
+            load_cursor(&context).await.phase,
             SweepPhase::Uploads
         ));
 
@@ -1415,10 +1466,7 @@ mod tests {
         assert_eq!(second.uploads_deleted, 0);
         assert!(second.cleanup_pending);
         assert!(matches!(
-            load_cursor(&context.storage_handle, deadline())
-                .await
-                .expect("cursor")
-                .phase,
+            load_cursor(&context).await.phase,
             SweepPhase::Hidden
         ));
 
@@ -1427,10 +1475,7 @@ mod tests {
             .expect_err("the hidden phase needs a blob adapter");
         assert!(error.contains("blob handle"), "{error}");
         assert!(matches!(
-            load_cursor(&context.storage_handle, deadline())
-                .await
-                .expect("cursor")
-                .phase,
+            load_cursor(&context).await.phase,
             SweepPhase::Hidden
         ));
     }
