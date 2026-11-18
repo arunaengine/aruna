@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::auth::REALMS_LIST_KEY;
 use aruna_core::metadata::{MetadataError, REGISTRY_CANDIDATE_LIMIT};
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::realm::RealmId;
@@ -24,11 +23,8 @@ use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
-use jsonwebtoken::DecodingKey;
-use tracing::warn;
 use ulid::Ulid;
 
-use self::peer_auth::load_auth_state;
 use super::contact::PeerContacts;
 use super::materialization_queue::metadata_graph_fence;
 use super::profile::cache::ProfileCache;
@@ -40,6 +36,8 @@ use crate::auth::error::ArunaBearerError;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::sync::mirror_repair::RECONCILE_GRACE;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::TokenClaims;
 
 mod effects;
 pub use self::effects::{export_rocrate_jsonld, send_metadata_effect};

@@ -19,13 +19,13 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use std::sync::Arc;
 
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::metadata::audit::{
     AUDIT_INBOUND_ADMISSION, AUDIT_OUTBOUND_ADMISSION, AUDIT_PAGE_LIMIT, AUDIT_PAGE_SIZE,
     AuditAggregate, ListAuditError, ListAuditOperation, ListAuditRequest, LocalPageOperation,
     decode_cursor,
 };
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::document_repository::GetConfigOperation;
 use crate::realm::load_config::config_unavailable;
 
 /// Gathers the group's audit trail from every eligible realm node and merges the
@@ -55,9 +55,14 @@ pub async fn list_audit(
     let mut digest_ready = false;
     let mut include_local = false;
     let mut user_origin = false;
-    let config = tokio::time::timeout_at(deadline, async { drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok() })
-        .await
-        .map_err(|_| ListAuditError::Unavailable)?;
+    let config = tokio::time::timeout_at(deadline, async {
+        drive(GetConfigOperation::new(realm_id), context)
+            .await
+            .inspect_err(config_unavailable)
+            .ok()
+    })
+    .await
+    .map_err(|_| ListAuditError::Unavailable)?;
     match config {
         None => partial = true,
         Some(config) => {
@@ -175,10 +180,15 @@ async fn local_audit_result(
         return Err(MetadataReadError::Unavailable);
     }
     validate_request(&request).map_err(|_| MetadataReadError::Unavailable)?;
-    let config = tokio::time::timeout_at(deadline, async { drive(GetConfigOperation::new(realm_id), context.as_ref()).await.inspect_err(config_unavailable).ok() })
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?
-        .ok_or(MetadataReadError::Unavailable)?;
+    let config = tokio::time::timeout_at(deadline, async {
+        drive(GetConfigOperation::new(realm_id), context.as_ref())
+            .await
+            .inspect_err(config_unavailable)
+            .ok()
+    })
+    .await
+    .map_err(|_| MetadataReadError::Unavailable)?
+    .ok_or(MetadataReadError::Unavailable)?;
     if config.digest().ok() != Some(request.config_digest) {
         return Err(MetadataReadError::Unavailable);
     }
@@ -232,7 +242,16 @@ pub(super) async fn authorize_admin(
     auth_context: AuthContext,
     path: String,
 ) -> Result<(), MetadataReadError> {
-    match drive(AuthorizeOperation::new(auth_context.realm_id, &auth_context, &path, &Permission::WRITE, PolicyRequestExtras::rest()), context.as_ref())
+    match drive(
+        AuthorizeOperation::new(
+            auth_context.realm_id,
+            &auth_context,
+            &path,
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
+        context.as_ref(),
+    )
     .await
     {
         Ok(()) => Ok(()),

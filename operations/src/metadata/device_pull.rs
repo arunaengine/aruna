@@ -29,15 +29,18 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::distribution::routing::{bound_view, route_write};
 use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::realm::load_config::config_unavailable;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::peer_acts_for;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
@@ -50,9 +53,6 @@ use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::staging::bucket_guard::BucketGuardOperation;
 use crate::staging::offered_directory::OfferedDirectoryError;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 /// Pulls this node is running, by receipt key. The registry lives as long as the process, so a
 /// restart forgets a running pull and the device asks for it again.
@@ -341,7 +341,10 @@ pub(crate) async fn authorize_peer(
             WritePeerError::Unauthorized => SyncRefusal::Unauthorized,
             WritePeerError::Unavailable(_) => SyncRefusal::Unavailable,
         })?;
-    let config = drive(GetConfigOperation::new(auth.realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(auth.realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(SyncRefusal::Unavailable)?;
     match peer_acts_for(&config, peer, auth.user_id) {
         true => Ok(auth),
@@ -420,7 +423,16 @@ pub(crate) async fn authorize_pull(
     permission: Permission,
     operation: &'static str,
 ) -> Result<(), SyncRefusal> {
-    drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, PolicyRequestExtras::operation(operation)), context)
+    drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &path,
+            &permission,
+            PolicyRequestExtras::operation(operation),
+        ),
+        context,
+    )
     .await
     .map_err(pull_refusal)
 }
@@ -522,7 +534,10 @@ async fn commit_pull(
     )
     .await
     .map_err(|_| SyncRefusal::Unavailable)?;
-    let quota = drive(GetConfigOperation::new(auth.realm_id), context).await.inspect_err(config_unavailable).ok()
+    let quota = drive(GetConfigOperation::new(auth.realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .and_then(|config| config.quota.effective_group_ceiling(&bucket.group_id));
     let operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
@@ -846,7 +861,10 @@ async fn holder_heads(
     (snapshot, range): (&DistributionSnapshot, &KeyRange),
     listing: SetListing,
 ) -> Result<SyncVersionPage, SyncRefusal> {
-    let config = drive(GetConfigOperation::new(auth.realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(auth.realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(SyncRefusal::Unavailable)?;
     let device = node_kind(&config, peer).is_some_and(|kind| kind.owner().is_some());
     let local = local_node(context)?;
