@@ -109,6 +109,7 @@ pub mod read_types;
 pub(crate) mod readable;
 pub mod references;
 pub mod search;
+pub mod search_fanout;
 pub mod search_types;
 pub(crate) mod title;
 

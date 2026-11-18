@@ -20,7 +20,7 @@ use aruna_operations::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
 };
 use aruna_operations::metadata::api::references::ReferencesOperation;
-use aruna_operations::metadata::api::search::search_metadata;
+use aruna_operations::metadata::api::search_fanout::search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
@@ -264,22 +264,25 @@ impl McpServer {
         let group_id = input.group_id.as_deref().map(parse_group).transpose()?;
         // As in REST, a group filter only narrows the hits, each checked for the caller.
         metadata_probe(self, &auth, "search_datasets", extras).await?;
-        let result = search_metadata(
+        let result = drive(
+            search_metadata(
+                self.state.get_realm_id(),
+                self.state.get_node_id(),
+                MetadataSearchRequest {
+                    auth: Some(auth),
+                    bearer_token: request_bearer(&parts)
+                        .map(|carrier| carrier.as_str().to_string()),
+                    graph_iris: None,
+                    query: input.q,
+                    conforms_to: input.conforms_to,
+                    group_id,
+                    limit: input.limit,
+                    cursor: None,
+                    mode: None,
+                    target_nodes: None,
+                },
+            ),
             self.state.get_ctx().as_ref(),
-            self.state.get_realm_id(),
-            self.state.get_node_id(),
-            MetadataSearchRequest {
-                auth: Some(auth),
-                bearer_token: request_bearer(&parts).map(|carrier| carrier.as_str().to_string()),
-                graph_iris: None,
-                query: input.q,
-                conforms_to: input.conforms_to,
-                group_id,
-                limit: input.limit,
-                cursor: None,
-                mode: None,
-                target_nodes: None,
-            },
         )
         .await
         .map_err(crate::metadata::map_api_error)

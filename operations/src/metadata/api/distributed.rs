@@ -1,19 +1,13 @@
-//! Runs metadata queries and searches across realm nodes and merges the results.
+//! Notes node results of metadata fanouts on their spans and plans ordered partition queries.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::super::handle::QUERY_MAX_BYTES;
 use super::distributed_types::query_select_limit;
-use super::fanout::run_metadata_fanout;
 use super::{
-    Arc, AuthContext, BucketPage, GroupId, HashMap, Instant, MAX_PAGINATION_DEPTH,
-    MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats,
-    MetadataNodeCall, MetadataQueryResults, MetadataReadError, MetadataSearchHit, NodeId,
-    NodeSearchResult, QUERY_MAX_ROWS, RealmId, SearchPageCursor, SearchWatermark, Span,
-    fanout_bearer, field, map_read_error, merge_search_hits, metadata_node_call, paginate,
-    record_elapsed_ms, resume_fetch_limit,
+    BucketPage, MetadataApiError, MetadataQueryResults, MetadataReadError, MetadataSearchHit,
+    QUERY_MAX_ROWS, Span,
 };
-use crate::driver::DriverContext;
 
 pub(super) fn record_bucket_result(span: &Span, result: &Result<BucketPage, MetadataReadError>) {
     match result {
@@ -54,174 +48,6 @@ pub(super) fn record_search_node(
             span.record("result", "error");
         }
     }
-}
-
-#[tracing::instrument(
-    name = "metadata.operation.search_distributed",
-    level = "debug",
-    skip(context, auth, bearer_token, query, resume, watermark, scope),
-    fields(
-        mode = ?scope.mode,
-        query_len = query.len() as u64,
-        page_size = page_size as u64,
-        graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
-        node_count = field::Empty,
-        discovery_ms = field::Empty,
-        elapsed_ms = field::Empty,
-        hit_count = field::Empty,
-    )
-)]
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_search_distributed(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    auth: Option<AuthContext>,
-    bearer_token: Option<String>,
-    graph_iris: Option<Vec<String>>,
-    query: String,
-    conforms_to: Option<String>,
-    group_id: Option<GroupId>,
-    resume: HashMap<NodeId, u32>,
-    watermark: Option<SearchWatermark>,
-    page_size: usize,
-    scope: MetadataFanoutScope,
-) -> Result<
-    (
-        Vec<MetadataSearchHit>,
-        Option<SearchPageCursor>,
-        bool,
-        MetadataFanoutStats,
-    ),
-    MetadataApiError,
-> {
-    let span = Span::current();
-    let total_started = Instant::now();
-    let handle = context
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    let remote_auth_token = fanout_bearer(bearer_token.as_deref());
-    let resume = Arc::new(resume);
-
-    let local_call: MetadataNodeCall<(Vec<MetadataSearchHit>, usize)> = metadata_node_call(
-        (
-            context.clone(),
-            auth.clone(),
-            graph_iris.clone(),
-            query.clone(),
-            conforms_to.clone(),
-            group_id,
-            resume.clone(),
-            page_size,
-        ),
-        |(context, auth, graph_iris, query, conforms_to, group_id, resume, page_size), node_id| async move {
-            let limit = resume_fetch_limit(&resume, node_id, page_size, MAX_PAGINATION_DEPTH);
-            let hits = match conforms_to {
-                Some(object_iri) => {
-                    let mut hits = Vec::new();
-                    for object_iri in
-                        crate::metadata::profile::validation::equivalent_profile_iris(&object_iri)
-                    {
-                        hits.extend(
-                            crate::metadata::search_local_filtered(
-                                &context,
-                                auth.clone(),
-                                graph_iris.clone(),
-                                query.clone(),
-                                limit,
-                                aruna_core::entity_patch::DCTERMS_CONFORMS_IRI.to_string(),
-                                object_iri,
-                                group_id,
-                            )
-                            .await
-                            .map_err(crate::metadata::protocol::metadata_read_error)?,
-                        );
-                    }
-                    merge_search_hits(hits).into_iter().take(limit).collect()
-                }
-                None => crate::metadata::search_authorized_local(
-                    &context, auth, graph_iris, query, limit, group_id,
-                )
-                .await
-                .map_err(crate::metadata::protocol::metadata_read_error)?,
-            };
-            Ok((hits, limit))
-        },
-    );
-    let remote_call: MetadataNodeCall<(Vec<MetadataSearchHit>, usize)> = metadata_node_call(
-        (
-            handle.clone(),
-            remote_auth_token.clone(),
-            graph_iris.clone(),
-            query.clone(),
-            conforms_to,
-            group_id,
-            resume.clone(),
-            page_size,
-        ),
-        |(handle, auth_token, graph_iris, query, conforms_to, group_id, resume, page_size),
-         node_id| async move {
-            let limit = resume_fetch_limit(&resume, node_id, page_size, MAX_PAGINATION_DEPTH);
-            let hits = match conforms_to {
-                Some(object_iri) => {
-                    let mut hits = Vec::new();
-                    for object_iri in
-                        crate::metadata::profile::validation::equivalent_profile_iris(&object_iri)
-                    {
-                        hits.extend(
-                            handle
-                                .search_remote_filtered(
-                                    node_id,
-                                    auth_token.clone(),
-                                    graph_iris.clone(),
-                                    query.clone(),
-                                    limit,
-                                    aruna_core::entity_patch::DCTERMS_CONFORMS_IRI.to_string(),
-                                    object_iri,
-                                    group_id,
-                                )
-                                .await?,
-                        );
-                    }
-                    merge_search_hits(hits).into_iter().take(limit).collect()
-                }
-                None => {
-                    handle
-                        .search_remote_graphs(
-                            node_id, auth_token, graph_iris, query, limit, group_id,
-                        )
-                        .await?
-                }
-            };
-            Ok((hits, limit))
-        },
-    );
-    let (node_parts, fanout_stats) = run_metadata_fanout(
-        context,
-        realm_id,
-        local_node_id,
-        scope,
-        MetadataFanoutOperation::Search,
-        local_call,
-        remote_call,
-        record_search_node,
-        map_read_error,
-    )
-    .await?;
-
-    let node_results = node_parts
-        .into_iter()
-        .map(|(node_id, (hits, requested))| NodeSearchResult {
-            node_id,
-            saturated: hits.len() >= requested,
-            hits,
-        })
-        .collect();
-    let page = paginate(node_results, watermark, page_size, MAX_PAGINATION_DEPTH);
-    span.record("hit_count", page.hits.len() as u64);
-    record_elapsed_ms(&span, "elapsed_ms", total_started);
-    Ok((page.hits, page.next, page.truncated, fanout_stats))
 }
 
 /// Returns the query each partition runs, ordered by its `ORDER BY` keys, every other projected

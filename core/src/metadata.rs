@@ -1364,6 +1364,10 @@ pub enum MetadataEffect {
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
+        /// Only documents of this group.
+        group_id: Option<GroupId>,
+        /// Only entities that conform to this profile IRI.
+        conforms_to: Option<String>,
     },
     QueryGraphs {
         auth_context: Option<AuthContext>,

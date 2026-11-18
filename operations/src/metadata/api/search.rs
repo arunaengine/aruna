@@ -5,28 +5,25 @@
 use super::fanout::run_metadata_fanout;
 use super::preflight::discover_realm_nodes;
 use super::search_types::{
-    MetadataSearchExecution, MetadataSearchRequest, ObjectCursor, ObjectCursorPartition,
-    ObjectCursorPayload, ObjectExecution, ObjectPartitionCoverage, ObjectPartitionState,
-    ObjectQueryMode, PendingBucket, RangeLayout, SearchQueryRequest,
+    ObjectCursor, ObjectCursorPartition, ObjectCursorPayload, ObjectExecution,
+    ObjectPartitionCoverage, ObjectPartitionState, ObjectQueryMode, PendingBucket, RangeLayout,
+    SearchQueryRequest,
 };
 use super::{
-    ApiQueryMode, AuthContext, BlobHeadKey, CursorEnvelopeError, DISTRIBUTED_QUERY_DEADLINE,
-    HashMap, HashSet, MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope,
-    MetadataFanoutStats, MetadataNodeCall, MetadataReadError, NodeId, ObjectKeyMatch,
-    QUERY_MAX_NODES, RealmId, RealmNodeDiscovery, SearchCursor, SearchCursorError, SearchNodePage,
-    SearchObjectsInput, SignedCursor, SystemTime, deduplicate_fanout_nodes, fanout_bearer,
-    map_read_error, metadata_node_call, object_search_fingerprint, query_fingerprint,
-    record_object_result, select_fanout_nodes,
+    AuthContext, BlobHeadKey, CursorEnvelopeError, DISTRIBUTED_QUERY_DEADLINE, HashMap, HashSet,
+    MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats,
+    MetadataNodeCall, MetadataReadError, NodeId, ObjectKeyMatch, QUERY_MAX_NODES, RealmId,
+    RealmNodeDiscovery, SearchNodePage, SearchObjectsInput, SignedCursor, SystemTime,
+    deduplicate_fanout_nodes, fanout_bearer, map_read_error, metadata_node_call,
+    object_search_fingerprint, record_object_result, select_fanout_nodes,
 };
 use crate::driver::DriverContext;
 use crate::s3::object::search_scan::SearchObjectsOperation;
 use aruna_core::cursor::OBJECT_CURSOR_CONTEXT;
 
-use super::distributed::run_search_distributed;
 use crate::distribution::feed_walks::IndexProgress;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::drive;
-use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
 use crate::realm::load_config::config_unavailable;
 use crate::s3::object::search_scan::changed_until;
 
@@ -810,163 +807,4 @@ fn incomplete_reason(
         reason.push_str(&format!("; about {pending} keys are still to be indexed"));
     }
     reason
-}
-
-pub async fn search_metadata(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    mut request: MetadataSearchRequest,
-) -> Result<MetadataSearchExecution, MetadataApiError> {
-    let deadline = tokio::time::Instant::now() + DISTRIBUTED_QUERY_DEADLINE;
-    if request.query.trim().is_empty() && request.conforms_to.is_none() {
-        return Err(MetadataApiError::BadRequest);
-    }
-    if request
-        .conforms_to
-        .as_deref()
-        .is_some_and(|iri| oxrdf::NamedNode::new(iri).is_err())
-    {
-        return Err(MetadataApiError::BadRequest);
-    }
-    if let Some(iri) = request.conforms_to.take() {
-        request.conforms_to = crate::metadata::profile::validation::equivalent_profile_iris(&iri)
-            .into_iter()
-            .next();
-    }
-    let page_size = request
-        .limit
-        .unwrap_or(SEARCH_PAGE_SIZE)
-        .clamp(1, SEARCH_MAX_PAGE);
-
-    let fingerprint = query_fingerprint(
-        &request.query,
-        request.graph_iris.as_deref(),
-        request.mode,
-        request.conforms_to.as_deref(),
-        request.group_id,
-    );
-    let mut cursor_discovery = None;
-    let (watermark, resume) = match request.cursor.as_deref() {
-        Some(raw) => {
-            // Check the full realm because capped fan-out may omit the cursor's signer.
-            let signer_nodes = match request.mode.unwrap_or(ApiQueryMode::Distributed) {
-                ApiQueryMode::Local => vec![local_node_id],
-                ApiQueryMode::Distributed => match request.target_nodes.as_ref() {
-                    Some(nodes) => {
-                        let mut signers = nodes.clone();
-                        signers.push(local_node_id);
-                        signers
-                    }
-                    None => {
-                        let discovery = tokio::time::timeout_at(
-                            deadline,
-                            discover_realm_nodes(context, realm_id, local_node_id),
-                        )
-                        .await
-                        .unwrap_or(RealmNodeDiscovery {
-                            nodes: vec![local_node_id],
-                            failed: true,
-                        });
-                        let mut signers = discovery.nodes.clone();
-                        signers.push(local_node_id);
-                        let nodes =
-                            select_fanout_nodes(&discovery.nodes, local_node_id, &fingerprint);
-                        let mut discovery = discovery;
-                        discovery.nodes = nodes;
-                        cursor_discovery = Some(discovery);
-                        signers
-                    }
-                },
-            };
-            let cursor = SearchCursor::decode(raw, &signer_nodes)
-                .map_err(|error| MetadataApiError::InvalidCursor(error.to_string()))?;
-            if cursor.fingerprint != fingerprint {
-                return Err(MetadataApiError::InvalidCursor(
-                    SearchCursorError::QueryMismatch.to_string(),
-                ));
-            }
-            (
-                Some(cursor.payload.watermark.clone()),
-                cursor.resume_positions(),
-            )
-        }
-        None => (None, HashMap::new()),
-    };
-
-    // Keep resumed nodes in the bounded selection so remaining hits are not
-    // silently discarded when discovery changes.
-    let (target_nodes, discovery_failed) = if request.cursor.is_some() {
-        let mut nodes = match request.target_nodes.as_ref() {
-            Some(nodes) => select_fanout_nodes(nodes, local_node_id, &fingerprint),
-            None => match request.mode.unwrap_or(ApiQueryMode::Distributed) {
-                ApiQueryMode::Local => vec![local_node_id],
-                ApiQueryMode::Distributed => cursor_discovery
-                    .as_ref()
-                    .map(|discovery| discovery.nodes.clone())
-                    .unwrap_or_else(|| vec![local_node_id]),
-            },
-        };
-        for node_id in resume.keys() {
-            if !nodes.contains(node_id) {
-                nodes.push(*node_id);
-            }
-        }
-        (
-            Some(deduplicate_fanout_nodes(nodes)),
-            cursor_discovery
-                .as_ref()
-                .is_some_and(|discovery| discovery.failed),
-        )
-    } else {
-        (request.target_nodes.take(), false)
-    };
-
-    let (hits, next, truncated, fanout_stats) = run_search_distributed(
-        context,
-        realm_id,
-        local_node_id,
-        request.auth,
-        request.bearer_token,
-        request.graph_iris,
-        request.query,
-        request.conforms_to,
-        request.group_id,
-        resume,
-        watermark,
-        page_size,
-        MetadataFanoutScope::new(request.mode, target_nodes, true)
-            .with_subject(fingerprint)
-            .with_discovery_failed(discovery_failed)
-            .with_deadline(deadline),
-    )
-    .await?;
-    let next_cursor = match next {
-        Some(cursor) => {
-            let net = context.net_handle.as_ref().ok_or_else(|| {
-                MetadataApiError::Internal(
-                    "net handle unavailable for search cursor signing".to_string(),
-                )
-            })?;
-            Some(
-                SearchCursor::new_signed(
-                    fingerprint,
-                    cursor.watermark,
-                    cursor.resume,
-                    net.node_id(),
-                    |bytes| net.sign(bytes),
-                )
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-                .encode()
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?,
-            )
-        }
-        None => None,
-    };
-    Ok(MetadataSearchExecution {
-        hits,
-        next_cursor,
-        truncated,
-        fanout_stats,
-    })
 }

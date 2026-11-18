@@ -10,7 +10,7 @@ use super::{
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::feed_walks::IndexProgress;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataSearchRequest {
     pub auth: Option<AuthContext>,
     pub bearer_token: Option<String>,
@@ -24,7 +24,7 @@ pub struct MetadataSearchRequest {
     pub target_nodes: Option<Vec<NodeId>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetadataSearchExecution {
     pub hits: Vec<MetadataSearchHit>,
     pub next_cursor: Option<String>,

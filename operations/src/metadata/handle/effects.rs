@@ -175,17 +175,36 @@ async fn run_effect(
             graph_iris,
             query,
             limit,
+            group_id,
+            conforms_to,
         } => {
-            match super::search::search_authorized_local(
-                context,
-                auth_context,
-                graph_iris,
-                query,
-                limit,
-                None,
-            )
-            .await
-            {
+            let searched = match conforms_to {
+                Some(object_iri) => {
+                    super::search::search_local_filtered(
+                        context,
+                        auth_context,
+                        graph_iris,
+                        query,
+                        limit,
+                        aruna_core::entity_patch::DCTERMS_CONFORMS_IRI.to_string(),
+                        object_iri,
+                        group_id,
+                    )
+                    .await
+                }
+                None => {
+                    super::search::search_authorized_local(
+                        context,
+                        auth_context,
+                        graph_iris,
+                        query,
+                        limit,
+                        group_id,
+                    )
+                    .await
+                }
+            };
+            match searched {
                 Ok(hits) => MetadataEvent::SearchResult { hits },
                 Err(error) => MetadataEvent::Error {
                     graph_iri: None,

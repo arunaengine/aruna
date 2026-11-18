@@ -24,7 +24,7 @@ use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::preflight::load_realm_nodes;
 use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
 use aruna_operations::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
-use aruna_operations::metadata::api::search::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::search_fanout::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::testing::sign_token;
 use aruna_operations::testing::test_context;
@@ -2352,22 +2352,24 @@ async fn search_cluster_page(
         .iter()
         .map(|node| node.net.node_id())
         .collect();
-    run_search_metadata(
+    drive(
+        run_search_metadata(
+            coordinator.state.get_realm_id(),
+            coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(cluster.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: query.to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(limit),
+                cursor,
+                mode: Some(ApiQueryMode::Distributed),
+                target_nodes: Some(target_nodes),
+            },
+        ),
         ctx.as_ref(),
-        coordinator.state.get_realm_id(),
-        coordinator.state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(cluster.auth.clone()),
-            bearer_token: None,
-            graph_iris: None,
-            query: query.to_string(),
-            conforms_to: None,
-            group_id: None,
-            limit: Some(limit),
-            cursor,
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(target_nodes),
-        },
     )
     .await
     .unwrap()
@@ -2473,22 +2475,24 @@ async fn search_cluster_group(
         .iter()
         .map(|node| node.net.node_id())
         .collect();
-    run_search_metadata(
+    drive(
+        run_search_metadata(
+            coordinator.state.get_realm_id(),
+            coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(cluster.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: query.to_string(),
+                conforms_to: None,
+                group_id,
+                limit: Some(50),
+                cursor: None,
+                mode: Some(ApiQueryMode::Distributed),
+                target_nodes: Some(target_nodes),
+            },
+        ),
         ctx.as_ref(),
-        coordinator.state.get_realm_id(),
-        coordinator.state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(cluster.auth.clone()),
-            bearer_token: None,
-            graph_iris: None,
-            query: query.to_string(),
-            conforms_to: None,
-            group_id,
-            limit: Some(50),
-            cursor: None,
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(target_nodes),
-        },
     )
     .await
     .unwrap()
@@ -2580,22 +2584,24 @@ async fn discovery_failure_partial() {
         ..ctx.as_ref().clone()
     };
 
-    let result = run_search_metadata(
+    let result = drive(
+        run_search_metadata(
+            test.state.get_realm_id(),
+            test.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(test.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: "Discovery".to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(10),
+                cursor: None,
+                mode: Some(ApiQueryMode::Distributed),
+                target_nodes: None,
+            },
+        ),
         &no_net_ctx,
-        test.state.get_realm_id(),
-        test.state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(test.auth.clone()),
-            bearer_token: None,
-            graph_iris: None,
-            query: "Discovery".to_string(),
-            conforms_to: None,
-            group_id: None,
-            limit: Some(10),
-            cursor: None,
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: None,
-        },
     )
     .await
     .unwrap();
@@ -4211,22 +4217,24 @@ async fn search_remote_paths(
     bearer_token: Option<ValidatedBearer>,
 ) -> SearchPathsResult {
     let ctx = test.coordinator.state.get_ctx();
-    let result = run_search_metadata(
+    let result = drive(
+        run_search_metadata(
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataSearchRequest {
+                auth,
+                bearer_token: bearer_token_string(bearer_token),
+                graph_iris: None,
+                query: "Remote".to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(10),
+                cursor: None,
+                mode: Some(ApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+            },
+        ),
         ctx.as_ref(),
-        test.coordinator.state.get_realm_id(),
-        test.coordinator.state.get_node_id(),
-        MetadataSearchRequest {
-            auth,
-            bearer_token: bearer_token_string(bearer_token),
-            graph_iris: None,
-            query: "Remote".to_string(),
-            conforms_to: None,
-            group_id: None,
-            limit: Some(10),
-            cursor: None,
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(vec![test.remote.net.node_id()]),
-        },
     )
     .await
     .unwrap();

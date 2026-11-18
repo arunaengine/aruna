@@ -16,9 +16,8 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::metadata::api::fanout::search_buckets_distributed;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
-use aruna_operations::metadata::api::search::{
-    search_metadata as run_search_metadata, search_objects,
-};
+use aruna_operations::metadata::api::search::search_objects;
+use aruna_operations::metadata::api::search_fanout::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
     ObjectExecution, ObjectQueryMode, SearchQueryRequest,
@@ -1057,22 +1056,24 @@ async fn run_documents(
         return Ok(None);
     }
     let ctx = state.get_ctx();
-    let result = run_search_metadata(
+    let result = drive(
+        run_search_metadata(
+            state.get_realm_id(),
+            state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(auth.clone()),
+                bearer_token,
+                graph_iris: None,
+                query: query.to_string(),
+                conforms_to,
+                group_id,
+                limit: Some(limit),
+                cursor,
+                mode: map_query_mode(mode),
+                target_nodes: None,
+            },
+        ),
         ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(auth.clone()),
-            bearer_token,
-            graph_iris: None,
-            query: query.to_string(),
-            conforms_to,
-            group_id,
-            limit: Some(limit),
-            cursor,
-            mode: map_query_mode(mode),
-            target_nodes: None,
-        },
     )
     .await
     .map_err(map_api_error)?;
