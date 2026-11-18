@@ -1,230 +1,133 @@
-//! Serves inbound shard manifest requests, checking realm and holder before paging a reply.
+//! Decides what a peer asking for a shard manifest gets: realm, trust and holder checks first.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::future::Future;
-use std::time::Duration;
-
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::ShardManifest;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_net::NetHandle;
-use aruna_net::streams::BiStream;
-use byteview::ByteView;
-use tokio::time::timeout;
-use tracing::{debug, warn};
-
-use crate::driver::DriverContext;
-use crate::shard::assemble_shard_manifest;
-use crate::shard::client::{SHARD_IO_TIMEOUT, close_stream};
-use crate::shard::protocol::{
-    MAX_RESPONSE_SIZE, ManifestPagePlan, ShardTransportMessage, ShardTransportResponse,
-    plan_manifest_pages, read_shard_request, write_manifest_pages, write_shard_response,
-};
+use aruna_core::operation::Operation;
 use aruna_core::placement::{bucket_membership, resolve_shard_holders};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_net::shard_manifest::ShardTransportMessage;
 
-enum PreparedShardResponse {
-    Message(ShardTransportResponse),
-    ManifestPages {
-        manifest: Box<ShardManifest>,
-        plan: ManifestPagePlan,
-    },
+use super::{AssembleManifestOperation, ManifestError};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+
+/// What a manifest request is answered with.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ManifestAnswer {
+    Reject(String),
+    Manifest(Box<ShardManifest>),
 }
 
-#[tracing::instrument(
-    name = "shard.incoming.stream",
-    level = "debug",
-    skip(context, stream),
-    fields(peer = %peer)
-)]
-pub async fn handle_shard_stream(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        warn!(peer = %peer, "Dropping inbound shard stream without net handle");
-        return;
-    };
-
-    let message = match with_io_timeout(
-        "reading shard manifest request",
-        read_shard_request(&mut stream),
-    )
-    .await
-    {
-        Ok(message) => message,
-        Err(error) => {
-            warn!(peer = %peer, error = %error, "Failed to read shard manifest request");
-            return;
-        }
-    };
-
-    let response = build_response(context, net_handle, peer, message).await;
-    if let Err(error) = with_io_timeout(
-        "writing shard manifest response",
-        write_response(&mut stream, &response),
-    )
-    .await
-    {
-        warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
-    }
-    close_stream(&mut stream).await;
+fn reject(reason: String) -> Result<Next<ManifestAnswer>, IoError> {
+    Ok(Next::Done(ManifestAnswer::Reject(reason)))
 }
 
-async fn write_response(
-    stream: &mut BiStream,
-    response: &PreparedShardResponse,
-) -> Result<(), String> {
-    match response {
-        PreparedShardResponse::Message(message) => write_shard_response(stream, message).await,
-        PreparedShardResponse::ManifestPages { manifest, plan } => {
-            write_manifest_pages(stream, manifest, plan).await
-        }
-    }
-}
-
-async fn with_io_timeout<T>(
-    operation: &'static str,
-    future: impl Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    with_io_deadline(SHARD_IO_TIMEOUT, operation, future).await
-}
-
-async fn with_io_deadline<T>(
-    duration: Duration,
-    operation: &'static str,
-    future: impl Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    timeout(duration, future)
-        .await
-        .unwrap_or_else(|_| Err(format!("timed out {operation}")))
-}
-
-async fn build_response(
-    context: &DriverContext,
-    net_handle: &NetHandle,
+/// Serves one manifest request after checking the realm, the peer and this node's holdership.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ServeManifestOperation {
+    local: (NodeId, RealmId),
     peer: NodeId,
-    message: ShardTransportMessage,
-) -> PreparedShardResponse {
-    let ShardTransportMessage::ManifestRequest {
-        realm_id,
-        placement,
-    } = message;
+    realm_id: RealmId,
+    placement: PlacementRef,
+    now_ms: u64,
+    assembling: bool,
+}
 
-    if realm_id != *net_handle.realm_id() {
-        return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
-            "shard peer `{peer}` addressed foreign realm `{realm_id}`"
-        )));
+impl ServeManifestOperation {
+    pub(crate) fn new(
+        local: (NodeId, RealmId),
+        peer: NodeId,
+        message: ShardTransportMessage,
+    ) -> Self {
+        let ShardTransportMessage::ManifestRequest {
+            realm_id,
+            placement,
+        } = message;
+        Self {
+            local,
+            peer,
+            realm_id,
+            placement,
+            now_ms: 0,
+            assembling: false,
+        }
     }
-    let config = match read_realm_config(context, realm_id).await {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
-                "realm `{realm_id}` config unavailable"
-            )));
-        }
-        Err(error) => {
-            return PreparedShardResponse::Message(ShardTransportResponse::Reject(error));
-        }
-    };
 
-    // Trust gate: only sync-eligible (server-class) realm nodes may fetch a
-    // manifest, mirroring the notification/metadata peer checks.
-    match config.sync_eligible_nodes() {
-        Ok(eligible) if eligible.contains(&peer) => {}
-        Ok(_) => {
-            return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
-                "shard peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
-            )));
+    fn check(&mut self, config: &RealmConfigDocument) -> Result<Next<ManifestAnswer>, IoError> {
+        let (peer, realm_id, placement) = (self.peer, self.realm_id, self.placement);
+        // Trust gate: only sync-eligible (server-class) realm nodes may fetch a
+        // manifest, mirroring the notification/metadata peer checks.
+        match config.sync_eligible_nodes() {
+            Ok(eligible) if eligible.contains(&peer) => {}
+            Ok(_) => {
+                return reject(format!(
+                    "shard peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
+                ));
+            }
+            Err(error) => return reject(error.to_string()),
         }
-        Err(error) => {
-            return PreparedShardResponse::Message(ShardTransportResponse::Reject(
-                error.to_string(),
+        // Only a current holder can answer authoritatively for a shard.
+        if !resolve_shard_holders(config, &placement).contains(&self.local.0) {
+            return reject(format!(
+                "node does not hold shard {}/{} in realm `{realm_id}`",
+                placement.strategy_id, placement.shard
             ));
         }
-    }
-
-    let holders = resolve_shard_holders(&config, &placement);
-    // Only a current holder can answer authoritatively for a shard.
-    if !holders.contains(&net_handle.node_id()) {
-        return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
-            "node does not hold shard {}/{} in realm `{realm_id}`",
-            placement.strategy_id, placement.shard
-        )));
-    }
-    // A transition target is not a holder yet and still has to verify the copy
-    // it pulled against this holder, so the derived membership decides here.
-    if !bucket_membership(&config, &placement, unix_timestamp_millis())
-        .members
-        .contains(&peer)
-    {
-        return PreparedShardResponse::Message(ShardTransportResponse::Reject(format!(
-            "shard peer `{peer}` is not a holder for shard {}/{} in realm `{realm_id}`",
-            placement.strategy_id, placement.shard
-        )));
-    }
-
-    match assemble_shard_manifest(context, realm_id, placement).await {
-        Ok(manifest) => {
-            let entries = manifest.entries.len();
-            let response = match plan_manifest_pages(&manifest, MAX_RESPONSE_SIZE) {
-                Ok(plan) => PreparedShardResponse::ManifestPages {
-                    manifest: Box::new(manifest),
-                    plan,
-                },
-                Err(error) => PreparedShardResponse::Message(ShardTransportResponse::Reject(error)),
-            };
-            debug!(
-                strategy = %placement.strategy_id,
-                shard = placement.shard,
-                entries,
-                "Served shard manifest"
-            );
-            response
+        // A transition target is not a holder yet and still has to verify the copy
+        // it pulled against this holder, so the derived membership decides here.
+        let membership = bucket_membership(config, &placement, self.now_ms);
+        if !membership.members.contains(&peer) {
+            return reject(format!(
+                "shard peer `{peer}` is not a holder for shard {}/{} in realm `{realm_id}`",
+                placement.strategy_id, placement.shard
+            ));
         }
-        Err(error) => PreparedShardResponse::Message(ShardTransportResponse::Reject(error)),
+        self.assembling = true;
+        let assemble = AssembleManifestOperation::new(realm_id, placement);
+        Ok(Next::Call(IoCall::child(assemble)))
     }
 }
 
-async fn read_realm_config(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<Option<RealmConfigDocument>, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(realm_id.as_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => RealmConfigDocument::from_bytes(&bytes)
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {}", other.label())),
+impl Operation for ServeManifestOperation {
+    type Output = ManifestAnswer;
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<ManifestAnswer>, IoError> {
+        let (peer, realm_id) = (self.peer, self.realm_id);
+        if realm_id != self.local.1 {
+            return reject(format!(
+                "shard peer `{peer}` addressed foreign realm `{realm_id}`"
+            ));
+        }
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ManifestAnswer>, IoError> {
+        if self.assembling {
+            return Ok(Next::Done(
+                match result.child::<ShardManifest, ManifestError>()? {
+                    Ok(manifest) => ManifestAnswer::Manifest(Box::new(manifest)),
+                    Err(ManifestError(error)) => ManifestAnswer::Reject(error),
+                },
+            ));
+        }
+        match result.child::<RealmConfigDocument, GetConfigError>()? {
+            Ok(config) => self.check(&config),
+            Err(GetConfigError::DocumentNotFound) => {
+                reject(format!("realm `{}` config unavailable", self.realm_id))
+            }
+            Err(error) => reject(error.to_string()),
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn timeout_reports_operation() {
-        let error = with_io_deadline(
-            Duration::from_millis(1),
-            "reading shard manifest request",
-            std::future::pending::<Result<(), String>>(),
-        )
-        .await
-        .expect_err("pending shard IO must time out");
-
-        assert_eq!(error, "timed out reading shard manifest request");
-    }
-}
+#[path = "incoming_tests.rs"]
+mod tests;

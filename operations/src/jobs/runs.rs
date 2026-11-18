@@ -102,9 +102,9 @@ impl ReadRunOperation {
         self.step = RunStep::Access(Box::new(link));
         Ok(Next::Call(IoCall::child(AuthorizeOperation::new(
             self.realm_id,
-            self.auth.clone(),
-            path,
-            Permission::READ,
+            &self.auth,
+            &path,
+            &Permission::READ,
             PolicyRequestExtras::rest(),
         ))))
     }

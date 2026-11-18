@@ -13,6 +13,7 @@ use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::UsageUpdateError;
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
@@ -44,7 +45,7 @@ use aruna_core::structs::storage::replication_queue::{
 };
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use byteview::ByteView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -117,32 +118,6 @@ pub struct PageImportResult {
     pub checkpoint: StagingJobCheckpoint,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PageImportState {
-    Init,
-    StartTransaction,
-    ReadGuards,
-    /// Reads the heads in the key interval of the page, which proves absent keys absent.
-    ReadHeads,
-    /// Reads the heads key by key, when the interval holds too many other keys.
-    ReadHeadKeys,
-    /// Reads a distributed bucket's record: every entry's key must be coordinated here.
-    ReadRecord,
-    /// Reads whether an ordinary bucket has a sync relationship that replicates its versions.
-    ReadRelationships,
-    ReadSecret,
-    ReadVersions,
-    WriteRows,
-    DeleteRows,
-    UpdateUsage,
-    Commit,
-    Schedule,
-    ScheduleDrain,
-    Abort,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum PageImportError {
     #[error(transparent)]
@@ -167,16 +142,16 @@ pub enum PageImportError {
     TooManyEntries(usize),
     #[error("a page writes at most {MAX_PAGE_BYTES} bytes, got {0}")]
     TooManyBytes(usize),
-    #[error("unexpected event in state {state:?}: expected {expected}, got {received}")]
-    UnexpectedEvent {
-        state: PageImportState,
-        expected: &'static str,
-        received: String,
-    },
     #[error("page import finished without output")]
     NotFinished,
     #[error("the page's keys lie in other ranges than the turns it holds")]
     RangesMoved(BTreeSet<Ulid>),
+}
+
+impl From<IoError> for PageImportError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
 }
 
 impl From<StorageReadError> for PageImportError {
@@ -265,7 +240,6 @@ fn head_keys(input: &PageImportInput) -> Result<Vec<Vec<u8>>, ConversionError> {
 /// empty page. Read in the transaction, a head written in the interval meanwhile conflicts.
 pub(crate) fn head_range(
     input: &PageImportInput,
-    txn_id: TxnId,
 ) -> Result<Option<StorageEffect>, ConversionError> {
     let keys = head_keys(input)?;
     let (Some(first), Some(last)) = (keys.iter().min(), keys.iter().max()) else {
@@ -277,7 +251,7 @@ pub(crate) fn head_range(
         end: IterEnd::Through(last.clone().into()),
         limit: keys.len() + HEAD_SLACK,
         max_bytes: HEAD_READ_BYTES,
-        txn_id: Some(txn_id),
+        txn_id: None,
     }))
 }
 
@@ -319,12 +293,12 @@ pub(crate) fn decode_heads(
 /// are read next.
 pub(crate) fn check_guards(
     input: &PageImportInput,
-    values: Vec<(Key, Option<Value>)>,
+    values: Vec<Option<Value>>,
 ) -> Result<PageGuards, PageImportError> {
     if values.len() != GUARD_READS + input.mirror_connectors.len() {
         return Err(StorageError::ReadError("short guard read".to_string()).into());
     }
-    let mut values = values.into_iter().map(|(_, value)| value);
+    let mut values = values.into_iter();
     let fence = values
         .next()
         .flatten()

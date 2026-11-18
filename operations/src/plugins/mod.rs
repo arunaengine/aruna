@@ -4,6 +4,7 @@
 
 pub mod account;
 pub mod artifacts;
+pub(crate) mod attempt;
 pub mod bound;
 pub mod check;
 pub mod cleanup;
@@ -46,6 +47,7 @@ pub mod settings;
 pub mod state;
 pub mod submit;
 pub mod sweep;
+pub(crate) mod transfer_steps;
 pub mod waiting;
 pub mod work;
 pub(crate) mod work_calls;

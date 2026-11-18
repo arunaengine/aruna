@@ -3,11 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use crate::driver::drive;
+use crate::plugins::attempt::invocation;
 use crate::plugins::calls::*;
+use crate::plugins::grants::short_path;
 use crate::plugins::host_calls::call_intent;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
@@ -16,13 +18,17 @@ use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::plugins::rows::write_rows;
 use crate::plugins::runs::event_run;
 use crate::plugins::runs::tests::queued;
-use crate::plugins::runs::{admit, ended};
-use aruna_core::plugin_runs::{MAX_ATTEMPTS, SourceEvent, SourceKind};
+use crate::plugins::runs::{admit, conclude, ended, read_run, save_run, unfinished};
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_runs::{
+    MAX_ATTEMPTS, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent, SourceKind,
+};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_plugins::InvokeError;
 use aruna_plugins::artifact::{ArtifactDigest, attach_manifest, read_manifest};
 use aruna_plugins::broker::Intent;
 use std::time::Duration;
+use ulid::Ulid;
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
 
@@ -378,12 +384,14 @@ async fn bounded_and_restarted() {
     let install = installed(&fixture).await;
     let run = admitted(&fixture, &install, 1, "spin").await;
     let first = worker(&fixture);
+    let busy = |n| Ulid::from_parts(900, n);
     for n in 0..RUNS_PARALLEL as u128 {
-        let busy = (install.install_id, CancellationToken::new());
-        first.running().insert(Ulid::from_parts(900, n), busy);
+        first.supervisor.admit(busy(n), install.install_id);
     }
     assert_eq!(first.claim(unix_timestamp_millis()).await.unwrap(), 0);
-    first.running().clear();
+    for n in 0..RUNS_PARALLEL as u128 {
+        first.supervisor.finish(busy(n));
+    }
     assert_eq!(first.claim(unix_timestamp_millis()).await.unwrap(), 1);
     first.stop().await;
     let cut = drive(read_run(install.install_id, run.run_id), &fixture.ctx)

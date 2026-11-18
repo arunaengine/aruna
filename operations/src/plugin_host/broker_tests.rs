@@ -4,24 +4,26 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::metadata::forward::routed_export::RoutedExportOperation;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::plugins::calls::*;
 use std::collections::BTreeMap;
 
 use super::*;
 use crate::metadata::MetadataHandle;
-use crate::metadata::api::read::query_metadata_document;
+use crate::metadata::api::document_query::DocumentQueryOperation;
 use crate::metadata::api::read_types::DocumentQueryRequest;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::create_entry::create_metadata_document;
+use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::materialization_queue::process_materialization_batch;
-use crate::metadata::projector::drain_projection_queue;
 use crate::plugins::dataset::merge_into;
 use crate::plugins::host_calls::VisibleObjects;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::store::Txn;
+use crate::testing::drain_projection_queue;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {
@@ -74,7 +76,12 @@ async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
             license: None,
         },
     });
-    let created = create_metadata_document(create, ctx.clone()).await.unwrap();
+    let created = drive(
+        CreateEntryOperation::new(create, ctx.net_handle.as_ref().map(|net| net.node_id())),
+        &ctx,
+    )
+    .await
+    .unwrap();
     project(&ctx).await;
     let mut run = queued(installed.install_id, 1);
     run.digest = installed.digest.clone();
@@ -407,9 +414,15 @@ async fn patch_keeps_entities() {
             jsonld: jsonld.to_string(),
         },
     });
-    let created = create_metadata_document(create, broker.ctx.clone())
-        .await
-        .unwrap();
+    let created = drive(
+        CreateEntryOperation::new(
+            create,
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+        ),
+        &broker.ctx,
+    )
+    .await
+    .unwrap();
     project(&broker.ctx).await;
     let document = created.record.document_id;
     let read = broker
@@ -429,9 +442,12 @@ async fn patch_keeps_entities() {
         allow_partial: false,
     };
     let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
-    let names = query_metadata_document(&broker.ctx, realm, node, request)
-        .await
-        .unwrap();
+    let names = drive(
+        DocumentQueryOperation::new(realm, node, request),
+        &broker.ctx,
+    )
+    .await
+    .unwrap();
     let names = format!("{:?}", names.results);
     for kept in ["nested file", "unreferenced lab", "two"] {
         assert!(names.contains(kept), "{kept} is gone: {names}");
@@ -721,7 +737,13 @@ async fn files_named(fixture: &Fixture, broker: &RunBroker, ids: &[&str]) -> Uli
             jsonld: jsonld.to_string(),
         },
     });
-    let created = create_metadata_document(create, broker.ctx.clone());
+    let created = drive(
+        CreateEntryOperation::new(
+            create,
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+        ),
+        &broker.ctx,
+    );
     let created = created.await.unwrap();
     project(&broker.ctx).await;
     created.record.document_id
@@ -743,7 +765,18 @@ async fn page_of(
         after,
     };
     let realm = fixture.actor.realm_id;
-    match export_rocrate_routed(&broker.ctx, realm, request, None, bound).await? {
+    match drive(
+        RoutedExportOperation::new(
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+            realm,
+            request,
+            None,
+            bound,
+        ),
+        &broker.ctx,
+    )
+    .await?
+    {
         ExportMetadataResult::Page { page, .. } => Ok(page),
         other => panic!("expected a page, got {other:?}"),
     }
@@ -1019,8 +1052,8 @@ async fn object_references() {
 async fn superseded_merge_journaled() {
     // A merge older than the materialized status whose change is not applied yet is still
     // journaled as an update once; the sender holds it until its own dot is applied.
-    use crate::metadata::projector::project_create_events;
-    use crate::metadata::record_reads::load_document_record;
+    use crate::metadata::record_reads::DocumentRecordOperation;
+    use crate::testing::project_create_events;
     use aruna_core::events::Event;
     use aruna_core::metadata::{
         MetadataBatchSource, MetadataEffect, MetadataEvent, MetadataEventPayload,
@@ -1036,7 +1069,7 @@ async fn superseded_merge_journaled() {
         .await
         .unwrap();
     project(&broker.ctx).await;
-    let record = load_document_record(&broker.ctx, document)
+    let record = drive(DocumentRecordOperation::new(document), &broker.ctx)
         .await
         .unwrap()
         .unwrap();
@@ -1294,9 +1327,15 @@ async fn crate_with_term(fixture: &Fixture, broker: &RunBroker, term: Value) -> 
             jsonld: jsonld.to_string(),
         },
     });
-    let document = create_metadata_document(create, broker.ctx.clone())
-        .await
-        .unwrap();
+    let document = drive(
+        CreateEntryOperation::new(
+            create,
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+        ),
+        &broker.ctx,
+    )
+    .await
+    .unwrap();
     let document = document.record.document_id;
     project(&broker.ctx).await;
     (document, revision_of(broker, document).await)
@@ -1399,7 +1438,7 @@ async fn removal_keeps_rest() {
     // descriptor and other entities are refused, and the other files stay.
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
-    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
+    let record = drive(DocumentRecordOperation::new(document), &broker.ctx).await;
     let record = record.unwrap().unwrap();
     let remove = |id: &str, revision| {
         let mutation = UpdateDocumentMutation::RemoveDataEntity { id: id.to_string() };
@@ -1437,7 +1476,16 @@ async fn removal_keeps_rest() {
         offset: None,
         after: None,
     };
-    let raw = export_rocrate_routed(&broker.ctx, fixture.actor.realm_id, request, None, u64::MAX);
+    let raw = drive(
+        RoutedExportOperation::new(
+            broker.ctx.net_handle.as_ref().map(|net| net.node_id()),
+            fixture.actor.realm_id,
+            request,
+            None,
+            u64::MAX,
+        ),
+        &broker.ctx,
+    );
     let ExportMetadataResult::Raw { raw, .. } = raw.await.unwrap() else {
         panic!("expected the raw revision");
     };
@@ -1502,7 +1550,7 @@ async fn pending_graph_refused() {
         .metadata_remove_file(&cx(), removal(document, "./a.txt", &pending, 1))
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Unavailable);
-    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
+    let record = drive(DocumentRecordOperation::new(document), &broker.ctx).await;
     let record = record.unwrap().unwrap();
     let remove = || {
         let mutation = UpdateDocumentMutation::RemoveDataEntity {
@@ -1546,7 +1594,7 @@ async fn unprojected_event_refused() {
     use aruna_core::storage_entries::{event_log_key, pending_projection_key};
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
-    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
+    let record = drive(DocumentRecordOperation::new(document), &broker.ctx).await;
     let record = record.unwrap().unwrap();
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./a.txt","@type":"File","name":"older"}"#.to_string(),

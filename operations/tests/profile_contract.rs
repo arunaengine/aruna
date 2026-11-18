@@ -11,6 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, EVENT_LOG_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
+use aruna_core::metadata::ProfileValidationStatus;
 use aruna_core::metadata::{
     CRATE_PROFILE_IRI, INVENIO_PROFILE_IRI, MetadataEffect, MetadataError, MetadataEvent,
     ProfileValidationSeverity, ProfileValidationState, ZENODO_PROFILE_IRI,
@@ -21,33 +22,80 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
-use aruna_operations::driver::DriverContext;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::forward::read::{admits_profile_peer, export_profile_local};
-use aruna_operations::metadata::forward::write::route_metadata_create;
+use aruna_operations::metadata::forward::profile_export::ProfileLocalOperation;
+use aruna_operations::metadata::forward::read::admits_profile_peer;
+use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 use aruna_operations::metadata::profile::validation::{
-    check_profile, current_validation_status, load_validation_status, preview_submission,
-    profile_public_iri, revalidate_current,
+    MetadataProfilePreview, ProfileAssessOperation, RevalidateOperation, StoredStatusOperation,
+    ValidationStatusOperation, profile_public_iri, profile_verdict,
 };
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
-use aruna_operations::metadata::update_entry::update_metadata_document;
+use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::metadata::{
     MetadataHandle, materialization_queue::process_materialization_batch,
-    projector::drain_projection_queue,
 };
+use aruna_operations::testing::drain_projection_queue;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use serde_json::json;
 use tempfile::TempDir;
 use ulid::Ulid;
+
+fn local_node(context: &DriverContext) -> Option<aruna_core::NodeId> {
+    context.net_handle.as_ref().map(|net| net.node_id())
+}
+
+async fn preview_submission(
+    context: &DriverContext,
+    group_id: Option<Ulid>,
+    jsonld: &str,
+) -> Result<MetadataProfilePreview, MetadataError> {
+    let preview =
+        ProfileAssessOperation::preview(local_node(context), group_id, jsonld.to_string());
+    drive(preview, context).await
+}
+
+async fn check_profile(
+    context: &DriverContext,
+    iri: &str,
+    jsonld: &str,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let check = ProfileAssessOperation::against(local_node(context), iri, jsonld.to_string());
+    drive(check, context).await.map(profile_verdict)
+}
+
+async fn load_validation_status(
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<Option<ProfileValidationStatus>, MetadataError> {
+    drive(StoredStatusOperation::new(document_id), context).await
+}
+
+async fn current_validation_status(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    drive(ValidationStatusOperation::new(record.clone()), context).await
+}
+
+async fn revalidate_current(
+    context: &DriverContext,
+    record: &MetadataRegistryRecord,
+) -> Result<ProfileValidationStatus, MetadataError> {
+    let revalidate = RevalidateOperation::new(local_node(context), record.clone());
+    drive(revalidate, context).await
+}
 
 static PROFILE_TEST_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
@@ -97,7 +145,7 @@ async fn tagged_create_retryable() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     assert_eq!(event_count(&test, document_id).await?, 1);
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("create commits status atomically");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -311,7 +359,7 @@ async fn warning_severity_accepts() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )
     .await?;
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("status is durable");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -351,7 +399,7 @@ async fn spans_crate_versions() -> Result<(), Box<dyn std::error::Error>> {
             versioned_crate(document_id, &tag, version, true),
         )
         .await?;
-        let status = load_validation_status(test.context.as_ref(), document_id, None)
+        let status = load_validation_status(test.context.as_ref(), document_id)
             .await?
             .expect("status is durable");
         assert_eq!(status.state, ProfileValidationState::Valid);
@@ -466,7 +514,7 @@ async fn builtin_profile_enforced() -> Result<(), Box<dyn std::error::Error>> {
         run_crate_json(document_id, true),
     )
     .await?;
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("a built-in verdict is durable");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -810,17 +858,24 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
     process_materialization_batch(test.context.as_ref()).await?;
     let tag = profile_public_iri(profile_id);
 
-    let error = update_metadata_document(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id,
-            public: true,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: crate_json(document_id, Some(&tag), false, true),
-            },
-            expected_revision: None,
-        }),
+    let error = drive(
+        UpdateEntryOperation::new(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id,
+                public: true,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: crate_json(document_id, Some(&tag), false, true),
+                },
+                expected_revision: None,
+            }),
+            test.context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
         test.context.as_ref(),
     )
     .await
@@ -830,27 +885,34 @@ async fn invalid_replace_retryable() -> Result<(), Box<dyn std::error::Error>> {
         UpdateDocumentError::MetadataError(MetadataError::ProfileValidation(_))
     ));
     assert_eq!(event_count(&test, document_id).await?, 1);
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("original status remains");
     assert_eq!(status.dataset_revision, created.event_id);
 
-    let updated = update_metadata_document(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id,
-            public: true,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: crate_json(document_id, Some(&tag), true, true),
-            },
-            expected_revision: None,
-        }),
+    let updated = drive(
+        UpdateEntryOperation::new(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id,
+                public: true,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: crate_json(document_id, Some(&tag), true, true),
+                },
+                expected_revision: None,
+            }),
+            test.context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
         test.context.as_ref(),
     )
     .await?;
     assert_eq!(event_count(&test, document_id).await?, 2);
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("replacement commits status");
     assert_eq!(status.dataset_revision, updated.last_event_id);
@@ -937,7 +999,7 @@ async fn accepts_group_profile() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )
     .await?;
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("an accepted create commits its status");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -1000,7 +1062,7 @@ async fn public_crosses_groups() -> Result<(), Box<dyn std::error::Error>> {
         ),
     )
     .await?;
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("an accepted create commits its status");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -1060,7 +1122,7 @@ async fn render_resolves_group() -> Result<(), Box<dyn std::error::Error>> {
     drain_projection_queue(test.context.as_ref()).await?;
     process_materialization_batch(test.context.as_ref()).await?;
 
-    let status = load_validation_status(test.context.as_ref(), document_id, None)
+    let status = load_validation_status(test.context.as_ref(), document_id)
         .await?
         .expect("materialization writes a status");
     assert_eq!(status.state, ProfileValidationState::Valid);
@@ -1085,11 +1147,13 @@ async fn channel_refuses_datasets() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let refusal = export_profile_local(
+    let refusal = drive(
+        ProfileLocalOperation::new(
+            test.actor.realm_id,
+            document_id,
+            created.record.last_event_id,
+        ),
         test.context.as_ref(),
-        test.actor.realm_id,
-        document_id,
-        created.record.last_event_id,
     )
     .await
     .expect_err("a Dataset is never served on the validation channel");
@@ -1127,19 +1191,15 @@ async fn channel_fences_revision() -> Result<(), Box<dyn std::error::Error>> {
     let group_id = Ulid::generate();
     let (profile_id, revision) = register_profile(&test, group_id, minimum_shape()).await?;
 
-    export_profile_local(
+    drive(
+        ProfileLocalOperation::new(test.actor.realm_id, profile_id, revision),
         test.context.as_ref(),
-        test.actor.realm_id,
-        profile_id,
-        revision,
     )
     .await
     .expect("the requested revision is served");
-    let refusal = export_profile_local(
+    let refusal = drive(
+        ProfileLocalOperation::new(test.actor.realm_id, profile_id, Ulid::generate()),
         test.context.as_ref(),
-        test.actor.realm_id,
-        profile_id,
-        Ulid::generate(),
     )
     .await
     .expect_err("a mismatched revision is refused");
@@ -1157,9 +1217,9 @@ async fn cache_skips_refetch() -> Result<(), Box<dyn std::error::Error>> {
     let jsonld = crate_json(draft_id, Some(&profile_public_iri(profile_id)), true, true);
     let metadata = test
         .context
-        .metadata_handle
+        .graph_handle
         .as_ref()
-        .ok_or("metadata handle is configured")?;
+        .ok_or("graph handle is configured")?;
 
     let before = metadata.profile_loads();
     preview_submission(test.context.as_ref(), Some(group_id), &jsonld).await?;
@@ -1176,17 +1236,24 @@ async fn make_private(
     group_id: Ulid,
     profile_id: Ulid,
 ) -> Result<Ulid, Box<dyn std::error::Error>> {
-    let updated = update_metadata_document(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id: profile_id,
-            public: false,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: profile_json(profile_id, minimum_shape()),
-            },
-            expected_revision: None,
-        }),
+    let updated = drive(
+        UpdateEntryOperation::new(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id: profile_id,
+                public: false,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: profile_json(profile_id, minimum_shape()),
+                },
+                expected_revision: None,
+            }),
+            test.context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
         test.context.as_ref(),
     )
     .await?;
@@ -1215,17 +1282,24 @@ async fn revision_change_repins() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     drain_projection_queue(test.context.as_ref()).await?;
 
-    let updated_profile = update_metadata_document(
-        UpdateDocumentOperation::new(UpdateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id: profile_id,
-            public: true,
-            mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                jsonld: profile_json(profile_id, minimum_shape()),
-            },
-            expected_revision: None,
-        }),
+    let updated_profile = drive(
+        UpdateEntryOperation::new(
+            UpdateDocumentOperation::new(UpdateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id: profile_id,
+                public: true,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: profile_json(profile_id, minimum_shape()),
+                },
+                expected_revision: None,
+            }),
+            test.context
+                .as_ref()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+        ),
         test.context.as_ref(),
     )
     .await?;
@@ -1568,17 +1642,20 @@ async fn create_crate(
     jsonld: String,
 ) -> Result<aruna_operations::metadata::create_document::CreateDocumentResult, CreateDocumentError>
 {
-    match route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor: test.actor.clone(),
-            group_id,
-            document_id,
-            document_path: path.to_string(),
-            public: true,
-            payload: CreateDocumentPayload::RoCrate { jsonld },
-        }),
-        test.context.clone(),
-        None,
+    match drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor: test.actor.clone(),
+                group_id,
+                document_id,
+                document_path: path.to_string(),
+                public: true,
+                payload: CreateDocumentPayload::RoCrate { jsonld },
+            }),
+            test.context.net_handle.as_ref().map(|net| net.node_id()),
+            None,
+        ),
+        &test.context,
     )
     .await
     {

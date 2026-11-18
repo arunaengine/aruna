@@ -17,7 +17,7 @@ use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
-use aruna_operations::auth::policy_load::enforce_policies;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
@@ -29,7 +29,7 @@ use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
 use aruna_operations::onboarding::finalize_bootstrap::{
-    BootstrapFinalizeError, BootstrapFinalizeInput, bootstrap_onboarding_finalize,
+    BootstrapFinalizeError, BootstrapFinalizeInput, FinalizeBootstrapOperation,
 };
 use aruna_operations::onboarding::inspect_secret::{
     InspectSecretError, InspectSecretInput, InspectSecretOperation,
@@ -232,9 +232,12 @@ async fn enforce_enrollment_policies(
         PolicyRequestExtras::operation(ENROLL_DEVICE_OPERATION),
     );
     // Fail closed: a denial and unreadable policy state both refuse.
-    enforce_policies(&state.get_ctx(), realm_id, &request)
-        .await
-        .map_err(|_| ServerError::Forbidden)
+    drive(
+        EnforcePolicyOperation::new(realm_id, request.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|_| ServerError::Forbidden)
 }
 
 async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
@@ -800,8 +803,8 @@ pub async fn bootstrap_onboarding(
         _ => return Err(ServerError::Forbidden),
     };
 
-    let finalized = bootstrap_onboarding_finalize(
-        BootstrapFinalizeInput {
+    let finalized = aruna_operations::driver::drive(
+        FinalizeBootstrapOperation::new(BootstrapFinalizeInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
             node_id,
@@ -812,8 +815,8 @@ pub async fn bootstrap_onboarding(
             node_location: request.node_location.clone(),
             node_weight: request.node_weight,
             node_labels: request.node_labels.clone(),
-        },
-        state.get_ctx(),
+        }),
+        &state.get_ctx(),
     )
     .await
     .map_err(map_finalize_error)?;

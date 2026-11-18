@@ -12,7 +12,8 @@ pub mod emit;
 pub mod enqueue;
 pub mod holder;
 pub mod inbox;
-pub mod incoming;
+#[cfg(test)]
+mod incoming_tests;
 pub mod list;
 pub mod mark_read;
 pub mod opt_in;

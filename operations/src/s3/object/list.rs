@@ -5,6 +5,7 @@
 use crate::s3::listing::PrefixTracker;
 use crate::s3::object::versions::served_copy;
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -13,7 +14,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     NODE_SUBJECT_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
@@ -23,22 +24,16 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::types::{Effects, GroupId, Key, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListBucketState {
-    Init,
-    StartTransaction,
+enum ListBucketState {
     ReadHeads,
     ReadVersions,
     ReadBlobLocations,
-    CommitTransaction,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -47,19 +42,19 @@ pub enum ListBucketError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
-    InvalidStateEvent {
-        state: ListBucketState,
-        expected: &'static str,
-        received: &'static str,
-    },
-    #[error("No transaction found")]
-    NoTransactionFound,
+    #[error("ListObjectsV2 failed: unexpected {0}")]
+    UnexpectedEvent(&'static str),
     #[error("ListObjectsV2 failed")]
     ListObjectsFailed,
-    #[error("operation did not finish")]
-    NotFinished,
 }
+
+impl From<IoError> for ListBucketError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+type ListTurn = Result<Next<ListBucketResult>, ListBucketError>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListBucketInput {
@@ -130,7 +125,6 @@ enum ResolvedEntry {
 pub struct ListBucketOperation {
     input: ListBucketInput,
     state: ListBucketState,
-    txn_id: Option<Ulid>,
     round_candidates: Vec<(BlobHeadKey, Ulid, Vec<u8>)>,
     resolved: Vec<ResolvedEntry>,
     location_reads: Vec<(String, Key)>,
@@ -149,7 +143,6 @@ pub struct ListBucketOperation {
     /// The inclusive first head key of the first round, at the lower bound.
     first_key: Option<Vec<u8>>,
     upper_key: Option<Vec<u8>>,
-    output: Option<Result<ListBucketResult, ListBucketError>>,
 }
 
 impl ListBucketOperation {
@@ -159,8 +152,7 @@ impl ListBucketOperation {
     pub fn new(input: ListBucketInput) -> Self {
         Self {
             input,
-            state: ListBucketState::Init,
-            txn_id: None,
+            state: ListBucketState::ReadHeads,
             round_candidates: Vec::new(),
             resolved: Vec::new(),
             location_reads: Vec::new(),
@@ -177,7 +169,6 @@ impl ListBucketOperation {
             bounds: None,
             first_key: None,
             upper_key: None,
-            output: None,
         }
     }
 
@@ -207,12 +198,6 @@ impl ListBucketOperation {
         Ok(())
     }
 
-    fn emit_error(&mut self, error: ListBucketError) -> Effects {
-        self.state = ListBucketState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
     fn max_keys(&self) -> usize {
         self.input.max_keys.unwrap_or(Self::DEFAULT_MAX_KEYS)
     }
@@ -234,33 +219,15 @@ impl ListBucketOperation {
         Ok(())
     }
 
-    fn handle_init(&mut self) -> Effects {
+    fn start_scan(&mut self) -> ListTurn {
         if self.max_keys() == 0 {
-            self.state = ListBucketState::Finish;
-            self.output = Some(Ok(ListBucketResult {
+            return Ok(Next::Done(ListBucketResult {
                 objects: Vec::new(),
                 common_prefixes: Vec::new(),
                 continuation_token: None,
             }));
-            return smallvec![];
         }
 
-        self.state = ListBucketState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: (event).label(),
-            });
-        };
-
-        self.txn_id = Some(txn_id);
         let prefix = match self
             .input
             .prefix
@@ -272,11 +239,11 @@ impl ListBucketOperation {
         };
         let prefix = match prefix {
             Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
+            Err(err) => return Err(err.into()),
         };
         let iter_start_key = if let Some(token) = self.input.continuation_token.clone() {
             if let Err(error) = self.resume_scan_state(&token) {
-                return self.emit_error(error);
+                return Err(error);
             }
             Some(token.last_key)
         } else {
@@ -289,7 +256,7 @@ impl ListBucketOperation {
                 Some(start_after) => {
                     match BlobHeadKey::object_prefix(&self.input.bucket, start_after) {
                         Ok(key) => Some(key),
-                        Err(err) => return self.emit_error(err.into()),
+                        Err(err) => return Err(err.into()),
                     }
                 }
                 None => None,
@@ -305,7 +272,7 @@ impl ListBucketOperation {
         self.scan_prefix = prefix;
         self.last_consumed_key = iter_start_key;
         if let Err(error) = self.apply_bounds() {
-            return self.emit_error(error);
+            return Err(error);
         }
         self.issue_scan_round()
     }
@@ -333,7 +300,7 @@ impl ListBucketOperation {
         Ok(())
     }
 
-    fn issue_scan_round(&mut self) -> Effects {
+    fn issue_scan_round(&mut self) -> ListTurn {
         let visible = self.emitted();
         self.scan_limit = self.max_keys().saturating_sub(visible).saturating_add(1);
         self.scan_rounds += 1;
@@ -356,16 +323,18 @@ impl ListBucketOperation {
         };
 
         self.state = ListBucketState::ReadHeads;
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        // An inclusive start needs the storage scan itself; it joins the read snapshot.
+        let scan = Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(self.scan_prefix.clone().into()),
             start,
             limit: self.scan_limit,
-            txn_id: self.txn_id,
-        })]
+            txn_id: None,
+        });
+        Ok(Next::Call(scan.into()))
     }
 
-    fn truncate_scan(&mut self) -> Effects {
+    fn truncate_scan(&mut self) -> ListTurn {
         self.continuation_token =
             self.last_consumed_key
                 .clone()
@@ -376,7 +345,7 @@ impl ListBucketOperation {
         self.finish_scan()
     }
 
-    fn finish_scan(&mut self) -> Effects {
+    fn finish_scan(&mut self) -> ListTurn {
         if self.location_reads.is_empty() {
             return self.finish_hydration(Vec::new());
         }
@@ -394,10 +363,7 @@ impl ListBucketOperation {
             );
         }
         self.state = ListBucketState::ReadBlobLocations;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// Whether this page carries a governed entry, so the batch leads with the
@@ -414,18 +380,12 @@ impl ListBucketOperation {
         })
     }
 
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListBucketError::NoTransactionFound);
-        };
-
-        self.state = ListBucketState::CommitTransaction;
-        self.output = Some(Ok(ListBucketResult {
+    fn finish(&mut self) -> ListTurn {
+        Ok(Next::Done(ListBucketResult {
             objects: std::mem::take(&mut self.objects),
             common_prefixes: self.prefixes.take(),
             continuation_token: self.continuation_token.clone(),
-        }));
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        }))
     }
 
     fn common_prefix_of(&self, key: &str) -> Option<String> {
@@ -436,13 +396,9 @@ impl ListBucketOperation {
         )
     }
 
-    fn handle_heads_read(&mut self, event: Event) -> Effects {
+    fn handle_heads_read(&mut self, event: Event) -> ListTurn {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(ListBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
+            return Err(ListBucketError::UnexpectedEvent(event.label()));
         };
 
         let round_len = values.len();
@@ -470,11 +426,11 @@ impl ListBucketOperation {
 
             let head = match BlobHeadKey::from_bytes(key.as_ref()) {
                 Ok(head) => head,
-                Err(err) => return self.emit_error(err.into()),
+                Err(err) => return Err(err.into()),
             };
             let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
                 Ok(pointer) => pointer,
-                Err(err) => return self.emit_error(err.into()),
+                Err(err) => return Err(err.into()),
             };
             candidates.push((head, pointer.version_id, key.to_vec()));
         }
@@ -499,37 +455,26 @@ impl ListBucketOperation {
             .collect::<Result<Vec<_>, _>>();
         let reads = match reads {
             Ok(reads) => reads,
-            Err(err) => return self.emit_error(err.into()),
+            Err(err) => return Err(err.into()),
         };
 
         self.round_candidates = candidates;
         self.state = ListBucketState::ReadVersions;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn round_versions_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(ListBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: (event).label(),
-            });
-        };
-
+    fn round_versions_read(&mut self, values: Vec<Option<Value>>) -> ListTurn {
         let candidates = std::mem::take(&mut self.round_candidates);
         if values.len() != candidates.len() {
-            return self.emit_error(ListBucketError::ListObjectsFailed);
+            return Err(ListBucketError::ListObjectsFailed);
         }
 
         let max_keys = self.max_keys();
-        for ((head, version_id, key_bytes), (_key, value)) in candidates.into_iter().zip(values) {
+        for ((head, version_id, key_bytes), value) in candidates.into_iter().zip(values) {
             let version = match value {
                 Some(value) => match BlobVersion::from_bytes(value.as_ref()) {
                     Ok(version) => Some(version),
-                    Err(err) => return self.emit_error(err.into()),
+                    Err(err) => return Err(err.into()),
                 },
                 None => None,
             };
@@ -547,7 +492,7 @@ impl ListBucketOperation {
                         // The group is already represented; advance past this key.
                         self.prefixes.set_resume(None);
                         if let Err(err) = self.enter_cursor_group(&group, &key_bytes) {
-                            return self.emit_error(err);
+                            return Err(err);
                         }
                     } else if live {
                         if self.emitted() >= max_keys {
@@ -556,7 +501,7 @@ impl ListBucketOperation {
                         self.prefixes.set_resume(None);
                         self.prefixes.push(group.clone());
                         if let Err(err) = self.enter_cursor_group(&group, &key_bytes) {
-                            return self.emit_error(err);
+                            return Err(err);
                         }
                     } else {
                         // No live sibling yet: emit nothing and do not seek
@@ -639,7 +584,7 @@ impl ListBucketOperation {
                             );
                             let bytes = match copy_key.to_bytes() {
                                 Ok(bytes) => bytes,
-                                Err(error) => return self.emit_error(error.into()),
+                                Err(error) => return Err(error.into()),
                             };
                             self.location_reads
                                 .push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
@@ -666,24 +611,12 @@ impl ListBucketOperation {
         self.issue_scan_round()
     }
 
-    fn handle_locations_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(ListBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: (event).label(),
-            });
-        };
-
-        self.finish_hydration(values)
-    }
-
-    fn finish_hydration(&mut self, locations: Vec<(Key, Option<Value>)>) -> Effects {
+    fn finish_hydration(&mut self, locations: Vec<Option<Value>>) -> ListTurn {
         let mut locations = locations.into_iter();
         let subject = match self.pending_subject() {
             true => locations
                 .next()
-                .and_then(|(_, value)| value)
+                .flatten()
                 .and_then(|value| NodeSubjectRecord::from_bytes(value.as_ref()).ok()),
             false => None,
         };
@@ -696,14 +629,14 @@ impl ListBucketOperation {
                     version_created_at,
                     governed,
                 } => {
-                    let Some((_key, value)) = locations.next() else {
-                        return self.emit_error(ListBucketError::ListObjectsFailed);
+                    let Some(value) = locations.next() else {
+                        return Err(ListBucketError::ListObjectsFailed);
                     };
                     let registration = match governed.as_ref() {
                         Some(_) => match locations.next() {
-                            Some((_, value)) => value,
+                            Some(value) => value,
                             None => {
-                                return self.emit_error(ListBucketError::ListObjectsFailed);
+                                return Err(ListBucketError::ListObjectsFailed);
                             }
                         },
                         None => None,
@@ -714,7 +647,7 @@ impl ListBucketOperation {
                     };
                     let location = match BackendLocation::from_bytes(value.as_ref()) {
                         Ok(location) => location,
-                        Err(err) => return self.emit_error(err.into()),
+                        Err(err) => return Err(err.into()),
                     };
                     // A governed head this node cannot answer for is still
                     // listed, but without describing bytes it may not serve.
@@ -739,64 +672,28 @@ impl ListBucketOperation {
             }
         }
 
-        self.commit()
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: (event).label(),
-            });
-        };
-
-        self.state = ListBucketState::Finish;
-        smallvec![]
+        self.finish()
     }
 }
 
-impl EffectOperation for ListBucketOperation {
+impl Operation for ListBucketOperation {
     type Output = ListBucketResult;
     type Error = ListBucketError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> ListTurn {
+        self.start_scan()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(ListBucketError::StorageError(error));
-        }
-
+    fn next(&mut self, result: IoResult) -> ListTurn {
         match self.state {
-            ListBucketState::Init => self.handle_init(),
-            ListBucketState::StartTransaction => self.handle_transaction_started(event),
-            ListBucketState::ReadHeads => self.handle_heads_read(event),
-            ListBucketState::ReadVersions => self.round_versions_read(event),
-            ListBucketState::ReadBlobLocations => self.handle_locations_read(event),
-            ListBucketState::CommitTransaction => self.handle_transaction_committed(event),
-            ListBucketState::Finish | ListBucketState::Error => smallvec![],
+            ListBucketState::ReadHeads => self.handle_heads_read(result.event()?),
+            ListBucketState::ReadVersions => self.round_versions_read(result.values()?),
+            ListBucketState::ReadBlobLocations => self.finish_hydration(result.values()?),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ListBucketState::Finish | ListBucketState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(ListBucketError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
     }
 }
 

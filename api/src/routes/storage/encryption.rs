@@ -8,6 +8,7 @@ use super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
+use crate::routes::storage::bucket::keys::activate_and_wake;
 use crate::server::state::ServerState;
 use aruna_core::errors::BlobError;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -33,7 +34,6 @@ use aruna_operations::s3::bucket::encryption::{
 use aruna_operations::s3::bucket::holders::LookupKeysOperation;
 use aruna_operations::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
 use aruna_operations::s3::bucket::key::rows::SettingsError;
-use aruna_operations::s3::bucket::key::wake::activate_and_wake;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };

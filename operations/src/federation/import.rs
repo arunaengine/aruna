@@ -1497,9 +1497,13 @@ pub(crate) mod tests {
         let (first, second) = (Ulid::from_bytes([9; 16]), Ulid::from_bytes([10; 16]));
         let live = upload(u64::MAX);
         let storage = &context.storage_handle;
-        crate::jobs::import::upload_store::write_rocrate_upload(&context, &live)
-            .await
-            .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(live.clone()),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         let mut record = record();
         record.grant.payload.artifact_blake3 = hex::encode(live.blake3);
         write_import(&context, "key", first, &record).await.unwrap();

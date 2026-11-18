@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_operations::driver::drive;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -137,13 +138,11 @@ async fn list_documents(
     _: OwnerAuth,
 ) -> ServerResult<Json<DeviceDocumentList>> {
     let context = state.get_ctx();
-    let replicas = list_replicas(&context)
-        .await
+    let replicas = drive(list_replicas(), &context).await.ok()
         .ok_or(ServerError::ServiceUnavailable)?;
     Ok(Json(DeviceDocumentList {
         cache_budget_bytes: cache_budget(),
-        cache_used_bytes: cache_usage(&context)
-            .await
+        cache_used_bytes: drive(cache_usage(), &context).await.ok()
             .ok_or(ServerError::ServiceUnavailable)?,
         documents: replicas.into_iter().map(DeviceDocument::from).collect(),
     }))
@@ -201,8 +200,8 @@ async fn set_selection(
     let document_id = Ulid::from_str(&document_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
     let replica = match request.selected {
-        true => select_document(&context, document_id).await,
-        false => deselect_document(&context, document_id).await,
+        true => drive(select_document(&context, document_id), &context).await,
+        false => drive(deselect_document(document_id), &context).await,
     }
     .map_err(map_selection_error)?;
     Ok(Json(replica.into()))

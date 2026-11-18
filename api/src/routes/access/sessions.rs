@@ -17,8 +17,8 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::create_token::CreateTokenError;
 use aruna_operations::driver::drive;
 use aruna_operations::session::{
-    CreateSessionConfig, CreateSessionError, ListSessionOperation, RevokeSessionError,
-    RevokeSessionOperation, bound_session_expiry, create_making_room,
+    CreateSessionConfig, CreateSessionError, ListSessionOperation, MakeRoomOperation,
+    RevokeSessionError, RevokeSessionOperation, bound_session_expiry,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -234,9 +234,12 @@ pub async fn create_session(
         auth_time: None,
         cutoff: None,
     };
-    let created = create_making_room(&state.get_ctx(), state.get_node_id(), config)
-        .await
-        .map_err(map_create_error)?;
+    let created = drive(
+        MakeRoomOperation::new(state.get_node_id(), config),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse {

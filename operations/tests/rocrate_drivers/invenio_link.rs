@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::driven::drain_links;
+use super::driven::list_links;
+use super::driven::seal_link_token;
 use super::remote::{RemoteServer, remote};
 use super::*;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -11,10 +14,8 @@ use aruna_core::repository::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
-use aruna_operations::jobs::repository::link_queue::drain_links;
-use aruna_operations::jobs::repository::link_store::list_links;
+use aruna_operations::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
-use aruna_operations::jobs::repository::seal_link_token;
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::jobs::store::state::{complete_job, fail_job};
 use aruna_operations::jobs::submit::SubmitJobError;
@@ -22,11 +23,11 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
-use aruna_operations::metadata::prune_queue::process_prune_batch;
-use aruna_operations::metadata::raw_revision::load_raw_revision;
+use aruna_operations::metadata::revision_read::RawViewOperation;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
 };
+use aruna_operations::testing::process_prune_batch;
 
 pub(super) const LINK_TOKEN: &str = "link-token";
 
@@ -246,8 +247,9 @@ pub(super) async fn change(
     text: &str,
     drop_empty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
-        .await?
+    let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await
+        .map(|(_, revision)| revision)?
         .ok_or("revision missing")?;
     let mut document: Value = serde_json::from_str(&revision.jsonld)?;
     let graph = document["@graph"].as_array_mut().ok_or("graph missing")?;
@@ -408,11 +410,12 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
             .any(|(method, path)| *method == Method::DELETE && path.ends_with("empty.txt"))
     );
 
-    let event = load_raw_revision(&fixture.context, doc_id(1), None)
-        .await?
+    let event = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await
+        .map(|(_, revision)| revision)?
         .ok_or("revision missing")?
         .winning_event_id;
-    Box::pin(aruna_operations::jobs::repository::link_queue::start_push(
+    Box::pin(super::driven::start_push(
         &fixture.context,
         &second,
         event,
@@ -588,8 +591,9 @@ async fn queued_push_recovers() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .await?;
     // A drain that submitted the job but stopped before recording it leaves the check queued.
-    let event = load_raw_revision(&fixture.context, doc_id(1), None)
-        .await?
+    let event = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await
+        .map(|(_, revision)| revision)?
         .ok_or("revision missing")?
         .winning_event_id;
     let spec = ExportRoCrateSpec {
@@ -714,9 +718,7 @@ async fn lost_holder_fails() -> Result<(), Box<dyn std::error::Error>> {
         config.to_bytes(&fixture.actor)?,
     )
     .await?;
-    assert!(
-        !aruna_operations::jobs::repository::link_queue::owner_holds(&fixture.context, &link).await
-    );
+    assert!(!super::driven::owner_holds(&fixture.context, &link).await);
 
     drain(&fixture).await?;
     let (failed, queued) = current(&fixture, &link).await;
@@ -758,7 +760,9 @@ async fn scaffold_link_checked() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
-    let raw = load_raw_revision(&fixture.context, doc_id(1), None).await?;
+    let raw = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await
+        .map(|(_, revision)| revision)?;
     assert!(raw.is_none(), "a scaffold keeps no raw revision");
 
     let link = Box::pin(attach(
@@ -902,8 +906,9 @@ async fn missing_file_fails() -> Result<(), Box<dyn std::error::Error>> {
     let server = remote(LINK_TOKEN).await;
     let link = Box::pin(linked(&fixture, &server.endpoint, LINK_TOKEN, false, None)).await?;
     // The crate names a stored object that does not exist in this realm.
-    let revision = load_raw_revision(&fixture.context, doc_id(1), None)
-        .await?
+    let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
+        .await
+        .map(|(_, revision)| revision)?
         .ok_or("revision missing")?;
     let document: Value = serde_json::from_str(&revision.jsonld)?;
     let entity = document["@graph"]
@@ -964,8 +969,8 @@ async fn has_row(fixture: &Fixture, key_space: &str, link: &RepositoryLink) -> b
 
 #[tokio::test]
 async fn cancelled_queue_settles() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
-    use aruna_operations::jobs::repository::link_store::change_link;
+    use super::driven::change_link;
+    use super::driven::{current_event, start_push};
     use aruna_operations::jobs::store::attempt::{CancelRequestOutcome, set_cancel_requested};
     for paused in [false, true] {
         let fixture = build_fixture(false).await?;

@@ -3,12 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::s3::bucket::key::extend::{ExtendBucketOperation, ExtendInput};
 use crate::s3::bucket::key::rows::authority_rows;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::SecretBytes;
+use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode, public_key_of};
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::task::TaskEvent;
 use std::time::SystemTime;
 
 const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
@@ -21,42 +25,21 @@ fn private() -> SharedSecret {
     SharedSecret::new(SecretBytes::new(vec![5; 32]))
 }
 
-/// Runs an unlock by `caller` with `admins` up to its prepare step.
-fn prepared(caller: UserId, admins: &[UserId]) -> (UnlockBucketOperation, Effects) {
-    let (mut operation, effects) = checked(caller, admins);
-    if !matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { .. })]
-    ) {
-        return (operation, effects);
-    }
-    let copy = (Key::from(Vec::new()), Value::from(vec![1]));
-    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-        values: vec![copy],
-        next_start_after: None,
-    }));
-    (operation, effects)
-}
-
-/// Runs an unlock up to the read of the caller's sealed copy.
-fn checked(caller: UserId, admins: &[UserId]) -> (UnlockBucketOperation, Effects) {
-    let key = BucketKeyRef::new(BUCKET_ID, 2);
-    let input = UnlockInput {
+fn input(caller: UserId) -> UnlockInput {
+    UnlockInput {
         bucket: "bucket".to_string(),
         group_id: Ulid::from_bytes([3; 16]),
         node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
         caller,
-        key,
+        key: BucketKeyRef::new(BUCKET_ID, 2),
         duration: Some(Duration::from_secs(60)),
         realm_id: RealmId::from_bytes([1; 32]),
         now_ms: 1_000,
-    };
-    let mut operation = UnlockBucketOperation::new(input, private());
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
-    let info = BucketInfo {
+    }
+}
+
+fn info() -> BucketInfo {
+    BucketInfo {
         group_id: Ulid::from_bytes([3; 16]),
         created_at: SystemTime::UNIX_EPOCH,
         created_by: user(1),
@@ -66,7 +49,47 @@ fn checked(caller: UserId, admins: &[UserId]) -> (UnlockBucketOperation, Effects
         placement_policy_generation: 0,
         compression: Compression::Off,
         distribution: None,
+    }
+}
+
+fn event(event: Event) -> IoResult {
+    IoResult::Event(Box::new(event))
+}
+
+fn blob(blob: BlobEvent) -> IoResult {
+    event(Event::Blob(blob))
+}
+
+fn synced() -> IoResult {
+    event(Event::Storage(StorageEvent::SyncAllFinished))
+}
+
+fn kept(stored: bool) -> IoResult {
+    IoResult::Child(ChildOutcome::new(Ok::<_, AuditError>(stored)))
+}
+
+fn asked(turn: &UnlockTurn) -> &Effect {
+    match turn {
+        Ok(Next::Call(IoCall::Effect(effect))) => effect,
+        other => panic!("expected an effect call, got {other:?}"),
+    }
+}
+
+/// The intent child of an unlock by `caller` with `admins`, up to the read of the sealed copy.
+fn checked(caller: UserId, admins: &[UserId]) -> (UnlockIntent, IntentTurn) {
+    let key = BucketKeyRef::new(BUCKET_ID, 2);
+    let mut operation = UnlockIntent {
+        input: input(caller),
+        step: IntentStep::ReadBucket,
+        implicit: false,
+        max: None,
+        private_key: Some(private()),
+        record: None,
+        ticket: None,
+        intent: None,
     };
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    operation.first().unwrap();
     let settings = BucketEncryption {
         mode: EncryptionMode::VaultLocked,
         bucket_id: Some(BUCKET_ID),
@@ -74,14 +97,28 @@ fn checked(caller: UserId, admins: &[UserId]) -> (UnlockBucketOperation, Effects
         max_unlock_ms: Some(3_600_000),
         ..Default::default()
     };
-    let row = |value: Option<Vec<u8>>| (Key::from(Vec::new()), value.map(Value::from));
-    let values = authority_rows(&info, Some(&settings), admins);
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let rows = authority_rows(&info(), Some(&settings), admins);
+    let values = rows.into_iter().map(|(_, value)| value).collect();
+    operation.next(IoResult::Values(values)).unwrap();
     let public = public_key_of(private().bytes()).unwrap();
     let record = BucketKeyRecord::new(key, Ulid::from_bytes([6; 16]), public, 1);
-    let values = vec![row(Some(record.to_bytes().unwrap())), row(None)];
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    (operation, effects)
+    let answer = IoResult::Values(vec![Some(record.to_bytes().unwrap().into()), None]);
+    let turn = operation.next(answer);
+    (operation, turn)
+}
+
+/// The intent child up to its prepare step.
+fn prepared(caller: UserId, admins: &[UserId]) -> (UnlockIntent, IntentTurn) {
+    let (mut operation, turn) = checked(caller, admins);
+    if !matches!(turn, Ok(Next::Call(IoCall::Page { .. }))) {
+        return (operation, turn);
+    }
+    let copy = (Key::from(Vec::new()), Value::from(vec![1]));
+    let turn = operation.next(IoResult::Page {
+        rows: vec![copy],
+        next: None,
+    });
+    (operation, turn)
 }
 
 fn ticket() -> KeyTicket {
@@ -91,81 +128,95 @@ fn ticket() -> KeyTicket {
     }
 }
 
-fn audited(effects: &Effects) -> BucketAuditRecord {
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space, value, ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected an audit write, got {effects:?}");
+fn intent_record() -> BucketAuditRecord {
+    let (mut intent, _) = prepared(user(1), &[]);
+    intent
+        .next(blob(BlobEvent::KeyPrepared { ticket: ticket() }))
+        .unwrap();
+    let Ok(Next::Done(prepared)) = intent.next(IoResult::Done) else {
+        panic!("the intent is written");
     };
-    assert_eq!(key_space, BUCKET_AUDIT_KEYSPACE);
-    BucketAuditRecord::from_bytes(value).unwrap()
+    prepared.intent
+}
+
+/// An unlock whose intent committed and synced, waiting for the activation.
+fn activating() -> UnlockBucketOperation {
+    let mut operation = UnlockBucketOperation::new(input(user(1)), private());
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let prepared = PreparedUnlock {
+        ticket: ticket(),
+        intent: intent_record(),
+        max: Some(Duration::from_secs(3_600)),
+    };
+    let committed = Ok::<_, UnlockError>(prepared);
+    let turn = operation.next(IoResult::Child(ChildOutcome::new(committed)));
+    // Reads see the key only after the intent committed and reached the disk.
+    assert_eq!(asked(&turn), &Effect::Storage(StorageEffect::SyncAll));
+    let turn = operation.next(synced());
+    assert_eq!(
+        asked(&turn),
+        &Effect::Blob(BlobEffect::ActivateKey { ticket: ticket() })
+    );
+    operation
+}
+
+fn status(deadline_ms: u64, seconds: u64) -> UnlockStatus {
+    UnlockStatus {
+        key: ticket().key,
+        session_id: ticket().session_id,
+        sequence: Ulid::from_parts(1, 1),
+        deadline_ms: Some(deadline_ms),
+        active: true,
+        unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
+        remaining: Some(Duration::from_secs(seconds)),
+        max_remaining: Some(Duration::from_secs(3_600)),
+    }
 }
 
 #[test]
 fn intent_before_activation() {
-    let (mut operation, effects) = prepared(user(1), &[]);
+    let (mut intent, turn) = prepared(user(1), &[]);
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::PrepareKey { .. })]
+        &turn,
+        Ok(Next::Call(IoCall::Effect(effect)))
+            if matches!(effect.as_ref(), Effect::Blob(BlobEffect::PrepareKey { .. }))
     ));
-    let effects = operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
-    let intent = audited(&effects);
+    let turn = intent.next(blob(BlobEvent::KeyPrepared { ticket: ticket() }));
+    let Ok(Next::Call(IoCall::Write(rows))) = &turn else {
+        panic!("expected the intent, got {turn:?}");
+    };
+    assert_eq!(rows[0].0, BUCKET_AUDIT_KEYSPACE);
+    let record = BucketAuditRecord::from_bytes(&rows[0].2).unwrap();
     assert_eq!(
-        (intent.outcome, intent.deadline_ms),
+        (record.outcome, record.deadline_ms),
         (AuditOutcome::Intent, Some(61_000))
     );
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    // Reads see the key only after the intent committed and reached the disk.
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
-    assert_eq!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::SyncAll)]
-    );
-    let effects = operation.step(Event::Storage(StorageEvent::SyncAllFinished));
-    assert_eq!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::ActivateKey { ticket: ticket() })]
-    );
-    let status = UnlockStatus {
-        key: ticket().key,
-        session_id: ticket().session_id,
-        sequence: ulid::Ulid::from_parts(1, 1),
-        deadline_ms: Some(65_000),
-        active: true,
-        unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
-        remaining: Some(Duration::from_secs(60)),
-        max_remaining: Some(Duration::from_secs(3_600)),
-    };
-    let effects = operation.step(Event::Blob(BlobEvent::KeyActivated {
-        status: status.clone(),
+
+    let mut operation = activating();
+    let active = status(65_000, 60);
+    let turn = operation.next(blob(BlobEvent::KeyActivated {
+        status: active.clone(),
     }));
     // The timed lock of this session is armed for the remaining time.
     let key = lock_timer(&ticket());
+    let after = Duration::from_secs(60);
     let arm = TaskEffect::ShortenTimer {
         key: key.clone(),
-        after: Duration::from_secs(60),
+        after,
     };
-    assert_eq!(effects.as_slice(), [Effect::Task(arm)]);
-    let after = Duration::from_secs(60);
-    let event = aruna_core::task::TaskEvent::TimerScheduled { key, after };
-    let effects = operation.step(Event::Task(event));
+    assert_eq!(asked(&turn), &Effect::Task(arm));
+    let armed = TaskEvent::TimerScheduled { key, after };
+    operation.next(event(Event::Task(armed))).unwrap();
     // The applied record states the deadline of the session as activated.
-    let applied = audited(&effects);
+    let applied = operation.outcome.clone().unwrap();
     assert_eq!(
         (applied.outcome, applied.deadline_ms),
         (AuditOutcome::Applied, Some(65_000))
     );
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    assert_eq!(operation.finalize(), Ok(status));
+    assert_eq!(operation.next(kept(true)), Ok(Next::Done(active)));
 }
 
 struct TimerSender(tokio::sync::mpsc::Sender<aruna_core::task::TaskKey>);
@@ -177,26 +228,27 @@ impl aruna_tasks::InboundTaskHandler for TimerSender {
     }
 }
 
+/// Runs the effect a turn asked for on the scheduler and returns its answer.
+async fn on_scheduler<T: std::fmt::Debug, E: std::fmt::Debug>(
+    scheduler: &aruna_tasks::TaskHandle,
+    turn: Result<Next<T>, E>,
+) -> IoResult {
+    let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+        panic!("expected a timer effect, got {turn:?}");
+    };
+    IoResult::Event(Box::new(scheduler.send_effect(*effect).await))
+}
+
 #[tokio::test(start_paused = true)]
 async fn reversed_unlock_shorten() {
-    use crate::s3::bucket::key::extend::{ExtendBucketOperation, ExtendInput};
-    use aruna_core::handle::Handle;
-
-    let (mut unlock, _) = prepared(user(1), &[]);
-    unlock.step = UnlockStep::ActivateKey;
-    unlock.ticket = Some(ticket());
-    let status = UnlockStatus {
-        key: ticket().key,
-        session_id: ticket().session_id,
-        sequence: Ulid::from_parts(1, 1),
+    let mut unlock = activating();
+    let active = UnlockStatus {
         deadline_ms: Some(91_000),
-        active: true,
         unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        remaining: Some(Duration::from_secs(90)),
-        max_remaining: Some(Duration::from_secs(3_600)),
+        ..status(91_000, 90)
     };
-    let mut older = unlock.step(Event::Blob(BlobEvent::KeyActivated {
-        status: status.clone(),
+    let older = unlock.next(blob(BlobEvent::KeyActivated {
+        status: active.clone(),
     }));
     let mut extension = ExtendBucketOperation::new(ExtendInput {
         bucket: "bucket".to_string(),
@@ -209,39 +261,31 @@ async fn reversed_unlock_shorten() {
         duration: Some(Duration::from_secs(30)),
         now_ms: 1_000,
     });
-    extension.start();
-    let info = BucketInfo {
-        group_id: unlock.input.group_id,
-        created_at: SystemTime::UNIX_EPOCH,
-        created_by: user(1),
-        cors_configuration: None,
-        storage_routing: Vec::new(),
-        placement_policies: Vec::new(),
-        placement_policy_generation: 0,
-        compression: Compression::Off,
-        distribution: None,
-    };
+    extension.first().unwrap();
     let settings = BucketEncryption {
         mode: EncryptionMode::VaultLocked,
         bucket_id: Some(BUCKET_ID),
         key_generation: ticket().key.generation,
         ..Default::default()
     };
-    let values = authority_rows(&info, Some(&settings), &[]);
-    extension.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    extension.step(Event::Blob(BlobEvent::KeyStatus {
-        generations: vec![status.clone()],
-    }));
-    extension.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    extension.step(Event::Storage(StorageEvent::SyncAllFinished));
-    let mut newer = extension.step(Event::Blob(BlobEvent::KeyExtended {
+    let rows = authority_rows(&info(), Some(&settings), &[]);
+    let values = rows.into_iter().map(|(_, value)| value).collect();
+    extension.next(IoResult::Values(values)).unwrap();
+    extension
+        .next(blob(BlobEvent::KeyStatus {
+            generations: vec![active.clone()],
+        }))
+        .unwrap();
+    let written = Ok::<(), StorageError>(());
+    extension
+        .next(IoResult::Child(ChildOutcome::new(written)))
+        .unwrap();
+    let newer = extension.next(blob(BlobEvent::KeyExtended {
         status: UnlockStatus {
             sequence: Ulid::from_parts(1, 2),
             deadline_ms: Some(31_000),
             remaining: Some(Duration::from_secs(30)),
-            ..status
+            ..active
         },
     }));
     let scheduler = aruna_tasks::TaskHandle::new();
@@ -250,8 +294,10 @@ async fn reversed_unlock_shorten() {
         .set_inbound_handler(std::sync::Arc::new(TimerSender(sender)))
         .await;
     let start = tokio::time::Instant::now();
-    extension.step(scheduler.send_effect(newer.pop().unwrap()).await);
-    unlock.step(scheduler.send_effect(older.pop().unwrap()).await);
+    let answer = on_scheduler(&scheduler, newer).await;
+    extension.next(answer).unwrap();
+    let answer = on_scheduler(&scheduler, older).await;
+    unlock.next(answer).unwrap();
     assert_eq!(fired.recv().await.unwrap(), lock_timer(&ticket()));
     assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(30));
     scheduler.shutdown(Duration::ZERO).await;
@@ -259,34 +305,24 @@ async fn reversed_unlock_shorten() {
 
 #[test]
 fn delayed_unlock_unresolved() {
-    let (mut operation, _) = prepared(user(1), &[]);
-    let effects = operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
-    let intent = audited(&effects);
+    let intent = intent_record();
     assert_eq!(intent.deadline_ms, Some(61_000));
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
-    operation.step(Event::Storage(StorageEvent::SyncAllFinished));
-    operation.step(Event::Blob(BlobEvent::KeyActivated {
-        status: UnlockStatus {
-            key: ticket().key,
-            session_id: ticket().session_id,
-            sequence: Ulid::from_parts(31_000, 1),
-            deadline_ms: Some(91_000),
-            active: true,
-            unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(31),
-            remaining: Some(Duration::from_secs(60)),
-            max_remaining: Some(Duration::from_secs(3_600)),
-        },
-    }));
-    let effects = operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+    let mut operation = activating();
+    operation.intent = Some(intent.clone());
+    let active = UnlockStatus {
+        sequence: Ulid::from_parts(31_000, 1),
+        unlocked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(31),
+        ..status(91_000, 60)
+    };
+    operation
+        .next(blob(BlobEvent::KeyActivated { status: active }))
+        .unwrap();
+    let armed = TaskEvent::TimerScheduled {
         key: lock_timer(&ticket()),
         after: Duration::from_secs(60),
-    }));
-    let outcome = audited(&effects);
+    };
+    operation.next(event(Event::Task(armed))).unwrap();
+    let outcome = operation.outcome.clone().unwrap();
     assert_eq!(outcome.deadline_ms, Some(91_000));
     assert_eq!(
         crate::s3::bucket::key::restart::replay(std::slice::from_ref(&intent), 76_000),
@@ -300,140 +336,88 @@ fn delayed_unlock_unresolved() {
 
 #[test]
 fn failed_activation_discards() {
-    let (mut operation, _) = prepared(user(1), &[]);
-    operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
-    operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+    let mut operation = activating();
     let refused = BlobError::BucketKey(BucketKeyError::Capacity);
-    let effects = operation.step(Event::Blob(BlobEvent::Error(refused)));
+    let turn = operation.next(blob(BlobEvent::Error(refused)));
     assert_eq!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() })]
+        asked(&turn),
+        &Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() })
     );
-    let effects = operation.step(Event::Blob(BlobEvent::KeyDiscarded { ticket: ticket() }));
-    let outcome = audited(&effects);
+    operation
+        .next(blob(BlobEvent::KeyDiscarded { ticket: ticket() }))
+        .unwrap();
+    let outcome = operation.outcome.clone().unwrap();
     assert_eq!(outcome.outcome, AuditOutcome::Failed);
-    // A failed outcome write is retried with the same record.
-    let error = StorageError::Timeout;
-    let effects = operation.step(Event::Storage(StorageEvent::Error { error }));
-    assert_eq!(audited(&effects), outcome);
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    assert!(matches!(operation.finalize(), Err(UnlockError::Blob(_))));
+    assert!(matches!(
+        operation.next(kept(true)),
+        Err(UnlockError::Blob(_))
+    ));
 }
 
 #[test]
 fn former_admin_refused() {
     // Admin rights decide implicit authority at the moment of the unlock (D30).
-    let (operation, effects) = prepared(user(2), &[]);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(operation.finalize(), Err(UnlockError::NotHolder));
-    let (_, effects) = prepared(user(2), &[user(2)]);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::PrepareKey { .. })]
-    ));
+    let (_, turn) = prepared(user(2), &[]);
+    assert!(matches!(turn, Err(UnlockError::NotHolder)));
+    let (_, turn) = prepared(user(2), &[user(2)]);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Effect(_)))));
 }
 
 #[test]
-fn foreign_events_refused() {
-    // A commit of another transaction proves nothing; the prepared key is discarded.
-    let (mut operation, _) = prepared(user(1), &[]);
-    operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_bytes([7; 16]),
-    }));
-    let discard = Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() });
-    assert!(effects.contains(&discard), "{effects:?}");
-    assert!(matches!(
-        operation.finalize(),
-        Err(UnlockError::InvalidStateEvent { .. })
-    ));
-
+fn foreign_status_refused() {
     // An activation answer for another key generation is not this session's.
-    let (mut operation, _) = prepared(user(1), &[]);
-    operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
-    operation.step(Event::Storage(StorageEvent::SyncAllFinished));
-    let status = UnlockStatus {
+    let mut operation = activating();
+    let other = UnlockStatus {
         key: BucketKeyRef::new(BUCKET_ID, 1),
-        session_id: ticket().session_id,
-        sequence: ulid::Ulid::from_parts(1, 1),
-        deadline_ms: None,
-        active: true,
-        unlocked_at: SystemTime::UNIX_EPOCH,
-        remaining: None,
-        max_remaining: None,
+        ..status(1, 1)
     };
-    let effects = operation.step(Event::Blob(BlobEvent::KeyActivated { status }));
-    assert!(effects.contains(&discard), "{effects:?}");
-    assert!(matches!(
-        operation.finalize(),
-        Err(UnlockError::InvalidStateEvent { .. })
-    ));
+    let turn = operation.next(blob(BlobEvent::KeyActivated { status: other }));
+    assert!(matches!(turn, Err(UnlockError::InvalidStateEvent { .. })));
+    let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
+    assert_eq!(operation.abort(), vec![discard]);
+}
+
+#[test]
+fn uncommitted_intent_discards() {
+    // A prepared key whose intent may be lost never activates.
+    let (mut intent, _) = prepared(user(1), &[]);
+    intent
+        .next(blob(BlobEvent::KeyPrepared { ticket: ticket() }))
+        .unwrap();
+    let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
+    assert_eq!(intent.abort(), vec![discard]);
 }
 
 #[test]
 fn unsynced_intent_discards() {
-    let (mut operation, _) = prepared(user(1), &[]);
-    operation.step(Event::Blob(BlobEvent::KeyPrepared { ticket: ticket() }));
-    operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: Key::from(Vec::new()),
-    }));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: Ulid::from_bytes([9; 16]),
-    }));
-    let error = StorageError::PersistError("disk full".to_string());
-    let effects = operation.step(Event::Storage(StorageEvent::Error { error }));
-    // The key never activates when its intent may be lost.
-    assert_eq!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() })]
-    );
-    assert!(matches!(operation.finalize(), Err(UnlockError::Storage(_))));
+    let mut operation = UnlockBucketOperation::new(input(user(1)), private());
+    operation.first().unwrap();
+    let prepared = PreparedUnlock {
+        ticket: ticket(),
+        intent: intent_record(),
+        max: None,
+    };
+    let committed = Ok::<_, UnlockError>(prepared);
+    operation
+        .next(IoResult::Child(ChildOutcome::new(committed)))
+        .unwrap();
+    // A failed sync ends the run, whose cleanup discards the key.
+    let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
+    assert_eq!(operation.abort(), vec![discard]);
 }
 
 #[test]
 fn copyless_holder_refused() {
-    let (mut operation, effects) = checked(user(1), &[]);
-    let [
-        Effect::Storage(StorageEffect::Iter {
-            key_space, prefix, ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected the copy read, got {effects:?}");
+    let (mut operation, turn) = checked(user(1), &[]);
+    let Ok(Next::Call(IoCall::Page { space, prefix, .. })) = &turn else {
+        panic!("expected the copy read, got {turn:?}");
     };
-    assert_eq!(key_space, KEY_COPY_KEYSPACE);
+    assert_eq!(space, KEY_COPY_KEYSPACE);
     let key = BucketKeyRef::new(BUCKET_ID, 2);
-    assert_eq!(
-        prefix.as_deref(),
-        Some(&SealedCopy::user_prefix(key, user(1))[..])
-    );
-    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(operation.finalize(), Err(UnlockError::NoCopy));
+    assert_eq!(prefix.as_ref(), &SealedCopy::user_prefix(key, user(1))[..]);
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert!(matches!(operation.next(empty), Err(UnlockError::NoCopy)));
 }

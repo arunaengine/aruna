@@ -15,6 +15,7 @@ use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::distribution::sharding::begin_range_rebuilds;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::inbound::initialize_net_holder;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
@@ -22,7 +23,6 @@ use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::plugin_host::plugin_work::PluginWorkHandler;
 use aruna_operations::shard::recovery::RecoveryStatus;
-use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_storage::FjallPersistPolicy;
 use aruna_tasks::TaskHandle;
@@ -405,16 +405,16 @@ async fn fill(
             compute_handle: None,
             outbound_handle: None,
         };
-        aruna_operations::groups::deletion::install_onboarding(
-            &context,
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let install = aruna_operations::groups::deletion::InstallOnboardingOperation::new(
             &ticket,
             config.realm_id,
             config.node_id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-        )
-        .await?;
+            now,
+        );
+        aruna_operations::driver::drive(install, &context).await?;
         stopped(stop)?;
     }
     let net_handle = NetHandle::new(
@@ -541,14 +541,14 @@ async fn fill(
     open_managed_keys(driver_ctx.as_ref(), config).await?;
     record_restart_locks(driver_ctx.as_ref(), config).await?;
     // Cached realm secrets the config no longer names go before any email job runs.
-    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id).await;
+    let refresh =
+        aruna_operations::notifications::email::RefreshMailOperation::new(config.realm_id);
+    if let Err(error) = drive(refresh, &driver_ctx).await {
+        warn!(%error, "Mail settings refresh stopped during startup");
+    }
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
-    aruna_operations::s3::sweeps::spawn_recovery_sweep(
-        driver_ctx.clone(),
-        origin,
-        &acquired.shutdown,
-    );
+    crate::startup::sweeps::spawn_recovery_sweep(driver_ctx.clone(), origin, &acquired.shutdown);
     stopped(stop)?;
 
     // Bind compute reconciliation before startup recovery.
@@ -661,7 +661,7 @@ fn spawn_usage_rebuild(
     let token = shutdown.token();
     shutdown.spawn(async move {
         // Range counters of distributed buckets are confirmed again by their own rebuilds.
-        match begin_range_rebuilds(&context).await {
+        match drive(begin_range_rebuilds(), &context).await {
             Ok(begun) if begun > 0 => info!(ranges = begun, "Range counter rebuilds begun"),
             Ok(_) => {}
             Err(error) => warn!(%error, "Range counter rebuilds could not begin"),

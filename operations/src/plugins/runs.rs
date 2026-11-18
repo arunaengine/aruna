@@ -545,7 +545,7 @@ pub const TICK: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 /// How one attempt of a run ended, before its intents are inspected.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Ended {
     Output(Option<String>),
     Failed(String),

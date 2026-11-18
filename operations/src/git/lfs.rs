@@ -5,12 +5,13 @@
 use super::objects::{self, Blob};
 use super::state::{Ancestry, reduce};
 use super::{GitError, publish, records, repository};
-use crate::auth::request_authorization::authorize;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::resolve::version_holders;
-use crate::driver::DriverContext;
+use crate::distribution::resolve::{RESOLVE_BUDGET, resolve_version, version_found};
+use crate::driver::{DriverContext, drive, drive_until};
+use tokio::time::Instant;
 use crate::replication::bao_read::BaoReadError;
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use aruna_core::git::{LfsObject, StoredObject};
 use aruna_core::stream::BackendStream;
@@ -52,7 +53,12 @@ async fn permit(
         if permission != Permission::READ {
             return Err(GitError::Invalid);
         }
-        return match managed_read(context, object.node_id, described(auth, object)).await {
+        return match drive(
+            ManagedReadOperation::new(object.node_id, described(auth, object)),
+            context,
+        )
+        .await
+        {
             Ok(_) => Ok(()),
             Err(BaoReadError::Refused(_)) => Err(GitError::NotFound),
             Err(_) => Err(GitError::Unavailable),
@@ -65,13 +71,15 @@ async fn permit(
         &object.bucket,
         &object.key,
     );
-    authorize(
+    drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &path,
+            &permission,
+            PolicyRequestExtras::rest(),
+        ),
         context,
-        auth.realm_id,
-        auth,
-        &path,
-        &permission,
-        PolicyRequestExtras::rest(),
     )
     .await?;
     Ok(())
@@ -113,9 +121,12 @@ pub(super) async fn readable(
                 .is_ok_and(|found| found.is_some())
         }
         (true, None) => false,
-        (false, _) => managed_read(context, object.node_id, described(auth, object))
-            .await
-            .is_ok(),
+        (false, _) => drive(
+            ManagedReadOperation::new(object.node_id, described(auth, object)),
+            context,
+        )
+        .await
+        .is_ok(),
     }
 }
 
@@ -185,10 +196,13 @@ pub async fn upload(
 /// The members that keep a pinned distributed version, found through the resolver.
 async fn set_holders(context: &DriverContext, object: &StoredObject) -> Vec<aruna_core::NodeId> {
     match &object.global {
-        Some(GlobalId::Version { version_id, .. }) => version_holders(context, *version_id)
-            .await
-            .map(|resolved| resolved.holders)
-            .unwrap_or_default(),
+        Some(GlobalId::Version { version_id, .. }) => {
+            let deadline = Instant::now() + RESOLVE_BUDGET;
+            let resolve = resolve_version(context, *version_id, deadline);
+            version_found(drive_until(resolve, context, deadline).await)
+                .map(|resolved| resolved.holders)
+                .unwrap_or_default()
+        }
         _ => Vec::new(),
     }
 }

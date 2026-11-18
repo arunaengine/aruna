@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::imports::shared::shares_folder;
+use crate::s3::imports::folders::shares_folder;
 use aruna_core::calls::IoCall;
 use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
 use aruna_core::structs::storage::backend_import::BackendImport;

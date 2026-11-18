@@ -21,7 +21,6 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::device::compute::LocalExecutionError;
 use aruna_operations::driver::drive;
 use aruna_operations::federation::grant::AdmitGrantOperation;
 use aruna_operations::jobs::REPORT_MAX_ROWS;
@@ -30,6 +29,7 @@ use aruna_operations::jobs::command::{
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
+use aruna_operations::jobs::local_run::LocalExecutionError;
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;

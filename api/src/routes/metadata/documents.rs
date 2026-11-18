@@ -16,9 +16,10 @@ use crate::metadata::{
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
-use aruna_operations::metadata::api::path::lookup_metadata_path as run_lookup_metadata_path;
+use aruna_operations::metadata::api::path::LookupPathOperation;
 use aruna_operations::metadata::api::path_types::MetadataLookupRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::read::get_metadata_routed as run_get_visible_metadata_document;
@@ -433,18 +434,16 @@ pub async fn get_metadata_path(
     Query(query): Query<MetadataPathQuery>,
 ) -> ServerResult<(StatusCode, Json<MetadataPathResponse>)> {
     let group_id = parse_group_id(&group_id)?;
-    let result = run_lookup_metadata_path(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        MetadataLookupRequest {
-            group_id,
-            document_path: query.path,
-            auth,
-        },
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_api_error)?;
+    let ctx = state.get_ctx();
+    let request = MetadataLookupRequest {
+        group_id,
+        document_path: query.path,
+        auth,
+    };
+    let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+    let auth_token = forwarded_auth_token(bearer_token)?;
+    let lookup = LookupPathOperation::new(state.get_realm_id(), request, auth_token, local_node);
+    let result = drive(lookup, ctx.as_ref()).await.map_err(map_api_error)?;
     Ok((
         StatusCode::OK,
         Json(MetadataPathResponse {

@@ -2,35 +2,29 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::document_repository::GetConfigOperation;
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::forward::authorize::authorize_forwarded_caller;
-use crate::forward::authorize::authorize_write;
-use crate::forward::authorize::forward_auth_error;
-use crate::forward::transport::RetryDisposition;
+use crate::auth::error::AuthorizeError;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::forward::authorize::{
+    ForwardAuthError, ForwardedCallerOperation, forward_auth_error, write_check,
+};
+use crate::forward::fetch::{peer_call, peer_reply};
 use crate::forward::transport::reject;
-use crate::forward::transport::retry_disposition;
-use crate::groups::create_group::CreateGroupConfig;
-use crate::groups::create_group::CreateGroupError;
-use crate::groups::create_group::CreateGroupOperation;
-use crate::metadata::api::MetadataApiError;
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::WriteAuthError;
+use crate::groups::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
+use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError, encode_message};
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
+use aruna_core::events::PeerRequestError;
 use aruna_core::metadata::AuthToken;
+use aruna_core::operation::Operation;
 use aruna_core::placement::selector::select_top_peers;
-use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::group::Group;
-use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::time::timeout;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -40,165 +34,306 @@ pub(super) const CREATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a forwarded group create did not produce a group. `Conflict` is the
 /// caller's problem (quota or a racing create) and must not be retried on
-/// another ingress; everything else maps to the usual transport response.
-#[derive(Debug, Error)]
+/// another ingress.
+#[derive(Debug, Error, PartialEq)]
 pub enum ForwardGroupError {
-    #[error(transparent)]
-    Api(#[from] MetadataApiError),
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
+    #[error("service unavailable")]
+    Unavailable,
     #[error("{0}")]
     Conflict(String),
 }
 
+impl From<IoError> for ForwardGroupError {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
+type CreatedGroup = (Group, GroupAuthorizationDocument);
+
 /// Sends a User node's group create to a sync-eligible ingress. The device
 /// never originates a realm administrative event: the ingress authorizes the
 /// caller's own token and originates the event with the caller as actor.
-pub async fn forward_group_create(
-    context: &Arc<DriverContext>,
+#[derive(Debug, PartialEq)]
+pub struct ForwardGroupOperation {
     realm_id: RealmId,
-    auth_token: AuthToken,
+    local: Option<NodeId>,
+    auth_token: Option<AuthToken>,
     display_name: String,
-) -> Result<(Group, GroupAuthorizationDocument), ForwardGroupError> {
-    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
-        return Err(MetadataApiError::ServiceUnavailable.into());
-    };
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return Err(MetadataApiError::ServiceUnavailable.into());
-    };
-    let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut subject = display_name.clone().into_bytes();
-    subject.extend_from_slice(&Ulid::generate().to_bytes());
-    let peers = select_top_peers(
-        config
-            .nodes
-            .iter()
-            .filter(|node| node.kind.is_sync_eligible())
-            .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-            .filter(|peer| Some(*peer) != local_node_id),
-        &subject,
-        CREATE_PEER_LIMIT,
-        |_| {},
-    );
-    if peers.is_empty() {
-        return Err(MetadataApiError::ServiceUnavailable.into());
+    request_id: Ulid,
+    frame: Vec<u8>,
+    /// Reversed, so the next peer pops off the end.
+    peers: Vec<NodeId>,
+    asked: Option<NodeId>,
+}
+
+impl ForwardGroupOperation {
+    /// `request_id` spreads repeated creates of one name over the ingress nodes.
+    pub fn new(
+        realm_id: RealmId,
+        local: Option<NodeId>,
+        auth_token: AuthToken,
+        display_name: String,
+        request_id: Ulid,
+    ) -> Self {
+        Self {
+            realm_id,
+            local,
+            auth_token: Some(auth_token),
+            display_name,
+            request_id,
+            frame: Vec::new(),
+            peers: Vec::new(),
+            asked: None,
+        }
     }
-    let message = MetadataTransportMessage::ForwardGroupCreate {
-        auth_token: Some(auth_token),
-        display_name,
-    };
-    // Retrying a create on another ingress could mint a second group, so only a request
-    // that never left this node moves on.
-    for peer in peers {
-        match timeout(
-            CREATE_ATTEMPT_TIMEOUT,
-            metadata.request_forwarded_write(peer, message.clone()),
-        )
-        .await
-        {
-            Ok(Ok(MetadataTransportMessage::ForwardedGroupCreated {
+
+    fn choose_peers(&mut self, config: &RealmConfigDocument) -> Result<(), ForwardGroupError> {
+        let mut subject = self.display_name.clone().into_bytes();
+        subject.extend_from_slice(&self.request_id.to_bytes());
+        let local = self.local;
+        let mut peers = select_top_peers(
+            (config.nodes.iter())
+                .filter(|node| node.kind.is_sync_eligible())
+                .filter_map(|node| NodeId::from_str(&node.node_id).ok())
+                .filter(|peer| Some(*peer) != local),
+            &subject,
+            CREATE_PEER_LIMIT,
+            |_| {},
+        );
+        peers.reverse();
+        self.peers = peers;
+        let message = MetadataTransportMessage::ForwardGroupCreate {
+            auth_token: self.auth_token.take(),
+            display_name: self.display_name.clone(),
+        };
+        self.frame = encode_message(&message).map_err(|_| ForwardGroupError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Retrying a create on another ingress could mint a second group, so only a request
+    /// that never left this node moves on.
+    fn ask_next(&mut self) -> Result<Next<CreatedGroup>, ForwardGroupError> {
+        let peer = self.peers.pop().ok_or(ForwardGroupError::Unavailable)?;
+        self.asked = Some(peer);
+        let frame = self.frame.clone();
+        Ok(Next::Call(peer_call(peer, frame, CREATE_ATTEMPT_TIMEOUT)))
+    }
+
+    fn answered(
+        &mut self,
+        peer: NodeId,
+        reply: Result<MetadataTransportMessage, PeerRequestError>,
+    ) -> Result<Next<CreatedGroup>, ForwardGroupError> {
+        match reply {
+            Ok(MetadataTransportMessage::ForwardedGroupCreated {
                 group,
                 authorization,
-            })) => return Ok((*group, *authorization)),
-            Ok(Ok(MetadataTransportMessage::GroupCreateConflict { reason })) => {
-                return Err(ForwardGroupError::Conflict(reason));
+            }) => Ok(Next::Done((*group, *authorization))),
+            Ok(MetadataTransportMessage::GroupCreateConflict { reason }) => {
+                Err(ForwardGroupError::Conflict(reason))
             }
-            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
                 error: WriteAuthError::Unauthorized,
-            })) => return Err(MetadataApiError::Unauthorized.into()),
-            Ok(Ok(MetadataTransportMessage::ForwardedWriteDenied {
+            }) => Err(ForwardGroupError::Unauthorized),
+            Ok(MetadataTransportMessage::ForwardedWriteDenied {
                 error: WriteAuthError::Forbidden,
-            })) => return Err(MetadataApiError::Forbidden.into()),
-            Ok(Ok(MetadataTransportMessage::Reject(error))) => {
+            }) => Err(ForwardGroupError::Forbidden),
+            Ok(MetadataTransportMessage::Reject(error)) => {
                 warn!(%peer, %error, "Ingress rejected a forwarded group create");
-                return Err(MetadataApiError::ServiceUnavailable.into());
+                Err(ForwardGroupError::Unavailable)
             }
-            Ok(Ok(_)) => {
+            Ok(_) => {
                 warn!(%peer, "Ingress answered a forwarded group create unexpectedly");
-                return Err(MetadataApiError::ServiceUnavailable.into());
+                Err(ForwardGroupError::Unavailable)
             }
-            Ok(Err(error)) if retry_disposition(error.delivery()) == RetryDisposition::TryNext => {
+            Err(PeerRequestError::NotSent(error)) => {
                 warn!(%peer, %error, "Failed to reach an ingress for a forwarded group create");
-                continue;
+                self.ask_next()
             }
-            Ok(Err(error)) => {
+            Err(PeerRequestError::Failed(error)) => {
                 warn!(%peer, %error, "Forwarded group create may have been applied");
-                return Err(MetadataApiError::ServiceUnavailable.into());
+                Err(ForwardGroupError::Unavailable)
             }
-            Err(_) => {
+            Err(PeerRequestError::TimedOut) => {
                 warn!(%peer, "Forwarded group create timed out on a reached ingress");
-                return Err(MetadataApiError::ServiceUnavailable.into());
+                Err(ForwardGroupError::Unavailable)
             }
         }
     }
-    Err(MetadataApiError::ServiceUnavailable.into())
+}
+
+impl Operation for ForwardGroupOperation {
+    type Output = CreatedGroup;
+    type Error = ForwardGroupError;
+
+    fn first(&mut self) -> Result<Next<CreatedGroup>, ForwardGroupError> {
+        let read = GetConfigOperation::new(self.realm_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<CreatedGroup>, ForwardGroupError> {
+        match self.asked.take() {
+            None => {
+                let config = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|_| ForwardGroupError::Unavailable)?;
+                self.choose_peers(&config)?;
+                self.ask_next()
+            }
+            Some(peer) => {
+                let reply = peer_reply(peer, result)?;
+                self.answered(peer, reply)
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ApplyStage {
+    Config,
+    Caller(RealmConfigDocument),
+    Admin(RealmConfigDocument, AuthContext),
+    Create,
+}
+
+type ApplyTurn = Result<Next<MetadataTransportMessage>, IoError>;
+
+fn unavailable() -> ApplyTurn {
+    Ok(Next::Done(
+        MetadataTransportMessage::ForwardedWriteUnavailable,
+    ))
 }
 
 /// Originates a group create requested by a device. Authority is the caller's
 /// forwarded token, checked exactly as the local HTTP handler would; a User
 /// peer may only ever act for the owner its realm config binds it to.
-pub(crate) async fn apply_group_create(
-    context: &Arc<DriverContext>,
+#[derive(Debug, PartialEq)]
+pub(crate) struct ApplyGroupOperation {
+    local: Option<(NodeId, RealmId)>,
     peer: NodeId,
     message: MetadataTransportMessage,
-) -> MetadataTransportMessage {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    };
-    let realm_id = *net_handle.realm_id();
-    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
-    };
-    if !is_sync_eligible(&config, net_handle.node_id()) {
-        return MetadataTransportMessage::ForwardedWriteUnavailable;
+    stage: ApplyStage,
+}
+
+impl ApplyGroupOperation {
+    pub(crate) fn new(
+        local: Option<(NodeId, RealmId)>,
+        peer: NodeId,
+        message: MetadataTransportMessage,
+    ) -> Self {
+        Self {
+            local,
+            peer,
+            message,
+            stage: ApplyStage::Config,
+        }
     }
-    let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
-        Ok(auth) => auth,
-        Err(error) => return forward_auth_error(error),
-    };
-    if auth.path_restrictions.is_some() {
-        return MetadataTransportMessage::ForwardedWriteDenied {
-            error: WriteAuthError::Forbidden,
+
+    fn create(
+        &mut self,
+        config: &RealmConfigDocument,
+        auth: &AuthContext,
+        realm_admin: bool,
+    ) -> ApplyTurn {
+        let Some((node_id, realm_id)) = self.local else {
+            return unavailable();
         };
-    }
-    let MetadataTransportMessage::ForwardGroupCreate { display_name, .. } = message else {
-        return reject("unexpected group create message");
-    };
-    let realm_admin = authorize_write(context, auth.clone(), format!("/{realm_id}/admin/groups"))
-        .await
-        .is_ok();
-    let owner_cap = if realm_admin {
-        None
-    } else {
-        config.quota.max_groups_for(&auth.user_id)
-    };
-    match drive(
-        CreateGroupOperation::new(CreateGroupConfig {
+        let MetadataTransportMessage::ForwardGroupCreate { display_name, .. } = &self.message
+        else {
+            return Ok(Next::Done(reject("unexpected group create message")));
+        };
+        let owner_cap = match realm_admin {
+            true => None,
+            false => config.quota.max_groups_for(&auth.user_id),
+        };
+        self.stage = ApplyStage::Create;
+        let create = CreateGroupOperation::new(CreateGroupConfig {
             actor: Actor {
-                node_id: net_handle.node_id(),
+                node_id,
                 user_id: auth.user_id,
                 realm_id,
             },
-            display_name,
+            display_name: display_name.clone(),
             owner_cap,
-        }),
-        context.as_ref(),
-    )
-    .await
-    {
-        Ok((group, authorization)) => MetadataTransportMessage::ForwardedGroupCreated {
-            group: Box::new(group),
-            authorization: Box::new(authorization),
-        },
-        Err(CreateGroupError::GroupLimitReached { limit }) => {
-            MetadataTransportMessage::GroupCreateConflict {
-                reason: format!("owned group limit reached ({limit})"),
-            }
-        }
-        Err(
-            CreateGroupError::StorageError(StorageError::TransactionConflict)
-            | CreateGroupError::PlacementFenced,
-        ) => MetadataTransportMessage::GroupCreateConflict {
-            reason: "concurrent group creation conflict; retry".to_string(),
-        },
-        Err(error) => reject(format!("group create failed: {error}")),
+        });
+        Ok(Next::Call(IoCall::child(create)))
     }
 }
+
+impl Operation for ApplyGroupOperation {
+    type Output = MetadataTransportMessage;
+    type Error = IoError;
+
+    fn first(&mut self) -> ApplyTurn {
+        let Some((_, realm_id)) = self.local else {
+            return unavailable();
+        };
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> ApplyTurn {
+        let Some((node_id, realm_id)) = self.local else {
+            return unavailable();
+        };
+        match std::mem::replace(&mut self.stage, ApplyStage::Create) {
+            ApplyStage::Config => {
+                let Ok(config) = result.child::<RealmConfigDocument, GetConfigError>()? else {
+                    return unavailable();
+                };
+                if !is_sync_eligible(&config, node_id) {
+                    return unavailable();
+                }
+                self.stage = ApplyStage::Caller(config);
+                let caller = ForwardedCallerOperation::new(self.peer, realm_id, &self.message);
+                Ok(Next::Call(IoCall::child(caller)))
+            }
+            ApplyStage::Caller(config) => {
+                let auth = match result.child::<AuthContext, ForwardAuthError>()? {
+                    Ok(auth) => auth,
+                    Err(error) => return Ok(Next::Done(forward_auth_error(error))),
+                };
+                if auth.path_restrictions.is_some() {
+                    return Ok(Next::Done(MetadataTransportMessage::ForwardedWriteDenied {
+                        error: WriteAuthError::Forbidden,
+                    }));
+                }
+                let check = write_check(&auth, &format!("/{realm_id}/admin/groups"));
+                self.stage = ApplyStage::Admin(config, auth);
+                Ok(Next::Call(IoCall::child(check)))
+            }
+            ApplyStage::Admin(config, auth) => {
+                let realm_admin = result.child::<(), AuthorizeError>()?.is_ok();
+                self.create(&config, &auth, realm_admin)
+            }
+            ApplyStage::Create => Ok(Next::Done(
+                match result.child::<CreatedGroup, CreateGroupError>()? {
+                    Ok((group, authorization)) => MetadataTransportMessage::ForwardedGroupCreated {
+                        group: Box::new(group),
+                        authorization: Box::new(authorization),
+                    },
+                    Err(CreateGroupError::GroupLimitReached { limit }) => {
+                        MetadataTransportMessage::GroupCreateConflict {
+                            reason: format!("owned group limit reached ({limit})"),
+                        }
+                    }
+                    Err(
+                        CreateGroupError::StorageError(StorageError::TransactionConflict)
+                        | CreateGroupError::PlacementFenced,
+                    ) => MetadataTransportMessage::GroupCreateConflict {
+                        reason: "concurrent group creation conflict; retry".to_string(),
+                    },
+                    Err(error) => reject(format!("group create failed: {error}")),
+                },
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "forward_tests.rs"]
+mod tests;

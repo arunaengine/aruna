@@ -13,4 +13,3 @@ pub mod restart;
 pub mod rows;
 pub mod startup;
 pub mod unlock;
-pub mod wake;

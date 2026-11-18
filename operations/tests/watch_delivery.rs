@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::document::{DocumentNetEvent, DocumentTarget};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
@@ -25,28 +25,32 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::{DocumentEffect, NodeId, UserId};
+use aruna_core::{NodeId, UserId};
 use aruna_operations::driver::drive;
-use aruna_operations::notifications::dispatch::{
-    create_for_user, delete_for_user, list_for_user, list_watches,
-};
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::user_call::WatchDispatchError;
 use aruna_operations::notifications::watch::digest::InterestOperation;
-use aruna_operations::notifications::watch::emit::emit_watch_event;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
+use aruna_operations::notifications::watch::origin::EmitEventOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
+use aruna_operations::testing::sync_topic;
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
 use crate::topology::store_realm_config;
 use crate::topology::{TestNode, realm_config_for, spawn_replicas, user_with_holder};
+use crate::user_calls::{create_for_user, delete_for_user, list_for_user, list_watches};
 
 const LIST_LIMIT: usize = LIST_MAX_LIMIT;
+
+/// Emits like every caller: failures only warn inside the operation.
+async fn emit_watch_event(context: &aruna_operations::driver::DriverContext, event: WatchEvent) {
+    let _ = drive(EmitEventOperation::new(event), context).await;
+}
 
 // The Definition of Done: a watch created via node A fires for an upload handled by node B and
 // is visible within seconds through node C.
@@ -550,26 +554,14 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
 
     install_config_document(&nodes, realm_id, &full_config).await?;
     let new_holder_node = node_by_id(&nodes, new_holder);
-    let sync_event = new_holder_node
-        .net
-        .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentEffect::SyncDocument {
-                topic: DocumentTarget::WatchInterest {
-                    realm_id,
-                    node_id: old_holder,
-                }
-                .sync_topic_id(realm_id, &PlacementRef::NIL),
-                peers: vec![old_holder],
-            },
-        )))
-        .await;
-    let reconciled = match sync_event {
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
-            targets,
-            ..
-        })) => targets,
-        other => return Err(format!("unexpected subscription history sync: {other:?}").into()),
-    };
+    let topic = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: old_holder,
+    }
+    .sync_topic_id(realm_id, &PlacementRef::NIL);
+    let reconciled = sync_topic(new_holder_node.context.as_ref(), topic, vec![old_holder])
+        .await?
+        .targets;
     let local_realm = *new_holder_node.net.realm_id();
     let refresh = RefreshInterestOperation::new(&reconciled, local_realm);
     drive(refresh, new_holder_node.context.as_ref()).await?;
@@ -804,12 +796,7 @@ async fn install_config_document(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            realm_id,
-            node.net.node_id(),
-        )
-        .await;
+        aruna_operations::driver::drive(aruna_operations::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_operations::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }

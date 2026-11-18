@@ -3,13 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, TOKEN_GRANT_KEYSPACE};
 use aruna_core::rows::PrefixPages;
 use aruna_core::structs::storage::abe_access::token_prefix;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use std::collections::BTreeSet;
 
@@ -50,17 +49,6 @@ pub fn encode_index(index: &BTreeSet<String>) -> Result<Value, ConversionError> 
         },
         |_| Ok(()),
     )
-}
-
-/// Reads one page of the token grant rows of `access_key`, after `start`, in `txn_id`.
-pub fn token_scan(access_key: &str, start: Option<Key>, txn_id: TxnId) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: TOKEN_GRANT_KEYSPACE.to_string(),
-        prefix: Some(token_prefix(access_key).into()),
-        start: start.map(IterStart::After),
-        limit: TOKEN_PAGE,
-        txn_id: Some(txn_id),
-    })
 }
 
 /// The pages of the token grant rows of `access_key`.

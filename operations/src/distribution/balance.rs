@@ -6,11 +6,11 @@
 // Fullness is stored bytes relative to capacity; one transfer runs at a time, with a cool-down.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::events::StatementSignEvent;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionSnapshot, KeyRange, MemberState, Statement, StatementClaim,
@@ -19,18 +19,15 @@ use aruna_core::structs::storage::distribution::{
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use super::create::submit;
-use crate::driver::{DriverContext, drive};
-use crate::s3::usage::LoadCountersOperation;
-use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
+use super::submit::{StateOperation, Stated};
+use crate::driver::DriverContext;
+use crate::s3::usage::{LoadCountersError, LoadCountersOperation};
+use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 
 /// How long a node waits after proposing a transfer before it proposes the next one.
-const COOL_DOWN: Duration = Duration::from_secs(30 * 60);
+pub(super) const COOL_DOWN: Duration = Duration::from_secs(30 * 60);
 /// A node balances only once it holds this many permille more than the set's average.
 const MARGIN_PERMILLE: u64 = 1100;
-
-/// When this node last proposed a transfer.
-static LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// One balancing decision: the range this node gives away and the member that takes it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,22 +84,16 @@ pub fn permille(used: u64, capacity: Option<u64>) -> Option<u64> {
     Some(u64::try_from(fill).unwrap_or(u64::MAX))
 }
 
-/// Proposes one balancing transfer of a set to its publisher, when this node is over-full and
-/// no cool-down runs.
-pub async fn balance_set(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    local: NodeId,
-    snapshot: &DistributionSnapshot,
-) {
-    let cooling = LAST
-        .lock()
-        .map(|last| last.is_some_and(|at| at.elapsed() < COOL_DOWN))
-        .unwrap_or(true);
-    if cooling {
-        return;
-    }
-    let mut fill: BTreeMap<NodeId, u64> = context
+/// What balancing needs to know about this node's neighbours and its own capacity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BalanceInputs {
+    pub(super) fill: BTreeMap<NodeId, u64>,
+    pub(super) capacity: Option<u64>,
+}
+
+/// The fill of every node this node hears from, and its own capacity.
+pub(super) fn balance_inputs(context: &DriverContext) -> BalanceInputs {
+    let fill = context
         .fresh_heartbeats()
         .into_iter()
         .filter_map(|(node_id, held)| {
@@ -111,56 +102,105 @@ pub async fn balance_set(
             Some((node_id, permille(used, utilization.storage_capacity_bytes)?))
         })
         .collect();
-    let capacity = crate::driver::node_routing(context).catalog.capacity();
-    let global = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
-    match drive(global, context).await {
-        Ok(usage) => match permille(usage.stored_bytes, capacity) {
-            Some(own) => fill.insert(local, own),
-            None => return,
-        },
-        Err(_) => return,
-    };
-    let Some(proposal) = propose(snapshot, local, &fill) else {
-        return;
-    };
-    let Some(member) = (snapshot.config.members.iter()).find(|m| m.node_id == local) else {
-        return;
-    };
-    let transfer_id = Ulid::generate();
-    let kind = StatementKind::TransferPrepare {
-        basis: snapshot.number,
-        transfer_id,
-        range_id: proposal.range_id,
-        to: proposal.to,
-        epoch: snapshot.max_epoch() + 1,
-        role: TransferRole::Leave,
-    };
-    let set_id = snapshot.set_id();
-    let statement = Statement::lifecycle(realm_id, set_id, member, &transfer_id.to_bytes(), kind);
-    let claim = StatementClaim {
-        signer: local,
-        statement,
-    };
-    let signed = match context.net_handle.as_ref().map_or_else(
-        || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
-        |net| net.sign_statement(claim),
-    ) {
-        StatementSignEvent::Signed(signed) => *signed,
-        StatementSignEvent::Unavailable(reason) => {
-            warn!(%reason, "A balancing transfer could not be signed");
-            return;
-        }
-    };
-    if let Ok(mut last) = LAST.lock() {
-        *last = Some(Instant::now());
+    BalanceInputs {
+        fill,
+        capacity: crate::driver::node_routing(context).catalog.capacity(),
     }
-    match submit(context, snapshot.root.publisher, local, signed).await {
-        Ok(()) => {
-            info!(%set_id, range_id = %proposal.range_id, to = %proposal.to, "Proposed a balancing transfer")
+}
+
+/// Proposes one balancing transfer of a set to its publisher, when this node is over-full.
+/// Outputs whether a transfer was signed, which starts the cool-down.
+#[derive(Debug, PartialEq)]
+pub(super) struct BalanceOperation {
+    ids: (NodeId, RealmId),
+    snapshot: DistributionSnapshot,
+    inputs: BalanceInputs,
+    proposal: Option<Proposal>,
+}
+
+impl BalanceOperation {
+    pub(super) fn new(
+        ids: (NodeId, RealmId),
+        snapshot: DistributionSnapshot,
+        inputs: BalanceInputs,
+    ) -> Self {
+        Self {
+            ids,
+            snapshot,
+            inputs,
+            proposal: None,
         }
-        Err(refusal) => {
-            warn!(%set_id, %refusal, "The publisher did not take a balancing transfer")
-        }
+    }
+
+    /// Signs and sends the transfer the fill asks for, if any.
+    fn propose(&mut self, used: u64) -> Result<Next<bool>, IoError> {
+        let (local, realm_id) = self.ids;
+        let Some(own) = permille(used, self.inputs.capacity) else {
+            return Ok(Next::Done(false));
+        };
+        self.inputs.fill.insert(local, own);
+        let snapshot = &self.snapshot;
+        let Some(proposal) = propose(snapshot, local, &self.inputs.fill) else {
+            return Ok(Next::Done(false));
+        };
+        let Some(member) = (snapshot.config.members.iter()).find(|m| m.node_id == local) else {
+            return Ok(Next::Done(false));
+        };
+        let transfer_id = Ulid::generate();
+        let kind = StatementKind::TransferPrepare {
+            basis: snapshot.number,
+            transfer_id,
+            range_id: proposal.range_id,
+            to: proposal.to,
+            epoch: snapshot.max_epoch() + 1,
+            role: TransferRole::Leave,
+        };
+        let set_id = snapshot.set_id();
+        let subject = transfer_id.to_bytes();
+        let statement = Statement::lifecycle(realm_id, set_id, member, &subject, kind);
+        let claim = StatementClaim {
+            signer: local,
+            statement,
+        };
+        let publisher = snapshot.root.publisher;
+        self.proposal = Some(proposal);
+        let state = StateOperation::new(Some(self.ids), publisher, claim);
+        Ok(Next::Call(IoCall::child(state)))
+    }
+}
+
+impl Operation for BalanceOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let global = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+        Ok(Next::Call(IoCall::child(global)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        let Some(proposal) = self.proposal.take() else {
+            return match result.child::<UsageCounters, LoadCountersError>()? {
+                Ok(usage) => self.propose(usage.stored_bytes),
+                Err(_) => Ok(Next::Done(false)),
+            };
+        };
+        let set_id = self.snapshot.set_id();
+        let (range_id, to) = (proposal.range_id, proposal.to);
+        Ok(Next::Done(match result.child::<Stated, IoError>()?? {
+            Stated::Taken => {
+                info!(%set_id, %range_id, %to, "Proposed a balancing transfer");
+                true
+            }
+            Stated::Refused(refusal) => {
+                warn!(%set_id, %refusal, "The publisher did not take a balancing transfer");
+                true
+            }
+            Stated::Unsigned(reason) => {
+                warn!(%reason, "A balancing transfer could not be signed");
+                false
+            }
+        }))
     }
 }
 

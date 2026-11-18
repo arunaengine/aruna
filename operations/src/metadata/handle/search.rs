@@ -22,7 +22,9 @@ use super::{
     LifecycleVisibilityRefresh, MetadataInner, MetadataVisibilityCache, REGISTRY_CANDIDATE_LIMIT,
     handles,
 };
+use crate::auth::enforcement::PolicyBulkOperation;
 use crate::auth::permission_rules::GroupPermissionRules;
+use crate::auth::request_authorization::GroupRulesOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::live_records::LiveRecordsOperation;
 use crate::metadata::query_cache::ScopeDigest;
@@ -607,21 +609,26 @@ pub(super) async fn resolve_visibility_scope(
         compute_handle: None,
         outbound_handle: None,
     };
-    let permissions = GroupPermissionRules::collect(
+    let permissions = drive(
+        GroupRulesOperation::new(
+            auth_context.as_ref(),
+            records
+                .iter()
+                .filter(|record| Some(record.realm_id) == auth_realm)
+                .map(|record| record.group_id),
+        ),
         &context,
-        auth_context.as_ref(),
-        records
-            .iter()
-            .filter(|record| Some(record.realm_id) == auth_realm)
-            .map(|record| record.group_id),
     )
-    .await;
+    .await
+    .unwrap_or_default();
     // Request policy removes denied records from both eager and SPARQL paths.
-    let evaluators = crate::auth::enforcement::PolicyEvaluator::load_bulk(
+    let evaluators = drive(
+        PolicyBulkOperation::new(
+            records
+                .iter()
+                .map(|record| (record.realm_id, record.group_id)),
+        ),
         &context,
-        records
-            .iter()
-            .map(|record| (record.realm_id, record.group_id)),
     )
     .await
     .map_err(|error| MetadataError::Backend(error.to_string()))?;

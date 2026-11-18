@@ -201,7 +201,7 @@ async fn publishes_local_run() -> TestResult<()> {
     let server = realm.node(0);
     // A node lists a new group a little later, so a fetch can miss it; the device must hold it.
     wait_until("the group on the device", device.node_id(), || async {
-        fetch_realm_documents(&device.context, FETCH_BUDGET).await
+        drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false)
             && matches!(read_group_auth(device, group_id).await, Ok(Some(_)))
     })
     .await?;
@@ -366,7 +366,7 @@ async fn checks_empty_target() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
     let server = realm.node(0);
-    assert!(fetch_realm_documents(&device.context, FETCH_BUDGET).await);
+    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
     let job_id = finished_run(
         (&realm, device),
         group_id,

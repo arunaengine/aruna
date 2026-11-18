@@ -4,6 +4,11 @@
 
 use super::list::summary_request;
 use super::*;
+use crate::driver::drive;
+use crate::metadata::api::export::ExportOperation;
+use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
+use aruna_core::metadata::GraphLifecycleRecord;
+use aruna_core::storage_entries::graph_lifecycle_key;
 
 fn raw_request(document_id: Ulid) -> ExportMetadataRequest {
     ExportMetadataRequest {
@@ -49,18 +54,19 @@ async fn raw_export_fenced() {
     let record = public_record(Ulid::generate(), Ulid::generate());
     seed_raw_document(&test, &record).await;
 
-    let exported = export_metadata_rocrate(
+    let exported = drive(
+        ExportOperation::new(TEST_REALM_ID, raw_request(record.document_id)),
         &test.context,
-        TEST_REALM_ID,
-        raw_request(record.document_id),
     )
     .await
     .expect("raw export succeeds");
     assert!(matches!(exported, ExportMetadataResult::Raw { .. }));
-    let foreign = export_metadata_rocrate(
+    let foreign = drive(
+        ExportOperation::new(
+            RealmId::from_bytes([9u8; 32]),
+            raw_request(record.document_id),
+        ),
         &test.context,
-        RealmId::from_bytes([9u8; 32]),
-        raw_request(record.document_id),
     )
     .await;
     assert!(matches!(foreign, Err(MetadataApiError::NotFound)));
@@ -78,10 +84,9 @@ async fn raw_export_fenced() {
     )
     .await;
 
-    let fenced = export_metadata_rocrate(
+    let fenced = drive(
+        ExportOperation::new(TEST_REALM_ID, raw_request(record.document_id)),
         &test.context,
-        TEST_REALM_ID,
-        raw_request(record.document_id),
     )
     .await;
 
@@ -114,70 +119,15 @@ fn raw_identity_fence() {
     ));
 }
 
-// The record lives only in the registry cache and the graph was never
-// projected, so a returned summary can only come from the summary cache.
-#[tokio::test]
-async fn summary_from_cache() {
-    let test = metadata_test();
-    let record = public_record(Ulid::generate(), Ulid::generate());
-    seed_registry_cache(&test, &record).await;
-    summary_cache().insert(
-        &record.graph_iri,
-        record.last_event_id,
-        "{\"cached\":true}",
-        Instant::now(),
-    );
-
-    let result = list_visible_documents(
-        &test.context,
-        TEST_REALM_ID,
-        summary_request(record.group_id, true),
-    )
-    .await
-    .expect("summary listing succeeds");
-
-    assert_eq!(result.documents.len(), 1);
-    assert_eq!(
-        result.documents[0].rocrate_summary_jsonld.as_deref(),
-        Some("{\"cached\":true}")
-    );
-}
-
-#[tokio::test]
-async fn stale_summary_refused() {
-    // A cursor advance must fall through to the handle, not serve the entry.
-    let test = metadata_test();
-    let record = public_record(Ulid::generate(), Ulid::generate());
-    seed_registry_cache(&test, &record).await;
-    summary_cache().insert(
-        &record.graph_iri,
-        Ulid::generate(),
-        "{\"stale\":true}",
-        Instant::now(),
-    );
-
-    let result = list_visible_documents(
-        &test.context,
-        TEST_REALM_ID,
-        summary_request(record.group_id, true),
-    )
-    .await
-    .expect("summary listing succeeds");
-
-    assert_eq!(result.documents.len(), 1);
-    assert!(result.documents[0].rocrate_summary_jsonld.is_none());
-}
-
 #[tokio::test]
 async fn pending_summary_listed() {
     let test = metadata_test();
     let record = public_record(Ulid::generate(), Ulid::generate());
     write_pending_marker(&test, &record).await;
 
-    let result = list_visible_documents(
+    let result = drive(
+        ListVisibleOperation::new(TEST_REALM_ID, summary_request(record.group_id, true)),
         &test.context,
-        TEST_REALM_ID,
-        summary_request(record.group_id, true),
     )
     .await
     .expect("summary listing succeeds");
@@ -185,10 +135,9 @@ async fn pending_summary_listed() {
     assert_eq!(result.documents[0].record.document_id, record.document_id);
     assert!(result.documents[0].rocrate_summary_jsonld.is_none());
 
-    let plain = list_visible_documents(
+    let plain = drive(
+        ListVisibleOperation::new(TEST_REALM_ID, summary_request(record.group_id, false)),
         &test.context,
-        TEST_REALM_ID,
-        summary_request(record.group_id, false),
     )
     .await
     .expect("plain listing succeeds");

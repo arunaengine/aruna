@@ -4,25 +4,25 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
     PLAINTEXT_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, HolderOrigin, KeyState,
 };
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
+use crate::s3::bucket::key::rows::{SettingsError, authority_keys, parse_authority};
+use crate::s3::object::put::abe::keyed;
 
 /// Key rows one page of the retained key scan reads.
 const KEY_PAGE: usize = 64;
@@ -39,11 +39,15 @@ pub enum PlaintextError {
     NoBucket,
     #[error(transparent)]
     Authority(#[from] SettingsError),
-    #[error("unexpected event in a plaintext check: {0}")]
-    UnexpectedEvent(String),
-    #[error("the plaintext check did not finish")]
-    NotFinished,
 }
+
+impl From<IoError> for PlaintextError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type Turn<T> = Result<Next<T>, PlaintextError>;
 
 /// Row of the plaintext request of an explicit copy job.
 pub fn job_consent(job_key: &[u8]) -> Vec<u8> {
@@ -55,86 +59,62 @@ pub fn relationship_consent(id: Ulid) -> Vec<u8> {
     [&b"r"[..], &id.to_bytes()].concat()
 }
 
-/// The write of a plaintext request by `requester`.
-pub fn consent_write(row: Vec<u8>, requester: UserId) -> Result<Effect, PlaintextError> {
+/// The stored row of a plaintext request by `requester`.
+pub fn consent_row(
+    row: Vec<u8>,
+    requester: UserId,
+) -> Result<(KeySpace, Key, Value), PlaintextError> {
     let value = postcard::to_allocvec(&requester)
         .map_err(|error| PlaintextError::Request(error.to_string()))?;
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: PLAINTEXT_COPY_KEYSPACE.to_string(),
-        key: Key::from(row),
-        value: value.into(),
-        txn_id: None,
-    }))
+    Ok((
+        PLAINTEXT_COPY_KEYSPACE.to_string(),
+        Key::from(row),
+        value.into(),
+    ))
 }
 
-pub fn consent_delete(row: Vec<u8>) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: PLAINTEXT_COPY_KEYSPACE.to_string(),
-        key: Key::from(row),
-        txn_id: None,
-    })
+/// The write of a plaintext request by `requester`.
+pub fn consent_write(row: Vec<u8>, requester: UserId) -> Result<IoCall, PlaintextError> {
+    Ok(IoCall::Write(vec![consent_row(row, requester)?]))
+}
+
+pub fn consent_delete(row: Vec<u8>) -> IoCall {
+    IoCall::Delete(vec![(PLAINTEXT_COPY_KEYSPACE.to_string(), Key::from(row))])
 }
 
 /// Writes or deletes one plaintext request row, from [`consent_write`] or [`consent_delete`].
 #[derive(Debug, PartialEq)]
 pub struct ConsentStoreOperation {
-    effect: Option<Effect>,
-    output: Option<Result<(), PlaintextError>>,
+    call: Option<IoCall>,
 }
 
 impl ConsentStoreOperation {
-    pub fn new(effect: Effect) -> Self {
-        Self {
-            effect: Some(effect),
-            output: None,
-        }
+    pub fn new(call: IoCall) -> Self {
+        Self { call: Some(call) }
     }
 }
 
-impl EffectOperation for ConsentStoreOperation {
+impl Operation for ConsentStoreOperation {
     type Output = ();
     type Error = PlaintextError;
 
-    fn start(&mut self) -> Effects {
-        self.effect.take().into_iter().collect()
+    fn first(&mut self) -> Turn<()> {
+        let call = self.call.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(call))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(match (&self.output, event) {
-            (
-                None,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-                ),
-            ) => Ok(()),
-            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(PlaintextError::UnexpectedEvent(event.label().to_string())),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<(), PlaintextError> {
-        self.output.unwrap_or(Err(PlaintextError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        result.done()?;
+        Ok(Next::Done(()))
     }
 }
 
 #[derive(Debug, PartialEq)]
 enum HolderState {
-    Init,
     ReadConsent,
     ReadBucket,
     ReadAuthority,
     ReadGrant,
-    Finish,
-    Error,
 }
 
 /// Whether `user` holds the key of `bucket` in realm `realm_id` now: its creator, a current group
@@ -148,7 +128,6 @@ pub struct HolderCheckOperation {
     consent: Option<Vec<u8>>,
     group_id: Option<Ulid>,
     state: HolderState,
-    output: Option<Result<bool, PlaintextError>>,
 }
 
 impl HolderCheckOperation {
@@ -159,8 +138,7 @@ impl HolderCheckOperation {
             user,
             consent: None,
             group_id: None,
-            state: HolderState::Init,
-            output: None,
+            state: HolderState::ReadBucket,
         }
     }
 
@@ -170,125 +148,75 @@ impl HolderCheckOperation {
         self
     }
 
-    fn done(&mut self, result: Result<bool, PlaintextError>) -> Effects {
-        self.state = match result {
-            Ok(_) => HolderState::Finish,
-            Err(_) => HolderState::Error,
-        };
-        self.output = Some(result);
-        smallvec![]
+    fn call(&mut self, state: HolderState, call: IoCall) -> Turn<bool> {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn read_bucket(&mut self) -> Effects {
-        self.state = HolderState::ReadBucket;
-        smallvec![read(S3_BUCKET_KEYSPACE, self.bucket.as_bytes().to_vec())]
+    fn read_bucket(&mut self) -> Turn<bool> {
+        let read = read_row(S3_BUCKET_KEYSPACE, self.bucket.as_bytes().to_vec());
+        self.call(HolderState::ReadBucket, read)
     }
 
-    fn consent_read(&mut self, value: Option<Value>) -> Effects {
-        match decode_requester(value.as_deref()) {
-            Ok(Some(requester)) if requester == self.user => self.read_bucket(),
-            Ok(_) => self.done(Ok(false)),
-            Err(error) => self.done(Err(error)),
+    fn consent_read(&mut self, value: Option<Value>) -> Turn<bool> {
+        match decode_requester(value.as_deref())? {
+            Some(requester) if requester == self.user => self.read_bucket(),
+            _ => Ok(Next::Done(false)),
         }
     }
 
-    fn bucket_read(&mut self, value: Option<Value>) -> Effects {
-        let Some(value) = value else {
-            return self.done(Err(PlaintextError::NoBucket));
-        };
-        let group_id = match BucketInfo::from_bytes(&value) {
-            Ok(info) => info.group_id,
-            Err(error) => return self.done(Err(error.into())),
-        };
+    fn bucket_read(&mut self, value: Option<Value>) -> Turn<bool> {
+        let value = value.ok_or(PlaintextError::NoBucket)?;
+        let group_id = BucketInfo::from_bytes(&value)?.group_id;
         self.group_id = Some(group_id);
-        self.state = HolderState::ReadAuthority;
-        smallvec![authority_read(&self.bucket, self.realm_id, group_id, None)]
+        let reads = authority_keys(&self.bucket, self.realm_id, group_id);
+        self.call(HolderState::ReadAuthority, IoCall::Read(reads))
     }
 
-    fn authority_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let Some(group_id) = self.group_id else {
-            return self.done(Err(PlaintextError::NotFinished));
-        };
-        let state = match parse_authority(values, self.realm_id, group_id) {
-            Ok(state) => state,
-            Err(error) => return self.done(Err(error.into())),
-        };
+    fn authority_read(&mut self, values: Vec<Option<Value>>) -> Turn<bool> {
+        let group_id = self.group_id.ok_or(IoError::Unfinished)?;
+        let state = parse_authority(keyed(&values), self.realm_id, group_id)?;
         if state.info.created_by == self.user || state.admins.contains(&self.user) {
-            return self.done(Ok(true));
+            return Ok(Next::Done(true));
         }
         let Some(bucket_id) = state.settings.bucket_id else {
-            return self.done(Ok(false));
+            return Ok(Next::Done(false));
         };
-        self.state = HolderState::ReadGrant;
         let row = [&bucket_id.to_bytes()[..], &self.user.to_storage_key()].concat();
-        smallvec![read(BUCKET_HOLDER_KEYSPACE, row)]
+        let read = read_row(BUCKET_HOLDER_KEYSPACE, row);
+        self.call(HolderState::ReadGrant, read)
     }
 
-    fn grant_read(&mut self, value: Option<Value>) -> Effects {
+    fn grant_read(&mut self, value: Option<Value>) -> Turn<bool> {
         let grant = value
             .map(|value| BucketHolder::from_bytes(&value))
-            .transpose();
-        match grant {
-            Ok(grant) => self.done(Ok(
-                grant.is_some_and(|grant| grant.origin == HolderOrigin::Explicit)
-            )),
-            Err(error) => self.done(Err(error.into())),
-        }
+            .transpose()?;
+        let explicit = grant.is_some_and(|grant| grant.origin == HolderOrigin::Explicit);
+        Ok(Next::Done(explicit))
     }
 }
 
-impl EffectOperation for HolderCheckOperation {
+impl Operation for HolderCheckOperation {
     type Output = bool;
     type Error = PlaintextError;
 
-    fn start(&mut self) -> Effects {
-        match &self.consent {
+    fn first(&mut self) -> Turn<bool> {
+        match self.consent.clone() {
             Some(row) => {
-                self.state = HolderState::ReadConsent;
-                smallvec![read(PLAINTEXT_COPY_KEYSPACE, row.clone())]
+                let read = read_row(PLAINTEXT_COPY_KEYSPACE, row);
+                self.call(HolderState::ReadConsent, read)
             }
             None => self.read_bucket(),
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (
-                HolderState::ReadConsent
-                | HolderState::ReadBucket
-                | HolderState::ReadAuthority
-                | HolderState::ReadGrant,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.done(Err(error.into())),
-            (HolderState::ReadConsent, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.consent_read(value)
-            }
-            (HolderState::ReadBucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.bucket_read(value)
-            }
-            (
-                HolderState::ReadAuthority,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.authority_read(values),
-            (HolderState::ReadGrant, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.grant_read(value)
-            }
-            (_, event) => self.done(Err(PlaintextError::UnexpectedEvent(
-                event.label().to_string(),
-            ))),
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match self.state {
+            HolderState::ReadConsent => self.consent_read(result.value()?),
+            HolderState::ReadBucket => self.bucket_read(result.value()?),
+            HolderState::ReadAuthority => self.authority_read(result.values()?),
+            HolderState::ReadGrant => self.grant_read(result.value()?),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, HolderState::Finish | HolderState::Error)
-    }
-
-    fn finalize(self) -> Result<bool, PlaintextError> {
-        self.output.unwrap_or(Err(PlaintextError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -296,54 +224,27 @@ impl EffectOperation for HolderCheckOperation {
 #[derive(Debug, PartialEq)]
 pub struct ConsentReadOperation {
     row: Vec<u8>,
-    output: Option<Result<Option<UserId>, PlaintextError>>,
 }
 
 impl ConsentReadOperation {
     pub fn new(row: Vec<u8>) -> Self {
-        Self { row, output: None }
+        Self { row }
     }
 }
 
-impl EffectOperation for ConsentReadOperation {
+impl Operation for ConsentReadOperation {
     type Output = Option<UserId>;
     type Error = PlaintextError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![read(PLAINTEXT_COPY_KEYSPACE, self.row.clone())]
+    fn first(&mut self) -> Turn<Self::Output> {
+        let read = read_row(PLAINTEXT_COPY_KEYSPACE, self.row.clone());
+        Ok(Next::Call(read))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.output = Some(match (&self.output, event) {
-            (None, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                decode_requester(value.as_deref())
-            }
-            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(PlaintextError::UnexpectedEvent(event.label().to_string())),
-        });
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Turn<Self::Output> {
+        let value = result.value()?;
+        Ok(Next::Done(decode_requester(value.as_deref())?))
     }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Option<UserId>, PlaintextError> {
-        self.output.unwrap_or(Err(PlaintextError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum EncryptionState {
-    Init,
-    ReadSettings,
-    ReadKeys,
-    Finish,
-    Error,
 }
 
 /// Whether `bucket` on this node encrypts its objects. With `retained` it also answers true
@@ -353,8 +254,7 @@ pub struct EncryptionCheckOperation {
     bucket: String,
     retained: bool,
     bucket_id: Option<Ulid>,
-    state: EncryptionState,
-    output: Option<Result<bool, PlaintextError>>,
+    reading_keys: bool,
 }
 
 impl EncryptionCheckOperation {
@@ -363,115 +263,61 @@ impl EncryptionCheckOperation {
             bucket: bucket.to_string(),
             retained,
             bucket_id: None,
-            state: EncryptionState::Init,
-            output: None,
+            reading_keys: false,
         }
     }
 
-    fn done(&mut self, result: Result<bool, PlaintextError>) -> Effects {
-        self.state = match result {
-            Ok(_) => EncryptionState::Finish,
-            Err(_) => EncryptionState::Error,
-        };
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn read_keys(&mut self, after: Option<Key>) -> Effects {
+    fn read_keys(&mut self, after: Option<Key>) -> Turn<bool> {
         let Some(bucket_id) = self.bucket_id else {
-            return self.done(Ok(false));
+            return Ok(Next::Done(false));
         };
-        self.state = EncryptionState::ReadKeys;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BUCKET_KEY_KEYSPACE.to_string(),
-            prefix: Some(bucket_id.to_bytes().to_vec().into()),
-            start: after.map(IterStart::After),
+        self.reading_keys = true;
+        Ok(Next::Call(IoCall::Page {
+            space: BUCKET_KEY_KEYSPACE.to_string(),
+            prefix: bucket_id.to_bytes().to_vec().into(),
+            after,
             limit: KEY_PAGE,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn settings_read(&mut self, value: Option<Value>) -> Effects {
-        let settings = match BucketEncryption::from_row(value.as_deref()) {
-            Ok(settings) => settings,
-            Err(error) => return self.done(Err(error.into())),
-        };
+    fn settings_read(&mut self, value: Option<Value>) -> Turn<bool> {
+        let settings = BucketEncryption::from_row(value.as_deref())?;
         if settings.is_encrypted() || !self.retained {
-            return self.done(Ok(settings.is_encrypted()));
+            return Ok(Next::Done(settings.is_encrypted()));
         }
         self.bucket_id = settings.bucket_id;
         self.read_keys(None)
     }
 
-    fn keys_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn keys_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Turn<bool> {
         for (_, value) in values {
-            match BucketKeyRecord::from_bytes(&value) {
-                Ok(record) if record.state != KeyState::Retired => return self.done(Ok(true)),
-                Ok(_) => {}
-                Err(error) => return self.done(Err(error.into())),
+            if BucketKeyRecord::from_bytes(&value)?.state != KeyState::Retired {
+                return Ok(Next::Done(true));
             }
         }
         match next {
             Some(next) => self.read_keys(Some(next)),
-            None => self.done(Ok(false)),
+            None => Ok(Next::Done(false)),
         }
     }
 }
 
-impl EffectOperation for EncryptionCheckOperation {
+impl Operation for EncryptionCheckOperation {
     type Output = bool;
     type Error = PlaintextError;
 
-    fn start(&mut self) -> Effects {
-        self.state = EncryptionState::ReadSettings;
-        smallvec![read(
-            BUCKET_ENCRYPTION_KEYSPACE,
-            self.bucket.as_bytes().to_vec()
-        )]
+    fn first(&mut self) -> Turn<bool> {
+        let key = self.bucket.as_bytes().to_vec();
+        Ok(Next::Call(read_row(BUCKET_ENCRYPTION_KEYSPACE, key)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (
-                EncryptionState::ReadSettings | EncryptionState::ReadKeys,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.done(Err(error.into())),
-            (
-                EncryptionState::ReadSettings,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => self.settings_read(value),
-            (
-                EncryptionState::ReadKeys,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.keys_read(values, next_start_after),
-            (_, event) => self.done(Err(PlaintextError::UnexpectedEvent(
-                event.label().to_string(),
-            ))),
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        if self.reading_keys {
+            let (values, next) = result.page()?;
+            return self.keys_read(values, next);
         }
+        self.settings_read(result.value()?)
     }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, EncryptionState::Finish | EncryptionState::Error)
-    }
-
-    fn finalize(self) -> Result<bool, PlaintextError> {
-        self.output.unwrap_or(Err(PlaintextError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-fn read(key_space: &str, key: Vec<u8>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        txn_id: None,
-    })
 }
 
 fn decode_requester(value: Option<&[u8]>) -> Result<Option<UserId>, PlaintextError> {
@@ -486,14 +332,11 @@ fn decode_requester(value: Option<&[u8]>) -> Result<Option<UserId>, PlaintextErr
 pub(crate) mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE};
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
-    use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::encryption::{EncryptionMode, GrantState};
     use std::time::SystemTime;
 
@@ -724,17 +567,8 @@ pub(crate) mod tests {
         assert!(allowed(foreign(7)).await);
     }
 
-    fn read_result(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: value.map(Into::into),
-        })
-    }
-
-    fn timeout() -> Event {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        })
+    fn read_result(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Into::into)])
     }
 
     fn info(created_by: UserId) -> Vec<u8> {
@@ -761,13 +595,14 @@ pub(crate) mod tests {
         let mut operation =
             HolderCheckOperation::new(realm, "sealed", user(1)).with_consent(row.clone());
         let theirs = postcard::to_allocvec(&user(2)).unwrap();
-        let start = [read(PLAINTEXT_COPY_KEYSPACE, row)];
-        check_trace(
-            &mut operation,
-            &start,
-            vec![(read_result(Some(theirs)), vec![])],
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(read_row(PLAINTEXT_COPY_KEYSPACE, row)))
         );
-        assert_eq!(operation.finalize(), Ok(false));
+        assert_eq!(
+            operation.next(read_result(Some(theirs))),
+            Ok(Next::Done(false))
+        );
     }
 
     #[test]
@@ -778,63 +613,73 @@ pub(crate) mod tests {
             HolderCheckOperation::new(realm, "sealed", user(1)).with_consent(row.clone());
         let mine = postcard::to_allocvec(&user(1)).unwrap();
         let group_id = Ulid::from_bytes([4; 16]);
-        let steps = vec![
-            (
-                read_result(Some(mine)),
-                vec![read(S3_BUCKET_KEYSPACE, b"sealed".to_vec())],
-            ),
-            (
-                read_result(Some(info(user(1)))),
-                vec![authority_read("sealed", realm, group_id, None)],
-            ),
-        ];
-        check_trace(&mut operation, &[read(PLAINTEXT_COPY_KEYSPACE, row)], steps);
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(read_result(Some(mine))),
+            Ok(Next::Call(read_row(S3_BUCKET_KEYSPACE, b"sealed".to_vec())))
+        );
+        assert_eq!(
+            operation.next(read_result(Some(info(user(1))))),
+            Ok(Next::Call(IoCall::Read(authority_keys(
+                "sealed", realm, group_id
+            ))))
+        );
         // A missing bucket fails instead of answering that nobody holds its key.
         let mut missing = HolderCheckOperation::new(realm, "gone", user(1));
-        missing.start();
-        missing.step(read_result(None));
-        assert_eq!(missing.finalize(), Err(PlaintextError::NoBucket));
+        missing.first().unwrap();
+        assert_eq!(
+            missing.next(read_result(None)),
+            Err(PlaintextError::NoBucket)
+        );
     }
 
     #[test]
     fn errors_fail_checks() {
-        let realm = RealmId::from_bytes([3; 32]);
-        let mut holder = HolderCheckOperation::new(realm, "sealed", user(1));
-        holder.start();
-        holder.step(timeout());
         assert_eq!(
-            holder.finalize(),
-            Err(PlaintextError::Storage(StorageError::Timeout))
+            PlaintextError::from(IoError::Storage(StorageError::Timeout)),
+            PlaintextError::Storage(StorageError::Timeout)
         );
         let mut consent = ConsentReadOperation::new(b"row".to_vec());
-        consent.start();
-        consent.step(read_result(Some(vec![0xff; 40])));
+        consent.first().unwrap();
         assert!(matches!(
-            consent.finalize(),
+            consent.next(read_result(Some(vec![0xff; 40]))),
             Err(PlaintextError::Request(_))
         ));
-        let mut store = ConsentStoreOperation::new(consent_delete(b"row".to_vec()));
-        store.start();
-        store.step(timeout());
-        assert_eq!(
-            store.finalize(),
-            Err(PlaintextError::Storage(StorageError::Timeout))
-        );
         let mut keys = EncryptionCheckOperation::new("plain", true);
-        keys.start();
+        keys.first().unwrap();
         let retained = BucketEncryption {
             bucket_id: Some(Ulid::from_bytes([5; 16])),
             ..Default::default()
         };
-        let effects = keys.step(read_result(Some(retained.to_bytes().unwrap())));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { .. })]
-        ));
-        keys.step(timeout());
+        let turn = keys.next(read_result(Some(retained.to_bytes().unwrap())));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+        let unreadable = IoResult::Page {
+            rows: vec![(b"key".to_vec().into(), vec![0xff].into())],
+            next: None,
+        };
+        assert!(keys.next(unreadable).is_err());
+    }
+
+    #[test]
+    fn consent_store_calls() {
+        // The request row is written or deleted by the one call the operation was given.
+        let row = b"row".to_vec();
+        let write = consent_write(row.clone(), user(1)).unwrap();
+        let mut store = ConsentStoreOperation::new(write);
         assert_eq!(
-            keys.finalize(),
-            Err(PlaintextError::Storage(StorageError::Timeout))
+            store.first(),
+            Ok(Next::Call(IoCall::Write(vec![
+                consent_row(row.clone(), user(1)).unwrap()
+            ])))
+        );
+        assert_eq!(store.next(IoResult::Done), Ok(Next::Done(())));
+        let mut delete = ConsentStoreOperation::new(consent_delete(row.clone()));
+        assert_eq!(
+            delete.first(),
+            Ok(Next::Call(IoCall::Delete(vec![(
+                PLAINTEXT_COPY_KEYSPACE.to_string(),
+                row.into()
+            )])))
         );
     }
 
@@ -842,78 +687,32 @@ pub(crate) mod tests {
     fn encryption_check_modes() {
         // Without `retained` the settings decide alone; an unencrypted bucket without keys is plain.
         let mut settings = EncryptionCheckOperation::new("plain", false);
-        settings.start();
-        assert!(settings.step(read_result(None)).is_empty());
-        assert_eq!(settings.finalize(), Ok(false));
+        settings.first().unwrap();
+        assert_eq!(settings.next(read_result(None)), Ok(Next::Done(false)));
         let mut retained = EncryptionCheckOperation::new("plain", true);
-        retained.start();
-        assert!(retained.step(read_result(None)).is_empty());
-        assert_eq!(retained.finalize(), Ok(false));
+        retained.first().unwrap();
+        assert_eq!(retained.next(read_result(None)), Ok(Next::Done(false)));
     }
 
     #[test]
-    fn operations_reject_events() {
-        let realm = RealmId::from_bytes([3; 32]);
-        let read_or_error = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        let holder = || {
-            let mut operation = HolderCheckOperation::new(realm, "sealed", user(1));
-            operation.start();
-            operation
-        };
-        assert!(!rejects_events(holder, sample_events, read_or_error).is_empty());
-        let consent = || {
-            let mut operation = ConsentReadOperation::new(b"row".to_vec());
-            operation.start();
-            operation
-        };
-        assert!(!rejects_events(consent, sample_events, read_or_error).is_empty());
-        let encryption = || {
-            let mut operation = EncryptionCheckOperation::new("b", true);
-            operation.start();
-            operation
-        };
-        assert!(!rejects_events(encryption, sample_events, read_or_error).is_empty());
-        let store = || {
-            let mut operation = ConsentStoreOperation::new(consent_delete(b"row".to_vec()));
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(store, sample_events, |event| {
-            matches!(
-                event,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. }
-                        | StorageEvent::DeleteResult { .. }
-                        | StorageEvent::Error { .. }
-                )
-            )
-        });
-        assert!(!refused.is_empty());
-    }
-
-    #[test]
-    fn abort_and_finalize() {
-        // Every check only reads, so no phase has cleanup.
+    fn wrong_results_fail() {
+        // Every check only reads, so a wrong answer fails it and leaves nothing to clean up.
         let realm = RealmId::from_bytes([3; 32]);
         let mut holder = HolderCheckOperation::new(realm, "sealed", user(1));
-        holder.start();
-        check_abort(&mut holder, &[]);
-        rejects_finalize(holder);
+        holder.first().unwrap();
+        assert!(holder.next(IoResult::Done).is_err());
+        assert!(holder.abort().is_empty());
         let mut consent = ConsentReadOperation::new(b"row".to_vec());
-        check_abort(&mut consent, &[]);
-        rejects_finalize(consent);
-        let mut encryption = EncryptionCheckOperation::new("b", false);
-        encryption.start();
-        check_abort(&mut encryption, &[]);
-        rejects_finalize(encryption);
+        consent.first().unwrap();
+        assert!(consent.next(IoResult::Done).is_err());
+        assert!(consent.abort().is_empty());
+        let mut encryption = EncryptionCheckOperation::new("b", true);
+        encryption.first().unwrap();
+        assert!(encryption.next(IoResult::Done).is_err());
+        assert!(encryption.abort().is_empty());
         let mut store = ConsentStoreOperation::new(consent_delete(b"row".to_vec()));
-        store.start();
-        check_abort(&mut store, &[]);
-        rejects_finalize(store);
+        store.first().unwrap();
+        assert!(store.next(read_result(None)).is_err());
+        assert!(store.abort().is_empty());
     }
 }

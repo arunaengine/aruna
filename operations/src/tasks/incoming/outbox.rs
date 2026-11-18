@@ -343,14 +343,12 @@ impl OperationsTaskHandler {
                 .saturating_sub(invocation.records),
         );
         let scan_started = Instant::now();
-        let mut batch = match read_outbox_records(
-            &self.context.storage_handle,
-            &[],
-            invocation.cursor.clone(),
-            page_limit,
-        )
-        .await
-        {
+        let read = OutboxPagePlan {
+            prefix: Vec::new(),
+            start_after: invocation.cursor.clone(),
+            limit: page_limit,
+        };
+        let mut batch = match drive(PlanOperation::new(read), self.context.as_ref()).await {
             Ok(batch) => batch,
             Err(error) => {
                 warn!(task_id = ?retry_key, error = %error, "Failed to read document sync outbox record");
@@ -361,7 +359,11 @@ impl OperationsTaskHandler {
         if batch.records.iter().any(|(_, record)| matches!(&record.event,
             DocumentOutboxEvent::AdminOperation { event, .. }
                 if matches!(event.op, aruna_core::admin_documents::AdminDocumentOperation::GroupDeleted { .. })))
-            && let Err(error) = crate::groups::deletion::sync_decision(self.context.as_ref()).await
+            && let Err(error) = crate::driver::drive(
+                crate::groups::deletion::SyncDecisionOperation,
+                self.context.as_ref(),
+            )
+            .await
         {
             warn!(error = %error, "Group deletion decision is not durable; retaining outbox");
             invocation.read_failed = true;
@@ -512,7 +514,7 @@ impl OperationsTaskHandler {
         mut rotation: OutboxRotation,
     ) -> Option<OutboxRotation> {
         if rotation.boundary.is_none() {
-            match read_outbox_tails(&self.context.storage_handle).await {
+            match drive(OutboxTailsOperation::new(), self.context.as_ref()).await {
                 Ok(boundaries) if boundaries.is_empty() => {
                     self.reset_backoff(retry_key);
                     return None;
@@ -611,9 +613,9 @@ impl OperationsTaskHandler {
             .await;
         invocation.undeliverable += undeliverable.len().saturating_sub(relayed.len());
         if !relayed.is_empty()
-            && let Err(error) = crate::sync::document_outbox::delete_outbox_records(
-                &self.context.storage_handle,
-                relayed,
+            && let Err(error) = drive(
+                PlanOperation::new(DeleteOutboxPlan { keys: relayed }),
+                self.context.as_ref(),
             )
             .await
         {
@@ -706,17 +708,16 @@ impl OperationsTaskHandler {
                 .insert(*topic);
         }
         for (_, (peers, topics)) in missing_topics {
-            let event = net_handle
-                .sync_document_topics(topics.into_iter().collect(), peers)
-                .await;
+            let sync = SyncTopicsOperation::new(
+                *net_handle.realm_id(),
+                topics.into_iter().collect(),
+                peers,
+            );
+            let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(
+                drive(sync, self.context.as_ref()).await,
+            )));
             let outcome = self
-                .finish_sync_batch(
-                    retry_key,
-                    Vec::new(),
-                    Vec::new(),
-                    Event::Net(NetEvent::DocumentSync(event)),
-                    Default::default(),
-                )
+                .finish_sync_batch(retry_key, Vec::new(), Vec::new(), event, Default::default())
                 .await;
             invocation.outcome.merge(outcome);
         }
@@ -927,14 +928,11 @@ impl OperationsTaskHandler {
         let requested_targets = subbatch.targets.clone();
         let (batch_topics, batch_origins) = subbatch.ordering_domains();
         let sync_started = Instant::now();
-        let event = net_handle
-            .send_effect(Effect::Net(NetEffect::DocumentSync(
-                DocumentEffect::SyncDocuments {
-                    topics: subbatch.topics,
-                    peers: subbatch.peers,
-                },
-            )))
-            .await;
+        let sync =
+            SyncTopicsOperation::new(*net_handle.realm_id(), subbatch.topics, subbatch.peers);
+        let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(
+            drive(sync, self.context.as_ref()).await,
+        )));
         outcome.sync_elapsed = sync_started.elapsed();
         let mut outcome = self
             .finish_sync_batch(
@@ -1099,11 +1097,13 @@ impl OutboxDrainer {
 /// Kicks the installed document-sync drain owner without replacing an existing
 /// persisted retry deadline.
 pub async fn drive_sync_drain(context: Arc<DriverContext>) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
+    if context.task_handle.is_none() {
         warn!("Cannot kick document sync outbox drain without task handle");
         return;
-    };
-    restore_outbox_timers(&context.storage_handle, task_handle).await;
+    }
+    if let Err(error) = drive(OutboxTimerOperation::new(), context.as_ref()).await {
+        warn!(%error, "Failed to restore document sync outbox timer");
+    }
 }
 
 impl OperationsTaskHandler {
@@ -1115,9 +1115,12 @@ impl OperationsTaskHandler {
     ) -> Result<(), ()> {
         if !metadata_create_events.is_empty() {
             let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
-            if let Err(error) =
-                project_create_events(&self.context, metadata_create_events, local_node_id).await
-            {
+            let project = ProjectEventsOperation::new(
+                metadata_create_events,
+                local_node_id,
+                max_clock_skew(),
+            );
+            if let Err(error) = drive(project, &self.context).await {
                 warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
                 return Err(());
             }
@@ -1136,7 +1139,10 @@ impl OperationsTaskHandler {
             };
             create_event_targets.push((document_id, event_id));
         }
-        if let Err(error) = project_logged_events(&self.context, create_event_targets).await {
+        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
+        let project =
+            ProjectLoggedOperation::new(create_event_targets, false, local_node, max_clock_skew());
+        if let Err(error) = drive(project, &self.context).await {
             warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
             return Err(());
         }
@@ -1160,7 +1166,10 @@ impl OperationsTaskHandler {
                 metadata_graph_tombstones,
                 ..
             })) => {
-                process_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones).await;
+                let tombstones = TombstonesOperation::new(metadata_graph_tombstones);
+                if let Err(error) = drive(tombstones, self.context.as_ref()).await {
+                    warn!(error = ?error, "Failed to prune deleted metadata graphs");
+                }
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {
@@ -1178,7 +1187,10 @@ impl OperationsTaskHandler {
                         warn!(%error, "Watch interest refresh stopped after an outbox drain");
                     }
                 }
-                crate::notifications::email::config_applied(self.context.as_ref(), &targets).await;
+                let refresh = RefreshMailOperation::applied(&targets);
+                if let Err(error) = drive(refresh, self.context.as_ref()).await {
+                    warn!(%error, "Mail settings refresh stopped after an outbox drain");
+                }
                 let project_started = Instant::now();
                 let projected = self
                     .project_create_events(retry_key, targets, metadata_create_events)
@@ -1190,11 +1202,10 @@ impl OperationsTaskHandler {
                 }
                 let delete_started = Instant::now();
                 let delete_count = record_keys.len();
-                let deleted = crate::sync::document_outbox::delete_outbox_records(
-                    &self.context.storage_handle,
-                    record_keys.clone(),
-                )
-                .await;
+                let delete = DeleteOutboxPlan {
+                    keys: record_keys.clone(),
+                };
+                let deleted = drive(PlanOperation::new(delete), self.context.as_ref()).await;
                 outcome.delete_elapsed = delete_started.elapsed();
                 if deleted.is_ok() {
                     outcome.deleted += delete_count;

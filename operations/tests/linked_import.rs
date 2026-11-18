@@ -36,16 +36,16 @@ use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurg
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
-use aruna_operations::auth::request_authorization::BucketAccess;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 use aruna_operations::blob::cleanup::process_cleanup_batch;
-use aruna_operations::blob::purge::{scope_totals, storage_files};
+use aruna_operations::blob::purge::{StorageFilesOperation, scope_totals};
 use aruna_operations::blob::unify::{Unified, preview_page, unify};
 use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::jobs::backend_import::run_backend_import;
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use aruna_operations::jobs::host::run_backend_import;
 use aruna_operations::jobs::store::query::insert_job;
 use aruna_operations::jobs::store::state::{
     ClaimOutcome, claim_job, complete_job, transition_to_running,
@@ -55,7 +55,7 @@ use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
 use aruna_operations::s3::imports::discovery::{
-    FileOutcome, SetDiscoveryOperation, authorized_preview,
+    AuthorizedPreviewOperation, FileOutcome, SetDiscoveryOperation,
 };
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::storage_read::iter_prefix_page;
@@ -391,9 +391,12 @@ async fn s3_previews_discovery() {
         place(&context, name, name.as_bytes()).await;
     }
     let caller = (&context.auth, context.node_id);
-    let preview = authorized_preview(&context.driver, caller, &context.rule, &proteins(), None)
-        .await
-        .unwrap();
+    let preview = drive(
+        AuthorizedPreviewOperation::new(caller, &context.rule, &proteins(), None),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let placed: Vec<_> = (preview.files.iter())
         .map(|file| (file.key.as_deref(), file.outcome.clone()))
         .collect();
@@ -407,9 +410,12 @@ async fn s3_previews_discovery() {
     );
     assert_eq!(preview.next, None);
     let after = Some(format!("{}/raw/b.txt", context.folder));
-    let rest = authorized_preview(&context.driver, caller, &context.rule, &proteins(), after)
-        .await
-        .unwrap();
+    let rest = drive(
+        AuthorizedPreviewOperation::new(caller, &context.rule, &proteins(), after),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(rest.files.len(), 1);
     assert_eq!(rest.files[0].key.as_deref(), Some("proteins/sub/c.faa.gz"));
 }
@@ -637,9 +643,12 @@ async fn content(context: &TestContext, key: &str, id: Ulid) -> Vec<u8> {
 /// The duplicates preview of the whole bucket.
 async fn duplicates(context: &TestContext) -> aruna_operations::blob::unify::UnifyPage {
     let scope = (context.auth.realm_id, context.group_id, context.node_id);
-    let access = BucketAccess::load(&context.driver, &context.auth, scope, BUCKET)
-        .await
-        .unwrap();
+    let access = drive(
+        BucketAccessOperation::new(&context.auth, scope, BUCKET),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
         .await
         .unwrap()
@@ -787,9 +796,17 @@ async fn s3_purges_named() {
     ]
     .map(|(key, id)| (key.to_string(), id));
     let scope = (BUCKET, context.group_id);
-    let files = storage_files(&context.driver, scope, &versions, Some(&spec.scope))
-        .await
-        .unwrap();
+    let files = drive(
+        StorageFilesOperation::new(
+            node_routing(&context.driver),
+            scope,
+            &versions,
+            Some(&spec.scope),
+        ),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     let kept: Vec<_> = (files.iter()).map(|file| file.kept.is_some()).collect();
     assert_eq!(kept, [false, true]);
 

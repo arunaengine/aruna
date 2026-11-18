@@ -45,7 +45,7 @@ use super::version_replication::{
     ReplicateScopeError, ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,
 };
 use crate::driver::{DriverContext, drive};
-use crate::notifications::watch::emit::emit_watch_event;
+use crate::notifications::watch::origin::EmitEventOperation;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
@@ -275,9 +275,16 @@ pub(super) async fn load_source_authorization(
         }
     };
     let group_id = bucket_info.group_id;
-    SourceAuthorization::load(context, auth_context, group_id, source_node_id)
-        .await
-        .map_err(|error| (error, Some(group_id)))
+    drive(
+        crate::replication::source_rules::SourceAuthOperation::new(
+            auth_context,
+            group_id,
+            source_node_id,
+        ),
+        context,
+    )
+    .await
+    .map_err(|error| (error, Some(group_id)))
 }
 
 pub(super) fn mark_failure(relationship: &mut SyncRelationship, error: &str) {
@@ -362,24 +369,22 @@ async fn emit_sync_watch(
             },
         ),
     };
-    emit_watch_event(
-        context,
-        WatchEvent {
-            event_id: Ulid::generate(),
-            realm_id: relationship.source.realm_id,
-            kind,
-            path: watch_resource_path(
-                group_id,
-                node_id,
-                bucket,
-                relationship.source.key_prefix().unwrap_or_default(),
-            ),
-            actor: relationship.created_by,
-            occurred_at_ms: unix_timestamp_millis(),
-            detail,
-        },
-    )
-    .await;
+    let emit = EmitEventOperation::new(WatchEvent {
+        event_id: Ulid::generate(),
+        realm_id: relationship.source.realm_id,
+        kind,
+        path: watch_resource_path(
+            group_id,
+            node_id,
+            bucket,
+            relationship.source.key_prefix().unwrap_or_default(),
+        ),
+        actor: relationship.created_by,
+        occurred_at_ms: unix_timestamp_millis(),
+        detail,
+    });
+    // Failures only warn inside the operation.
+    let _ = drive(emit, context).await;
 }
 
 pub(super) fn job_source_auth<'a>(

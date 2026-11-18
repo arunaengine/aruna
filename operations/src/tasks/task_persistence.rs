@@ -29,7 +29,7 @@ pub(crate) async fn persist_task_effect(
         TaskEffect::ResetTimer { key, after } => write_timer(storage, key, *after).await,
         TaskEffect::ShortenTimer { key, after } => shorten_timer(storage, key, *after).await,
         TaskEffect::CancelTimer { key } => delete_timer(storage, key).await,
-        TaskEffect::AbortRunningHandlers { .. } => Ok(()),
+        TaskEffect::ScheduleIdleTimer { .. } | TaskEffect::AbortRunningHandlers { .. } => Ok(()),
     }
 }
 
@@ -63,6 +63,7 @@ fn timer_is_restored(effect: &TaskEffect) -> bool {
 fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
     let (TaskEffect::ResetTimer { key, .. }
     | TaskEffect::ShortenTimer { key, .. }
+    | TaskEffect::ScheduleIdleTimer { key, .. }
     | TaskEffect::CancelTimer { key }
     | TaskEffect::AbortRunningHandlers { key }) = effect;
     matches!(key, TaskKey::LockBucket { .. })

@@ -2914,7 +2914,7 @@ mod tests {
         ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
         target_key,
     };
-    use crate::driver::DriverContext;
+    use crate::driver::{DriverContext, drive};
     use crate::replication::protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
@@ -3116,11 +3116,13 @@ mod tests {
             event,
             Event::Storage(StorageEvent::BatchWriteResult { .. })
         ));
-        let authorization = SourceAuthorization::load(
+        let authorization = drive(
+            crate::replication::source_rules::SourceAuthOperation::new(
+                input.auth_context.clone(),
+                group_id,
+                input.target_node_id,
+            ),
             &context,
-            input.auth_context.clone(),
-            group_id,
-            input.target_node_id,
         )
         .await
         .unwrap();

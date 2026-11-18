@@ -10,8 +10,9 @@ pub(crate) mod rewrite;
 pub mod upload;
 pub mod upload_store;
 
+use crate::metadata::forward::route_create::RouteCreateOperation;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use upload::UploadClaimError;
-use upload_store::{claim_rocrate_upload, delete_rocrate_upload};
 
 use crate::jobs::export::archive::persist_checkpoint;
 use std::collections::{BTreeSet, HashMap};
@@ -43,7 +44,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
-use byteview::ByteView;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
@@ -59,6 +59,7 @@ use self::reader::HiddenRangeReader;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, validate_document};
 use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
+use super::run_rows::ReadStateOperation;
 use super::store::{put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
@@ -69,16 +70,16 @@ use crate::jobs::store::query::list_job_entries;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::write::{route_metadata_create, route_metadata_update};
+use crate::metadata::forward::write::route_metadata_update;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
-use crate::notifications::watch::emit::emit_metadata_created;
+use crate::notifications::watch::origin::EmitEventOperation;
 use crate::placement::policy::{GateContextError, GateOperation};
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::BucketScope;
 use crate::s3::object::delete::DeleteObjectError;
-use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
-use crate::s3::object::delete::pinned::version_pins;
+use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation};
+use crate::s3::object::delete::pinned::VersionPinsOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
@@ -354,6 +355,22 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
     }
 }
 
+/// The connector kind of a repository import in reference mode; `None` for any other import.
+async fn reference_kind(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+) -> Result<Option<aruna_core::structs::execution::harvest::RepositoryConnectorKind>, ImportFailure>
+{
+    let Some((group_id, connector_id)) = super::repository::reference_source(spec) else {
+        return Ok(None);
+    };
+    let connector = super::repository::connector::ConnectorViewOperation::new(group_id, connector_id);
+    let view = drive(connector, &ctx.driver)
+        .await
+        .map_err(transfer_failure)?;
+    Ok(Some(view.connector.kind))
+}
+
 fn transfer_failure(error: super::repository::TransferError) -> ImportFailure {
     use super::repository::TransferError;
     match error {
@@ -378,26 +395,48 @@ async fn acquire_source(
             options,
             pull,
         } => {
-            use super::repository::{Action, ensure_supported};
-            let kind = super::repository::connector_kind(&ctx.driver, *group_id, *connector_id)
+            use super::repository::connector::ConnectorViewOperation;
+            use super::repository::invenio::import::{AcquireOperation, AcquireRequest};
+            use super::repository::{Action, JobScope, NodeScope, ensure_supported};
+            let connector = ConnectorViewOperation::new(*group_id, *connector_id);
+            let kind = drive(connector, &ctx.driver)
                 .await
-                .map_err(transfer_failure)?;
+                .map_err(transfer_failure)?
+                .connector
+                .kind;
             ensure_supported(kind, Action::Import).map_err(transfer_failure)?;
             if pull.is_some() {
                 ensure_supported(kind, Action::Pull).map_err(transfer_failure)?;
             }
-            let (artifact, found, progress) = super::repository::acquire(
+            // A pull update merges into the dataset's current crate.
+            let current = match pull {
+                Some(aruna_core::repository::RepositoryPull::Update { .. }) => Some(
+                    Box::pin(crate::jobs::export::crate_jsonld(
+                        &ctx.driver,
+                        &spec.auth_context,
+                        spec.document_id,
+                        spec.limits.metadata_bytes,
+                    ))
+                    .await
+                    .map_err(transfer_failure)?,
+                ),
+                _ => None,
+            };
+            let acquire = AcquireOperation::new(AcquireRequest {
                 kind,
-                ctx,
-                spec,
-                *group_id,
-                *connector_id,
-                record_id,
-                options,
-                pull.as_ref(),
-            )
-            .await
-            .map_err(transfer_failure)?;
+                scope: NodeScope::of(&ctx.driver),
+                job: JobScope::of(ctx),
+                spec: spec.clone(),
+                group_id: *group_id,
+                connector_id: *connector_id,
+                record_id: record_id.clone(),
+                options: options.clone(),
+                pull: pull.clone(),
+                current,
+            });
+            let (artifact, found, progress) = Box::pin(drive(acquire, &ctx.driver))
+                .await
+                .map_err(transfer_failure)?;
             checkpoint.identifiers = found;
             checkpoint.pull = progress;
             Ok(ImportInput {
@@ -409,12 +448,17 @@ async fn acquire_source(
             })
         }
         ImportRoCrateSource::Upload { upload_id } => {
-            let record = claim_rocrate_upload(
+            let record = crate::driver::drive_retry(
+                || {
+                    crate::jobs::import::upload::ClaimUploadOperation::new(
+                        *upload_id,
+                        spec.auth_context.user_id,
+                        ctx.job_id,
+                        aruna_core::time::unix_timestamp_millis(),
+                    )
+                },
                 &ctx.driver,
-                *upload_id,
-                spec.auth_context.user_id,
-                ctx.job_id,
-                aruna_core::time::unix_timestamp_millis(),
+                &*upload_id.to_bytes(),
             )
             .await
             .map_err(|error| match error {
@@ -879,9 +923,8 @@ async fn write_next(
         ctx.shutdown.clone(),
     )
     .await?;
-    let reference = super::repository::reference_kind(&ctx.driver, spec)
-        .await
-        .map_err(transfer_failure)?
+    let reference = reference_kind(ctx, spec)
+        .await?
         .filter(|kind| super::repository::is_reference(*kind, &entry.path));
     if let Some(kind) = reference {
         let mut bytes = Vec::new();
@@ -896,14 +939,19 @@ async fn write_next(
         }
         let descriptor = serde_json::from_slice(&bytes)
             .map_err(|_| ImportFailure::Permanent("invalid reference descriptor".into()))?;
-        let metadata = super::repository::write_reference(
-            kind,
-            ctx,
-            spec,
-            bucket_info,
-            &entry.target_key,
-            entry.version_id,
-            &descriptor,
+        let metadata = drive(
+            super::repository::invenio::reference::WriteRepositoryReference::new(
+                kind,
+                super::repository::NodeScope::of(&ctx.driver),
+                super::repository::JobScope::of(ctx),
+                spec.clone(),
+                bucket_info,
+                entry.target_key.clone(),
+                entry.version_id,
+                descriptor,
+                Ulid::generate(),
+            ),
+            &ctx.driver,
         )
         .await
         .map_err(transfer_failure)?;
@@ -1049,9 +1097,7 @@ async fn rewrite_crate(
 ) -> Result<(), ImportFailure> {
     let validated = validate_document(&plan.metadata_json).map_err(validation_failure)?;
     let reports = load_reports(ctx).await?;
-    let reference = super::repository::reference_kind(&ctx.driver, spec)
-        .await
-        .map_err(transfer_failure)?;
+    let reference = reference_kind(ctx, spec).await?;
     let mut targets = HashMap::new();
     let mut used = BTreeSet::new();
     for entry in &plan.entries {
@@ -1134,17 +1180,20 @@ async fn create_document(
         user_id: spec.auth_context.user_id,
         realm_id: spec.auth_context.realm_id,
     };
-    match route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor,
-            group_id: spec.metadata.group_id,
-            document_id: spec.document_id,
-            document_path: spec.metadata.path.clone(),
-            public: spec.metadata.public,
-            payload: CreateDocumentPayload::RoCrate { jsonld },
-        }),
-        ctx.driver.clone(),
-        Some(AuthToken::internal(spec.auth_context.clone())),
+    match drive(
+        RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor,
+                group_id: spec.metadata.group_id,
+                document_id: spec.document_id,
+                document_path: spec.metadata.path.clone(),
+                public: spec.metadata.public,
+                payload: CreateDocumentPayload::RoCrate { jsonld },
+            }),
+            ctx.driver.net_handle.as_ref().map(|net| net.node_id()),
+            Some(AuthToken::internal(spec.auth_context.clone())),
+        ),
+        &ctx.driver,
     )
     .await
     {
@@ -1154,16 +1203,16 @@ async fn create_document(
             if let Some(pull) = checkpoint.pull.as_mut() {
                 pull.revision = Some(created.event_id);
             }
-            emit_metadata_created(
-                &ctx.driver,
+            let emit = EmitEventOperation::metadata_created(
                 spec.auth_context.realm_id,
                 spec.auth_context.user_id,
                 created.record.group_id,
                 created.record.document_id,
                 &created.record.document_path,
                 created.event_id,
-            )
-            .await;
+            );
+            // Failures only warn inside the operation.
+            let _ = drive(emit, &ctx.driver).await;
             Ok(())
         }
         Err(error) => Err(classify_metadata(error)),
@@ -1193,7 +1242,12 @@ async fn update_document(
         ..
     } = &spec.source
     {
-        super::repository::pull::running(ctx, spec, *link_id)
+        let running = super::repository::pull::PullRunningOperation::new(
+            ctx.job_id,
+            spec.document_id,
+            *link_id,
+        );
+        drive(running, &ctx.driver)
             .await
             .map_err(transfer_failure)?;
     }
@@ -1221,10 +1275,9 @@ async fn update_document(
             user_id: spec.auth_context.user_id,
             realm_id: spec.auth_context.realm_id,
         };
-        let record =
-            crate::metadata::record_reads::load_document_record(&ctx.driver, spec.document_id)
-                .await
-                .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
+        let record = drive(DocumentRecordOperation::new(spec.document_id), &ctx.driver)
+            .await
+            .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
         // The holder refuses the update inside its transaction when an edit landed after `base`.
         match Box::pin(route_metadata_update(
             &ctx.driver,
@@ -1312,9 +1365,15 @@ async fn cleanup_source(
             .await
             .map_err(ImportFailure::Retryable)?;
         if let Some(upload_id) = input.upload_id {
-            delete_rocrate_upload(&ctx.driver, upload_id, ctx.job_id)
-                .await
-                .map_err(ImportFailure::Retryable)?;
+            crate::driver::drive(
+                crate::jobs::import::upload_store::DeleteUploadOperation::new(
+                    upload_id, ctx.job_id,
+                ),
+                &ctx.driver,
+            )
+            .await
+            .map_err(|error| error.0)
+            .map_err(ImportFailure::Retryable)?;
         }
     }
     checkpoint.refs.hidden_locations.clear();
@@ -1322,14 +1381,15 @@ async fn cleanup_source(
         register_identifiers(ctx, spec, checkpoint.identifiers.clone()).await?;
         checkpoint.identifiers.clear();
     }
-    Box::pin(super::repository::pull::settle_import(
-        ctx,
-        spec,
-        checkpoint.pull.as_ref(),
-        checkpoint.failure.as_deref(),
-    ))
-    .await
-    .map_err(|error| {
+    let settle = super::repository::pull::SettleImportOperation::new(
+        super::repository::NodeScope::of(&ctx.driver),
+        ctx.job_id,
+        ctx.owner_node_id,
+        spec.clone(),
+        checkpoint.pull.clone(),
+        checkpoint.failure.clone(),
+    );
+    Box::pin(drive(settle, &ctx.driver)).await.map_err(|error| {
         ImportFailure::Retryable(format!("recording the pull link failed: {error}"))
     })?;
     checkpoint.phase = ImportPhase::Done;
@@ -1408,11 +1468,14 @@ async fn rollback_writes(
             version_id: entry.version_id,
         })
         .collect();
-    let (pins, guards) = version_pins(&ctx.driver, scope, &spec.auth_context, &queries)
-        .await
-        .map_err(|error| {
-            ImportFailure::Retryable(format!("rollback cannot check releases: {error}"))
-        })?;
+    let (pins, guards) = drive(
+        VersionPinsOperation::new(scope, &spec.auth_context, queries.to_vec()),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| {
+        ImportFailure::Retryable(format!("rollback cannot check releases: {error}"))
+    })?;
     let (pinned, removable): (Vec<_>, Vec<_>) = (plan.entries[..attempted].iter())
         .zip(pins)
         .partition(|(_, pinned)| *pinned);
@@ -1428,9 +1491,8 @@ async fn rollback_writes(
         kept.push(entry.target_key.clone());
     }
     let removable: Vec<_> = removable.into_iter().map(|(entry, _)| entry).collect();
-    let outcomes = delete_objects(
-        &ctx.driver,
-        BulkDeleteInput {
+    let outcomes = drive(
+        BulkDeleteOperation::new(BulkDeleteInput {
             bucket: spec.target.bucket.clone(),
             entries: removable
                 .iter()
@@ -1445,9 +1507,11 @@ async fn rollback_writes(
             deleted_by: spec.auth_context.user_id,
             restrictions: spec.auth_context.path_restrictions.clone(),
             guards,
-        },
+        }),
+        &ctx.driver,
     )
-    .await;
+    .await
+    .map_err(|error| ImportFailure::Retryable(format!("rollback delete failed: {error}")))?;
     let mut removed = 0;
     // Only a version that was really removed loses its report detail, so the
     // entry that failed before writing keeps its own failure message.
@@ -1907,13 +1971,9 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
 }
 
 async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, String> {
-    read_state(
-        &ctx.driver,
-        JOB_STATE_KEYSPACE,
-        ByteView::from(ctx.job_id.to_bytes().to_vec()),
-        "import checkpoint",
-    )
-    .await
+    drive(ReadStateOperation::new(ctx.job_id), &ctx.driver)
+        .await
+        .map_err(|error| error.0)
 }
 
 async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {

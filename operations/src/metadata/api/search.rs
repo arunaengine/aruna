@@ -19,12 +19,14 @@ use super::{
     record_object_result, select_fanout_nodes,
 };
 use crate::driver::DriverContext;
-use crate::realm::load_config::load_realm_config;
 use crate::s3::object::search_scan::search_local_objects;
 
 use super::distributed::run_search_distributed;
 use crate::distribution::feed_walks::IndexProgress;
+use crate::document_repository::GetConfigOperation;
+use crate::driver::drive;
 use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
+use crate::realm::load_config::config_unavailable;
 use crate::s3::object::search_scan::changed_until;
 
 const OBJECT_CURSOR_VERSION: u8 = 1;
@@ -401,8 +403,10 @@ pub(super) async fn resolve_object_partitions(
                 let authorized_signers = match plan.mode {
                     ObjectQueryMode::Local => vec![local_node_id],
                     ObjectQueryMode::DistributedBestEffort | ObjectQueryMode::DistributedStrict => {
-                        load_realm_config(context, realm_id)
+                        drive(GetConfigOperation::new(realm_id), context)
                             .await
+                            .inspect_err(config_unavailable)
+                            .ok()
                             .ok_or(MetadataApiError::ServiceUnavailable)?
                             .node_ids()
                             .map_err(|_| MetadataApiError::ServiceUnavailable)?

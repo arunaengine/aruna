@@ -33,8 +33,8 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version};
-use crate::driver::DriverContext;
+use crate::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version, resolved};
+use crate::driver::{DriverContext, drive_until};
 
 const PAGE_SIZE: usize = 256;
 const BATCH_SIZE: usize = 256;
@@ -485,7 +485,7 @@ pub(crate) async fn retry_unverified(context: &DriverContext) -> Result<bool, Da
             Some(set_id) => Some(Some(*set_id)),
             None => {
                 let deadline = Instant::now() + RESOLVE_BUDGET;
-                match resolve_version(context, version_id, deadline).await {
+                match resolved(drive_until(resolve_version(context, version_id, deadline), context, deadline).await) {
                     GlobalResolution::Found(found) => Some(Some(found.set_id)),
                     GlobalResolution::NotFound => Some(None),
                     GlobalResolution::Unavailable | GlobalResolution::Ambiguous => None,

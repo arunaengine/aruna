@@ -710,7 +710,7 @@ impl Operation for AwaitingJobsOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::runtime::key_unlocked;
+    use crate::jobs::key_locks::KeyUnlockedOperation;
     use crate::testing::test_context;
     use aruna_storage::StorageHandle;
 
@@ -762,7 +762,7 @@ mod tests {
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage = aruna_storage::FjallStorage::open(root).unwrap();
-        let net = aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage.clone())
+        let net = aruna_net::NetHandle::new(crate::testing::local_net(), storage.clone())
             .await
             .unwrap();
         let config = BackendConfig {
@@ -1449,7 +1449,11 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert!(!key_unlocked(&context, old).await);
+        assert!(
+            !drive(KeyUnlockedOperation::new(old), &context)
+                .await
+                .unwrap()
+        );
         release_tx.send(()).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), None);
         actor.join().unwrap();
@@ -1665,7 +1669,11 @@ mod tests {
                 queued,
                 Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
             ));
-            assert!(!key_unlocked(&context, old).await);
+            assert!(
+                !drive(KeyUnlockedOperation::new(old), &context)
+                    .await
+                    .unwrap()
+            );
 
             let mut unavailable = interrupted.clone();
             unavailable.task_handle = Some(aruna_tasks::TaskHandle::inactive());

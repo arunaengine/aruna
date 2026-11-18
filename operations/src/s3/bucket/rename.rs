@@ -6,9 +6,8 @@
 use crate::s3::imports::cron::is_running;
 use crate::s3::imports::validate_folder;
 use crate::s3::purge_fence::fence_key;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
@@ -17,7 +16,8 @@ use aruna_core::keyspaces::{
     PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
     RELATIONSHIP_OUT_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::values;
 use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::job_record_key;
 use aruna_core::structs::identity::realm::RealmId;
@@ -31,8 +31,7 @@ use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::replication_queue::queued_prefixes;
 use aruna_core::structs::sync_relationship_prefix;
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use thiserror::Error;
@@ -110,9 +109,17 @@ pub enum RenameError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event in state {0}")]
+    #[error("unexpected answer in state {0}")]
     Unexpected(&'static str),
 }
+
+impl From<IoError> for RenameError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type RenameTurn = Result<Next<RenamePlan>, RenameError>;
 
 /// Why `to` cannot be a key, if it cannot.
 pub fn check_target(to: &str) -> Result<(), String> {
@@ -183,8 +190,6 @@ struct Found {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RenameState {
-    Init,
-    Start,
     Bucket,
     Scan,
     Runs,
@@ -194,8 +199,6 @@ enum RenameState {
     Index,
     Delete,
     Write,
-    Commit,
-    Finish,
 }
 
 /// Reads every row of the selected keys in one write transaction, checks for collisions and
@@ -204,7 +207,6 @@ enum RenameState {
 pub struct RenameKeysOperation {
     input: RenameInput,
     state: RenameState,
-    txn_id: Option<TxnId>,
     scans: VecDeque<Scan>,
     scan: Option<Scan>,
     rules: Vec<BackendImport>,
@@ -218,7 +220,7 @@ pub struct RenameKeysOperation {
     row_reads: Option<Vec<(usize, usize, String)>>,
     truncated: bool,
     writes: Vec<(String, Key, Value)>,
-    output: Option<Result<RenamePlan, RenameError>>,
+    plan: Option<RenamePlan>,
 }
 
 impl RenameKeysOperation {
@@ -227,8 +229,7 @@ impl RenameKeysOperation {
         Self {
             input,
             targets,
-            state: RenameState::Init,
-            txn_id: None,
+            state: RenameState::Bucket,
             scans: VecDeque::new(),
             scan: None,
             rules: Vec::new(),
@@ -238,14 +239,13 @@ impl RenameKeysOperation {
             row_reads: None,
             truncated: false,
             writes: Vec::new(),
-            output: None,
+            plan: None,
         }
     }
 
-    fn fail(&mut self, error: RenameError) -> Effects {
-        self.state = RenameState::Finish;
-        self.output = Some(Err(error));
-        self.abort()
+    fn call(&mut self, state: RenameState, call: IoCall) -> RenameTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
     fn validate(&self) -> Result<Vec<RenameItem>, RenameError> {
@@ -313,58 +313,40 @@ impl RenameKeysOperation {
         })
     }
 
-    fn txn(&self) -> Result<TxnId, RenameError> {
-        self.txn_id.ok_or(RenameError::Unexpected("transaction"))
-    }
-
-    fn read_bucket(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = RenameState::Bucket;
+    fn read_bucket(&mut self) -> RenameTurn {
         let name: Key = self.input.bucket.as_bytes().to_vec().into();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (S3_BUCKET_KEYSPACE.to_string(), name.clone()),
-                (BUCKET_ENCRYPTION_KEYSPACE.to_string(), name.clone()),
-                (COMPRESSION_MIGRATION_KEYSPACE.to_string(), name.clone()),
-                (
-                    PURGE_FENCE_KEYSPACE.to_string(),
-                    fence_key(&self.input.bucket)
-                ),
-                (LINKED_JOB_KEYSPACE.to_string(), name),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        let reads = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), name.clone()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), name.clone()),
+            (COMPRESSION_MIGRATION_KEYSPACE.to_string(), name.clone()),
+            (
+                PURGE_FENCE_KEYSPACE.to_string(),
+                fence_key(&self.input.bucket),
+            ),
+            (LINKED_JOB_KEYSPACE.to_string(), name),
+        ];
+        self.call(RenameState::Bucket, IoCall::Read(reads))
     }
 
     /// Only a plain bucket of the caller's group without replication, a purge or a running
     /// compression or storage move is renamed; a move would miss the moved versions.
-    fn bucket_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let [
-            (_, bucket),
-            (_, encryption),
-            (_, migration),
-            (_, fence),
-            (_, job),
-        ] = values.as_slice()
-        else {
-            return self.fail(RenameError::Unexpected("Bucket"));
-        };
+    fn bucket_read(
+        &mut self,
+        [bucket, encryption, migration, fence, job]: [Option<Value>; 5],
+    ) -> RenameTurn {
         if let Some((expected, _)) = &self.input.job
             && job.as_ref() != Some(expected)
         {
             return self.conflict(JOB_CHANGED);
         }
-        match bucket.as_deref().map(BucketInfo::from_bytes).transpose() {
-            Ok(Some(info)) if info.group_id != self.input.group_id => {
-                return self.fail(RenameError::NotFound);
-            }
-            // Its inventory and replicas name every key, so keys move only as new writes.
-            Ok(Some(info)) if info.distribution.is_some() => {
-                return self.conflict("keys of a distributed bucket cannot be renamed in place");
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => return self.fail(RenameError::NotFound),
-            Err(error) => return self.fail(error.into()),
+        let info = bucket.as_deref().map(BucketInfo::from_bytes).transpose()?;
+        let info = info.ok_or(RenameError::NotFound)?;
+        if info.group_id != self.input.group_id {
+            return Err(RenameError::NotFound);
+        }
+        // Its inventory and replicas name every key, so keys move only as new writes.
+        if info.distribution.is_some() {
+            return self.conflict("keys of a distributed bucket cannot be renamed in place");
         }
         if encryption.is_some() {
             return self.conflict("an encrypted bucket cannot be renamed");
@@ -372,16 +354,16 @@ impl RenameKeysOperation {
         if fence.is_some() {
             return self.conflict("a permanent purge of this bucket is running");
         }
-        match migration.as_deref().map(CompressionMigration::from_bytes) {
-            Some(Ok(record)) if record.finished_at_ms.is_none() => {
-                return self.conflict("a compression or storage move of this bucket is running");
-            }
-            Some(Err(error)) => return self.fail(error.into()),
-            _ => {}
+        let migration = migration.as_deref().map(CompressionMigration::from_bytes);
+        if migration
+            .transpose()?
+            .is_some_and(|run| run.finished_at_ms.is_none())
+        {
+            return self.conflict("a compression or storage move of this bucket is running");
         }
         let bucket = self.input.bucket.as_str();
         let group = self.input.group_id.to_bytes().to_vec();
-        self.scans = VecDeque::from([
+        let mut scans = VecDeque::from([
             Scan::new(
                 ScanKind::Relations,
                 RELATIONSHIP_OUT_KEYSPACE,
@@ -397,56 +379,43 @@ impl RenameKeysOperation {
             Scan::new(ScanKind::Rules, BACKEND_IMPORT_KEYSPACE, group, PAGE),
             Scan::new(ScanKind::Uploads, UPLOAD_KEYSPACE, Vec::new(), PAGE),
         ]);
-        match queued_prefixes(bucket) {
-            Ok(prefixes) => self.scans.extend(
-                prefixes.map(|(space, prefix)| Scan::new(ScanKind::Queued, space, prefix, 1)),
-            ),
-            Err(error) => return self.fail(error.into()),
-        }
+        let queued = queued_prefixes(bucket)?;
+        scans.extend(queued.map(|(space, prefix)| Scan::new(ScanKind::Queued, space, prefix, 1)));
         if self.input.keys.is_none() && self.input.pairs.is_empty() {
-            let prefix = BlobHeadKey::object_prefix(bucket, &self.input.from);
-            match prefix {
-                Ok(prefix) => self.scans.push_back(Scan::new(
-                    ScanKind::Select,
-                    BLOB_HEAD_KEYSPACE,
-                    prefix,
-                    PAGE,
-                )),
-                Err(error) => return self.fail(error.into()),
-            }
+            let prefix = BlobHeadKey::object_prefix(bucket, &self.input.from)?;
+            scans.push_back(Scan::new(
+                ScanKind::Select,
+                BLOB_HEAD_KEYSPACE,
+                prefix,
+                PAGE,
+            ));
         }
+        self.scans = scans;
         self.next_scan()
     }
 
-    fn conflict(&mut self, reason: &str) -> Effects {
-        self.fail(RenameError::Conflict(reason.to_string()))
+    fn conflict(&self, reason: &str) -> RenameTurn {
+        Err(RenameError::Conflict(reason.to_string()))
     }
 
-    fn next_scan(&mut self) -> Effects {
+    fn next_scan(&mut self) -> RenameTurn {
         let Some(scan) = self.scans.pop_front() else {
             self.scan = None;
             return self.scans_done();
         };
-        self.state = RenameState::Scan;
-        let effect = Effect::Storage(StorageEffect::Iter {
-            key_space: scan.space.to_string(),
-            prefix: Some(scan.prefix.clone().into()),
-            start: scan.start.clone().map(IterStart::After),
+        let page = IoCall::Page {
+            space: scan.space.to_string(),
+            prefix: scan.prefix.clone().into(),
+            after: scan.start.clone(),
             limit: scan.limit,
-            txn_id: self.txn_id,
-        });
+        };
         self.scan = Some(scan);
-        smallvec![effect]
+        self.call(RenameState::Scan, page)
     }
 
-    fn scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
-        let Some(mut scan) = self.scan.take() else {
-            return self.fail(RenameError::Unexpected("Scan"));
-        };
-        let more = match self.take_page(scan.kind, values) {
-            Ok(more) => more,
-            Err(error) => return self.fail(error),
-        };
+    fn scanned(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> RenameTurn {
+        let mut scan = self.scan.take().ok_or(RenameError::Unexpected("Scan"))?;
+        let more = self.take_page(scan.kind, rows)?;
         if let (true, Some(next)) = (more, next) {
             scan.start = Some(next);
             self.scans.push_front(scan);
@@ -546,15 +515,11 @@ impl RenameKeysOperation {
     }
 
     /// The location rows of the keys' materialized versions, which name their linked files.
-    fn read_locations(&mut self) -> Effects {
+    fn read_locations(&mut self) -> RenameTurn {
         let mut reads = Vec::new();
         for found in &self.found {
             for (_, value) in &found.versions {
-                let version = match BlobVersion::from_bytes(value) {
-                    Ok(version) => version,
-                    Err(error) => return self.fail(error.into()),
-                };
-                if let Some(key) = version.location_key() {
+                if let Some(key) = BlobVersion::from_bytes(value)?.location_key() {
                     reads.push((BLOB_LOCATIONS_KEYSPACE.to_string(), key.to_bytes().into()));
                 }
             }
@@ -566,15 +531,11 @@ impl RenameKeysOperation {
         if reads.is_empty() {
             return self.locations_read(Vec::new());
         }
-        self.state = RenameState::Locations;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(RenameState::Locations, IoCall::Read(reads))
     }
 
     /// Reads each rule's record of every linked file a version of a selected key names.
-    fn locations_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn locations_read(&mut self, values: Vec<Option<Value>>) -> RenameTurn {
         let mut owners = Vec::new();
         for (index, found) in self.found.iter().enumerate() {
             let count = found.versions.iter().filter(|(_, value)| {
@@ -583,18 +544,15 @@ impl RenameKeysOperation {
             owners.extend(std::iter::repeat_n(index, count.count()));
         }
         if owners.len() != values.len() {
-            return self.fail(RenameError::Unexpected("Locations"));
+            return Err(RenameError::Unexpected("Locations"));
         }
         let mut reads = Vec::new();
         let mut seen = HashSet::new();
-        for (index, (_, value)) in owners.into_iter().zip(values) {
+        for (index, value) in owners.into_iter().zip(values) {
             let Some(value) = value else {
                 continue;
             };
-            let location = match BackendLocation::from_bytes(&value) {
-                Ok(location) => location,
-                Err(error) => return self.fail(error.into()),
-            };
+            let location = BackendLocation::from_bytes(&value)?;
             if !location.is_external() {
                 continue;
             }
@@ -644,40 +602,32 @@ impl RenameKeysOperation {
         if reads.is_empty() {
             return self.read_index();
         }
-        let effect = StorageEffect::BatchRead {
-            reads: reads
-                .iter()
-                .map(|(_, rule, path)| {
-                    let key = object_key(self.rules[*rule].import_id, path);
-                    (IMPORTED_OBJECT_KEYSPACE.to_string(), key)
-                })
-                .collect(),
-            txn_id: self.txn_id,
-        };
+        let rows = reads
+            .iter()
+            .map(|(_, rule, path)| {
+                let key = object_key(self.rules[*rule].import_id, path);
+                (IMPORTED_OBJECT_KEYSPACE.to_string(), key)
+            })
+            .collect();
         self.row_reads = Some(reads);
-        self.state = RenameState::Rows;
-        smallvec![Effect::Storage(effect)]
+        self.call(RenameState::Rows, IoCall::Read(rows))
     }
 
     /// Notes each recorded file that maps to its selected key.
-    fn rows_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn rows_read(&mut self, values: Vec<Option<Value>>) -> RenameTurn {
         let reads = self.row_reads.clone().unwrap_or_default();
         if reads.len() != values.len() {
-            return self.fail(RenameError::Unexpected("Rows"));
+            return Err(RenameError::Unexpected("Rows"));
         }
-        for ((index, rule, path), (key, value)) in reads.into_iter().zip(values) {
+        for ((index, rule, path), value) in reads.into_iter().zip(values) {
             let Some(value) = value else {
                 continue;
             };
-            let row = match ImportedObject::from_bytes(&value) {
-                Ok(row) => row,
-                Err(error) => return self.fail(error.into()),
-            };
-            let mapped = row
-                .key
-                .clone()
-                .or_else(|| self.rules[rule].aruna_key(&path));
+            let row = ImportedObject::from_bytes(&value)?;
+            let import = &self.rules[rule];
+            let mapped = row.key.clone().or_else(|| import.aruna_key(&path));
             if mapped.as_deref() == Some(self.items[index].from.as_str()) {
+                let key = object_key(import.import_id, &path);
                 self.found[index].rows.push((key, row));
                 self.items[index].files.push(path);
             }
@@ -686,7 +636,7 @@ impl RenameKeysOperation {
     }
 
     /// The rules are known; a running import of the bucket would act on stale rows.
-    fn scans_done(&mut self) -> Effects {
+    fn scans_done(&mut self) -> RenameTurn {
         match (self.found.is_empty(), self.row_reads.is_some()) {
             (true, _) => self.read_runs(),
             (false, false) => self.read_locations(),
@@ -694,7 +644,7 @@ impl RenameKeysOperation {
         }
     }
 
-    fn read_runs(&mut self) -> Effects {
+    fn read_runs(&mut self) -> RenameTurn {
         // A later part would select the keys this part moved, so `to` inside `from` needs one part.
         if self.truncated && self.input.to.starts_with(&self.input.from) {
             return self.conflict("too many keys to rename into a folder inside `from` at once");
@@ -711,51 +661,36 @@ impl RenameKeysOperation {
         if reads.is_empty() {
             return self.read_heads();
         }
-        self.state = RenameState::Runs;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(RenameState::Runs, IoCall::Read(reads))
     }
 
-    fn runs_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        for (_, value) in values {
-            match value.as_deref().map(JobRecord::from_bytes).transpose() {
-                Ok(Some(record)) if is_running(record.state) => {
-                    return self.conflict("an import of this bucket is running");
-                }
-                Ok(_) => {}
-                Err(error) => return self.fail(error.into()),
+    fn runs_read(&mut self, values: Vec<Option<Value>>) -> RenameTurn {
+        for value in values {
+            let record = value.as_deref().map(JobRecord::from_bytes).transpose()?;
+            if record.is_some_and(|record| is_running(record.state)) {
+                return self.conflict("an import of this bucket is running");
             }
         }
         self.read_heads()
     }
 
-    fn read_heads(&mut self) -> Effects {
+    fn read_heads(&mut self) -> RenameTurn {
         let bucket = &self.input.bucket;
-        let reads: Result<Vec<_>, _> = self
+        let reads = self
             .items
             .iter()
             .flat_map(|item| [&item.from, &item.to])
             .map(|key| BlobHeadKey::new(bucket.clone(), key.clone()).to_bytes())
             .map(|head| head.map(|head| (BLOB_HEAD_KEYSPACE.to_string(), Key::from(head))))
-            .collect();
-        let reads = match reads {
-            Ok(reads) => reads,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = RenameState::Heads;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+            .collect::<Result<Vec<_>, _>>()?;
+        self.call(RenameState::Heads, IoCall::Read(reads))
     }
 
-    fn heads_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn heads_read(&mut self, values: Vec<Option<Value>>) -> RenameTurn {
         if values.len() != self.items.len() * 2 {
-            return self.fail(RenameError::Unexpected("Heads"));
+            return Err(RenameError::Unexpected("Heads"));
         }
-        let mut values = values.into_iter().map(|(_, value)| value);
+        let mut values = values.into_iter();
         while let (Some(head), Some(target)) = (values.next(), values.next()) {
             self.found.push(Found {
                 head,
@@ -763,10 +698,8 @@ impl RenameKeysOperation {
                 ..Found::default()
             });
         }
-        match self.key_scans() {
-            Ok(scans) => self.scans.extend(scans),
-            Err(error) => return self.fail(error),
-        }
+        let scans = self.key_scans()?;
+        self.scans.extend(scans);
         self.next_scan()
     }
 
@@ -833,31 +766,24 @@ impl RenameKeysOperation {
         rows
     }
 
-    fn read_index(&mut self) -> Effects {
+    fn read_index(&mut self) -> RenameTurn {
         let rows = self.index_rows();
         let mut reads = Vec::with_capacity(rows.len());
         for (_, row) in &rows {
-            match row.to_bytes() {
-                Ok(key) => reads.push((PATHS_INDEX_KEYSPACE.to_string(), key.into())),
-                Err(error) => return self.fail(error.into()),
-            }
+            reads.push((PATHS_INDEX_KEYSPACE.to_string(), row.to_bytes()?.into()));
         }
         if reads.is_empty() {
             return self.finish_plan();
         }
-        self.state = RenameState::Index;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(RenameState::Index, IoCall::Read(reads))
     }
 
-    fn index_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn index_read(&mut self, values: Vec<Option<Value>>) -> RenameTurn {
         let rows = self.index_rows();
         if values.len() != rows.len() {
-            return self.fail(RenameError::Unexpected("Index"));
+            return Err(RenameError::Unexpected("Index"));
         }
-        for ((index, row), (_, value)) in rows.into_iter().zip(values) {
+        for ((index, row), value) in rows.into_iter().zip(values) {
             if value.is_some() {
                 self.found[index].indexed.push(row);
             }
@@ -866,26 +792,17 @@ impl RenameKeysOperation {
     }
 
     /// Fills each item and its conflict; a preview ends here, a rename moves the rows.
-    fn finish_plan(&mut self) -> Effects {
+    fn finish_plan(&mut self) -> RenameTurn {
         let sources: HashSet<String> = self.items.iter().map(|item| item.from.clone()).collect();
-        let described: Result<(), RenameError> = self
-            .items
-            .iter_mut()
-            .zip(&self.found)
-            .try_for_each(|(item, found)| {
-                describe(item, found, (&sources, &self.uploads), self.input.cutoff_ms)
-            });
-        if let Err(error) = described {
-            return self.fail(error);
+        for (item, found) in self.items.iter_mut().zip(&self.found) {
+            describe(item, found, (&sources, &self.uploads), self.input.cutoff_ms)?;
         }
         let plan = RenamePlan {
             items: self.items.clone(),
             truncated: self.truncated,
         };
         if !self.input.apply {
-            self.state = RenameState::Finish;
-            self.output = Some(Ok(plan));
-            return self.abort();
+            return Ok(Next::Done(plan));
         }
         let conflicts: Vec<String> = plan
             .items
@@ -897,20 +814,12 @@ impl RenameKeysOperation {
             .take(5)
             .collect();
         if !conflicts.is_empty() {
-            return self.fail(RenameError::Conflict(conflicts.join("; ")));
+            return Err(RenameError::Conflict(conflicts.join("; ")));
         }
-        self.output = Some(Ok(plan));
-        match self.moves() {
-            Ok((deletes, writes)) => {
-                self.writes = writes;
-                self.state = RenameState::Delete;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes,
-                    txn_id: self.txn_id,
-                })]
-            }
-            Err(error) => self.fail(error),
-        }
+        self.plan = Some(plan);
+        let (deletes, writes) = self.moves()?;
+        self.writes = writes;
+        self.call(RenameState::Delete, IoCall::Delete(deletes))
     }
 
     /// The rows to delete under the old keys and to write under the new ones.
@@ -1053,93 +962,46 @@ fn describe(
     Ok(())
 }
 
-impl EffectOperation for RenameKeysOperation {
+impl Operation for RenameKeysOperation {
     type Output = RenamePlan;
     type Error = RenameError;
 
-    fn start(&mut self) -> Effects {
-        match self.validate() {
-            Ok(items) => self.items = items,
-            Err(error) => return self.fail(error),
-        }
-        self.state = RenameState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> RenameTurn {
+        self.items = self.validate()?;
+        self.read_bucket()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let Event::Storage(event) = event else {
-            return self.fail(RenameError::Unexpected("Rename"));
-        };
-        match (self.state, event) {
-            (_, StorageEvent::Error { error }) => self.fail(error.into()),
-            (RenameState::Start, StorageEvent::TransactionStarted { txn_id }) => {
-                self.read_bucket(txn_id)
-            }
-            (RenameState::Bucket, StorageEvent::BatchReadResult { values }) => {
-                self.bucket_read(values)
-            }
-            (
-                RenameState::Scan,
-                StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                },
-            ) => self.scanned(values, next_start_after),
-            (RenameState::Runs, StorageEvent::BatchReadResult { values }) => self.runs_read(values),
-            (RenameState::Heads, StorageEvent::BatchReadResult { values }) => {
-                self.heads_read(values)
-            }
-            (RenameState::Locations, StorageEvent::BatchReadResult { values }) => {
-                self.locations_read(values)
-            }
-            (RenameState::Rows, StorageEvent::BatchReadResult { values }) => self.rows_read(values),
-            (RenameState::Index, StorageEvent::BatchReadResult { values }) => {
-                self.index_read(values)
-            }
-            (RenameState::Delete, StorageEvent::BatchDeleteResult { .. }) => {
-                self.state = RenameState::Write;
-                let writes = std::mem::take(&mut self.writes);
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: self.txn_id,
-                })]
-            }
-            (RenameState::Write, StorageEvent::BatchWriteResult { .. }) => match self.txn() {
-                Ok(txn_id) => {
-                    self.state = RenameState::Commit;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                }
-                Err(error) => self.fail(error),
-            },
-            (RenameState::Commit, StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
-                self.state = RenameState::Finish;
-                smallvec![]
-            }
-            _ => self.fail(RenameError::Unexpected("Rename")),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == RenameState::Finish
-    }
-
-    fn finalize(self) -> Result<RenamePlan, RenameError> {
+    fn next(&mut self, result: IoResult) -> RenameTurn {
         match self.state {
-            RenameState::Finish => self
-                .output
-                .unwrap_or(Err(RenameError::Unexpected("Finish"))),
-            _ => Err(RenameError::Unexpected("Finish")),
+            RenameState::Bucket => self.bucket_read(values::<5>(result)?),
+            RenameState::Scan => {
+                let (rows, next) = result.page()?;
+                self.scanned(rows, next)
+            }
+            RenameState::Runs => self.runs_read(result.values()?),
+            RenameState::Heads => self.heads_read(result.values()?),
+            RenameState::Locations => self.locations_read(result.values()?),
+            RenameState::Rows => self.rows_read(result.values()?),
+            RenameState::Index => self.index_read(result.values()?),
+            RenameState::Delete => {
+                result.done()?;
+                let writes = std::mem::take(&mut self.writes);
+                self.call(RenameState::Write, IoCall::Write(writes))
+            }
+            RenameState::Write => {
+                result.done()?;
+                let plan = self.plan.take();
+                plan.map(Next::Done).ok_or(RenameError::Unexpected("Write"))
+            }
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
+    /// A preview only reads, from one snapshot; a rename moves the rows it read.
+    fn transaction(&self) -> TransactionMode {
+        match self.input.apply {
+            true => TransactionMode::Write,
+            false => TransactionMode::ReadSnapshot,
+        }
     }
 }
 

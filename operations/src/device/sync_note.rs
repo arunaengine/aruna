@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SYNC_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::done;
@@ -53,16 +52,6 @@ impl DeviceSyncState {
 
 pub(crate) fn sync_state_key() -> Key {
     ByteView::from(SYNC_STATE_KEY.to_vec())
-}
-
-/// The state a read answer holds; an absent, unreadable or undecodable row counts as empty.
-pub(crate) fn read_state(event: &Event) -> DeviceSyncState {
-    match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => postcard::from_bytes(bytes).unwrap_or_default(),
-        _ => DeviceSyncState::default(),
-    }
 }
 
 /// What the device records about its exchange with the realm.

@@ -5,6 +5,7 @@
 use aruna_core::document::{DocumentSyncRevision, DocumentTarget};
 use aruna_core::errors::StorageError;
 use aruna_core::types::Value;
+use aruna_net::shard_manifest::manifest_entry_digest;
 use ulid::Ulid;
 
 use super::*;

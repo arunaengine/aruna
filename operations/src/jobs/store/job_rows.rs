@@ -2,12 +2,46 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
 
 use super::mutation::{read_record, record_read};
 use super::*;
+
+/// Reads one job record; a malformed row is retained for offline recovery and reads as absent.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReadJobOperation {
+    job_id: JobId,
+}
+
+impl ReadJobOperation {
+    pub(crate) fn new(job_id: JobId) -> Self {
+        Self { job_id }
+    }
+}
+
+impl Operation for ReadJobOperation {
+    type Output = Option<JobRecord>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<JobRecord>>, IoError> {
+        let row = (JOB_KEYSPACE.to_string(), job_record_key(self.job_id));
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<JobRecord>>, IoError> {
+        let [row] = values::<1>(result)?;
+        let record = row.and_then(|row| match JobRecord::from_bytes(&row) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                warn!(job_id = %self.job_id, error = %error, "Malformed job record retained");
+                None
+            }
+        });
+        Ok(Next::Done(record))
+    }
+}
 
 #[derive(Debug, PartialEq)]
 enum RowsStep {
@@ -45,6 +79,10 @@ impl Operation for PutRowsOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn conflict_retries() -> u32 {
+        MUTATE_MAX_ATTEMPTS - 1
     }
 
     fn first(&mut self) -> Result<Next<()>, JobMutationError> {

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
+use crate::driver::{drive, node_routing};
 use crate::s3::bucket::rename::tests::{BUCKET, group, put, realm, rule, setup};
 use crate::tests::records::node;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
@@ -141,9 +142,17 @@ async fn finds_pinned_files() {
     let versions =
         [("gone/a", a), ("gone/b", b), ("gone/c", c)].map(|(key, id)| (key.to_string(), id));
 
-    let found = storage_files(&context, (BUCKET, group()), &versions, Some(&scope()))
-        .await
-        .unwrap();
+    let found = drive(
+        StorageFilesOperation::new(
+            node_routing(&context),
+            (BUCKET, group()),
+            &versions,
+            Some(&scope()),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
     let kept: Vec<_> = found
         .iter()
         .map(|file| (file.location.backend_path.as_str(), file.kept.is_some()))
@@ -170,9 +179,12 @@ async fn plans_until_ended() {
     store(&context, ("gone/a", id), &versioned, Some("p1")).await;
     store(&context, ("gone/x", id), &unversioned, None).await;
     let versions = [("gone/a", id), ("gone/x", id)].map(|(key, id)| (key.to_string(), id));
-    let found = storage_files(&context, (BUCKET, group()), &versions, None)
-        .await
-        .unwrap();
+    let found = drive(
+        StorageFilesOperation::new(node_routing(&context), (BUCKET, group()), &versions, None),
+        &context,
+    )
+    .await
+    .unwrap();
     let storage = aruna_core::structs::storage::group_backend::GroupStorage {
         backend_id: rule().backend_id,
         group_id: group(),
@@ -189,8 +201,12 @@ async fn plans_until_ended() {
     let space = aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
     put(&context, space, backend, storage.to_bytes().unwrap()).await;
     // Planning twice, as a resumed purge does, plans each file once, in the cleanup queue.
-    plan_files(&context, job, &found).await.unwrap();
-    plan_files(&context, job, &found).await.unwrap();
+    drive(PlanFilesOperation::new(job, &found), &context)
+        .await
+        .unwrap();
+    drive(PlanFilesOperation::new(job, &found), &context)
+        .await
+        .unwrap();
     let works = || async {
         let page = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
@@ -243,12 +259,18 @@ async fn plans_until_ended() {
         )];
         let context = context.clone();
         async move {
-            batch(&context, read)
-                .await
-                .unwrap()
-                .pop()
-                .flatten()
-                .is_some()
+            let read = aruna_core::effects::StorageEffect::BatchRead {
+                reads: read,
+                txn_id: None,
+            };
+            let answer = context.storage_handle.send_storage_effect(read).await;
+            let aruna_core::events::Event::Storage(
+                aruna_core::events::StorageEvent::BatchReadResult { values },
+            ) = answer
+            else {
+                panic!("the claim read failed");
+            };
+            values[0].1.is_some()
         }
     };
     assert!(!claimed(&context).await);
@@ -316,9 +338,17 @@ async fn plans_named_unversioned() {
     }
     let versions =
         [("gone/a", a), ("gone/b", b), ("gone/c", c)].map(|(key, id)| (key.to_string(), id));
-    let found = storage_files(&context, (BUCKET, group()), &versions, Some(&scope()))
-        .await
-        .unwrap();
+    let found = drive(
+        StorageFilesOperation::new(
+            node_routing(&context),
+            (BUCKET, group()),
+            &versions,
+            Some(&scope()),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
     let planned: Vec<_> = (found.iter())
         .map(|file| (file.version.as_deref(), file.kept.is_some()))
         .collect();
@@ -372,9 +402,17 @@ async fn bounds_alias_checks() {
         .await;
     }
     let versions = [("gone/a".to_string(), id), ("gone/b".to_string(), other)];
-    let found = storage_files(&context, (BUCKET, group()), &versions, Some(&scope()))
-        .await
-        .unwrap();
+    let found = drive(
+        StorageFilesOperation::new(
+            node_routing(&context),
+            (BUCKET, group()),
+            &versions,
+            Some(&scope()),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
     let kept: Vec<_> = found.iter().map(|file| file.kept.as_deref()).collect();
     assert_eq!(kept, [Some(UNCHECKED_READERS); 2]);
 }
@@ -400,4 +438,101 @@ async fn bounds_long_histories() {
     put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
     let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
     assert!(!totals.complete);
+}
+
+fn linked(path: &str, id: Ulid) -> StorageFile {
+    StorageFile {
+        key: "gone/a".to_string(),
+        version_id: id,
+        location: file(path, Ulid::from_parts(30, 1)),
+        version: None,
+        owner: None,
+        kept: None,
+        index: None,
+    }
+}
+
+#[test]
+fn unversioned_files_unplanned() {
+    // A file without a backend version needs no write at all.
+    let files = [linked("raw/gone/a", Ulid::from_parts(10, 1))];
+    let mut operation = PlanFilesOperation::new(Ulid::from_parts(1, 1), &files);
+    assert_eq!(operation.first(), Ok(Next::Done(())));
+}
+
+#[test]
+fn versioned_file_planned() {
+    let mut planned = linked("raw/gone/a", Ulid::from_parts(10, 1));
+    planned.version = Some("p1".to_string());
+    let job = Ulid::from_parts(1, 1);
+    let mut operation = PlanFilesOperation::new(job, std::slice::from_ref(&planned));
+    let Ok(Next::Call(IoCall::Write(writes))) = operation.first() else {
+        panic!("expected the plan write");
+    };
+    assert_eq!(writes[0].0, BLOB_CLEANUP_KEYSPACE);
+    assert_eq!(writes[0].1, plan_key(job, planned.location.ulid));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+}
+
+fn wanted() -> BlobLocationKey {
+    file("raw/gone/a", Ulid::from_parts(20, 1))
+        .location_key()
+        .unwrap()
+}
+
+fn alias(key: &str) -> Key {
+    let id = Ulid::from_parts(40, 1);
+    HashIndex::new([3; 32], id, realm(), group(), node(4), BUCKET, key)
+        .to_bytes()
+        .unwrap()
+        .into()
+}
+
+fn alias_page(keys: &[&str], next: Option<Key>) -> IoResult {
+    IoResult::Page {
+        rows: (keys.iter())
+            .map(|key| (alias(key), Value::from(Vec::new())))
+            .collect(),
+        next,
+    }
+}
+
+#[test]
+fn spent_budget_unknown() {
+    let mut operation = ReadElsewhere::new(wanted(), scope(), 0);
+    assert_eq!(operation.first(), Ok(Next::Done((None, 0))));
+}
+
+#[test]
+fn scoped_aliases_pass() {
+    // Aliases inside the purge scope go with it and still use up the budget.
+    let mut operation = ReadElsewhere::new(wanted(), scope(), 5);
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Page { limit: 5, .. }))
+    ));
+    let turn = operation.next(alias_page(&["gone/a"], None));
+    assert_eq!(turn, Ok(Next::Done((Some(false), 4))));
+}
+
+#[test]
+fn deleted_alias_ignored() {
+    // An alias whose version row is gone reads nothing.
+    let mut operation = ReadElsewhere::new(wanted(), scope(), 5);
+    operation.first().unwrap();
+    let turn = operation.next(alias_page(&["kept/a"], None));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    let turn = operation.next(IoResult::Values(vec![None]));
+    assert_eq!(turn, Ok(Next::Done((Some(false), 4))));
+}
+
+#[test]
+fn no_versions_routes() {
+    let versions = Vec::new();
+    let place = (BUCKET, group());
+    let mut operation = StorageFilesOperation::new(NodeRouting::default(), place, &versions, None);
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
 }

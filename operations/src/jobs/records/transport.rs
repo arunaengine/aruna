@@ -34,6 +34,7 @@ use crate::jobs::lifecycle::launch_admit::{
 use crate::jobs::lifecycle::witness_arm::ArmFamilyOperation;
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
+use crate::realm::load_config::config_unavailable;
 
 #[derive(Debug, PartialEq)]
 struct PageRequest {
@@ -387,7 +388,10 @@ impl Operation for ServeRecordOperation {
         match self.step {
             ServeStep::Config => match result.child::<RealmConfigDocument, GetConfigError>()? {
                 Ok(config) => self.configured(config),
-                Err(_) => self.fail(ServeError::Unavailable),
+                Err(error) => {
+                    config_unavailable(&error);
+                    self.fail(ServeError::Unavailable)
+                }
             },
             ServeStep::Append => match result.child::<AppendOutcome, RecordStoreError>()? {
                 Ok(outcome) => self.appended(outcome),
@@ -496,8 +500,12 @@ impl Operation for ServeLaunchOperation {
                 Err(_) => launch_unavailable(),
             };
         }
-        let Ok(config) = result.child::<RealmConfigDocument, GetConfigError>()? else {
-            return launch_unavailable();
+        let config = match result.child::<RealmConfigDocument, GetConfigError>()? {
+            Ok(config) => config,
+            Err(error) => {
+                config_unavailable(&error);
+                return launch_unavailable();
+            }
         };
         let eligible = config
             .sync_eligible_nodes()

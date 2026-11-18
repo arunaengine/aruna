@@ -20,10 +20,14 @@ use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
 use aruna_operations::s3::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
 use aruna_operations::s3::imports::cron::next_due;
-use aruna_operations::s3::imports::discovery::{authorized_renames, rename_guards};
+use aruna_operations::s3::imports::discovery::{RenameGuardsOperation, authorized_renames};
 use aruna_operations::s3::imports::remove::RemoveImportOperation;
-use aruna_operations::s3::imports::schedule::{start_run, wake_schedule};
-use aruna_operations::s3::imports::{ImportRuleError, last_run, list_imports, read_import};
+use aruna_operations::s3::imports::schedule::{
+    ImportRunInput, StartRunOperation, WakeScheduleOperation,
+};
+use aruna_operations::s3::imports::{
+    ImportRuleError, LastRunOperation, ListImportsOperation, ReadImportOperation,
+};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -184,14 +188,19 @@ pub(super) async fn existing_rule(
     import_id: &str,
 ) -> ServerResult<BackendImport> {
     let import_id = Ulid::from_str(import_id).map_err(|_| ServerError::BadRequest)?;
-    read_import(&state.get_ctx(), group_id, import_id)
-        .await
-        .map_err(map_error)?
-        .ok_or(ServerError::NotFound)
+    drive(
+        ReadImportOperation::new(group_id, import_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?
+    .ok_or(ServerError::NotFound)
 }
 
 async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<ImportResponse> {
-    let run = last_run(&state.get_ctx(), &rule).await.map_err(map_error)?;
+    let run = drive(LastRunOperation::new(&rule), &state.get_ctx())
+        .await
+        .map_err(map_error)?;
     let since = rule.last_started_ms.unwrap_or(millis(rule.created_at));
     let now = unix_timestamp_millis();
     let next_run_at = rule
@@ -369,7 +378,7 @@ pub async fn create_import(
     .await
     .map_err(map_error)?;
     if scheduled {
-        wake_schedule(&state.get_ctx()).await;
+        drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
     Ok((StatusCode::CREATED, Json(describe(&state, rule).await?)))
 }
@@ -422,7 +431,7 @@ pub async fn list_group_imports(
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<ListImportsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
-    let rules = list_imports(&state.get_ctx(), group_id)
+    let rules = drive(ListImportsOperation::new(group_id), &state.get_ctx())
         .await
         .map_err(map_error)?;
     let mut imports = Vec::with_capacity(rules.len());
@@ -567,7 +576,7 @@ pub async fn update_import(
         .await
         .map_err(map_error)?;
     if scheduled {
-        wake_schedule(&state.get_ctx()).await;
+        drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
     Ok(Json(describe(&state, rule).await?))
 }
@@ -616,7 +625,7 @@ pub async fn delete_import(
     .await;
     if removed.is_err() {
         // A removal that stopped after deleting the rule is finished by the schedule.
-        wake_schedule(&state.get_ctx()).await;
+        drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
     removed.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -672,16 +681,18 @@ pub async fn run_import(
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let retention_ms = state.rocrate_limits().artifact_retention_ms;
-    let started = start_run(
-        &state.get_ctx(),
-        &rule,
-        auth,
-        state.get_node_id(),
-        None,
+    let context = state.get_ctx();
+    let input = ImportRunInput {
+        auth_context: auth,
+        node_id: state.get_node_id(),
+        dedup: None,
         retention_ms,
-    )
-    .await
-    .map_err(map_error)?;
+        serving: context.node_and_realm(),
+        now_ms: unix_timestamp_millis(),
+    };
+    let started = drive(StartRunOperation::new(&rule, input), &context)
+        .await
+        .map_err(map_error)?;
     let Some(job_id) = started else {
         return Err(ServerError::Conflict(
             "the last run of this import has not finished".to_string(),
@@ -836,11 +847,13 @@ pub async fn get_renames(
         )));
     }
     let context = state.get_ctx();
-    let access = aruna_operations::s3::imports::discovery::bucket_access(
+    let access = drive(
+        aruna_operations::s3::imports::discovery::RuleAccessOperation::new(
+            &auth,
+            state.get_node_id(),
+            &rule,
+        ),
         &context,
-        &auth,
-        state.get_node_id(),
-        &rule,
     )
     .await
     .map_err(map_error)?;
@@ -964,7 +977,7 @@ pub async fn start_renames(
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let caller = (&auth, state.get_node_id());
     // The move starts only while the rule and its patterns are as they were when checked.
-    let guards = rename_guards(&state.get_ctx(), &rule)
+    let guards = drive(RenameGuardsOperation::new(&rule), &state.get_ctx())
         .await
         .map_err(map_error)?;
     let checked = authorized_renames(&state.get_ctx(), caller, &rule, Permission::WRITE)

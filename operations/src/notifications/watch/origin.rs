@@ -12,9 +12,13 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
-use aruna_core::structs::execution::notification_watch::{WatchEvent, watch_path_matches};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
+};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::types::GroupId;
 use tracing::warn;
+use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::client::{HolderRequestOperation, RemoteError, events_delivered};
@@ -40,10 +44,10 @@ enum EmitState {
     Forward(NodeId),
 }
 
-/// Best effort after the commit: every failure only warns. System writes with a nil actor are
-/// not emitted, since watches are a user-plane feature.
+/// Delivers one event to known holders. Best effort: every failure only warns. System writes
+/// with a nil actor are not emitted, since watches are a user-plane feature.
 #[derive(Debug, PartialEq)]
-pub struct EmitWatchOperation {
+pub(crate) struct EmitWatchOperation {
     event: WatchEvent,
     local: NodeId,
     /// The remote holders the interest table matches, and this node when it holds a watch.
@@ -240,6 +244,76 @@ impl Operation for EmitWatchOperation {
                 }
                 self.next_holder()
             }
+        }
+    }
+}
+
+/// Post-commit emission of an origin watch event to the holders this node's interest matches
+/// and to this node when it holds a matching watch. A node without a net handle emits nothing.
+#[derive(Debug, PartialEq)]
+pub struct EmitEventOperation {
+    event: WatchEvent,
+    emitting: bool,
+}
+
+impl EmitEventOperation {
+    pub fn new(event: WatchEvent) -> Self {
+        Self {
+            event,
+            emitting: false,
+        }
+    }
+
+    /// The event of every dataset creation path, so an import or a job notifies exactly like
+    /// `POST /metadata`. `event_id` dates it, keeping a retried create's inbox key stable.
+    pub fn metadata_created(
+        realm_id: RealmId,
+        actor: UserId,
+        group_id: GroupId,
+        document_id: Ulid,
+        document_path: &str,
+        event_id: Ulid,
+    ) -> Self {
+        Self::new(WatchEvent {
+            event_id,
+            realm_id,
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{group_id}/{document_path}"),
+            actor,
+            occurred_at_ms: event_id.timestamp_ms(),
+            detail: WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            },
+        })
+    }
+}
+
+impl Operation for EmitEventOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Turn {
+        let holders = NetEffect::WatchHolders {
+            realm_id: self.event.realm_id,
+            path: self.event.path.clone(),
+            kind: self.event.kind,
+        };
+        Ok(Next::Call(IoCall::from(Effect::Net(holders))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn {
+        if self.emitting {
+            return result.child::<(), IoError>()?.map(Next::Done);
+        }
+        match result.event()? {
+            Event::Net(NetEvent::WatchHolders(None)) => Ok(Next::Done(())),
+            Event::Net(NetEvent::WatchHolders(Some((local, holders)))) => {
+                self.emitting = true;
+                let emit = EmitWatchOperation::new(self.event.clone(), local, holders);
+                Ok(Next::Call(IoCall::child(emit)))
+            }
+            other => Err(unexpected_event("NetEvent::WatchHolders", &other)),
         }
     }
 }

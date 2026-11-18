@@ -5,12 +5,45 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::calls::{IoCall, IoError, IoResult};
+use crate::calls::{IoCall, IoError, IoResult, Next};
+use crate::operation::Operation;
 use crate::types::{Key, KeySpace, Value};
 
 /// The call that reads one row.
 pub fn read_row(space: &str, key: impl Into<Key>) -> IoCall {
     IoCall::Read(vec![(space.to_string(), key.into())])
+}
+
+/// One call outside any transaction, run as a child of a host in a transaction.
+#[derive(Debug, PartialEq)]
+struct OutsideCall {
+    call: Option<IoCall>,
+}
+
+impl Operation for OutsideCall {
+    type Output = IoResult;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<IoResult>, IoError> {
+        self.call.take().map(Next::Call).ok_or(IoError::Unfinished)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<IoResult>, IoError> {
+        Ok(Next::Done(result))
+    }
+}
+
+/// `call` as a child of its own, so its failure reaches the caller as an answer.
+pub fn outside_call(call: IoCall) -> IoCall {
+    IoCall::child(OutsideCall { call: Some(call) })
+}
+
+/// The result of an [`outside_call`], or a result that answered the call directly.
+pub fn outside_answer(result: IoResult) -> Result<IoResult, IoError> {
+    match result {
+        IoResult::Child(_) => result.child::<IoResult, IoError>()?,
+        other => Ok(other),
+    }
 }
 
 /// The `N` values of a read of `N` rows, in the order they were asked for.

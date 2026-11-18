@@ -39,7 +39,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::metadata::projector::project_logged_events;
+use aruna_operations::testing::project_logged_events;
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};

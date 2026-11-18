@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::driven::{seal_credential, search};
 use super::*;
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryQuery, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
-use aruna_operations::jobs::repository::{seal_credential, search};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 
 #[tokio::test]
@@ -218,9 +218,9 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    use super::driven::change_link;
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
     use aruna_core::repository::{LinkFailure, LinkPatch, LinkStatus};
-    use aruna_operations::jobs::repository::link_store::change_link;
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -315,7 +315,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
             reason: LinkFailure::RemoteChanged
         }
     );
-    let state = Box::pin(aruna_operations::jobs::repository::remote_state(
+    let state = Box::pin(super::driven::remote_state(
         RepositoryConnectorKind::Invenio,
         fixture.context.as_ref(),
         &failed,
@@ -349,15 +349,10 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         "Live revision after remote edit"
     );
 
-    let event = aruna_operations::metadata::raw_revision::load_raw_revision(
-        &fixture.context,
-        doc_id(1),
-        None,
-    )
-    .await?
+    let event = aruna_operations::driver::drive(aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(1)), &fixture.context).await.map(|(_, revision)| revision)?
     .ok_or("revision missing")?
     .winning_event_id;
-    Box::pin(aruna_operations::jobs::repository::link_queue::start_push(
+    Box::pin(super::driven::start_push(
         &fixture.context,
         &continued,
         event,
@@ -408,9 +403,9 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
+    use super::driven::change_link;
     use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
     use aruna_core::repository::{LinkPatch, LinkReview};
-    use aruna_operations::jobs::repository::link_store::change_link;
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -455,15 +450,10 @@ async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     succeeded(run_push(&fixture, &link).await?);
     let pushed = current(&fixture, &link).await.0;
     let draft = pushed.remote.draft_id.clone().ok_or("no draft")?;
-    let event = aruna_operations::metadata::raw_revision::load_raw_revision(
-        &fixture.context,
-        doc_id(1),
-        None,
-    )
-    .await?
+    let event = aruna_operations::driver::drive(aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(1)), &fixture.context).await.map(|(_, revision)| revision)?
     .ok_or("revision missing")?
     .winning_event_id;
-    Box::pin(aruna_operations::jobs::repository::link_queue::start_push(
+    Box::pin(super::driven::start_push(
         &fixture.context,
         &pushed,
         event,
@@ -680,12 +670,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
         assert!(count > 0, "{mode:?} imported nothing");
         replay_event_log(fixture.context.as_ref()).await?;
         process_materialization_batch(fixture.context.as_ref()).await?;
-        let crate_json = aruna_operations::metadata::raw_revision::load_raw_revision(
-            &fixture.context,
-            document,
-            None,
-        )
-        .await?
+        let crate_json = aruna_operations::driver::drive(aruna_operations::metadata::revision_read::RawViewOperation::revision(document), &fixture.context).await.map(|(_, revision)| revision)?
         .ok_or("imported crate missing")?
         .jsonld;
         assert!(crate_json.contains(&doi), "{mode:?} crate lacks {doi}");
@@ -728,11 +713,11 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
 async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
+    use super::driven::drain_links;
+    use super::driven::{change_link, list_links};
     use aruna_core::repository::invenio::crate_versions;
     use aruna_core::repository::{LinkPatch, RepositoryPull};
     use aruna_core::structs::secondary_id::SecondaryIdKind;
-    use aruna_operations::jobs::repository::link_queue::drain_links;
-    use aruna_operations::jobs::repository::link_store::{change_link, list_links};
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -856,12 +841,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(pulled.remote.record_id.as_deref(), Some(second.id.as_str()));
     assert_eq!(pulled.remote.identifier, second.identifier);
     assert_eq!(pulled.pull_reason(), None);
-    let revision = aruna_operations::metadata::raw_revision::load_raw_revision(
-        &fixture.context,
-        doc_id(2),
-        None,
-    )
-    .await?
+    let revision = aruna_operations::driver::drive(aruna_operations::metadata::revision_read::RawViewOperation::revision(doc_id(2)), &fixture.context).await.map(|(_, revision)| revision)?
     .ok_or("revision missing")?;
     let document: Value = serde_json::from_str(&revision.jsonld)?;
     let mut versions = crate_versions(&document);
@@ -872,7 +852,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     assert!(revision.jsonld.contains(&format!("{title} v2")));
     // Imports name records by version DOI, concept DOI or page URL as well.
     let resolve = async |reference| {
-        Box::pin(aruna_operations::jobs::repository::resolve(
+        Box::pin(super::driven::resolve(
             RepositoryConnectorKind::Invenio,
             &fixture.context,
             &auth,

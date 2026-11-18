@@ -24,7 +24,7 @@ use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::metadata::api::fanout::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
 use aruna_operations::placement::policy::GateOperation;
-use aruna_operations::replication::live_queue::complete_put;
+use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -1164,18 +1164,21 @@ pub(crate) async fn store_stream(
     let result = drive(operation, &state.get_ctx())
         .await
         .map_err(put_server_error)?;
-    complete_put(
+    drive(
+        CompletePutOperation::new(CompletePutInput {
+            realm_id: state.get_realm_id(),
+            node_id: state.get_node_id(),
+            auth: auth.clone(),
+            group_id: bucket_info.group_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: result.version_id,
+            size_bytes: result.location.blob_size,
+        }),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        auth.clone(),
-        bucket_info.group_id,
-        bucket.to_string(),
-        key.to_string(),
-        result.version_id,
-        result.location.blob_size,
     )
-    .await;
+    .await
+    .ok();
     Ok(result)
 }
 
@@ -1324,9 +1327,6 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
         ),
         HeadObjectError::StorageError(error) => internal_error(error),
         HeadObjectError::ConversionError(error) => internal_error(error),
-        HeadObjectError::InvalidState { current, expected } => internal_error(format!(
-            "invalid object head state {current:?}; expected {expected:?}"
-        )),
         HeadObjectError::InvalidStateEvent {
             state,
             expected,
@@ -1334,11 +1334,9 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
         } => internal_error(format!(
             "unexpected object head event in {state:?}: expected {expected}, got {received}"
         )),
-        HeadObjectError::NoTransactionFound => internal_error("object head transaction is missing"),
         HeadObjectError::ResolveReferenceError(error) => internal_error(error),
         HeadObjectError::StagingSourceError(error) => internal_error(error),
         HeadObjectError::ManagedCopyError(error) => internal_error(error),
-        HeadObjectError::NotFinished => internal_error("object head did not finish"),
         HeadObjectError::HeadObjectFailed => internal_error("object head failed"),
     }
 }

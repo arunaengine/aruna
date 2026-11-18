@@ -23,9 +23,13 @@ use crate::server::state::ServerState;
 use aruna_core::structs::execution::job::ExportRoCrateSpec;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::driver::drive;
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
+use aruna_operations::metadata::api::export::ExportOperation;
 use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
-use aruna_operations::metadata::forward::read::export_rocrate_routed as run_export_rocrate;
+use aruna_operations::metadata::forward::routed_export::{
+    RoutedExportOperation, ensure_export_limit,
+};
 use aruna_operations::metadata::forward::write::route_metadata_update as run_update_metadata_document;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use axum::extract::{Path, Query, State};
@@ -249,23 +253,24 @@ pub async fn export_metadata_rocrate(
     let metadata_bytes = state.rocrate_limits().metadata_bytes;
     let export = match params.here {
         true => {
-            aruna_operations::metadata::forward::read::export_rocrate_here(
+            // This node's own copy only, for a w3id redirect that chose it.
+            drive(
+                ExportOperation::new(state.get_realm_id(), request),
                 ctx.as_ref(),
-                state.get_realm_id(),
-                request,
-                metadata_bytes,
             )
             .await
+            .and_then(|export| ensure_export_limit(&export, metadata_bytes).map(|()| export))
         }
         false => {
-            run_export_rocrate(
-                &ctx,
+            let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+            let export = RoutedExportOperation::new(
+                local_node,
                 state.get_realm_id(),
                 request,
                 forwarded_auth_token(bearer_token)?,
                 metadata_bytes,
-            )
-            .await
+            );
+            drive(export, ctx.as_ref()).await
         }
     }
     .map_err(map_api_error)?;

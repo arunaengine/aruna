@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::keyspaces::LINKED_JOB_KEYSPACE;
@@ -11,10 +12,13 @@ use aruna_core::types::GroupId;
 use tracing::warn;
 
 use super::job_progress::{JobStep, StoreProgressError, StoreProgressOperation};
+use crate::auth::bearer_token::GrantValidOperation;
 use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_authorization::BucketAccess;
-use crate::driver::{DriverContext, drive_retry};
-use crate::s3::bucket::remap::{RemapScope, job_page};
+use crate::auth::request_authorization::BucketAccessOperation;
+use crate::driver::{DriverContext, drive, drive_retry};
+use crate::s3::bucket::remap::{RemapJobOperation, RemapScope};
 
 /// Delay between pages of a running job, and before a waiting job tries again.
 const CONTINUE: Duration = Duration::from_secs(1);
@@ -63,7 +67,7 @@ async fn run_page(
     job: LinkedJob,
 ) -> Result<Duration, String> {
     let step = match job_access(context, bucket, &job).await {
-        Ok(Some(access)) => page(context, bucket, &job, &access).await,
+        Ok(Some(access)) => page(context, bucket, &job, Arc::new(access)).await,
         Ok(None) => {
             let ended = Some(LinkedState::Aborted);
             return store(context, bucket, &job, ended_step(), ended)
@@ -94,10 +98,9 @@ pub(super) async fn job_access(
     bucket: &str,
     job: &LinkedJob,
 ) -> Result<Option<BucketAccess>, String> {
-    let valid = crate::auth::bearer_token::grant_valid(
-        &context.storage_handle,
-        &job.grant,
-        &job.auth.user_id,
+    let valid = drive(
+        GrantValidOperation::new(&job.grant, &job.auth.user_id),
+        &context,
     );
     if !valid.await.map_err(|error| error.to_string())? {
         return Ok(None);
@@ -106,7 +109,12 @@ pub(super) async fn job_access(
         return Ok(None);
     }
     let scope = (job.auth.realm_id, job.group_id, job.node_id);
-    match BucketAccess::load(context, &job.auth, scope, bucket).await {
+    match drive(
+        BucketAccessOperation::new(&job.auth, scope, bucket),
+        context,
+    )
+    .await
+    {
         Ok(access) if access.allows(None, &Permission::WRITE) => Ok(Some(access)),
         Ok(_) | Err(AuthorizeError::PermissionDenied) => Ok(None),
         Err(AuthorizeError::Policy(crate::auth::error::PolicyEnforcementError::Denied {
@@ -126,13 +134,15 @@ pub(crate) async fn still_admin(
     use crate::auth::error::PolicyEnforcementError;
     use crate::auth::request_policy::PolicyRequestExtras;
     let path = format!("/{}/g/{group_id}/admin/**", auth.realm_id);
-    let checked = crate::auth::request_authorization::authorize(
+    let checked = drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            &path,
+            &Permission::WRITE,
+            PolicyRequestExtras::rest(),
+        ),
         context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
     );
     match checked.await {
         Ok(_) => Ok(true),
@@ -146,7 +156,7 @@ async fn page(
     context: &DriverContext,
     bucket: &str,
     job: &LinkedJob,
-    access: &BucketAccess,
+    access: Arc<BucketAccess>,
 ) -> JobStep {
     let waiting = |error: String| JobStep {
         cursor: job.cursor.clone(),
@@ -159,16 +169,16 @@ async fn page(
                 realm_id: job.auth.realm_id,
                 group_id: job.group_id,
                 node_id: job.node_id,
-                bucket,
+                bucket: bucket.to_string(),
                 access,
             };
-            match job_page(context, plan, &scope, job).await {
+            match drive(RemapJobOperation::new(plan, &scope, job), context).await {
                 Ok(step) => step,
                 Err(error) => waiting(error.to_string()),
             }
         }
         LinkedTask::Unify { prefix } => {
-            let page = crate::blob::unify::job_page(context, (bucket, prefix), access, job);
+            let page = crate::blob::unify::job_page(context, (bucket, prefix), &access, job);
             match page.await {
                 Ok(step) => step,
                 Err(error) => waiting(error),

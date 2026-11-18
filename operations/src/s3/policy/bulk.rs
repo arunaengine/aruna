@@ -3,22 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::check_permissions::permission_check;
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::records::HeadAliasContext;
-use crate::distribution::guard::{GuardError, authority_read, authority_rows, write_authority};
+use crate::distribution::guard::{GuardError, authority_reads, write_authority};
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::resolve_set::{
     PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
 };
 use crate::s3::policy::successor::{
-    CapturedDefault, SuccessorError, SuccessorOutcome, SuccessorPlan, mint_child, mint_outcome,
+    CapturedDefault, MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
-use aruna_core::calls::ChildOutcome;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::{EffectOperation, SubOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
@@ -33,8 +32,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::distribution::{DistributionBinding, RouteError};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -104,19 +102,21 @@ pub enum BulkError {
     BucketChanged,
     #[error(transparent)]
     Distribution(#[from] GuardError),
-    #[error("unexpected event during the bulk pass")]
-    InvalidEvent,
 }
+
+impl From<IoError> for BulkError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type BulkTurn = Result<Next<BulkReport>, BulkError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BulkState {
-    Init,
     Authorize,
     AuthorizeGroup,
-    StartCapture,
-    ReadCapture,
-    WriteRun,
-    CommitCapture,
+    Capture,
     Resolve,
     /// Reads the set record and this node's fence before the heads, so only owned keys mint.
     ReadRecord,
@@ -125,15 +125,7 @@ enum BulkState {
     ResolveUnion,
     ReadIntents,
     Mint,
-    /// The finished mint left a cleanup effect whose event must be consumed
-    /// before the next object opens its own transaction.
-    Settle,
-    StartStatus,
-    ReadStatus,
-    WriteStatus,
-    CommitStatus,
-    Finish,
-    Error,
+    Close,
 }
 
 /// Only the resolutions one object's mint may evaluate. A pass accumulates every
@@ -165,6 +157,162 @@ struct Candidate {
     intent: Option<PolicyIntent>,
 }
 
+/// What the capture transaction leaves the pass with.
+#[derive(Clone, Debug, PartialEq)]
+struct CapturedRun {
+    run: PolicyBulkRun,
+    group_id: GroupId,
+    binding: Option<DistributionBinding>,
+}
+
+type CaptureTurn = Result<Next<CapturedRun>, BulkError>;
+
+/// The run's own transaction: capturing and superseding are compare-and-set writes against the
+/// row it just read.
+#[derive(Debug, PartialEq)]
+struct CaptureRun {
+    operation_id: Ulid,
+    bucket: String,
+    group_id: GroupId,
+    written: Option<CapturedRun>,
+}
+
+impl CaptureRun {
+    fn rows_read(&mut self, [bucket, run]: [Option<Value>; 2]) -> CaptureTurn {
+        let bucket = bucket.ok_or(BulkError::NoSuchBucket)?;
+        let bucket = BucketInfo::from_bytes(bucket.as_ref())?;
+        // The authorized group was read before this transaction: a bucket
+        // recreated for another group must not inherit that admin's authority.
+        if bucket.group_id != self.group_id {
+            return Err(BulkError::BucketChanged);
+        }
+        let stored = (run.as_deref())
+            .map(PolicyBulkRun::from_bytes)
+            .transpose()?;
+        let captured = |run| CapturedRun {
+            run,
+            group_id: bucket.group_id,
+            binding: bucket.distribution.clone(),
+        };
+        let Some(run) = stored else {
+            return self.write_run(captured(PolicyBulkRun {
+                operation_id: self.operation_id,
+                bucket: self.bucket.clone(),
+                bucket_identity: bucket.identity(),
+                generation: bucket.placement_policy_generation,
+                target_refs: bucket.placement_policies.clone(),
+                status: PolicyStatus::Active,
+            }));
+        };
+        if run.bucket != self.bucket || run.bucket_identity != bucket.identity() {
+            return Err(BulkError::BucketChanged);
+        }
+        // A default change ends the run: one pass never mixes two policies.
+        if run.generation != bucket.placement_policy_generation
+            || run.target_refs != bucket.placement_policies
+        {
+            let mut superseded = run;
+            superseded.status = PolicyStatus::Superseded;
+            return self.write_run(captured(superseded));
+        }
+        Ok(Next::Done(captured(run)))
+    }
+
+    fn write_run(&mut self, captured: CapturedRun) -> CaptureTurn {
+        let row = run_row(&captured.run)?;
+        self.written = Some(captured);
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+fn run_row(run: &PolicyBulkRun) -> Result<(String, Key, Value), ConversionError> {
+    Ok((
+        BULK_RUN_KEYSPACE.to_string(),
+        PolicyBulkRun::key(run.operation_id)?.into(),
+        run.to_bytes()?.into(),
+    ))
+}
+
+impl Operation for CaptureRun {
+    type Output = CapturedRun;
+    type Error = BulkError;
+
+    fn first(&mut self) -> CaptureTurn {
+        let reads = vec![
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                Key::from(self.bucket.as_bytes().to_vec()),
+            ),
+            (
+                BULK_RUN_KEYSPACE.to_string(),
+                Key::from(PolicyBulkRun::key(self.operation_id)?),
+            ),
+        ];
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CaptureTurn {
+        match self.written.take() {
+            Some(captured) => {
+                result.done()?;
+                Ok(Next::Done(captured))
+            }
+            None => self.rows_read(values::<2>(result)?),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+type CloseTurn = Result<Next<Option<PolicyBulkRun>>, BulkError>;
+
+/// Status transitions are compare-and-set: only an active run moves on, so a replayed or
+/// concurrent pass cannot revive or downgrade a finished one. Outputs the stored run.
+#[derive(Debug, PartialEq)]
+struct CloseRun {
+    operation_id: Ulid,
+    status: PolicyStatus,
+    written: Option<PolicyBulkRun>,
+}
+
+impl Operation for CloseRun {
+    type Output = Option<PolicyBulkRun>;
+    type Error = BulkError;
+
+    fn first(&mut self) -> CloseTurn {
+        let key = PolicyBulkRun::key(self.operation_id)?;
+        Ok(Next::Call(read_row(BULK_RUN_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CloseTurn {
+        if let Some(run) = self.written.take() {
+            result.done()?;
+            return Ok(Next::Done(Some(run)));
+        }
+        let stored = result.value()?;
+        let stored = stored
+            .as_deref()
+            .map(PolicyBulkRun::from_bytes)
+            .transpose()?;
+        let Some(mut run) = stored else {
+            return Ok(Next::Done(None));
+        };
+        if run.status != PolicyStatus::Active {
+            return Ok(Next::Done(Some(run)));
+        }
+        run.status = self.status;
+        let row = run_row(&run)?;
+        self.written = Some(run);
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
 /// Runs one bounded pass over this responder's own heads. Nothing here claims
 /// whole-bucket or realm-wide convergence: the report states what this node
 /// observed and what stays a resumable gap.
@@ -172,7 +320,6 @@ struct Candidate {
 pub struct PolicyBulkOperation {
     config: BulkConfig,
     state: BulkState,
-    txn_id: Option<TxnId>,
     group_id: Option<Ulid>,
     /// The set hint of a distributed bucket, so planned successor ids carry it.
     set_hint: Option<SetHint>,
@@ -183,13 +330,7 @@ pub struct PolicyBulkOperation {
     resolved: BTreeMap<Ulid, PolicyResolution>,
     candidates: Vec<Candidate>,
     index: usize,
-    mint: Option<Box<dyn SubOperation>>,
-    /// Outcome of a mint that is still cleaning up.
-    settled: Option<Result<SuccessorOutcome, SuccessorError>>,
-    /// The status the closing transaction writes once the pass has finished.
-    pending_status: Option<PolicyStatus>,
     report: BulkReport,
-    output: Option<Result<BulkReport, BulkError>>,
 }
 
 impl PolicyBulkOperation {
@@ -210,8 +351,7 @@ impl PolicyBulkOperation {
         };
         Self {
             config,
-            state: BulkState::Init,
-            txn_id: None,
+            state: BulkState::Authorize,
             group_id: None,
             set_hint: None,
             binding: None,
@@ -220,234 +360,114 @@ impl PolicyBulkOperation {
             resolved: BTreeMap::new(),
             candidates: Vec::new(),
             index: 0,
-            mint: None,
-            settled: None,
-            pending_status: None,
             report,
-            output: None,
         }
     }
 
-    fn page_limit(&self) -> usize {
-        self.config.limit.clamp(1, BULK_PAGE_LIMIT)
+    fn call(&mut self, state: BulkState, call: IoCall) -> BulkTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn authorize(&self, path: String) -> Effects {
-        smallvec![permission_check(
-            self.config.auth_context.clone(),
+    fn authorize(&mut self, state: BulkState, path: String) -> BulkTurn {
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
             path,
-            Permission::WRITE,
-        )]
+            required_permission: Permission::WRITE,
+        });
+        self.call(state, IoCall::child(check))
     }
 
-    fn start_capture(&mut self) -> Effects {
-        self.state = BulkState::StartCapture;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    /// A failed check counts as a denial.
+    fn allowed(result: Result<bool, AuthorizationError>) -> Result<bool, BulkError> {
+        result.map_err(|error| {
+            warn!(error = %error, "Bulk policy authorization check failed");
+            BulkError::Unauthorized
+        })
     }
 
-    fn fail(&mut self, error: BulkError) -> Effects {
-        let cleanup = self.abort();
-        self.state = BulkState::Error;
-        self.output = Some(Err(error));
-        cleanup
+    fn capture(&mut self) -> BulkTurn {
+        let capture = CaptureRun {
+            operation_id: self.config.operation_id,
+            bucket: self.config.bucket.clone(),
+            group_id: self.config.group_id,
+            written: None,
+        };
+        self.call(BulkState::Capture, IoCall::child(capture))
     }
 
-    fn finish(&mut self) -> Effects {
+    fn finish(&mut self) -> BulkTurn {
         if let Some(run) = self.run.as_ref() {
             self.report.status = run.status;
         }
-        self.output = Some(Ok(self.report.clone()));
-        self.state = BulkState::Finish;
-        smallvec![]
-    }
-
-    /// Rolls the run transaction back and reports what the pass observed.
-    fn stop(&mut self) -> Effects {
-        let mut effects = self.abort();
-        effects.extend(self.finish());
-        effects
-    }
-
-    /// The run's own transaction: capturing, superseding and completion are all
-    /// compare-and-set writes against the row this pass just read.
-    fn read_capture(&mut self, txn_id: TxnId) -> Result<Effects, BulkError> {
-        self.txn_id = Some(txn_id);
-        self.state = BulkState::ReadCapture;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    S3_BUCKET_KEYSPACE.to_string(),
-                    Key::from(self.config.bucket.as_bytes().to_vec()),
-                ),
-                (
-                    BULK_RUN_KEYSPACE.to_string(),
-                    Key::from(PolicyBulkRun::key(self.config.operation_id)?),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn handle_capture(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(BulkError::InvalidEvent);
-        };
-        let [(_, bucket_value), (_, run_value)] = values.as_slice() else {
-            return self.fail(BulkError::InvalidEvent);
-        };
-        let Some(bucket_value) = bucket_value.as_ref() else {
-            return self.fail(BulkError::NoSuchBucket);
-        };
-        let bucket = match BucketInfo::from_bytes(bucket_value.as_ref()) {
-            Ok(bucket) => bucket,
-            Err(error) => return self.fail(error.into()),
-        };
-        // The authorized group was read before this transaction: a bucket
-        // recreated for another group must not inherit that admin's authority.
-        if bucket.group_id != self.config.group_id {
-            return self.fail(BulkError::BucketChanged);
-        }
-        let stored = match run_value
-            .as_ref()
-            .map(|value| PolicyBulkRun::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(stored) => stored,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.group_id = Some(bucket.group_id);
-        self.set_hint = bucket.distribution.as_ref().map(DistributionBinding::hint);
-        self.binding = bucket.distribution.clone();
-        self.report.generation = bucket.placement_policy_generation;
-        self.report.target_refs = bucket.placement_policies.clone();
-
-        let Some(run) = stored else {
-            let run = PolicyBulkRun {
-                operation_id: self.config.operation_id,
-                bucket: self.config.bucket.clone(),
-                bucket_identity: bucket.identity(),
-                generation: bucket.placement_policy_generation,
-                target_refs: bucket.placement_policies.clone(),
-                status: PolicyStatus::Active,
-            };
-            return self.write_run(run);
-        };
-        if run.bucket != self.config.bucket || run.bucket_identity != bucket.identity() {
-            return self.fail(BulkError::BucketChanged);
-        }
-        self.report.generation = run.generation;
-        self.report.target_refs = run.target_refs.clone();
-        // A default change ends the run: one pass never mixes two policies.
-        if run.generation != bucket.placement_policy_generation
-            || run.target_refs != bucket.placement_policies
-        {
-            let mut superseded = run;
-            superseded.status = PolicyStatus::Superseded;
-            return self.write_run(superseded);
-        }
-        if run.status != PolicyStatus::Active {
-            self.run = Some(run);
-            return self.stop();
-        }
-        self.run = Some(run);
-        match self.txn_id {
-            Some(txn_id) => {
-                self.state = BulkState::CommitCapture;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            None => self.fail(BulkError::InvalidEvent),
-        }
-    }
-
-    fn write_run(&mut self, run: PolicyBulkRun) -> Effects {
-        let (key, value) = match (PolicyBulkRun::key(run.operation_id), run.to_bytes()) {
-            (Ok(key), Ok(value)) => (key, value),
-            (Err(error), _) | (_, Err(error)) => return self.fail(error.into()),
-        };
-        self.run = Some(run);
-        self.state = BulkState::WriteRun;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BULK_RUN_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Done(self.report.clone()))
     }
 
     /// After the capture commits, the pass either stops or resolves its target.
-    fn after_capture(&mut self) -> Effects {
-        self.txn_id = None;
-        let stopped = self
-            .run
-            .as_ref()
-            .is_none_or(|run| run.status != PolicyStatus::Active);
-        if stopped {
-            return self.finish();
+    fn captured(&mut self, captured: CapturedRun) -> BulkTurn {
+        let CapturedRun {
+            run,
+            group_id,
+            binding,
+        } = captured;
+        self.group_id = Some(group_id);
+        self.set_hint = binding.as_ref().map(DistributionBinding::hint);
+        self.binding = binding;
+        self.report.generation = run.generation;
+        self.report.target_refs = run.target_refs.clone();
+        let active = run.status == PolicyStatus::Active;
+        self.run = Some(run);
+        match active {
+            true => self.resolve_refs(),
+            false => self.finish(),
         }
-        self.resolve_refs()
     }
 
-    fn resolve_refs(&mut self) -> Effects {
-        let refs = self
-            .run
-            .as_ref()
-            .map(|run| run.target_refs.clone())
-            .unwrap_or_default();
-        let resolver = PolicySetResolver::new(
+    fn resolver(&self, refs: &[PlacementPolicyRef]) -> IoCall {
+        IoCall::child(PolicySetResolver::new(
             self.config.auth_context.realm_id,
             self.config.subject.node_id,
             self.config.now_ms,
             // A rule this node cannot obtain blocks its objects; the run stays
             // resumable instead of failing.
             ResolveMode::Lenient,
-            &refs,
-        );
-        self.state = BulkState::Resolve;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            resolver,
-            |result| { Event::Child(ChildOutcome::new(result)) }
-        ))]
+            refs,
+        ))
     }
 
-    fn after_resolve(&mut self, resolved: Resolutions) -> Effects {
+    fn resolve_refs(&mut self) -> BulkTurn {
+        let refs = (self.run.as_ref())
+            .map(|run| run.target_refs.clone())
+            .unwrap_or_default();
+        let resolver = self.resolver(&refs);
+        self.call(BulkState::Resolve, resolver)
+    }
+
+    /// The lenient resolver's resolutions; an unreadable outcome resolves nothing.
+    fn resolutions(result: IoResult) -> Resolutions {
+        result
+            .child::<Resolutions, PolicySetError>()
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    }
+
+    fn target_resolved(&mut self, resolved: Resolutions) -> BulkTurn {
         self.resolved.extend(resolved);
-        match foreign_owner(&self.resolved, self.config.group_id) {
-            Some(policy_id) => self.fail(BulkError::ForeignPolicy { policy_id }),
-            None => self.read_record(),
+        if let Some(policy_id) = foreign_owner(&self.resolved, self.config.group_id) {
+            return Err(BulkError::ForeignPolicy { policy_id });
         }
-    }
-
-    /// The lenient resolver child's resolutions; an unreadable outcome resolves nothing.
-    fn resolutions(event: Event) -> Resolutions {
-        let Event::Child(outcome) = event else {
-            return Resolutions::new();
-        };
-        match outcome.take::<Resolutions, PolicySetError>() {
-            Some(Ok(resolved)) => resolved,
-            _ => Resolutions::new(),
-        }
+        self.read_record()
     }
 
     /// Each mint checks the authority again inside its own transaction; this read only
     /// selects the keys to plan.
-    fn read_record(&mut self) -> Effects {
+    fn read_record(&mut self) -> BulkTurn {
         let Some(binding) = self.binding.as_ref() else {
             return self.scan_heads();
         };
-        self.state = BulkState::ReadRecord;
-        smallvec![authority_read(binding.set_id, None)]
-    }
-
-    fn handle_record(&mut self, event: Event) -> Effects {
-        match authority_rows(event) {
-            Ok(rows) => {
-                self.authority = rows;
-                self.scan_heads()
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        let reads = authority_reads(binding.set_id);
+        self.call(BulkState::ReadRecord, IoCall::Read(reads))
     }
 
     /// Whether this node plans `key`: always in an ordinary bucket, and in a distributed one only
@@ -471,55 +491,34 @@ impl PolicyBulkOperation {
         }
     }
 
-    fn scan_heads(&mut self) -> Effects {
-        let prefix = match BlobHeadKey::bucket_prefix(&self.config.bucket) {
-            Ok(prefix) => prefix,
-            Err(error) => return self.fail(error.into()),
+    fn scan_heads(&mut self) -> BulkTurn {
+        let page = IoCall::Page {
+            space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: BlobHeadKey::bucket_prefix(&self.config.bucket)?.into(),
+            after: self.config.start_after.clone(),
+            limit: self.config.limit.clamp(1, BULK_PAGE_LIMIT),
         };
-        self.state = BulkState::ScanHeads;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: self.config.start_after.clone().map(IterStart::After),
-            limit: self.page_limit(),
-            txn_id: None,
-        })]
+        self.call(BulkState::ScanHeads, page)
     }
 
-    fn handle_heads(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.fail(BulkError::InvalidEvent);
-        };
-        self.report.cursor = next_start_after;
+    fn heads_read(&mut self, (rows, next): (Vec<(Key, Value)>, Option<Key>)) -> BulkTurn {
+        self.report.cursor = next;
         self.report.complete = self.report.cursor.is_none();
-        if values.is_empty() {
+        if rows.is_empty() {
             return self.after_page();
         }
-        let mut reads = Vec::with_capacity(values.len());
-        for (key, value) in values {
-            let head = match BlobHeadKey::from_bytes(key.as_ref()) {
-                Ok(head) => head,
-                Err(error) => return self.fail(error.into()),
-            };
-            match self.owns(&head.key) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => return self.fail(error),
+        let mut reads = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            let head = BlobHeadKey::from_bytes(key.as_ref())?;
+            if !self.owns(&head.key)? {
+                continue;
             }
-            let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
-                Ok(pointer) => pointer,
-                Err(error) => return self.fail(error.into()),
-            };
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
             let version_key = VersionKey::new(&self.config.bucket, &head.key, pointer.version_id);
-            let encoded = match version_key.to_bytes() {
-                Ok(encoded) => encoded,
-                Err(error) => return self.fail(error.into()),
-            };
-            reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(encoded)));
+            reads.push((
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                Key::from(version_key.to_bytes()?),
+            ));
             self.candidates.push(Candidate {
                 key: head.key,
                 pointer,
@@ -530,28 +529,26 @@ impl PolicyBulkOperation {
         if reads.is_empty() {
             return self.after_page();
         }
-        self.state = BulkState::ReadVersions;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        self.call(BulkState::ReadVersions, IoCall::Read(reads))
     }
 
-    fn handle_versions(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(BulkError::InvalidEvent);
-        };
-        if values.len() != self.candidates.len() {
-            return self.fail(BulkError::InvalidEvent);
+    fn check_answers(&self, read: &[Option<Value>]) -> Result<(), BulkError> {
+        if read.len() == self.candidates.len() {
+            return Ok(());
         }
-        let target = self
-            .run
-            .as_ref()
+        let got = "a different row count";
+        let expected = "one row per candidate";
+        Err(IoError::Unexpected { expected, got }.into())
+    }
+
+    fn versions_read(&mut self, read: Vec<Option<Value>>) -> BulkTurn {
+        self.check_answers(&read)?;
+        let target = (self.run.as_ref())
             .map(|run| run.target_refs.clone())
             .unwrap_or_default();
         let candidates = std::mem::take(&mut self.candidates);
         let mut pending = Vec::with_capacity(candidates.len());
-        for (mut candidate, (_, value)) in candidates.into_iter().zip(values) {
+        for (mut candidate, value) in candidates.into_iter().zip(read) {
             self.report.observed += 1;
             let Some(value) = value else {
                 // A head pointing at a version this node no longer stores is a
@@ -562,10 +559,7 @@ impl PolicyBulkOperation {
                 });
                 continue;
             };
-            let version = match BlobVersion::from_bytes(value.as_ref()) {
-                Ok(version) => version,
-                Err(error) => return self.fail(error.into()),
-            };
+            let version = BlobVersion::from_bytes(value.as_ref())?;
             if version.state == BlobVersionState::Deleted || covered(&version, &target) {
                 self.report.covered += 1;
                 continue;
@@ -582,7 +576,7 @@ impl PolicyBulkOperation {
 
     /// The union a mint stores also contains the refs the head already carries,
     /// so they have to be authenticated too before any of them may be evaluated.
-    fn resolve_union(&mut self) -> Effects {
+    fn resolve_union(&mut self) -> BulkTurn {
         let mut refs = Vec::new();
         for candidate in &self.candidates {
             for policy_ref in &candidate.refs {
@@ -594,56 +588,27 @@ impl PolicyBulkOperation {
         if refs.is_empty() {
             return self.read_intents();
         }
-        let resolver = PolicySetResolver::new(
-            self.config.auth_context.realm_id,
-            self.config.subject.node_id,
-            self.config.now_ms,
-            ResolveMode::Lenient,
-            &refs,
-        );
-        self.state = BulkState::ResolveUnion;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            resolver,
-            |result| { Event::Child(ChildOutcome::new(result)) }
-        ))]
+        let resolver = self.resolver(&refs);
+        self.call(BulkState::ResolveUnion, resolver)
     }
 
-    fn read_intents(&mut self) -> Effects {
+    fn read_intents(&mut self) -> BulkTurn {
         let mut reads = Vec::with_capacity(self.candidates.len());
         for candidate in &self.candidates {
             let key = PolicyIntentKey::new(self.config.operation_id, candidate.key.clone());
-            let encoded = match key.to_bytes() {
-                Ok(encoded) => encoded,
-                Err(error) => return self.fail(error.into()),
-            };
-            reads.push((BULK_INTENT_KEYSPACE.to_string(), Key::from(encoded)));
+            reads.push((BULK_INTENT_KEYSPACE.to_string(), Key::from(key.to_bytes()?)));
         }
-        self.state = BulkState::ReadIntents;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        self.call(BulkState::ReadIntents, IoCall::Read(reads))
     }
 
     /// Reuses the intent planned for this head, replans one whose head moved,
     /// and never re-mints one an earlier pass completed.
-    fn handle_intents(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.fail(BulkError::InvalidEvent);
-        };
-        if values.len() != self.candidates.len() {
-            return self.fail(BulkError::InvalidEvent);
-        }
+    fn intents_read(&mut self, read: Vec<Option<Value>>) -> BulkTurn {
+        self.check_answers(&read)?;
         let candidates = std::mem::take(&mut self.candidates);
         let mut pending = Vec::with_capacity(candidates.len());
-        for (mut candidate, (_, value)) in candidates.into_iter().zip(values) {
-            let stored = match value
-                .map(|value| PolicyIntent::from_bytes(value.as_ref()))
-                .transpose()
-            {
-                Ok(stored) => stored,
-                Err(error) => return self.fail(error.into()),
-            };
+        for (mut candidate, value) in candidates.into_iter().zip(read) {
+            let stored = value.as_deref().map(PolicyIntent::from_bytes).transpose()?;
             let intent = match stored {
                 Some(intent) if matches!(intent.outcome, PolicyIntentOutcome::Completed { .. }) => {
                     self.report.covered += 1;
@@ -671,14 +636,19 @@ impl PolicyBulkOperation {
         self.mint_next()
     }
 
-    fn mint_next(&mut self) -> Effects {
+    fn mint_next(&mut self) -> BulkTurn {
         let Some(candidate) = self.candidates.get(self.index) else {
             return self.after_page();
         };
         let (Some(intent), Some(run), Some(group_id)) =
             (candidate.intent.clone(), self.run.as_ref(), self.group_id)
         else {
-            return self.fail(BulkError::InvalidEvent);
+            let expected = "a planned candidate";
+            return Err(IoError::Unexpected {
+                expected,
+                got: "none",
+            }
+            .into());
         };
         let plan = SuccessorPlan {
             context: HeadAliasContext::new(
@@ -705,14 +675,11 @@ impl PolicyBulkOperation {
             }),
             intent: Some(intent),
         };
-        let mut mint = mint_child(plan);
-        let effects = mint.start();
-        self.mint = Some(mint);
-        self.state = BulkState::Mint;
-        effects
+        let mint = MintSuccessorOperation::new(plan);
+        self.call(BulkState::Mint, IoCall::child(mint))
     }
 
-    fn record_outcome(&mut self, result: Result<SuccessorOutcome, SuccessorError>) -> Effects {
+    fn record_outcome(&mut self, result: Result<SuccessorOutcome, SuccessorError>) -> BulkTurn {
         let key = self
             .candidates
             .get(self.index)
@@ -756,13 +723,13 @@ impl PolicyBulkOperation {
                     reason: PolicyBlockedReason::SourceUnavailable,
                 })
             }
-            Err(error) => return self.fail(error.into()),
+            Err(error) => return Err(error.into()),
         }
         self.mint_next()
     }
 
     /// Converged only when a full rescan from the start found nothing to do.
-    fn after_page(&mut self) -> Effects {
+    fn after_page(&mut self) -> BulkTurn {
         let converged = self.config.start_after.is_none()
             && self.report.complete
             && self.report.minted == 0
@@ -774,61 +741,13 @@ impl PolicyBulkOperation {
         self.close_run(PolicyStatus::Completed)
     }
 
-    /// Status transitions are compare-and-set: only an active run moves on, so
-    /// a replayed or concurrent pass cannot revive or downgrade a finished one.
-    fn close_run(&mut self, status: PolicyStatus) -> Effects {
-        self.pending_status = Some(status);
-        self.state = BulkState::StartStatus;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn read_status(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = BulkState::ReadStatus;
-        let key = match PolicyBulkRun::key(self.config.operation_id) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
+    fn close_run(&mut self, status: PolicyStatus) -> BulkTurn {
+        let close = CloseRun {
+            operation_id: self.config.operation_id,
+            status,
+            written: None,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BULK_RUN_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_status(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(BulkError::InvalidEvent);
-        };
-        let stored = match value
-            .map(|value| PolicyBulkRun::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(stored) => stored,
-            Err(error) => return self.fail(error.into()),
-        };
-        let (Some(mut run), Some(status)) = (stored, self.pending_status) else {
-            return self.stop();
-        };
-        if run.status != PolicyStatus::Active {
-            self.run = Some(run);
-            return self.stop();
-        }
-        run.status = status;
-        let (key, value) = match (PolicyBulkRun::key(run.operation_id), run.to_bytes()) {
-            (Ok(key), Ok(value)) => (key, value),
-            (Err(error), _) | (_, Err(error)) => return self.fail(error.into()),
-        };
-        self.run = Some(run);
-        self.state = BulkState::WriteStatus;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BULK_RUN_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        self.call(BulkState::Close, IoCall::child(close))
     }
 }
 
@@ -838,171 +757,56 @@ fn covered(version: &BlobVersion, target: &[PlacementPolicyRef]) -> bool {
         .all(|policy| version.placement_policies.contains(policy))
 }
 
-impl EffectOperation for PolicyBulkOperation {
+impl Operation for PolicyBulkOperation {
     type Output = BulkReport;
     type Error = BulkError;
 
-    fn start(&mut self) -> Effects {
-        self.state = BulkState::Authorize;
-        self.authorize(policy_admin_path(self.config.auth_context.realm_id))
+    fn first(&mut self) -> BulkTurn {
+        let path = policy_admin_path(self.config.auth_context.realm_id);
+        self.authorize(BulkState::Authorize, path)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        // The mint and the resolver classify their own storage failures.
-        let event = match (self.state, event) {
-            (
-                BulkState::Mint | BulkState::Settle | BulkState::Resolve | BulkState::ResolveUnion,
-                event,
-            ) => event,
-            (_, Event::Storage(StorageEvent::Error { error })) => return self.fail(error.into()),
-            (_, event) => event,
-        };
+    fn next(&mut self, result: IoResult) -> BulkTurn {
         match self.state {
-            BulkState::Init => self.start(),
             BulkState::Authorize => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                match allowed {
-                    Ok(true) => self.start_capture(),
-                    // A group administrator governs that group's own buckets.
-                    Ok(false) => {
-                        self.state = BulkState::AuthorizeGroup;
-                        self.authorize(group_admin_path(
-                            self.config.auth_context.realm_id,
-                            self.config.group_id,
-                        ))
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "Bulk policy authorization check failed");
-                        self.fail(BulkError::Unauthorized)
-                    }
+                if Self::allowed(result.child::<bool, AuthorizationError>()?)? {
+                    return self.capture();
                 }
+                // A group administrator governs that group's own buckets.
+                let realm_id = self.config.auth_context.realm_id;
+                let path = group_admin_path(realm_id, self.config.group_id);
+                self.authorize(BulkState::AuthorizeGroup, path)
             }
             BulkState::AuthorizeGroup => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                match allowed {
-                    Ok(true) => self.start_capture(),
-                    Ok(false) => self.fail(BulkError::Unauthorized),
-                    Err(error) => {
-                        warn!(error = %error, "Bulk policy authorization check failed");
-                        self.fail(BulkError::Unauthorized)
-                    }
+                match Self::allowed(result.child::<bool, AuthorizationError>()?)? {
+                    true => self.capture(),
+                    false => Err(BulkError::Unauthorized),
                 }
             }
-            BulkState::StartCapture => {
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                match self.read_capture(txn_id) {
-                    Ok(effects) => effects,
-                    Err(error) => self.fail(error),
-                }
+            BulkState::Capture => self.captured(result.child::<CapturedRun, BulkError>()??),
+            BulkState::Resolve => self.target_resolved(Self::resolutions(result)),
+            BulkState::ReadRecord => {
+                let [record, fence] = values::<2>(result)?;
+                self.authority = (record, fence);
+                self.scan_heads()
             }
-            BulkState::ReadCapture => self.handle_capture(event),
-            BulkState::WriteRun => {
-                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                match self.txn_id {
-                    Some(txn_id) => {
-                        self.state = BulkState::CommitCapture;
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    None => self.fail(BulkError::InvalidEvent),
-                }
-            }
-            BulkState::CommitCapture => {
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                self.after_capture()
-            }
-            BulkState::Resolve => self.after_resolve(Self::resolutions(event)),
-            BulkState::ReadRecord => self.handle_record(event),
-            BulkState::ScanHeads => self.handle_heads(event),
-            BulkState::ReadVersions => self.handle_versions(event),
+            BulkState::ScanHeads => self.heads_read(result.page()?),
+            BulkState::ReadVersions => self.versions_read(result.values()?),
             BulkState::ResolveUnion => {
-                self.resolved.extend(Self::resolutions(event));
+                self.resolved.extend(Self::resolutions(result));
                 self.read_intents()
             }
-            BulkState::ReadIntents => self.handle_intents(event),
+            BulkState::ReadIntents => self.intents_read(result.values()?),
             BulkState::Mint => {
-                let Some(mint) = self.mint.as_mut() else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                let effects = mint.step(event);
-                if !mint.is_complete() {
-                    return effects;
-                }
-                let Some(mint) = self.mint.take() else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                let outcome = mint_outcome(mint.finalize());
-                if effects.is_empty() {
-                    return self.record_outcome(outcome);
-                }
-                self.settled = Some(outcome);
-                self.state = BulkState::Settle;
-                effects
+                self.record_outcome(result.child::<SuccessorOutcome, SuccessorError>()?)
             }
-            // The cleanup event belongs to the finished mint, so it decides
-            // nothing here.
-            BulkState::Settle => match self.settled.take() {
-                Some(outcome) => self.record_outcome(outcome),
-                None => self.fail(BulkError::InvalidEvent),
-            },
-            BulkState::StartStatus => {
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                self.read_status(txn_id)
-            }
-            BulkState::ReadStatus => self.handle_status(event),
-            BulkState::WriteStatus => {
-                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                match self.txn_id {
-                    Some(txn_id) => {
-                        self.state = BulkState::CommitStatus;
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    None => self.fail(BulkError::InvalidEvent),
+            BulkState::Close => {
+                if let Some(run) = result.child::<Option<PolicyBulkRun>, BulkError>()?? {
+                    self.run = Some(run);
                 }
-            }
-            BulkState::CommitStatus => {
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return self.fail(BulkError::InvalidEvent);
-                };
-                self.txn_id = None;
                 self.finish()
             }
-            BulkState::Finish | BulkState::Error => smallvec![],
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, BulkState::Finish | BulkState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(BulkError::InvalidEvent))
-    }
-
-    fn abort(&mut self) -> Effects {
-        let mut effects: Effects = smallvec![];
-        if let Some(mint) = self.mint.as_mut() {
-            effects.extend(mint.abort());
-        }
-        if let Some(txn_id) = self.txn_id.take() {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        effects
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -1021,7 +825,10 @@ impl EffectOperation for PolicyBulkOperation {
 /// keeps the object as a resumable gap.
 #[cfg(test)]
 mod tests {
-    use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, PolicyBulkOperation};
+    use super::{
+        BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, CaptureRun, CloseRun,
+        PolicyBulkOperation,
+    };
     use crate::driver::{DriverContext, drive};
     use crate::placement::policy::GateOperation;
     use crate::placement::policy::cache::cache_key;
@@ -1032,14 +839,15 @@ mod tests {
     use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, POLICY_CACHE_KEYSPACE,
         S3_BUCKET_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;
@@ -1466,29 +1274,63 @@ mod tests {
         Value::from(bucket.to_bytes().expect("bucket encodes"))
     }
 
+    fn capture(group_id: GroupId) -> CaptureRun {
+        CaptureRun {
+            operation_id: Ulid::from_bytes([3u8; 16]),
+            bucket: BUCKET.to_string(),
+            group_id,
+            written: None,
+        }
+    }
+
     #[test]
     fn rejects_regrouped_bucket() {
         // A bucket deleted and recreated for another group must not stay under
         // the authority of the group this run authorized.
-        let mut operation = PolicyBulkOperation::new(bulk_config(Ulid::generate()));
-        operation.state = BulkState::ReadCapture;
+        let mut capture = capture(Ulid::generate());
+        assert_eq!(capture.transaction(), TransactionMode::Write);
+        assert!(matches!(capture.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let rows = IoResult::Values(vec![Some(stored_bucket(Ulid::generate())), None]);
+        assert_eq!(capture.next(rows), Err(BulkError::BucketChanged));
+    }
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    Key::from(Vec::<u8>::new()),
-                    Some(stored_bucket(Ulid::generate())),
-                ),
-                (Key::from(Vec::<u8>::new()), None),
-            ],
-        }));
+    #[test]
+    fn first_pass_stores_run() {
+        let group_id = Ulid::generate();
+        let mut capture = capture(group_id);
+        capture.first().unwrap();
+        let rows = IoResult::Values(vec![Some(stored_bucket(group_id)), None]);
+        assert!(matches!(
+            capture.next(rows),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Done(captured)) = capture.next(IoResult::Done) else {
+            panic!("the captured run is returned");
+        };
+        assert_eq!(captured.run.status, PolicyStatus::Active);
+    }
 
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::Write { .. })))
-        );
-        assert_eq!(operation.finalize(), Err(BulkError::BucketChanged));
+    #[test]
+    fn finished_run_stays() {
+        // A pass never revives or downgrades a run another pass finished.
+        use aruna_core::structs::placement::policy::attachment::PolicyBulkRun;
+        let operation_id = Ulid::from_bytes([3u8; 16]);
+        let run = PolicyBulkRun {
+            operation_id,
+            bucket: BUCKET.to_string(),
+            bucket_identity: (Ulid::generate(), UNIX_EPOCH, UserId::default()),
+            generation: 1,
+            target_refs: Vec::new(),
+            status: PolicyStatus::Superseded,
+        };
+        let mut close = CloseRun {
+            operation_id,
+            status: PolicyStatus::Completed,
+            written: None,
+        };
+        close.first().unwrap();
+        let stored = IoResult::Values(vec![Some(run.to_bytes().unwrap().into())]);
+        assert_eq!(close.next(stored), Ok(Next::Done(Some(run))));
     }
 
     #[tokio::test]
@@ -1673,9 +1515,9 @@ mod tests {
         ] {
             let mut operation = PolicyBulkOperation::new(bulk_config(Ulid::generate()));
             operation.state = BulkState::Mint;
-            operation.record_outcome(Err(SuccessorError::Distribution(refusal)));
+            let turn = operation.record_outcome(Err(SuccessorError::Distribution(refusal)));
             assert_eq!(operation.report.replanned, 1);
-            assert_ne!(operation.state, BulkState::Error);
+            assert!(turn.is_ok());
         }
     }
 

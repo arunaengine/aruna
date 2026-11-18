@@ -22,8 +22,7 @@ use aruna_operations::federation::import::ReadImportOperation;
 use aruna_operations::jobs::import::upload::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation,
 };
-use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
-use aruna_operations::metadata::create_entry::mint_job_document;
+use aruna_operations::metadata::create_entry::DocumentMintOperation;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation,
@@ -439,15 +438,15 @@ pub async fn submit_import(
             user_id: spec.auth_context.user_id,
             realm_id: state.get_realm_id(),
         };
-        let document_id = mint_job_document(
-            state.get_ctx().as_ref(),
-            &actor,
+        let mint = DocumentMintOperation::job(
+            actor.clone(),
             spec.metadata.group_id,
-            &spec.metadata.path,
-        )
-        .await
-        .map_err(crate::metadata::map_create_error)?
-        .as_ulid();
+            spec.metadata.path.clone(),
+        );
+        let document_id = drive(mint, state.get_ctx().as_ref())
+            .await
+            .map_err(crate::metadata::map_create_error)?
+            .as_ulid();
         spec.document_id = document_id;
         fast_source_check(
             &state,
@@ -616,10 +615,14 @@ async fn fast_source_check(
             crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await
         }
         ImportRoCrateSource::Upload { upload_id } => {
-            let record = load_rocrate_upload(&state.get_ctx(), *upload_id)
-                .await
-                .map_err(|error| ServerError::InternalError(error.into()))?
-                .ok_or(ServerError::NotFound)?;
+            let record = aruna_operations::driver::drive(
+                aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(*upload_id),
+                &state.get_ctx(),
+            )
+            .await
+            .map_err(|error| error.0)
+            .map_err(|error| ServerError::InternalError(error.into()))?
+            .ok_or(ServerError::NotFound)?;
             if record.owner != auth.user_id {
                 return Err(ServerError::Forbidden);
             }

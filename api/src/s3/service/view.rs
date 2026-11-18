@@ -4,10 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::execution::job::{JobId, JobRecord};
+use aruna_operations::driver::drive;
 use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::jobs::workflow::input_view::{
-    MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, decode_token, encode_token, head_entry,
-    list_shown, names_manifest, read_entry, read_manifest, view_bucket, view_entries,
+    MAX_VIEW_KEYS, ReadManifestOperation, ViewEntry, ViewError, ViewFrom, ViewLister, creator,
+    decode_token, encode_token, head_entry, names_manifest, read_entry, view_bucket, view_entries,
 };
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::visible::{is_sealed, open_cursor, seal_cursor};
@@ -81,7 +82,10 @@ impl ArunaS3Service {
         record: &JobRecord,
         entries: &[ViewEntry],
     ) -> S3Result<(bytes::Bytes, String)> {
-        let body = read_manifest(&self.state, record, entries, self.node_id)
+        let realm_id = self.state.serving_realm(record.created_by.realm_id);
+        let auth = creator(record, realm_id);
+        let manifest = ReadManifestOperation::new(auth, entries.to_vec(), self.node_id);
+        let body = drive(manifest, &self.state)
             .await
             .map_err(view_error)?
             .ok_or_else(|| s3_error!(NoSuchKey, "The specified key does not exist."))?;
@@ -131,19 +135,16 @@ impl ArunaS3Service {
         };
         // Each candidate is authorized in key order from the position, as a HEAD of it would be.
         let scope = (prefix.as_str(), input.delimiter.as_deref());
-        let (state, record_ref, node_id) = (&self.state, &record, self.node_id);
-        let page = list_shown(&entries, scope, from, max_keys, |entry: &ViewEntry| {
-            let entry = entry.clone();
-            Box::pin(async move {
-                match head_entry(state, record_ref, &entry, node_id).await {
-                    Ok(()) => Ok(true),
-                    Err(ViewError::Denied | ViewError::NotFound) => Ok(false),
-                    Err(error) => Err(error),
-                }
-            })
-        })
-        .await
-        .map_err(view_error)?;
+        let mut lister = ViewLister::new(&entries, scope, from, max_keys);
+        while let Some(entry) = lister.candidate() {
+            let shown = match head_entry(&self.state, &record, entry, self.node_id).await {
+                Ok(()) => true,
+                Err(ViewError::Denied | ViewError::NotFound) => false,
+                Err(error) => return Err(view_error(error)),
+            };
+            lister.answer(shown);
+        }
+        let page = lister.finish();
         let next_continuation_token = match &page.next {
             Some(ViewFrom::After(marker)) => Some(encode_token(&bucket, marker)),
             Some(from) => Some(

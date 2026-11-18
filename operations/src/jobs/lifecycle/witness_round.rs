@@ -44,6 +44,7 @@ use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::store_call::{RowBatch, RowRead};
+use crate::realm::load_config::config_unavailable;
 use aruna_core::structs::execution::job::PageManifest;
 
 /// Wall-clock budget of one launch offer.
@@ -681,7 +682,10 @@ impl Operation for WitnessRoundOperation {
         match self.step {
             RoundStep::Config => match result.child::<RealmConfigDocument, GetConfigError>()? {
                 Ok(config) => self.configured(config),
-                Err(_) => retry(1_000),
+                Err(error) => {
+                    config_unavailable(&error);
+                    retry(1_000)
+                }
             },
             RoundStep::Family => self.family_read(result),
             RoundStep::Silence => self.silence_read(result),

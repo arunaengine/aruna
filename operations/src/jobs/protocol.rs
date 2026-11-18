@@ -35,6 +35,7 @@ use super::remote_key::{AcceptWakeOperation, RegisterWaitsOperation};
 use super::route::{JobRouteError, RoutedJobStatus};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::write_peer::WritePeerOperation;
+use crate::realm::load_config::config_unavailable;
 
 /// What a job-control request is answered with. `running` names the local attempts the
 /// receiving node must signal, because a cancel reached them.
@@ -346,7 +347,8 @@ impl Operation for ServeCancelOperation {
             },
             CancelStep::Config => match result.child::<RealmConfigDocument, GetConfigError>()? {
                 Ok(config) => self.configured(&config),
-                Err(_) => {
+                Err(error) => {
+                    config_unavailable(&error);
                     let error = JobRouteError::Unavailable("realm config unavailable".into());
                     self.done(JobResponse::Unavailable(error.to_string()))
                 }

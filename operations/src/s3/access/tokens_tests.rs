@@ -5,6 +5,7 @@
 use super::list::{GroupTokensConfig, ListTokensOperation, TokenPage};
 use super::revoke::{RevokeTarget, RevokeTokensConfig, RevokeTokensOperation};
 use super::{GroupTokensError, TokenCursor, TokenKind, TokenStatus};
+use crate::auth::bearer_token::UserCutoffOperation;
 use crate::driver::{DriverContext, drive};
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use crate::session::index::encode_index;
@@ -502,10 +503,9 @@ async fn foreign_token_missing() {
 }
 
 async fn cutoff_of(fixture: &Fixture, user: UserId) -> Option<u64> {
-    crate::auth::bearer_token::realm_user_cutoff(
-        &fixture.context.storage_handle,
-        user.realm_id,
-        &user,
+    drive(
+        UserCutoffOperation::new(user.realm_id, &user),
+        &fixture.context,
     )
     .await
     .unwrap()

@@ -14,7 +14,7 @@ use ulid::Ulid;
 
 use super::rows::{StoreError, decode, done, encode, read_call, row, values};
 use super::unavailable;
-use crate::metadata::forward::write::PinnedCreate;
+use crate::metadata::forward::pinned::PinnedCreate;
 
 /// How the key row of a create was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

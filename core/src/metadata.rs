@@ -1327,6 +1327,8 @@ pub enum MetadataEffect {
         graph_iri: String,
     },
     ListGraphs,
+    /// Every live registry record of this node, from the metadata handle's cache.
+    CachedRecords,
     ContainsGraph {
         graph_iri: String,
     },
@@ -1361,6 +1363,49 @@ pub enum MetadataEffect {
         graph_iri: String,
         batch: MetadataBatch,
     },
+    // Profile checks of unsaved candidates; nothing is committed.
+    /// Structural RO-Crate findings of a candidate that carries no Profile tag.
+    CheckStructure {
+        jsonld: String,
+    },
+    /// Evaluates a candidate against one Profile revision's shapes.
+    CheckProfile {
+        shapes: crate::profile_shapes::ProfileShapes,
+        jsonld: String,
+    },
+    /// The shape sources this node keeps of one Profile revision.
+    CachedShapes {
+        profile_id: Ulid,
+        revision: Ulid,
+    },
+    /// Keeps the fetched shape sources of one Profile revision.
+    CacheShapes {
+        profile_id: Ulid,
+        revision: Ulid,
+        shapes: Vec<String>,
+    },
+    /// The summary of a graph at a document cursor, from this node's summary cache when it
+    /// holds that cursor.
+    ExportSummaryAt {
+        graph_iri: String,
+        cursor: Ulid,
+    },
+    // This node's registry cache.
+    /// The generation of the registry cache, read before a write whose row it caches later.
+    CacheGeneration,
+    /// Caches registry rows; with a generation, only when no fill or removal happened since.
+    CacheRecords {
+        records: Vec<MetadataRegistryRecord>,
+        generation: Option<u64>,
+    },
+    /// Drops one document's row from the registry cache.
+    UncacheRecord {
+        document_id: Ulid,
+    },
+    /// The live registry rows of one group, when the registry cache holds a fresh copy.
+    CachedGroup {
+        group_id: GroupId,
+    },
 }
 
 impl MetadataEffect {
@@ -1384,6 +1429,7 @@ impl MetadataEffect {
             MetadataEffect::QueryGraphs { .. } => "query_graphs",
             MetadataEffect::DeleteGraph { .. } => "delete_graph",
             MetadataEffect::ListGraphs => "list_graphs",
+            MetadataEffect::CachedRecords => "cached_records",
             MetadataEffect::ContainsGraph { .. } => "contains_graph",
             MetadataEffect::ContainsDot { .. } => "contains_dot",
             MetadataEffect::PlanBatch { .. } => "plan_batch",
@@ -1391,6 +1437,15 @@ impl MetadataEffect {
             MetadataEffect::GraphSnapshot { .. } => "graph_snapshot",
             MetadataEffect::ExportVersioned { .. } => "export_versioned",
             MetadataEffect::InstallSnapshot { .. } => "install_snapshot",
+            MetadataEffect::CheckStructure { .. } => "check_structure",
+            MetadataEffect::CheckProfile { .. } => "check_profile",
+            MetadataEffect::CachedShapes { .. } => "cached_shapes",
+            MetadataEffect::CacheShapes { .. } => "cache_shapes",
+            MetadataEffect::ExportSummaryAt { .. } => "export_summary_at",
+            MetadataEffect::CacheGeneration => "cache_generation",
+            MetadataEffect::CacheRecords { .. } => "cache_records",
+            MetadataEffect::UncacheRecord { .. } => "uncache_record",
+            MetadataEffect::CachedGroup { .. } => "cached_group",
         }
     }
 
@@ -1409,6 +1464,7 @@ impl MetadataEffect {
             | MetadataEffect::GetGraphPolicy { graph_iri }
             | MetadataEffect::ExportRoCrate { graph_iri }
             | MetadataEffect::ExportRoCrateSummary { graph_iri }
+            | MetadataEffect::ExportSummaryAt { graph_iri, .. }
             | MetadataEffect::DeleteGraph { graph_iri }
             | MetadataEffect::ContainsGraph { graph_iri }
             | MetadataEffect::ContainsDot { graph_iri, .. }
@@ -1424,7 +1480,16 @@ impl MetadataEffect {
             MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris
                 .as_ref()
                 .and_then(|graph_iris| graph_iris.first().cloned()),
-            MetadataEffect::ListGraphs => None,
+            MetadataEffect::ListGraphs
+            | MetadataEffect::CachedRecords
+            | MetadataEffect::CheckStructure { .. }
+            | MetadataEffect::CheckProfile { .. }
+            | MetadataEffect::CachedShapes { .. }
+            | MetadataEffect::CacheShapes { .. }
+            | MetadataEffect::CacheGeneration
+            | MetadataEffect::CacheRecords { .. }
+            | MetadataEffect::UncacheRecord { .. }
+            | MetadataEffect::CachedGroup { .. } => None,
         }
     }
 
@@ -1501,6 +1566,10 @@ pub enum MetadataEvent {
     GraphListResult {
         graph_iris: Vec<String>,
     },
+    CachedRecords {
+        records:
+            std::sync::Arc<Vec<crate::structs::storage::metadata_registry::MetadataRegistryRecord>>,
+    },
     ContainsGraphResult {
         graph_iri: String,
         exists: bool,
@@ -1531,6 +1600,25 @@ pub enum MetadataEvent {
     BatchMerged {
         graph_iri: String,
         applied: bool,
+    },
+    /// The registry cache generation; a cache change answers with the generation after it.
+    CacheGeneration {
+        generation: u64,
+    },
+    /// The cached registry rows of one group, or `None` without a fresh copy.
+    CachedGroup {
+        records: Option<Vec<MetadataRegistryRecord>>,
+    },
+    /// The kept shape sources of one Profile revision, if any; a store answers with `None`.
+    ProfileShapes {
+        shapes: Option<Vec<String>>,
+    },
+    /// The verdict of a structure or Profile check, or why there is none.
+    ProfileChecked {
+        report: Result<
+            Box<crate::profile_shapes::ProfileShaclReport>,
+            crate::profile_shapes::ProfileShaclError,
+        >,
     },
     Error {
         graph_iri: Option<String>,

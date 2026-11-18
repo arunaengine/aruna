@@ -52,7 +52,7 @@ use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartOb
 use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_storage::storage;
 use axum::{Router, routing::get};
 use bytes::Bytes;
@@ -617,7 +617,7 @@ pub async fn test_get_object() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -884,7 +884,7 @@ pub async fn hash_mismatch_rejected() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -1043,7 +1043,7 @@ async fn bound_connector_used() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -1227,7 +1227,7 @@ async fn drift_creates_successor() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -2214,7 +2214,9 @@ async fn offered_drift_replaces() {
         node_id: test_node_id(),
         user_id: UserId::new(Ulid::generate(), realm_id),
     };
-    offer_directory(context, offer.clone()).await.unwrap();
+    drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     std::fs::write(&file, b"one-changed").unwrap();
 
     let mut operation = GetObjectOperation::new(GetObjectInput {
@@ -2265,7 +2267,7 @@ async fn historical_drift_fails() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
     storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(

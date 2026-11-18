@@ -5,6 +5,8 @@
 use crate::auth::require_unrestricted_auth;
 use crate::cors::CorsConfig;
 use crate::server::state::ServerState;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
+use aruna_operations::driver::drive;
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -239,9 +241,12 @@ pub(crate) async fn authorize_self(
         Some(auth),
         extras,
     );
-    aruna_operations::auth::policy_load::enforce_policies(&state.get_ctx(), realm_id, &request)
-        .await
-        .map_err(|_| crate::error::ServerError::Forbidden)
+    drive(
+        EnforcePolicyOperation::new(realm_id, request.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|_| crate::error::ServerError::Forbidden)
 }
 
 fn error_result(body: crate::error::ErrorResponse) -> CallToolResult {

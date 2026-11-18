@@ -30,6 +30,7 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::realm::load_config::config_unavailable;
 
 /// A local job read failed; the text is what the caller reports.
 #[derive(Debug, Error, PartialEq)]
@@ -193,9 +194,9 @@ impl ReadableJobOperation {
         self.step = ReadableStep::Check(record, checks);
         Ok(Next::Call(IoCall::child(AuthorizeOperation::new(
             self.auth.realm_id,
-            self.auth.clone(),
-            path,
-            permission,
+            &self.auth,
+            &path,
+            &permission,
             PolicyRequestExtras::rest(),
         ))))
     }
@@ -389,6 +390,7 @@ impl Operation for JobOwnerOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<NodeId>, JobRouteError> {
         let config = result
             .child::<RealmConfigDocument, GetConfigError>()?
+            .inspect_err(config_unavailable)
             .map_err(|_| unavailable("realm config unavailable"))?;
         match config.job_owner(self.job_id) {
             Ok(owner) => Ok(Next::Done(owner)),

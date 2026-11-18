@@ -732,10 +732,12 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::LocalFile(_)
         | Effect::Index(_)
         | Effect::Session(_)
+        | Effect::Compute(_)
         | Effect::Outbound(_)
         | Effect::SubOperation(_)
         | Effect::Group(_)
         | Effect::Delay(_)
+        | Effect::Job(_)
         | Effect::Search()
         | Effect::Stream() => None,
     }
@@ -1149,6 +1151,7 @@ pub(crate) fn drive_suboperation<'a>(
                 depth,
                 "Starting suboperation"
             );
+            let _hold = take_hold(context, operation.hold_scope()).await;
             let mut run = SubRun(operation.as_mut(), None);
             let mut state = drive_effects(
                 &mut run,
@@ -1196,6 +1199,9 @@ async fn take_hold(
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     match scope? {
         HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
+        HoldScope::DocumentWrite(document_id) => {
+            Some(context.graph_handle.as_ref()?.hold_document(document_id).await)
+        }
         scope => Some(local_hold(scope).lock_owned().await),
     }
 }

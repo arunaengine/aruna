@@ -1,73 +1,21 @@
-//! Emits an origin watch event to the local holder and to remote holders after a commit.
+//! Tests the watch event emission end to end against a local store and net handle.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind,
-};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::GroupId;
-use ulid::Ulid;
-
-use crate::driver::{DriverContext, drive};
-use crate::notifications::watch::origin::EmitWatchOperation;
-
-/// Post-commit, best-effort emission of an origin watch event to the holders this node's
-/// interest table matches and to this node when it holds a matching watch; failures only warn.
-pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return;
-    };
-    let interest = net_handle.watch_interest_snapshot();
-    let holders = interest.matching_nodes(event.realm_id, &event.path, event.kind);
-    let emit = EmitWatchOperation::new(event, net_handle.node_id(), holders);
-    // Every failure is logged inside the operation.
-    let _ = drive(emit, context).await;
-}
-
-/// Post-commit, best-effort `metadata_created` emission shared by every dataset
-/// creation path, so an import or a job notifies exactly like `POST /metadata`.
-/// `event_id` dates the event, keeping a retried create's inbox key stable.
-pub(crate) async fn emit_metadata_created(
-    context: &DriverContext,
-    realm_id: RealmId,
-    actor: UserId,
-    group_id: GroupId,
-    document_id: Ulid,
-    document_path: &str,
-    event_id: Ulid,
-) {
-    emit_watch_event(
-        context,
-        WatchEvent {
-            event_id,
-            realm_id,
-            kind: WatchEventKind::MetadataCreated,
-            path: format!("meta/{group_id}/{document_path}"),
-            actor,
-            occurred_at_ms: event_id.timestamp_ms(),
-            detail: WatchEventDetail::MetadataCreated {
-                group_id,
-                document_id,
-            },
-        },
-    )
-    .await;
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::driver::{DriverContext, drive};
+    use crate::notifications::watch::origin::EmitEventOperation;
     use aruna_core::NodeId;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
     use aruna_core::metrics::NodeMetrics;
     use aruna_core::structs::execution::notification::NotificationRecord;
     use aruna_core::structs::execution::notification_watch::{
-        WatchEventDetail, WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable,
-        parse_watch_path, watch_resource_path,
+        WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask, WatchInterestEntry,
+        WatchInterestTable, parse_watch_path, watch_resource_path,
     };
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -80,6 +28,11 @@ mod tests {
     use ulid::Ulid;
 
     use crate::tests::notifications::create_local_watch;
+
+    /// Failures only warn inside the operation, as they do for every caller.
+    async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
+        let _ = drive(EmitEventOperation::new(event), context).await;
+    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -314,16 +267,15 @@ mod tests {
         let document_id = Ulid::generate();
         let event_id = Ulid::generate();
         for _ in 0..2 {
-            emit_metadata_created(
-                &ctx,
+            let emit = EmitEventOperation::metadata_created(
                 realm,
                 actor,
                 group_id,
                 document_id,
                 "datasets/project",
                 event_id,
-            )
-            .await;
+            );
+            drive(emit, &ctx).await.expect("the emission runs");
         }
 
         let rows = read_inbox_rows(&ctx).await;

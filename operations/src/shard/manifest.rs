@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::ShardManifestEntry;
 use aruna_core::keyspaces::SHARD_MANIFEST_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::{shard_manifest_prefix, sync_revision_key};
+use aruna_core::storage_entries::shard_manifest_prefix;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::Key;
 use byteview::ByteView;
@@ -73,32 +73,6 @@ impl Operation for ManifestScanOperation {
             None => Next::Done(std::mem::take(&mut self.entries)),
         })
     }
-}
-
-pub(crate) fn manifest_entry_digest(entries: &[ShardManifestEntry]) -> [u8; 32] {
-    let mut encoded_entries: Vec<Vec<u8>> = entries.iter().map(canonical_entry_bytes).collect();
-    encoded_entries.sort();
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&(encoded_entries.len() as u64).to_be_bytes());
-    for encoded in encoded_entries {
-        hasher.update(&(encoded.len() as u64).to_be_bytes());
-        hasher.update(&encoded);
-    }
-    *hasher.finalize().as_bytes()
-}
-
-fn canonical_entry_bytes(entry: &ShardManifestEntry) -> Vec<u8> {
-    let target_key = sync_revision_key(&entry.target);
-    let target_key = target_key.as_ref();
-    let mut bytes = Vec::with_capacity(4 + target_key.len() + 8 + 16 + 32 + 8);
-    bytes.extend_from_slice(&(target_key.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(target_key);
-    bytes.extend_from_slice(&entry.revision.generation.to_be_bytes());
-    bytes.extend_from_slice(&entry.revision.event_id.to_bytes());
-    bytes.extend_from_slice(entry.revision.actor.as_bytes());
-    bytes.extend_from_slice(&entry.revision.updated_at_ms.to_be_bytes());
-    bytes
 }
 
 #[cfg(test)]

@@ -31,7 +31,7 @@ use aruna_operations::device::inspect_draft::{InspectDraftError, InspectDraftOpe
 use aruna_operations::device::list_drafts::ListDraftsOperation;
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState, token_issued_at};
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::profile::validation::preview_submission;
+use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
 use aruna_operations::metadata::public_preview::restricted_files;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -422,7 +422,10 @@ async fn preview_draft(
         ensure_metadata_scope(&state, &auth, group_id, Permission::READ).await?;
     }
     let jsonld = rocrate_jsonld(&request.rocrate)?;
-    let preview = preview_submission(&state.get_ctx(), group_id, &jsonld)
+    let context = state.get_ctx();
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let preview = ProfileAssessOperation::preview(local_node, group_id, jsonld);
+    let preview = drive(preview, &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut response = ProfilePreviewResponse::from(preview);
