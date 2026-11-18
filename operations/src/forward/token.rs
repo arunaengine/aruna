@@ -607,3 +607,7 @@ mod tests {
         assert_eq!(operation.next(answer), denied(WriteAuthError::Forbidden));
     }
 }
+
+#[cfg(test)]
+#[path = "revoke_tests.rs"]
+mod apply_tests;
