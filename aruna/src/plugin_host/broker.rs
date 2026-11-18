@@ -160,7 +160,7 @@ impl RunBroker {
         let update = drive(
             RouteUpdateOperation::new(
                 (actor, local_node),
-                (Some(ready.record.clone()), ready.document_id),
+                (Some((*ready.record).clone()), ready.document_id),
                 DocumentUpdate {
                     public: None,
                     mutation: mutation(ready.entity),

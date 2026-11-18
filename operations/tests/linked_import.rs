@@ -4,7 +4,6 @@
 
 use crate::job_calls::insert_job;
 use crate::job_calls::{claim_job, complete_job, transition_to_running};
-use crate::job_calls::{claim_job, complete_job, transition_to_running};
 use aruna_blob::blob::{BackendRegistry, BlobHandler, NodeBackend};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};

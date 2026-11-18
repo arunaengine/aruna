@@ -1444,7 +1444,7 @@ async fn removal_keeps_rest() {
         let mutation = UpdateDocumentMutation::RemoveDataEntity { id: id.to_string() };
         let token = Some(AuthToken::Internal(fixture.auth()));
         let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
-        crate::driver::drive(
+        aruna_operations::driver::drive(
             RouteUpdateOperation::new(
                 (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
                 (Some(record.clone()), document),
@@ -1562,7 +1562,7 @@ async fn pending_graph_refused() {
         let token = Some(AuthToken::Internal(fixture.auth()));
         let (ctx, actor) = (&broker.ctx, fixture.actor.clone());
         let expected = Some(Ulid::from_string(&pending).unwrap());
-        crate::driver::drive(
+        aruna_operations::driver::drive(
             RouteUpdateOperation::new(
                 (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
                 (Some(record.clone()), document),
@@ -1651,7 +1651,7 @@ async fn unprojected_event_refused() {
             fixture.actor.clone(),
             Some(record.last_event_id),
         );
-        crate::driver::drive(
+        aruna_operations::driver::drive(
             RouteUpdateOperation::new(
                 (actor, ctx.net_handle.as_ref().map(|net| net.node_id())),
                 (Some(record.clone()), document),
