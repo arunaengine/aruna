@@ -216,7 +216,7 @@ async fn job_context(
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    crate::jobs::store::query::insert_job(&driver, &record)
+    crate::jobs::store::test_calls::insert_job(&driver, &record)
         .await
         .unwrap();
     let ctx = JobContext {
