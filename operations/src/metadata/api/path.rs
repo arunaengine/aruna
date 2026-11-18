@@ -21,6 +21,9 @@ use crate::realm::load_config::load_realm_config;
 use super::read::load_claim_records;
 use aruna_core::StructuredId;
 use futures_util::StreamExt;
+use crate::driver::drive;
+use crate::auth::request_authorization::GroupRulesOperation;
+use crate::auth::enforcement::PolicyBulkOperation;
 
 pub(super) fn select_forward_peers(
     config: &RealmConfigDocument,
@@ -283,18 +286,11 @@ pub(crate) async fn local_path_candidates(
             holds_placement(&config, &registry_placement(&config, record), net.node_id())
         });
     }
-    let permissions = GroupPermissionRules::collect(
-        context,
-        auth.filter(|auth| auth.realm_id == realm_id),
-        records.iter().map(|record| record.group_id),
-    )
+    let permissions = drive(GroupRulesOperation::new(auth.filter(|auth| auth.realm_id == realm_id), records.iter().map(|record| record.group_id)), context)
     .await;
-    let evaluators = crate::auth::enforcement::PolicyEvaluator::load_bulk(
-        context,
-        records
+    let evaluators = drive(PolicyBulkOperation::new(records
             .iter()
-            .map(|record| (record.realm_id, record.group_id)),
-    )
+            .map(|record| (record.realm_id, record.group_id))), context)
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let policy_auth = auth;

@@ -13,12 +13,13 @@ use aruna_core::structs::identity::group_delete::{
 
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::{ForwardAuthError, authorize_forwarded_caller};
+use crate::forward::authorize::ForwardAuthError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::peer_trust::is_sync_eligible;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
+use crate::forward::authorize::ForwardedCallerOperation;
 
 pub(crate) async fn apply_request(
     context: &Arc<DriverContext>,
@@ -34,7 +35,7 @@ pub(crate) async fn apply_request(
             return Err(GroupDeletionError::Invalid("invalid group request".into()));
         };
         if let GroupDeleteAction::Start { group_id } = action {
-            let auth = authorize_forwarded_caller(context, peer, *net.realm_id(), &message)
+            let auth = drive(ForwardedCallerOperation::new(peer, *net.realm_id(), &message), context)
                 .await
                 .map_err(|error| match error {
                     ForwardAuthError::Unavailable(reason) => {

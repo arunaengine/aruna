@@ -23,7 +23,6 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::harvest::create_connector::INVENIO_TOKEN as CONNECTOR_TOKEN;
@@ -32,6 +31,7 @@ use crate::harvest::repository::{parse_secret_read, read_secret_effect};
 
 use super::executor::JobContext;
 use super::export::ExportCheckpoint;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 pub mod check;
 pub mod invenio;
@@ -388,14 +388,7 @@ pub(crate) async fn open_connector(
     permission: Permission,
     credential: Option<&RepositoryCredential>,
 ) -> Result<(ConnectorView, Option<String>), TransferError> {
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &format!("/{}/g/{group_id}/meta/**", auth.realm_id),
-        &permission,
-        PolicyRequestExtras::operation("metadata.repository"),
-    )
+    drive(AuthorizeOperation::new(auth.realm_id, auth, &format!("/{}/g/{group_id}/meta/**", auth.realm_id), &permission, PolicyRequestExtras::operation("metadata.repository")), context)
     .await
     .map_err(|error| match error {
         AuthorizeError::Storage(_)

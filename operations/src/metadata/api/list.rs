@@ -20,6 +20,8 @@ use aruna_core::handle::Handle;
 use futures_util::StreamExt;
 
 use crate::metadata::live_records::LiveRecordsOperation;
+use crate::auth::request_authorization::GroupRulesOperation;
+use crate::auth::enforcement::PolicyBulkOperation;
 
 // Bounded so a single summary page cannot saturate the craqle read permits.
 pub(super) const FANOUT_LIMIT: usize = 8;
@@ -82,24 +84,17 @@ pub async fn list_visible_documents(
         .auth
         .as_ref()
         .filter(|auth| auth.realm_id == realm_id);
-    let permissions = GroupPermissionRules::collect(
-        context,
-        auth,
-        records
+    let permissions = drive(GroupRulesOperation::new(auth, records
             .iter()
             .filter(|record| record.realm_id == realm_id)
-            .map(|record| record.group_id),
-    )
+            .map(|record| record.group_id)), context)
     .await;
     // RBAC/public visibility is additionally constrained by the metadata.read
     // request policies, loaded once per distinct group (fail-closed on error).
-    let evaluators = crate::auth::enforcement::PolicyEvaluator::load_bulk(
-        context,
-        records
+    let evaluators = drive(PolicyBulkOperation::new(records
             .iter()
             .filter(|record| record.realm_id == realm_id)
-            .map(|record| (record.realm_id, record.group_id)),
-    )
+            .map(|record| (record.realm_id, record.group_id))), context)
     .await
     .map_err(|_| MetadataApiError::ServiceUnavailable)?;
     let policy_auth = request.auth.as_ref();

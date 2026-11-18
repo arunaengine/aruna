@@ -4,7 +4,6 @@
 
 use super::state::{Ancestry, reduce};
 use super::{GitError, objects, publish, records};
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -24,6 +23,7 @@ use aruna_core::structs::storage::dataset_location::{DatasetLocation, default_bu
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// The chosen location, or the default one; `true` marks the default.
 pub async fn effective(
@@ -240,14 +240,7 @@ async fn permit(
     } else {
         object_permission_path(auth.realm_id, bucket.group_id, node, name, prefix)
     };
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
+    drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::WRITE, PolicyRequestExtras::rest()), context)
     .await?;
     Ok(())
 }

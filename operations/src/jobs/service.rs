@@ -47,7 +47,6 @@ use super::submit::{
 use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, mint_unplaced};
 use super::workflow::finalize::finalize_followups;
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::lifecycle::held::HeldReservations;
@@ -64,6 +63,7 @@ use super::lifecycle::routing::{family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
 use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
@@ -802,7 +802,7 @@ async fn linked_push_job(
     ];
     for (path, permission) in checks {
         let extras = PolicyRequestExtras::rest();
-        match authorize(context, auth.realm_id, auth, &path, &permission, extras).await {
+        match drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, extras), context).await {
             Ok(()) => {}
             Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => return Ok(None),
             Err(AuthorizeError::CheckFailed(error)) => return Err(error),
@@ -833,14 +833,7 @@ async fn joined_pid_job(
     else {
         return Ok(None);
     };
-    match authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &document.permission_path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
+    match drive(AuthorizeOperation::new(auth.realm_id, auth, &document.permission_path, &Permission::WRITE, PolicyRequestExtras::rest()), context)
     .await
     {
         Ok(()) => {

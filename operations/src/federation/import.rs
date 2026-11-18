@@ -23,7 +23,6 @@ use serde::Serialize;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::drive_retry;
@@ -36,6 +35,7 @@ use crate::jobs::store::state::read_job_record;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::execution::job::dedup_index_key;
 use aruna_core::structs::execution::job::upload_stale;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 const IMPORT_OPERATION: &str = "federation.import";
 
@@ -167,7 +167,7 @@ pub async fn authorize_import(
                 .unwrap_or_default(),
             ..Default::default()
         };
-        authorize(context, realm_id, auth, &path, &Permission::WRITE, extras)
+        drive(AuthorizeOperation::new(realm_id, auth, &path, &Permission::WRITE, extras), context)
             .await
             .map_err(|_| ImportError::Denied)?;
     }

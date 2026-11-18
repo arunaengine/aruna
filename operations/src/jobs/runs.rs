@@ -11,10 +11,11 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 use crate::jobs::store::attempt::{read_crate_status, read_run_link};
+use crate::driver::drive;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 #[derive(Debug, Error)]
 pub enum RunReadError {
@@ -58,7 +59,7 @@ pub async fn read_run(
             document_id,
         );
         let extras = PolicyRequestExtras::rest();
-        match authorize(context, realm_id, auth, &path, &Permission::READ, extras).await {
+        match drive(AuthorizeOperation::new(realm_id, auth, &path, &Permission::READ, extras), context).await {
             Ok(()) => {}
             Err(AuthorizeError::Storage(error)) => {
                 return Err(RunReadError::Unavailable(error.to_string()));

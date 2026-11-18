@@ -29,7 +29,6 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
@@ -52,6 +51,7 @@ use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::staging::bucket_guard::BucketGuardOperation;
 use crate::staging::offered_directory::OfferedDirectoryError;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Pulls this node is running, by receipt key. The registry lives as long as the process, so a
 /// restart forgets a running pull and the device asks for it again.
@@ -420,14 +420,7 @@ pub(crate) async fn authorize_pull(
     permission: Permission,
     operation: &'static str,
 ) -> Result<(), SyncRefusal> {
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &path,
-        &permission,
-        PolicyRequestExtras::operation(operation),
-    )
+    drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, PolicyRequestExtras::operation(operation)), context)
     .await
     .map_err(pull_refusal)
 }

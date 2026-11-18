@@ -32,7 +32,6 @@ use super::{
     MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,
 };
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
@@ -50,6 +49,9 @@ use crate::sync::sync_relationship::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::node_state::ReadInfoOperation;
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::forward::realm::ApplyRelayOperation;
+use crate::forward::token::ApplyRevokeOperation;
 
 impl MetadataHandle {
     #[allow(clippy::too_many_arguments)]
@@ -166,14 +168,7 @@ impl MetadataHandle {
             net_handle.node_id(),
             local_bucket,
         );
-        match authorize(
-            context.as_ref(),
-            *net_handle.realm_id(),
-            &auth,
-            &path,
-            &Permission::WRITE,
-            extras,
-        )
+        match drive(AuthorizeOperation::new(*net_handle.realm_id(), &auth, &path, &Permission::WRITE, extras), context.as_ref())
         .await
         {
             Ok(()) => {}
@@ -248,14 +243,7 @@ async fn delete_mirror(
                     net_handle.node_id(),
                     local_bucket,
                 );
-                match authorize(
-                    context.as_ref(),
-                    *net_handle.realm_id(),
-                    auth,
-                    &path,
-                    &Permission::WRITE,
-                    extras,
-                )
+                match drive(AuthorizeOperation::new(*net_handle.realm_id(), auth, &path, &Permission::WRITE, extras), context.as_ref())
                 .await
                 {
                     Ok(()) => {}
@@ -903,7 +891,7 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 Box::pin(async {
-                    crate::forward::entry::apply_token_revoke(context, peer, forward).await
+                    drive(ApplyRevokeOperation::new(context.node_and_realm(), peer, forward), context).await.unwrap_or_else(|error| reject(format!("token revocation failed: {error}")))
                 })
                 .await
             }
@@ -1015,7 +1003,7 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
                 Box::pin(async {
-                    crate::forward::entry::apply_admin_relay(context, peer, forward).await
+                    drive(ApplyRelayOperation::new(context.node_and_realm(), peer, forward), context).await.unwrap_or_else(|error| { tracing::warn!(%error, "Failed to persist a relayed admin event"); MetadataTransportMessage::ForwardedWriteUnavailable })
                 })
                 .await
             }

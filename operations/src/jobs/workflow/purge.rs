@@ -23,7 +23,6 @@ use super::super::store::{put_purge_checkpoint, read_purge_checkpoint};
 use super::purge_audit::{WriteAuditOperation, purge_audit_record};
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::drive_retry;
 use crate::driver::{DriverContext, drive};
@@ -39,6 +38,7 @@ use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, version_pins
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::structs::storage::release::MembershipQuery;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 const PURGE_BATCH_SIZE: usize = 1_000;
 /// How often a paused purge looks whether it was resumed.
@@ -432,14 +432,7 @@ async fn authorize_object(
         spec.scope.bucket(),
         key,
     );
-    authorize(
-        &ctx.driver,
-        spec.auth_context.realm_id,
-        &spec.auth_context,
-        &path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
+    drive(AuthorizeOperation::new(spec.auth_context.realm_id, &spec.auth_context, &path, &Permission::WRITE, PolicyRequestExtras::rest()), &ctx.driver)
     .await
     .map_err(|error| match error {
         AuthorizeError::PermissionDenied

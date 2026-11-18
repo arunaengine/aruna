@@ -5,7 +5,6 @@
 use super::objects::{self, Blob};
 use super::state::{Ancestry, reduce};
 use super::{GitError, publish, records, repository};
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::resolve::version_holders;
 use crate::driver::DriverContext;
@@ -22,6 +21,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
 use ulid::Ulid;
+use crate::driver::drive;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 fn key(id: Ulid, oid: &str) -> String {
     format!("git-lfs/{id}/{oid}")
@@ -65,14 +66,7 @@ async fn permit(
         &object.bucket,
         &object.key,
     );
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &path,
-        &permission,
-        PolicyRequestExtras::rest(),
-    )
+    drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, PolicyRequestExtras::rest()), context)
     .await?;
     Ok(())
 }

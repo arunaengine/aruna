@@ -17,12 +17,12 @@ use aruna_core::structs::storage::distribution::ticket::{
 };
 use thiserror::Error;
 
-use crate::auth::bearer_token::grant_valid;
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
+use crate::auth::bearer_token::GrantValidOperation;
 
 /// Seconds a spent nonce outlives its ticket, for clocks that run behind the issuer's.
 const SPENT_MARGIN_SECS: u64 = 60;
@@ -95,7 +95,7 @@ pub async fn redeem_ticket(
     if !is_sync_eligible(&config, ticket.issuer) {
         return Err(RedeemError::Issuer);
     }
-    match grant_valid(&context.storage_handle, &ticket.grant, &ticket.user_id).await {
+    match drive(GrantValidOperation::new(&ticket.grant, &ticket.user_id), &context).await {
         Ok(true) => {}
         Ok(false) => return Err(RedeemError::Revoked),
         Err(_) => return Err(RedeemError::Unavailable),

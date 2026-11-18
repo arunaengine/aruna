@@ -26,7 +26,7 @@ use ulid::Ulid;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::{ForwardAuthError, authorize_write};
+use crate::forward::authorize::ForwardAuthError;
 use crate::forward::fetch::FanoutOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::peer_trust::is_sync_eligible;
@@ -37,6 +37,8 @@ use super::commit::CommitOperation;
 use super::onboarding::InstallOperation;
 use super::prepare::PrepareOperation;
 use super::resources::render;
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::forward::authorize::write_check;
 
 pub(super) fn coordinator(config: &RealmConfigDocument) -> Result<NodeId, GroupDeletionError> {
     config
@@ -110,7 +112,7 @@ pub(super) async fn authorize(
         paths.push(format!("/{}/g/{group_id}/admin", auth.realm_id));
     }
     for path in paths {
-        match authorize_write(context, auth.clone(), path).await {
+        match drive(write_check(&auth, &path), context).await.map_err(ForwardAuthError::from) {
             Ok(()) => return Ok(()),
             Err(ForwardAuthError::Unavailable(reason)) => {
                 return Err(GroupDeletionError::Unavailable(reason));
@@ -133,14 +135,7 @@ pub(super) async fn visible(
     let mut kept = Vec::new();
     for name in names {
         let path = bucket_permission_path(auth.realm_id, group_id, node, &name);
-        let read = crate::auth::request_authorization::authorize(
-            context,
-            auth.realm_id,
-            auth,
-            &path,
-            &Permission::READ,
-            PolicyRequestExtras::rest(),
-        )
+        let read = drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, PolicyRequestExtras::rest()), context)
         .await;
         if read.is_ok() {
             kept.push(name);

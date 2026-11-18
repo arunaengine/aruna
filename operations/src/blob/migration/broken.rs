@@ -16,6 +16,8 @@ use aruna_core::types::Key;
 use super::check::{CheckOutcome, CheckVersionOperation};
 use super::drain::{BUCKET_PAGE, MIGRATION_CONTINUE, MIGRATION_PAGE};
 use crate::driver::DriverContext;
+use crate::driver::drive;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Advances the unfinished checks at the head of the queue by one page each. Returns when
 /// the task must run again.
@@ -275,7 +277,6 @@ async fn clean_one(
     cleaned: &mut Cleaned,
 ) -> Result<bool, String> {
     use crate::auth::error::AuthorizeError;
-    use crate::auth::request_authorization::authorize;
     use crate::auth::request_policy::PolicyRequestExtras;
     use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
     use aruna_core::structs::identity::auth::Permission;
@@ -287,14 +288,7 @@ async fn clean_one(
         &key.key,
     );
     let extras = PolicyRequestExtras::rest();
-    match authorize(
-        context,
-        template.realm_id,
-        auth,
-        &path,
-        &Permission::WRITE,
-        extras,
-    )
+    match drive(AuthorizeOperation::new(template.realm_id, auth, &path, &Permission::WRITE, extras), context)
     .await
     {
         Ok(()) => {}

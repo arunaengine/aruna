@@ -19,7 +19,6 @@ use super::alias::AliasFamilyOperation;
 use super::publish::publish_terminal;
 use super::routing::family_projection;
 use super::updates::{SETTLE_RETRY_AFTER, schedule_terminal_settle};
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::protocol::send_job_request;
@@ -33,6 +32,7 @@ use crate::jobs::store::JobMutationError;
 use crate::jobs::store::attempt::{CancelRequestOutcome, set_cancel_requested};
 use crate::realm::load_config::load_realm_config;
 use aruna_core::metadata::AuthToken;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Cancels one external job through its family. `None` means the alias names no
 /// family here, so the caller keeps its ordinary local cancellation.
@@ -95,14 +95,7 @@ async fn cancel_authority(
         return Some(CancelAuthority::Submitter);
     }
     let local = context.net_handle.as_ref()?.node_id();
-    authorize(
-        context,
-        spec.realm_id,
-        auth,
-        &group_permission_path(spec.realm_id, spec.group_id, local),
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
+    drive(AuthorizeOperation::new(spec.realm_id, auth, &group_permission_path(spec.realm_id, spec.group_id, local), &Permission::WRITE, PolicyRequestExtras::rest()), context)
     .await
     .ok()
     .map(|()| CancelAuthority::GroupAdmin)

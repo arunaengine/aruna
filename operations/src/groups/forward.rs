@@ -5,8 +5,6 @@
 use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::forward::authorize::authorize_forwarded_caller;
-use crate::forward::authorize::authorize_write;
 use crate::forward::authorize::forward_auth_error;
 use crate::forward::transport::RetryDisposition;
 use crate::forward::transport::reject;
@@ -33,6 +31,9 @@ use thiserror::Error;
 use tokio::time::timeout;
 use tracing::warn;
 use ulid::Ulid;
+use crate::forward::authorize::ForwardAuthError;
+use crate::forward::authorize::ForwardedCallerOperation;
+use crate::forward::authorize::write_check;
 
 pub(super) const CREATE_PEER_LIMIT: usize = 4;
 
@@ -150,7 +151,7 @@ pub(crate) async fn apply_group_create(
     if !is_sync_eligible(&config, net_handle.node_id()) {
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     }
-    let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
+    let auth = match drive(ForwardedCallerOperation::new(peer, realm_id, &message), context).await {
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
     };
@@ -162,8 +163,7 @@ pub(crate) async fn apply_group_create(
     let MetadataTransportMessage::ForwardGroupCreate { display_name, .. } = message else {
         return reject("unexpected group create message");
     };
-    let realm_admin = authorize_write(context, auth.clone(), format!("/{realm_id}/admin/groups"))
-        .await
+    let realm_admin = drive(write_check(&auth, &format!("/{realm_id}/admin/groups")), context).await.map_err(ForwardAuthError::from)
         .is_ok();
     let owner_cap = if realm_admin {
         None

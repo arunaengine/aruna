@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 use crate::driver::{drive, drive_until};
@@ -26,6 +25,7 @@ use crate::metadata::audit::{
     AuditAggregate, ListAuditError, ListAuditOperation, ListAuditRequest, LocalPageOperation,
     decode_cursor,
 };
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Gathers the group's audit trail from every eligible realm node and merges the
 /// pages. `local_node` reads its own keyspace directly; the remaining nodes are
@@ -231,14 +231,7 @@ pub(super) async fn authorize_admin(
     auth_context: AuthContext,
     path: String,
 ) -> Result<(), MetadataReadError> {
-    match authorize(
-        context.as_ref(),
-        auth_context.realm_id,
-        &auth_context,
-        &path,
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
+    match drive(AuthorizeOperation::new(auth_context.realm_id, &auth_context, &path, &Permission::WRITE, PolicyRequestExtras::rest()), context.as_ref())
     .await
     {
         Ok(()) => Ok(()),

@@ -23,8 +23,6 @@ use aruna_core::transfer::{ExportGrant, GrantError, GrantRecord, PinnedSource, c
 use ulid::Ulid;
 use url::Url;
 
-use crate::auth::bearer_token::realm_user_cutoff;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::federation::grant::{IssueGrantConfig, IssueGrantOperation, record_key};
@@ -32,6 +30,8 @@ use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::export::{crate_jsonld, unheld_bucket};
 use crate::jobs::key_wake::read_row;
 use crate::replication::plaintext::HolderCheckOperation;
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::auth::bearer_token::UserCutoffOperation;
 
 const EXPORT_OPERATION: &str = "federation.export";
 
@@ -60,14 +60,7 @@ pub async fn authorize_export(
         ]),
         ..Default::default()
     };
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        document_path,
-        &Permission::READ,
-        extras,
-    )
+    drive(AuthorizeOperation::new(auth.realm_id, auth, document_path, &Permission::READ, extras), context)
     .await
     .map_err(|_| GrantError::Denied)
 }
@@ -144,7 +137,7 @@ async fn recheck(
     auth: &AuthContext,
     record: &GrantRecord,
 ) -> Result<(), GrantError> {
-    let cutoff = realm_user_cutoff(&context.storage_handle, auth.realm_id, &record.principal)
+    let cutoff = drive(UserCutoffOperation::new(auth.realm_id, &record.principal), &context)
         .await
         .map_err(|error| GrantError::Storage(error.to_string()))?;
     // A credential cutoff of the consenting user also ends grants issued before it.

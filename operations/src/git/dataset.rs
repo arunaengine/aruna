@@ -6,7 +6,6 @@ use super::objects::{self, Blob};
 use super::project::author;
 use super::snapshot::execute;
 use super::{GitError, lfs, location, publish};
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
@@ -22,6 +21,7 @@ use aruna_core::structs::storage::dataset_location::DatasetLocation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// What a push to main stores: the location, its bucket here, and the changed files.
 pub(super) struct PushTarget {
@@ -157,14 +157,7 @@ impl PushTarget {
             .ok_or(GitError::Unavailable)?;
         let target = object_permission_path(auth.realm_id, bucket.group_id, node, name, &key);
         let extras = PolicyRequestExtras::operation("s3.PutObject");
-        authorize(
-            context,
-            auth.realm_id,
-            &auth,
-            &target,
-            &Permission::WRITE,
-            extras,
-        )
+        drive(AuthorizeOperation::new(auth.realm_id, &auth, &target, &Permission::WRITE, extras), context)
         .await?;
         let content = match LfsObject::from_pointer(&bytes) {
             Some(pointer) => match lfs::locate(context, document, &pointer.oid).await? {
@@ -261,14 +254,7 @@ async fn copied(
         &source.key,
     );
     let extras = PolicyRequestExtras::operation("s3.GetObject");
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::READ,
-        extras,
-    )
+    drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras), context)
     .await?;
     let quota = drive(GetConfigOperation::new(auth.realm_id), context)
         .await

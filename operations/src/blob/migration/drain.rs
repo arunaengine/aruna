@@ -35,6 +35,9 @@ use super::{
 };
 use super::{batch, broken, check};
 use crate::blob::records::blob_location_read;
+use crate::driver::drive;
+use crate::auth::request_authorization::BucketAccessOperation;
+use crate::auth::bearer_token::GrantValidOperation;
 
 /// The rename request of the move `record` of `bucket`, if it was started to rename files.
 pub(super) async fn rename_request(
@@ -73,11 +76,7 @@ pub(super) async fn rename_access(
     bucket: &str,
 ) -> Result<Option<crate::auth::request_authorization::BucketAccess>, String> {
     use crate::auth::request_authorization::BucketAccess;
-    let valid = crate::auth::bearer_token::grant_valid(
-        &context.storage_handle,
-        &request.grant,
-        &request.auth.user_id,
-    );
+    let valid = drive(GrantValidOperation::new(&request.grant, &request.auth.user_id), &context);
     if !valid.await.map_err(|error| error.to_string())? {
         return Ok(None);
     }
@@ -86,7 +85,7 @@ pub(super) async fn rename_access(
         return Ok(None);
     }
     let scope = (request.auth.realm_id, routing.group_id, request.node_id);
-    let loaded = BucketAccess::load(context, &request.auth, scope, bucket).await;
+    let loaded = drive(BucketAccessOperation::new(&request.auth, scope, bucket), context).await;
     let Some(access) = granted(loaded)? else {
         return Ok(None);
     };

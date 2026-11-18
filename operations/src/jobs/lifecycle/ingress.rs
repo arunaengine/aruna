@@ -43,7 +43,6 @@ use super::submission_rules::{
 };
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::pages::{load_chain, page_request};
@@ -64,6 +63,7 @@ use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperat
 use aruna_core::jobs::{InputResolveRequest, SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::storage::release::MembershipQuery;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Resolves inputs this node holds for an ingress, under a bearer validated here, so grants
 /// vouch only for an identity this node checked. Each answer is an input after its links with
@@ -738,14 +738,7 @@ async fn readable_metadata(
 ) -> Result<Option<CapturedDatabase>, String> {
     let path = bucket_permission_path(auth.realm_id, info.group_id, local, bucket);
     let extras = PolicyRequestExtras::rest();
-    let metadata = match authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &path,
-        &Permission::READ,
-        extras,
-    )
+    let metadata = match drive(AuthorizeOperation::new(auth.realm_id, auth, &path, &Permission::READ, extras), context)
     .await
     {
         Ok(()) => bucket_metadata(context, bucket, info).await?,
@@ -997,14 +990,7 @@ async fn authorize_group(
     request: &SubmissionRequest,
     local: NodeId,
 ) -> Result<(), AuthorizeError> {
-    authorize(
-        context,
-        auth.realm_id,
-        auth,
-        &group_permission_path(auth.realm_id, request.spec.group_id, local),
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
+    drive(AuthorizeOperation::new(auth.realm_id, auth, &group_permission_path(auth.realm_id, request.spec.group_id, local), &Permission::WRITE, PolicyRequestExtras::rest()), context)
     .await
 }
 

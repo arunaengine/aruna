@@ -56,15 +56,15 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::forward::authorize::ForwardAuthError;
-use crate::forward::authorize::authorize_forwarded_caller;
-use crate::forward::authorize::authorize_write;
-use crate::forward::entry::held_record;
 use crate::forward::replay::HeldRecordError;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::reject;
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::realm::peer_trust::peer_acts_for;
 use std::str::FromStr;
+use crate::forward::authorize::ForwardedCallerOperation;
+use crate::forward::authorize::write_check;
+use crate::forward::replay::HeldRecordOperation;
 
 pub(super) const GROUP_SCAN_PAGE: usize = 10_000;
 
@@ -477,7 +477,7 @@ pub(super) async fn run_device_batch(
     if !is_sync_eligible(&config, net_handle.node_id()) {
         return Err(SyncRefusal::Unavailable);
     }
-    let auth = authorize_forwarded_caller(context, peer, realm_id, &message)
+    let auth = drive(ForwardedCallerOperation::new(peer, realm_id, &message), context)
         .await
         .map_err(|error| match error {
             ForwardAuthError::Unauthorized => SyncRefusal::Unauthorized,
@@ -499,7 +499,7 @@ pub(super) async fn run_device_batch(
     if config.digest().ok() != Some(config_digest) {
         return Err(SyncRefusal::Unavailable);
     }
-    let record = held_record(context, &config, net_handle.node_id(), document_id)
+    let record = drive(HeldRecordOperation::new(config.clone(), net_handle.node_id(), document_id), context)
         .await
         .map_err(|error| match error {
             HeldRecordError::NotFound => SyncRefusal::NotFound,
@@ -512,8 +512,7 @@ pub(super) async fn run_device_batch(
             "the batch was planned against another document".to_string(),
         ));
     }
-    authorize_write(context, auth.clone(), record.permission_path.clone())
-        .await
+    drive(write_check(&auth, &record.permission_path.clone()), context).await.map_err(ForwardAuthError::from)
         .map_err(|error| match error {
             ForwardAuthError::Unauthorized => SyncRefusal::Unauthorized,
             ForwardAuthError::Forbidden => SyncRefusal::Forbidden,
