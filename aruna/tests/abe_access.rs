@@ -9,7 +9,7 @@ use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_seal::{SealedSecret, open_sealed, seal_to};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::abe::{
     AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
@@ -859,7 +859,7 @@ async fn abe_holders() -> TestResult<()> {
         let racing = KeyGrant { context: context.clone(), enc: [1; 32], ciphertext: vec![1; 16] };
         let auth = AuthContext { user_id: seed.user_id, realm_id: seed.realm_id, path_restrictions: None, session: None };
         let now = aruna_core::time::unix_timestamp_millis();
-        let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), KeyAction::Publish(racing), now);
+        let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), KeyAction::Publish(racing), now).into_machine();
         let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
             let Effect::Storage(effect) = effect else { panic!("unexpected effect {effect:?}") };
@@ -2166,7 +2166,8 @@ async fn abe_epochs() -> TestResult<()> {
         let now = aruna_core::time::unix_timestamp_millis();
         let action = KeyAction::Epoch { instant: false };
         let mut operation =
-            KeyOperation::new(BUCKET.into(), auth.clone(), node, action.clone(), now);
+            KeyOperation::new(BUCKET.into(), auth.clone(), node, action.clone(), now)
+                .into_machine();
         let mut effects: std::collections::VecDeque<Effect> =
             operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
@@ -2516,7 +2517,8 @@ async fn publish_racing(
     };
     let now = aruna_core::time::unix_timestamp_millis();
     let action = KeyAction::Publish(grant);
-    let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), action, now);
+    let mut operation =
+        KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), action, now).into_machine();
     let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     let mut race = Some(race);
     while let Some(effect) = effects.pop_front() {

@@ -29,7 +29,6 @@ pub mod offer;
 pub mod outbox;
 mod output_policies;
 pub mod plan;
-mod policies;
 pub mod publish;
 pub mod report;
 pub mod reservation;

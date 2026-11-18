@@ -938,10 +938,10 @@ pub mod test {
             operation.next(IoResult::Done),
             Ok(Next::Call(IoCall::Delete(deletes)))
         );
-        // The group's bucket fence is read inside the transaction before the commit.
+        // A realm without a candidate map has no fence to read, so the write ends here.
         assert!(matches!(
             operation.next(IoResult::Done),
-            Ok(Next::Call(IoCall::Read(reads))) if !reads.is_empty()
+            Ok(Next::Done((_, true, true)))
         ));
 
         // With admin events queued, the drain wake and the new member's notice follow.

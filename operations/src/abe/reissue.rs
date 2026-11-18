@@ -5,8 +5,7 @@
 use super::epoch::{parse_progress, progress};
 use super::*;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::events::SubOperationEvent;
-use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::{NodeId, UserId};
@@ -267,7 +266,7 @@ impl Operation for ProgressWrite {
 
 impl KeyOperation {
     /// After node issuance, runs the next page of a raise's saved reissue progress, if any.
-    pub(super) fn walk(&mut self) -> Effects {
+    pub(super) fn walk(&self) -> Option<IoCall> {
         let issuing = matches!(
             self.action,
             KeyAction::Request(_)
@@ -276,22 +275,12 @@ impl KeyOperation {
                 | KeyAction::Writes(_)
         );
         if self.quiet || !issuing {
-            self.state = State::Done;
-            self.output = self.result.take().map(Ok);
-            return smallvec![];
+            return None;
         }
-        self.state = State::Reissue;
         let bucket = self.bucket.clone();
         let page =
             ReissueOperation::new(bucket, self.auth.clone(), self.node, self.now, MAX_REQUESTS);
-        let sub = boxed_suboperation(page, |result| {
-            let more = result.unwrap_or_else(|error| {
-                tracing::warn!(event = "abe.reissue.failed", error = %error);
-                false
-            });
-            Event::SubOperation(SubOperationEvent::ReissuePaged { more })
-        });
-        smallvec![Effect::SubOperation(sub)]
+        Some(IoCall::child(page))
     }
 }
 impl Operation for ReissueOperation {
@@ -450,14 +439,11 @@ mod tests {
         let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
         let mut run = KeyOperation::new("bucket".into(), auth, node, action, 1).quiet();
         run.state = State::Snapshot;
-        let values = vec![(Key::from(Vec::new()), None); 8];
-        assert!(
-            run.step(Event::Storage(StorageEvent::BatchReadResult { values }))
-                .is_empty()
-        );
-        assert!(run.is_complete());
+        let failed = run.next(IoResult::Values(vec![None; 8]));
+        assert_eq!(failed, Err(KeyError::Storage));
         // No progress write follows: a later run resumes from the saved cursor.
-        let ran = IoResult::Child(ChildOutcome::new(run.finalize()));
+        let failed = failed.map(|_| KeyResult::Opened(Vec::new()));
+        let ran = IoResult::Child(ChildOutcome::new(failed));
         assert_eq!(operation.next(ran), Err(KeyError::Storage));
     }
 }
