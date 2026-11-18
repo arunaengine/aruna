@@ -3,341 +3,67 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::Duration;
 
-use aruna_blob::blob::{BlobHandle, InboundError, refuse_stream};
-use aruna_core::effects::BlobEffect;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
-    HashIndex, bucket_permission_path, object_permission_path,
+    BucketInfo, HashIndex, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::replication::ReplicationItemKind;
-use aruna_net::streams::BiStream;
-use tokio::time::timeout;
+use aruna_core::structs::storage::routing::NodeRouting;
+use thiserror::Error;
 use tracing::{debug, error, warn};
 use ulid::Ulid;
 
-use super::{IncomingVersionOperation, IncomingVersionResult};
-use crate::auth::enforcement::PolicyBulkOperation;
-use crate::auth::error::AuthorizeError;
-use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_authorization::GroupRulesOperation;
+use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionResult};
+use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
+use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
+use crate::auth::permission_rules::GroupPermissionRules;
+use crate::auth::request_authorization::{AuthorizeOperation, GroupRulesOperation};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive, node_routing};
+use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
+use crate::distribution::resolve::{
+    MAX_CONTENT_VERSIONS, ResolveError, content_versions, indexed_key,
+};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::groups::routing::{QuotaOperation, RoutingInputsError};
 use crate::notifications::watch::origin::EmitEventOperation;
+use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::realm::mutate_placement::node_kind;
-use crate::replication::bao_read::IncomingBaoOperation;
-use crate::replication::locations::LocationSummaryOperation;
+use crate::replication::bao_read::{BaoReadError, IncomingBaoOperation, IncomingBaoResult};
+use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
 use crate::replication::protocol::{
-    BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
+    BaoReadRequest, BaoReadTarget, LocationSummaryRequest, VersionReplicationManifest,
+    VersionReplicationMessage,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::bucket_guard::BucketGuardOperation;
+use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
 use crate::staging::offered_directory::OfferedDirectoryError;
 
-const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
+type StreamTurn = Result<Next<()>, IoError>;
+type ManifestPaths = (Option<String>, Option<String>);
+type ReadPolicy = (HashSet<String>, Vec<HashIndex>, bool);
+type ContentPage = (Vec<(Ulid, String)>, bool);
 
-/// What the bao plane admits this peer as. Replication is trusted from
-/// sync-eligible realm nodes only; an owner-bound device gets bao reads alone from
-/// a sync-eligible node, never becoming a replication source. Fails closed.
-async fn bao_peer_admitted(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local: NodeId,
-    peer: NodeId,
-) -> Option<BaoAdmission> {
-    let config = match drive(GetConfigOperation::new(realm_id), context).await {
-        Ok(config) => config,
-        Err(error) => {
-            warn!(peer = %peer, error = %error, "Failed to read realm config for replication gate");
-            return None;
-        }
-    };
-    let eligible = match config.sync_eligible_nodes() {
-        Ok(ids) => ids,
-        Err(error) => {
-            warn!(peer = %peer, error = %error, "Failed to resolve replication peers");
-            return None;
-        }
-    };
-    if eligible.contains(&peer) {
-        return Some(BaoAdmission::Infra);
-    }
-    // Only a realm node answers a device, so a device never reaches another
-    // device's plane.
-    let device = node_kind(&config, peer)
-        .and_then(|kind| kind.owner())
-        .is_some();
-    (device && eligible.contains(&local)).then_some(BaoAdmission::DeviceRead)
+fn close_call(stream_id: Ulid) -> IoCall {
+    Effect::Blob(BlobEffect::CloseConnection { stream_id }).into()
 }
 
-/// Bounded admission read: identity comes from the realm config, never from
-/// the remote's claim, and a slow store read must not hold the stream open.
-async fn bao_admission(
-    context: &DriverContext,
-    realm_id: RealmId,
-    local: NodeId,
-    peer: NodeId,
-) -> Option<BaoAdmission> {
-    timeout(
-        INBOUND_BAO_TIMEOUT,
-        bao_peer_admitted(context, realm_id, local, peer),
-    )
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Executes the manifest/reference-advance family for an admitted infra
-/// peer: routing, request policy, placement gate, and the watch emitted on
-/// success. Every refusal here closes the registered bao stream.
-#[allow(clippy::too_many_arguments)]
-async fn accept_version_replication(
-    context: &DriverContext,
-    rocrate_limits: &RoCrateLimits,
-    blob_handle: &BlobHandle,
-    realm_id: RealmId,
-    local_node: NodeId,
-    peer: NodeId,
-    stream_id: Ulid,
-    manifest: VersionReplicationManifest,
-) {
-    debug!(
-        peer = %peer,
-        stream_id = %stream_id,
-        bucket = %manifest.bucket,
-        key = %manifest.key,
-        version_id = %manifest.version_id,
-        kind = ?manifest.kind,
-        "Received inbound version replication manifest"
-    );
-    let watch_manifest = manifest.clone();
-    // Only a materialized item can place a blob, so only it reads the caps.
-    let routing = if manifest.kind == ReplicationItemKind::Materialized {
-        match crate::driver::drive(
-            crate::groups::routing::QuotaOperation::new(crate::driver::node_routing(context)),
-            context,
-        )
-        .await
-        {
-            Ok(routing) => routing,
-            Err(error) => {
-                error!(
-                    peer = %peer,
-                    error = %error,
-                    "Refusing inbound replication with unreadable routing inputs"
-                );
-                blob_handle.close_stream(stream_id).await;
-                return;
-            }
-        }
-    } else {
-        node_routing(context)
-    };
-    let (manifest_path, writer_path) =
-        match manifest_policy(context, realm_id, local_node, &manifest).await {
-            Ok(path) => path,
-            Err(error) => {
-                error!(
-                    peer = %peer,
-                    stream_id = %stream_id,
-                    error = %error,
-                    "Refusing inbound replication with unavailable request policy"
-                );
-                blob_handle.close_stream(stream_id).await;
-                return;
-            }
-        };
-    let gate = match crate::driver::drive(
-        crate::placement::policy::GateOperation::new(
-            realm_id,
-            aruna_core::time::unix_timestamp_millis(),
-        ),
-        context,
-    )
-    .await
-    {
-        Ok(gate) => gate,
-        Err(error) => {
-            error!(
-                peer = %peer,
-                stream_id = %stream_id,
-                error = %error,
-                "Refusing inbound replication with unreadable placement subject"
-            );
-            blob_handle.close_stream(stream_id).await;
-            return;
-        }
-    };
-    let mut op = IncomingVersionOperation::new(stream_id, local_node, realm_id, manifest)
-        .with_routing(routing)
-        .with_rocrate_limits(rocrate_limits.clone())
-        .with_publisher_node(peer)
-        .with_manifest_policy(manifest_path)
-        .with_writer_policy(writer_path);
-    if let Some(gate) = gate {
-        op = op.with_gate(gate);
+fn closed(result: IoResult) -> StreamTurn {
+    if let Event::Blob(BlobEvent::Error(error)) = result.event()? {
+        error!(error = ?error, "Failed to close rejected inbound bao stream");
     }
-    match drive(op, context).await {
-        Ok(result) => {
-            emit_replication_watch(context, local_node, &watch_manifest, &result).await;
-        }
-        Err(err) => {
-            error!(error = ?err, "Failed to process inbound version replication stream");
-            blob_handle.close_stream(stream_id).await;
-        }
-    }
-}
-
-/// Answers the bao read family: policy resolution, then the read operation;
-/// a policy or drive failure refuses the stream.
-async fn answer_bao_read(
-    context: &DriverContext,
-    blob_handle: &BlobHandle,
-    realm_id: RealmId,
-    local_node: NodeId,
-    peer: NodeId,
-    stream_id: Ulid,
-    request: BaoReadRequest,
-) {
-    let (policy_paths, policy_candidates, had_denial) =
-        match bao_policy(context, realm_id, local_node, &request).await {
-            Ok(result) => result,
-            Err(error) => {
-                error!(
-                    peer = %peer,
-                    stream_id = %stream_id,
-                    error = %error,
-                    "Refusing inbound bao read with unavailable request policy"
-                );
-                blob_handle.close_stream(stream_id).await;
-                return;
-            }
-        };
-    let op = IncomingBaoOperation::new(peer, local_node, realm_id, stream_id, request)
-        .with_policy_paths(policy_paths)
-        .with_policy_candidates(policy_candidates, had_denial)
-        .with_now(aruna_core::time::unix_timestamp_millis())
-        .with_snapshot();
-    if let Err(error) = drive(op, context).await {
-        error!(
-            peer = %peer,
-            stream_id = %stream_id,
-            error = ?error,
-            "Failed to process inbound bao read"
-        );
-        blob_handle.close_stream(stream_id).await;
-    }
-}
-
-/// Answers the location summary family. The summary describes what this
-/// node holds, so the request's own authenticated context decides whether
-/// anything is disclosed; a drive failure refuses the stream.
-async fn answer_location_summary(
-    context: &DriverContext,
-    blob_handle: &BlobHandle,
-    realm_id: RealmId,
-    local_node: NodeId,
-    peer: NodeId,
-    stream_id: Ulid,
-    request: LocationSummaryRequest,
-) {
-    let identity_allowed =
-        request.realm_id == realm_id && auth_matches(&request.auth_context, realm_id);
-    let op = LocationSummaryOperation::new_incoming(peer, local_node, stream_id, request)
-        .with_policy(identity_allowed);
-    if let Err(error) = drive(op, context).await {
-        error!(
-            peer = %peer,
-            stream_id = %stream_id,
-            error = ?error,
-            "Failed to answer inbound location summary"
-        );
-        blob_handle.close_stream(stream_id).await;
-    }
-}
-
-/// Answers which key this member's version id index holds for one version.
-async fn answer_version_key(
-    context: &DriverContext,
-    blob_handle: &BlobHandle,
-    stream_id: Ulid,
-    set_id: Ulid,
-    version_id: Ulid,
-) {
-    let key = drive(crate::distribution::resolve::indexed_key(set_id, version_id), context)
-        .await
-        .ok()
-        .flatten();
-    let Ok(payload) = VersionReplicationMessage::VersionKeyResponse(key).to_bytes() else {
-        blob_handle.close_stream(stream_id).await;
-        return;
-    };
-    let sent = blob_handle
-        .send_blob_effect(BlobEffect::SendMessage { stream_id, payload })
-        .await;
-    if let Event::Blob(BlobEvent::Error(error)) = sent {
-        debug!(error = ?error, "Failed to answer a version key lookup");
-    }
-    blob_handle.close_stream(stream_id).await;
-}
-
-/// Answers which versions this member's content index holds for one identity.
-async fn answer_content(
-    context: &DriverContext,
-    blob_handle: &BlobHandle,
-    stream_id: Ulid,
-    set_id: Ulid,
-    identity: [u8; 32],
-) {
-    use crate::distribution::resolve::{MAX_CONTENT_VERSIONS, content_versions};
-    let Ok((versions, more)) =
-        drive(content_versions(set_id, &identity, MAX_CONTENT_VERSIONS), context).await
-    else {
-        blob_handle.close_stream(stream_id).await;
-        return;
-    };
-    let answer = VersionReplicationMessage::ContentResponse { versions, more };
-    let Ok(payload) = answer.to_bytes() else {
-        blob_handle.close_stream(stream_id).await;
-        return;
-    };
-    let sent = blob_handle
-        .send_blob_effect(BlobEffect::SendMessage { stream_id, payload })
-        .await;
-    if let Event::Blob(BlobEvent::Error(error)) = sent {
-        debug!(error = ?error, "Failed to answer a content lookup");
-    }
-    blob_handle.close_stream(stream_id).await;
-}
-
-/// The bao plane input boundary: admission, bounded frame reads, and
-/// family-specific refusals all happen here or in the family handlers.
-pub(crate) async fn handle_bao_stream(
-    context: &DriverContext,
-    rocrate_limits: &RoCrateLimits,
-    stream: BiStream,
-    node_id: NodeId,
-) {
-    let Some(blob_handle) = context.blob_handle.clone() else {
-        error!("Cannot handle incoming bao stream without blob handle");
-        return;
-    };
-    let Some(net_handle) = context.net_handle.clone() else {
-        error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
-        return;
-    };
-    let realm_id = *net_handle.realm_id();
+    Ok(Next::Done(()))
     let local_node = net_handle.node_id();
     // #332: only an authenticated sync-eligible realm peer
     // may open the blob replication plane at all.
