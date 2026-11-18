@@ -203,3 +203,100 @@ fn failed_fanout_marked() {
         Ok(Next::Done(replies)) if matches!(replies[0].1, Err(GroupDeletionError::Unavailable(_)))
     ));
 }
+
+fn start_message() -> MetadataTransportMessage {
+    MetadataTransportMessage::GroupDeletion {
+        auth_token: None,
+        action: GroupDeleteAction::Start {
+            group_id: Ulid::from_bytes([3; 16]),
+        },
+    }
+}
+
+fn starting() -> ApplyRequestOperation {
+    let request = Ulid::from_bytes([6; 16]);
+    let mut operation = ApplyRequestOperation::new(local(), node(2), start_message(), request);
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    operation
+}
+
+fn caller() -> AuthContext {
+    AuthContext {
+        user_id: UserId::local(Ulid::from_bytes([4; 16]), realm()),
+        realm_id: realm(),
+        path_restrictions: None,
+        session: None,
+    }
+}
+
+fn caller_refused(error: ForwardAuthError) -> IoResult {
+    IoResult::Child(ChildOutcome::new(Err::<AuthContext, _>(error)))
+}
+
+#[test]
+fn request_needs_network() {
+    let request = Ulid::from_bytes([6; 16]);
+    let mut operation = ApplyRequestOperation::new(None, node(2), start_message(), request);
+    assert_eq!(operation.first(), Err(network_missing()));
+}
+
+#[test]
+fn other_message_invalid() {
+    let message = MetadataTransportMessage::WriteNotFound;
+    let request = Ulid::from_bytes([6; 16]);
+    let mut operation = ApplyRequestOperation::new(local(), node(2), message, request);
+    assert!(matches!(
+        operation.first(),
+        Err(GroupDeletionError::Invalid(_))
+    ));
+}
+
+#[test]
+fn start_runs_deletion() {
+    let mut operation = starting();
+    let accepted = IoResult::Child(ChildOutcome::new(Ok::<_, ForwardAuthError>(caller())));
+    assert!(matches!(
+        operation.next(accepted),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(operation.stage, RequestStage::Run);
+    assert_eq!(operation.next(done()), Ok(Next::Done(None)));
+}
+
+#[test]
+fn refused_start_unauthorized() {
+    assert_eq!(
+        starting().next(caller_refused(ForwardAuthError::Forbidden)),
+        Err(GroupDeletionError::Unauthorized)
+    );
+}
+
+#[test]
+fn unavailable_start_kept() {
+    let error = ForwardAuthError::Unavailable("down".to_string());
+    assert_eq!(
+        starting().next(caller_refused(error)),
+        Err(GroupDeletionError::Unavailable("down".to_string()))
+    );
+}
+
+#[test]
+fn control_request_answers() {
+    let message = MetadataTransportMessage::GroupDeletion {
+        auth_token: None,
+        action: abort(plan(node(2))),
+    };
+    let request = Ulid::from_bytes([6; 16]);
+    let mut operation = ApplyRequestOperation::new(local(), node(2), message, request);
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let reply = IoResult::Child(ChildOutcome::new(Ok::<_, GroupDeletionError>(
+        None::<GroupDeleteProof>,
+    )));
+    assert_eq!(operation.next(reply), Ok(Next::Done(None)));
+}

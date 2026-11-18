@@ -116,3 +116,24 @@ fn other_refusal_unchanged() {
     let mut operation = BlockedOperation::new(&auth(), group(), node(), error.clone());
     assert_eq!(operation.first(), Ok(Next::Done(error)));
 }
+
+#[test]
+fn absent_rows_empty() {
+    let mut operation = LoadGroupOperation::new(group());
+    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    assert_eq!(
+        operation.next(IoResult::Values(vec![None, None])),
+        Ok(Next::Done((None, None)))
+    );
+}
+
+#[test]
+fn garbled_group_unavailable() {
+    let mut operation = LoadGroupOperation::new(group());
+    operation.first().unwrap();
+    let garbled = aruna_core::types::Value::from(vec![0xff]);
+    assert!(matches!(
+        operation.next(IoResult::Values(vec![Some(garbled), None])),
+        Err(GroupDeletionError::Unavailable(_))
+    ));
+}

@@ -350,3 +350,7 @@ impl Operation for CheckGroupOperation {
 }
 
 fn drop_proof(_: Option<GroupDeleteProof>) {}
+
+#[cfg(test)]
+#[path = "scan_tests.rs"]
+mod call_tests;
