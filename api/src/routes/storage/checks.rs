@@ -12,7 +12,7 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, object_permissi
 use aruna_core::structs::storage::broken::{BrokenReason, StorageCheck};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::blob::migration::broken::{
-    clean_broken, is_current, list_broken, read_check,
+    CleanBrokenOperation, IsCurrentOperation, ListBrokenOperation, ReadCheckOperation,
 };
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::storage_check::{StartCheckError, StartCheckOperation};
@@ -227,7 +227,7 @@ pub async fn get_bucket_check(
     let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket(&state, &auth, &bucket, group_id, Permission::READ).await?;
     let ctx = state.get_ctx();
-    let progress = read_check(&ctx, &bucket)
+    let progress = drive(ReadCheckOperation::new(&bucket), &ctx)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let (broken, next) =
@@ -261,7 +261,7 @@ async fn visible_page(
             return Ok((broken, next));
         }
         let page = limit.min(scan - examined);
-        let (rows, more) = list_broken(&ctx, bucket, after.take(), page)
+        let (rows, more) = drive(ListBrokenOperation::new(bucket, after.take(), page), &ctx)
             .await
             .map_err(|error| ServerError::InternalError(error.into()))?;
         for (key, row) in rows {
@@ -304,7 +304,7 @@ async fn visible(
     group_id: ulid::Ulid,
     key: &aruna_core::structs::storage::blob::VersionKey,
 ) -> ServerResult<bool> {
-    if !is_current(&state.get_ctx(), key)
+    if !drive(IsCurrentOperation::new(key), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?
     {
@@ -426,16 +426,10 @@ pub async fn clean_bucket_check(
         node_id: state.get_node_id(),
         deleted_by: auth.user_id,
     };
-    let cleaned = clean_broken(
-        &state.get_ctx(),
-        &template,
-        &auth,
-        after,
-        PAGE_MAX,
-        SCAN_MAX,
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?;
+    let clean = CleanBrokenOperation::new(&template, &auth, after, (PAGE_MAX, SCAN_MAX));
+    let cleaned = drive(clean, &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     if cleaned.exhausted {
         return Err(scan_limit());
     }
