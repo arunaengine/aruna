@@ -614,5 +614,5 @@ impl Operation for AddProgressOperation {
 }
 
 #[cfg(test)]
-#[path = "status_tests.rs"]
+#[path = "view_tests.rs"]
 mod tests;
