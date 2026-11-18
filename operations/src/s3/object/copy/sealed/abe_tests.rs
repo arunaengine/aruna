@@ -484,8 +484,9 @@ async fn stale_epoch_refused() {
         .await
         .unwrap()
         .version_id;
+    // Completion reads the epoch in its transaction, so the rotation is a lost conflict.
     let outcome = complete(storage, "copy", version_id, Some(&sealed), Race::Epoch).await;
-    assert_eq!(outcome, Err(AbeError::Epoch));
+    assert_eq!(outcome, Err(AbeError::Unavailable));
     assert!(pending_row(storage, "copy", version_id).await.is_some());
 }
 
@@ -511,7 +512,7 @@ async fn stale_generation_refused() {
         .unwrap()
         .version_id;
     let outcome = complete(storage, "copy", version_id, Some(&sealed), race).await;
-    assert_eq!(outcome, Err(AbeError::Parameters));
+    assert_eq!(outcome, Err(AbeError::Unavailable));
     assert!(pending_row(storage, "copy", version_id).await.is_some());
 }
 

@@ -579,11 +579,11 @@ mod tests {
     use super::*;
     use crate::s3::object::put::test::{asked, event, read_spaces, values, written};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;
+    use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE};
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
     use aruna_core::structs::storage::blob::BackendRef;
-    use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
     use aruna_core::structs::storage::routing::{
         BackendCatalog, GroupRoutingInputs, RoutingSnapshot, RoutingTarget,
     };
@@ -960,5 +960,459 @@ mod tests {
             *row_key,
             object_key(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv")
         );
+    }
+
+    #[test]
+    fn retires_own_intent() {
+        let mut put = operation("{dir}{name}");
+        begin(&mut put).unwrap();
+        let id = put.version_id.unwrap();
+        let location = written_at("raw/x/one.csv".to_string(), id);
+        put.written_location = Some(location.clone());
+        put.output = Some(location);
+        let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id, true);
+        put.written_intent = keys.clone();
+        records(&mut put, &[]).unwrap().unwrap();
+        put.next(row(Some(vec![0u8]))).unwrap();
+
+        // The committed version makes its intent obsolete in the same transaction.
+        let turn = put.next(IoResult::Done);
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the intent delete, got {turn:?}")
+        };
+        // Both paths the write could have taken lose their intent.
+        let space = IMPORT_INTENT_KEYSPACE.to_string();
+        let expected: Vec<_> = keys.into_iter().map(|key| (space.clone(), key)).collect();
+        assert_eq!(deletes, expected);
+        let turn = put.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Then { .. })), "{turn:?}");
+    }
+
+    #[test]
+    fn fences_import_rows() {
+        let import_id = Ulid::from_bytes([4u8; 16]);
+        let row_written = (
+            IMPORTED_OBJECT_KEYSPACE.to_string(),
+            Key::from(vec![1u8]),
+            Value::from(vec![2u8]),
+        );
+        let fenced = |exists: bool| {
+            let mut operation =
+                operation(DEFAULT_PATTERN).with_import_rows(import_id, vec![row_written.clone()]);
+            let turn = records(&mut operation, &[]).expect("a rule read");
+            let Ok(Next::Call(IoCall::Read(reads))) = turn else {
+                panic!("expected the rule read, got {turn:?}")
+            };
+            assert_eq!(reads[0].0, BACKEND_IMPORT_KEYSPACE);
+            assert_eq!(reads[0].1, import_key(Ulid::from_parts(2, 2), import_id));
+            operation.next(row(exists.then(|| vec![0u8])))
+        };
+
+        let turn = fenced(true);
+        assert_eq!(written(&turn), [row_written.clone()]);
+        // A removed rule refuses the version, so no row outlives it.
+        assert_eq!(fenced(false).err(), Some(PutObjectError::ImportRemoved));
+    }
+
+    #[test]
+    fn drops_deduplicated_version() {
+        let version_written = (
+            BACKEND_VERSION_KEYSPACE.to_string(),
+            version_key(Ulid::from_parts(5, 5)),
+            Value::from(b"v1".to_vec()),
+        );
+        let rows = |committed: Ulid| {
+            let import_id = Ulid::from_bytes([4u8; 16]);
+            let mut operation = operation(DEFAULT_PATTERN)
+                .with_import_rows(import_id, vec![version_written.clone()]);
+            operation.written_location =
+                Some(written_at("raw/a.csv".to_string(), Ulid::from_parts(5, 5)));
+            operation.output = Some(written_at("raw/a.csv".to_string(), committed));
+            records(&mut operation, &[]).expect("a rule read").unwrap();
+            operation.next(row(Some(vec![0u8])))
+        };
+
+        let turn = rows(Ulid::from_parts(5, 5));
+        assert_eq!(written(&turn), [version_written.clone()]);
+        // Dedup keeps an older location, so the new one gets no version row.
+        let turn = rows(Ulid::from_parts(6, 6));
+        let mut versions = written(&turn).iter();
+        assert!(versions.all(|(space, ..)| space != BACKEND_VERSION_KEYSPACE));
+    }
+
+    #[test]
+    fn checks_expected_head() {
+        let head = Ulid::from_parts(9, 9);
+        let pointer = |id| {
+            Some(
+                CurrentVersionPointer::new_with_generation(id, 1)
+                    .to_bytes()
+                    .unwrap(),
+            )
+        };
+        let lookup = |expected: Option<Ulid>, found: Option<Vec<u8>>| {
+            let mut operation = operation(DEFAULT_PATTERN).with_expected_head(expected);
+            operation.output = Some(written_at("raw/a.csv".to_string(), Ulid::from_parts(5, 5)));
+            operation.state = PutObjectState::ReadObjectLookup;
+            operation.next(row(found))
+        };
+
+        assert_eq!(
+            read_spaces(&lookup(Some(head), pointer(head))),
+            [BLOB_VERSIONS_KEYSPACE]
+        );
+        assert!(matches!(
+            lookup(None, None),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+
+        // A write or a delete marker since the caller looked keeps the key.
+        for (expected, found) in [
+            (Some(head), pointer(Ulid::from_parts(9, 10))),
+            (None, pointer(head)),
+            (Some(head), None),
+        ] {
+            let turn = lookup(expected, found);
+            assert_eq!(turn.err(), Some(PutObjectError::HeadChanged));
+        }
+    }
+
+    #[test]
+    fn picks_same_name() {
+        let id = Ulid::from_parts(7, 7);
+        let path = "raw/a.csv";
+        assert_eq!(
+            same_name_path(path, id, false, false),
+            (path.to_string(), true)
+        );
+        assert_eq!(
+            same_name_path(path, id, false, true),
+            (path.to_string(), true)
+        );
+        // A backend with versions keeps the replaced bytes, so the write overwrites.
+        assert_eq!(
+            same_name_path(path, id, true, true),
+            (path.to_string(), false)
+        );
+        // Without versions the write goes next to the file, never over it.
+        assert_eq!(
+            same_name_path(path, id, true, false),
+            (format!("raw/a.csv~{id}"), true)
+        );
+    }
+
+    /// Runs the gates and the read of the rule's record at the path, answered with `row`.
+    fn owner_answered(operation: &mut PutObjectOperation, owner: Option<&str>) -> Turn {
+        let turn = begin(operation);
+        assert_eq!(read_spaces(&turn), [IMPORTED_OBJECT_KEYSPACE]);
+        let owner = owner.map(|key| {
+            let id = Ulid::from_parts(8, 8);
+            ImportedObject::written(id, key.to_string(), 3, None)
+                .to_bytes()
+                .unwrap()
+        });
+        operation.next(row(owner))
+    }
+
+    fn stat(exists: bool, version: Option<&str>) -> IoResult {
+        let version = version.map(str::to_string);
+        event(Event::Blob(BlobEvent::PlainStat { exists, version }))
+    }
+
+    #[test]
+    fn ignores_keyless_rows() {
+        // An imported `raw/a.csv` maps to `in/a.csv`, yet `in/x/a.csv` can give the same path.
+        let listed = aruna_core::structs::storage::backend_import::ExternalObject {
+            key: "raw/a.csv".to_string(),
+            size: 3,
+            etag: None,
+            modified_ms: None,
+        };
+        let row = ImportedObject::new(Ulid::from_parts(8, 8), &listed);
+        assert_eq!(row.key, None);
+        let row = row.to_bytes().unwrap();
+        assert_eq!(path_owned(Some(&row), "in/x/a.csv"), Ok(false));
+    }
+
+    #[test]
+    fn keeps_foreign_files() {
+        // Only the file the rule recorded for this key is replaced on a backend with versions.
+        let cases = [
+            (Some("in/x/one.csv"), false),
+            (Some("other/one.csv"), true),
+            (None, true),
+        ];
+        for (owner, tagged) in cases {
+            let mut operation = operation("{dir}{name}");
+            owner_answered(&mut operation, owner).unwrap();
+            let id = operation.version_id.unwrap();
+            operation.next(stat(true, Some("v1"))).unwrap();
+            let turn = past_intent(&mut operation);
+            let plain = plain_write(&turn);
+            let expected = match tagged {
+                true => (format!("raw/x/one.csv~{id}"), true),
+                false => ("raw/x/one.csv".to_string(), false),
+            };
+            assert_eq!(
+                (plain.path.clone(), plain.if_not_exists),
+                expected,
+                "{owner:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stats_same_name() {
+        let mut operation = operation("{dir}{name}");
+        let turn = owner_answered(&mut operation, None);
+        let id = operation.version_id.unwrap();
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "raw/x/one.csv"
+        ));
+
+        operation.next(stat(true, None)).unwrap();
+        let turn = past_intent(&mut operation);
+        let plain = plain_write(&turn);
+        assert_eq!(plain.path, format!("raw/x/one.csv~{id}"));
+        assert!(plain.if_not_exists);
+    }
+
+    #[test]
+    fn adopts_registered_version() {
+        let found = |stored: Option<[u8; 32]>| {
+            let mut put = operation("{dir}{name}");
+            begin(&mut put).unwrap();
+            let id = put.version_id.unwrap();
+            put.output = Some(written_at("raw/x/one.csv".to_string(), id));
+            // The version is read in the transaction before the head moves.
+            let turn = put.write_current_lookup(None);
+            assert_eq!(read_spaces(&turn), [BLOB_VERSIONS_KEYSPACE]);
+            let version = stored.map(|hash| {
+                let version = BlobVersion::materialized(
+                    hash,
+                    BackendRef::Group(backend_id()),
+                    EncodingClass::Raw,
+                    SystemTime::UNIX_EPOCH,
+                    UserId::default(),
+                    None,
+                );
+                version.to_bytes().unwrap()
+            });
+            let turn = put.next(row(version));
+            (put, turn)
+        };
+        // Nothing registered yet: the delete trail is read, then the head moves as usual.
+        let (mut put, _) = found(None);
+        let turn = put.next(row(None));
+        assert!(matches!(
+            turn,
+            Ok(Next::Call(IoCall::Page { ref space, .. })) if space == DELETE_TRAIL_KEYSPACE
+        ));
+        let page = || IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        put.next(page()).unwrap();
+        let turn = put.next(page());
+        assert_eq!(written(&turn)[1].0, BLOB_HEAD_KEYSPACE);
+        // An import registered the same bytes first: no head move and no second charge.
+        let (_, turn) = found(Some([7u8; 32]));
+        assert!(matches!(turn, Ok(Next::Then { .. })), "{turn:?}");
+        // Other bytes under the same version id are a conflict.
+        let (_, turn) = found(Some([8u8; 32]));
+        assert_eq!(turn.err(), Some(PutObjectError::VersionExists));
+    }
+
+    #[test]
+    fn records_written_hash() {
+        let mut operation = operation("{dir}{name}");
+        owner_answered(&mut operation, None).unwrap();
+        operation.next(stat(false, None)).unwrap();
+        past_intent(&mut operation).unwrap();
+        // A backend without conditional writes put the bytes at the tagged path instead.
+        let id = operation.version_id.unwrap();
+        let tagged = format!("raw/x/one.csv~{id}");
+        let written = BlobEvent::PlainWritten {
+            location: written_at(tagged.clone(), id),
+            version: None,
+            etag: None,
+        };
+        let turn = operation.next(event(Event::Blob(written)));
+        // The hash is stored with a read of the rule before the version transaction starts.
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, PutObjectState::WriteEvidence);
+        let turn = operation.next(fenced(Ok(Fenced::Written)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, PutObjectState::Publish);
+    }
+
+    #[test]
+    fn stores_with_rule() {
+        // A removed rule gets no intent: the fenced write stores nothing and fails the write.
+        let mut operation = operation(DEFAULT_PATTERN);
+        begin(&mut operation).unwrap();
+        let turn = operation.next(fenced(Ok(Fenced::RuleGone)));
+        assert!(operation.written_intent.is_empty());
+        assert_eq!(turn.err(), Some(PutObjectError::ImportRemoved));
+    }
+
+    #[test]
+    fn taken_path_fails() {
+        let mut operation = operation("{dir}{name}");
+        owner_answered(&mut operation, None).unwrap();
+        operation.next(stat(false, None)).unwrap();
+        past_intent(&mut operation).unwrap();
+
+        // Another upload took the free path first; nothing at the path is deleted.
+        let taken = Event::Blob(BlobEvent::Error(BlobError::PathTaken));
+        let turn = operation.next(event(taken));
+        // The refused write moved no byte, so its intent goes first.
+        let id = operation.version_id.unwrap();
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the intent delete, got {turn:?}")
+        };
+        // A free path may go to its tagged path on a backend without conditional writes.
+        let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/x/one.csv", id, true);
+        assert_eq!(keys.len(), 2);
+        let found: Vec<_> = deletes.iter().map(|(_, key)| key.clone()).collect();
+        assert_eq!(found, keys);
+        // The write fails as taken only once the delete is on disk.
+        let turn = operation.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))));
+        let turn = operation.next(IoResult::Done);
+        assert_eq!(
+            turn.err(),
+            Some(PutObjectError::BlobWriteFailed(BlobError::PathTaken))
+        );
+        // The tenant path is never rolled back.
+        operation.state = PutObjectState::Error;
+        assert!(operation.abort().is_empty());
+    }
+
+    /// A write whose provider version is known, at its tagged path, before its transaction.
+    fn rewritten(hash: u8) -> PutObjectOperation {
+        let mut operation = operation(DEFAULT_PATTERN);
+        operation.version_id = Some(Ulid::from_parts(9, 1));
+        let resolved = ResolvedBackend::new(BackendRef::Group(backend_id()), None);
+        let target = operation.plain_target(&resolved).unwrap();
+        operation.plain = Some(PlainWrite {
+            target,
+            resolved,
+            version: Some("v2".to_string()),
+            etag: None,
+            owned: true,
+        });
+        let mut new = written_at("raw/x/one.csv~new".to_string(), Ulid::from_parts(5, 5));
+        new.hashes.insert(HASH_BLAKE3.to_string(), vec![hash; 32]);
+        operation.written_location = Some(new);
+        operation
+    }
+
+    /// Answers the reads of the current version, whose file holds bytes with hash 7.
+    fn current(operation: &mut PutObjectOperation, old: &BackendLocation) -> Turn {
+        let turn = operation.start_hash_lookup();
+        assert_eq!(read_spaces(&turn), [BLOB_HEAD_KEYSPACE]);
+        let head = CurrentVersionPointer::new(Ulid::from_parts(8, 1));
+        operation.next(row(Some(head.to_bytes().unwrap()))).unwrap();
+        let version = BlobVersion::materialized(
+            [7; 32],
+            BackendRef::Group(backend_id()),
+            old.format.encoding(),
+            SystemTime::UNIX_EPOCH,
+            UserId::default(),
+            None,
+        );
+        operation.next(row(Some(version.to_bytes().unwrap())))
+    }
+
+    #[test]
+    fn reuses_same_file() {
+        let mut old = written_at("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        old.format.layout = StoredLayout::Plain(old.ulid);
+        let mut operation = rewritten(7);
+        let turn = current(&mut operation, &old);
+        assert_eq!(read_spaces(&turn), [BLOB_LOCATIONS_KEYSPACE]);
+        operation.next(row(Some(old.to_bytes().unwrap()))).unwrap();
+        operation.next(row(Some(b"v1".to_vec()))).unwrap();
+        // The older file's version is not being deleted, so it takes the new version.
+        assert_eq!(operation.state, PutObjectState::ReadDedupClaim);
+        operation.next(row(None)).unwrap();
+        // The version reads the older file; the written one is released after the commit.
+        assert_eq!(operation.output, Some(old.clone()));
+        let (space, _, value) = operation.dedup_release().unwrap().unwrap();
+        assert_eq!(space, BLOB_CLEANUP_KEYSPACE);
+        let work = BlobCleanupWork::from_bytes(&value).unwrap();
+        let BlobCleanupWork::ReleaseRenamed {
+            location,
+            import_id,
+            version_id,
+            version,
+        } = work
+        else {
+            panic!("expected a release, got {work:?}")
+        };
+        assert_eq!(location.backend_path, "raw/x/one.csv~new");
+        assert_eq!(
+            (import_id, version_id, version.as_str()),
+            (Ulid::from_bytes([4u8; 16]), Ulid::from_parts(9, 1), "v2")
+        );
+    }
+
+    #[test]
+    fn keeps_other_bytes() {
+        let mut old = written_at("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        old.format.layout = StoredLayout::Plain(old.ulid);
+        // Other bytes than the current version's go the usual way and release nothing.
+        let mut operation = rewritten(8);
+        let turn = current(&mut operation, &old);
+        assert_eq!(operation.state, PutObjectState::CheckHashLookup, "{turn:?}");
+        assert!(operation.dedup_release().is_none());
+        // Without a backend version the written file cannot go, so it is kept as well.
+        let mut operation = rewritten(7);
+        if let Some(plain) = operation.plain.as_mut() {
+            plain.version = None;
+        }
+        operation.start_hash_lookup().unwrap();
+        assert_eq!(operation.state, PutObjectState::CheckHashLookup);
+    }
+
+    #[test]
+    fn reuses_older_version() {
+        // A same-name re-upload on a versioned storage gives way to the older backend version.
+        let reuse = |stored: &[u8]| {
+            let mut old = written_at("raw/x/one.csv~new".to_string(), Ulid::from_parts(4, 4));
+            old.format.layout = StoredLayout::Plain(old.ulid);
+            let mut operation = rewritten(7);
+            current(&mut operation, &old).unwrap();
+            let turn = operation.next(row(Some(old.to_bytes().unwrap())));
+            assert_eq!(read_spaces(&turn), [BACKEND_VERSION_KEYSPACE]);
+            operation.next(row(Some(stored.to_vec()))).unwrap();
+            if operation.state == PutObjectState::ReadDedupClaim {
+                operation.next(row(None)).unwrap();
+            }
+            (operation, old)
+        };
+        let (operation, old) = reuse(b"v1");
+        assert_eq!(operation.output, Some(old));
+        assert!(operation.dedup_release().is_some());
+        // The same backend version is the same file; nothing is released.
+        let (operation, _) = reuse(b"v2");
+        assert_eq!(operation.state, PutObjectState::CheckHashLookup);
+        assert!(operation.dedup_release().is_none());
+    }
+
+    #[test]
+    fn skips_claimed_file() {
+        // A backend version a release is deleting takes no new reader.
+        let mut old = written_at("raw/x/one.csv~old".to_string(), Ulid::from_parts(4, 4));
+        old.format.layout = StoredLayout::Plain(old.ulid);
+        let mut operation = rewritten(7);
+        current(&mut operation, &old).unwrap();
+        operation.next(row(Some(old.to_bytes().unwrap()))).unwrap();
+        operation.next(row(Some(b"v1".to_vec()))).unwrap();
+        operation.next(row(Some(Vec::new()))).unwrap();
+        assert_eq!(operation.state, PutObjectState::CheckHashLookup);
+        assert!(operation.dedup_release().is_none());
     }
 }
