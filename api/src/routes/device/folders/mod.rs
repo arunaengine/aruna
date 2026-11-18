@@ -858,9 +858,12 @@ async fn list_folder_entries(
 ) -> ServerResult<Json<FolderEntryPage>> {
     let folder_id = parse_folder_id(&folder_id)?;
     let cursor = decode_cursor(query.cursor)?;
-    let (entries, next) = drive(list_entries(folder_id, query.state.as_deref(), cursor), &state.get_ctx())
-        .await
-        .map_err(map_folder_error)?;
+    let (entries, next) = drive(
+        list_entries(folder_id, query.state.as_deref(), cursor),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_folder_error)?;
     Ok(Json(FolderEntryPage {
         entries: entries
             .into_iter()
@@ -965,7 +968,7 @@ async fn act_on_entry(
         ));
     }
     let context = state.get_ctx();
-    let record = apply_action(
+    let action = apply_action(
         &context,
         ApplyActionInput {
             folder_id,
@@ -976,9 +979,8 @@ async fn act_on_entry(
             expected,
             actor: auth.user_id,
         },
-    )
-    .await
-    .map_err(map_action_error)?;
+    );
+    let record = drive(action, &context).await.map_err(map_action_error)?;
     if record.outcome == ActionOutcome::Stale {
         return Err(ServerError::PreconditionFailed(
             "the file changed since the owner saw it".to_string(),
@@ -1080,7 +1082,7 @@ async fn act_on_folder(
             "the confirmation must name this folder".to_string(),
         ));
     }
-    apply_action(
+    let action = apply_action(
         &context,
         ApplyActionInput {
             folder_id,
@@ -1089,9 +1091,8 @@ async fn act_on_folder(
             expected: None,
             actor: auth.user_id,
         },
-    )
-    .await
-    .map_err(map_action_error)?;
+    );
+    drive(action, &context).await.map_err(map_action_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 

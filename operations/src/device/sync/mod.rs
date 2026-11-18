@@ -39,7 +39,7 @@ use crate::driver::drive;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
 
-use download::apply_downloads;
+use download::ApplyDownloadsOperation;
 use folders::{list_folders, store_progress};
 use reconcile::{ReconcileError, ReconcileFolderOperation, ReconcileInput, ReconcilePlan};
 use repository::SYNC_PAGE_SIZE;
@@ -223,7 +223,9 @@ pub async fn reconcile_folder(
             let page = crate::driver::drive(ReconcileFolderOperation::new(page), context).await?;
             plan.absorb(page);
         }
-        apply_downloads(context, folder, std::mem::take(&mut plan.downloads)).await;
+        let downloads = std::mem::take(&mut plan.downloads);
+        let apply = ApplyDownloadsOperation::new(*net_handle.realm_id(), folder.clone(), downloads);
+        drive(apply, context).await.ok();
         Ok((plan, view.next_cursor))
     }
     .await;
@@ -386,11 +388,6 @@ pub(super) async fn request_versions(
             crate::metadata::transport_message_kind(&other)
         ))),
     }
-}
-
-/// Wakes the upload drain after an explicit owner action queued a row.
-pub(crate) async fn arm_upload_timer(context: &Arc<DriverContext>) {
-    arm_timer(context, TaskKey::DrainUploadOutbox).await;
 }
 
 async fn arm_timer(context: &Arc<DriverContext>, key: TaskKey) {

@@ -16,9 +16,7 @@ use aruna_core::effects::{BlobEffect, Effect, NetEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::heartbeat::HeartbeatEffect;
-use aruna_core::holder_choice::{
-    HolderCandidate, HolderChoiceError, HolderChoiceOperation, pick,
-};
+use aruna_core::holder_choice::{HolderCandidate, HolderChoiceError, HolderChoiceOperation, pick};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
@@ -131,6 +129,7 @@ enum MemberStep {
 struct PullMemberOperation {
     request: PullRequest,
     step: MemberStep,
+    member_id: Option<Ulid>,
     member: Option<Member>,
     replicas: usize,
 }
@@ -142,6 +141,7 @@ impl PullMemberOperation {
         Self {
             request,
             step: MemberStep::Bucket,
+            member_id: None,
             member: None,
             replicas: 0,
         }
@@ -240,20 +240,14 @@ impl Operation for PullMemberOperation {
                     .distribution
                     .filter(|binding| binding.set_id == self.request.held.set_id)
                     .ok_or(GetObjectError::HoldersUnavailable)?;
-                self.member = Some(Member {
-                    member_id: binding.member_id,
-                    strategy: DataStrategy::Stream,
-                    behaviour: RangeBehaviour::default(),
-                    keeping: false,
-                    holders: Vec::new(),
-                });
+                self.member_id = Some(binding.member_id);
                 self.step = MemberStep::Record;
                 let key = binding.set_id.to_bytes().to_vec();
                 Ok(Next::Call(read_row(DISTRIBUTION_KEYSPACE, key)))
             }
             MemberStep::Record => {
                 let record = value(result)?.ok_or(GetObjectError::HoldersUnavailable)?;
-                let member_id = self.member()?.member_id;
+                let member_id = self.member_id.ok_or(IoError::Unfinished)?;
                 self.recorded(&record, member_id)
             }
             MemberStep::Spread => {
@@ -266,7 +260,9 @@ impl Operation for PullMemberOperation {
                     .map(|candidate| candidate.node_id)
                     .collect();
                 if !fresh.is_empty() {
-                    self.member()?.holders.retain(|holder| fresh.contains(holder));
+                    self.member()?
+                        .holders
+                        .retain(|holder| fresh.contains(holder));
                 }
                 self.step = MemberStep::Encryption;
                 let key = self.request.bucket.as_bytes().to_vec();
@@ -424,7 +420,10 @@ impl PullThroughOperation {
         let size = self.request.held.size;
         let range = self.request.range.as_ref();
         self.resolved = range.map(|range| range.resolve(size)).transpose()?;
-        self.range = self.resolved.as_ref().map(|resolved| resolved.range.clone());
+        self.range = self
+            .resolved
+            .as_ref()
+            .map(|resolved| resolved.range.clone());
         let plan = PullPlan::choose(
             member.strategy,
             member.behaviour,
