@@ -614,7 +614,8 @@ async fn spool_source(
             size,
         }) => {
             if ctx.cancel.is_cancelled() || ctx.shutdown.is_cancelled() {
-                let _ = crate::blob::hidden::delete_hidden(&ctx.driver, &location).await;
+                let delete = crate::blob::hidden::DeleteHiddenOperation::new(&location);
+                let _ = crate::driver::drive(delete, &ctx.driver).await;
                 return Err(if ctx.cancel.is_cancelled() {
                     ImportFailure::Cancelled
                 } else {
@@ -1370,9 +1371,10 @@ async fn cleanup_source(
         }
     }
     if let Some(input) = checkpoint.input.as_ref() {
-        crate::blob::hidden::delete_hidden(&ctx.driver, &input.location)
+        let delete = crate::blob::hidden::DeleteHiddenOperation::new(&input.location);
+        crate::driver::drive(delete, &ctx.driver)
             .await
-            .map_err(ImportFailure::Retryable)?;
+            .map_err(|error| ImportFailure::Retryable(error.to_string()))?;
         if let Some(upload_id) = input.upload_id {
             crate::driver::drive(
                 crate::jobs::import::upload_store::DeleteUploadOperation::new(

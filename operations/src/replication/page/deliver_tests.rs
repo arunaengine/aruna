@@ -3,9 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::time::SystemTime;
 
+use aruna_core::calls::{IoCall, IoResult};
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -27,7 +29,8 @@ use ulid::Ulid;
 use super::*;
 use crate::distribution::test_record::{binding, realm, replicated, secret, store_record};
 use crate::distribution::test_store::{context, install, open};
-use crate::replication::drain::drain_batch;
+use crate::driver::{DriverContext, drive};
+use crate::replication::drain::ProcessBatchOperation;
 use crate::replication::page::apply::tests::source;
 use aruna_core::structs::storage::replication_queue::{
     LiveObligationRecord, live_obligation_entry,
@@ -151,15 +154,51 @@ fn committed(key: &str, id: u128, generation: u64, head: bool) -> Vec<(String, K
 }
 
 /// Applies every page on the member; the first `lost` answers are lost after the commit.
-struct Member<'a> {
-    handle: &'a StorageHandle,
+struct MemberState {
+    handle: StorageHandle,
     lost: Mutex<usize>,
     /// Records of each page sent.
     pages: Mutex<Vec<usize>>,
+    answer: Mutex<Option<Result<PageAnswer, String>>>,
 }
 
-impl PageSender for Member<'_> {
-    async fn send(&self, _node: NodeId, page: ReferencePage) -> Result<PageAnswer, String> {
+#[derive(Clone)]
+struct Member(Arc<MemberState>);
+
+impl Member {
+    fn new(handle: &StorageHandle, lost: usize) -> Self {
+        Self(Arc::new(MemberState {
+            handle: handle.clone(),
+            lost: Mutex::new(lost),
+            pages: Mutex::default(),
+            answer: Mutex::default(),
+        }))
+    }
+}
+
+impl std::ops::Deref for Member {
+    type Target = MemberState;
+
+    fn deref(&self) -> &MemberState {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Member {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Member")
+    }
+}
+
+impl PartialEq for Member {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl PageTransport for Member {
+    /// Applies the page on the member's own store; the call only hands the turn back.
+    fn request(&self, _node: NodeId, page: ReferencePage) -> Result<IoCall, String> {
         self.pages.lock().unwrap().push(page.manifests.len());
         let input = ApplyInput {
             page,
@@ -167,15 +206,47 @@ impl PageSender for Member<'_> {
             realm_id: realm(),
             local: secret(9).public(),
         };
-        let answer =
-            page_answer(drive(PageApplyOperation::new(input), &context(self.handle)).await);
+        let member = context(&self.handle);
+        let applied = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(drive(PageApplyOperation::new(input), &member))
+        });
         let mut lost = self.lost.lock().unwrap();
-        if *lost > 0 {
-            *lost -= 1;
-            return Err("the answer was lost".to_string());
-        }
-        Ok(answer)
+        let answer = match *lost > 0 {
+            true => {
+                *lost -= 1;
+                Err("the answer was lost".to_string())
+            }
+            false => Ok(page_answer(applied)),
+        };
+        *self.answer.lock().unwrap() = Some(answer);
+        Ok(IoCall::Delay(Duration::ZERO))
     }
+
+    fn answer(&self, _result: IoResult) -> Result<PageAnswer, String> {
+        let answer = self.answer.lock().unwrap().take();
+        answer.unwrap_or_else(|| Err("no page was sent".to_string()))
+    }
+}
+
+async fn drain_batch(
+    context: &DriverContext,
+    sender: &Member,
+) -> Result<crate::replication::drain::BlobDrainResult, BlobQueueError> {
+    let drain = ProcessBatchOperation::new(
+        sender.clone(),
+        crate::driver::node_routing(context),
+        context.node_and_realm(),
+    );
+    drive(drain, context).await
+}
+
+async fn deliver_pages(
+    context: &DriverContext,
+    jobs: Vec<(Vec<u8>, BlobJobRecord)>,
+    sender: &Member,
+) -> Result<PageReport, BlobQueueError> {
+    drive(DeliverPagesOperation::new(sender.clone(), jobs), context).await
 }
 
 async fn counters(handle: &StorageHandle) -> BucketCounters {
@@ -192,7 +263,7 @@ async fn counters(handle: &StorageHandle) -> BucketCounters {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn backlog_arrives_once() {
     // More obligations than one page reads become jobs and pages until none is owed, and the
     // member stores and counts every record exactly once.
@@ -208,11 +279,7 @@ async fn backlog_arrives_once() {
     writes.extend(committed("b", 900_001, 1, false));
     writes.extend(committed("b", 900_002, 2, true));
     write(&coordinator.handle, writes).await;
-    let sender = Member {
-        handle: &member.handle,
-        lost: Mutex::new(0),
-        pages: Mutex::default(),
-    };
+    let sender = Member::new(&member.handle, 0);
     let context = context(&coordinator.handle);
     for _ in 0..16 {
         let result = drain_batch(&context, &sender).await.unwrap();
@@ -259,7 +326,7 @@ async fn backlog_arrives_once() {
 
 // Prints how fast a backlog reaches a member in pages; a measurement, not a contract. Run in
 // release with `--ignored --nocapture` to read it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn pages_measured() {
     let (snapshot, bytes) = replicated(true, 1);
@@ -272,11 +339,7 @@ async fn pages_measured() {
         writes.extend(committed(&key, index as u128 + 1, 1, true));
     }
     write(&coordinator.handle, writes).await;
-    let sender = Member {
-        handle: &member.handle,
-        lost: Mutex::new(0),
-        pages: Mutex::default(),
-    };
+    let sender = Member::new(&member.handle, 0);
     let context = context(&coordinator.handle);
     let started = std::time::Instant::now();
     for _ in 0..200 {
@@ -292,7 +355,7 @@ async fn pages_measured() {
     println!("{count} records in {pages} pages, {elapsed:?}: {rate:.0} records/s");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn lost_answer_replays() {
     // A page committed on the member whose answer was lost is sent again: the member answers
     // from what it stored, and the coordinator retires the jobs only then.
@@ -304,11 +367,7 @@ async fn lost_answer_replays() {
         writes.extend(committed(&format!("c/{index}"), index + 1, 1, true));
     }
     write(&coordinator.handle, writes).await;
-    let sender = Member {
-        handle: &member.handle,
-        lost: Mutex::new(1),
-        pages: Mutex::default(),
-    };
+    let sender = Member::new(&member.handle, 1);
     let context = context(&coordinator.handle);
     let result = drain_batch(&context, &sender).await.unwrap();
     assert_eq!(result.failed, 40, "the unanswered page is kept");
@@ -334,7 +393,7 @@ async fn lost_answer_replays() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn failed_page_shrinks() {
     // A page whose answer never came returns in pages of half its size, so a page too slow for
     // its member gets cheaper instead of timing out the same way again.
@@ -346,11 +405,7 @@ async fn failed_page_shrinks() {
         writes.extend(committed(&format!("d/{index}"), index as u128 + 1, 1, true));
     }
     write(&coordinator.handle, writes).await;
-    let sender = Member {
-        handle: &member.handle,
-        lost: Mutex::new(1),
-        pages: Mutex::default(),
-    };
+    let sender = Member::new(&member.handle, 1);
     let context = context(&coordinator.handle);
     drain_batch(&context, &sender).await.unwrap();
     let jobs = rows(&coordinator.handle, REPLICATION_JOB_KEYSPACE).await;

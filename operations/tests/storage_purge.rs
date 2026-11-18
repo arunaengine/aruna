@@ -42,7 +42,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use crate::job_calls::put_purge_checkpoint;
 use crate::job_calls::insert_job;
@@ -62,7 +62,7 @@ use aruna_operations::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation,
 };
 use aruna_operations::s3::object::copy::{
-    CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
+    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
@@ -272,27 +272,30 @@ async fn scoped_fence_isolates() {
     ));
 
     assert!(matches!(
-        copy_object(
-            &context.driver,
-            CopyObjectInput {
-                source_bucket: "bucket".to_string(),
-                source_key: "source.txt".to_string(),
-                source_version_id: None,
-                source_group_id: context.group_id,
-                source_auth_context: auth(&context),
-                dest_bucket: "bucket".to_string(),
-                dest_key: "blocked/copy.txt".to_string(),
-                user_id: context.user_id,
-                group_id: context.group_id,
-                realm_id: context.realm_id,
-                node_id: context.node_id,
-                quota_ceiling: None,
-                conditions: CopySourceConditions::default(),
-                metadata: None,
-                restrictions: None,
-                references: CopyReferences::Materialize,
-                job_id: None,
-            },
+        drive(
+            CopyObjectOperation::new(
+                CopyObjectInput {
+                    source_bucket: "bucket".to_string(),
+                    source_key: "source.txt".to_string(),
+                    source_version_id: None,
+                    source_group_id: context.group_id,
+                    source_auth_context: auth(&context),
+                    dest_bucket: "bucket".to_string(),
+                    dest_key: "blocked/copy.txt".to_string(),
+                    user_id: context.user_id,
+                    group_id: context.group_id,
+                    realm_id: context.realm_id,
+                    node_id: context.node_id,
+                    quota_ceiling: None,
+                    conditions: CopySourceConditions::default(),
+                    metadata: None,
+                    restrictions: None,
+                    references: CopyReferences::Materialize,
+                    job_id: None,
+                },
+                node_routing(&context.driver)
+            ),
+            &context.driver
         )
         .await,
         Err(CopyObjectError::Put(PutObjectError::PurgeFence(

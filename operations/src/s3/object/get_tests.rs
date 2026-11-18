@@ -12,7 +12,7 @@ use crate::s3::object::get::{
     ObjectRangeRequest, Turn,
 };
 use crate::s3::object::read::{
-    HolderFailures, RoutedRead, get_object_routed, promote_leased, routed_info, slice_blob,
+    GetRoutedOperation, HolderFailures, PromoteLeasedOperation, RoutedRead, routed_info, slice_blob,
 };
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
@@ -844,36 +844,42 @@ async fn routed_missing_blob() {
         outbound_handle: None,
     };
 
-    let read = get_object_routed(
+    let read = drive(
+        GetRoutedOperation::new(
+            GetObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: None,
+                range: None,
+                group_id: Ulid::generate(),
+                user_identity,
+                realm_id: user_identity.realm_id,
+                node_id: test_node_id(),
+            },
+            None,
+            None,
+        ),
         &driver_ctx,
-        GetObjectInput {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id: None,
-            range: None,
-            group_id: Ulid::generate(),
-            user_identity,
-            realm_id: user_identity.realm_id,
-            node_id: test_node_id(),
-        },
-        None,
     )
     .await;
     assert!(matches!(read, Err(GetObjectError::GetObjectFailed)));
 
-    let ranged = get_object_routed(
+    let ranged = drive(
+        GetRoutedOperation::new(
+            GetObjectInput {
+                bucket,
+                key,
+                version_id: None,
+                range: Some(ObjectRangeRequest::StartEnd { start: 0, end: 1 }),
+                group_id: Ulid::generate(),
+                user_identity,
+                realm_id: user_identity.realm_id,
+                node_id: test_node_id(),
+            },
+            None,
+            None,
+        ),
         &driver_ctx,
-        GetObjectInput {
-            bucket,
-            key,
-            version_id: None,
-            range: Some(ObjectRangeRequest::StartEnd { start: 0, end: 1 }),
-            group_id: Ulid::generate(),
-            user_identity,
-            realm_id: user_identity.realm_id,
-            node_id: test_node_id(),
-        },
-        None,
     )
     .await;
     assert!(matches!(ranged, Err(GetObjectError::GetObjectFailed)));
@@ -2696,9 +2702,13 @@ async fn promotes_serving_realm() {
         node_id,
     };
     let limits = RoCrateLimits::default();
-    promote_leased(&context, &input, archive, lease, &limits)
-        .await
-        .unwrap();
+    let origin = (input.realm_id, input.node_id);
+    drive(
+        PromoteLeasedOperation::new(origin, archive, lease, &limits),
+        &context,
+    )
+    .await
+    .unwrap();
 
     for (realm_id, indexed) in [(serving, true), (foreign.realm_id, false)] {
         let alias = HashIndex::new(

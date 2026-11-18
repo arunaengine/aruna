@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::s3::bucket::job_pages::{job_access, process_linked, still_admin, store};
+use crate::s3::bucket::job_pages::{
+    JobAccessOperation, ProcessLinkedOperation, StillAdminOperation, StoreJobOperation,
+};
 use crate::s3::bucket::job_progress::JobStep;
 use crate::s3::bucket::rename::tests::{
     BUCKET, access, get, group, head_key, object, realm, setup,
@@ -14,6 +16,13 @@ use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::linked_job::{LinkedTask, RemapPlan};
 use ulid::Ulid;
+
+async fn process_linked(
+    context: &DriverContext,
+) -> Result<Option<std::time::Duration>, crate::blob::migration::shared::MigrationError> {
+    let routing = crate::driver::node_routing(context);
+    drive(ProcessLinkedOperation::new(routing), context).await
+}
 
 fn grant() -> TokenGrant {
     TokenGrant {
@@ -142,7 +151,12 @@ async fn abort_keeps_progress() {
         done: 1,
         ..JobStep::default()
     };
-    store(&context, BUCKET, &running, step, None).await.unwrap();
+    drive(
+        StoreJobOperation::new(BUCKET, &running, step, None),
+        &context,
+    )
+    .await
+    .unwrap();
     let ended = stored(&context).await;
     assert_eq!((ended.state, ended.done), (LinkedState::Aborted, 1));
     assert_eq!(ended.cursor.as_deref(), Some("a.faa.gz"));
@@ -200,17 +214,20 @@ async fn needs_group_admin() {
     // A job runs only while its caller still administers the group.
     let (_directory, context) = setup().await;
     let auth = access(&context).await;
-    assert!(still_admin(&context, &auth, group()).await.unwrap());
+    let admin = StillAdminOperation::new(&auth, group());
+    assert!(drive(admin, &context).await.unwrap());
     let stranger = aruna_core::structs::identity::auth::AuthContext {
         user_id: aruna_core::UserId::local(Ulid::from_parts(77, 7), realm()),
         ..auth.clone()
     };
-    assert!(!still_admin(&context, &stranger, group()).await.unwrap());
+    let admin = StillAdminOperation::new(&stranger, group());
+    assert!(!drive(admin, &context).await.unwrap());
     let mut job = job(stranger);
     job.task = LinkedTask::Unify {
         prefix: String::new(),
     };
-    assert!(job_access(&context, BUCKET, &job).await.unwrap().is_none());
+    let access = drive(JobAccessOperation::new(BUCKET, &job), &context).await;
+    assert!(access.unwrap().is_none());
 }
 
 fn bucket_key() -> Key {

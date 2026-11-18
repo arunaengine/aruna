@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_moves_to_timers() {
+    fn keep_moves_timers() {
         // A failed batch is retried; a lasting outage hands each record to its retry timer.
         let (first, second) = (record(), record());
         let mut keep = KeepAudit::new(vec![first.clone(), second.clone()]);

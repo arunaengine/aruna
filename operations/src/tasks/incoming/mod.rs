@@ -45,15 +45,13 @@ impl Drop for OutboxBarrier {
 }
 
 use crate::blob::cleanup::{
-    BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_cleanup_batch, sweep_stale_uploads,
+    BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, CleanupNode, ProcessCleanupOperation,
+    SweepUploadsOperation,
 };
-use crate::blob::hidden::{
-    HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
-};
+use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
 use crate::blob::holders::RefreshHoldersOperation;
-use crate::blob::reclaim_sweep::{
-    RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
-};
+use crate::blob::reclaim_sweep::{RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, ReclaimSweepOperation};
+use crate::blob::sweep_timer::ArmSweepOperation;
 use crate::device::drain::{DrainOutcome, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
@@ -148,7 +146,10 @@ use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
-use crate::replication::drain::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
+use crate::replication::drain::{
+    ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
+};
+use crate::replication::page::deliver::MetadataPages;
 use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{
@@ -931,8 +932,12 @@ impl OperationsTaskHandler {
                 let start = (self.migration_cursor.lock())
                     .expect("migration cursor mutex poisoned")
                     .clone();
-                let run =
-                    crate::blob::migration::drain::process_migrations(&self.context, start).await;
+                let run = crate::blob::migration::drain::ProcessMigrationsOperation::new(
+                    crate::driver::node_routing(&self.context),
+                    self.context.node_and_realm(),
+                    start,
+                );
+                let run = drive(run, &self.context).await;
                 let after = match run {
                     Ok(run) => {
                         *(self.migration_cursor.lock()).expect("migration cursor mutex poisoned") =
@@ -978,14 +983,13 @@ impl OperationsTaskHandler {
                 };
                 let key = BucketKeyRef::new(bucket_id, generation);
                 let origin = (*net_handle.realm_id(), net_handle.node_id());
-                let promoted = crate::blob::unlocked::promote_unlocked(
-                    &self.context,
+                let promoted = crate::blob::unlocked::PromoteUnlockedOperation::new(
                     key,
                     origin,
                     &self.rocrate_limits,
                 );
                 // A locked key leaves the archives pending; its next unlock promotes them.
-                if let Err(error) = promoted.await {
+                if let Err(error) = drive(promoted, &self.context).await {
                     warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
                 }
             }),

@@ -421,11 +421,12 @@ mod tests {
     use aruna_storage::StorageHandle;
 
     use super::super::drain::{
-        REPLICATION_CURSOR_KEY, ReplicationScanCursor, advance_replication_cursor, job_source_auth,
-        load_source_authorization, mark_failure, mark_progress, mark_success, process_blob_batch,
-        read_job_relationships, read_relationships, read_replication_cursor, reschedule_blob_job,
-        scan_due_jobs, store_relationship, write_blob_job,
+        AdvanceCursorOperation, BlobDrainResult, BlobJobScan, JobRelationshipsOperation,
+        LoadAuthOperation, ProcessBatchOperation, REPLICATION_CURSOR_KEY, ReplicationScanCursor,
+        ScanJobsOperation, SourceRefusal, StoreRelationshipOperation, job_source_auth,
+        mark_failure, mark_progress, mark_success, reschedule_call,
     };
+    use super::super::page::deliver::MetadataPages;
     use super::super::retire::{BlobJobOutcome, RetireJobOperation};
 
     /// Whether any job or live obligation is queued.
@@ -457,10 +458,197 @@ mod tests {
         .await
     }
     use super::super::obligations::{
-        OBLIGATION_BATCH_SIZE, REPLICATION_JOB_LIMIT, REPLICATION_RELATIONSHIP_LIMIT,
-        delete_live_obligation, process_live_obligations, read_relationships_limit,
-        retire_obligations, write_live_jobs,
+        DeleteObligationOperation, LiveRepairResult, LiveRepairWrite, OBLIGATION_BATCH_SIZE,
+        ProcessObligationsOperation, REPLICATION_JOB_LIMIT, REPLICATION_PAGE_SIZE,
+        REPLICATION_RELATIONSHIP_LIMIT, ReadRelationshipsOperation, RelationshipPage,
+        RetireObligationsOperation, WriteJobsOperation, WriteObligationOperation,
     };
+    use super::super::version_replication::SourceAuthorization;
+    use crate::testing::test_context;
+
+    async fn process_blob_batch(
+        context: &DriverContext,
+    ) -> Result<BlobDrainResult, BlobQueueError> {
+        let drain = ProcessBatchOperation::new(
+            MetadataPages,
+            crate::driver::node_routing(context),
+            context.node_and_realm(),
+        );
+        drive(drain, context).await
+    }
+
+    async fn process_live_obligations(
+        context: &DriverContext,
+    ) -> Result<LiveRepairResult, BlobQueueError> {
+        drive(ProcessObligationsOperation::new(), context).await
+    }
+
+    async fn store_relationship(
+        context: &DriverContext,
+        relationship: SyncRelationship,
+    ) -> Result<bool, String> {
+        let store = StoreRelationshipOperation::new(relationship);
+        let stored = drive(store, context).await;
+        stored.map_err(|error| error.to_string())?
+    }
+
+    async fn load_source_authorization(
+        context: &DriverContext,
+        auth: AuthContext,
+        source_node: NodeId,
+        bucket: &str,
+    ) -> Result<SourceAuthorization, SourceRefusal> {
+        let load = LoadAuthOperation::new(auth, source_node, bucket);
+        drive(load, context).await.expect("the check runs")
+    }
+
+    async fn read_replication_cursor(
+        storage: &StorageHandle,
+    ) -> Result<ReplicationScanCursor, BlobQueueError> {
+        let read = StorageEffect::Read {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: REPLICATION_CURSOR_KEY.to_vec().into(),
+            txn_id: None,
+        };
+        match storage.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
+                .and_then(|value| postcard::from_bytes(value.as_ref()).ok())
+                .unwrap_or_default()),
+            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+        }
+    }
+
+    async fn advance_replication_cursor(
+        storage: &StorageHandle,
+        candidate: ReplicationScanCursor,
+    ) -> Result<(), BlobQueueError> {
+        let context = test_context(storage.clone());
+        drive(AdvanceCursorOperation::new(candidate), &context).await
+    }
+
+    async fn scan_due_jobs(
+        storage: &StorageHandle,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<BlobJobScan, BlobQueueError> {
+        let context = test_context(storage.clone());
+        drive(ScanJobsOperation::new(now_ms, limit), &context).await
+    }
+
+    async fn read_job_relationships(
+        storage: &StorageHandle,
+        jobs: &[(Vec<u8>, BlobJobRecord)],
+    ) -> Result<std::collections::HashMap<(String, Ulid), SyncRelationship>, BlobQueueError> {
+        let context = test_context(storage.clone());
+        drive(JobRelationshipsOperation::new(jobs), &context).await
+    }
+
+    async fn write_rows(
+        storage: &StorageHandle,
+        writes: Vec<(String, aruna_core::types::Key, aruna_core::types::Value)>,
+    ) -> Result<(), BlobQueueError> {
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        match storage.send_storage_effect(write).await {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+        }
+    }
+
+    async fn write_blob_job(
+        storage: &StorageHandle,
+        job: &BlobJobRecord,
+    ) -> Result<(), BlobQueueError> {
+        write_rows(storage, vec![blob_job_entry(job)?]).await
+    }
+
+    async fn reschedule_blob_job(
+        storage: &StorageHandle,
+        key: Vec<u8>,
+        job: &BlobJobRecord,
+        error: String,
+    ) -> Result<u64, BlobQueueError> {
+        let (call, due) = reschedule_call(key, job, error, unix_timestamp_millis())?;
+        let aruna_core::calls::IoCall::Write(writes) = call else {
+            panic!("a reschedule writes its job");
+        };
+        write_rows(storage, writes).await?;
+        Ok(due)
+    }
+
+    /// Every outgoing relationship of a bucket.
+    async fn read_relationships(
+        storage: &StorageHandle,
+        bucket: &str,
+    ) -> Result<Vec<SyncRelationship>, BlobQueueError> {
+        let mut after = None;
+        let mut relationships = Vec::new();
+        loop {
+            let page =
+                read_relationships_limit(storage, bucket, after, REPLICATION_PAGE_SIZE).await?;
+            relationships.extend(page.values.into_iter().map(|(_, value)| value));
+            after = page.next;
+            if after.is_none() {
+                return Ok(relationships);
+            }
+        }
+    }
+
+    async fn read_relationships_limit(
+        storage: &StorageHandle,
+        bucket: &str,
+        start: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<RelationshipPage, BlobQueueError> {
+        let context = test_context(storage.clone());
+        let read = ReadRelationshipsOperation::new(bucket, start, limit);
+        drive(read, &context).await
+    }
+
+    async fn write_live_jobs(
+        storage: &StorageHandle,
+        obligation: &LiveObligationRecord,
+        relationships: Option<&RelationshipPage>,
+        members: Vec<BlobJobRecord>,
+    ) -> Result<LiveRepairWrite, BlobQueueError> {
+        let context = test_context(storage.clone());
+        let write = WriteJobsOperation::new(obligation, relationships, members);
+        drive(write, &context).await
+    }
+
+    async fn store_obligation(
+        storage: &StorageHandle,
+        record: &LiveObligationRecord,
+    ) -> Result<(), BlobQueueError> {
+        let context = test_context(storage.clone());
+        drive(WriteObligationOperation::new(record.clone()), &context).await
+    }
+
+    async fn delete_live_obligation(
+        storage: &StorageHandle,
+        key: Vec<u8>,
+        expected: Option<&LiveReplicationContinuation>,
+    ) -> Result<(), BlobQueueError> {
+        let context = test_context(storage.clone());
+        let delete = DeleteObligationOperation::new(key, expected.cloned());
+        drive(delete, &context).await
+    }
+
+    async fn retire_obligations(
+        storage: &StorageHandle,
+        obligations: Vec<(Vec<u8>, Option<LiveReplicationContinuation>)>,
+        jobs: Vec<BlobJobRecord>,
+        cursor: (Option<Vec<u8>>, Option<Vec<u8>>),
+    ) -> Result<(), BlobQueueError> {
+        let context = test_context(storage.clone());
+        drive(
+            RetireObligationsOperation::new(obligations, jobs, cursor),
+            &context,
+        )
+        .await
+    }
     use super::super::version_replication::SourceAuthorizationError;
     use crate::sync::mirror_repair::StoreStatusOperation;
     use aruna_core::UserId;
@@ -1265,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn kept_job_records_consent() {
+    fn kept_job_consents() {
         // A preferred job stays, and only the granted request is written for it.
         let mut operation = QueueBlobOperation::new(on_demand_input(), None).with_plaintext(true);
         let turn = operation.keep_existing();
@@ -1279,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_timer_keeps_job() {
+    fn timer_failure_keeps() {
         // The job is durable, so a drain timer that cannot be set is reported, not an error.
         let mut operation = QueueBlobOperation::new(on_demand_input(), None);
         operation.state = QueueBlobState::ScheduleDrain;
@@ -3025,9 +3213,7 @@ mod tests {
             ..Default::default()
         });
         for record in [obligation("fresh"), continued.clone()] {
-            super::super::obligations::write_live_obligation(&storage, &record)
-                .await
-                .unwrap();
+            store_obligation(&storage, &record).await.unwrap();
         }
         write_blob_job(&storage, &job("a", 3)).await.unwrap();
         let retired = vec![
@@ -3091,7 +3277,7 @@ mod tests {
             relationship_id: Ulid::from(9u128),
             hop_count: 4,
         }));
-        super::super::obligations::write_live_obligation(&storage, &record)
+        store_obligation(&storage, &record)
             .await
             .expect("obligation persists");
 
@@ -3116,7 +3302,7 @@ mod tests {
             false,
         );
         record.continuation = Some(LiveReplicationContinuation::default());
-        super::super::obligations::write_live_obligation(&storage, &record)
+        store_obligation(&storage, &record)
             .await
             .expect("obligation persists");
         let key = live_obligation_key(&record)
@@ -3159,7 +3345,7 @@ mod tests {
             relationships_complete: false,
             members_done: false,
         });
-        super::super::obligations::write_live_obligation(&storage, &record)
+        store_obligation(&storage, &record)
             .await
             .expect("obligation persists");
         let mut stale = record.clone();
@@ -3169,7 +3355,7 @@ mod tests {
             members_done: false,
         });
 
-        super::super::obligations::write_live_obligation(&storage, &stale)
+        store_obligation(&storage, &stale)
             .await
             .expect("stale write is a no-op");
 

@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn no_rows_no_job() {
+    fn rowless_skips_job() {
         let mut operation = ActiveJobOperation::new("b", &[]);
         operation.first().unwrap();
         assert_eq!(operation.next(no_rows()), Ok(Next::Done(None)));

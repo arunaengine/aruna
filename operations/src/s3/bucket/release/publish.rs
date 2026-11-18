@@ -53,7 +53,7 @@ use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, Ob
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::origin::{OriginError, read_origin};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::object::read::get_object_routed;
+use crate::s3::object::read::GetRoutedOperation;
 use aruna_core::metadata::AuthToken;
 use aruna_core::time::unix_timestamp_millis;
 
@@ -766,7 +766,10 @@ fn routed_read(
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
 ) -> Pin<Box<dyn Future<Output = Result<GetObjectResult, GetObjectError>> + Send + '_>> {
-    Box::pin(get_object_routed(context, input, restrictions))
+    Box::pin(drive(
+        GetRoutedOperation::new(input, restrictions, None),
+        context,
+    ))
 }
 
 /// Reads `range` of a release crate version, or all of it, and the version's whole size.

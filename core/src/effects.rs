@@ -52,6 +52,9 @@ pub enum Effect {
     Net(NetEffect),
     Metadata(MetadataEffect),
     SubOperation(Box<dyn SubOperation>),
+    /// Starts a child beside the caller while a background slot is free; answered at once by
+    /// `TaskEvent::BackgroundStarted`. The child's result goes nowhere.
+    Background(Box<dyn SubOperation>),
     Task(TaskEffect),
     Search(),
     Stream(),
@@ -164,6 +167,20 @@ pub enum BlobEffect {
     },
     ReleaseReservation {
         id: Ulid,
+    },
+    /// Settles the reservation a write left behind; answered by `ReservationReconciled`.
+    ReconcileReservation {
+        location: BackendLocation,
+    },
+    /// Removes an in-place target no upload record or version owns any more; answered by
+    /// `DeleteFinished`.
+    DiscardTarget {
+        location: BackendLocation,
+    },
+    /// Aborts the provider uploads of an in-place target and keeps its object; answered by
+    /// `UploadAborted`.
+    AbortTarget {
+        location: BackendLocation,
     },
     SpoolHidden {
         namespace: Ulid,

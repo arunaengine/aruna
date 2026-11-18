@@ -837,7 +837,11 @@ pub(super) async fn assemble_export(
                 .saturating_add(spec.limits.artifact_retention_ms),
         }),
         (Event::Blob(BlobEvent::HiddenSpooled { location, .. }), Err(error)) => {
-            let _ = delete_hidden(&ctx.driver, &location).await;
+            let _ = crate::driver::drive(
+                crate::blob::hidden::DeleteHiddenOperation::new(&location),
+                &ctx.driver,
+            )
+            .await;
             Err(error)
         }
         (Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit })), _) => {
@@ -1284,7 +1288,11 @@ pub(super) async fn discard_artifact(
     persist: bool,
 ) {
     if let Some(artifact) = checkpoint.artifact.as_ref() {
-        let _ = delete_hidden(&ctx.driver, &artifact.location).await;
+        let _ = crate::driver::drive(
+            crate::blob::hidden::DeleteHiddenOperation::new(&artifact.location),
+            &ctx.driver,
+        )
+        .await;
     }
     checkpoint.artifact = None;
     checkpoint.refs.hidden_locations.clear();

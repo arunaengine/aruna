@@ -18,6 +18,7 @@ use aruna_core::types::Value;
 use super::queue::BlobQueueError;
 
 /// How a processed job ends. The first three retire it; only `Completed` and `Failed` report.
+#[derive(Debug, PartialEq)]
 pub(crate) enum BlobJobOutcome {
     /// The run copied or confirmed every version.
     Completed,

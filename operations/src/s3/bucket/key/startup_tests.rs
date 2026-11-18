@@ -117,7 +117,7 @@ fn missing_secret_reported() {
 }
 
 #[test]
-fn failed_read_keeps_going() {
+fn failed_read_continues() {
     // A vault that cannot answer for one key leaves the next key to open.
     let (mut operation, _) = scanned(&[record(1, KeyState::Active), record(2, KeyState::Active)]);
     let turn = operation.next(vault_answer(Err(VaultReadError::Storage(
@@ -139,7 +139,7 @@ fn failed_install_reported() {
 }
 
 #[test]
-fn vault_read_checks_entry() {
+fn vault_checks_entry() {
     let entry = VaultEntry::new(VaultPurpose::BucketKey, Ulid::from_bytes([1; 16]));
     let mut read = VaultKeyRead { entry };
     assert!(matches!(read.first(), Ok(Next::Call(IoCall::Effect(_)))));

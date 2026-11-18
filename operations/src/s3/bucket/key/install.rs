@@ -364,7 +364,7 @@ mod tests {
     use super::*;
     use crate::driver::DriverContext;
     use crate::driver::drive;
-    use crate::jobs::key_wake::wake_unlocked;
+    use crate::jobs::key_wake::WakeUnlockedOperation;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
@@ -403,9 +403,8 @@ mod tests {
         let status = drive(operation, context).await?;
         let now_ms = aruna_core::time::unix_timestamp_millis();
         let limits = RoCrateLimits::default();
-        wake_unlocked(context, status.key, now_ms, origin, &limits)
-            .await
-            .unwrap();
+        let wake = WakeUnlockedOperation::new(status.key, now_ms, origin, &limits);
+        drive(wake, context).await.unwrap();
         Ok(status)
     }
 
@@ -761,9 +760,8 @@ mod tests {
 
     #[tokio::test]
     async fn install_wakes_parked() {
-        use crate::jobs::store::key_wait::park_job;
-        use crate::jobs::store::query::insert_job;
-        use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
+        use crate::jobs::store::job_calls::ClaimOutcome;
+        use crate::jobs::store::test_calls::{claim_job, insert_job, park_job, read_job_record};
         use aruna_core::keyspaces::KEY_COPY_KEYSPACE;
         use aruna_core::node_vault::{VaultEntry, VaultPurpose};
         use aruna_core::structs::execution::job::{
@@ -884,7 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlock_resumes_rewrite() {
-        use crate::blob::migration::queue::{RECHECK, process_transitions};
+        use crate::blob::migration::queue::{ProcessTransitionsOperation, RECHECK};
         use crate::tests::records::read_row;
         use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
         use crate::tests::incoming::{RecordingTaskHandler, freeze_clock};
@@ -968,7 +966,15 @@ mod tests {
                 txn_id: None,
             })
             .await;
-        assert_eq!(process_transitions(&context).await.unwrap(), Some(RECHECK));
+        assert_eq!(
+            crate::driver::drive(
+                ProcessTransitionsOperation::new(context.node_and_realm()),
+                &context
+            )
+            .await
+            .unwrap(),
+            Some(RECHECK)
+        );
         let stored = read_row(&context, TRANSITION_KEYSPACE, b"sealed".to_vec())
             .await
             .unwrap()
@@ -1031,7 +1037,12 @@ mod tests {
         );
         assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
         assert!(duration < RECHECK);
-        process_transitions(&context).await.unwrap();
+        crate::driver::drive(
+            ProcessTransitionsOperation::new(context.node_and_realm()),
+            &context,
+        )
+        .await
+        .unwrap();
         let stored = read_row(&context, TRANSITION_KEYSPACE, b"sealed".to_vec())
             .await
             .unwrap()

@@ -10,7 +10,9 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
-use crate::s3::object::copy::{CopyObjectInput, CopyReferences, CopySourceConditions, copy_object};
+use crate::s3::object::copy::{
+    CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
+};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{FileChangeKind, GitEffect, GitEvent, LfsObject, PendingMerge, StoredObject};
 use aruna_core::repo_layout::{Layout, StoredFile};
@@ -305,9 +307,12 @@ async fn copied(
         references: CopyReferences::Materialize,
         job_id: None,
     };
-    let result = copy_object(context, input)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
+    let result = drive(
+        CopyObjectOperation::new(input, node_routing(context)),
+        context,
+    )
+    .await
+    .map_err(|_| GitError::Unavailable)?;
     drive(
         objects::described(
             context.node_id(),

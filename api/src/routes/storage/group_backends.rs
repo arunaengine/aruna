@@ -11,7 +11,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage, valid_bucket};
-use aruna_operations::blob::reclaim_sweep::backend_status;
+use aruna_operations::blob::reclaim_sweep::BackendStatusOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::groups::backends::create::{
     CreateBackendError, CreateBackendInput, CreateBackendOperation,
@@ -858,7 +858,8 @@ pub async fn backend_reclaim_status(
         .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|record| record.group_id == group_id)
         .ok_or(ServerError::NotFound)?;
-    let status = backend_status(&context, &BackendRef::Group(backend_id))
+    let backend = BackendRef::Group(backend_id);
+    let status = drive(BackendStatusOperation::new(&backend), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
 

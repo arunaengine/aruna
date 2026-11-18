@@ -52,7 +52,6 @@ use crate::auth::permission_rules::{
     PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::hidden::delete_hidden;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolvePathsOperation};
 use crate::driver::{DriverContext, drive};

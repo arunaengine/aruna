@@ -1023,32 +1023,35 @@ async fn copy_object(
     dest_key: &str,
     group_id: Ulid,
 ) -> CopyResultData {
-    aruna_operations::s3::object::copy::copy_object(
-        &h.driver,
-        CopyObjectInput {
-            source_bucket: bucket.to_string(),
-            source_key: source_key.to_string(),
-            source_version_id: None,
-            source_group_id: group_id,
-            source_auth_context: AuthContext {
+    drive(
+        aruna_operations::s3::object::copy::CopyObjectOperation::new(
+            CopyObjectInput {
+                source_bucket: bucket.to_string(),
+                source_key: source_key.to_string(),
+                source_version_id: None,
+                source_group_id: group_id,
+                source_auth_context: AuthContext {
+                    user_id: h.created_by,
+                    realm_id: h.realm_id,
+                    path_restrictions: None,
+                    session: None,
+                },
+                dest_bucket: bucket.to_string(),
+                dest_key: dest_key.to_string(),
                 user_id: h.created_by,
+                group_id,
                 realm_id: h.realm_id,
-                path_restrictions: None,
-                session: None,
+                node_id: h.node_id,
+                quota_ceiling: None,
+                conditions: CopySourceConditions::default(),
+                metadata: None,
+                restrictions: None,
+                references: CopyReferences::Materialize,
+                job_id: None,
             },
-            dest_bucket: bucket.to_string(),
-            dest_key: dest_key.to_string(),
-            user_id: h.created_by,
-            group_id,
-            realm_id: h.realm_id,
-            node_id: h.node_id,
-            quota_ceiling: None,
-            conditions: CopySourceConditions::default(),
-            metadata: None,
-            restrictions: None,
-            references: CopyReferences::Materialize,
-            job_id: None,
-        },
+            aruna_operations::driver::node_routing(&h.driver),
+        ),
+        &h.driver,
     )
     .await
     .unwrap()

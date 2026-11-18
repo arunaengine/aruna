@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::driver::{DriverContext, drive, drive_retry_until};
+use crate::driver::{DriverContext, drive, drive_retry_until, node_routing};
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::records::pages::ServePageOperation;
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
@@ -21,12 +21,16 @@ use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::PlacementReconcileOutcome;
 use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::plugin_host::peer::serve_peer;
-use crate::replication::catch_up::wake_bootstrap;
+use crate::replication::catch_up::WakeBootstrapOperation;
+use crate::replication::incoming::stream::{
+    BaoAdmission, BaoAdmissionOperation, BaoPeerStream, ServeBaoOperation,
+};
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 use crate::staging::native_source::PrepareReferenceOperation;
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
 use crate::triggers::{PeerInput, peer_operation};
+use aruna_blob::blob::{InboundError, refuse_stream};
 use aruna_blob::native;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
@@ -450,7 +454,7 @@ async fn reconcile_inbound_topics(
         warn!(%error, "Mail settings refresh stopped after a document sync");
     }
     // An installed record may name a member this node bootstraps.
-    wake_bootstrap(context).await;
+    drive(WakeBootstrapOperation::default(), context).await.ok();
     let refresh = RefreshInterestOperation::new(&targets.targets, *net_handle.realm_id());
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Watch interest refresh stopped after a document sync");
@@ -567,6 +571,104 @@ fn install_inbound_handler(
     Some(inbound_handler)
 }
 
+const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded admission read: a slow store read must not hold the stream open.
+async fn bao_admission(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local: NodeId,
+    peer: NodeId,
+) -> Option<BaoAdmission> {
+    let admission = BaoAdmissionOperation::new(realm_id, local, peer);
+    tokio::time::timeout(INBOUND_BAO_TIMEOUT, drive(admission, context))
+        .await
+        .ok()?
+        .ok()
+        .flatten()
+}
+
+/// The bao plane input: admits the peer, registers the stream, reads its first frame within
+/// bounds and hands the frame to its operation.
+async fn handle_bao_stream(
+    context: &DriverContext,
+    rocrate_limits: &RoCrateLimits,
+    stream: BiStream,
+    node_id: NodeId,
+) {
+    let Some(blob_handle) = context.blob_handle.clone() else {
+        error!("Cannot handle incoming bao stream without blob handle");
+        return;
+    };
+    let Some(net_handle) = context.net_handle.clone() else {
+        error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
+        return;
+    };
+    let realm_id = *net_handle.realm_id();
+    let local_node = net_handle.node_id();
+    // Only an authenticated sync-eligible realm peer may open the blob replication plane.
+    if bao_admission(context, realm_id, local_node, node_id)
+        .await
+        .is_none()
+    {
+        warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
+        refuse_stream(stream);
+        return;
+    }
+    let stream_id = match blob_handle
+        .accept_stream(node_id, stream, INBOUND_BAO_TIMEOUT)
+        .await
+    {
+        Ok(stream_id) => stream_id,
+        Err(InboundError::TimedOut) => {
+            warn!(peer = %node_id, "Timed out registering inbound bao stream");
+            return;
+        }
+        Err(err) => {
+            error!(peer = %node_id, error = ?err, "Failed to register inbound bao stream");
+            return;
+        }
+    };
+    let Some(admission) = bao_admission(context, realm_id, local_node, node_id).await else {
+        warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
+        blob_handle.close_stream(stream_id).await;
+        return;
+    };
+    let payload = match blob_handle
+        .first_frame(stream_id, INBOUND_BAO_TIMEOUT)
+        .await
+    {
+        Ok(payload) => payload,
+        Err(InboundError::TimedOut) => {
+            warn!(peer = %node_id, stream_id = %stream_id, "Timed out reading inbound bao control message");
+            blob_handle.close_stream(stream_id).await;
+            return;
+        }
+        Err(InboundError::Blob(err)) => {
+            error!(error = ?err, "Failed to read initial inbound bao payload");
+            blob_handle.close_stream(stream_id).await;
+            return;
+        }
+        Err(InboundError::Unexpected(event)) => {
+            error!(event, "Unexpected first event for inbound bao stream");
+            blob_handle.close_stream(stream_id).await;
+            return;
+        }
+    };
+    let peer_stream = BaoPeerStream {
+        realm_id,
+        local_node,
+        peer: node_id,
+        stream_id,
+    };
+    let routing = node_routing(context);
+    let serve = ServeBaoOperation::new(peer_stream, admission, payload, routing, rocrate_limits);
+    if let Err(error) = drive(serve, context).await {
+        error!(peer = %node_id, stream_id = %stream_id, error = ?error, "Failed to answer inbound bao stream");
+        blob_handle.close_stream(stream_id).await;
+    }
+}
+
 #[async_trait]
 impl InboundEventHandler for OperationsInboundHandler {
     #[tracing::instrument(
@@ -584,7 +686,7 @@ impl InboundEventHandler for OperationsInboundHandler {
             // protocol branch is boxed to keep only the active one on the stack.
             match alpn {
                 Alpn::Bao => {
-                    Box::pin(crate::replication::incoming::stream::handle_bao_stream(
+                    Box::pin(handle_bao_stream(
                         self.context.as_ref(),
                         &self.rocrate_limits,
                         stream,

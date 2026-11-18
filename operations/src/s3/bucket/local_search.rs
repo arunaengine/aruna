@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_scan_ends_page() {
+    fn empty_scan_ends() {
         let mut search = LocalBucketSearch::new(input());
         assert!(matches!(search.first(), Ok(Next::Call(IoCall::Child(_)))));
         let Ok(Next::Done(page)) = search.next(scanned(Vec::new(), None)) else {
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn used_budget_seals_position() {
+    fn budget_seals_position() {
         let mut search = LocalBucketSearch::with_budget(input(), 1);
         search.first().unwrap();
         let next = Some(Key::from(b"bucket".to_vec()));

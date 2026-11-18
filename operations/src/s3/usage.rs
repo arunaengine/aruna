@@ -863,12 +863,6 @@ pub(crate) fn counted(active_node_ids: Option<&HashSet<NodeId>>, node_id: Option
     }
 }
 
-/// One batch read of every global counter shard, inside `txn_id` when given.
-pub(crate) fn global_shard_read(txn_id: Option<TxnId>) -> StorageEffect {
-    let reads = global_shard_rows();
-    StorageEffect::BatchRead { reads, txn_id }
-}
-
 /// The rows of the node-wide counter shards.
 pub(crate) fn global_shard_rows() -> Vec<(KeySpace, Key)> {
     (global_shard_keys().into_iter())
@@ -876,7 +870,7 @@ pub(crate) fn global_shard_rows() -> Vec<(KeySpace, Key)> {
         .collect()
 }
 
-/// The node-wide counters: the sum of the shard rows [`global_shard_read`] returned.
+/// The node-wide counters: the sum of the rows [`global_shard_rows`] names.
 pub(crate) fn global_sum<E>(
     values: impl IntoIterator<Item = Option<Value>>,
 ) -> Result<UsageCounters, E>

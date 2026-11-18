@@ -2,135 +2,53 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use aruna_core::NodeId;
 use aruna_core::backoff::capped_backoff;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, GroupEvent, GroupResult};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
-    IMPORT_INTENT_KEYSPACE, MIGRATION_AHEAD_KEYSPACE, MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE,
+    COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    MIGRATION_AHEAD_KEYSPACE, MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE,
 };
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::storage::backend_import::{RenameRequest, WriteIntent};
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::backend_import::{RenameRequest, WriteIntent, object_prefix};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, ResolvedBackend, VersionKey,
 };
-use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{
     Compression, CompressionMigration, MigrationAhead, StoredLayout,
 };
-use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::types::{Key, TxnId};
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
+use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::batch::Stop;
+use super::batch::{Batch, Stop};
+use super::broken::ProcessChecksOperation;
+use super::check::{CheckOutcome, CheckVersionError, CheckVersionOperation};
+use super::queue::ProcessTransitionsOperation;
+use super::shared::{
+    EarlierPatternsOperation, MigrationError, encryption_read, is_encrypted, routing_call,
+    routing_result,
+};
 use super::{
     Earlier, MigrateOutcome, MigrateVersionError, MigrateVersionOperation, RULE_PAGE, place,
     same_bytes,
 };
-use super::{batch, broken, check};
 use crate::auth::bearer_token::GrantValidOperation;
-use crate::auth::request_authorization::BucketAccessOperation;
-use crate::blob::records::blob_location_read;
-use crate::driver::drive;
-
-/// The rename request of the move `record` of `bucket`, if it was started to rename files.
-pub(super) async fn rename_request(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    record: &CompressionMigration,
-) -> Result<Option<RenameRequest>, String> {
-    let read = StorageEffect::Read {
-        key_space: RENAME_MOVE_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    let value = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => {
-            return Err(format!(
-                "could not read the rename request: {}",
-                other.label()
-            ));
-        }
-    };
-    let request = value
-        .map(|value| RenameRequest::from_bytes(&value))
-        .transpose();
-    let request = request.map_err(|error| error.to_string())?;
-    Ok(request.filter(|request| record.moving && request.started_at_ms == record.started_at_ms))
-}
-
-/// The caller's WRITE on the bucket's keys, loaded once for a page of a rename; `None` when
-/// the caller's token no longer holds or the caller may not use the bucket any more. State
-/// that cannot be read is an error, so the page is retried rather than passed over.
-pub(super) async fn rename_access(
-    context: &crate::driver::DriverContext,
-    request: &RenameRequest,
-    routing: &RoutingSnapshot,
-    bucket: &str,
-) -> Result<Option<crate::auth::request_authorization::BucketAccess>, String> {
-    let valid = drive(
-        GrantValidOperation::new(&request.grant, &request.auth.user_id),
-        &context,
-    );
-    if !valid.await.map_err(|error| error.to_string())? {
-        return Ok(None);
-    }
-    let admin = crate::s3::bucket::job_pages::still_admin(context, &request.auth, routing.group_id);
-    if !admin.await? {
-        return Ok(None);
-    }
-    let scope = (request.auth.realm_id, routing.group_id, request.node_id);
-    let loaded = drive(
-        BucketAccessOperation::new(&request.auth, scope, bucket),
-        context,
-    )
-    .await;
-    let Some(access) = granted(loaded)? else {
-        return Ok(None);
-    };
-    let write = aruna_core::structs::identity::auth::Permission::WRITE;
-    Ok(access.allows(None, &write).then_some(access))
-}
-
-/// A denial ends the rename; policy state that cannot be read is an error to retry.
-pub(super) fn granted<T>(
-    loaded: Result<T, crate::auth::error::AuthorizeError>,
-) -> Result<Option<T>, String> {
-    use crate::auth::error::AuthorizeError;
-    use crate::auth::error::PolicyEnforcementError;
-    match loaded {
-        Ok(access) => Ok(Some(access)),
-        Err(AuthorizeError::PermissionDenied)
-        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// Reads the earlier patterns of the rules a move resolves against.
-pub async fn read_earlier(
-    context: &crate::driver::DriverContext,
-    routing: &RoutingSnapshot,
-) -> Result<Earlier, String> {
-    let mut earlier = Earlier::new();
-    for rule in &routing.imports {
-        let patterns = crate::driver::drive(
-            crate::s3::imports::ReadEarlierOperation::new(rule.import_id),
-            context,
-        )
-        .await;
-        let patterns = patterns.map_err(|error| error.to_string())?;
-        if !patterns.is_empty() {
-            earlier.insert(rule.import_id, patterns);
-        }
-    }
-    Ok(earlier)
-}
+use crate::auth::error::{ArunaBearerError, AuthorizeError, PolicyEnforcementError};
+use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
+use crate::s3::bucket::job_pages::{ProcessLinkedOperation, StillAdminOperation};
 
 /// Versions one task run handles per bucket before it yields to other timers.
 pub(super) const MIGRATION_PAGE: usize = 64;
@@ -163,6 +81,116 @@ pub(super) const RETRY_BASE: Duration = Duration::from_secs(60);
 
 pub(super) const RETRY_MAX: Duration = Duration::from_secs(3600);
 
+/// Intent pages one hand-over run writes at most before it stores its place.
+const HANDOVER_PAGES: usize = 16;
+
+type Turn<T> = Result<Next<T>, MigrationError>;
+/// This node and its realm, where it serves one.
+type Serving = Option<(NodeId, RealmId)>;
+
+fn bucket_key(bucket: &str) -> Key {
+    bucket.as_bytes().to_vec().into()
+}
+
+fn soonest(next: &mut Option<Duration>, after: Duration) {
+    *next = Some(next.map_or(after, |next| next.min(after)));
+}
+
+/// The rename request `value` holds, if the move `record` was started for it.
+pub(super) fn decode_request(
+    value: Option<Value>,
+    record: (bool, u64),
+) -> Result<Option<RenameRequest>, MigrationError> {
+    let request = value
+        .map(|value| RenameRequest::from_bytes(&value))
+        .transpose()
+        .map_err(MigrationError::failed)?;
+    let (moving, started_at_ms) = record;
+    Ok(request.filter(|request| moving && request.started_at_ms == started_at_ms))
+}
+
+/// A denial ends the rename; policy state that cannot be read is an error to retry.
+pub(super) fn granted<T>(loaded: Result<T, AuthorizeError>) -> Result<Option<T>, String> {
+    match loaded {
+        Ok(access) => Ok(Some(access)),
+        Err(AuthorizeError::PermissionDenied)
+        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum AccessStep {
+    Grant,
+    Admin,
+    Bucket,
+}
+
+/// The caller's WRITE on the bucket's keys, loaded once for a page of a rename; `None` when
+/// the caller's token no longer holds or the caller may not use the bucket any more. State
+/// that cannot be read is an error, so the page is retried rather than passed over.
+#[derive(Debug, PartialEq)]
+pub(super) struct RenameAccessOperation {
+    request: RenameRequest,
+    group_id: ulid::Ulid,
+    bucket: String,
+    step: AccessStep,
+}
+
+impl RenameAccessOperation {
+    pub(super) fn new(request: &RenameRequest, group_id: ulid::Ulid, bucket: &str) -> Self {
+        Self {
+            request: request.clone(),
+            group_id,
+            bucket: bucket.to_string(),
+            step: AccessStep::Grant,
+        }
+    }
+}
+
+impl Operation for RenameAccessOperation {
+    type Output = Option<BucketAccess>;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<Option<BucketAccess>> {
+        let request = &self.request;
+        let valid = GrantValidOperation::new(&request.grant, &request.auth.user_id);
+        Ok(Next::Call(IoCall::child(valid)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<BucketAccess>> {
+        let request = &self.request;
+        match self.step {
+            AccessStep::Grant => {
+                let valid =
+                    (result.child::<bool, ArunaBearerError>()?).map_err(MigrationError::failed)?;
+                if !valid {
+                    return Ok(Next::Done(None));
+                }
+                let admin = StillAdminOperation::new(&request.auth, self.group_id);
+                self.step = AccessStep::Admin;
+                Ok(Next::Call(IoCall::child(admin)))
+            }
+            AccessStep::Admin => {
+                if !result.child::<bool, MigrationError>()?? {
+                    return Ok(Next::Done(None));
+                }
+                let scope = (request.auth.realm_id, self.group_id, request.node_id);
+                let load = BucketAccessOperation::new(&request.auth, scope, &self.bucket);
+                self.step = AccessStep::Bucket;
+                Ok(Next::Call(IoCall::child(load)))
+            }
+            AccessStep::Bucket => {
+                let loaded = result.child::<BucketAccess, AuthorizeError>()?;
+                let access = granted(loaded).map_err(MigrationError::Failed)?;
+                let write = Permission::WRITE;
+                let access = access.filter(|access| access.allows(None, &write));
+                Ok(Next::Done(access))
+            }
+        }
+    }
+}
+
 /// What one task run left behind.
 #[derive(Debug, PartialEq)]
 pub struct MigrationRun {
@@ -172,671 +200,1360 @@ pub struct MigrationRun {
     pub cursor: Option<Key>,
 }
 
+#[derive(Debug, PartialEq)]
+enum RunStep {
+    Queue,
+    Progress(Key),
+    Encryption(String, CompressionMigration),
+    Handover(String, CompressionMigration),
+    Retired,
+    Page,
+    Transitions,
+    Checks,
+    Linked,
+}
+
 /// Advances the unfinished migrations of one page of queued buckets by one page each.
-pub async fn process_migrations(
-    context: &crate::driver::DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct ProcessMigrationsOperation {
+    routing: NodeRouting,
+    serving: Serving,
     after: Option<Key>,
-) -> Result<MigrationRun, String> {
-    let resumed = after.is_some();
-    let (rows, cursor) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        COMPRESSION_QUEUE_KEYSPACE,
-        None,
-        after,
-        BUCKET_PAGE,
-        None,
-    )
-    .await?;
-    let now = aruna_core::time::unix_timestamp_millis();
-    let mut next = None::<Duration>;
-    let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
-    for (key, _) in rows {
-        let Some(record) = read_progress(context, &key).await? else {
-            continue;
+    resumed: bool,
+    now_ms: u64,
+    step: RunStep,
+    rows: VecDeque<Key>,
+    cursor: Option<Key>,
+    next: Option<Duration>,
+}
+
+type RunTurn = Turn<MigrationRun>;
+
+impl ProcessMigrationsOperation {
+    pub fn new(routing: NodeRouting, serving: Serving, after: Option<Key>) -> Self {
+        Self {
+            routing,
+            serving,
+            resumed: after.is_some(),
+            after,
+            now_ms: 0,
+            step: RunStep::Queue,
+            rows: VecDeque::new(),
+            cursor: None,
+            next: None,
+        }
+    }
+
+    fn call(&mut self, step: RunStep, call: IoCall) -> RunTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn next_bucket(&mut self) -> RunTurn {
+        match self.rows.pop_front() {
+            Some(key) => {
+                let read = read_row(COMPRESSION_MIGRATION_KEYSPACE, key.clone());
+                self.call(RunStep::Progress(key), read)
+            }
+            None => self.shared_work(),
+        }
+    }
+
+    fn progress_read(&mut self, key: Key, value: Option<Value>) -> RunTurn {
+        let Some(record) = decode_progress(value)? else {
+            return self.next_bucket();
         };
         if record.finished_at_ms.is_some() {
-            continue;
+            return self.next_bucket();
         }
-        if let Some(at) = record.retry_at_ms.filter(|at| *at > now) {
-            soon(Duration::from_millis(at - now));
-            continue;
+        if let Some(at) = record.retry_at_ms.filter(|at| *at > self.now_ms) {
+            soonest(&mut self.next, Duration::from_millis(at - self.now_ms));
+            return self.next_bucket();
         }
-        let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
-        // Encryption replaced this work: its transition converts every version.
-        if encrypting(context, &key).await? {
-            if record.moving && !hand_over_moves(context, &bucket, record.started_at_ms).await? {
-                soon(MIGRATION_CONTINUE);
-                continue;
-            }
-            let mut retired = record;
-            retired.retry_at_ms = None;
-            retired.finished_at_ms = Some(now);
-            store_progress(context, &bucket, &retired, None).await?;
-            continue;
-        }
-        if let Some(after) = migrate_page(context, &bucket, record, MIGRATION_TIME).await? {
-            soon(after);
-        }
+        let bucket = String::from_utf8(key.to_vec()).map_err(MigrationError::failed)?;
+        let read = encryption_read(&bucket);
+        self.call(RunStep::Encryption(bucket, record), read)
     }
-    // Encryption transitions share this task; a run at the queue head advances them all.
-    if !resumed
-        && let Some(after) = crate::blob::migration::queue::process_transitions(context).await?
-    {
-        soon(after);
-    }
-    // Storage checks share this task too.
-    if !resumed && let Some(after) = broken::process_checks(context).await? {
-        soon(after);
-    }
-    // So do the re-mapping and duplicate cleanup jobs of buckets.
-    if !resumed && let Some(after) = crate::s3::bucket::job_pages::process_linked(context).await? {
-        soon(after);
-    }
-    // Queued buckets after this page, or before it when the run resumed mid-queue.
-    if cursor.is_some() || resumed {
-        soon(MIGRATION_CONTINUE);
-    }
-    Ok(MigrationRun { next, cursor })
-}
 
-pub(super) async fn encrypting(
-    context: &crate::driver::DriverContext,
-    bucket: &Key,
-) -> Result<bool, String> {
-    let read = StorageEffect::Read {
-        key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-        key: bucket.clone(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            BucketEncryption::from_row(value.as_deref())
-                .map(|settings| settings.is_encrypted())
-                .map_err(|error| error.to_string())
+    /// Encryption replaced this work: its transition converts every version.
+    fn retire(&mut self, bucket: String, mut record: CompressionMigration) -> RunTurn {
+        record.retry_at_ms = None;
+        record.finished_at_ms = Some(self.now_ms);
+        let store = StoreMigrationOperation::new(&bucket, record, None);
+        self.call(RunStep::Retired, IoCall::child(store))
+    }
+
+    /// Encryption transitions, storage checks and the jobs of buckets share this task; a run at
+    /// the queue head advances them all.
+    fn shared_work(&mut self) -> RunTurn {
+        if self.resumed {
+            return self.finish();
         }
-        other => Err(format!(
-            "could not read encryption settings: {}",
-            other.label()
-        )),
+        let transitions = ProcessTransitionsOperation::new(self.serving);
+        self.call(RunStep::Transitions, IoCall::child(transitions))
+    }
+
+    fn take_wait(&mut self, result: IoResult) -> Result<(), MigrationError> {
+        if let Some(after) = result.child::<Option<Duration>, MigrationError>()?? {
+            soonest(&mut self.next, after);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> RunTurn {
+        // Queued buckets after this page, or before it when the run resumed mid-queue.
+        if self.cursor.is_some() || self.resumed {
+            soonest(&mut self.next, MIGRATION_CONTINUE);
+        }
+        Ok(Next::Done(MigrationRun {
+            next: self.next,
+            cursor: self.cursor.take(),
+        }))
     }
 }
 
-pub(super) async fn read_progress(
-    context: &crate::driver::DriverContext,
-    key: &Key,
-) -> Result<Option<CompressionMigration>, String> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| CompressionMigration::from_bytes(value.as_ref()))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!(
-            "could not read migration progress: {}",
-            other.label()
-        )),
+impl Operation for ProcessMigrationsOperation {
+    type Output = MigrationRun;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> RunTurn {
+        Ok(Next::Call(IoCall::Page {
+            space: COMPRESSION_QUEUE_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.after.take(),
+            limit: BUCKET_PAGE,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> RunTurn {
+        match std::mem::replace(&mut self.step, RunStep::Page) {
+            RunStep::Queue => {
+                let (rows, cursor) = result.page()?;
+                self.cursor = cursor;
+                self.rows = rows.into_iter().map(|(key, _)| key).collect();
+                self.next_bucket()
+            }
+            RunStep::Progress(key) => self.progress_read(key, result.value()?),
+            RunStep::Encryption(bucket, record) => {
+                if !is_encrypted(result.value()?)? {
+                    let budget = MIGRATION_TIME;
+                    let page =
+                        MigratePageOperation::new(self.routing.clone(), &bucket, record, budget);
+                    return self.call(RunStep::Page, IoCall::child(page));
+                }
+                if !record.moving {
+                    return self.retire(bucket, record);
+                }
+                let started = record.started_at_ms;
+                let hand_over = HandOverOperation::new(self.routing.clone(), &bucket, started);
+                self.call(RunStep::Handover(bucket, record), IoCall::child(hand_over))
+            }
+            RunStep::Handover(bucket, record) => {
+                if result.child::<bool, MigrationError>()?? {
+                    return self.retire(bucket, record);
+                }
+                soonest(&mut self.next, MIGRATION_CONTINUE);
+                self.next_bucket()
+            }
+            RunStep::Retired => {
+                result.child::<(), MigrationError>()??;
+                self.next_bucket()
+            }
+            RunStep::Page => {
+                self.take_wait(result)?;
+                self.next_bucket()
+            }
+            RunStep::Transitions => {
+                self.take_wait(result)?;
+                let checks = ProcessChecksOperation::new();
+                self.call(RunStep::Checks, IoCall::child(checks))
+            }
+            RunStep::Checks => {
+                self.take_wait(result)?;
+                let linked = ProcessLinkedOperation::new(self.routing.clone());
+                self.call(RunStep::Linked, IoCall::child(linked))
+            }
+            RunStep::Linked => {
+                self.take_wait(result)?;
+                self.finish()
+            }
+        }
     }
 }
 
-/// Migrates one page of a bucket's versions and stores the progress, unless a newer
-/// setting replaced the record meanwhile. A run that worked for `budget` starts no more
-/// versions. Returns when the bucket needs the next run.
-pub(super) async fn migrate_page(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    mut record: CompressionMigration,
-    budget: Duration,
-) -> Result<Option<Duration>, String> {
-    let begun = std::time::Instant::now();
-    // A hand-over under way finishes before anything else of the move.
-    if record.moving && handing_over(context, bucket, record.started_at_ms).await? {
-        if !hand_over_moves(context, bucket, record.started_at_ms).await? {
-            return Ok(Some(MIGRATION_CONTINUE));
+fn decode_progress(value: Option<Value>) -> Result<Option<CompressionMigration>, MigrationError> {
+    value
+        .map(|value| CompressionMigration::from_bytes(value.as_ref()))
+        .transpose()
+        .map_err(MigrationError::failed)
+}
+
+/// How one version of a run ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowEnd {
+    /// The rename was paused or aborted before the version started.
+    Halted,
+    Migrated,
+    Skipped,
+    /// A move found a copy it cannot read, which a storage check recorded.
+    Broken,
+    Failed,
+}
+
+/// What a version of a run moves with, when it moves.
+#[derive(Debug, PartialEq)]
+struct RowMove {
+    routing: RoutingSnapshot,
+    earlier: Earlier,
+    started_ms: u64,
+}
+
+#[derive(Debug, PartialEq)]
+enum RowStep {
+    Rename,
+    Migrate,
+    Broken(String),
+}
+
+/// Checks that a rename still runs, migrates one version, and checks a copy a move could not
+/// read.
+#[derive(Debug, PartialEq)]
+struct MigrateRowOperation {
+    bucket: String,
+    version: VersionKey,
+    target: Compression,
+    moved: Option<RowMove>,
+    moving: bool,
+    /// The moving flag and start of a move whose rename must still run.
+    rename: Option<(bool, u64)>,
+    now_ms: u64,
+    step: RowStep,
+}
+
+impl MigrateRowOperation {
+    fn migrate(&mut self) -> Turn<RowEnd> {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+        let mut operation = MigrateVersionOperation::new(self.version.clone(), self.target, now);
+        if let Some(moved) = self.moved.take() {
+            self.moving = true;
+            operation = (operation.with_routing(moved.routing))
+                .with_earlier(moved.earlier)
+                .with_mover(moved.started_ms);
         }
-        record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
-        store_progress(context, bucket, &record, None).await?;
-        return Ok(None);
+        self.step = RowStep::Migrate;
+        Ok(Next::Call(IoCall::child(operation)))
     }
-    // A due retry pass counts its own skips and failures.
-    if record.retry_at_ms.take().is_some() {
-        record.skipped = 0;
-        record.failed = 0;
+
+    fn migrated(&mut self, moved: Result<MigrateOutcome, MigrateVersionError>) -> Turn<RowEnd> {
+        let error = match moved {
+            Ok(MigrateOutcome::Migrated) => return Ok(Next::Done(RowEnd::Migrated)),
+            Ok(MigrateOutcome::Skipped) => return Ok(Next::Done(RowEnd::Skipped)),
+            Err(error) => error,
+        };
+        // A taken name says nothing about the old copy, so the provider is not asked about it.
+        let taken = matches!(error, MigrateVersionError::Blob(BlobError::PathTaken));
+        if !self.moving || taken {
+            return self.failed(&error.to_string());
+        }
+        self.step = RowStep::Broken(error.to_string());
+        let check = CheckVersionOperation::new(self.version.clone(), self.now_ms);
+        Ok(Next::Call(IoCall::child(check)))
     }
-    let routing = match record.moving {
-        true => match move_routing(context, bucket).await? {
-            Some(routing) => Some(routing),
-            None => {
-                record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
-                store_progress(context, bucket, &record, None).await?;
-                return Ok(None);
+
+    fn failed(&self, error: &str) -> Turn<RowEnd> {
+        tracing::warn!(bucket = %self.bucket, %error, "Failed to re-encode a version");
+        Ok(Next::Done(RowEnd::Failed))
+    }
+}
+
+impl Operation for MigrateRowOperation {
+    type Output = RowEnd;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<RowEnd> {
+        if self.rename.is_some() {
+            return Ok(Next::Call(read_row(
+                RENAME_MOVE_KEYSPACE,
+                bucket_key(&self.bucket),
+            )));
+        }
+        self.migrate()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<RowEnd> {
+        match std::mem::replace(&mut self.step, RowStep::Migrate) {
+            RowStep::Rename => {
+                let record = self.rename.unwrap_or((false, 0));
+                let request = decode_request(result.value()?, record)?;
+                if request.is_none_or(|request| request.paused || request.aborted_at_ms.is_some()) {
+                    return Ok(Next::Done(RowEnd::Halted));
+                }
+                self.migrate()
             }
-        },
-        false => None,
-    };
-    // Without earlier patterns no file is renamed, so only an asked rename reads them; each
-    // file is renamed only while the caller who asked may still write its key.
-    let request = match routing.as_ref() {
-        Some(_) => rename_request(context, bucket, &record).await?,
-        None => None,
-    };
-    // An aborted rename ends here with its counts, once no version of it is in flight.
-    if request
-        .as_ref()
-        .is_some_and(|request| request.aborted_at_ms.is_some())
-    {
-        return end_aborted(context, bucket, record).await;
-    }
-    // A paused rename waits for its resume, which wakes this task again.
-    if request.as_ref().is_some_and(|request| request.paused) {
-        return Ok(None);
-    }
-    let (earlier, access) = match routing.as_ref() {
-        Some(routing) => match request.clone() {
-            Some(request) => match rename_access(context, &request, routing, bucket).await? {
-                Some(access) => (read_earlier(context, routing).await?, Some(access)),
-                None => (Earlier::new(), None),
-            },
-            None => (Earlier::new(), None),
-        },
-        None => (Earlier::new(), None),
-    };
-    let write = aruna_core::structs::identity::auth::Permission::WRITE;
-    let mut denied = 0usize;
-    let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (versions, next) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        BLOB_VERSIONS_KEYSPACE,
-        Some(prefix.into()),
-        record.cursor.clone().map(Into::into),
-        MIGRATION_ROWS,
-        None,
-    )
-    .await?;
-    let keys = versions
-        .iter()
-        .map(|(key, _)| VersionKey::from_bytes(key.as_ref()));
-    let keys: Vec<VersionKey> = keys.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-    // Keys outside a move's prefix are only re-encoded.
-    let moves =
-        |key: &VersionKey| (routing.as_ref()).filter(|_| key.key.starts_with(&record.prefix));
-    // A rename moves several keys at once, but never two versions of one key or one new name.
-    let limit = match request {
-        Some(_) => RENAME_PARALLEL,
-        None => 1,
-    };
-    let name = |key: &VersionKey| {
-        let routing = moves(key).filter(|_| limit > 1)?;
-        Some(place(routing, key).ok()?.1?.path)
-    };
-    let rows = keys.iter().map(|key| (key.key.clone(), name(key)));
-    let mut batch = batch::Batch::new(rows.collect());
-    // Rows the last run of this pass finished after its cursor already count, so they pass.
-    let ahead = read_ahead(context, bucket).await?;
-    let ahead: std::collections::HashSet<Vec<u8>> = ahead
-        .map(|ahead| ahead.rows_for(&record))
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    for (row, (key, _)) in versions.iter().enumerate() {
-        if ahead.contains(key.as_ref()) {
-            batch.passed(row);
-        }
-    }
-    let worked = AtomicUsize::new(0);
-    let (target, started_ms) = (record.target, record.started_at_ms);
-    let start = |row: usize| {
-        let version_key = keys[row].clone();
-        let routing = moves(&version_key).cloned();
-        let moving = routing.is_some();
-        let object = version_key.key.clone();
-        let mut operation = MigrateVersionOperation::new(version_key, target, SystemTime::now());
-        if let Some(routing) = routing {
-            let allowed =
-                (access.as_ref()).is_some_and(|access| access.allows(Some(&object), &write));
-            denied += usize::from(!earlier.is_empty() && !allowed);
-            let earlier = match allowed {
-                true => earlier.clone(),
-                false => Earlier::new(),
-            };
-            operation = (operation.with_routing(routing))
-                .with_earlier(earlier)
-                .with_mover(started_ms);
-        }
-        let (key, worked) = (&versions[row].0, &worked);
-        async move {
-            let moved = crate::driver::drive(operation, context).await;
-            // A taken name says nothing about the old copy, so the provider is not asked about it.
-            let taken = matches!(moved, Err(MigrateVersionError::Blob(BlobError::PathTaken)));
-            let broken = moved.is_err() && moving && !taken && is_broken(context, key).await;
-            let skipped = matches!(moved, Ok(MigrateOutcome::Skipped));
-            worked.fetch_add(usize::from(!skipped), Ordering::Relaxed);
-            if let (Err(error), false) = (&moved, broken) {
-                tracing::warn!(bucket, %error, "Failed to re-encode a version");
-            }
-            (moved, broken)
-        }
-    };
-    // A run with enough work or time stores its progress, and a pause or an abort of the rename
-    // stops it, before the next version starts.
-    let mut started = 0usize;
-    let proceed = || {
-        let spent = begun.elapsed() >= budget || worked.load(Ordering::Relaxed) >= MIGRATION_WORK;
-        let full = started > 0 && spent;
-        started += 1;
-        let (renaming, record) = (request.is_some(), &record);
-        async move {
-            if full {
-                return Ok(Some(Stop::More));
-            }
-            let stopped = renaming && rename_stopped(context, bucket, record).await?;
-            Ok(stopped.then_some(Stop::Halted))
-        }
-    };
-    let (results, stop) = batch::run_rows(&mut batch, limit, start, proceed).await;
-    let stopped = stop? == Some(Stop::Halted);
-    // Each row this run finished counts once; the next run starts after the rows finished in
-    // storage order and passes over those finished after them.
-    let done = batch.done();
-    let rows = batch.finished_after().map(|row| versions[row].0.to_vec());
-    let ahead = MigrationAhead {
-        rows: rows.collect(),
-        ..MigrationAhead::default()
-    };
-    for (moved, broken) in results.into_iter().flatten() {
-        match moved {
-            Ok(MigrateOutcome::Migrated) => record.migrated += 1,
-            Ok(MigrateOutcome::Skipped) => record.skipped += 1,
-            // A move records a copy that cannot be read as broken instead of retrying it.
-            Err(_) if broken => record.skipped += 1,
-            Err(_) => record.failed += 1,
-        }
-    }
-    if let Some(last) = done.checked_sub(1) {
-        record.cursor = Some(versions[last].0.to_vec());
-    }
-    let ahead = MigrationAhead {
-        started_at_ms: record.started_at_ms,
-        retries: record.retries,
-        cursor: record.cursor.clone(),
-        ..ahead
-    };
-    let more = next.is_some() || done < versions.len();
-    if stopped {
-        let aborted = rename_request(context, bucket, &record).await?;
-        if aborted.is_some_and(|request| request.aborted_at_ms.is_some()) {
-            return end_aborted(context, bucket, record).await;
-        }
-        store_progress(context, bucket, &record, Some(&ahead)).await?;
-        return Ok(None);
-    }
-    if denied > 0 {
-        tracing::warn!(
-            bucket,
-            denied,
-            "Files the rename's caller may not write keep their name"
-        );
-    }
-    let now = aruna_core::time::unix_timestamp_millis();
-    let after = match (more, record.failed > 0) {
-        // This run moved the cursor, so the rows left can go on at once.
-        (true, _) => Some(Duration::ZERO),
-        // Successful versions are already in the target, so a retry pass reads no blob for them.
-        (false, true) if record.retries < MIGRATION_RETRIES => {
-            let wait = capped_backoff(RETRY_BASE, RETRY_MAX, record.retries, 0);
-            record.retries += 1;
-            record.cursor = None;
-            record.retry_at_ms = Some(now.saturating_add(wait.as_millis() as u64));
-            Some(wait)
-        }
-        (false, _) => {
-            // A move that ends hands every attempt it still owns to the cleanup queue first;
-            // a long hand-over goes on in the next runs.
-            match record.moving && !hand_over_moves(context, bucket, record.started_at_ms).await? {
-                true => Some(MIGRATION_CONTINUE),
-                false => {
-                    record.finished_at_ms = Some(now);
-                    None
+            RowStep::Migrate => self.migrated(result.child()?),
+            RowStep::Broken(error) => {
+                let checked = result.child::<CheckOutcome, CheckVersionError>()?;
+                match checked {
+                    Ok(CheckOutcome::Broken(_)) => Ok(Next::Done(RowEnd::Broken)),
+                    _ => self.failed(&error),
                 }
             }
         }
-    };
-    store_progress(context, bucket, &record, Some(&ahead)).await?;
-    Ok(after)
-}
-
-/// The rows the last run of a bucket's migration finished after its cursor.
-pub(super) async fn read_ahead(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-) -> Result<Option<MigrationAhead>, String> {
-    let read = StorageEffect::Read {
-        key_space: MIGRATION_AHEAD_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| MigrationAhead::from_bytes(&value))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!("could not read the rows ahead: {}", other.label())),
     }
 }
 
-/// Writes the rows a run finished after its cursor in `txn_id`, the transaction of its progress,
-/// so they count exactly when the progress does; without any the row goes.
-async fn stage_ahead(
-    storage: &aruna_storage::StorageHandle,
-    txn_id: TxnId,
-    bucket: &str,
-    ahead: &MigrationAhead,
-) -> Result<(), String> {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let space = MIGRATION_AHEAD_KEYSPACE.to_string();
-    let effect = match ahead.rows.is_empty() {
-        true => StorageEffect::Delete {
-            key_space: space,
-            key,
-            txn_id: Some(txn_id),
-        },
-        false => StorageEffect::Write {
-            key_space: space,
-            key,
-            value: ahead.to_bytes().map_err(|error| error.to_string())?.into(),
-            txn_id: Some(txn_id),
-        },
-    };
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
-            Ok(())
+#[derive(Debug, PartialEq)]
+enum PageStep {
+    Handover,
+    HandedOver,
+    Routing,
+    Request,
+    Access,
+    Earlier,
+    Versions,
+    Ahead,
+    Window,
+    StopRequest,
+    FinalHandOver,
+    /// The child that decides the answer of this operation.
+    Tail,
+    Store(Option<Duration>),
+}
+
+/// Migrates one page of a bucket's versions and stores the progress, unless a newer setting
+/// replaced the record meanwhile. A run that worked for `budget` starts no more versions.
+/// Outputs when the bucket needs the next run.
+#[derive(Debug, PartialEq)]
+pub(super) struct MigratePageOperation {
+    routing: NodeRouting,
+    bucket: String,
+    record: CompressionMigration,
+    budget: Duration,
+    begun_ms: u64,
+    now_ms: u64,
+    step: PageStep,
+    snapshot: Option<RoutingSnapshot>,
+    request: Option<RenameRequest>,
+    access: Option<Arc<BucketAccess>>,
+    earlier: Earlier,
+    versions: Vec<Key>,
+    keys: Vec<VersionKey>,
+    more: bool,
+    batch: Batch,
+    limit: usize,
+    /// The row of each window member, in the order they started.
+    members: Vec<usize>,
+    started: usize,
+    worked: usize,
+    denied: usize,
+    stop: Option<Stop>,
+    failure: Option<MigrationError>,
+    pending_after: Option<MigrationAhead>,
+}
+
+type PageTurn = Turn<Option<Duration>>;
+
+impl MigratePageOperation {
+    pub(super) fn new(
+        routing: NodeRouting,
+        bucket: &str,
+        record: CompressionMigration,
+        budget: Duration,
+    ) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
+            record,
+            budget,
+            begun_ms: 0,
+            now_ms: 0,
+            step: PageStep::Handover,
+            snapshot: None,
+            request: None,
+            access: None,
+            earlier: Earlier::new(),
+            versions: Vec::new(),
+            keys: Vec::new(),
+            more: false,
+            batch: Batch::new(Vec::new()),
+            limit: 1,
+            members: Vec::new(),
+            started: 0,
+            worked: 0,
+            denied: 0,
+            stop: None,
+            failure: None,
+            pending_after: None,
         }
-        other => Err(format!("could not store the rows ahead: {}", other.label())),
+    }
+
+    fn call(&mut self, step: PageStep, call: IoCall) -> PageTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn store(&mut self, ahead: Option<MigrationAhead>, after: Option<Duration>) -> PageTurn {
+        let store = StoreMigrationOperation::new(&self.bucket, self.record.clone(), ahead);
+        self.call(PageStep::Store(after), IoCall::child(store))
+    }
+
+    fn end_now(&mut self) -> PageTurn {
+        self.record.finished_at_ms = Some(self.now_ms);
+        self.store(None, None)
+    }
+
+    fn end_aborted(&mut self) -> PageTurn {
+        let end = EndAbortedOperation::new(self.routing.clone(), &self.bucket, self.record.clone());
+        self.call(PageStep::Tail, IoCall::child(end))
+    }
+
+    fn hand_over(&self) -> IoCall {
+        let started = self.record.started_at_ms;
+        IoCall::child(HandOverOperation::new(
+            self.routing.clone(),
+            &self.bucket,
+            started,
+        ))
+    }
+
+    /// A due retry pass counts its own skips and failures.
+    fn after_handover(&mut self) -> PageTurn {
+        if self.record.retry_at_ms.take().is_some() {
+            self.record.skipped = 0;
+            self.record.failed = 0;
+        }
+        if !self.record.moving {
+            return self.read_versions();
+        }
+        let call = routing_call(self.routing.clone(), &self.bucket);
+        self.call(PageStep::Routing, call)
+    }
+
+    /// Without earlier patterns no file is renamed, so only an asked rename reads them; each
+    /// file is renamed only while the caller who asked may still write its key.
+    fn request_read(&mut self, value: Option<Value>) -> PageTurn {
+        let record = (self.record.moving, self.record.started_at_ms);
+        self.request = decode_request(value, record)?;
+        let Some(request) = self.request.as_ref() else {
+            return self.read_versions();
+        };
+        // An aborted rename ends here with its counts, once no version of it is in flight.
+        if request.aborted_at_ms.is_some() {
+            return self.end_aborted();
+        }
+        // A paused rename waits for its resume, which wakes this task again.
+        if request.paused {
+            return Ok(Next::Done(None));
+        }
+        let Some(routing) = self.snapshot.as_ref() else {
+            return self.read_versions();
+        };
+        let access = RenameAccessOperation::new(request, routing.group_id, &self.bucket);
+        self.call(PageStep::Access, IoCall::child(access))
+    }
+
+    fn read_versions(&mut self) -> PageTurn {
+        let page = IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: VersionKey::bucket_prefix(&self.bucket)?.into(),
+            after: self.record.cursor.clone().map(Into::into),
+            limit: MIGRATION_ROWS,
+        };
+        self.call(PageStep::Versions, page)
+    }
+
+    /// The routing a key moves with; keys outside a move's prefix are only re-encoded.
+    fn moves(&self, key: &VersionKey) -> Option<&RoutingSnapshot> {
+        (self.snapshot.as_ref()).filter(|_| key.key.starts_with(&self.record.prefix))
+    }
+
+    fn versions_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> PageTurn {
+        self.more = next.is_some();
+        self.versions = rows.into_iter().map(|(key, _)| key).collect();
+        self.keys = (self.versions.iter())
+            .map(|key| VersionKey::from_bytes(key.as_ref()))
+            .collect::<Result<_, _>>()?;
+        // A rename moves several keys at once, but never two versions of one key or one name.
+        self.limit = match self.request {
+            Some(_) => RENAME_PARALLEL,
+            None => 1,
+        };
+        let name = |key: &VersionKey| {
+            let routing = self.moves(key).filter(|_| self.limit > 1)?;
+            Some(place(routing, key).ok()?.1?.path)
+        };
+        let rows = self.keys.iter().map(|key| (key.key.clone(), name(key)));
+        let batch = Batch::new(rows.collect());
+        self.batch = batch;
+        let read = read_row(MIGRATION_AHEAD_KEYSPACE, bucket_key(&self.bucket));
+        self.call(PageStep::Ahead, read)
+    }
+
+    /// Rows the last run of this pass finished after its cursor already count, so they pass.
+    fn ahead_read(&mut self, value: Option<Value>) -> PageTurn {
+        let ahead = value
+            .map(|value| MigrationAhead::from_bytes(&value))
+            .transpose()?;
+        let ahead: HashSet<Vec<u8>> = ahead
+            .map(|ahead| ahead.rows_for(&self.record))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for (row, key) in self.versions.iter().enumerate() {
+            if ahead.contains(key.as_ref()) {
+                self.batch.passed(row);
+            }
+        }
+        self.begun_ms = self.now_ms;
+        let mut members = Vec::new();
+        while let Some(row) = self.ready_row() {
+            members.push(self.row_member(row));
+        }
+        if members.is_empty() {
+            return self.after_window();
+        }
+        let group = EffectGroup {
+            members,
+            limit: self.limit,
+            form: GroupForm::Window,
+        };
+        self.call(PageStep::Window, IoCall::Group(group))
+    }
+
+    /// The next row to start. A run with enough work or time starts no more, and stores its
+    /// progress; a pause or an abort is seen by the row itself.
+    fn ready_row(&mut self) -> Option<usize> {
+        if self.stop.is_some() || self.failure.is_some() || self.batch.running() >= self.limit {
+            return None;
+        }
+        let row = self.batch.ready()?;
+        let elapsed = aruna_core::time::unix_timestamp_millis().saturating_sub(self.begun_ms);
+        let spent = Duration::from_millis(elapsed) >= self.budget || self.worked >= MIGRATION_WORK;
+        if self.started > 0 && spent {
+            self.stop = Some(Stop::More);
+            return None;
+        }
+        self.started += 1;
+        self.batch.start(row);
+        self.members.push(row);
+        Some(row)
+    }
+
+    fn row_operation(&mut self, row: usize) -> MigrateRowOperation {
+        let version = self.keys[row].clone();
+        let moved = self.moves(&version).cloned().map(|routing| {
+            let write = Permission::WRITE;
+            let access = self.access.as_ref();
+            let allowed = access.is_some_and(|access| access.allows(Some(&version.key), &write));
+            let denied = !self.earlier.is_empty() && !allowed;
+            let earlier = match allowed {
+                true => self.earlier.clone(),
+                false => Earlier::new(),
+            };
+            let started_ms = self.record.started_at_ms;
+            let moved = RowMove {
+                routing,
+                earlier,
+                started_ms,
+            };
+            (moved, denied)
+        });
+        let moved = moved.map(|(moved, denied)| {
+            self.denied += usize::from(denied);
+            moved
+        });
+        let rename =
+            (self.request.is_some()).then_some((self.record.moving, self.record.started_at_ms));
+        MigrateRowOperation {
+            bucket: self.bucket.clone(),
+            version,
+            target: self.record.target,
+            moved,
+            moving: false,
+            step: match rename {
+                Some(_) => RowStep::Rename,
+                None => RowStep::Migrate,
+            },
+            rename,
+            now_ms: 0,
+        }
+    }
+
+    fn row_member(&mut self, row: usize) -> Effect {
+        let operation = self.row_operation(row);
+        Effect::SubOperation(boxed_suboperation(operation, |result| {
+            Event::Child(ChildOutcome::new(result))
+        }))
+    }
+
+    fn row_ended(&mut self, row: usize, end: Result<RowEnd, MigrationError>) {
+        let end = match end {
+            Ok(end) => end,
+            Err(error) => {
+                self.batch.abandon(row);
+                self.failure.get_or_insert(error);
+                return;
+            }
+        };
+        if end == RowEnd::Halted {
+            self.batch.abandon(row);
+            self.stop = Some(Stop::Halted);
+            return;
+        }
+        self.batch.finish(row);
+        self.worked += usize::from(end != RowEnd::Skipped);
+        match end {
+            RowEnd::Migrated => self.record.migrated += 1,
+            // A move records a copy that cannot be read as broken instead of retrying it.
+            RowEnd::Skipped | RowEnd::Broken => self.record.skipped += 1,
+            RowEnd::Failed => self.record.failed += 1,
+            RowEnd::Halted => {}
+        }
+    }
+
+    fn window_event(&mut self, event: GroupEvent) -> PageTurn {
+        let (index, result) = match event {
+            GroupEvent::Member { index, result } => (index, result),
+            GroupEvent::Closed => return self.after_window(),
+            GroupEvent::Finished { .. } => {
+                return Err(MigrationError::Failed(
+                    "unexpected group answer".to_string(),
+                ));
+            }
+        };
+        let row = (self.members.get(index).copied())
+            .ok_or_else(|| MigrationError::Failed("unknown window member".to_string()))?;
+        let end = match result {
+            GroupResult::Done(event) => match *event {
+                Event::Child(outcome) => {
+                    IoResult::Child(outcome).child::<RowEnd, MigrationError>()?
+                }
+                other => Err(MigrationError::Failed(other.label().to_string())),
+            },
+            other => Err(MigrationError::Failed(format!("{other:?}"))),
+        };
+        self.row_ended(row, end);
+        self.step = PageStep::Window;
+        match self.ready_row() {
+            Some(row) => {
+                let operation = self.row_operation(row);
+                Ok(Next::Call(IoCall::child(operation)))
+            }
+            None => Ok(Next::Wait),
+        }
+    }
+
+    /// Each row this run finished counts once; the next run starts after the rows finished in
+    /// storage order and passes over those finished after them.
+    fn after_window(&mut self) -> PageTurn {
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        let done = self.batch.done();
+        let rows = (self.batch.finished_after()).map(|row| self.versions[row].to_vec());
+        let rows = rows.collect();
+        if let Some(last) = done.checked_sub(1) {
+            self.record.cursor = Some(self.versions[last].to_vec());
+        }
+        let ahead = MigrationAhead {
+            started_at_ms: self.record.started_at_ms,
+            retries: self.record.retries,
+            cursor: self.record.cursor.clone(),
+            rows,
+        };
+        let more = self.more || done < self.versions.len();
+        self.pending_after = Some(ahead);
+        if self.stop == Some(Stop::Halted) {
+            let read = read_row(RENAME_MOVE_KEYSPACE, bucket_key(&self.bucket));
+            return self.call(PageStep::StopRequest, read);
+        }
+        if self.denied > 0 {
+            tracing::warn!(
+                bucket = %self.bucket,
+                denied = self.denied,
+                "Files the rename's caller may not write keep their name"
+            );
+        }
+        let record = &mut self.record;
+        let after = match (more, record.failed > 0) {
+            // This run moved the cursor, so the rows left can go on at once.
+            (true, _) => Some(Duration::ZERO),
+            // Successful versions are already in the target, so a retry pass reads no blob for
+            // them.
+            (false, true) if record.retries < MIGRATION_RETRIES => {
+                let wait = capped_backoff(RETRY_BASE, RETRY_MAX, record.retries, 0);
+                record.retries += 1;
+                record.cursor = None;
+                record.retry_at_ms = Some(self.now_ms.saturating_add(wait.as_millis() as u64));
+                Some(wait)
+            }
+            // A move that ends hands every attempt it still owns to the cleanup queue first;
+            // a long hand-over goes on in the next runs.
+            (false, _) if record.moving => {
+                let call = self.hand_over();
+                return self.call(PageStep::FinalHandOver, call);
+            }
+            (false, _) => {
+                record.finished_at_ms = Some(self.now_ms);
+                None
+            }
+        };
+        self.store_ahead(after)
+    }
+
+    fn store_ahead(&mut self, after: Option<Duration>) -> PageTurn {
+        let ahead = self.pending_after.take();
+        self.store(ahead, after)
+    }
+}
+
+impl Operation for MigratePageOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> PageTurn {
+        // A hand-over under way finishes before anything else of the move.
+        if self.record.moving {
+            let read = read_row(MOVE_HANDOVER_KEYSPACE, bucket_key(&self.bucket));
+            return Ok(Next::Call(read));
+        }
+        self.after_handover()
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn {
+        match std::mem::replace(&mut self.step, PageStep::Tail) {
+            PageStep::Handover => {
+                let handover = decode_handover(result.value()?)?;
+                let started = self.record.started_at_ms;
+                if handover.is_some_and(|handover| handover.started_ms == started) {
+                    let call = self.hand_over();
+                    return self.call(PageStep::HandedOver, call);
+                }
+                self.after_handover()
+            }
+            PageStep::HandedOver => match result.child::<bool, MigrationError>()?? {
+                true => self.end_now(),
+                false => Ok(Next::Done(Some(MIGRATION_CONTINUE))),
+            },
+            PageStep::Routing => {
+                self.snapshot = routing_result(result)?;
+                if self.snapshot.is_none() {
+                    return self.end_now();
+                }
+                let read = read_row(RENAME_MOVE_KEYSPACE, bucket_key(&self.bucket));
+                self.call(PageStep::Request, read)
+            }
+            PageStep::Request => self.request_read(result.value()?),
+            PageStep::Access => {
+                let access = result.child::<Option<BucketAccess>, MigrationError>()??;
+                let Some(access) = access else {
+                    return self.read_versions();
+                };
+                self.access = Some(Arc::new(access));
+                let Some(routing) = self.snapshot.as_ref() else {
+                    return self.read_versions();
+                };
+                let earlier = EarlierPatternsOperation::new(routing);
+                self.call(PageStep::Earlier, IoCall::child(earlier))
+            }
+            PageStep::Earlier => {
+                self.earlier = result.child::<Earlier, MigrationError>()??;
+                self.read_versions()
+            }
+            PageStep::Versions => {
+                let (rows, next) = result.page()?;
+                self.versions_read(rows, next)
+            }
+            PageStep::Ahead => self.ahead_read(result.value()?),
+            PageStep::Window => match result {
+                IoResult::Group(event) => self.window_event(event),
+                other => Err(MigrationError::Failed(other.label().to_string())),
+            },
+            PageStep::StopRequest => {
+                let record = (self.record.moving, self.record.started_at_ms);
+                let request = decode_request(result.value()?, record)?;
+                if request.is_some_and(|request| request.aborted_at_ms.is_some()) {
+                    return self.end_aborted();
+                }
+                self.store_ahead(None)
+            }
+            PageStep::FinalHandOver => match result.child::<bool, MigrationError>()?? {
+                true => {
+                    self.record.finished_at_ms = Some(self.now_ms);
+                    self.store_ahead(None)
+                }
+                false => self.store_ahead(Some(MIGRATION_CONTINUE)),
+            },
+            PageStep::Tail => {
+                let after = result.child::<Option<Duration>, MigrationError>()??;
+                Ok(Next::Done(after))
+            }
+            PageStep::Store(after) => {
+                result.child::<(), MigrationError>()??;
+                Ok(Next::Done(after))
+            }
+        }
     }
 }
 
 /// Ends an aborted rename's move once its intents are handed to the cleanup queue, which
 /// settles them apart from this move; its request stays to show the abort.
-pub(super) async fn end_aborted(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    mut record: CompressionMigration,
-) -> Result<Option<Duration>, String> {
-    if !hand_over_moves(context, bucket, record.started_at_ms).await? {
-        return Ok(Some(MIGRATION_CONTINUE));
+#[derive(Debug, PartialEq)]
+pub(super) struct EndAbortedOperation {
+    routing: NodeRouting,
+    bucket: String,
+    record: CompressionMigration,
+    now_ms: u64,
+    storing: bool,
+}
+
+impl EndAbortedOperation {
+    pub(super) fn new(routing: NodeRouting, bucket: &str, record: CompressionMigration) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
+            record,
+            now_ms: 0,
+            storing: false,
+        }
     }
-    record.retry_at_ms = None;
-    record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
-    store_progress(context, bucket, &record, None).await?;
-    Ok(None)
+}
+
+impl Operation for EndAbortedOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> PageTurn {
+        let started = self.record.started_at_ms;
+        let hand_over = HandOverOperation::new(self.routing.clone(), &self.bucket, started);
+        Ok(Next::Call(IoCall::child(hand_over)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn {
+        if self.storing {
+            result.child::<(), MigrationError>()??;
+            return Ok(Next::Done(None));
+        }
+        if !result.child::<bool, MigrationError>()?? {
+            return Ok(Next::Done(Some(MIGRATION_CONTINUE)));
+        }
+        self.record.retry_at_ms = None;
+        self.record.finished_at_ms = Some(self.now_ms);
+        self.storing = true;
+        let store = StoreMigrationOperation::new(&self.bucket, self.record.clone(), None);
+        Ok(Next::Call(IoCall::child(store)))
+    }
 }
 
 /// Where a move's hand-over of its intents stands: the move, the rule and the last intent.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Handover {
     pub(super) started_ms: u64,
     pub(super) import_id: Option<Ulid>,
     pub(super) after: Option<Vec<u8>>,
 }
 
-/// Intent pages one hand-over run writes at most before it stores its place.
-const HANDOVER_PAGES: usize = 16;
-
-/// Whether the move started at `started_ms` has a hand-over under way.
-async fn handing_over(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    started_ms: u64,
-) -> Result<bool, String> {
-    Ok(read_handover(context, bucket)
-        .await?
-        .is_some_and(|handover| handover.started_ms == started_ms))
+pub(super) fn decode_handover(value: Option<Value>) -> Result<Option<Handover>, MigrationError> {
+    value
+        .map(|value| postcard::from_bytes(&value))
+        .transpose()
+        .map_err(MigrationError::failed)
 }
 
-pub(super) async fn read_handover(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-) -> Result<Option<Handover>, String> {
-    let read = StorageEffect::Read {
-        key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| postcard::from_bytes(&value))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!("could not read the hand-over: {}", other.label())),
-    }
-}
-
-pub(super) async fn store_handover(
-    context: &crate::driver::DriverContext,
+/// The row that stores `handover`, or the delete that ends it.
+pub(super) fn handover_call(
     bucket: &str,
     handover: Option<&Handover>,
-) -> Result<(), String> {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let effect = match handover {
-        Some(handover) => StorageEffect::Write {
-            key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
+) -> Result<IoCall, MigrationError> {
+    let key = bucket_key(bucket);
+    let Some(handover) = handover else {
+        return Ok(IoCall::Delete(vec![(
+            MOVE_HANDOVER_KEYSPACE.to_string(),
             key,
-            value: postcard::to_allocvec(handover)
-                .map_err(|error| error.to_string())?
-                .into(),
-            txn_id: None,
-        },
-        None => StorageEffect::Delete {
-            key_space: MOVE_HANDOVER_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        },
+        )]));
     };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
-            Ok(())
-        }
-        other => Err(format!("could not store the hand-over: {}", other.label())),
-    }
+    let value = postcard::to_allocvec(handover).map_err(MigrationError::failed)?;
+    let row = (MOVE_HANDOVER_KEYSPACE.to_string(), key, value.into());
+    Ok(IoCall::Write(vec![row]))
+}
+
+#[derive(Debug, PartialEq)]
+enum HandStep {
+    Routing,
+    Place,
+    Page,
+    Written,
+    Stored(bool),
 }
 
 /// Writes one `SettleMove` work per intent this move still owns, with the intent itself, a
-/// bounded number of pages per run from a stored place; `true` once all are handed over.
-async fn hand_over_moves(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
+/// bounded number of pages per run from a stored place. Outputs `true` once all are handed over.
+#[derive(Debug, PartialEq)]
+pub(super) struct HandOverOperation {
+    routing: NodeRouting,
+    bucket: String,
     started_ms: u64,
-) -> Result<bool, String> {
-    let Some(routing) = move_routing(context, bucket).await? else {
-        store_handover(context, bucket, None).await?;
-        return Ok(true);
-    };
-    let mut rules: Vec<Ulid> = (routing.imports.iter())
-        .filter(|rule| rule.bucket == bucket)
-        .map(|rule| rule.import_id)
-        .collect();
-    rules.sort();
-    let stored = read_handover(context, bucket).await?;
-    let mut place = match stored.filter(|handover| handover.started_ms == started_ms) {
-        Some(handover) => handover,
-        None => Handover {
+    step: HandStep,
+    rules: Vec<Ulid>,
+    place: Option<Handover>,
+    pages: usize,
+    more: Option<Key>,
+}
+
+impl HandOverOperation {
+    pub(super) fn new(routing: NodeRouting, bucket: &str, started_ms: u64) -> Self {
+        Self {
+            routing,
+            bucket: bucket.to_string(),
             started_ms,
-            import_id: rules.first().copied(),
-            after: None,
-        },
-    };
-    for _ in 0..HANDOVER_PAGES {
-        let Some(import_id) = place.import_id else {
-            store_handover(context, bucket, None).await?;
-            return Ok(true);
+            step: HandStep::Routing,
+            rules: Vec::new(),
+            place: None,
+            pages: 0,
+            more: None,
+        }
+    }
+
+    fn store(&mut self, place: Option<&Handover>, finished: bool) -> Turn<bool> {
+        let call = handover_call(&self.bucket, place)?;
+        self.step = HandStep::Stored(finished);
+        Ok(Next::Call(call))
+    }
+
+    fn next_page(&mut self) -> Turn<bool> {
+        if self.pages == HANDOVER_PAGES {
+            let place = self.place.take();
+            return self.store(place.as_ref(), false);
+        }
+        let Some(place) = self.place.as_mut() else {
+            return self.store(None, true);
         };
-        let (rows, next) = crate::storage_read::iter_prefix_page(
-            &context.storage_handle,
-            IMPORT_INTENT_KEYSPACE,
-            Some(aruna_core::structs::storage::backend_import::object_prefix(
-                import_id,
-            )),
-            place.after.take().map(Into::into),
-            RULE_PAGE,
-            None,
-        )
-        .await?;
+        let Some(import_id) = place.import_id else {
+            return self.store(None, true);
+        };
+        self.pages += 1;
+        let after = place.after.take().map(Into::into);
+        self.step = HandStep::Page;
+        Ok(Next::Call(IoCall::Page {
+            space: IMPORT_INTENT_KEYSPACE.to_string(),
+            prefix: object_prefix(import_id),
+            after,
+            limit: RULE_PAGE,
+        }))
+    }
+
+    fn page_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn<bool> {
         let mut writes = Vec::new();
         for (key, value) in rows {
-            let intent = WriteIntent::from_bytes(&value).map_err(|error| error.to_string())?;
+            let intent = WriteIntent::from_bytes(&value)?;
             // Only this move's own intents; an upload's or another move's stay.
-            if intent.mover != Some(started_ms) {
+            if intent.mover != Some(self.started_ms) {
                 continue;
             }
-            let version = VersionKey::new(bucket, &intent.key, intent.version_id);
+            let version = VersionKey::new(&self.bucket, &intent.key, intent.version_id);
             let work = BlobCleanupWork::SettleMove {
                 version,
                 intents: vec![(key.to_vec(), intent)],
             };
-            let value = work.to_bytes().map_err(|error| error.to_string())?;
-            writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
+            let value = work.to_bytes()?.into();
+            writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value));
         }
-        if !writes.is_empty() {
-            let write = StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            };
-            match context.storage_handle.send_storage_effect(write).await {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-                other => return Err(format!("could not hand over the moves: {}", other.label())),
-            }
+        self.more = next;
+        if writes.is_empty() {
+            return self.advance_place();
         }
-        match next {
-            Some(next) => place.after = Some(next.to_vec()),
-            None => {
-                // Rules are sorted; a removed rule still has its place among them.
-                place.import_id = rules.iter().find(|rule| **rule > import_id).copied();
-            }
-        }
+        self.step = HandStep::Written;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
-    store_handover(context, bucket, Some(&place)).await?;
-    Ok(false)
-}
 
-/// Runs `version` once more as a rename, which adopts a copy that reached its new name, then
-/// retires `intents`; a copy no version reads goes to the release first. `true` once settled,
-/// `false` while the version cannot run yet.
-pub async fn settle_move(
-    context: &crate::driver::DriverContext,
-    version: &VersionKey,
-    intents: &[(Vec<u8>, WriteIntent)],
-) -> Result<bool, String> {
-    let storage = &context.storage_handle;
-    let key: Key = version
-        .to_bytes()
-        .map_err(|error| error.to_string())?
-        .into();
-    let read = StorageEffect::Read {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: None,
-    };
-    let present = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
-        other => {
-            return Err(format!(
-                "could not read the moved version: {}",
-                other.label()
-            ));
+    fn advance_place(&mut self) -> Turn<bool> {
+        let next = self.more.take();
+        if let Some(place) = self.place.as_mut() {
+            match next {
+                Some(next) => place.after = Some(next.to_vec()),
+                None => {
+                    // Rules are sorted; a removed rule still has its place among them.
+                    let current = place.import_id;
+                    place.import_id = (self.rules.iter())
+                        .find(|rule| Some(**rule) > current)
+                        .copied();
+                }
+            }
         }
-    };
-    let routing = match present {
-        true => move_routing(context, &version.bucket).await?,
-        false => None,
-    };
-    let Some(routing) = routing else {
-        return retire_intents(context, version, intents).await;
-    };
-    let earlier = read_earlier(context, &routing).await?;
-    let operation =
-        MigrateVersionOperation::new(version.clone(), Compression::Off, SystemTime::now())
-            .with_routing(routing)
-            .with_earlier(earlier);
-    // A run that ends on its own decided the version's file; any intent it leaves is stale.
-    match crate::driver::drive(operation, context).await {
-        Ok(_) => retire_intents(context, version, intents).await,
-        // A copy the storage check records as broken never moves, so its intents are stale too.
-        Err(_) if is_broken(context, &key).await => {
-            let (bucket, version_id) = (version.bucket.as_str(), version.version_id);
-            tracing::warn!(bucket, %version_id, "A moved version has no stored copy");
-            retire_intents(context, version, intents).await
-        }
-        Err(error) => {
-            tracing::warn!(%error, "A move did not settle yet");
-            Ok(false)
-        }
+        self.next_page()
     }
 }
 
-/// Retires the intents of a settled move; a copy one of them proves that no version reads is
-/// handed to the release of renamed files at its exact backend version first.
-async fn retire_intents(
-    context: &crate::driver::DriverContext,
-    version: &VersionKey,
-    intents: &[(Vec<u8>, WriteIntent)],
-) -> Result<bool, String> {
-    let read_path = read_path(context, version).await?;
-    for (key, intent) in intents {
-        // The key is the rule, the path, a zero byte and the version id.
-        let (Some(import), Some(path)) = (key.get(..16), key.get(16..key.len().saturating_sub(17)))
-        else {
-            continue;
+impl Operation for HandOverOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        Ok(Next::Call(routing_call(self.routing.clone(), &self.bucket)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match std::mem::replace(&mut self.step, HandStep::Page) {
+            HandStep::Routing => {
+                let Some(routing) = routing_result(result)? else {
+                    return self.store(None, true);
+                };
+                self.rules = (routing.imports.iter())
+                    .filter(|rule| rule.bucket == self.bucket)
+                    .map(|rule| rule.import_id)
+                    .collect();
+                self.rules.sort();
+                self.step = HandStep::Place;
+                let read = read_row(MOVE_HANDOVER_KEYSPACE, bucket_key(&self.bucket));
+                Ok(Next::Call(read))
+            }
+            HandStep::Place => {
+                let stored = decode_handover(result.value()?)?;
+                let started_ms = self.started_ms;
+                let stored = stored.filter(|handover| handover.started_ms == started_ms);
+                self.place = Some(stored.unwrap_or(Handover {
+                    started_ms,
+                    import_id: self.rules.first().copied(),
+                    after: None,
+                }));
+                self.next_page()
+            }
+            HandStep::Page => {
+                let (rows, next) = result.page()?;
+                self.page_read(rows, next)
+            }
+            HandStep::Written => {
+                result.done()?;
+                self.advance_place()
+            }
+            HandStep::Stored(finished) => {
+                result.done()?;
+                Ok(Next::Done(finished))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum StoreStep {
+    Current,
+    Progress,
+    Ahead,
+    Request,
+    Left,
+}
+
+/// Stores the progress, with the rows a run finished ahead of its cursor where given, unless a
+/// newer setting replaced the record. A finished migration leaves the queue and its rename
+/// request with its last progress; the request of an aborted rename stays to show the abort.
+#[derive(Debug, PartialEq)]
+pub(super) struct StoreMigrationOperation {
+    key: Key,
+    record: CompressionMigration,
+    ahead: Option<MigrationAhead>,
+    step: StoreStep,
+}
+
+impl StoreMigrationOperation {
+    pub(super) fn new(
+        bucket: &str,
+        record: CompressionMigration,
+        ahead: Option<MigrationAhead>,
+    ) -> Self {
+        Self {
+            key: bucket_key(bucket),
+            record,
+            ahead,
+            step: StoreStep::Current,
+        }
+    }
+
+    /// The rows go in the transaction of the progress, so they count exactly when it does;
+    /// without any the row goes.
+    fn store_ahead(&mut self) -> Turn<()> {
+        let Some(ahead) = self.ahead.take() else {
+            return self.leave();
         };
-        let path = String::from_utf8_lossy(path).into_owned();
-        if read_path.as_deref() == Some(path.as_str()) {
-            continue;
+        self.step = StoreStep::Ahead;
+        let space = MIGRATION_AHEAD_KEYSPACE.to_string();
+        let key = self.key.clone();
+        if ahead.rows.is_empty() {
+            return Ok(Next::Call(IoCall::Delete(vec![(space, key)])));
         }
-        let import = Ulid::from_bytes(import.try_into().map_err(|_| "bad intent key")?);
-        if !abandon(context, (key, intent, import), path).await? {
-            return Ok(false);
-        }
+        Ok(Next::Call(IoCall::Write(vec![(
+            space,
+            key,
+            ahead.to_bytes()?.into(),
+        )])))
     }
-    let keys: Vec<Vec<u8>> = intents.iter().map(|(key, _)| key.clone()).collect();
-    drop_intents(context, &keys).await
+
+    fn leave(&mut self) -> Turn<()> {
+        if self.record.finished_at_ms.is_none() {
+            return Ok(Next::Done(()));
+        }
+        self.step = StoreStep::Request;
+        Ok(Next::Call(read_row(RENAME_MOVE_KEYSPACE, self.key.clone())))
+    }
 }
 
-/// The path of the linked file `version` reads now, if any.
-async fn read_path(
-    context: &crate::driver::DriverContext,
-    version: &VersionKey,
-) -> Result<Option<String>, String> {
-    let key = version.to_bytes().map_err(|error| error.to_string())?;
-    let read = StorageEffect::Read {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    let value = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => return Err(format!("could not read a version: {}", other.label())),
-    };
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let blob = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
-    let Some(location) = blob.location_key() else {
-        return Ok(None);
-    };
-    let Effect::Storage(read) = blob_location_read(&location, None) else {
-        return Err("unexpected location read".to_string());
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| BackendLocation::from_bytes(&value).map(|found| found.backend_path))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        other => Err(format!("could not read a location: {}", other.label())),
+impl Operation for StoreMigrationOperation {
+    type Output = ();
+    type Error = MigrationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Turn<()> {
+        let read = read_row(COMPRESSION_MIGRATION_KEYSPACE, self.key.clone());
+        Ok(Next::Call(read))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match self.step {
+            StoreStep::Current => {
+                let Some(stored) = decode_progress(result.value()?)? else {
+                    return Ok(Next::Done(()));
+                };
+                // An aborted move keeps the end its abort wrote.
+                let record = &self.record;
+                if stored.started_at_ms != record.started_at_ms
+                    || stored.target != record.target
+                    || stored.finished_at_ms.is_some()
+                {
+                    return Ok(Next::Done(()));
+                }
+                self.step = StoreStep::Progress;
+                let row = (
+                    COMPRESSION_MIGRATION_KEYSPACE.to_string(),
+                    self.key.clone(),
+                    record.to_bytes().map_err(MigrationError::failed)?.into(),
+                );
+                Ok(Next::Call(IoCall::Write(vec![row])))
+            }
+            StoreStep::Progress => {
+                result.done()?;
+                self.store_ahead()
+            }
+            StoreStep::Ahead => {
+                result.done()?;
+                self.leave()
+            }
+            StoreStep::Request => {
+                let request = result.value()?;
+                let request = request.as_deref().map(RenameRequest::from_bytes);
+                let aborted = request.is_some_and(|request| {
+                    request.is_ok_and(|request| request.aborted_at_ms.is_some())
+                });
+                let mut deletes = vec![(COMPRESSION_QUEUE_KEYSPACE.to_string(), self.key.clone())];
+                if !aborted {
+                    deletes.push((RENAME_MOVE_KEYSPACE.to_string(), self.key.clone()));
+                }
+                self.step = StoreStep::Left;
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            StoreStep::Left => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SettleStep {
+    Version,
+    Routing,
+    Earlier(Box<RoutingSnapshot>),
+    Migrate,
+    Check(String),
+    ReadVersion,
+    ReadLocation,
+    Abandon,
+    Dropped,
+}
+
+/// Runs a version once more as a rename, which adopts a copy that reached its new name, then
+/// retires its intents; a copy no version reads goes to the release first. Outputs `true` once
+/// settled, `false` while the version cannot run yet.
+#[derive(Debug, PartialEq)]
+pub struct SettleMoveOperation {
+    routing: NodeRouting,
+    version: VersionKey,
+    intents: VecDeque<(Vec<u8>, WriteIntent)>,
+    keys: Vec<Vec<u8>>,
+    read_path: Option<String>,
+    now_ms: u64,
+    step: SettleStep,
+}
+
+type SettleTurn = Turn<bool>;
+
+impl SettleMoveOperation {
+    pub fn new(
+        routing: NodeRouting,
+        version: &VersionKey,
+        intents: Vec<(Vec<u8>, WriteIntent)>,
+    ) -> Self {
+        Self {
+            routing,
+            version: version.clone(),
+            keys: intents.iter().map(|(key, _)| key.clone()).collect(),
+            intents: intents.into(),
+            read_path: None,
+            now_ms: 0,
+            step: SettleStep::Version,
+        }
+    }
+
+    fn call(&mut self, step: SettleStep, call: IoCall) -> SettleTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn version_row(&self) -> Result<IoCall, MigrationError> {
+        Ok(read_row(BLOB_VERSIONS_KEYSPACE, self.version.to_bytes()?))
+    }
+
+    /// Retires the intents of a settled move, starting from the file the version reads now.
+    fn retire(&mut self) -> SettleTurn {
+        let read = self.version_row()?;
+        self.call(SettleStep::ReadVersion, read)
+    }
+
+    fn version_read(&mut self, value: Option<Value>) -> SettleTurn {
+        let Some(value) = value else {
+            return self.next_intent();
+        };
+        let Some(location) = BlobVersion::from_bytes(&value)?.location_key() else {
+            return self.next_intent();
+        };
+        let read = read_row(BLOB_LOCATIONS_KEYSPACE, location.to_bytes());
+        self.call(SettleStep::ReadLocation, read)
+    }
+
+    /// The next intent whose file no version reads goes to the release.
+    fn next_intent(&mut self) -> SettleTurn {
+        while let Some((key, intent)) = self.intents.pop_front() {
+            // The key is the rule, the path, a zero byte and the version id.
+            let end = key.len().saturating_sub(17);
+            let (Some(import), Some(path)) = (key.get(..16), key.get(16..end)) else {
+                continue;
+            };
+            let path = String::from_utf8_lossy(path).into_owned();
+            if self.read_path.as_deref() == Some(path.as_str()) {
+                continue;
+            }
+            let import = <[u8; 16]>::try_from(import).map_err(MigrationError::failed)?;
+            let abandon = AbandonOperation::new(key, intent, Ulid::from_bytes(import), path);
+            return self.call(SettleStep::Abandon, IoCall::child(abandon));
+        }
+        let deletes = (self.keys.iter())
+            .map(|key| (IMPORT_INTENT_KEYSPACE.to_string(), key.clone().into()))
+            .collect();
+        self.call(SettleStep::Dropped, IoCall::Delete(deletes))
+    }
+
+    fn migrated(&mut self, moved: Result<MigrateOutcome, MigrateVersionError>) -> SettleTurn {
+        match moved {
+            // A run that ends on its own decided the version's file; any intent it leaves is
+            // stale.
+            Ok(_) => self.retire(),
+            Err(error) => {
+                let check = CheckVersionOperation::new(self.version.clone(), self.now_ms);
+                self.call(SettleStep::Check(error.to_string()), IoCall::child(check))
+            }
+        }
+    }
+}
+
+impl Operation for SettleMoveOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> SettleTurn {
+        Ok(Next::Call(self.version_row()?))
+    }
+
+    fn next(&mut self, result: IoResult) -> SettleTurn {
+        match std::mem::replace(&mut self.step, SettleStep::Migrate) {
+            SettleStep::Version => {
+                if result.value()?.is_none() {
+                    return self.retire();
+                }
+                let call = routing_call(self.routing.clone(), &self.version.bucket);
+                self.call(SettleStep::Routing, call)
+            }
+            SettleStep::Routing => {
+                let Some(routing) = routing_result(result)? else {
+                    return self.retire();
+                };
+                let earlier = EarlierPatternsOperation::new(&routing);
+                self.call(
+                    SettleStep::Earlier(Box::new(routing)),
+                    IoCall::child(earlier),
+                )
+            }
+            SettleStep::Earlier(routing) => {
+                let earlier = result.child::<Earlier, MigrationError>()??;
+                let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
+                let version = self.version.clone();
+                let migrate = MigrateVersionOperation::new(version, Compression::Off, now)
+                    .with_routing(*routing)
+                    .with_earlier(earlier);
+                self.call(SettleStep::Migrate, IoCall::child(migrate))
+            }
+            SettleStep::Migrate => self.migrated(result.child()?),
+            SettleStep::Check(error) => {
+                // A copy the storage check records as broken never moves, so its intents are
+                // stale too.
+                let checked = result.child::<CheckOutcome, CheckVersionError>()?;
+                if matches!(checked, Ok(CheckOutcome::Broken(_))) {
+                    let (bucket, version_id) = (&self.version.bucket, self.version.version_id);
+                    tracing::warn!(%bucket, %version_id, "A moved version has no stored copy");
+                    return self.retire();
+                }
+                tracing::warn!(%error, "A move did not settle yet");
+                Ok(Next::Done(false))
+            }
+            SettleStep::ReadVersion => self.version_read(result.value()?),
+            SettleStep::ReadLocation => {
+                self.read_path = result
+                    .value()?
+                    .map(|value| BackendLocation::from_bytes(&value))
+                    .transpose()?
+                    .map(|found| found.backend_path);
+                self.next_intent()
+            }
+            SettleStep::Abandon => match result.child::<bool, MigrationError>()?? {
+                true => self.next_intent(),
+                false => Ok(Next::Done(false)),
+            },
+            SettleStep::Dropped => {
+                result.done()?;
+                Ok(Next::Done(true))
+            }
+        }
     }
 }
 
@@ -845,296 +1562,249 @@ pub(super) fn release_key(intent_row: &[u8], version: &str) -> Vec<u8> {
     [intent_row, &[1], version.as_bytes()].concat()
 }
 
+#[derive(Debug, PartialEq)]
+enum AbandonStep {
+    Stat,
+    Dropped,
+    Copies(Box<BackendLocation>, String, Option<String>, PrefixPages),
+    Queued,
+}
+
 /// Queues the release of the file at `path`, once per intent and version, if it has a backend
-/// version and its size and ETag prove the bytes `intent` recorded; others stay. `false` when
-/// the storage cannot be asked yet.
-async fn abandon(
-    context: &crate::driver::DriverContext,
-    (intent_row, intent, import_id): (&[u8], &WriteIntent, Ulid),
+/// version and its size and ETag prove the bytes the intent recorded; others stay. Outputs
+/// `false` when the storage cannot be asked yet.
+#[derive(Debug, PartialEq)]
+struct AbandonOperation {
+    intent_row: Vec<u8>,
+    intent: WriteIntent,
+    import_id: Ulid,
     path: String,
-) -> Result<bool, String> {
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return Ok(false);
-    };
-    let resolved = ResolvedBackend::new(intent.backend.clone(), None);
-    let stat = BlobEffect::StatExternal {
-        resolved,
-        path: path.clone(),
-        created_by: intent.created_by,
-    };
-    // Nothing there releases nothing but this write's own reservation, which a stat does not
-    // show as a file; without a backend version nothing names the bytes.
-    let (mut location, version, etag) = match blob_handle.send_blob_effect(stat).await {
-        Event::Blob(BlobEvent::ExternalStat { location: None, .. }) => {
-            let drop = BlobEffect::DropReservation {
-                backend: intent.backend.clone(),
-                path,
-                version_id: intent.version_id,
-            };
-            let dropped = blob_handle.send_blob_effect(drop).await;
-            return Ok(matches!(dropped, Event::Blob(BlobEvent::DeleteFinished)));
-        }
-        Event::Blob(BlobEvent::ExternalStat {
-            location: Some(location),
-            version: Some(version),
-            etag,
-        }) => (location, version, etag),
-        Event::Blob(BlobEvent::ExternalStat { .. }) => return Ok(true),
-        _ => return Ok(false),
-    };
-    let Some(source) = stored_copy(context, intent.written).await? else {
-        return Ok(true);
-    };
-    if !same_bytes(&source, location.blob_size, etag.as_deref()) {
-        return Ok(true);
-    }
-    location.hashes = source.hashes;
-    location.format.layout = StoredLayout::Plain(location.ulid);
-    let key = release_key(intent_row, &version);
-    let work = BlobCleanupWork::ReleaseRenamed {
-        location,
-        import_id,
-        version_id: intent.version_id,
-        version,
-    };
-    let value = work.to_bytes().map_err(|error| error.to_string())?;
-    let write = StorageEffect::Write {
-        key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-        key: key.into(),
-        value: value.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(true),
-        other => Err(format!(
-            "could not queue the abandoned copy: {}",
-            other.label()
-        )),
-    }
+    step: AbandonStep,
 }
 
-/// A stored copy of the bytes with the BLAKE3 `hash` that records their MD5.
-async fn stored_copy(
-    context: &crate::driver::DriverContext,
-    hash: Option<[u8; 32]>,
-) -> Result<Option<BackendLocation>, String> {
-    let Some(hash) = hash else {
-        return Ok(None);
-    };
-    let mut after = None;
-    loop {
-        let (rows, next) = crate::storage_read::iter_prefix_page(
-            &context.storage_handle,
-            BLOB_LOCATIONS_KEYSPACE,
-            Some(hash.to_vec().into()),
-            after,
-            RULE_PAGE,
-            None,
-        )
-        .await?;
-        for (_, value) in rows {
-            let location =
-                BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
-            if location.hashes.contains_key(HASH_MD5) {
-                return Ok(Some(location));
+impl AbandonOperation {
+    fn new(intent_row: Vec<u8>, intent: WriteIntent, import_id: Ulid, path: String) -> Self {
+        Self {
+            intent_row,
+            intent,
+            import_id,
+            path,
+            step: AbandonStep::Stat,
+        }
+    }
+
+    /// Nothing there releases nothing but this write's own reservation, which a stat does not
+    /// show as a file; without a backend version nothing names the bytes.
+    fn stat_read(&mut self, event: Event) -> Turn<bool> {
+        let (location, version, etag) = match event {
+            Event::Blob(BlobEvent::ExternalStat { location: None, .. }) => {
+                let drop = Effect::Blob(BlobEffect::DropReservation {
+                    backend: self.intent.backend.clone(),
+                    path: self.path.clone(),
+                    version_id: self.intent.version_id,
+                });
+                self.step = AbandonStep::Dropped;
+                return Ok(Next::Call(drop.into()));
             }
-        }
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(None),
-        }
-    }
-}
-
-async fn drop_intents(
-    context: &crate::driver::DriverContext,
-    intents: &[Vec<u8>],
-) -> Result<bool, String> {
-    let deletes = intents
-        .iter()
-        .map(|key| (IMPORT_INTENT_KEYSPACE.to_string(), key.clone().into()))
-        .collect();
-    let delete = StorageEffect::BatchDelete {
-        deletes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(delete).await {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(true),
-        other => Err(format!(
-            "could not drop the move's intents: {}",
-            other.label()
-        )),
-    }
-}
-
-/// Whether the caller paused or aborted the rename of the move `record`.
-async fn rename_stopped(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    record: &CompressionMigration,
-) -> Result<bool, String> {
-    let request = rename_request(context, bucket, record).await?;
-    Ok(request.is_none_or(|request| request.paused || request.aborted_at_ms.is_some()))
-}
-
-/// Whether a version whose move failed is broken; a check records it.
-async fn is_broken(context: &crate::driver::DriverContext, key: &Key) -> bool {
-    let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
-        return false;
-    };
-    let now_ms = aruna_core::time::unix_timestamp_millis();
-    let operation = check::CheckVersionOperation::new(version_key, now_ms);
-    let outcome = crate::driver::drive(operation, context).await;
-    matches!(outcome, Ok(check::CheckOutcome::Broken(_)))
-}
-
-/// The routing a move resolves against, read once per page; `None` once the bucket is gone.
-pub async fn move_routing(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-) -> Result<Option<RoutingSnapshot>, String> {
-    let routing = crate::driver::node_routing(context);
-    let operation = crate::blob::import_rows::BucketRoutingOperation::new(routing, bucket);
-    let snapshot = crate::driver::drive(operation, context).await;
-    snapshot.map_err(|error| error.to_string())
-}
-
-/// Stores the progress, with the rows a run finished `ahead` of its cursor where given.
-async fn store_progress(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    record: &CompressionMigration,
-    ahead: Option<&MigrationAhead>,
-) -> Result<(), String> {
-    let storage = &context.storage_handle;
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => {
-            return Err(format!(
-                "could not start a progress transaction: {}",
-                other.label()
-            ));
-        }
-    };
-    let staged = stage_progress(storage, txn_id, bucket, record, ahead).await;
-    if !matches!(staged, Ok(true)) {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return staged.map(|_| ());
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        other => Err(format!(
-            "migration progress was not stored: {}",
-            other.label()
-        )),
-    }
-}
-
-/// Writes the progress, and the rows `ahead` where given, in `txn_id`. Returns `false` when a
-/// newer setting replaced the record.
-async fn stage_progress(
-    storage: &aruna_storage::StorageHandle,
-    txn_id: TxnId,
-    bucket: &str,
-    record: &CompressionMigration,
-    ahead: Option<&MigrationAhead>,
-) -> Result<bool, String> {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let current = storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: Some(txn_id),
-        })
-        .await;
-    let stored = match current {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            CompressionMigration::from_bytes(value.as_ref()).map_err(|error| error.to_string())?
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
-        other => {
-            return Err(format!(
-                "could not read migration progress: {}",
-                other.label()
-            ));
-        }
-    };
-    // An aborted move keeps the end its abort wrote.
-    let ended = stored.finished_at_ms.is_some();
-    if stored.started_at_ms != record.started_at_ms || stored.target != record.target || ended {
-        return Ok(false);
-    }
-    let value = record.to_bytes().map_err(|error| error.to_string())?;
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
-            key: key.clone(),
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => {
-            return Err(format!(
-                "could not write migration progress: {}",
-                other.label()
-            ));
-        }
-    }
-    if let Some(ahead) = ahead {
-        stage_ahead(storage, txn_id, bucket, ahead).await?;
-    }
-    // A finished migration leaves the queue and its rename request with its last progress;
-    // the request of an aborted rename stays to show the abort.
-    if record.finished_at_ms.is_some() {
-        let read = StorageEffect::Read {
-            key_space: RENAME_MOVE_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: Some(txn_id),
+            Event::Blob(BlobEvent::ExternalStat {
+                location: Some(location),
+                version: Some(version),
+                etag,
+            }) => (location, version, etag),
+            Event::Blob(BlobEvent::ExternalStat { .. }) => return Ok(Next::Done(true)),
+            _ => return Ok(Next::Done(false)),
         };
-        let request = match storage.send_storage_effect(read).await {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            other => {
-                return Err(format!(
-                    "could not read the rename request: {}",
-                    other.label()
-                ));
-            }
+        // A stored copy of the bytes that records their MD5 proves what the file holds.
+        let Some(hash) = self.intent.written else {
+            return Ok(Next::Done(true));
         };
-        let request = request.as_deref().map(RenameRequest::from_bytes);
-        let aborted = request
-            .is_some_and(|request| request.is_ok_and(|request| request.aborted_at_ms.is_some()));
-        let spaces = match aborted {
-            true => &[COMPRESSION_QUEUE_KEYSPACE][..],
-            false => &[COMPRESSION_QUEUE_KEYSPACE, RENAME_MOVE_KEYSPACE][..],
+        let pages = PrefixPages::new(BLOB_LOCATIONS_KEYSPACE, hash.to_vec(), RULE_PAGE);
+        let page = pages.call();
+        self.step = AbandonStep::Copies(Box::new(location), version, etag, pages);
+        Ok(Next::Call(page))
+    }
+
+    fn queue_release(
+        &mut self,
+        mut location: BackendLocation,
+        version: String,
+        etag: Option<String>,
+        source: BackendLocation,
+    ) -> Turn<bool> {
+        if !same_bytes(&source, location.blob_size, etag.as_deref()) {
+            return Ok(Next::Done(true));
+        }
+        location.hashes = source.hashes;
+        location.format.layout = StoredLayout::Plain(location.ulid);
+        let key = release_key(&self.intent_row, &version);
+        let work = BlobCleanupWork::ReleaseRenamed {
+            location,
+            import_id: self.import_id,
+            version_id: self.intent.version_id,
+            version,
         };
-        for space in spaces {
-            let delete = StorageEffect::Delete {
-                key_space: space.to_string(),
-                key: key.clone(),
-                txn_id: Some(txn_id),
-            };
-            match storage.send_storage_effect(delete).await {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-                other => {
-                    return Err(format!(
-                        "could not leave the migration queue: {}",
-                        other.label()
-                    ));
+        self.step = AbandonStep::Queued;
+        let row = (
+            BLOB_CLEANUP_KEYSPACE.to_string(),
+            key.into(),
+            work.to_bytes()?.into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+impl Operation for AbandonOperation {
+    type Output = bool;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<bool> {
+        let stat = Effect::Blob(BlobEffect::StatExternal {
+            resolved: ResolvedBackend::new(self.intent.backend.clone(), None),
+            path: self.path.clone(),
+            created_by: self.intent.created_by,
+        });
+        Ok(Next::Call(stat.into()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<bool> {
+        match std::mem::replace(&mut self.step, AbandonStep::Queued) {
+            AbandonStep::Stat => self.stat_read(result.event()?),
+            AbandonStep::Dropped => Ok(Next::Done(matches!(
+                result.event()?,
+                Event::Blob(BlobEvent::DeleteFinished)
+            ))),
+            AbandonStep::Copies(location, version, etag, mut pages) => {
+                for (_, value) in pages.take(result)? {
+                    let source = BackendLocation::from_bytes(&value)?;
+                    if source.hashes.contains_key(HASH_MD5) {
+                        return self.queue_release(*location, version, etag, source);
+                    }
                 }
+                if pages.done() {
+                    return Ok(Next::Done(true));
+                }
+                let page = pages.call();
+                self.step = AbandonStep::Copies(location, version, etag, pages);
+                Ok(Next::Call(page))
+            }
+            AbandonStep::Queued => {
+                result.done()?;
+                Ok(Next::Done(true))
             }
         }
     }
-    Ok(true)
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+
+    fn record() -> CompressionMigration {
+        CompressionMigration::new(Compression::Off, 5)
+    }
+
+    fn empty_page() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        }
+    }
+
+    fn child<T, E>(outcome: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(outcome))
+    }
+
+    #[test]
+    fn replaced_record_kept() {
+        let mut store = StoreMigrationOperation::new("b", record(), None);
+        store.first().unwrap();
+        let mut newer = record();
+        newer.started_at_ms = 6;
+        let value = Value::from(newer.to_bytes().unwrap());
+        assert_eq!(
+            store.next(IoResult::Values(vec![Some(value)])),
+            Ok(Next::Done(()))
+        );
+    }
+
+    #[test]
+    fn finished_record_leaves() {
+        let mut finished = record();
+        finished.finished_at_ms = Some(9);
+        let stored = Value::from(record().to_bytes().unwrap());
+        let mut store = StoreMigrationOperation::new("b", finished, None);
+        store.first().unwrap();
+        let turn = store.next(IoResult::Values(vec![Some(stored)]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+        let turn = store.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        let turn = store.next(IoResult::Values(vec![None]));
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("a finished migration leaves the queue");
+        };
+        assert_eq!(deletes.len(), 2);
+    }
+
+    #[test]
+    fn empty_bucket_finishes() {
+        let mut page =
+            MigratePageOperation::new(NodeRouting::default(), "b", record(), MIGRATION_TIME);
+        page.stamp(7);
+        assert!(matches!(page.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let turn = page.next(empty_page());
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        let turn = page.next(IoResult::Values(vec![None]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(page.record.finished_at_ms, Some(7));
+        assert_eq!(
+            page.next(child::<(), MigrationError>(Ok(()))),
+            Ok(Next::Done(None))
+        );
+    }
+
+    #[test]
+    fn gone_bucket_ends() {
+        let mut hand = HandOverOperation::new(NodeRouting::default(), "b", 5);
+        assert!(matches!(hand.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let routed: Result<Option<RoutingSnapshot>, crate::blob::import_rows::ImportRowsError> =
+            Ok(None);
+        let turn = hand.next(child(routed));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+        assert_eq!(hand.next(IoResult::Done), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn empty_queue_ends() {
+        let routing = NodeRouting::default();
+        let after = Some(Key::from(b"a".to_vec()));
+        let mut run = ProcessMigrationsOperation::new(routing, None, after);
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Page { .. }))));
+        let expected = MigrationRun {
+            next: Some(MIGRATION_CONTINUE),
+            cursor: None,
+        };
+        assert_eq!(run.next(empty_page()), Ok(Next::Done(expected)));
+    }
+
+    #[test]
+    fn locked_storage_waits() {
+        let intent = WriteIntent {
+            key: "k".to_string(),
+            version_id: Ulid::from_bytes([1; 16]),
+            backend: aruna_core::structs::storage::blob::BackendRef::node_default(),
+            created_by: Default::default(),
+            written: None,
+            mover: None,
+        };
+        let import = Ulid::from_bytes([2; 16]);
+        let mut abandon = AbandonOperation::new(vec![1], intent, import, "p".to_string());
+        assert!(matches!(abandon.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+        let answer = IoResult::Event(Box::new(missing));
+        assert_eq!(abandon.next(answer), Ok(Next::Done(false)));
+    }
 }

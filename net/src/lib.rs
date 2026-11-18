@@ -1117,6 +1117,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Storage(_) => "storage",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
+        Effect::Background(_) => "background",
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",

@@ -395,7 +395,10 @@ mod tests {
 
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
 
-    use crate::blob::reclaim_sweep::{RECLAIM_TICK_LIMIT, backend_status, sweep_at};
+    use crate::blob::reclaim_sweep::{
+        BackendStatusOperation, RECLAIM_TICK_LIMIT, ReclaimOutcome, ReclaimSweepError,
+        ReclaimSweepOperation,
+    };
     use crate::driver::{DriverContext, drive};
     use crate::storage_read::iter_prefix_page;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -411,6 +414,19 @@ mod tests {
     use aruna_core::types::Value;
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    async fn sweep_at(
+        context: &DriverContext,
+        now: SystemTime,
+        start_after: Option<aruna_core::types::Key>,
+    ) -> Result<ReclaimOutcome, ReclaimSweepError> {
+        let catalog = crate::driver::node_routing(context).catalog;
+        drive(
+            ReclaimSweepOperation::new(catalog, now, start_after),
+            context,
+        )
+        .await
+    }
 
     const HASH: [u8; 32] = [4u8; 32];
 
@@ -910,9 +926,15 @@ mod tests {
             UsageCounters::from_bytes(&counters).unwrap(),
             UsageCounters::default()
         );
-        let outcome = crate::blob::cleanup::process_cleanup_batch(&after)
-            .await
-            .unwrap();
+        let outcome = crate::driver::drive(
+            crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
+                routing: crate::driver::node_routing(&after),
+                has_blob: (&after).blob_handle.is_some(),
+            }),
+            &after,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.failed, 1);
         let (queued, _) = iter_prefix_page(
             &after.storage_handle,
@@ -1267,9 +1289,12 @@ mod tests {
         )
         .await;
 
-        let status = backend_status(&context, &BackendRef::node_default())
-            .await
-            .unwrap();
+        let status = drive(
+            BackendStatusOperation::new(&BackendRef::node_default()),
+            &context,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(status.pending_candidates, 1);
         assert_eq!(status.queued_cleanups, 0);
@@ -1296,9 +1321,12 @@ mod tests {
         )
         .await;
 
-        let status = backend_status(&context, &BackendRef::node_default())
-            .await
-            .unwrap();
+        let status = drive(
+            BackendStatusOperation::new(&BackendRef::node_default()),
+            &context,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(status.pending_candidates, 0);
         assert_eq!(status.queued_cleanups, 1);

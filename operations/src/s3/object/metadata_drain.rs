@@ -702,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_observation_moves_time() {
+    fn matching_observation_moves() {
         let version = reference(observation(1), 10);
         let mut apply = RefreshApply::new(refresh(Some(observation(1)), 20));
         assert_eq!(apply.transaction(), TransactionMode::Write);
@@ -723,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_observation_writes_nothing() {
+    fn stale_observation_skipped() {
         for (metadata, seconds) in [(observation(1), 10), (observation(2), 5)] {
             let mut apply = RefreshApply::new(refresh(Some(metadata), seconds));
             apply.first().unwrap();
@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn settle_keeps_newer_job() {
+    fn settle_keeps_newer() {
         // A job a newer request replaced stays queued.
         let mut settle = SettleJob::new(b"key".to_vec(), job(5), None);
         assert_eq!(settle.transaction(), TransactionMode::Write);
@@ -814,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_drops_broken_rows() {
+    fn drain_drops_broken() {
         // A due row too short to name a job is deleted, and the scan goes on.
         let mut drain = DrainRefreshOperation::new();
         drain.first().unwrap();
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_stops_at_future() {
+    fn drain_stops_future() {
         let mut drain = DrainRefreshOperation::new();
         drain.first().unwrap();
         let later = u64::MAX;

@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn no_net_no_user() {
+    fn netless_not_user() {
         let mut operation = LocalUserOperation::new(realm());
         let asked: IoCall = Effect::Net(NetEffect::LocalNode).into();
         assert_eq!(operation.first(), Ok(Next::Call(asked)));
@@ -435,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn unlisted_node_no_user() {
+    fn unlisted_not_user() {
         let mut operation = LocalUserOperation::new(realm());
         operation.first().unwrap();
         let read = operation.next(net(NetEvent::LocalNode(Some(node()))));
@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_no_user() {
+    fn unconfigured_not_user() {
         let mut operation = LocalUserOperation::new(realm());
         operation.first().unwrap();
         operation
