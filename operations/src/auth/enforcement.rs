@@ -4,17 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::error::PolicyEnforcementError;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use crate::driver::{DriverContext, drive};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, RequestPolicy,
     policy_set_hash,
 };
+use aruna_core::rows::all_values;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
@@ -122,12 +120,17 @@ impl PolicyLoadOperation {
 pub(crate) fn policy_reads(realm_id: RealmId, group_id: Option<GroupId>) -> Vec<(KeySpace, Key)> {
     let config = DocumentTarget::RealmConfig { realm_id };
     let mut reads = vec![crate::document_repository::read_row(&config)];
-    if let Some(group_id) = group_id {
-        let key = Key::from(group_id.to_bytes().to_vec());
-        reads.push((GROUP_KEYSPACE.to_string(), key.clone()));
-        reads.push((AUTH_KEYSPACE.to_string(), key));
-    }
+    reads.extend(group_id.into_iter().flat_map(group_reads));
     reads
+}
+
+/// The group row and its authorization row.
+fn group_reads(group_id: GroupId) -> [(KeySpace, Key); 2] {
+    let key = Key::from(group_id.to_bytes().to_vec());
+    [
+        (GROUP_KEYSPACE.to_string(), key.clone()),
+        (AUTH_KEYSPACE.to_string(), key),
+    ]
 }
 
 /// The evaluator from the rows [`policy_reads`] named, answered in that order. Missing state
@@ -194,49 +197,74 @@ impl Operation for PolicyLoadOperation {
     }
 }
 
-impl PolicyEvaluator {
-    /// Reads and compiles the realm's, and optionally one group's, policy set.
-    /// Missing policy state, a read failure, and a compile failure all fail
-    /// closed; the group scope is skipped only when the request names no group.
-    pub async fn load(
-        context: &DriverContext,
-        realm_id: RealmId,
-        group_id: Option<GroupId>,
+/// One evaluator per distinct realm and group scope.
+pub type PolicyEvaluators = HashMap<(RealmId, GroupId), PolicyEvaluator>;
+
+/// Reads the policy state of many scopes from one snapshot: each realm once, then each group.
+/// Any missing or unreadable scope fails the whole load closed.
+#[derive(Debug, PartialEq)]
+pub struct PolicyBulkOperation {
+    plan: BulkPlan,
+}
+
+impl PolicyBulkOperation {
+    pub fn new(
+        groups: impl IntoIterator<Item = (RealmId, GroupId)>,
     ) -> Result<Self, PolicyEnforcementError> {
-        drive(PolicyLoadOperation::new(realm_id, group_id), context).await
+        Ok(Self {
+            plan: bulk_plan(groups)?,
+        })
     }
 
-    /// Loads one evaluator per distinct realm/group scope. Realm policy state is
-    /// read once per realm, then each group is read once and evaluated in memory.
-    pub async fn load_bulk(
-        context: &DriverContext,
-        groups: impl IntoIterator<Item = (RealmId, GroupId)>,
-    ) -> Result<HashMap<(RealmId, GroupId), PolicyEvaluator>, PolicyEnforcementError> {
-        let plan = bulk_plan(groups)?;
-        let mut realms = HashMap::with_capacity(plan.realms.len());
-        for realm_id in plan.realms {
-            realms.insert(realm_id, realm_scope(context, realm_id).await?);
+    fn evaluators(
+        &self,
+        values: Vec<Option<Value>>,
+    ) -> Result<PolicyEvaluators, PolicyEnforcementError> {
+        let mut values = values.into_iter();
+        let mut realms = HashMap::with_capacity(self.plan.realms.len());
+        for realm_id in &self.plan.realms {
+            let config = values.next().flatten().ok_or_else(realm_unavailable)?;
+            let config = RealmConfigDocument::from_bytes(&config)
+                .map_err(|error| PolicyEnforcementError::Unavailable(error.to_string()))?;
+            realms.insert(*realm_id, compile_scope(&config.request_policies, "realm")?);
         }
-
-        let mut evaluators = HashMap::with_capacity(plan.scopes.len());
-        for (realm_id, group_id) in plan.scopes {
-            let group = group_scope(context, realm_id, group_id).await?;
-            let Some(realm) = realms.get(&realm_id).cloned() else {
-                return Err(PolicyEnforcementError::Unavailable(
-                    "realm policy snapshot is unavailable".to_string(),
-                ));
+        let mut evaluators = HashMap::with_capacity(self.plan.scopes.len());
+        for (realm_id, group_id) in &self.plan.scopes {
+            let (Some(group), Some(auth)) = (values.next().flatten(), values.next().flatten())
+            else {
+                return Err(group_unavailable());
             };
-            evaluators.insert(
-                (realm_id, group_id),
-                Self {
-                    realm,
-                    group: Some(group),
-                },
-            );
+            let group = Some(group_policies(*realm_id, &group, &auth)?);
+            let realm = realms
+                .get(realm_id)
+                .cloned()
+                .ok_or_else(realm_unavailable)?;
+            evaluators.insert((*realm_id, *group_id), PolicyEvaluator { realm, group });
         }
         Ok(evaluators)
     }
+}
 
+impl Operation for PolicyBulkOperation {
+    type Output = PolicyEvaluators;
+    type Error = PolicyEnforcementError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
+
+    fn first(&mut self) -> Result<Next<PolicyEvaluators>, PolicyEnforcementError> {
+        let realms = (self.plan.realms.iter()).flat_map(|realm_id| policy_reads(*realm_id, None));
+        let groups = (self.plan.scopes.iter()).flat_map(|(_, group_id)| group_reads(*group_id));
+        Ok(Next::Call(IoCall::Read(realms.chain(groups).collect())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PolicyEvaluators>, PolicyEnforcementError> {
+        self.evaluators(all_values(result)?).map(Next::Done)
+    }
+}
+
+impl PolicyEvaluator {
     /// Evaluates the realm then the group scope; either may deny, neither grants.
     /// Whether an enabled policy decides by the request path, so a decision at one path says
     /// nothing about the paths below it.
@@ -253,6 +281,7 @@ impl PolicyEvaluator {
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct BulkPlan {
     scopes: Vec<(RealmId, GroupId)>,
     realms: Vec<RealmId>,
@@ -292,49 +321,6 @@ fn realm_unavailable() -> PolicyEnforcementError {
 /// without a group scope never reaches this loader.
 fn group_unavailable() -> PolicyEnforcementError {
     PolicyEnforcementError::Unavailable("group policy state is unavailable".to_string())
-}
-
-async fn realm_scope(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
-    match drive(GetConfigOperation::new(realm_id), context).await {
-        Ok(config) => compile_scope(&config.request_policies, "realm"),
-        Err(GetConfigError::DocumentNotFound) => Err(realm_unavailable()),
-        Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
-    }
-}
-
-async fn group_scope(
-    context: &DriverContext,
-    realm_id: RealmId,
-    group_id: GroupId,
-) -> Result<Arc<CompiledPolicySet>, PolicyEnforcementError> {
-    match drive(GetGroupOperation::new(GetGroupConfig { group_id }), context).await {
-        Ok((group, auth_doc)) => {
-            if group.realm_id != realm_id {
-                return Err(PolicyEnforcementError::Unavailable(
-                    "group belongs to another realm".to_string(),
-                ));
-            }
-            compile_scope(&auth_doc.policies, "group")
-        }
-        Err(GetGroupError::GroupNotFound | GetGroupError::DocNotFound) => Err(group_unavailable()),
-        Err(error) => Err(PolicyEnforcementError::Unavailable(error.to_string())),
-    }
-}
-
-/// Evaluates realm then group policies for one request. Missing state and read,
-/// compile, or evaluation failures deny. Either scope may deny; neither may
-/// grant.
-pub async fn enforce_policies(
-    context: &DriverContext,
-    realm_id: RealmId,
-    request: &PolicyRequest,
-) -> Result<(), PolicyEnforcementError> {
-    drive(PolicyLoadOperation::for_request(realm_id, request), context)
-        .await?
-        .evaluate(request)
 }
 
 /// Extracts the group id from a canonical `/{realm}/g/{group}/...` path, mirroring
@@ -519,97 +505,6 @@ mod tests {
         ));
     }
 
-    fn context_at(directory: &tempfile::TempDir) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(
-                directory.path().to_str().expect("storage path"),
-            )
-            .expect("storage opens"),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            outbound_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
-
-    async fn seed_realm(context: &DriverContext, realm_id: RealmId) {
-        let actor = aruna_core::structs::identity::auth::Actor {
-            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-            user_id: aruna_core::UserId::nil(realm_id),
-            realm_id,
-        };
-        let config = aruna_core::structs::identity::realm::RealmConfigDocument::default_for_realm(
-            realm_id,
-            Vec::new(),
-        );
-        let event = context
-            .storage_handle
-            .send_storage_effect(aruna_core::effects::StorageEffect::Write {
-                key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
-                key: aruna_core::types::Key::from(*realm_id.as_bytes()),
-                value: config.to_bytes(&actor).expect("config encodes").into(),
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            aruna_core::events::Event::Storage(
-                aruna_core::events::StorageEvent::WriteResult { .. }
-            )
-        ));
-    }
-
-    #[tokio::test]
-    async fn missing_is_unavailable() {
-        let directory = tempfile::tempdir().unwrap();
-        let context = context_at(&directory);
-        let result = PolicyEvaluator::load_bulk(
-            &context,
-            [(RealmId([5u8; 32]), Ulid::from_bytes([8u8; 16]))],
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            Err(PolicyEnforcementError::Unavailable(message))
-                if message == "realm policy state is unavailable"
-        ));
-    }
-
-    #[tokio::test]
-    async fn missing_state_denies() {
-        // Unreadable realm or group state must deny; only a request that names no
-        // group may skip the group scope.
-        let directory = tempfile::tempdir().unwrap();
-        let context = context_at(&directory);
-        let realm_id = RealmId([6u8; 32]);
-        let group_id = Ulid::from_bytes([8u8; 16]);
-
-        assert!(matches!(
-            PolicyEvaluator::load(&context, realm_id, None).await,
-            Err(PolicyEnforcementError::Unavailable(message))
-                if message == "realm policy state is unavailable"
-        ));
-
-        seed_realm(&context, realm_id).await;
-
-        assert!(matches!(
-            PolicyEvaluator::load(&context, realm_id, Some(group_id)).await,
-            Err(PolicyEnforcementError::Unavailable(message))
-                if message == "group policy state is unavailable"
-        ));
-        let request = PolicyRequest::basic("/r".to_string(), "read".to_string(), String::new());
-        assert!(
-            PolicyEvaluator::load(&context, realm_id, None)
-                .await
-                .and_then(|evaluator| evaluator.evaluate(&request))
-                .is_ok()
-        );
-    }
-
     #[test]
     fn loads_one_read() {
         // The realm row alone, or with the group and its authorization row; no realm denies.
@@ -625,6 +520,90 @@ mod tests {
         assert_eq!(
             operation.next(IoResult::Values(vec![None])),
             Err(realm_unavailable())
+        );
+    }
+
+    fn actor(realm_id: RealmId) -> aruna_core::structs::identity::auth::Actor {
+        aruna_core::structs::identity::auth::Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn config_row(realm_id: RealmId) -> Option<Value> {
+        let config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+        Some(config.to_bytes(&actor(realm_id)).unwrap().into())
+    }
+
+    /// The group and authorization rows of `group_id`, stored under `realm_id`.
+    fn group_rows(realm_id: RealmId, group_id: GroupId) -> [Option<Value>; 2] {
+        let actor = actor(realm_id);
+        let group = Group {
+            display_name: "group".to_string(),
+            group_id,
+            realm_id,
+            roles: Default::default(),
+            owner: actor.user_id,
+        };
+        let auth = GroupAuthorizationDocument::default_group_doc(actor.user_id, realm_id, group_id);
+        [
+            Some(group.to_bytes(&actor).unwrap().into()),
+            Some(auth.to_bytes(&actor).unwrap().into()),
+        ]
+    }
+
+    #[test]
+    fn bulk_reads_once() {
+        // A realm shared by two groups is read once, all from one snapshot.
+        let realm_id = RealmId([3u8; 32]);
+        let (first, second) = (Ulid::from_bytes([4u8; 16]), Ulid::from_bytes([5u8; 16]));
+        let mut operation =
+            PolicyBulkOperation::new([(realm_id, first), (realm_id, second)]).unwrap();
+        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+        let Ok(Next::Call(IoCall::Read(reads))) = operation.first() else {
+            panic!("expected one read");
+        };
+        assert_eq!(reads.len(), 5);
+        let mut values = vec![config_row(realm_id)];
+        values.extend(group_rows(realm_id, first));
+        values.extend(group_rows(realm_id, second));
+        let Ok(Next::Done(evaluators)) = operation.next(IoResult::Values(values)) else {
+            panic!("expected the evaluators");
+        };
+        assert_eq!(evaluators.len(), 2);
+        assert!(evaluators[&(realm_id, first)].group.is_some());
+    }
+
+    #[test]
+    fn bulk_fails_closed() {
+        // A missing realm or group row, or a group of another realm, denies the whole load.
+        let realm_id = RealmId([3u8; 32]);
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let [group, auth] = group_rows(realm_id, group_id);
+        let [foreign, foreign_auth] = group_rows(RealmId([8u8; 32]), group_id);
+        let cases = [
+            (vec![None, group.clone(), auth.clone()], realm_unavailable()),
+            (vec![config_row(realm_id), None, auth], group_unavailable()),
+            (vec![config_row(realm_id), group, None], group_unavailable()),
+            (
+                vec![config_row(realm_id), foreign, foreign_auth],
+                PolicyEnforcementError::Unavailable("group belongs to another realm".to_string()),
+            ),
+        ];
+        for (values, expected) in cases {
+            let mut operation = PolicyBulkOperation::new([(realm_id, group_id)]).unwrap();
+            assert_eq!(operation.next(IoResult::Values(values)), Err(expected));
+        }
+    }
+
+    #[test]
+    fn bulk_empty_ends() {
+        let mut operation = PolicyBulkOperation::new([]).unwrap();
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(Vec::new()))));
+        assert_eq!(
+            operation.next(IoResult::Values(Vec::new())),
+            Ok(Next::Done(HashMap::new()))
         );
     }
 }

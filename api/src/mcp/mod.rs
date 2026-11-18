@@ -239,7 +239,7 @@ pub(crate) async fn authorize_self(
         Some(auth),
         extras,
     );
-    aruna_operations::auth::enforcement::enforce_policies(&state.get_ctx(), realm_id, &request)
+    aruna_operations::auth::policy_load::enforce_policies(&state.get_ctx(), realm_id, &request)
         .await
         .map_err(|_| crate::error::ServerError::Forbidden)
 }

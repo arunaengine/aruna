@@ -4,11 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{PolicyEvaluator, enforce_policies};
+use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::error::{AuthorizeError, check_error};
 use crate::auth::permission_rules::{
     GroupPermissionRules, PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
+use crate::auth::policy_load::enforce_policies;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
