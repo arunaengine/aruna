@@ -24,6 +24,7 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
+use aruna_core::telemetry::record_stage;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
@@ -555,6 +556,8 @@ pub(crate) struct ApplyRecordOperation {
     record: OaiRecord,
     datestamp_ms: u64,
     row: Option<HarvestProvenance>,
+    now_ms: u64,
+    access_started_ms: u64,
     step: ApplyStep,
 }
 
@@ -573,6 +576,8 @@ impl ApplyRecordOperation {
             record,
             datestamp_ms,
             row: None,
+            now_ms: 0,
+            access_started_ms: 0,
             step: ApplyStep::Provenance,
         }
     }
@@ -621,8 +626,9 @@ impl ApplyRecordOperation {
     }
 
     /// Checks the source owner as a direct metadata create of the record's document path would.
-    fn access(&self, document_id: Ulid) -> Result<IoCall, HarvestFailure> {
+    fn access(&mut self, document_id: Ulid) -> Result<IoCall, HarvestFailure> {
         let path = self.path()?;
+        self.access_started_ms = self.now_ms;
         Ok(IoCall::child(AuthorizeCreateOperation::new(
             self.actor.realm_id,
             &self.owner(),
@@ -636,6 +642,8 @@ impl ApplyRecordOperation {
 
     /// The end of an [`Self::access`] check; a refusal names the record's path.
     fn access_result(&self, result: IoResult) -> Result<(), HarvestFailure> {
+        let elapsed = self.now_ms.saturating_sub(self.access_started_ms);
+        record_stage("permission", Duration::from_millis(elapsed));
         match result.child::<(), AuthorizeError>()? {
             Ok(()) => Ok(()),
             Err(
@@ -777,6 +785,10 @@ fn routed_result(result: IoResult) -> Result<Result<(), HarvestWriteFailure>, Ha
 impl Operation for ApplyRecordOperation {
     type Output = RecordApplied;
     type Error = HarvestFailure;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> ApplyTurn {
         let identifier = &self.record.header.identifier;
