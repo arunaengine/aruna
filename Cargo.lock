@@ -823,8 +823,11 @@ version = "3.0.0-alpha.207"
 dependencies = [
  "aruna-core",
  "async-trait",
+ "bytes",
+ "futures-util",
  "lettre",
  "reqwest 0.13.5",
+ "thiserror 2.0.21",
  "tokio",
  "ulid 3.0.0",
 ]
@@ -866,6 +869,7 @@ dependencies = [
  "tokio-util",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+ "ulid 3.0.0",
  "url",
  "wasm-encoder 0.258.3",
  "wasmparser 0.258.3",
