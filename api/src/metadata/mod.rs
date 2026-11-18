@@ -28,7 +28,7 @@ use aruna_operations::metadata::api::export_types::{
     ExportMetadataResult, RoCrateExportView as OperationMetadataRoCrateExportView,
 };
 use aruna_operations::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
-use aruna_operations::metadata::api::list::list_visible_documents as run_list_visible_metadata_documents;
+use aruna_operations::metadata::api::list::ListVisibleOperation;
 use aruna_operations::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use aruna_operations::metadata::api::read_types::{
     ApiQueryMode, MetadataReferenceEntry, MetadataReferencesExecution,
@@ -151,21 +151,17 @@ pub(crate) async fn run_document_list(
     let include = parse_include_flags(query.include.as_deref())?;
     let order = parse_metadata_order(query.order.as_deref())?;
     let ctx = state.get_ctx();
-    let result = run_list_visible_metadata_documents(
-        ctx.as_ref(),
-        state.get_realm_id(),
-        ListVisibleRequest {
-            group_id,
-            path_prefix: query.path_prefix,
-            include_summary: include.summary,
-            limit: query.limit,
-            offset: query.offset,
-            order,
-            auth,
-        },
-    )
-    .await
-    .map_err(map_api_error)?;
+    let request = ListVisibleRequest {
+        group_id,
+        path_prefix: query.path_prefix,
+        include_summary: include.summary,
+        limit: query.limit,
+        offset: query.offset,
+        order,
+        auth,
+    };
+    let list = ListVisibleOperation::new(state.get_realm_id(), request);
+    let result = drive(list, ctx.as_ref()).await.map_err(map_api_error)?;
 
     let mut documents = Vec::with_capacity(result.documents.len());
     for document in result.documents {
@@ -438,18 +434,16 @@ pub(crate) async fn local_write_record(
     {
         return Ok(None);
     }
-    let record =
-        match drive(DocumentRecordOperation::new(document_id), context.as_ref()).await
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => return Ok(None),
-            Err(ReadError::Storage(error)) => {
-                return Err(ServerError::InternalError(error.into()));
-            }
-            Err(ReadError::Conversion(error)) => {
-                return Err(ServerError::InternalError(error.into()));
-            }
-        };
+    let record = match drive(DocumentRecordOperation::new(document_id), context.as_ref()).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return Ok(None),
+        Err(ReadError::Storage(error)) => {
+            return Err(ServerError::InternalError(error.into()));
+        }
+        Err(ReadError::Conversion(error)) => {
+            return Err(ServerError::InternalError(error.into()));
+        }
+    };
     ensure_record_writable(state, auth, &record, extras).await?;
     Ok(Some(record))
 }

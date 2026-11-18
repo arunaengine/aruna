@@ -70,7 +70,7 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
-use crate::metadata::api::list::list_visible_documents;
+use crate::metadata::api::list::ListVisibleOperation;
 use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
 use crate::metadata::forward::read::get_metadata_routed;
@@ -653,7 +653,8 @@ impl Broker for RunBroker {
             order: MetadataListOrder::Created,
             auth: Some(auth),
         };
-        let listed = list_visible_documents(&self.ctx, self.scope.realm_id, request).await;
+        let list = ListVisibleOperation::new(self.scope.realm_id, request);
+        let listed = drive(list, &self.ctx).await;
         let listed = listed.map_err(api_error)?;
         let full = listed.documents.len() >= PAGE;
         let mut resources = Vec::new();

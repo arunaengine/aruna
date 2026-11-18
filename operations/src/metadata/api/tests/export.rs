@@ -125,10 +125,9 @@ async fn pending_summary_listed() {
     let record = public_record(Ulid::generate(), Ulid::generate());
     write_pending_marker(&test, &record).await;
 
-    let result = list_visible_documents(
+    let result = drive(
+        ListVisibleOperation::new(TEST_REALM_ID, summary_request(record.group_id, true)),
         &test.context,
-        TEST_REALM_ID,
-        summary_request(record.group_id, true),
     )
     .await
     .expect("summary listing succeeds");
@@ -136,10 +135,9 @@ async fn pending_summary_listed() {
     assert_eq!(result.documents[0].record.document_id, record.document_id);
     assert!(result.documents[0].rocrate_summary_jsonld.is_none());
 
-    let plain = list_visible_documents(
+    let plain = drive(
+        ListVisibleOperation::new(TEST_REALM_ID, summary_request(record.group_id, false)),
         &test.context,
-        TEST_REALM_ID,
-        summary_request(record.group_id, false),
     )
     .await
     .expect("plain listing succeeds");

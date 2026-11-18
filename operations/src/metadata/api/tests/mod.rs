@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::fanout::run_metadata_fanout;
-use super::list::{load_group_records, load_pending_records};
+use super::list::{GroupRecordsOperation, ListVisibleOperation, PendingRecordsOperation};
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::handle::QUERY_MAX_BYTES;
@@ -17,9 +17,8 @@ use super::export_types::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
 use super::fanout::ensure_query_form;
-use super::list::list_visible_documents;
 use super::list_types::{ListVisibleRequest, ListVisibleResult, MetadataListOrder};
-use super::path::local_path_candidates;
+use super::path::LocalPathOperation;
 use super::path::{reduce_path_response, select_forward_peers, validate_path_resolution};
 use super::path_types::MetadataLookupResult;
 use super::path_types::sanitize_path_winner;

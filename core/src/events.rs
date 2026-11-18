@@ -826,6 +826,7 @@ impl MetadataEvent {
                 BatchPlanned,
                 BatchMerged,
                 CacheGeneration,
+                CachedGroup,
                 ProfileShapes,
                 ProfileChecked,
                 Error,

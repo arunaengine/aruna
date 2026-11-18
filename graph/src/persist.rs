@@ -108,7 +108,8 @@ pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
         | MetadataEffect::CacheShapes { .. }
         | MetadataEffect::CacheGeneration
         | MetadataEffect::CacheRecords { .. }
-        | MetadataEffect::UncacheRecord { .. } => false,
+        | MetadataEffect::UncacheRecord { .. }
+        | MetadataEffect::CachedGroup { .. } => false,
     }
 }
 

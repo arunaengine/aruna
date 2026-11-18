@@ -1400,6 +1400,10 @@ pub enum MetadataEffect {
     UncacheRecord {
         document_id: Ulid,
     },
+    /// The live registry rows of one group, when the registry cache holds a fresh copy.
+    CachedGroup {
+        group_id: GroupId,
+    },
 }
 
 impl MetadataEffect {
@@ -1438,6 +1442,7 @@ impl MetadataEffect {
             MetadataEffect::CacheGeneration => "cache_generation",
             MetadataEffect::CacheRecords { .. } => "cache_records",
             MetadataEffect::UncacheRecord { .. } => "uncache_record",
+            MetadataEffect::CachedGroup { .. } => "cached_group",
         }
     }
 
@@ -1479,7 +1484,8 @@ impl MetadataEffect {
             | MetadataEffect::CacheShapes { .. }
             | MetadataEffect::CacheGeneration
             | MetadataEffect::CacheRecords { .. }
-            | MetadataEffect::UncacheRecord { .. } => None,
+            | MetadataEffect::UncacheRecord { .. }
+            | MetadataEffect::CachedGroup { .. } => None,
         }
     }
 
@@ -1590,6 +1596,10 @@ pub enum MetadataEvent {
     /// The registry cache generation; a cache change answers with the generation after it.
     CacheGeneration {
         generation: u64,
+    },
+    /// The cached registry rows of one group, or `None` without a fresh copy.
+    CachedGroup {
+        records: Option<Vec<MetadataRegistryRecord>>,
     },
     /// The kept shape sources of one Profile revision, if any; a store answers with `None`.
     ProfileShapes {

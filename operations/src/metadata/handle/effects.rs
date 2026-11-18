@@ -68,6 +68,13 @@ async fn run_effect(
                 generation: cache.current_generation(),
             };
         }
+        MetadataEffect::CachedGroup { group_id } => {
+            let records = match cache.records_group_any(group_id) {
+                Some((records, true)) => Some(records.as_ref().clone()),
+                _ => None,
+            };
+            return MetadataEvent::CachedGroup { records };
+        }
         _ => {}
     }
     let Some(graph) = context.graph_handle.as_ref() else {
