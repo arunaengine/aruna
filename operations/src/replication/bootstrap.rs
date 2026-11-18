@@ -88,10 +88,9 @@ enum PageState {
 
 type Step = Result<Next<PageProgress>, BootstrapError>;
 
-/// Advances one cursor by one page. The pending jobs and the page are read outside any
-/// transaction, so live writes into the range never conflict it; the cursor and the page's jobs
-/// commit together in a child that checks the cursor is unchanged, so a crash repeats at most
-/// the last page.
+/// Advances one cursor by one page. Its jobs and page are read outside any transaction, so live
+/// writes never conflict it; cursor and jobs commit in a child that checks the cursor is
+/// unchanged, so a crash repeats at most the last page.
 #[derive(Debug, PartialEq)]
 pub struct BootstrapPage {
     config: PageConfig,

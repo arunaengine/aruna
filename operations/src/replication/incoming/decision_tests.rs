@@ -70,8 +70,8 @@ fn denies_incoming_replica() {
     // would invite bytes is refused instead.
     let rule = policy("us-east");
     let mut operation = governed(&rule).with_gate(gate("eu-west"));
-    let mut effects = operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
-    let Some(Effect::SubOperation(mut gate)) = effects.pop() else {
+    let turn = operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    let Ok(Next::Call(IoCall::Child(mut gate))) = turn else {
         panic!("expected the gate child")
     };
 
@@ -81,7 +81,10 @@ fn denies_incoming_replica() {
             .is_empty()
     );
     assert!(gate.is_complete());
-    operation.step(gate.finalize());
+    let Event::Child(outcome) = gate.finalize() else {
+        panic!("the gate finishes as a child")
+    };
+    operation.next(IoResult::Child(outcome)).unwrap();
 
     assert!(rejected(&operation));
 }
@@ -92,7 +95,9 @@ fn missing_subject_refuses() {
     // never invites the bytes.
     let rule = policy("eu-west");
     let mut operation = governed(&rule);
-    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    operation
+        .send_negotiation(ReplicationNegotiationResult::NeedBlobVersion)
+        .unwrap();
     assert!(rejected(&operation));
 }
 
@@ -107,18 +112,11 @@ fn reference_registers_nothing() {
         realm(),
         manifest,
     );
-    operation.txn_id = Some(Ulid::from_parts(3, 3));
     operation.destination_group_id = Some(Ulid::from_parts(4, 4));
 
-    operation.write_version();
-    assert!(
-        operation
-            .pending_version_effects
-            .iter()
-            .all(|effect| !matches!(
-                effect,
-                Effect::Storage(StorageEffect::Write { key_space, .. })
-                    if key_space == MANAGED_COPY_KEYSPACE
-            ))
-    );
+    let turn = operation.write_version();
+    let Ok(Next::Call(IoCall::Write(rows))) = &turn else {
+        panic!("expected the version rows, got {turn:?}")
+    };
+    assert!(rows.iter().all(|row| row.0 != MANAGED_COPY_KEYSPACE));
 }
