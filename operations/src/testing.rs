@@ -1,10 +1,12 @@
-//! Builds storage-only driver contexts, raw storage reads and writes, and signed tokens for tests.
+//! Builds storage-only driver contexts, a local net config, raw storage reads and writes, and
+//! signed tokens for tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::auth::TokenClaims;
+use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
@@ -25,6 +27,17 @@ pub fn test_context(storage: StorageHandle) -> DriverContext {
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
+    }
+}
+
+/// A net on loopback without relays or discovery, so a test reaches no outside service. A relay
+/// connection's timers also read the real clock and spin forever under paused time.
+pub fn local_net() -> NetConfig {
+    NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback address"),
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
     }
 }
 
