@@ -202,3 +202,22 @@ pub async fn route_metadata_update(
     let route = RouteUpdateOperation::new(node, (record.cloned(), document_id), update, token);
     drive(route, context).await
 }
+
+pub async fn list_audit(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local_node: NodeId,
+    token: Option<AuthToken>,
+    request: aruna_operations::metadata::audit::ListAuditRequest,
+    deadline: tokio::time::Instant,
+) -> Result<
+    aruna_operations::metadata::audit::AuditAggregate,
+    aruna_operations::metadata::audit::ListAuditError,
+> {
+    use aruna_operations::metadata::audit::ListAuditError;
+    use aruna_operations::metadata::audit_entry::{AuditListOperation, outbound_admission};
+    let _admission = outbound_admission().ok_or(ListAuditError::Unavailable)?;
+    let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let list = AuditListOperation::new((realm_id, local_node), token, request, wait);
+    drive(list, context).await
+}

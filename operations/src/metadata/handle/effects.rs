@@ -291,21 +291,6 @@ pub async fn export_rocrate_jsonld(
     }
 }
 
-/// The summary JSON-LD of one graph.
-pub(crate) async fn export_summary_jsonld(
-    context: &DriverContext,
-    graph_iri: String,
-) -> Result<String, MetadataError> {
-    match export(context, MetadataEffect::ExportRoCrateSummary { graph_iri }).await {
-        MetadataEvent::RoCrateSummaryResult { jsonld, .. } => Ok(jsonld),
-        MetadataEvent::Error { error, .. } => Err(error),
-        other => Err(MetadataError::Backend(format!(
-            "unexpected metadata summary event: {}",
-            other.label()
-        ))),
-    }
-}
-
 pub(super) fn record_query_counts(span: &Span, results: &MetadataQueryResults) {
     match results {
         MetadataQueryResults::Solutions(rows) => {

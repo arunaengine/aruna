@@ -350,6 +350,7 @@ pub(crate) fn schedule_prune_drain() -> Effect {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+    use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
     use crate::sync::outbox_record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::DOCUMENT_INDEX_KEYSPACE;

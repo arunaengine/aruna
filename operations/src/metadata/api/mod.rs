@@ -121,7 +121,7 @@ use self::path_types::PathShardView;
 use self::preflight_types::ReferenceNodeExecution;
 #[cfg(test)]
 use self::preflight_types::{authorized_realm_nodes, preflight_fingerprint};
-use self::read_types::{ApiQueryMode, MetadataReferenceEntry, MetadataReferencesRequest};
+use self::read_types::ApiQueryMode;
 
 use self::search_types::{BucketSearchExecution, BucketSearchRequest, ObjectQueryMode};
 #[cfg(test)]

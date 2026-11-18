@@ -18,7 +18,7 @@ use aruna_operations::metadata::forward::routed_status::RoutedStatusOperation;
 use aruna_operations::metadata::profile::validation::{
     ProfileAssessOperation, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
 };
-use aruna_operations::metadata::public_preview::restricted_files as run_restricted_files;
+use aruna_operations::metadata::public_preview::RestrictedFilesOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -214,16 +214,12 @@ pub async fn preview_profile_validation(
     let preview = drive(preview, &context).await.map_err(map_metadata_error)?;
     let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
+        let node = (state.get_realm_id(), state.get_node_id());
+        let restricted = RestrictedFilesOperation::new(node, auth.clone(), &request.rocrate);
         response.set_restricted(
-            run_restricted_files(
-                &context,
-                state.get_realm_id(),
-                state.get_node_id(),
-                &auth,
-                &request.rocrate,
-            )
-            .await
-            .map_err(map_metadata_error)?,
+            drive(restricted, &context)
+                .await
+                .map_err(map_metadata_error)?,
         );
     }
     Ok((StatusCode::OK, Json(response)))
