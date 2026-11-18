@@ -13,7 +13,6 @@ pub mod inventory;
 pub mod outputs;
 pub mod prepare;
 pub mod purge;
-mod purge_audit;
 pub mod reconcile;
 pub mod recovery;
 pub mod run_crate;
