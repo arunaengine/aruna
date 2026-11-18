@@ -194,18 +194,250 @@ impl Operation for StorePoliciesOperation {
             result.done()?;
             return Ok(Next::Done(()));
         }
-    };
-    let Some(value) = value else {
-        return Err(PartCopyError::UploadPart(UploadPartError::NoSuchUpload));
-    };
-    Ok(MultipartUpload::from_bytes(value.as_ref()).map_err(UploadPartError::from)?)
+        let mut record = upload_record(result.value()?)?;
+        check_target(&record, (&self.bucket, &self.key))?;
+        if !record.merge_policies(&self.policies)? {
+            return Ok(Next::Done(()));
+        }
+        let value = record.to_bytes().map_err(UploadPartError::from)?;
+        self.writing = true;
+        let key = Key::from(self.upload_id.to_bytes().to_vec());
+        let row = (UPLOAD_KEYSPACE.to_string(), key, Value::from(value));
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum KeepStep {
+    Upload,
+    Gate,
+    Store,
+}
+
+/// Admits this node for the refs a part copied on another member carries and merges them into
+/// the upload before its bytes land, as a part copied here does.
+#[derive(Debug, PartialEq)]
+pub struct KeepPoliciesOperation {
+    realm_id: RealmId,
+    upload_id: Ulid,
+    bucket: String,
+    key: String,
+    policies: Vec<PlacementPolicyRef>,
+    step: KeepStep,
+}
+
+impl KeepPoliciesOperation {
+    pub fn new(
+        (realm_id, upload_id): (RealmId, Ulid),
+        (bucket, key): (&str, &str),
+        policies: &[PlacementPolicyRef],
+    ) -> Self {
+        Self {
+            realm_id,
+            upload_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            policies: policies.to_vec(),
+            step: KeepStep::Upload,
+        }
+    }
+}
+
+impl Operation for KeepPoliciesOperation {
+    type Output = ();
+    type Error = PartCopyError;
+
+    fn first(&mut self) -> CopyTurn<()> {
+        if self.policies.is_empty() {
+            return Ok(Next::Done(()));
+        }
+        Ok(Next::Call(read_upload(self.upload_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<()> {
+        match self.step {
+            KeepStep::Upload => {
+                let upload = upload_record(result.value()?)?;
+                check_target(&upload, (&self.bucket, &self.key))?;
+                let refs = union_refs(&upload.placement_policies, &self.policies)
+                    .map_err(UploadPartError::from)?;
+                let gate = GatePartOperation::new(self.realm_id, refs, upload.group_id);
+                self.step = KeepStep::Gate;
+                Ok(Next::Call(IoCall::child(gate)))
+            }
+            KeepStep::Gate => {
+                result.child::<(), PartCopyError>()??;
+                let target = (self.bucket.as_str(), self.key.as_str());
+                let store = StorePoliciesOperation::new(target, self.upload_id, &self.policies);
+                self.step = KeepStep::Store;
+                Ok(Next::Call(IoCall::child(store)))
+            }
+            KeepStep::Store => {
+                result.child::<(), PartCopyError>()??;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PartCopyStep {
+    Fence,
+    Upload,
+    Source,
+    Gate,
+    Store,
+    Part,
+}
+
+/// Copies bytes of an existing object into one part of an open upload; `token` admits the source
+/// read while its bucket key is locked.
+#[derive(Debug, PartialEq)]
+pub struct PartCopyOperation {
+    input: PartCopyInput,
+    token: Option<TokenRead>,
+    upload: Option<MultipartUpload>,
+    source: Option<GetObjectResult>,
+    modified: Option<SystemTime>,
+    source_version_id: Option<Ulid>,
+    step: PartCopyStep,
+}
+
+impl PartCopyOperation {
+    pub fn new(input: PartCopyInput, token: Option<TokenRead>) -> Self {
+        Self {
+            input,
+            token,
+            upload: None,
+            source: None,
+            modified: None,
+            source_version_id: None,
+            step: PartCopyStep::Fence,
+        }
+    }
+
+    fn read_source(&mut self) -> CopyTurn<PartCopyResult> {
+        let input = &self.input;
+        let source = GetObjectInput {
+            bucket: input.source_bucket.clone(),
+            key: input.source_key.clone(),
+            version_id: input.source_version_id,
+            range: input.range.clone(),
+            group_id: input.source_group_id,
+            user_identity: input.source_auth_context.user_id,
+            realm_id: input.source_auth_context.realm_id,
+            node_id: input.node_id,
+        };
+        let restrictions = input.source_auth_context.path_restrictions.clone();
+        let read = ReadSourceOperation::new(source, restrictions, self.token.take());
+        self.step = PartCopyStep::Source;
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    /// Checks the conditions before the lazy source stream is consumed. No byte of a governed
+    /// source lands here before this node is admitted for the union the part will carry.
+    fn source_read(&mut self, source: GetObjectResult) -> CopyTurn<PartCopyResult> {
+        let (location, metadata) = (source.location.as_ref(), source.source_metadata.as_ref());
+        self.modified = source_modified(source.info.version_created_at, location, metadata);
+        self.source_version_id = source.version_id;
+        let etag = source_etag(location, metadata);
+        evaluate_source_conditions(&self.input.conditions, etag.as_deref(), self.modified, true)
+            .map_err(|_| PartCopyError::PreconditionFailed)?;
+        let upload = self.upload.as_ref().ok_or(IoError::Unfinished)?;
+        let refs = union_refs(&upload.placement_policies, &source.source_policies)
+            .map_err(UploadPartError::from)?;
+        let realm_id = self.input.source_auth_context.realm_id;
+        let gate = GatePartOperation::new(realm_id, refs, upload.group_id);
+        self.source = Some(source);
+        self.step = PartCopyStep::Gate;
+        Ok(Next::Call(IoCall::child(gate)))
+    }
+
+    /// Stored before the bytes land: a lost merge must not let the completed object drop the
+    /// refs its source carried.
+    fn store_policies(&mut self) -> CopyTurn<PartCopyResult> {
+        let source = self.source.as_ref().ok_or(IoError::Unfinished)?;
+        if source.source_policies.is_empty() {
+            return self.write_part();
+        }
+        let input = &self.input;
+        let target = (input.dest_bucket.as_str(), input.dest_key.as_str());
+        let store = StorePoliciesOperation::new(target, input.upload_id, &source.source_policies);
+        self.step = PartCopyStep::Store;
+        Ok(Next::Call(IoCall::child(store)))
+    }
+
+    fn write_part(&mut self) -> CopyTurn<PartCopyResult> {
+        let source = self.source.take().ok_or(IoError::Unfinished)?;
+        let content_length = (source.resolved_range.as_ref())
+            .map(|range| range.content_length as u64)
+            .or_else(|| source.location.as_ref().map(|location| location.blob_size));
+        let input = &self.input;
+        let part = UploadPartOperation::new(UploadPartInput {
+            bucket: input.dest_bucket.clone(),
+            key: input.dest_key.clone(),
+            upload_id: input.upload_id,
+            part_number: input.part_number,
+            content_length,
+            body: Some(source.blob),
+            created_by: input.user_id,
+            expected_checksums: Vec::new(),
+        });
+        self.step = PartCopyStep::Part;
+        Ok(Next::Call(IoCall::child(part)))
+    }
+}
+
+impl Operation for PartCopyOperation {
+    type Output = PartCopyResult;
+    type Error = PartCopyError;
+
+    fn first(&mut self) -> CopyTurn<PartCopyResult> {
+        let input = &self.input;
+        let fence = FenceCheckOperation::new(&input.dest_bucket, &input.dest_key);
+        Ok(Next::Call(IoCall::child(fence)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<PartCopyResult> {
+        match self.step {
+            PartCopyStep::Fence => {
+                (result.child::<(), PurgeFenceError>()?).map_err(UploadPartError::PurgeFence)?;
+                self.step = PartCopyStep::Upload;
+                Ok(Next::Call(read_upload(self.input.upload_id)))
+            }
+            PartCopyStep::Upload => {
+                let upload = upload_record(result.value()?)?;
+                check_target(&upload, (&self.input.dest_bucket, &self.input.dest_key))?;
+                self.upload = Some(upload);
+                self.read_source()
+            }
+            PartCopyStep::Source => {
+                self.source_read(result.child::<GetObjectResult, GetObjectError>()??)
+            }
+            PartCopyStep::Gate => {
+                result.child::<(), PartCopyError>()??;
+                self.store_policies()
+            }
+            PartCopyStep::Store => {
+                result.child::<(), PartCopyError>()??;
+                self.write_part()
+            }
+            PartCopyStep::Part => {
+                let part = result.child::<UploadPartResult, UploadPartError>()??;
+                Ok(Next::Done(PartCopyResult {
+                    part_location: part.location,
+                    source_version_id: self.source_version_id,
+                    source_last_modified: self.modified,
+                }))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::drive;
-    use crate::placement::policy::GateOperation;
+    use crate::driver::{DriverContext, drive};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
@@ -228,6 +460,90 @@ mod test {
 
     fn test_node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
+
+    async fn upload_part_copy(
+        context: &DriverContext,
+        input: PartCopyInput,
+    ) -> Result<PartCopyResult, PartCopyError> {
+        drive(PartCopyOperation::new(input, None), context).await
+    }
+
+    async fn keep_part_policies(
+        context: &DriverContext,
+        upload: (RealmId, Ulid),
+        target: (&str, &str),
+        policies: &[PlacementPolicyRef],
+    ) -> Result<(), PartCopyError> {
+        drive(
+            KeepPoliciesOperation::new(upload, target, policies),
+            context,
+        )
+        .await
+    }
+
+    async fn stored_upload(context: &DriverContext, upload_id: Ulid) -> MultipartUpload {
+        let read = StorageEffect::Read {
+            key_space: UPLOAD_KEYSPACE.to_string(),
+            key: upload_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        };
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = context.storage_handle.send_storage_effect(read).await
+        else {
+            panic!("the upload record is stored");
+        };
+        MultipartUpload::from_bytes(value.as_ref()).unwrap()
+    }
+
+    fn step_input() -> PartCopyInput {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        PartCopyInput {
+            source_bucket: "source".to_string(),
+            source_key: "a".to_string(),
+            source_version_id: None,
+            source_group_id: Ulid::from_bytes([2; 16]),
+            dest_bucket: "dest".to_string(),
+            dest_key: "b".to_string(),
+            upload_id: Ulid::from_bytes([3; 16]),
+            part_number: 1,
+            range: None,
+            user_id: UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            node_id: test_node_id(),
+            source_auth_context: AuthContext::anonymous(realm_id),
+            conditions: CopySourceConditions::default(),
+        }
+    }
+
+    #[test]
+    fn missing_upload_refused() {
+        let mut copy = PartCopyOperation::new(step_input(), None);
+        copy.first().unwrap();
+        let fenced: Result<(), PurgeFenceError> = Ok(());
+        let outcome = aruna_core::calls::ChildOutcome::new(fenced);
+        assert!(matches!(
+            copy.next(IoResult::Child(outcome)),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        let answer = copy.next(IoResult::Values(vec![None]));
+        assert_eq!(
+            answer,
+            Err(PartCopyError::UploadPart(UploadPartError::NoSuchUpload))
+        );
+    }
+
+    #[test]
+    fn no_policies_finish() {
+        let upload = (RealmId::from_bytes([1; 32]), Ulid::from_bytes([3; 16]));
+        let mut keep = KeepPoliciesOperation::new(upload, ("dest", "b"), &[]);
+        assert_eq!(keep.first(), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn store_uses_transaction() {
+        let store = StorePoliciesOperation::new(("dest", "b"), Ulid::from_bytes([3; 16]), &[]);
+        assert_eq!(store.transaction(), TransactionMode::Write);
     }
 
     async fn full_context() -> (TempDir, DriverContext) {
@@ -658,7 +974,7 @@ mod test {
         keep_part_policies(&context, (realm_id, upload_id), target, &[allowed])
             .await
             .unwrap();
-        let record = read_upload(&context, upload_id).await.unwrap();
+        let record = stored_upload(&context, upload_id).await;
         assert_eq!(record.placement_policies, vec![allowed]);
         let error = keep_part_policies(&context, (realm_id, upload_id), target, &[denied])
             .await
@@ -696,9 +1012,10 @@ mod test {
         let kept = keep_part_policies(&context, (realm_id, upload_id), other, &[policy]).await;
         assert_eq!(kept, mismatch);
         let other = ("other", "dest.txt");
-        let stored = store_source_policies(&context, other, upload_id, &[policy]).await;
+        let store = StorePoliciesOperation::new(other, upload_id, &[policy]);
+        let stored = drive(store, &context).await;
         assert_eq!(stored, mismatch);
-        let record = read_upload(&context, upload_id).await.unwrap();
+        let record = stored_upload(&context, upload_id).await;
         assert!(record.placement_policies.is_empty());
     }
 
