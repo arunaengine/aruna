@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::plugins::calls::*;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{EventBatch, RECEIVER_GAP, RunState, RunTrigger, SourceEvent};
@@ -11,17 +12,16 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
+use crate::plugin_host::worker::decide_batch;
+use crate::plugin_host::worker::prune_runs;
+use crate::plugin_host::worker::tests::{created, installed, scoped, worker};
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, save_run, unfinished};
 use crate::plugins::store::Txn;
-use crate::plugins::worker::decide_batch;
-use crate::plugins::worker::prune_runs;
-use crate::plugins::worker::tests::{created, installed, scoped, worker};
 use aruna_plugins::broker::HostError;
 
 /// A created dataset journaled now, and its forward row for `install`.
@@ -518,7 +518,7 @@ fn judge_maps_check() {
 }
 
 #[test]
-fn row_uses_seen_outcome() {
+fn row_reuses_outcome() {
     let mut decide = DecideRow::new(empty_config(), local_node(), plain_row("s1"), 9);
     assert!(is_child(decide.first().unwrap()));
     let seen = child_result(Ok::<_, StoreError>(Some(Outcome::Expired)));
@@ -537,7 +537,7 @@ fn late_row_expires() {
 }
 
 #[test]
-fn row_judged_then_decided() {
+fn row_judged_first() {
     let mut decide = DecideRow::new(empty_config(), local_node(), plain_row("s1"), 9);
     let unseen = child_result(Ok::<Option<Outcome>, StoreError>(None));
     assert!(is_child(decide.next(unseen).unwrap()));
@@ -568,4 +568,34 @@ fn batch_collects_decisions() {
     let install = Ulid::from_parts(1, 1);
     let expected = vec![(install, "s1".to_string(), Outcome::Expired)];
     assert_eq!(decisions.events, expected);
+}
+
+mod operations {
+    use super::*;
+    use crate::plugins::fixtures::{self, config_result, is_child, node};
+
+    fn serve(peer: u8) -> ServeEvents {
+        let place = (fixtures::realm(), node(1));
+        ServeEvents::new(place, node(peer), EventBatch::default(), 5)
+    }
+
+    #[test]
+    fn serve_decides_batch() {
+        let mut events = serve(3);
+        assert_eq!(events.hold_scope(), Some(HoldScope::PluginAdmissions));
+        assert!(is_child(&events.first()));
+        assert!(is_child(
+            &events.next(config_result(fixtures::realm_nodes()))
+        ));
+        let decided = child_result(Ok::<_, StoreError>(Decisions::default()));
+        assert_eq!(events.next(decided), Ok(Next::Done(Decisions::default())));
+    }
+
+    #[test]
+    fn serve_refuses_device() {
+        let mut events = serve(4);
+        events.first().unwrap();
+        let refused = events.next(config_result(fixtures::realm_nodes()));
+        assert_eq!(refused, Err(MetadataReadError::Forbidden));
+    }
 }
