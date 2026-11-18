@@ -1210,33 +1210,38 @@ impl Operation for HolderReadOperation {
     type Output = HolderRead;
     type Error = GetObjectError;
 
-    for holder in holders {
-        let request = BaoReadRequest {
-            auth_context: AuthContext {
-                user_id: read.user_id,
-                realm_id,
-                path_restrictions: read.restrictions.clone(),
-                session: None,
-            },
-            realm_id,
-            target: BaoReadTarget::Blake3(read.blake3),
-            expected_blake3: Some(read.blake3),
-            metadata_only: true,
-            destination: None,
-            known_refs: Vec::new(),
-            range: None,
-        };
-        match drive(ManagedReadOperation::new(holder, request), context).await {
-            Ok(BaoReadOutput::Metadata {
-                size, etag, hashes, ..
-            }) => {
-                return Ok(routed_info(&read, size, etag, hashes, summary));
+    fn first(&mut self) -> Turn<HolderRead> {
+        Ok(Next::Call(Effect::Net(NetEffect::LocalNode).into()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<HolderRead> {
+        match self.step {
+            HolderStep::Node => {
+                let Event::Net(NetEvent::LocalNode(Some(node))) = result.event()? else {
+                    return Err(GetObjectError::GetObjectFailed);
+                };
+                let read = self.read()?;
+                let holders = GetHoldersOperation::new(read.blake3, read.realm_id, node);
+                self.step = HolderStep::Holders;
+                Ok(Next::Call(IoCall::child(holders)))
             }
-            Ok(BaoReadOutput::Stream { .. }) => failures.unavailable = true,
-            Err(error) => failures.record(error),
+            HolderStep::Holders => {
+                let holders = (result.child::<Vec<NodeId>, GetHoldersError>()?)
+                    .map_err(|_| GetObjectError::GetObjectFailed)?;
+                self.holders = holders.into();
+                self.read_summary()
+            }
+            HolderStep::Summary => {
+                self.summary =
+                    summary_from_value(result.value()?).map_err(|error| match error {
+                        LookupError::Conversion(error) => GetObjectError::ConversionError(error),
+                        _ => GetObjectError::GetObjectFailed,
+                    })?;
+                self.next_holder()
+            }
+            HolderStep::Read => self.answered(result.child()?),
         }
     }
-    Err(failures.into_error())
 }
 
 /// Holder hashes describe the bytes; the local version describes logical multipart facts.
@@ -1291,32 +1296,132 @@ pub(super) fn routed_info(
     }
 }
 
-/// The local version owns multipart facts even when another holder supplies bytes.
-async fn local_multipart_summary(
-    context: &DriverContext,
-    version_id: Option<Ulid>,
-) -> Result<Option<MultipartObjectSummary>, GetObjectError> {
-    let Some(version_id) = version_id else {
-        return Ok(None);
-    };
-    let key = MultipartObjectKey::summary(version_id)
-        .to_bytes()
-        .map_err(GetObjectError::ConversionError)?;
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => summary_from_value(value)
-            .map_err(|error| match error {
-                LookupError::Conversion(error) => GetObjectError::ConversionError(error),
-                _ => GetObjectError::GetObjectFailed,
-            }),
-        _ => Err(GetObjectError::GetObjectFailed),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::s3::object::get::ObjectRangeRequest;
+    use aruna_core::calls::ChildOutcome;
+
+    fn input() -> GetObjectInput {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        GetObjectInput {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: None,
+            range: None,
+            group_id: Ulid::from_bytes([2; 16]),
+            user_identity: UserId::local(Ulid::from_bytes([3; 16]), realm_id),
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        }
+    }
+
+    fn failed_read(error: GetObjectError) -> IoResult {
+        let read: Read = Err(error);
+        IoResult::Child(ChildOutcome::new(read))
+    }
+
+    #[test]
+    fn local_error_returned() {
+        let mut read = ReadLocalOperation::new(input(), None, None);
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let answer = read.next(failed_read(GetObjectError::NoSuchKey));
+        assert_eq!(answer, Err(GetObjectError::NoSuchKey));
+    }
+
+    #[test]
+    fn routed_error_returned() {
+        let mut read = GetRoutedOperation::new(input(), None, None);
+        read.first().unwrap();
+        let answer = read.next(failed_read(GetObjectError::NoSuchVersion));
+        assert_eq!(answer, Err(GetObjectError::NoSuchVersion));
+    }
+
+    #[test]
+    fn ranged_info_refused() {
+        let mut request = input();
+        request.range = Some(ObjectRangeRequest::Start { start: 0 });
+        let mut info = ObjectInfoOperation::new(request, None);
+        assert_eq!(info.first(), Err(GetObjectError::InvalidRange));
+    }
+
+    #[test]
+    fn info_error_returned() {
+        let mut info = ObjectInfoOperation::new(input(), None);
+        info.first().unwrap();
+        let answer = info.next(failed_read(GetObjectError::NoSuchKey));
+        assert_eq!(answer, Err(GetObjectError::NoSuchKey));
+    }
+
+    #[test]
+    fn source_error_returned() {
+        let mut read = ReadSourceOperation::new(input(), None, None);
+        read.first().unwrap();
+        let answer = read.next(failed_read(GetObjectError::DeleteMarker));
+        assert_eq!(answer, Err(GetObjectError::DeleteMarker));
+    }
+
+    #[test]
+    fn keyed_read_pins() {
+        let private = SharedSecret::new(aruna_core::compute::SecretBytes::new(vec![6; 32]));
+        let limits = RoCrateLimits::default();
+        let mut read = KeyedReadOperation::new(input(), None, private, &limits);
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let missing: Result<HeadObjectResult, HeadObjectError> = Err(HeadObjectError::NoSuchKey);
+        let answer = read.next(IoResult::Child(ChildOutcome::new(missing)));
+        assert_eq!(answer, Err(GetObjectError::GetObjectFailed));
+    }
+
+    #[test]
+    fn keep_failure_continues() {
+        let keep = SourceKeep {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::from_bytes([7; 16]),
+            group_id: Ulid::from_bytes([2; 16]),
+            user_id: input().user_identity,
+            ranged: false,
+        };
+        let mut read = KeepReadOperation::new(keep);
+        read.first().unwrap();
+        let failed: Result<KeepStart, IoError> = Err(IoError::Unfinished);
+        let answer = read.next(IoResult::Child(ChildOutcome::new(failed)));
+        assert_eq!(answer, Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn settled_keep_answers() {
+        let keep = SourceKeep {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::from_bytes([7; 16]),
+            group_id: Ulid::from_bytes([2; 16]),
+            user_id: input().user_identity,
+            ranged: true,
+        };
+        let mut read = KeepReadOperation::new(keep);
+        read.first().unwrap();
+        let settled: Result<KeepStart, IoError> = Ok(KeepStart::Settled(true));
+        let answer = read.next(IoResult::Child(ChildOutcome::new(settled)));
+        assert_eq!(answer, Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn unknown_node_fails() {
+        let read = RoutedRead {
+            user_id: input().user_identity,
+            realm_id: input().realm_id,
+            blake3: [5; 32],
+            version_id: None,
+            metadata: HashMap::new(),
+            version_created_at: None,
+            source_policies: Vec::new(),
+            restrictions: None,
+        };
+        let mut holders = HolderReadOperation::new(read, true);
+        holders.first().unwrap();
+        let none = Event::Net(NetEvent::LocalNode(None));
+        let answer = holders.next(IoResult::Event(Box::new(none)));
+        assert_eq!(answer, Err(GetObjectError::GetObjectFailed));
     }
 }
