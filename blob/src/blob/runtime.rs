@@ -100,6 +100,7 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ReadMessage { .. } => (EffectClass::Control, "read_message"),
         BlobEffect::CloseConnection { .. } => (EffectClass::Control, "close_connection"),
         BlobEffect::Read { .. } => (EffectClass::Read, "read"),
+        BlobEffect::CollectStream { .. } => (EffectClass::Read, "collect_stream"),
         BlobEffect::ReadRange { .. } => (EffectClass::Read, "read_range"),
         BlobEffect::ReadHiddenRange { .. } => (EffectClass::Read, "read_hidden_range"),
         BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
@@ -178,6 +179,17 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::DeletePlain { .. }
             | BlobEffect::DropReservation { .. }
     )
+}
+
+/// The bytes of `blob`, read to its end.
+async fn collect_stream(
+    mut blob: BackendStream<Result<Bytes, StreamError>>,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut blob).await {
+        bytes.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+    }
+    Ok(bytes)
 }
 
 /// Tracks one in-flight blob mutation so `drain_writes` can wait for it.
@@ -835,6 +847,9 @@ impl BlobHandler {
                 self.clear_active(id);
                 BlobEvent::ReservationReleased { id }
             }
+            BlobEffect::CollectStream { blob } => BlobEvent::StreamCollected {
+                bytes: collect_stream(blob).await,
+            },
             BlobEffect::ReconcileReservation { location } => {
                 match Box::pin(self.reconcile_reservation(location)).await {
                     Ok(done) => BlobEvent::ReservationReconciled { done },

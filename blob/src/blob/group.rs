@@ -171,6 +171,7 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         // An observation is served straight from the owner's filesystem, so it
         // claims no tenant backend at all.
         BlobEffect::ServeSourceRead { .. }
+        | BlobEffect::CollectStream { .. }
         | BlobEffect::SpoolHidden { .. }
         | BlobEffect::SpoolLocal { .. }
         | BlobEffect::Remote(_)

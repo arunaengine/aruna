@@ -260,7 +260,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             NetEvent::ExecutionSign(sign_execution(&ctx.secret_key, *claim))
         }
         NetEffect::GrantSign(grant) => NetEvent::GrantSign(sign_grant(&ctx.secret_key, *grant)),
-        NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
         )),
@@ -322,12 +321,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
         }
     }
-}
-
-/// Release reads and holder requests run in the operations runner, never here.
-fn release_unavailable() -> aruna_core::structs::storage::release::ReleaseEvent {
-    let reason = "release reads must be dispatched by the operations runner".to_string();
-    aruna_core::structs::storage::release::ReleaseEvent::Holder(Err(reason))
 }
 
 /// Signs a snapshot with this node's key, only when this node is the set's bound publisher.
@@ -651,7 +644,6 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
         NetEffect::ExecutionSign(_) => "execution_sign",
-        NetEffect::Release(_) => "release",
         NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::MetadataRequest(_) => "metadata_request",
         NetEffect::RefreshDocumentPeers(_) => "refresh_document_peers",

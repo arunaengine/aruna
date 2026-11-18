@@ -168,6 +168,10 @@ pub enum BlobEffect {
     ReleaseReservation {
         id: Ulid,
     },
+    /// Reads a stream to its end; answered by `StreamCollected`.
+    CollectStream {
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
     /// Settles the reservation a write left behind; answered by `ReservationReconciled`.
     ReconcileReservation {
         location: BackendLocation,
@@ -806,8 +810,6 @@ pub enum NetEffect {
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
     /// Signs one job record of an execution; only a claim naming this node as publisher.
     ExecutionSign(Box<crate::structs::execution::job::ExecutionClaim>),
-    /// Reads a release crate version or asks a range holder about releases.
-    Release(Box<crate::structs::storage::release::ReleaseEffect>),
     /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.
     ArtifactStore(Box<crate::plugins::ArtifactStore>),
     /// Sends one notification request frame to a holder and reads its answer frame.
