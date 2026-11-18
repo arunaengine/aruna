@@ -100,9 +100,9 @@ fn holder_token(bucket: &str, cursor: &str) -> Option<String> {
     if is_sealed(cursor) {
         return Some(cursor.to_string());
     }
-    match decode_resume::<()>(cursor).ok()? {
+    match decode_resume(cursor).ok()? {
         Resume::After { key, group } => {
-            let token = resume_token::<()>(bucket, &key, group.as_deref()).ok()?;
+            let token = resume_token(bucket, &key, group.as_deref()).ok()?;
             encode_list_token(&token).ok()
         }
         Resume::From(_) | Resume::Hidden { .. } => None,
@@ -114,7 +114,7 @@ fn page_cursor(token: String) -> Option<String> {
     if is_sealed(&token) {
         return Some(token);
     }
-    after_cursor::<()>(decode_list_token(&token)?).ok()
+    after_cursor(decode_list_token(&token)?).ok()
 }
 
 #[derive(Debug, PartialEq)]
