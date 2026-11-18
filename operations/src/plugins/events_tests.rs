@@ -11,10 +11,6 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use crate::driver::drive;
-use crate::plugin_host::worker::decide_batch;
-use crate::plugin_host::worker::match_journal;
-use crate::plugin_host::worker::plan_replays;
-use crate::plugin_host::worker::send_outbox;
 use crate::plugin_host::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced, worker,
 };

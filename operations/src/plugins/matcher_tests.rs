@@ -8,7 +8,6 @@ use aruna_core::plugin_runs::{SourceKind, journal_entries};
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
-use crate::plugin_host::worker::match_journal;
 use crate::plugin_host::worker::tests::{created, installed, scoped, synced};
 use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;

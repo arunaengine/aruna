@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::plugins::calls::*;
 use crate::driver::drive;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{hook_key, hook_time_key};
@@ -10,7 +11,6 @@ use aruna_core::secrets::{Delivery, SecretName, SecretScope};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, SecretAudit, SecretUse};
 
 use super::*;
-use crate::plugin_host::worker::prune_audit;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::encode;

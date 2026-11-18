@@ -12,8 +12,6 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
-use crate::plugin_host::worker::decide_batch;
-use crate::plugin_host::worker::prune_runs;
 use crate::plugin_host::worker::tests::{created, installed, scoped, worker};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, journal};

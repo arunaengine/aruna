@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
-use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 
 use aruna_core::NodeId;
 use aruna_core::effects::Effect;
@@ -32,8 +32,10 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
+use super::decide::DecideBatch;
 use super::matcher::Outbox;
 use super::peer::{ask_peer, peer_answer};
+use super::receiver::lost_reason;
 use super::rows::{
     Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, values,
@@ -48,7 +50,7 @@ pub(crate) const REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 /// When each receiver is tried again after a failed or busy send.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Backoff(BTreeMap<NodeId, (u32, u64)>);
 
 impl Backoff {
@@ -735,6 +737,189 @@ impl Operation for SendEvents {
             Some(MetadataTransportMessage::EventsDecided { result }) => Ok(Next::Done(result?)),
             _ => Err(MetadataReadError::Unavailable),
         }
+    }
+}
+
+/// Which receivers one outbox pass serves. This node's own batches are decided under the
+/// admission hold; the others wait for the network without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutboxRoute {
+    Local,
+    Remote,
+}
+
+/// What one outbox pass did.
+#[derive(Debug, PartialEq)]
+pub(crate) struct OutboxPass {
+    pub decided: usize,
+    pub backoff: Backoff,
+    pub failure: Option<StoreError>,
+}
+
+/// The requests of one receiver still to send.
+#[derive(Debug, PartialEq)]
+struct ReceiverQueue {
+    node: NodeId,
+    requests: VecDeque<Pending>,
+}
+
+#[derive(Debug, PartialEq)]
+enum OutboxPhase {
+    Collect,
+    Sent(BTreeMap<(Ulid, String), Vec<u8>>),
+    Applied,
+}
+
+/// Sends each reachable receiver its batches and applies their decisions. Rows of removed
+/// installs are dropped and rows past their send expiry become gaps. A receiver that fails or
+/// is busy waits; one that took every request is tried at once next time.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SendOutbox {
+    config: Arc<RealmConfigDocument>,
+    route: OutboxRoute,
+    local: NodeId,
+    now_ms: u64,
+    bound: usize,
+    metadata: bool,
+    backoff: Backoff,
+    receivers: VecDeque<ReceiverQueue>,
+    current: Option<ReceiverQueue>,
+    decided: usize,
+    phase: OutboxPhase,
+}
+
+impl SendOutbox {
+    pub(crate) fn new(
+        config: Arc<RealmConfigDocument>,
+        (route, local): (OutboxRoute, NodeId),
+        (now_ms, metadata): (u64, bool),
+        backoff: Backoff,
+    ) -> Self {
+        Self {
+            config,
+            route,
+            local,
+            now_ms,
+            bound: REQUEST_BYTES,
+            metadata,
+            backoff,
+            receivers: VecDeque::new(),
+            current: None,
+            decided: 0,
+            phase: OutboxPhase::Collect,
+        }
+    }
+
+    fn served(&self, node: NodeId) -> bool {
+        (node == self.local) == (self.route == OutboxRoute::Local)
+    }
+
+    fn collect(&self) -> CollectOutbox {
+        let open = (self.config.installs.iter())
+            .map(|install| install.receiver)
+            .filter(|node| self.served(*node))
+            .filter(|node| lost_reason(&self.config, *node).is_none())
+            .filter(|node| self.backoff.ready(*node, self.now_ms))
+            .collect();
+        let pass = (self.now_ms, self.bound);
+        CollectOutbox::new(self.config.clone(), open, pass, self.metadata)
+    }
+
+    fn finish(&mut self, failure: Option<StoreError>) -> Next<OutboxPass> {
+        Next::Done(OutboxPass {
+            decided: self.decided,
+            backoff: std::mem::take(&mut self.backoff),
+            failure,
+        })
+    }
+
+    /// Sends the next request, moving on to the next receiver when one has none left.
+    fn advance(&mut self) -> Next<OutboxPass> {
+        loop {
+            let Some(mut receiver) = self.current.take().or_else(|| self.receivers.pop_front())
+            else {
+                return self.finish(None);
+            };
+            let Some((batch, keys)) = receiver.requests.pop_front() else {
+                self.backoff.cleared(receiver.node);
+                continue;
+            };
+            let node = receiver.node;
+            self.current = Some(receiver);
+            self.phase = OutboxPhase::Sent(keys);
+            return Next::Call(match self.route {
+                OutboxRoute::Local => {
+                    let nodes = (self.local, self.local);
+                    let config = self.config.clone();
+                    IoCall::child(DecideBatch::new(config, nodes, batch, self.now_ms))
+                }
+                OutboxRoute::Remote => IoCall::child(SendEvents::new(node, batch)),
+            });
+        }
+    }
+
+    /// The receiver waits, and what it still had stays in the outbox.
+    fn receiver_failed(&mut self) -> Next<OutboxPass> {
+        if let Some(receiver) = self.current.take() {
+            self.backoff.failed(receiver.node, self.now_ms);
+        }
+        self.advance()
+    }
+
+    fn decisions(&self, result: IoResult) -> Result<Option<Decisions>, IoError> {
+        Ok(match self.route {
+            OutboxRoute::Local => result.child::<Decisions, StoreError>()?.ok(),
+            OutboxRoute::Remote => result.child::<Decisions, MetadataReadError>()?.ok(),
+        })
+    }
+
+    fn step(&mut self, result: IoResult) -> Result<Next<OutboxPass>, StoreError> {
+        match std::mem::replace(&mut self.phase, OutboxPhase::Applied) {
+            OutboxPhase::Collect => {
+                let batches = result.child::<BTreeMap<NodeId, Requests>, StoreError>()??;
+                self.receivers = (batches.into_iter())
+                    .map(|(node, requests)| ReceiverQueue {
+                        node,
+                        requests: (requests.open.into_iter())
+                            .map(|(pending, _)| pending)
+                            .collect(),
+                    })
+                    .collect();
+                Ok(self.advance())
+            }
+            OutboxPhase::Sent(keys) => match self.decisions(result)? {
+                Some(decisions) => Ok(Next::Call(IoCall::child(apply(&keys, decisions)))),
+                None => Ok(self.receiver_failed()),
+            },
+            OutboxPhase::Applied => {
+                let (count, busy) = result.child::<(usize, bool), StoreError>()??;
+                self.decided += count;
+                Ok(match busy {
+                    true => self.receiver_failed(),
+                    false => self.advance(),
+                })
+            }
+        }
+    }
+}
+
+impl Operation for SendOutbox {
+    type Output = OutboxPass;
+    type Error = StoreError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        (self.route == OutboxRoute::Local).then_some(HoldScope::PluginAdmissions)
+    }
+
+    fn first(&mut self) -> Result<Next<OutboxPass>, StoreError> {
+        Ok(Next::Call(IoCall::child(self.collect())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<OutboxPass>, StoreError> {
+        Ok(match self.step(result) {
+            Ok(next) => next,
+            Err(error) => self.finish(Some(error)),
+        })
     }
 }
 

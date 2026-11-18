@@ -10,7 +10,6 @@ use aruna_core::structs::execution::job::PluginWorkSpec;
 use super::*;
 use crate::driver::DriverContext;
 use crate::plugin_host::plugin_work::tests::ready_copy;
-use crate::plugin_host::worker::sweep_marks;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::values_result;

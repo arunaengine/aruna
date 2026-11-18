@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE};
@@ -13,18 +14,22 @@ use aruna_core::plugin_runs::{
     EVENTS_QUEUED, GapReason, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
     SourceKind, journal_key,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_plugins::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::clock::{AskClock, ClockReading, SKEW_MARGIN_MS, local_start};
 use super::grants::held_covers;
+use super::lifecycle::targets;
 use super::matcher::{Counting, Outbox, Target};
 use super::rows::{
     Row, Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, unexpected, values,
 };
+use crate::realm::mutate_placement::node_kind;
 
 pub(crate) const COVERAGE_ROW: u8 = b'c';
 const REPLAY_ROW: u8 = b'r';
@@ -541,6 +546,144 @@ impl Operation for RunReplays {
         }
         self.current = Some((key.clone(), done_pages + 1));
         Ok(Next::Call(self.page_of(key)))
+    }
+}
+
+/// A replay about to start, waiting for the time it starts from.
+#[derive(Debug, PartialEq)]
+struct PlannedReplay {
+    target: Box<Target>,
+    next: Box<CoverageRow>,
+    old: Coverage,
+}
+
+#[derive(Debug, PartialEq)]
+enum PlanPhase {
+    Plan,
+    Clock(PlannedReplay, u64, NodeId, Option<u64>),
+    Start,
+}
+
+/// Starts a replay for each active install whose coverage grew here since its coverage row. The
+/// activation time on another node's clock is mapped with one round trip to it. Answers how many
+/// replays started; a user node keeps no journal and starts none.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PlanReplays {
+    config: Arc<RealmConfigDocument>,
+    local: NodeId,
+    now_ms: u64,
+    clock_ms: Option<u64>,
+    targets: VecDeque<Target>,
+    started: usize,
+    phase: PlanPhase,
+}
+
+impl PlanReplays {
+    pub(crate) fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
+        Self {
+            targets: targets(&config).into(),
+            config,
+            local,
+            now_ms,
+            clock_ms: None,
+            started: 0,
+            phase: PlanPhase::Plan,
+        }
+    }
+
+    fn advance(&mut self) -> Next<usize> {
+        while let Some(target) = self.targets.pop_front() {
+            let id = target.install_id;
+            let install = (self.config.installs.iter()).find(|install| install.install_id == id);
+            if let Some(install) = install {
+                self.phase = PlanPhase::Plan;
+                let plan = PlanReplay::new(install.clone(), target);
+                return Next::Call(IoCall::child(plan));
+            }
+        }
+        Next::Done(self.started)
+    }
+
+    fn start(
+        &mut self,
+        plan: PlannedReplay,
+        start: Option<u64>,
+        by: Option<NodeId>,
+    ) -> Next<usize> {
+        let PlannedReplay { target, next, old } = plan;
+        let replay = StartReplay::new(*target, (*next, old), (start, by), self.now_ms);
+        self.phase = PlanPhase::Start;
+        Next::Call(IoCall::child(replay))
+    }
+
+    fn planned(&mut self, plan: ReplayPlan) -> Next<usize> {
+        let ReplayPlan::Start {
+            target,
+            next,
+            old,
+            boundary,
+            by,
+        } = plan
+        else {
+            return self.advance();
+        };
+        let plan = PlannedReplay { target, next, old };
+        match by {
+            Some(node) if node == self.local => {
+                let start = boundary.saturating_sub(SKEW_MARGIN_MS);
+                self.start(plan, Some(start), by)
+            }
+            Some(node) => {
+                self.phase = PlanPhase::Clock(plan, boundary, node, self.clock_ms);
+                Next::Call(IoCall::child(AskClock(node)))
+            }
+            None => self.start(plan, None, None),
+        }
+    }
+}
+
+impl Operation for PlanReplays {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.clock_ms = Some(now_ms);
+    }
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        let user = matches!(
+            node_kind(&self.config, self.local),
+            Some(RealmNodeKind::User { .. })
+        );
+        Ok(match user {
+            true => Next::Done(0),
+            false => self.advance(),
+        })
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<usize>, StoreError> {
+        match std::mem::replace(&mut self.phase, PlanPhase::Plan) {
+            PlanPhase::Plan => {
+                let plan = result.child::<ReplayPlan, StoreError>()??;
+                Ok(self.planned(plan))
+            }
+            PlanPhase::Clock(plan, boundary, node, sent_ms) => {
+                let remote = result.child::<Option<u64>, IoError>()?;
+                let reading = (sent_ms.zip(remote.ok().flatten()).zip(self.clock_ms)).map(
+                    |((sent_ms, remote_ms), received_ms)| ClockReading {
+                        sent_ms,
+                        remote_ms,
+                        received_ms,
+                    },
+                );
+                Ok(self.start(plan, local_start(boundary, reading), Some(node)))
+            }
+            PlanPhase::Start => {
+                result.child::<(), StoreError>()??;
+                self.started += 1;
+                Ok(self.advance())
+            }
+        }
     }
 }
 

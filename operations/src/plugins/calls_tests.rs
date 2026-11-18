@@ -8,13 +8,13 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::plugin_installs::{PluginInstall, SecretBinding};
-use aruna_core::plugin_runs::{HookRequest, PluginRun};
+use aruna_core::plugin_runs::{Decisions, EventBatch, HookRequest, PluginRun};
 use aruna_core::plugins::Released;
 use aruna_core::plugins::{Chunk, NodeCheckError, PublishedPlugin, ReleaseError, ReleaseRequest};
 use aruna_core::secrets::{SecretKind, SecretName};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::{HostError, JobStatus, ObjectPage};
 use aruna_plugins::manifest::Manifest;
@@ -25,9 +25,13 @@ use super::account::RepairAccount;
 use super::artifacts::ArtifactError;
 use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, CheckNodeBinding};
 use super::check::RunScope;
+use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
 use super::copies::Assembled;
 use super::copy_rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
+use super::decide::DecideBatch;
 use super::dispatch::{EnqueueTimers, HookAuthorization, StartError, StartRun, VerifyHook};
+use super::finished::NotifyDue;
+use super::forward::{Backoff, CollectOutbox, REQUEST_BYTES, apply};
 use super::held::AskRelease;
 use super::hooks::{AdmitHook, HookError};
 use super::install::{
@@ -35,19 +39,28 @@ use super::install::{
 };
 use super::job_work::{CancelWork, JobState, RetireWork, SettleWork, StartWork};
 use super::lifecycle::{RemoveInstall, SetGrants, SetPaused, UpdateInstall};
+use super::lifecycle::{match_targets, targets};
+use super::marks::SweepMarks;
+use super::matcher::MatchJournal;
+use super::prune::PruneAudit;
 use super::publish::{CheckPublish, FinishPublish, PublishError, PublishStep};
+use super::receiver::lost_reason;
 use super::reconcile::{RepairSettled, repair_account};
 use super::records::{InstallEntryConfig, InstallEntryOperation};
+use super::replay::{PlanReplay, ReplayPlan, RunReplays, StartReplay};
 use super::rows::StoreError;
 use super::rules::{EnsureRules, RetireRules};
+use super::runs::{PruneRuns, RunError};
 use super::secret_use::{OpenSealed, ReleaseSecret, Sealed, SelectSecret, Selected};
 use super::submit::WorkRequest;
 use super::sweep::SweepOrphans;
+use super::waiting::RecheckWaiting;
 use super::work::WorkRow;
 use super::work_calls::{JobOutputs, JobRow};
 use crate::driver::{DriverContext, drive};
 pub(crate) use crate::plugin_host::read_config;
 use crate::plugin_host::ready_artifact;
+use crate::realm::mutate_placement::node_kind;
 
 fn local_of(ctx: &DriverContext) -> Option<NodeId> {
     ctx.net_handle.as_ref().map(|net| net.node_id())
@@ -426,4 +439,151 @@ pub(crate) async fn job_outputs(
     cursor: Option<String>,
 ) -> Result<ObjectPage, HostError> {
     Ok(drive(JobOutputs::new(place, id, cursor), ctx).await?)
+}
+
+pub(crate) async fn match_journal(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    (now_ms, bound): (u64, usize),
+) -> Result<usize, StoreError> {
+    let targets = match_targets(config, local);
+    drive(MatchJournal::new(targets, now_ms, bound), ctx).await
+}
+
+pub(crate) async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunError> {
+    drive(PruneRuns::new(now_ms), ctx).await
+}
+
+pub(crate) async fn prune_audit(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    drive(PruneAudit::new(now_ms), ctx).await
+}
+
+pub(crate) async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
+    drive(SweepMarks::new(), ctx).await
+}
+
+pub(crate) async fn decide_batch(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    nodes: (NodeId, NodeId),
+    batch: EventBatch,
+    now_ms: u64,
+) -> Result<Decisions, StoreError> {
+    let decide = DecideBatch::new(Arc::new(config.clone()), nodes, batch, now_ms);
+    drive(decide, ctx).await
+}
+
+/// Runs one outbox pass with `send` in place of the receivers.
+pub(crate) async fn send_outbox<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    send_bounded(ctx, config, (now_ms, REQUEST_BYTES), backoff, send).await
+}
+
+pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    (now_ms, bound): (u64, usize),
+    backoff: &mut Backoff,
+    send: impl Fn(NodeId, EventBatch) -> F,
+) -> Result<usize, StoreError> {
+    let open = (config.installs.iter())
+        .map(|install| install.receiver)
+        .filter(|node| lost_reason(config, *node).is_none() && backoff.ready(*node, now_ms))
+        .collect();
+    let metadata = ctx.net_handle.is_some();
+    let collect = CollectOutbox::new(Arc::new(config.clone()), open, (now_ms, bound), metadata);
+    let mut decided = 0;
+    for (receiver, requests) in drive(collect, ctx).await? {
+        let mut failed = false;
+        for ((batch, keys), _) in requests.open {
+            let Ok(decisions) = send(receiver, batch).await else {
+                failed = true;
+                break;
+            };
+            let (count, busy) = drive(apply(&keys, decisions), ctx).await?;
+            decided += count;
+            if busy {
+                failed = true;
+                break;
+            }
+        }
+        match failed {
+            true => backoff.failed(receiver, now_ms),
+            false => backoff.cleared(receiver),
+        }
+    }
+    Ok(decided)
+}
+
+pub(crate) async fn notify_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<usize, RunError> {
+    drive(NotifyDue::new(Arc::new(config.clone()), local, now_ms), ctx).await
+}
+
+pub(crate) async fn recheck_waiting(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    let recheck = RecheckWaiting::new(Arc::new(config.clone()), local, now_ms);
+    drive(recheck, ctx).await
+}
+
+/// Starts the replays that are due, with `probe` in place of another node's clock.
+pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+    probe: impl Fn(NodeId) -> F,
+) -> Result<usize, StoreError> {
+    if matches!(node_kind(config, local), Some(RealmNodeKind::User { .. })) {
+        return Ok(0);
+    }
+    let mut started = 0;
+    for target in targets(config) {
+        let id = target.install_id;
+        let Some(install) = config.installs.iter().find(|i| i.install_id == id) else {
+            continue;
+        };
+        let plan = PlanReplay::new(install.clone(), target);
+        let ReplayPlan::Start {
+            target,
+            next,
+            old,
+            boundary,
+            by,
+        } = drive(plan, ctx).await?
+        else {
+            continue;
+        };
+        let start = match by {
+            Some(node) if node == local => Some(boundary.saturating_sub(SKEW_MARGIN_MS)),
+            Some(node) => local_start(boundary, probe(node).await),
+            None => None,
+        };
+        let replay = StartReplay::new(*target, (*next, old), (start, by), now_ms);
+        drive(replay, ctx).await?;
+        started += 1;
+    }
+    Ok(started)
+}
+
+pub(crate) async fn run_replays(
+    ctx: &DriverContext,
+    now_ms: u64,
+    pages: (usize, usize),
+) -> Result<usize, StoreError> {
+    drive(RunReplays::new(now_ms, pages), ctx).await
 }

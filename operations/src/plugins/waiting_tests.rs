@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::plugins::calls::*;
 use crate::driver::drive;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_SEEN_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
@@ -11,8 +12,6 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
-use crate::plugin_host::worker::decide_batch;
-use crate::plugin_host::worker::recheck_waiting;
 use crate::plugin_host::worker::tests::{created, installed};
 use crate::plugins::decide::{SeenRow, seen_key};
 use crate::plugins::install::tests::Fixture;

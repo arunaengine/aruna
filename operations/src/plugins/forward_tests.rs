@@ -11,9 +11,8 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugin_host::worker::match_journal;
 use crate::plugin_host::worker::tests::{created, installed};
-use crate::plugin_host::worker::{send_bounded, send_outbox};
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::rows::tests::child_result;
@@ -624,5 +623,100 @@ mod operations {
         assert_eq!(send.next(said), Ok(Next::Done(Decisions::default())));
         let silent = send.next(peer_silent(node(1)));
         assert_eq!(silent, Err(MetadataReadError::Unavailable));
+    }
+}
+
+mod outbox_pass {
+    use serde_json::json;
+
+    use super::*;
+    use crate::plugins::fixtures::{self, is_child, is_effect, node};
+
+    fn pass(route: OutboxRoute) -> SendOutbox {
+        let config = Arc::new(fixtures::config(&fixtures::install(), json!({})));
+        SendOutbox::new(config, (route, node(3)), (50, true), Backoff::default())
+    }
+
+    fn collected(peer: NodeId, count: usize) -> IoResult {
+        let pending = || ((EventBatch::default(), BTreeMap::new()), 0);
+        let requests = Requests {
+            bound: REQUEST_BYTES,
+            open: (0..count).map(|_| pending()).collect(),
+        };
+        child_result(Ok::<_, StoreError>(BTreeMap::from([(peer, requests)])))
+    }
+
+    fn decided() -> IoResult {
+        child_result(Ok::<_, MetadataReadError>(Decisions::default()))
+    }
+
+    fn done(next: Result<Next<OutboxPass>, StoreError>) -> OutboxPass {
+        let Ok(Next::Done(pass)) = next else {
+            panic!("the pass should be over");
+        };
+        pass
+    }
+
+    #[test]
+    fn only_local_holds() {
+        let local = pass(OutboxRoute::Local).hold_scope();
+        assert_eq!(local, Some(HoldScope::PluginAdmissions));
+        assert_eq!(pass(OutboxRoute::Remote).hold_scope(), None);
+    }
+
+    #[test]
+    fn remote_applies_decisions() {
+        let mut send = pass(OutboxRoute::Remote);
+        assert!(is_child(&send.first()));
+        assert!(is_child(&send.next(collected(node(1), 1))));
+        assert!(is_child(&send.next(decided())));
+        let applied = child_result(Ok::<_, StoreError>((2usize, false)));
+        let over = done(send.next(applied));
+        assert_eq!((over.decided, over.failure), (2, None));
+        assert!(over.backoff.ready(node(1), 50));
+    }
+
+    #[test]
+    fn failed_receiver_waits() {
+        let mut send = pass(OutboxRoute::Remote);
+        send.first().unwrap();
+        send.next(collected(node(1), 2)).unwrap();
+        let failed = Err::<Decisions, _>(MetadataReadError::Unavailable);
+        let over = done(send.next(child_result(failed)));
+        assert!(!over.backoff.ready(node(1), 50));
+    }
+
+    #[test]
+    fn busy_receiver_waits() {
+        let mut send = pass(OutboxRoute::Remote);
+        send.first().unwrap();
+        send.next(collected(node(1), 1)).unwrap();
+        send.next(decided()).unwrap();
+        let busy = child_result(Ok::<_, StoreError>((1usize, true)));
+        let over = done(send.next(busy));
+        assert_eq!(over.decided, 1);
+        assert!(!over.backoff.ready(node(1), 50));
+    }
+
+    #[test]
+    fn local_decides_here() {
+        let mut send = pass(OutboxRoute::Local);
+        send.first().unwrap();
+        let asked = send.next(collected(node(3), 1));
+        assert!(is_child(&asked) && !is_effect(&asked));
+        let answer = child_result(Ok::<_, StoreError>(Decisions::default()));
+        assert!(is_child(&send.next(answer)));
+    }
+
+    #[test]
+    fn store_failure_keeps_backoff() {
+        let mut send = pass(OutboxRoute::Remote);
+        send.backoff.failed(node(2), 50);
+        send.first().unwrap();
+        let failed = StoreError("no".to_string());
+        let answer = child_result(Err::<BTreeMap<NodeId, Requests>, _>(failed.clone()));
+        let over = done(send.next(answer));
+        assert_eq!(over.failure, Some(failed));
+        assert!(!over.backoff.ready(node(2), 50));
     }
 }

@@ -11,7 +11,6 @@ use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use serde_json::json;
 
 use super::*;
-use crate::plugin_host::worker::{notify_work, prune_runs};
 use crate::plugins::host_calls::call_intent;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
@@ -355,4 +354,48 @@ fn failed_run_waits() {
     let mut due = completions(&install);
     let page = page_result(vec![work_row_of(&install, &told)], None);
     assert_eq!(due.next(page), Ok(Next::Done(Vec::new())));
+}
+
+mod notify_pass {
+    use serde_json::json;
+
+    use super::*;
+    use crate::plugins::fixtures::{self, is_child, node};
+    use crate::plugins::rows::tests::child_result;
+
+    fn notify() -> NotifyDue {
+        let config = Arc::new(fixtures::config(&fixtures::install(), json!({})));
+        let mut notify = NotifyDue::new(config, node(3), 5);
+        assert_eq!(notify.hold_scope(), Some(HoldScope::PluginAdmissions));
+        assert!(is_child(&notify.first()));
+        notify
+    }
+
+    fn due() -> IoResult {
+        let id = Ulid::from_parts(1, 1);
+        let work = vec![NotifyWork::new(id, id, None)];
+        child_result(Ok::<_, StoreError>(work))
+    }
+
+    #[test]
+    fn counts_notified() {
+        let mut pass = notify();
+        assert!(is_child(&pass.next(due())));
+        let done = child_result(Ok::<bool, RunError>(true));
+        assert_eq!(pass.next(done), Ok(Next::Done(1)));
+    }
+
+    #[test]
+    fn full_queue_waits() {
+        let mut pass = notify();
+        pass.next(due()).unwrap();
+        let full = child_result(Err::<bool, _>(RunError::Full(3)));
+        assert_eq!(pass.next(full), Ok(Next::Done(0)));
+    }
+
+    #[test]
+    fn nothing_due() {
+        let none = child_result(Ok::<_, StoreError>(Vec::<NotifyWork>::new()));
+        assert_eq!(notify().next(none), Ok(Next::Done(0)));
+    }
 }

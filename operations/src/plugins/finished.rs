@@ -7,13 +7,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{PluginRun, RunState, SourceEvent, SourceKind, run_key};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::intents::{intent_scan, undone_keys};
@@ -399,6 +400,65 @@ impl Operation for DueCompletions {
                 .push(NotifyWork::new(install.install_id, row.work_id, run));
         }
         self.advance()
+    }
+}
+
+/// Admits a `job_finished` run for every settled work whose starting run succeeded and marks the
+/// work notified in the same transaction; a manifest without the trigger is notified without a
+/// run. Answers how many works were notified.
+#[derive(Debug, PartialEq)]
+pub(crate) struct NotifyDue {
+    due: Option<DueCompletions>,
+    pending: VecDeque<NotifyWork>,
+    current: Option<Ulid>,
+    notified: usize,
+}
+
+impl NotifyDue {
+    pub(crate) fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
+        Self {
+            due: Some(DueCompletions::new(config, local, now_ms)),
+            pending: VecDeque::new(),
+            current: None,
+            notified: 0,
+        }
+    }
+
+    fn advance(&mut self) -> Next<usize> {
+        let Some(notify) = self.pending.pop_front() else {
+            return Next::Done(self.notified);
+        };
+        self.current = Some(notify.work_id());
+        Next::Call(IoCall::child(notify))
+    }
+}
+
+impl Operation for NotifyDue {
+    type Output = usize;
+    type Error = RunError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
+
+    fn first(&mut self) -> Result<Next<usize>, RunError> {
+        let due = self.due.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(due)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<usize>, RunError> {
+        let Some(work) = self.current.take() else {
+            self.pending = result.child::<Vec<NotifyWork>, StoreError>()??.into();
+            return Ok(self.advance());
+        };
+        match result.child::<bool, RunError>()? {
+            Ok(true) => self.notified += 1,
+            Ok(false) => {}
+            // A full queue takes the completion at a later pass.
+            Err(RunError::Full(_)) => {}
+            Err(error) => warn!(%error, %work, "Could not deliver a finished plugin job"),
+        }
+        Ok(self.advance())
     }
 }
 

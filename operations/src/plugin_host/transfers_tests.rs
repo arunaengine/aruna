@@ -327,7 +327,6 @@ async fn narrowed_rule() {
 async fn sweep_during_download() {
     // A sweep while the answer is still on its way keeps the mark of the version not yet
     // written; once written, the version keeps it too.
-    use crate::plugin_host::worker::sweep_marks;
     use crate::plugins::marks::is_marked;
     let fixture = Fixture::new().await;
     let install = downloader(&fixture).await;
