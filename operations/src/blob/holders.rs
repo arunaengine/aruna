@@ -5,21 +5,22 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
 use aruna_core::errors::{ConversionError, DhtError, StorageError};
-use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
+use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent};
 use aruna_core::id::DhtKeyId;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, NODE_STATE_KEYSPACE, PATHS_INDEX_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BlobLocationKey, BucketInfo, HashIndex};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
 const REFRESH_PAGE_SIZE: usize = 256;
@@ -32,16 +33,13 @@ const REFRESH_CURSOR_KEY: &[u8] = b"holder_refresh_cursor";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RefreshState {
-    Init,
+    Schedule,
     ReadCursor,
     ReadPage,
     ReadOwners,
     ReadBuckets,
     Publish,
     SaveCursor,
-    Schedule,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -52,8 +50,6 @@ pub enum RefreshHoldersError {
     Storage(#[from] StorageError),
     #[error("failed to schedule blob holder refresh: {0}")]
     Schedule(String),
-    #[error("operation did not finish")]
-    NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -61,6 +57,14 @@ pub enum RefreshHoldersError {
         got: String,
     },
 }
+
+impl From<IoError> for RefreshHoldersError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type RefreshTurn = Result<Next<usize>, RefreshHoldersError>;
 
 /// Republishes the hashes of this node's blob locations page by page from a durable cursor.
 /// A hash whose owners all sit in distributed buckets is left out: those are found through
@@ -75,10 +79,11 @@ pub struct RefreshHoldersOperation {
     last_published: Option<DhtKeyId>,
     /// The hash whose owners are being read, and their bucket names.
     current: Option<(DhtKeyId, Vec<String>)>,
+    /// The buckets of the running read, in the order asked.
+    asked_buckets: Vec<String>,
     /// Whether a bucket of this node is distributed.
     distributed: HashMap<String, bool>,
     refreshed: usize,
-    output: Option<Result<usize, RefreshHoldersError>>,
 }
 
 impl RefreshHoldersOperation {
@@ -86,64 +91,71 @@ impl RefreshHoldersOperation {
         Self {
             realm_id,
             limits,
-            state: RefreshState::Init,
+            state: RefreshState::Schedule,
             pending: VecDeque::new(),
             next_start: None,
             last_published: None,
             current: None,
+            asked_buckets: Vec::new(),
             distributed: HashMap::new(),
             refreshed: 0,
-            output: None,
         }
     }
 
-    fn read_page(&mut self, start: Option<Key>) -> Effects {
-        self.state = RefreshState::ReadPage;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(IterStart::After),
+    fn call(&mut self, state: RefreshState, call: IoCall) -> RefreshTurn {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn read_page(&mut self, after: Option<Key>) -> RefreshTurn {
+        let page = IoCall::Page {
+            space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
             limit: REFRESH_PAGE_SIZE,
-            txn_id: None,
-        })]
+        };
+        self.call(RefreshState::ReadPage, page)
     }
 
-    /// Reads the owner rows of the next hash, saves the cursor after a page, or ends the run.
-    fn next_effect(&mut self) -> Effects {
+    /// Reads the owner rows of the next hash, or saves the cursor after a page.
+    fn next_call(&mut self) -> RefreshTurn {
         if let Some(key) = self.pending.pop_front() {
-            let prefix = match HashIndex::hash_prefix(key.as_bytes()) {
-                Ok(prefix) => prefix,
-                Err(error) => return self.fail(error.into()),
-            };
+            let prefix = HashIndex::hash_prefix(key.as_bytes())?;
             self.current = Some((key, Vec::new()));
-            self.state = RefreshState::ReadOwners;
-            return smallvec![Effect::Storage(StorageEffect::Iter {
-                key_space: PATHS_INDEX_KEYSPACE.to_string(),
-                prefix: Some(prefix.into()),
-                start: None,
+            let page = IoCall::Page {
+                space: PATHS_INDEX_KEYSPACE.to_string(),
+                prefix: prefix.into(),
+                after: None,
                 limit: OWNER_PROBE,
-                txn_id: None,
-            })];
+            };
+            return self.call(RefreshState::ReadOwners, page);
         }
-        self.state = RefreshState::SaveCursor;
         let key = Key::from(REFRESH_CURSOR_KEY.to_vec());
-        let key_space = NODE_STATE_KEYSPACE.to_string();
-        match self.next_start.clone() {
-            Some(start) => smallvec![Effect::Storage(StorageEffect::Write {
-                key_space,
-                key,
-                value: start.to_vec().into(),
-                txn_id: None,
-            })],
-            None => smallvec![Effect::Storage(StorageEffect::Delete {
-                key_space,
-                key,
-                txn_id: None,
-            })],
-        }
+        let space = NODE_STATE_KEYSPACE.to_string();
+        let save = match self.next_start.clone() {
+            Some(start) => IoCall::Write(vec![(space, key, start.to_vec().into())]),
+            None => IoCall::Delete(vec![(space, key)]),
+        };
+        self.call(RefreshState::SaveCursor, save)
     }
 
-    fn owners_read(&mut self, values: Vec<(Key, aruna_core::types::Value)>, more: bool) -> Effects {
+    fn page_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> RefreshTurn {
+        // Copies of one hash sort together, so one publish per hash
+        // is enough even though each backend has its own entry.
+        for (key, _) in values {
+            let Ok(location) = BlobLocationKey::from_bytes(key.as_ref()) else {
+                continue;
+            };
+            let dht_key = DhtKeyId::from_bytes(location.blake3_hash);
+            if self.last_published.replace(dht_key) != Some(dht_key) {
+                self.pending.push_back(dht_key);
+            }
+        }
+        self.next_start = next;
+        self.next_call()
+    }
+
+    fn owners_read(&mut self, values: Vec<(Key, Value)>, more: bool) -> RefreshTurn {
         // Owners beyond the probe are unknown, so the hash stays announced.
         if more {
             return self.decide();
@@ -155,15 +167,10 @@ impl RefreshHoldersOperation {
             .collect();
         buckets.sort();
         buckets.dedup();
-        let unknown: Vec<(String, Key)> = buckets
+        let unknown: Vec<String> = buckets
             .iter()
             .filter(|bucket| !self.distributed.contains_key(*bucket))
-            .map(|bucket| {
-                (
-                    S3_BUCKET_KEYSPACE.to_string(),
-                    bucket.clone().into_bytes().into(),
-                )
-            })
+            .cloned()
             .collect();
         if let Some((_, owners)) = self.current.as_mut() {
             *owners = buckets;
@@ -174,18 +181,22 @@ impl RefreshHoldersOperation {
         if self.distributed.len() >= BUCKET_MEMORY {
             self.distributed.clear();
         }
-        self.state = RefreshState::ReadBuckets;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: unknown,
-            txn_id: None,
-        })]
+        let reads = unknown
+            .iter()
+            .map(|bucket| {
+                (
+                    S3_BUCKET_KEYSPACE.to_string(),
+                    bucket.clone().into_bytes().into(),
+                )
+            })
+            .collect();
+        self.asked_buckets = unknown;
+        self.call(RefreshState::ReadBuckets, IoCall::Read(reads))
     }
 
-    fn buckets_read(&mut self, values: Vec<(Key, Option<aruna_core::types::Value>)>) -> Effects {
-        for (key, value) in values {
-            let Ok(bucket) = String::from_utf8(key.to_vec()) else {
-                continue;
-            };
+    fn buckets_read(&mut self, values: Vec<Option<Value>>) -> RefreshTurn {
+        let asked = std::mem::take(&mut self.asked_buckets);
+        for (bucket, value) in asked.into_iter().zip(values) {
             // A bucket that is gone or unreadable counts as ordinary, so its hash stays announced.
             let distributed = value
                 .and_then(|value| BucketInfo::from_bytes(value.as_ref()).ok())
@@ -196,158 +207,94 @@ impl RefreshHoldersOperation {
     }
 
     /// Publishes the current hash unless every owner row names a distributed bucket.
-    fn decide(&mut self) -> Effects {
+    fn decide(&mut self) -> RefreshTurn {
         let Some((key, owners)) = self.current.take() else {
-            return self.next_effect();
+            return self.next_call();
         };
         let only_distributed = !owners.is_empty()
             && owners
                 .iter()
                 .all(|bucket| self.distributed.get(bucket).copied().unwrap_or(false));
         if only_distributed {
-            return self.next_effect();
+            return self.next_call();
         }
-        self.state = RefreshState::Publish;
         self.refreshed = self.refreshed.saturating_add(1);
-        match dht_registration_effect(key.as_bytes(), self.realm_id, &self.limits) {
-            Ok(effect) => smallvec![effect],
-            Err(error) => self.fail(error.into()),
-        }
+        let put = dht_registration_effect(key.as_bytes(), self.realm_id, &self.limits)?;
+        self.call(RefreshState::Publish, put.into())
     }
 
-    fn fail(&mut self, error: RefreshHoldersError) -> Effects {
-        self.state = RefreshState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RefreshHoldersError::UnexpectedEvent {
-            state,
+    fn unexpected(&self, expected: &'static str, event: Event) -> RefreshTurn {
+        Err(RefreshHoldersError::UnexpectedEvent {
+            state: format!("{:?}", self.state),
             expected,
             got: event.label().to_string(),
         })
     }
+
+    fn timer_set(&mut self, event: Event) -> RefreshTurn {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled {
+                key: TaskKey::RefreshBlobHolders,
+                ..
+            }) => {
+                let read = read_row(NODE_STATE_KEYSPACE, REFRESH_CURSOR_KEY.to_vec());
+                self.call(RefreshState::ReadCursor, read)
+            }
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                Err(RefreshHoldersError::Schedule(message))
+            }
+            other => self.unexpected("blob holder timer result", other),
+        }
+    }
+
+    fn published(&mut self, event: Event) -> RefreshTurn {
+        match event {
+            Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
+            | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
+            | Event::Net(NetEvent::Error(_)) => self.next_call(),
+            other => self.unexpected("DHT put result", other),
+        }
+    }
 }
 
-impl EffectOperation for RefreshHoldersOperation {
+impl Operation for RefreshHoldersOperation {
     type Output = usize;
     type Error = RefreshHoldersError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RefreshState::Schedule;
-        smallvec![Effect::Task(TaskEffect::ResetTimer {
+    fn first(&mut self) -> RefreshTurn {
+        let reset = Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::RefreshBlobHolders,
             after: Duration::from_millis(self.limits.holder_refresh_ms),
-        })]
+        });
+        self.call(RefreshState::Schedule, reset.into())
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
+    fn next(&mut self, result: IoResult) -> RefreshTurn {
         match self.state {
-            RefreshState::ReadCursor => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.read_page(value.map(|value| Key::from(value.to_vec())))
+            RefreshState::Schedule => self.timer_set(result.event()?),
+            RefreshState::ReadCursor => {
+                let cursor = result.value()?;
+                self.read_page(cursor.map(|value| Key::from(value.to_vec())))
+            }
+            RefreshState::ReadPage => {
+                let (values, next) = result.page()?;
+                self.page_read(values, next)
+            }
+            RefreshState::ReadOwners => {
+                let (values, next) = result.page()?;
+                self.owners_read(values, next.is_some())
+            }
+            RefreshState::ReadBuckets => self.buckets_read(result.values()?),
+            RefreshState::Publish => self.published(result.event()?),
+            RefreshState::SaveCursor => {
+                result.done()?;
+                match self.next_start.take() {
+                    Some(start) => self.read_page(Some(start)),
+                    None => Ok(Next::Done(self.refreshed)),
                 }
-                other => self.unexpected("refresh cursor", other),
-            },
-            RefreshState::ReadPage => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    // Copies of one hash sort together, so one publish per hash
-                    // is enough even though each backend has its own entry.
-                    for (key, _) in values {
-                        let Ok(location) = BlobLocationKey::from_bytes(key.as_ref()) else {
-                            continue;
-                        };
-                        let dht_key = DhtKeyId::from_bytes(location.blake3_hash);
-                        if self.last_published.replace(dht_key) != Some(dht_key) {
-                            self.pending.push_back(dht_key);
-                        }
-                    }
-                    self.next_start = next_start_after;
-                    self.next_effect()
-                }
-                other => self.unexpected("blob location page", other),
-            },
-            RefreshState::ReadOwners => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => self.owners_read(values, next_start_after.is_some()),
-                other => self.unexpected("hash owner rows", other),
-            },
-            RefreshState::ReadBuckets => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    self.buckets_read(values)
-                }
-                other => self.unexpected("owner buckets", other),
-            },
-            RefreshState::Publish => match event {
-                Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
-                | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
-                | Event::Net(NetEvent::Error(_)) => self.next_effect(),
-                other => self.unexpected("DHT put result", other),
-            },
-            RefreshState::SaveCursor => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    let start = self.next_start.take();
-                    self.read_page(start)
-                }
-                Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    self.state = RefreshState::Finish;
-                    self.output = Some(Ok(self.refreshed));
-                    smallvec![]
-                }
-                other => self.unexpected("refresh cursor write", other),
-            },
-            RefreshState::Schedule => match event {
-                Event::Task(TaskEvent::TimerScheduled {
-                    key: TaskKey::RefreshBlobHolders,
-                    ..
-                }) => {
-                    self.state = RefreshState::ReadCursor;
-                    smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space: NODE_STATE_KEYSPACE.to_string(),
-                        key: REFRESH_CURSOR_KEY.to_vec().into(),
-                        txn_id: None,
-                    })]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    self.fail(RefreshHoldersError::Schedule(message))
-                }
-                other => self.unexpected("blob holder timer result", other),
-            },
-            RefreshState::Init | RefreshState::Finish | RefreshState::Error => {
-                self.unexpected("no event in a terminal state", event)
             }
         }
     }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RefreshState::Finish | RefreshState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RefreshHoldersError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GetState {
-    Init,
-    Read,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -356,12 +303,21 @@ pub enum GetHoldersError {
     Dht(#[from] DhtError),
     #[error("blob holder lookup did not complete")]
     Aborted,
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
+    #[error("unexpected event while looking up blob holders: expected {expected}, got {got}")]
+    UnexpectedEvent { expected: &'static str, got: String },
+    #[error("blob holder lookup failed: {0}")]
+    Io(IoError),
+}
+
+/// A deadline must not look like an empty holder set: the caller reports the gap instead of
+/// claiming it enumerated every copy.
+impl From<IoError> for GetHoldersError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Aborted | IoError::Hung { .. } => Self::Aborted,
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -369,8 +325,6 @@ pub struct GetHoldersOperation {
     key: DhtKeyId,
     realm_id: RealmId,
     self_node_id: NodeId,
-    state: GetState,
-    output: Option<Result<Vec<NodeId>, GetHoldersError>>,
 }
 
 impl GetHoldersOperation {
@@ -379,27 +333,10 @@ impl GetHoldersOperation {
             key: DhtKeyId::from_bytes(blake3),
             realm_id,
             self_node_id,
-            state: GetState::Init,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: GetHoldersError) -> Effects {
-        self.state = GetState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(GetHoldersError::UnexpectedEvent {
-            state,
-            expected,
-            got: event.label().to_string(),
-        })
-    }
-
-    fn finish(&mut self, values: Vec<DhtEntry>) -> Effects {
+    fn holders(&self, values: Vec<DhtEntry>) -> Vec<NodeId> {
         let mut holders = values
             .into_iter()
             .map(|entry| entry.node_id)
@@ -407,58 +344,38 @@ impl GetHoldersOperation {
             .collect::<Vec<_>>();
         holders.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         holders.dedup();
-        self.state = GetState::Finish;
-        self.output = Some(Ok(holders));
-        smallvec![]
+        holders
     }
 }
 
-impl EffectOperation for GetHoldersOperation {
+impl Operation for GetHoldersOperation {
     type Output = Vec<NodeId>;
     type Error = GetHoldersError;
 
-    fn start(&mut self) -> Effects {
-        self.state = GetState::Read;
-        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
+    fn first(&mut self) -> Result<Next<Vec<NodeId>>, GetHoldersError> {
+        let get = Effect::Net(NetEffect::Dht(DhtEffect::Get {
             key: self.key,
             realm_filter: Some(self.realm_id),
             // Holder discovery must see every publisher, so it stays exhaustive
             // under the default read budget.
             options: DhtGetOptions::default(),
-        }))]
+        }));
+        Ok(Next::Call(get.into()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            GetState::Read => match event {
-                Event::Net(NetEvent::Dht(DhtEvent::GetResult { key, values, .. }))
-                    if key == self.key =>
-                {
-                    self.finish(values)
-                }
-                Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => self.fail(error.into()),
-                other => self.unexpected("DHT get result", other),
-            },
-            GetState::Init | GetState::Finish | GetState::Error => {
-                self.unexpected("no event in a terminal state", event)
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<NodeId>>, GetHoldersError> {
+        match result.event()? {
+            Event::Net(NetEvent::Dht(DhtEvent::GetResult { key, values, .. }))
+                if key == self.key =>
+            {
+                Ok(Next::Done(self.holders(values)))
             }
+            Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => Err(error.into()),
+            other => Err(GetHoldersError::UnexpectedEvent {
+                expected: "DHT get result",
+                got: other.label().to_string(),
+            }),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GetState::Finish | GetState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(GetHoldersError::Aborted))
-    }
-
-    /// A deadline must not look like an empty holder set: the caller reports the
-    /// gap instead of claiming it enumerated every copy.
-    fn abort(&mut self) -> Effects {
-        self.state = GetState::Error;
-        self.output.get_or_insert(Err(GetHoldersError::Aborted));
-        smallvec![]
     }
 }
 
@@ -480,8 +397,6 @@ pub(crate) fn dht_registration_effect(
 #[cfg(test)]
 mod pure_tests {
     use aruna_core::events::DhtEntry;
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::format::EncodingClass;
 
     use super::*;
@@ -504,6 +419,38 @@ mod pure_tests {
             BackendRef::Node("cold".to_string()),
         )
         .to_bytes()
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn page(rows: Vec<Key>, next: Option<Key>) -> IoResult {
+        IoResult::Page {
+            rows: rows
+                .into_iter()
+                .map(|key| (key, Vec::<u8>::new().into()))
+                .collect(),
+            next,
+        }
+    }
+
+    fn put_done() -> IoResult {
+        event(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
+            key: DhtKeyId::from_bytes([1; 32]),
+            remote_attempt_count: 1,
+            remote_store_count: 1,
+        })))
+    }
+
+    fn is_put(turn: &RefreshTurn) -> bool {
+        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+            return false;
+        };
+        matches!(
+            effect.as_ref(),
+            Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))
+        )
     }
 
     fn entry(node_id: NodeId, realm_id: RealmId) -> DhtEntry {
@@ -559,150 +506,152 @@ mod pure_tests {
         };
         let mut operation = RefreshHoldersOperation::new(realm_id, limits);
 
-        let schedule = operation.start();
-        assert_eq!(
-            schedule.as_slice(),
-            [Effect::Task(TaskEffect::ResetTimer {
-                key: TaskKey::RefreshBlobHolders,
-                after: Duration::from_secs(30),
-            })]
-        );
-        let cursor_read = operation.step(Event::Task(TaskEvent::TimerScheduled {
+        let reset = Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::RefreshBlobHolders,
             after: Duration::from_secs(30),
-        }));
+        });
+        assert_eq!(operation.first(), Ok(Next::Call(reset.into())));
+        let cursor_read = operation.next(event(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::RefreshBlobHolders,
+            after: Duration::from_secs(30),
+        })));
+        assert_eq!(
+            cursor_read,
+            Ok(Next::Call(read_row(
+                NODE_STATE_KEYSPACE,
+                REFRESH_CURSOR_KEY.to_vec()
+            )))
+        );
+        let first = operation.next(IoResult::Values(vec![None]));
         assert!(matches!(
-            cursor_read.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == NODE_STATE_KEYSPACE
-        ));
-        let first = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: REFRESH_CURSOR_KEY.to_vec().into(),
-            value: None,
-        }));
-        assert!(matches!(
-            first.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                key_space,
+            &first,
+            Ok(Next::Call(IoCall::Page {
+                space,
                 limit: REFRESH_PAGE_SIZE,
-                start: None,
+                after: None,
                 ..
-            })] if key_space == BLOB_LOCATIONS_KEYSPACE
+            })) if space == BLOB_LOCATIONS_KEYSPACE
         ));
 
         let cursor: Key = location_key(1).into();
-        let owners = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
-                (location_key(1).into(), Vec::<u8>::new().into()),
-                (cold_key(1).into(), Vec::<u8>::new().into()),
-            ],
-            next_start_after: Some(cursor.clone()),
-        }));
+        let owners = operation.next(page(
+            vec![location_key(1).into(), cold_key(1).into()],
+            Some(cursor.clone()),
+        ));
         assert!(matches!(
-            owners.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == PATHS_INDEX_KEYSPACE
+            &owners,
+            Ok(Next::Call(IoCall::Page { space, .. })) if space == PATHS_INDEX_KEYSPACE
         ));
         // A hash without owner rows is announced, as before.
-        let publish = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
+        let publish = operation.next(page(Vec::new(), None));
+        assert!(is_put(&publish), "{publish:?}");
+
+        let save = operation.next(put_done());
+        assert_eq!(
+            save,
+            Ok(Next::Call(IoCall::Write(vec![(
+                NODE_STATE_KEYSPACE.to_string(),
+                REFRESH_CURSOR_KEY.to_vec().into(),
+                cursor.to_vec().into(),
+            )])))
+        );
+        let next_page = operation.next(IoResult::Done);
         assert!(matches!(
-            publish.as_slice(),
-            [Effect::Net(NetEffect::Dht(DhtEffect::Put {
-                ttl,
-                ..
-            }))] if *ttl == Duration::from_secs(90)
+            &next_page,
+            Ok(Next::Call(IoCall::Page { after: Some(after), .. })) if after == &cursor
         ));
 
-        let save = operation.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
-            key: DhtKeyId::from_bytes([1; 32]),
-            remote_attempt_count: 1,
-            remote_store_count: 1,
-        })));
-        assert!(matches!(
-            save.as_slice(),
-            [Effect::Storage(StorageEffect::Write { key_space, value, .. })]
-                if key_space == NODE_STATE_KEYSPACE && value.as_ref() == cursor.as_ref()
-        ));
-        let next_page = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: REFRESH_CURSOR_KEY.to_vec().into(),
-        }));
-        assert!(matches!(
-            next_page.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(start)),
-                ..
-            })] if start == &cursor
-        ));
-
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(location_key(2).into(), Vec::<u8>::new().into())],
-            next_start_after: None,
-        }));
+        operation
+            .next(page(vec![location_key(2).into()], None))
+            .unwrap();
         operation.distributed.insert("shared".to_string(), true);
-        let clear = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(owner_row("shared", 2), Vec::<u8>::new().into())],
-            next_start_after: None,
-        }));
-        assert!(
-            matches!(
-                clear.as_slice(),
-                [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-                    if key_space == NODE_STATE_KEYSPACE
-            ),
+        let clear = operation.next(page(vec![owner_row("shared", 2)], None));
+        assert_eq!(
+            clear,
+            Ok(Next::Call(IoCall::Delete(vec![(
+                NODE_STATE_KEYSPACE.to_string(),
+                REFRESH_CURSOR_KEY.to_vec().into(),
+            )]))),
             "a hash held only by distributed buckets is not announced"
         );
-        let finish = operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: REFRESH_CURSOR_KEY.to_vec().into(),
-        }));
-        assert!(finish.is_empty());
-        assert_eq!(operation.finalize(), Ok(1));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(1)));
+    }
+
+    /// A refresh about to read the owners of one hash.
+    fn reading_owners(seed: u8) -> RefreshHoldersOperation {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        operation
+            .pending
+            .push_back(DhtKeyId::from_bytes([seed; 32]));
+        operation.next_call().unwrap();
+        operation
     }
 
     // Owners past the probe may be ordinary buckets, so a truncated probe keeps the hash.
     #[test]
     fn truncated_owners_announce() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        let mut operation = reading_owners(4);
         operation.distributed.insert("shared".to_string(), true);
-        operation.pending.push_back(DhtKeyId::from_bytes([4; 32]));
-        operation.next_effect();
-        let publish = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(owner_row("shared", 4), Vec::<u8>::new().into())],
-            next_start_after: Some(owner_row("shared", 4)),
-        }));
-        assert!(matches!(
-            publish.as_slice(),
-            [Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))]
+        let publish = operation.next(page(
+            vec![owner_row("shared", 4)],
+            Some(owner_row("shared", 4)),
         ));
+        assert!(is_put(&publish), "{publish:?}");
     }
 
     #[test]
     fn unknown_bucket_announces() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
-        operation.pending.push_back(DhtKeyId::from_bytes([4; 32]));
-        operation.next_effect();
-        let read = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(owner_row("gone", 4), Vec::<u8>::new().into())],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            read.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { .. })]
-        ));
-        let publish = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(b"gone".to_vec().into(), None)],
-        }));
+        let mut operation = reading_owners(4);
+        let read = operation.next(page(vec![owner_row("gone", 4)], None));
+        assert_eq!(
+            read,
+            Ok(Next::Call(IoCall::Read(vec![(
+                S3_BUCKET_KEYSPACE.to_string(),
+                b"gone".to_vec().into()
+            )])))
+        );
+        let publish = operation.next(IoResult::Values(vec![None]));
         assert!(
-            matches!(
-                publish.as_slice(),
-                [Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))]
-            ),
+            is_put(&publish),
             "a bucket that cannot be read keeps its hash announced"
         );
+        assert_eq!(operation.distributed.get("gone"), Some(&false));
+    }
+
+    #[test]
+    fn failed_put_continues() {
+        // An announcement that fails is retried by the next refresh, so the run goes on.
+        let mut operation = reading_owners(4);
+        operation.next(page(Vec::new(), None)).unwrap();
+        let failed = event(Event::Net(NetEvent::Dht(DhtEvent::Error {
+            error: DhtError::Other("offline".to_string()),
+        })));
+        let turn = operation.next(failed);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+    }
+
+    #[test]
+    fn timer_failure_fails() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        operation.first().unwrap();
+        let turn = operation.next(event(Event::Task(TaskEvent::Error {
+            key: Some(TaskKey::RefreshBlobHolders),
+            message: "stopped".to_string(),
+        })));
+        assert_eq!(
+            turn,
+            Err(RefreshHoldersError::Schedule("stopped".to_string()))
+        );
+    }
+
+    fn get_result(values: Vec<DhtEntry>) -> IoResult {
+        event(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
+            key: DhtKeyId::from_bytes([4; 32]),
+            stale: false,
+            values,
+        })))
     }
 
     #[test]
@@ -712,18 +661,16 @@ mod pure_tests {
         let mut expected = vec![node(3), node(1), node(2)];
         expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         let mut operation = GetHoldersOperation::new([4; 32], realm_id, self_node);
-        operation.start();
-        operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
-            key: DhtKeyId::from_bytes([4; 32]),
-            stale: false,
-            values: vec![
-                entry(node(3), realm_id),
-                entry(node(1), realm_id),
-                entry(node(2), realm_id),
-            ],
-        })));
-
-        assert_eq!(operation.finalize(), Ok(expected));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        let values = vec![
+            entry(node(3), realm_id),
+            entry(node(1), realm_id),
+            entry(node(2), realm_id),
+        ];
+        assert_eq!(operation.next(get_result(values)), Ok(Next::Done(expected)));
     }
 
     #[test]
@@ -732,71 +679,34 @@ mod pure_tests {
         let self_node = node(9);
         let other = node(2);
         let mut operation = GetHoldersOperation::new([4; 32], realm_id, self_node);
-        operation.start();
-        operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
-            key: DhtKeyId::from_bytes([4; 32]),
-            stale: false,
-            values: vec![
-                entry(self_node, realm_id),
-                entry(other, realm_id),
-                entry(other, realm_id),
-            ],
-        })));
-
-        assert_eq!(operation.finalize(), Ok(vec![other]));
+        operation.first().unwrap();
+        let values = vec![
+            entry(self_node, realm_id),
+            entry(other, realm_id),
+            entry(other, realm_id),
+        ];
+        assert_eq!(
+            operation.next(get_result(values)),
+            Ok(Next::Done(vec![other]))
+        );
     }
 
-    // A state that expects no event must reject one instead of ignoring it.
     #[test]
-    fn terminal_rejects_event() {
+    fn lookup_failures_stay() {
+        // A deadline is not an empty holder set, and a foreign result is refused.
+        assert_eq!(
+            GetHoldersError::from(IoError::Aborted),
+            GetHoldersError::Aborted
+        );
         let realm_id = RealmId::from_bytes([1; 32]);
-        let refresh = || RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
-        let put = || {
-            Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
-                key: DhtKeyId::from_bytes([1; 32]),
-                remote_attempt_count: 1,
-                remote_store_count: 1,
-            }))
-        };
-        for (_, effects, error) in rejects_events(
-            refresh,
-            || {
-                let mut events = sample_events();
-                events.push(put());
-                events
-            },
-            |_| false,
-        ) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(
-                    error,
-                    RefreshHoldersError::UnexpectedEvent { .. } | RefreshHoldersError::Storage(_)
-                ),
-                "{error:?}"
-            );
-        }
-
-        let get = || GetHoldersOperation::new([4; 32], realm_id, node(9));
-        let offline = || {
-            Event::Net(NetEvent::Dht(DhtEvent::Error {
-                error: DhtError::Other("offline".to_string()),
-            }))
-        };
-        for (_, effects, error) in rejects_events(
-            get,
-            || {
-                let mut events = sample_events();
-                events.push(offline());
-                events
-            },
-            |_| false,
-        ) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(error, GetHoldersError::UnexpectedEvent { .. }),
-                "{error:?}"
-            );
-        }
+        let mut operation = GetHoldersOperation::new([4; 32], realm_id, node(9));
+        operation.first().unwrap();
+        let turn = operation.next(put_done());
+        assert!(matches!(turn, Err(GetHoldersError::UnexpectedEvent { .. })));
+        let offline = DhtError::Other("offline".to_string());
+        let failed = event(Event::Net(NetEvent::Dht(DhtEvent::Error {
+            error: DhtError::Other("offline".to_string()),
+        })));
+        assert_eq!(operation.next(failed), Err(GetHoldersError::Dht(offline)));
     }
 }

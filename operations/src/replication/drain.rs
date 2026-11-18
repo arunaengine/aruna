@@ -275,9 +275,16 @@ pub(super) async fn load_source_authorization(
         }
     };
     let group_id = bucket_info.group_id;
-    SourceAuthorization::load(context, auth_context, group_id, source_node_id)
-        .await
-        .map_err(|error| (error, Some(group_id)))
+    drive(
+        crate::replication::source_rules::SourceAuthOperation::new(
+            auth_context,
+            group_id,
+            source_node_id,
+        ),
+        context,
+    )
+    .await
+    .map_err(|error| (error, Some(group_id)))
 }
 
 pub(super) fn mark_failure(relationship: &mut SyncRelationship, error: &str) {

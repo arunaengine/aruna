@@ -26,7 +26,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_storage::storage;
 use std::collections::HashMap;
 use tempfile::{TempDir, tempdir};
@@ -42,7 +42,7 @@ async fn full_context() -> (TempDir, DriverContext) {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).expect("blob root");
     let storage_handle = storage::FjallStorage::open(temp_root).expect("storage opens");
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
         .await
         .expect("net handle");
     let blob_handle = BlobHandler::new(

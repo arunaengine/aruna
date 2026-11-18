@@ -10,7 +10,7 @@ use aruna_core::structs::storage::abe_access::{
 };
 use aruna_operations::abe::{MemberKeysOperation, ReissueOperation};
 use aruna_operations::auth::epoch_due::EpochDueOperation;
-use aruna_operations::s3::abe_rekey::rekey_page;
+use aruna_operations::s3::abe_rekey::RekeyOperation;
 use axum::extract::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -476,8 +476,11 @@ pub async fn rekey_subtree(
     let scope = KeyScope::Subtree(body.prefix.clone());
     scope.validate().map_err(|_| ServerError::BadRequest)?;
     raise_run(&state, &auth, &bucket, KeyAction::Rekey).await?;
-    let page = rekey_page(&state.get_ctx(), &bucket, &body.prefix, MAX_REQUESTS).await;
-    let (progress, done) = page.map_err(key_error)?;
+    let context = state.get_ctx();
+    let origin = (context.net_handle.as_ref()).map(|net| (*net.realm_id(), net.node_id()));
+    let now = std::time::SystemTime::now();
+    let operation = RekeyOperation::new(&bucket, &body.prefix, MAX_REQUESTS, origin, now);
+    let (progress, done) = drive(operation, &context).await.map_err(key_error)?;
     Ok(Json(RekeyView {
         prefix: progress.prefix,
         epoch: progress.epoch,

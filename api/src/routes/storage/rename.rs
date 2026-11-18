@@ -11,7 +11,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::checked_rename::authorized_rename;
+use aruna_operations::s3::bucket::checked_rename::AuthorizedRenameOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::rename::{RenameError, RenameInput, RenameItem, RenamePlan};
 use axum::Json;
@@ -217,9 +217,12 @@ pub async fn preview_rename(
     let (auth, group_id) = authorize(&state, auth, &bucket).await?;
     let folders = (request.from, request.to);
     let input = rename_input(&state, group_id, &bucket, folders, None);
-    let plan = authorized_rename(&state.get_ctx(), &auth, input)
-        .await
-        .map_err(map_error)?;
+    let plan = drive(
+        AuthorizedRenameOperation::new(&auth, input),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(plan_response(bucket, plan)))
 }
 
@@ -288,9 +291,12 @@ pub async fn rename_keys(
     let (auth, group_id) = authorize(&state, auth, &bucket).await?;
     let folders = (request.from, request.to);
     let input = rename_input(&state, group_id, &bucket, folders, Some(request.keys));
-    let plan = authorized_rename(&state.get_ctx(), &auth, input)
-        .await
-        .map_err(map_error)?;
+    let plan = drive(
+        AuthorizedRenameOperation::new(&auth, input),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(plan_response(bucket, plan)))
 }
 

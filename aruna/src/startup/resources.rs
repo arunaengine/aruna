@@ -548,11 +548,7 @@ async fn fill(
     }
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
-    aruna_operations::s3::sweeps::spawn_recovery_sweep(
-        driver_ctx.clone(),
-        origin,
-        &acquired.shutdown,
-    );
+    crate::startup::sweeps::spawn_recovery_sweep(driver_ctx.clone(), origin, &acquired.shutdown);
     stopped(stop)?;
 
     // Bind compute reconciliation before startup recovery.

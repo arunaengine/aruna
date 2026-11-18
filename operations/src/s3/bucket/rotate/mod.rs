@@ -3,10 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::s3::bucket::key::abe::PrepareAbe;
 use crate::s3::bucket::key::rows::{
-    Row, SettingsError, authority_read, copy_targets, full_scan, generation_rows, group_bucket_key,
+    Row, SettingsError, authority_keys, copy_targets, full_scan, generation_rows, group_bucket_key,
     parse_authority, uploads_open,
 };
+use crate::s3::object::put::abe::keyed;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -16,7 +19,8 @@ use aruna_core::keyspaces::{
     TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::values as row_values;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
@@ -30,9 +34,8 @@ use aruna_core::structs::storage::transition::{
     EncryptionTransition, TransitionKind, TransitionTarget,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use thiserror::Error;
@@ -40,23 +43,18 @@ use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChangeState {
-    Init,
-    StartTransaction,
     ReadBucket,
     CheckUploads,
     ReadKey,
     CheckUnlocked,
     ReadGrants,
     GenerateKey,
+    PrepareAbe,
     SealCopies,
     ReadUnlocked,
     WriteRows,
-    WriteVault,
-    Commit,
-    Finish,
-    Error,
-    PrepareAbe,
     DeleteIndex,
+    WriteVault,
 }
 
 /// The change a holder or admin asked for.
@@ -106,6 +104,14 @@ pub enum ChangeError {
     NotFinished,
 }
 
+impl From<IoError> for ChangeError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type ChangeTurn = Result<Next<ChangeResult>, ChangeError>;
+
 #[derive(Debug, PartialEq)]
 pub struct ChangeInput {
     pub bucket: String,
@@ -136,8 +142,7 @@ pub struct ChangeResult {
 pub struct ChangeEncryptionOperation {
     input: ChangeInput,
     state: ChangeState,
-    abe: Option<crate::s3::bucket::key::abe::PrepareAbeOperation>,
-    txn_id: Option<TxnId>,
+    abe: Option<PrepareAbe>,
     info: Option<BucketInfo>,
     admins: BTreeSet<UserId>,
     settings: BucketEncryption,
@@ -147,16 +152,14 @@ pub struct ChangeEncryptionOperation {
     /// The node vault copy this change writes.
     vault: Option<(Ulid, SharedSecret)>,
     result: Option<ChangeResult>,
-    output: Option<Result<ChangeResult, ChangeError>>,
 }
 
 impl ChangeEncryptionOperation {
     pub fn new(input: ChangeInput) -> Self {
         Self {
             input,
-            state: ChangeState::Init,
+            state: ChangeState::ReadBucket,
             abe: None,
-            txn_id: None,
             info: None,
             admins: BTreeSet::new(),
             settings: BucketEncryption::default(),
@@ -165,17 +168,22 @@ impl ChangeEncryptionOperation {
             new_key: None,
             vault: None,
             result: None,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: impl Into<ChangeError>) -> Effects {
-        self.output = Some(Err(error.into()));
-        self.new_key = None;
-        self.vault = None;
-        let effects = self.abort();
-        self.state = ChangeState::Error;
-        effects
+    fn call(&mut self, state: ChangeState, call: IoCall) -> ChangeTurn {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn refused(&self, received: Event) -> ChangeTurn {
+        match received {
+            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+            other => Err(ChangeError::InvalidStateEvent {
+                state: self.state,
+                received: other.label(),
+            }),
+        }
     }
 
     /// Mode and settings the change asks for.
@@ -203,26 +211,27 @@ impl ChangeEncryptionOperation {
                 && mode == EncryptionMode::VaultLocked)
     }
 
-    fn read_bucket(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn read_bucket(&mut self, values: Vec<Option<Value>>) -> ChangeTurn {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-        let state = match parse_authority(values, realm_id, group_id) {
+        let state = match parse_authority(keyed(&values), realm_id, group_id) {
             Ok(state) => state,
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         };
         if !state.admins.contains(&self.input.caller) {
-            return self.fail(ChangeError::NotAdmin);
+            return Err(ChangeError::NotAdmin);
         }
         if !state.settings.is_encrypted() {
-            return self.fail(ChangeError::NotEncrypted);
+            return Err(ChangeError::NotEncrypted);
         }
         if state.settings.storage_generation != self.input.expected_generation {
-            return self.fail(BucketKeyError::StaleGeneration {
+            return Err(BucketKeyError::StaleGeneration {
                 requested: self.input.expected_generation,
                 current: state.settings.storage_generation,
-            });
+            }
+            .into());
         }
         if self.input.max_unlock_ms == Some(Some(0)) {
-            return self.fail(BucketKeyError::InvalidDuration);
+            return Err(BucketKeyError::InvalidDuration.into());
         }
         self.admins = state.admins;
         self.info = Some(state.info);
@@ -231,7 +240,7 @@ impl ChangeEncryptionOperation {
         if wanted.0 == EncryptionMode::NodeManaged
             && matches!(self.input.max_unlock_ms, Some(Some(_)))
         {
-            return self.fail(BucketKeyError::ManagedLimit);
+            return Err(BucketKeyError::ManagedLimit.into());
         }
         let current = (
             self.settings.mode,
@@ -239,49 +248,41 @@ impl ChangeEncryptionOperation {
             self.settings.block_keys,
         );
         if self.input.change != KeyChange::Rotate && wanted == current {
-            return self.fail(ChangeError::Unchanged);
+            return Err(ChangeError::Unchanged);
         }
-        self.state = ChangeState::CheckUploads;
-        smallvec![full_scan(UPLOAD_KEYSPACE, None, self.txn_id)]
+        self.call(ChangeState::CheckUploads, full_scan(UPLOAD_KEYSPACE, None))
     }
 
     /// Writes that captured the old plan fail at publication on the storage generation; open
     /// multipart uploads would publish parts sealed for it, so they must finish first.
-    fn check_uploads(&mut self, uploads: &[(Key, Value)]) -> Effects {
+    fn check_uploads(&mut self, uploads: &[(Key, Value)]) -> ChangeTurn {
         if uploads_open(uploads, &self.input.bucket) {
-            return self.fail(ChangeError::OpenUploads);
+            return Err(ChangeError::OpenUploads);
         }
         let Some(active) = self.settings.active_key() else {
-            return self.fail(ChangeError::NotEncrypted);
+            return Err(ChangeError::NotEncrypted);
         };
-        self.state = ChangeState::ReadKey;
         let bucket: Key = self.input.bucket.as_bytes().to_vec().into();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (BUCKET_KEY_KEYSPACE.to_string(), active.key().into()),
-                (TRANSITION_KEYSPACE.to_string(), bucket),
-            ],
-            txn_id: self.txn_id,
-        })]
+        let reads = vec![
+            (BUCKET_KEY_KEYSPACE.to_string(), active.key().into()),
+            (TRANSITION_KEYSPACE.to_string(), bucket),
+        ];
+        self.call(ChangeState::ReadKey, IoCall::Read(reads))
     }
 
-    fn read_key(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let mut rows = values.into_iter().map(|(_, value)| value);
-        let (Some(Some(record)), Some(transition), None) = (rows.next(), rows.next(), rows.next())
-        else {
-            return self.fail(ChangeError::NotFinished);
-        };
+    fn read_key(&mut self, [record, transition]: [Option<Value>; 2]) -> ChangeTurn {
+        let record = record.ok_or(ChangeError::NotFinished)?;
         let transition = transition.map(|row| EncryptionTransition::from_bytes(row.as_ref()));
         match transition.transpose() {
             Ok(Some(transition)) if transition.finished_at_ms.is_none() => {
-                return self.fail(ChangeError::TransitionRunning);
+                return Err(ChangeError::TransitionRunning);
             }
             Ok(_) => {}
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         }
         let record = match BucketKeyRecord::from_bytes(record.as_ref()) {
             Ok(record) => record,
-            Err(error) => return self.fail(error),
+            Err(error) => return Err(error.into()),
         };
         let (mode, ..) = self.wanted();
         let key = record.key;
@@ -289,37 +290,37 @@ impl ChangeEncryptionOperation {
         self.active = Some(record);
         if leaves_vault {
             // Leaving `vault_locked` needs the unlocked key for the node vault copy.
-            self.state = ChangeState::ReadUnlocked;
-            return smallvec![Effect::Blob(BlobEffect::ReadUnlockedKey { key })];
+            let read = Effect::Blob(BlobEffect::ReadUnlockedKey { key });
+            return self.call(ChangeState::ReadUnlocked, read.into());
         }
         // Every other change moves archives that only the unlocked source key opens.
-        self.state = ChangeState::CheckUnlocked;
-        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus {
-            bucket_id: key.bucket_id
-        })]
+        let status = Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: key.bucket_id,
+        });
+        self.call(ChangeState::CheckUnlocked, status.into())
     }
 
-    fn check_unlocked(&mut self, generations: &[UnlockStatus]) -> Effects {
+    fn check_unlocked(&mut self, generations: &[UnlockStatus]) -> ChangeTurn {
         let Some(key) = self.active.as_ref().map(|record| record.key) else {
-            return self.fail(ChangeError::NotFinished);
+            return Err(ChangeError::NotFinished);
         };
         if !generations
             .iter()
             .any(|status| status.key == key && status.active)
         {
-            return self.fail(BucketKeyError::Locked(key.bucket_id));
+            return Err(BucketKeyError::Locked(key.bucket_id).into());
         }
         if self.new_generation() {
-            self.state = ChangeState::ReadGrants;
             let prefix = key.bucket_id.to_bytes().to_vec().into();
-            return smallvec![full_scan(BUCKET_HOLDER_KEYSPACE, Some(prefix), self.txn_id)];
+            let scan = full_scan(BUCKET_HOLDER_KEYSPACE, Some(prefix));
+            return self.call(ChangeState::ReadGrants, scan);
         }
         self.write_rows(None, Vec::new())
     }
 
-    fn seal(&mut self, public_key: [u8; 32], private_key: SharedSecret) -> Effects {
+    fn seal(&mut self, public_key: [u8; 32], private_key: SharedSecret) -> ChangeTurn {
         let (Some(active), Some(_info)) = (self.active.as_ref(), self.info.as_ref()) else {
-            return self.fail(ChangeError::NotFinished);
+            return Err(ChangeError::NotFinished);
         };
         let key = BucketKeyRef::new(active.key.bucket_id, active.key.generation + 1);
         let record_id = Ulid::generate();
@@ -330,57 +331,34 @@ impl ChangeEncryptionOperation {
             record.vault_entry = Some(record_id);
         }
         self.new_key = Some((record, private_key.clone()));
-        let Some(txn) = self.txn_id else {
-            return self.fail(ChangeError::NotFinished);
-        };
-        let mut abe = crate::s3::bucket::key::abe::PrepareAbeOperation::new(
-            self.input.realm_id,
-            self.input.node_id,
-            key,
-            private_key,
-            txn,
-        );
-        self.state = ChangeState::PrepareAbe;
-        let effects = abe.start();
+        let mut abe = PrepareAbe::new(self.input.realm_id, self.input.node_id, key, private_key);
+        let call = abe.first()?;
         self.abe = Some(abe);
-        effects
+        self.call(ChangeState::PrepareAbe, call)
     }
 
-    fn prepare_abe(&mut self, event: Event) -> Effects {
-        let Some(abe) = self.abe.as_mut() else {
-            return self.fail(ChangeError::NotFinished);
-        };
-        let effects = abe.step(event);
-        if !abe.is_complete() {
-            return effects;
+    fn prepare_abe(&mut self, result: IoResult) -> ChangeTurn {
+        let abe = self.abe.as_mut().ok_or(ChangeError::NotFinished)?;
+        if let Some(call) = abe.next::<ChangeError>(result)? {
+            return Ok(Next::Call(call));
         }
-        let Some(abe) = self.abe.take() else {
-            return self.fail(ChangeError::NotFinished);
-        };
-        if let Err(error) = abe.finalize() {
-            return self.fail(error);
-        }
-        let Some((key, public_key)) = self.new_key.as_ref().map(|(r, _)| (r.key, r.public_key))
-        else {
-            return self.fail(ChangeError::NotFinished);
-        };
-        let Some(private_key) = self.new_key.as_ref().map(|(_, s)| s.clone()) else {
-            return self.fail(ChangeError::NotFinished);
-        };
+        self.abe = None;
+        let (record, private_key) = self.new_key.as_ref().ok_or(ChangeError::NotFinished)?;
+        let (key, public_key, private_key) = (record.key, record.public_key, private_key.clone());
         let report = self.report(&[]);
         let holders = copy_targets(&report, &self.input.lookups);
         if holders.is_empty() {
             return self.write_rows(None, Vec::new());
         }
-        self.state = ChangeState::SealCopies;
-        smallvec![Effect::Blob(BlobEffect::SealHolderCopies {
+        let seal = BlobEffect::SealHolderCopies {
             key,
             public_key,
             private_key,
             realm_id: self.input.realm_id,
             node_id: self.input.node_id,
             holders,
-        })]
+        };
+        self.call(ChangeState::SealCopies, Effect::Blob(seal).into())
     }
 
     fn report(&self, copies: &[SealedCopy]) -> HolderReport {
@@ -391,190 +369,133 @@ impl ChangeEncryptionOperation {
     }
 
     /// The new settings, key rows and transition, written in the change's transaction.
-    fn write_rows(&mut self, secret: Option<SharedSecret>, copies: Vec<SealedCopy>) -> Effects {
-        match self.rows(secret, copies) {
-            Ok(writes) => {
-                self.state = ChangeState::WriteRows;
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: self.txn_id,
-                })]
-            }
-            Err(error) => self.fail(error),
-        }
+    fn write_rows(&mut self, secret: Option<SharedSecret>, copies: Vec<SealedCopy>) -> ChangeTurn {
+        let writes = self.rows(secret, copies)?;
+        self.call(ChangeState::WriteRows, IoCall::Write(writes))
     }
-}
 
-impl ChangeEncryptionOperation {
     /// A bucket turned `off` leaves the group index, so member grants no longer visit it.
-    fn delete_index(&mut self) -> Effects {
+    fn delete_index(&mut self) -> ChangeTurn {
         if self.wanted().0 != EncryptionMode::Off {
             return self.write_vault();
         }
-        self.state = ChangeState::DeleteIndex;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
-            key: group_bucket_key(self.input.group_id, &self.input.bucket),
-            txn_id: self.txn_id,
-        })]
+        let key = group_bucket_key(self.input.group_id, &self.input.bucket);
+        let delete = vec![(GROUP_ENCRYPTED_KEYSPACE.to_string(), key)];
+        self.call(ChangeState::DeleteIndex, IoCall::Delete(delete))
     }
 
-    fn write_vault(&mut self) -> Effects {
+    fn write_vault(&mut self) -> ChangeTurn {
         let Some((id, secret)) = self.vault.take() else {
-            return self.commit();
+            return self.finish();
         };
-        self.state = ChangeState::WriteVault;
-        smallvec![Effect::Storage(StorageEffect::VaultWrite {
+        let write = StorageEffect::VaultWrite {
             entry: VaultEntry::new(VaultPurpose::BucketKey, id),
             secret,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(ChangeError::NotFinished);
+            txn_id: None,
         };
-        self.state = ChangeState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.call(ChangeState::WriteVault, Effect::Storage(write).into())
     }
 
-    /// A change that moves copies wakes the transition worker.
-    fn finish(&mut self) -> Effects {
-        self.txn_id = None;
-        self.state = ChangeState::Finish;
-        let result = self.result.take();
-        let moves = result
-            .as_ref()
-            .is_some_and(|result| result.transition.is_some());
-        self.output = result.map(Ok);
-        match moves {
-            true => smallvec![Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::MigrateCompression,
-                after: Duration::ZERO,
-            })],
-            false => smallvec![],
+    /// A change that moves copies wakes the transition worker once it committed.
+    fn finish(&mut self) -> ChangeTurn {
+        let output = self.result.take().ok_or(ChangeError::NotFinished)?;
+        if output.transition.is_none() {
+            return Ok(Next::Done(output));
         }
+        let wake = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::MigrateCompression,
+            after: Duration::ZERO,
+        });
+        Ok(Next::Then {
+            output,
+            calls: vec![wake.into()],
+        })
+    }
+
+    fn grants_read(&mut self, rows: Vec<(Key, Value)>) -> ChangeTurn {
+        self.grants = rows
+            .iter()
+            .map(|(_, value)| BucketHolder::from_bytes(value.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let generate = Effect::Blob(BlobEffect::GenerateBucketKey);
+        self.call(ChangeState::GenerateKey, generate.into())
+    }
+
+    fn copies_sealed(&mut self, copies: Vec<SealedCopy>) -> ChangeTurn {
+        let wanted = self.new_key.as_ref().map(|(record, _)| record.key);
+        if copies.iter().any(|copy| Some(copy.key) != wanted) {
+            return Err(ChangeError::NotFinished);
+        }
+        self.write_rows(None, copies)
     }
 }
 
-impl EffectOperation for ChangeEncryptionOperation {
+impl Operation for ChangeEncryptionOperation {
     type Output = ChangeResult;
     type Error = ChangeError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ChangeState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> ChangeTurn {
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let reads = authority_keys(&self.input.bucket, realm_id, group_id);
+        self.call(ChangeState::ReadBucket, IoCall::Read(reads))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.fail(error.clone());
-        }
-        match (self.state, event) {
-            (ChangeState::PrepareAbe, event) => self.prepare_abe(event),
-            (
-                ChangeState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = ChangeState::ReadBucket;
-                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-                let bucket = &self.input.bucket;
-                smallvec![authority_read(bucket, realm_id, group_id, Some(txn_id))]
-            }
-            (ChangeState::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.read_bucket(values)
-            }
-            (
-                ChangeState::CheckUploads,
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => self.check_uploads(&values),
-            (ChangeState::ReadKey, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.read_key(values)
-            }
-            (ChangeState::CheckUnlocked, Event::Blob(BlobEvent::KeyStatus { generations })) => {
-                self.check_unlocked(&generations)
-            }
-            (ChangeState::ReadGrants, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                let grants = values
-                    .iter()
-                    .map(|(_, value)| BucketHolder::from_bytes(value.as_ref()))
-                    .collect::<Result<Vec<_>, _>>();
-                match grants {
-                    Ok(grants) => {
-                        self.grants = grants;
-                        self.state = ChangeState::GenerateKey;
-                        smallvec![Effect::Blob(BlobEffect::GenerateBucketKey)]
-                    }
-                    Err(error) => self.fail(error),
+    fn next(&mut self, result: IoResult) -> ChangeTurn {
+        match self.state {
+            ChangeState::ReadBucket => self.read_bucket(result.values()?),
+            ChangeState::CheckUploads => self.check_uploads(&result.page()?.0),
+            ChangeState::ReadKey => self.read_key(row_values::<2>(result)?),
+            ChangeState::CheckUnlocked => match result.event()? {
+                Event::Blob(BlobEvent::KeyStatus { generations }) => {
+                    self.check_unlocked(&generations)
                 }
-            }
-            (
-                ChangeState::GenerateKey,
+                other => self.refused(other),
+            },
+            ChangeState::ReadGrants => self.grants_read(result.page()?.0),
+            ChangeState::GenerateKey => match result.event()? {
                 Event::Blob(BlobEvent::BucketKeyGenerated {
                     public_key,
                     private_key,
-                }),
-            ) => self.seal(public_key, private_key),
-            (ChangeState::SealCopies, Event::Blob(BlobEvent::CopiesSealed { copies })) => {
-                let wanted = self.new_key.as_ref().map(|(record, _)| record.key);
-                if copies.iter().any(|copy| Some(copy.key) != wanted) {
-                    return self.fail(ChangeError::NotFinished);
+                }) => self.seal(public_key, private_key),
+                other => self.refused(other),
+            },
+            ChangeState::PrepareAbe => self.prepare_abe(result),
+            ChangeState::SealCopies => match result.event()? {
+                Event::Blob(BlobEvent::CopiesSealed { copies }) => self.copies_sealed(copies),
+                other => self.refused(other),
+            },
+            ChangeState::ReadUnlocked => match result.event()? {
+                Event::Blob(BlobEvent::UnlockedKeyRead { key, private_key })
+                    if self.settings.active_key() == Some(key) =>
+                {
+                    self.write_rows(Some(private_key), Vec::new())
                 }
-                self.write_rows(None, copies)
-            }
-            (
-                ChangeState::ReadUnlocked,
-                Event::Blob(BlobEvent::UnlockedKeyRead { key, private_key }),
-            ) if self.settings.active_key() == Some(key) => {
-                self.write_rows(Some(private_key), Vec::new())
-            }
-            (ChangeState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                other => self.refused(other),
+            },
+            ChangeState::WriteRows => {
+                result.done()?;
                 self.delete_index()
             }
-            (ChangeState::DeleteIndex, Event::Storage(StorageEvent::DeleteResult { .. })) => {
+            ChangeState::DeleteIndex => {
+                result.done()?;
                 self.write_vault()
             }
-            (ChangeState::WriteVault, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.commit()
-            }
-            (
-                ChangeState::Commit,
-                Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
-            ) if Some(txn_id) == self.txn_id => self.finish(),
-            (ChangeState::Finish | ChangeState::Error, _) => smallvec![],
-            (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
-            (state, received) => self.fail(ChangeError::InvalidStateEvent {
-                state,
-                received: received.label(),
-            }),
+            ChangeState::WriteVault => match result.event()? {
+                Event::Storage(StorageEvent::WriteResult { .. }) => self.finish(),
+                other => self.refused(other),
+            },
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ChangeState::Finish | ChangeState::Error)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            ChangeState::Finish | ChangeState::Error => {
-                self.output.unwrap_or(Err(ChangeError::NotFinished))
-            }
-            _ => Err(ChangeError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
+    /// A failed change keeps no key.
+    fn abort(&mut self) -> Vec<IoCall> {
         self.new_key = None;
         self.vault = None;
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        Vec::new()
     }
 }
 

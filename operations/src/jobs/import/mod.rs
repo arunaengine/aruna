@@ -79,8 +79,8 @@ use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::BucketScope;
 use crate::s3::object::delete::DeleteObjectError;
-use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
-use crate::s3::object::delete::pinned::version_pins;
+use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation};
+use crate::s3::object::delete::pinned::VersionPinsOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
@@ -1458,11 +1458,14 @@ async fn rollback_writes(
             version_id: entry.version_id,
         })
         .collect();
-    let (pins, guards) = version_pins(&ctx.driver, scope, &spec.auth_context, &queries)
-        .await
-        .map_err(|error| {
-            ImportFailure::Retryable(format!("rollback cannot check releases: {error}"))
-        })?;
+    let (pins, guards) = drive(
+        VersionPinsOperation::new(scope, &spec.auth_context, queries.to_vec()),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| {
+        ImportFailure::Retryable(format!("rollback cannot check releases: {error}"))
+    })?;
     let (pinned, removable): (Vec<_>, Vec<_>) = (plan.entries[..attempted].iter())
         .zip(pins)
         .partition(|(_, pinned)| *pinned);
@@ -1478,9 +1481,8 @@ async fn rollback_writes(
         kept.push(entry.target_key.clone());
     }
     let removable: Vec<_> = removable.into_iter().map(|(entry, _)| entry).collect();
-    let outcomes = delete_objects(
-        &ctx.driver,
-        BulkDeleteInput {
+    let outcomes = drive(
+        BulkDeleteOperation::new(BulkDeleteInput {
             bucket: spec.target.bucket.clone(),
             entries: removable
                 .iter()
@@ -1495,9 +1497,11 @@ async fn rollback_writes(
             deleted_by: spec.auth_context.user_id,
             restrictions: spec.auth_context.path_restrictions.clone(),
             guards,
-        },
+        }),
+        &ctx.driver,
     )
-    .await;
+    .await
+    .map_err(|error| ImportFailure::Retryable(format!("rollback delete failed: {error}")))?;
     let mut removed = 0;
     // Only a version that was really removed loses its report detail, so the
     // entry that failed before writing keeps its own failure message.

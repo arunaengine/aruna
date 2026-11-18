@@ -63,7 +63,7 @@ use crate::metadata::api::export_types::{
 };
 use crate::metadata::forward::routed_export::RoutedExportOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::jobs::WaitTarget;
 use aruna_core::metadata::AuthToken;
@@ -1890,19 +1890,21 @@ async fn open_remote(
     };
     // The challenge loop fills in this node's advertised subject and the refs
     // it learns, so a governed copy can be staged instead of dead-ending.
-    match managed_read(
+    match drive(
+        ManagedReadOperation::new(
+            node_id,
+            BaoReadRequest {
+                auth_context: spec.auth_context.clone(),
+                realm_id: spec.auth_context.realm_id,
+                target,
+                expected_blake3,
+                metadata_only,
+                destination: None,
+                known_refs: Vec::new(),
+                range: None,
+            },
+        ),
         driver,
-        node_id,
-        BaoReadRequest {
-            auth_context: spec.auth_context.clone(),
-            realm_id: spec.auth_context.realm_id,
-            target,
-            expected_blake3,
-            metadata_only,
-            destination: None,
-            known_refs: Vec::new(),
-            range: None,
-        },
     )
     .await
     {

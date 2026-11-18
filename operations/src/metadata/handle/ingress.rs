@@ -40,7 +40,7 @@ use crate::forward::token::ApplyRevokeOperation;
 use crate::forward::transport::reject;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::local_search::search_local_buckets;
+use crate::s3::bucket::local_search::LocalBucketSearch;
 use crate::s3::bucket::release::publish::{PublishError, holder_answer};
 use crate::s3::bucket::search::SearchBucketsInput;
 use crate::s3::object::search::SearchObjectsInput;
@@ -499,9 +499,8 @@ impl MetadataHandle {
                     .await
                     {
                         Ok(auth) => match self.inner.net_handle.as_ref() {
-                            Some(net_handle) => match search_local_buckets(
-                                context.as_ref(),
-                                SearchBucketsInput {
+                            Some(net_handle) => match crate::driver::drive(
+                                LocalBucketSearch::new(SearchBucketsInput {
                                     auth,
                                     realm_id: *net_handle.realm_id(),
                                     node_id: net_handle.node_id(),
@@ -512,7 +511,8 @@ impl MetadataHandle {
                                     group_id,
                                     start_after: start_after.map(Into::into),
                                     database,
-                                },
+                                }),
+                                context.as_ref(),
                             )
                             .await
                             {

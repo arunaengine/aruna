@@ -121,7 +121,7 @@ use aruna_operations::s3::object::copy::{
     CopyObjectInput as CopyObjectData, CopyReferences, copy_object_token,
 };
 use aruna_operations::s3::object::delete::bulk::{
-    BulkDeleteEntry, BulkDeleteInput as DOSI, delete_objects,
+    BulkDeleteEntry, BulkDeleteInput as DOSI, BulkDeleteOperation,
 };
 use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
 use aruna_operations::s3::object::get::GetObjectInput as GOI;
@@ -3055,9 +3055,8 @@ impl S3 for ArunaS3Service {
             .await;
         errors.extend(forward_errors);
 
-        let outcomes = delete_objects(
-            &self.state,
-            DOSI {
+        let outcomes = drive(
+            BulkDeleteOperation::new(DOSI {
                 bucket: bucket.clone(),
                 entries,
                 group_id: user_access.group_id,
@@ -3066,9 +3065,11 @@ impl S3 for ArunaS3Service {
                 deleted_by: user_access.user_identity,
                 restrictions: replication_auth.path_restrictions.clone(),
                 guards,
-            },
+            }),
+            &self.state,
         )
-        .await;
+        .await
+        .map_err(IntoS3Error::into_s3_error)?;
 
         Ok(self
             .delete_objects_response(

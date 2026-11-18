@@ -240,10 +240,13 @@ async fn hides_unmapped_failures() {
     let context = test.state.get_ctx();
     let group = Ulid::from_string(&ids.0).unwrap();
     let import = Ulid::from_string(&ids.1).unwrap();
-    let rule = aruna_operations::s3::imports::read_import(&context, group, import)
-        .await
-        .unwrap()
-        .unwrap();
+    let rule = aruna_operations::driver::drive(
+        aruna_operations::s3::imports::ReadImportOperation::new(group, import),
+        &context,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     // A file under the rule's folder has keys to check; one outside it has none to show.
     let inside = file_keys(&context, (&rule, &[], &[]), "raw/a.faa.gz")
         .await

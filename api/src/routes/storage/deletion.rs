@@ -17,7 +17,7 @@ use aruna_operations::jobs::service::submit_purge_job;
 use aruna_operations::metadata::api::links::set_preview_distributed;
 use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
-use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_scope};
+use aruna_operations::s3::object::delete::pinned::{PinnedError, RefuseScopeOperation};
 use aruna_operations::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
 };
@@ -592,7 +592,12 @@ async fn refuse_released(
         bucket: scope.bucket(),
         info,
     };
-    match refuse_scope(state.get_ctx().as_ref(), place, auth, scope).await {
+    match drive(
+        RefuseScopeOperation::new(place, auth, scope),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error @ PinnedError::Unchecked(_)) => {
             Err(ServerError::ServiceUnavailableReason(error.to_string()))
@@ -821,14 +826,17 @@ pub async fn delete_preview(
             } => (key.clone(), *version_id),
         })
         .collect();
-    let files = aruna_operations::blob::purge::storage_files(
-        &context,
-        (&bucket, info.group_id),
+    let routing = aruna_operations::driver::node_routing(&context);
+    let place = (bucket.as_str(), info.group_id);
+    let lookup = aruna_operations::blob::purge::StorageFilesOperation::new(
+        routing,
+        place,
         &versions,
         Some(&scope),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?;
+    );
+    let files = drive(lookup, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let kept_files = files.iter().filter(|file| file.kept.is_some()).count() as u64;
     let unchecked = aruna_operations::blob::purge::UNCHECKED_READERS;
     let unchecked = files

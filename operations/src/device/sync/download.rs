@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 use super::materialize::{MaterializeEntryOperation, MaterializeInput, MaterializeOutcome};
@@ -60,7 +60,11 @@ pub(crate) async fn fetch_remote(
         known_refs: Vec::new(),
         range: None,
     };
-    let mut answer = managed_read(context, folder.remote.node_id, request.clone()).await;
+    let mut answer = drive(
+        ManagedReadOperation::new(folder.remote.node_id, request.clone()),
+        context,
+    )
+    .await;
     // A member keeping only the record of a distributed version names a holder of its bytes.
     if let Err(BaoReadError::Refused(BaoReadRefusal::HeldBy { holder, set_id })) = answer {
         let held = BaoReadRequest {
@@ -70,7 +74,7 @@ pub(crate) async fn fetch_remote(
             },
             ..request
         };
-        answer = managed_read(context, holder, held).await;
+        answer = drive(ManagedReadOperation::new(holder, held), context).await;
     }
     match answer {
         Ok(BaoReadOutput::Stream { blob, .. }) => Ok(blob),

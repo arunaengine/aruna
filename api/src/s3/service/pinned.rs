@@ -10,7 +10,7 @@ use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use aruna_operations::s3::object::delete::pinned::{
-    PinnedError, ReleaseGuards, refuse_pinned, version_pins,
+    PinnedError, RefusePinnedOperation, ReleaseGuards, VersionPinsOperation,
 };
 use s3s::dto::Error as S3DeleteError;
 use s3s::{S3Error, S3ErrorCode, S3Result};
@@ -76,9 +76,12 @@ impl ArunaS3Service {
             return Ok(Vec::new());
         };
         let scope = self.scope(bucket, &info);
-        refuse_pinned(&self.state, scope, auth, (key, version_id))
-            .await
-            .map_err(|error| pinned_error(&error))
+        drive(
+            RefusePinnedOperation::new(scope, auth, (key, version_id)),
+            &self.state,
+        )
+        .await
+        .map_err(|error| pinned_error(&error))
     }
 
     /// Keeps the entries no release pins, with the guards their deletes keep; each pinned or
@@ -105,7 +108,11 @@ impl ArunaS3Service {
                 })
             })
             .collect();
-        let pins = version_pins(&self.state, self.scope(bucket, &info), auth, &queries).await;
+        let pins = drive(
+            VersionPinsOperation::new(self.scope(bucket, &info), auth, queries.to_vec()),
+            &self.state,
+        )
+        .await;
         let (pins, guards): (Vec<Result<bool, PinnedError>>, _) = match pins {
             Ok((pins, guards)) => (pins.into_iter().map(Ok).collect(), guards),
             Err(error) => (vec![Err(error); queries.len()], Vec::new()),

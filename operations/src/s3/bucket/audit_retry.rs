@@ -6,17 +6,19 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, TASK_TIMER_KEYSPACE};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::storage::key_audit::BucketAuditRecord;
 use aruna_core::task::{PersistedTaskTimer, TaskEffect, TaskKey};
-use aruna_core::types::{Effects, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
+
+use crate::s3::bucket::key::lock::answers_timer;
 
 /// Writes of an audit record inside its operation before the record moves to a retry timer.
 pub(crate) const AUDIT_ATTEMPTS: u32 = 3;
@@ -41,6 +43,67 @@ pub fn retry_effect(record: &BucketAuditRecord) -> Effect {
 /// Timer rows one resume page reads.
 const TIMER_PAGE: usize = 256;
 
+/// Writes audit records in one batch and, for records that must survive a crash, syncs them to
+/// disk. A child, so its parent sees a failed write and decides what follows.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AuditWrite {
+    rows: Vec<(String, Key, Value)>,
+    sync: bool,
+    syncing: bool,
+}
+
+impl AuditWrite {
+    pub(crate) fn new(record: &BucketAuditRecord, sync: bool) -> Result<Self, ConversionError> {
+        Self::batch(std::slice::from_ref(record), sync)
+    }
+
+    pub(crate) fn batch(
+        records: &[BucketAuditRecord],
+        sync: bool,
+    ) -> Result<Self, ConversionError> {
+        let row = |record: &BucketAuditRecord| {
+            let value = record.to_bytes()?.into();
+            Ok::<_, ConversionError>((
+                BUCKET_AUDIT_KEYSPACE.to_string(),
+                record.key().into(),
+                value,
+            ))
+        };
+        Ok(Self {
+            rows: records.iter().map(row).collect::<Result<_, _>>()?,
+            sync,
+            syncing: false,
+        })
+    }
+}
+
+impl Operation for AuditWrite {
+    type Output = ();
+    type Error = StorageError;
+
+    fn first(&mut self) -> Result<Next<()>, StorageError> {
+        Ok(Next::Call(IoCall::Write(self.rows.clone())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, StorageError> {
+        if self.syncing {
+            return match result.event()? {
+                Event::Storage(StorageEvent::SyncAllFinished) => Ok(Next::Done(())),
+                other => Err(StorageError::ReadError(format!(
+                    "unexpected answer to a sync: {}",
+                    other.label()
+                ))),
+            };
+        }
+        result.done()?;
+        if !self.sync {
+            return Ok(Next::Done(()));
+        }
+        self.syncing = true;
+        Ok(Next::Call(Effect::Storage(StorageEffect::SyncAll).into()))
+    }
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum AuditError {
     #[error("not an audit record timer")]
@@ -49,21 +112,94 @@ pub enum AuditError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Storage(#[from] StorageError),
-    #[error("unexpected event while storing an audit record: {0}")]
-    UnexpectedEvent(String),
-    #[error("the audit record store did not finish")]
-    NotFinished,
+    #[error("unexpected answer while keeping an audit record: {0}")]
+    Unexpected(&'static str),
+}
+
+impl From<IoError> for AuditError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
 }
 
 #[derive(Debug, PartialEq)]
-enum StoreState {
-    Init,
-    StartTransaction,
-    WriteRecord,
-    DeleteTimer,
-    Commit,
-    Finish,
-    Error,
+enum KeepState {
+    Write,
+    ArmTimers,
+}
+
+/// Stores audit records that must not be lost: a failed batch is retried, and records a lasting
+/// outage keeps from storage move to retry timers. Outputs whether the batch was stored.
+#[derive(Debug, PartialEq)]
+pub(crate) struct KeepAudit {
+    records: Vec<BucketAuditRecord>,
+    state: KeepState,
+    attempts: u32,
+    timers: VecDeque<BucketAuditRecord>,
+    waiting: Option<TaskKey>,
+}
+
+type KeepTurn = Result<Next<bool>, AuditError>;
+
+impl KeepAudit {
+    pub(crate) fn new(records: Vec<BucketAuditRecord>) -> Self {
+        Self {
+            records,
+            state: KeepState::Write,
+            attempts: 0,
+            timers: VecDeque::new(),
+            waiting: None,
+        }
+    }
+
+    fn write(&mut self) -> KeepTurn {
+        let write = AuditWrite::batch(&self.records, false)?;
+        self.attempts += 1;
+        Ok(Next::Call(IoCall::child(write)))
+    }
+
+    fn written(&mut self, written: Result<(), StorageError>) -> KeepTurn {
+        if written.is_ok() {
+            return Ok(Next::Done(true));
+        }
+        if self.attempts < AUDIT_ATTEMPTS {
+            return self.write();
+        }
+        self.state = KeepState::ArmTimers;
+        self.timers = std::mem::take(&mut self.records).into();
+        self.next_timer()
+    }
+
+    fn next_timer(&mut self) -> KeepTurn {
+        let Some(record) = self.timers.pop_front() else {
+            return Ok(Next::Done(false));
+        };
+        self.waiting = Some(retry_timer(&record));
+        Ok(Next::Call(retry_effect(&record).into()))
+    }
+}
+
+impl Operation for KeepAudit {
+    type Output = bool;
+    type Error = AuditError;
+
+    fn first(&mut self) -> KeepTurn {
+        self.write()
+    }
+
+    fn next(&mut self, result: IoResult) -> KeepTurn {
+        if self.state == KeepState::Write {
+            return self.written(result.child::<(), StorageError>()?);
+        }
+        match result.event()? {
+            Event::Task(event)
+                if (self.waiting.as_ref()).is_some_and(|key| answers_timer(&event, key)) =>
+            {
+                self.next_timer()
+            }
+            other => Err(AuditError::Unexpected(other.label())),
+        }
+    }
 }
 
 /// Stores the record a `RecordAudit` timer keeps and deletes the timer's persisted row in the
@@ -72,141 +208,52 @@ enum StoreState {
 #[derive(Debug, PartialEq)]
 pub struct StoreAuditOperation {
     key: TaskKey,
-    rows: Option<(Key, Vec<u8>, Key)>,
-    txn_id: Option<TxnId>,
-    state: StoreState,
-    error: Option<AuditError>,
+    timer: Option<Key>,
 }
 
 impl StoreAuditOperation {
     pub fn new(key: TaskKey) -> Self {
-        Self {
-            key,
-            rows: None,
-            txn_id: None,
-            state: StoreState::Init,
-            error: None,
-        }
-    }
-
-    fn rows(key: &TaskKey) -> Result<(Key, Vec<u8>, Key), AuditError> {
-        let TaskKey::RecordAudit { record } = key else {
-            return Err(AuditError::NotAuditTimer);
-        };
-        let timer = key.storage_key()?;
-        Ok((record.key().into(), record.to_bytes()?, timer))
-    }
-
-    fn fail(&mut self, error: AuditError) -> Effects {
-        self.state = StoreState::Error;
-        self.error = Some(error);
-        self.abort()
-    }
-
-    fn write(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        let Some((key, value, _)) = &self.rows else {
-            return self.fail(AuditError::NotFinished);
-        };
-        self.state = StoreState::WriteRecord;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
-            key: key.clone(),
-            value: value.clone().into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn delete_timer(&mut self) -> Effects {
-        let (Some((_, _, timer)), Some(txn_id)) = (&self.rows, self.txn_id) else {
-            return self.fail(AuditError::NotFinished);
-        };
-        self.state = StoreState::DeleteTimer;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: TASK_TIMER_KEYSPACE.to_string(),
-            key: timer.clone(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(AuditError::NotFinished);
-        };
-        self.state = StoreState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        Self { key, timer: None }
     }
 }
 
-impl EffectOperation for StoreAuditOperation {
+impl Operation for StoreAuditOperation {
     type Output = ();
     type Error = AuditError;
 
-    fn start(&mut self) -> Effects {
-        match Self::rows(&self.key) {
-            Ok(rows) => self.rows = Some(rows),
-            Err(error) => return self.fail(error),
-        }
-        self.state = StoreState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<()>, AuditError> {
+        let TaskKey::RecordAudit { record } = &self.key else {
+            return Err(AuditError::NotAuditTimer);
+        };
+        let row = (
+            BUCKET_AUDIT_KEYSPACE.to_string(),
+            record.key().into(),
+            record.to_bytes()?.into(),
+        );
+        self.timer = Some(self.key.storage_key()?);
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            // A failed commit closed the transaction, so nothing is left to abort.
-            (StoreState::Commit, Event::Storage(StorageEvent::Error { error })) => {
-                self.txn_id = None;
-                self.fail(error.into())
-            }
-            (
-                StoreState::StartTransaction | StoreState::WriteRecord | StoreState::DeleteTimer,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.fail(error.into()),
-            (
-                StoreState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => self.write(txn_id),
-            (StoreState::WriteRecord, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.delete_timer()
-            }
-            (StoreState::DeleteTimer, Event::Storage(StorageEvent::DeleteResult { .. })) => {
-                self.commit()
-            }
-            (StoreState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = StoreState::Finish;
-                smallvec![]
-            }
-            (_, event) => self.fail(AuditError::UnexpectedEvent(event.label().to_string())),
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, AuditError> {
+        result.done()?;
+        Ok(match self.timer.take() {
+            Some(timer) => Next::Call(IoCall::Delete(vec![(
+                TASK_TIMER_KEYSPACE.to_string(),
+                timer,
+            )])),
+            None => Next::Done(()),
+        })
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, StoreState::Finish | StoreState::Error)
-    }
-
-    fn finalize(self) -> Result<(), AuditError> {
-        match (self.state, self.error) {
-            (StoreState::Finish, _) => Ok(()),
-            (_, Some(error)) => Err(error),
-            _ => Err(AuditError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        aruna_core::effects::abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
 #[derive(Debug, PartialEq)]
 enum ResumeState {
-    Init,
     Scan,
     Store,
-    Finish,
-    Error,
 }
 
 /// Stores every audit record a persisted timer still keeps, before startup rebuilds the unlock
@@ -217,34 +264,33 @@ pub struct ResumeAuditOperation {
     kept: VecDeque<TaskKey>,
     next: Option<Key>,
     stored: usize,
-    error: Option<AuditError>,
 }
 
 impl Default for ResumeAuditOperation {
     fn default() -> Self {
         Self {
-            state: ResumeState::Init,
+            state: ResumeState::Scan,
             kept: VecDeque::new(),
             next: None,
             stored: 0,
-            error: None,
         }
     }
 }
 
+type ResumeTurn = Result<Next<usize>, AuditError>;
+
 impl ResumeAuditOperation {
-    fn scan(&mut self, start: Option<Key>) -> Effects {
+    fn scan(&mut self, after: Option<Key>) -> ResumeTurn {
         self.state = ResumeState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: TASK_TIMER_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: TASK_TIMER_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
             limit: TIMER_PAGE,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn page_read(&mut self, values: Vec<(Key, Key)>, next: Option<Key>) -> Effects {
+    fn page_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> ResumeTurn {
         for (_, value) in values {
             let Ok(timer) = postcard::from_bytes::<PersistedTaskTimer>(value.as_ref()) else {
                 continue;
@@ -257,81 +303,41 @@ impl ResumeAuditOperation {
         self.store_next()
     }
 
-    fn store_next(&mut self) -> Effects {
+    fn store_next(&mut self) -> ResumeTurn {
         let Some(key) = self.kept.pop_front() else {
             return match self.next.take() {
                 Some(next) => self.scan(Some(next)),
-                None => {
-                    self.state = ResumeState::Finish;
-                    smallvec![]
-                }
+                None => Ok(Next::Done(self.stored)),
             };
         };
         self.state = ResumeState::Store;
-        let store = StoreAuditOperation::new(key);
-        smallvec![Effect::SubOperation(boxed_suboperation(store, |result| {
-            Event::SubOperation(SubOperationEvent::AuditStored {
-                result: result.map_err(|error| error.to_string()),
-            })
-        }))]
-    }
-
-    fn fail(&mut self, error: AuditError) -> Effects {
-        self.state = ResumeState::Error;
-        self.error = Some(error);
-        smallvec![]
+        Ok(Next::Call(IoCall::child(StoreAuditOperation::new(key))))
     }
 }
 
-impl EffectOperation for ResumeAuditOperation {
+impl Operation for ResumeAuditOperation {
     type Output = usize;
     type Error = AuditError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> ResumeTurn {
         self.scan(None)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (ResumeState::Scan, Event::Storage(StorageEvent::Error { error })) => {
-                self.fail(error.into())
+    fn next(&mut self, result: IoResult) -> ResumeTurn {
+        match self.state {
+            ResumeState::Scan => {
+                let (rows, next) = result.page()?;
+                self.page_read(rows, next)
             }
-            (
-                ResumeState::Scan,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.page_read(values, next_start_after),
-            (
-                ResumeState::Store,
-                Event::SubOperation(SubOperationEvent::AuditStored { result }),
-            ) => {
-                match result {
+            ResumeState::Store => {
+                match result.child::<(), AuditError>()? {
                     Ok(()) => self.stored += 1,
                     // The timer stays persisted and retries once the task runtime restores it.
                     Err(error) => warn!(error = %error, "Kept audit record still not stored"),
                 }
                 self.store_next()
             }
-            (_, event) => self.fail(AuditError::UnexpectedEvent(event.label().to_string())),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ResumeState::Finish | ResumeState::Error)
-    }
-
-    fn finalize(self) -> Result<usize, AuditError> {
-        match (self.state, self.error) {
-            (ResumeState::Finish, _) => Ok(self.stored),
-            (_, Some(error)) => Err(error),
-            _ => Err(AuditError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -339,9 +345,7 @@ impl EffectOperation for ResumeAuditOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, next_event_id};
     use aruna_storage::storage;
     use tempfile::tempdir;
@@ -503,228 +507,127 @@ mod tests {
         }
     }
 
-    fn txn() -> TxnId {
-        Ulid::from_parts(9, 9)
-    }
-
-    fn storage_error() -> Event {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        })
-    }
-
-    /// A store operation advanced through `events` after start.
-    fn store_after(events: Vec<Event>) -> StoreAuditOperation {
-        let mut operation = StoreAuditOperation::new(retry_timer(&record()));
-        operation.start();
-        for event in events {
-            operation.step(event);
-        }
-        operation
-    }
-
-    fn started() -> Event {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id: txn() })
-    }
-
-    fn written() -> Event {
-        Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        })
-    }
-
-    fn deleted() -> Event {
-        Event::Storage(StorageEvent::DeleteResult {
-            key: Vec::new().into(),
-        })
-    }
-
     #[test]
     fn stores_in_transaction() {
         // Each `record()` gets a new event id, so the timer and its rows share one record.
         let record = record();
         let key = retry_timer(&record);
         let mut operation = StoreAuditOperation::new(key.clone());
-        let write = Effect::Storage(StorageEffect::Write {
-            key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
-            key: record.key().into(),
-            value: record.to_bytes().unwrap().into(),
-            txn_id: Some(txn()),
-        });
-        let delete = Effect::Storage(StorageEffect::Delete {
-            key_space: TASK_TIMER_KEYSPACE.to_string(),
-            key: key.storage_key().unwrap(),
-            txn_id: Some(txn()),
-        });
-        let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id: txn() });
-        let committed = Event::Storage(StorageEvent::TransactionCommitted { txn_id: txn() });
-        let start = [Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })];
-        let steps = vec![
-            (started(), vec![write]),
-            (written(), vec![delete]),
-            (deleted(), vec![commit]),
-            (committed, vec![]),
-        ];
-        check_trace(&mut operation, &start, steps);
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Write(vec![(
+                BUCKET_AUDIT_KEYSPACE.to_string(),
+                record.key().into(),
+                record.to_bytes().unwrap().into(),
+            )])))
+        );
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Delete(vec![(
+                TASK_TIMER_KEYSPACE.to_string(),
+                key.storage_key().unwrap(),
+            )])))
+        );
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
     }
 
     #[test]
     fn other_timers_refused() {
         let mut operation = StoreAuditOperation::new(TaskKey::DrainCleanupQueue);
-        assert!(operation.start().is_empty());
-        assert_eq!(operation.finalize(), Err(AuditError::NotAuditTimer));
+        assert_eq!(operation.first(), Err(AuditError::NotAuditTimer));
     }
 
     #[test]
-    fn store_errors_abort() {
-        // Before the commit an open transaction is aborted; a failed commit has none left.
-        let abort = || Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
-        let mut starting = store_after(Vec::new());
-        assert!(starting.step(storage_error()).is_empty());
-        let mut writing = store_after(vec![started()]);
-        assert_eq!(writing.step(storage_error()).as_slice(), [abort()]);
-        let mut deleting = store_after(vec![started(), written()]);
-        assert_eq!(deleting.step(storage_error()).as_slice(), [abort()]);
-        let mut committing = store_after(vec![started(), written(), deleted()]);
-        assert!(committing.step(storage_error()).is_empty());
-        for operation in [starting, writing, deleting, committing] {
-            assert_eq!(
-                operation.finalize(),
-                Err(AuditError::Storage(StorageError::Timeout))
-            );
-        }
-    }
-
-    #[test]
-    fn store_rejects_events() {
-        let phases: [fn() -> Vec<Event>; 4] = [
-            Vec::new,
-            || vec![started()],
-            || vec![started(), written()],
-            || vec![started(), written(), deleted()],
-        ];
-        for (index, phase) in phases.into_iter().enumerate() {
-            let make = || store_after(phase());
-            let refused = rejects_events(make, sample_events, |event| {
-                let expected = [
-                    matches!(
-                        event,
-                        Event::Storage(StorageEvent::TransactionStarted { .. })
-                    ),
-                    matches!(event, Event::Storage(StorageEvent::WriteResult { .. })),
-                    matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })),
-                    matches!(
-                        event,
-                        Event::Storage(StorageEvent::TransactionCommitted { .. })
-                    ),
-                ];
-                expected[index] || matches!(event, Event::Storage(StorageEvent::Error { .. }))
-            });
-            assert!(!refused.is_empty());
-        }
-    }
-
-    #[test]
-    fn store_abort_finalize() {
-        let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
-        let mut starting = store_after(Vec::new());
-        check_abort(&mut starting, &[]);
-        rejects_finalize(starting);
-        let mut writing = store_after(vec![started()]);
-        check_abort(&mut writing, &[abort]);
-        rejects_finalize(writing);
-    }
-
-    fn timer_row(key: TaskKey) -> (Key, Key) {
-        let timer = PersistedTaskTimer {
-            key,
-            due_unix_millis: 1,
-        };
-        let row = postcard::to_allocvec(&timer).unwrap();
-        (Vec::new().into(), row.into())
-    }
-
-    fn scan(start: Option<&[u8]>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: TASK_TIMER_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(|key| IterStart::After(key.to_vec().into())),
-            limit: TIMER_PAGE,
-            txn_id: None,
-        })
-    }
-
-    fn stored_event(result: Result<(), String>) -> Event {
-        Event::SubOperation(SubOperationEvent::AuditStored { result })
-    }
-
-    #[test]
-    fn resumes_kept_records() {
-        // Other timers and undecodable rows are skipped; a failed store keeps its timer.
-        let mut operation = ResumeAuditOperation::default();
-        assert_eq!(operation.start().as_slice(), [scan(None)]);
-        let page = Event::Storage(StorageEvent::IterResult {
-            values: vec![
-                timer_row(retry_timer(&record())),
-                timer_row(TaskKey::DrainCleanupQueue),
-                (Vec::new().into(), vec![0xff].into()),
-                timer_row(retry_timer(&record())),
-            ],
-            next_start_after: Some(b"last".to_vec().into()),
-        });
-        let effects = operation.step(page);
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = operation.step(stored_event(Ok(())));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = operation.step(stored_event(Err("busy".to_string())));
-        assert_eq!(effects.as_slice(), [scan(Some(b"last"))]);
-        let last = Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        });
-        assert!(operation.step(last).is_empty());
-        assert_eq!(operation.finalize(), Ok(1));
-    }
-
-    #[test]
-    fn resume_contract() {
-        let mut scanning = ResumeAuditOperation::default();
-        scanning.start();
-        assert!(scanning.step(storage_error()).is_empty());
+    fn audit_write_syncs() {
+        // A record that must survive a crash is synced before the write counts.
+        let mut write = AuditWrite::new(&record(), true).unwrap();
+        assert!(matches!(write.first(), Ok(Next::Call(IoCall::Write(_)))));
         assert_eq!(
-            scanning.finalize(),
-            Err(AuditError::Storage(StorageError::Timeout))
+            write.next(IoResult::Done),
+            Ok(Next::Call(Effect::Storage(StorageEffect::SyncAll).into()))
         );
-        let scanning = || {
-            let mut operation = ResumeAuditOperation::default();
-            operation.start();
-            operation
+        let synced = IoResult::Event(Box::new(Event::Storage(StorageEvent::SyncAllFinished)));
+        assert_eq!(write.next(synced), Ok(Next::Done(())));
+        let mut plain = AuditWrite::new(&record(), false).unwrap();
+        plain.first().unwrap();
+        assert_eq!(plain.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    fn written(result: Result<(), StorageError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    #[test]
+    fn keep_stores_batch() {
+        let mut keep = KeepAudit::new(vec![record()]);
+        assert!(matches!(keep.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(keep.next(written(Ok(()))), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn keep_moves_to_timers() {
+        // A failed batch is retried; a lasting outage hands each record to its retry timer.
+        let (first, second) = (record(), record());
+        let mut keep = KeepAudit::new(vec![first.clone(), second.clone()]);
+        keep.first().unwrap();
+        for _ in 1..AUDIT_ATTEMPTS {
+            let retry = keep.next(written(Err(StorageError::Timeout)));
+            assert!(matches!(retry, Ok(Next::Call(IoCall::Child(_)))));
+        }
+        let mut turn = keep.next(written(Err(StorageError::Timeout)));
+        for kept in [first, second] {
+            assert_eq!(turn, Ok(Next::Call(retry_effect(&kept).into())));
+            let armed = Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
+                key: retry_timer(&kept),
+                after: AUDIT_RETRY,
+            });
+            turn = keep.next(IoResult::Event(Box::new(armed)));
+        }
+        assert_eq!(turn, Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn keep_refuses_stray() {
+        let mut keep = KeepAudit::new(vec![record()]);
+        keep.state = KeepState::ArmTimers;
+        keep.waiting = Some(retry_timer(&record()));
+        let stray = IoResult::Event(Box::new(Event::Storage(StorageEvent::SyncAllFinished)));
+        assert!(matches!(keep.next(stray), Err(AuditError::Unexpected(_))));
+    }
+
+    #[test]
+    fn resume_keeps_failures() {
+        // A record that cannot be stored keeps its timer and does not stop the others.
+        let record = record();
+        let timer = PersistedTaskTimer {
+            key: retry_timer(&record),
+            due_unix_millis: 0,
         };
-        let refused = rejects_events(scanning, sample_events, |event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-            )
-        });
-        assert!(!refused.is_empty());
-        let storing = || {
-            let mut operation = scanning();
-            operation.step(Event::Storage(StorageEvent::IterResult {
-                values: vec![timer_row(retry_timer(&record()))],
-                next_start_after: None,
-            }));
-            operation
+        let value = Value::from(postcard::to_allocvec(&timer).unwrap());
+        let mut resume = ResumeAuditOperation::default();
+        assert!(matches!(
+            resume.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: vec![
+                (Key::from(vec![1]), value.clone()),
+                (Key::from(vec![2]), value),
+            ],
+            next: None,
         };
-        let refused = rejects_events(storing, sample_events, |_| false);
-        assert_eq!(refused.len(), sample_events().len());
-        let mut fresh = ResumeAuditOperation::default();
-        check_abort(&mut fresh, &[]);
-        rejects_finalize(fresh);
-        let mut open = storing();
-        check_abort(&mut open, &[]);
-        rejects_finalize(open);
+        assert!(matches!(
+            resume.next(page),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let failed = Err::<(), _>(AuditError::Storage(StorageError::Timeout));
+        let turn = resume.next(IoResult::Child(ChildOutcome::new(failed)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let stored = Ok::<(), AuditError>(());
+        assert_eq!(
+            resume.next(IoResult::Child(ChildOutcome::new(stored))),
+            Ok(Next::Done(1))
+        );
     }
 }

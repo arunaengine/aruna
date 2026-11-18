@@ -44,10 +44,10 @@ use crate::distribution::source_keep::keep_first;
 use crate::distribution::source_plan::SourceKeep;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::{local_is_user, managed_read};
+use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use crate::s3::object::lookup::{LookupError, summary_from_read};
+use crate::s3::object::lookup::{LookupError, summary_from_value};
 
 /// Reads an object, continuing against the realm's holders when this node holds
 /// the version record but not its bytes. Only User nodes route, since elsewhere a
@@ -141,7 +141,10 @@ pub async fn get_object_token(
     else {
         return result;
     };
-    if !local_is_user(context, realm_id).await {
+    if !drive(LocalUserOperation::new(realm_id), context)
+        .await
+        .unwrap_or(false)
+    {
         return Err(GetObjectError::GetObjectFailed);
     }
     let read = RoutedRead {
@@ -438,7 +441,10 @@ pub async fn get_object_info(
             metadata,
             version_created_at,
             source_policies,
-        }) if local_is_user(context, realm_id).await => {
+        }) if drive(LocalUserOperation::new(realm_id), context)
+            .await
+            .unwrap_or(false) =>
+        {
             let read = RoutedRead {
                 user_id,
                 realm_id,
@@ -586,7 +592,7 @@ async fn routed_blob(
             known_refs: Vec::new(),
             range: None,
         };
-        match failures.consider(managed_read(context, holder, request).await) {
+        match failures.consider(drive(ManagedReadOperation::new(holder, request), context).await) {
             Some(BaoReadOutput::Stream {
                 blob,
                 size,
@@ -637,7 +643,7 @@ async fn routed_metadata(
             known_refs: Vec::new(),
             range: None,
         };
-        match managed_read(context, holder, request).await {
+        match drive(ManagedReadOperation::new(holder, request), context).await {
             Ok(BaoReadOutput::Metadata {
                 size, etag, hashes, ..
             }) => {
@@ -723,9 +729,11 @@ async fn local_multipart_summary(
         .await;
     match event {
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        event => summary_from_read(event).map_err(|error| match error {
-            LookupError::Conversion(error) => GetObjectError::ConversionError(error),
-            _ => GetObjectError::GetObjectFailed,
-        }),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => summary_from_value(value)
+            .map_err(|error| match error {
+                LookupError::Conversion(error) => GetObjectError::ConversionError(error),
+                _ => GetObjectError::GetObjectFailed,
+            }),
+        _ => Err(GetObjectError::GetObjectFailed),
     }
 }

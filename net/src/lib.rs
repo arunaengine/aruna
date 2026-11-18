@@ -1097,6 +1097,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",
         Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
         Effect::Net(NetEffect::RecordSuppression(_)) => "record_suppression",
+        Effect::Net(NetEffect::LocalNode) => "local_node",
+        Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
         Effect::Net(NetEffect::RegisterInterest { .. }) => "register_interest",
         Effect::Net(NetEffect::RetractInterest(_)) => "retract_interest",
         Effect::Net(NetEffect::ReplaceInterest(_)) => "replace_interest",

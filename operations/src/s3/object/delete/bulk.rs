@@ -2,15 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{GroupId, Key, Value};
+use std::collections::VecDeque;
 use ulid::Ulid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,19 +34,41 @@ pub struct BulkDeleteInput {
     pub guards: Vec<(String, Key, Option<Value>)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct BulkDeleteOutcome {
     pub key: String,
     pub requested_version_id: Option<Ulid>,
     pub result: Result<DeleteObjectResult, DeleteObjectError>,
 }
 
-pub async fn delete_objects(
-    context: &DriverContext,
+type BulkTurn = Result<Next<Vec<BulkDeleteOutcome>>, DeleteObjectError>;
+
+/// Deletes the entries one after the other. A failed entry only fails its own outcome.
+#[derive(Debug, PartialEq)]
+pub struct BulkDeleteOperation {
     input: BulkDeleteInput,
-) -> Vec<BulkDeleteOutcome> {
-    let mut outcomes = Vec::with_capacity(input.entries.len());
-    for entry in input.entries {
+    entries: VecDeque<BulkDeleteEntry>,
+    running: Option<BulkDeleteEntry>,
+    outcomes: Vec<BulkDeleteOutcome>,
+}
+
+impl BulkDeleteOperation {
+    pub fn new(mut input: BulkDeleteInput) -> Self {
+        let entries: VecDeque<_> = std::mem::take(&mut input.entries).into();
+        let outcomes = Vec::with_capacity(entries.len());
+        Self {
+            input,
+            entries,
+            running: None,
+            outcomes,
+        }
+    }
+
+    fn next_entry(&mut self) -> BulkTurn {
+        let Some(entry) = self.entries.pop_front() else {
+            return Ok(Next::Done(std::mem::take(&mut self.outcomes)));
+        };
+        let input = &self.input;
         let operation = DeleteObjectOperation::new(DeleteObjectInput {
             bucket: input.bucket.clone(),
             key: entry.key.clone(),
@@ -59,28 +83,44 @@ pub async fn delete_objects(
             true => operation.with_fence(input.guards.clone(), Vec::new()),
             false => operation,
         };
-        let result = drive(operation, context).await;
-
-        outcomes.push(BulkDeleteOutcome {
-            key: entry.key,
-            requested_version_id: entry.version_id,
-            result,
-        });
+        self.running = Some(entry);
+        Ok(Next::Call(IoCall::child(operation)))
     }
-    outcomes
+}
+
+impl Operation for BulkDeleteOperation {
+    type Output = Vec<BulkDeleteOutcome>;
+    type Error = DeleteObjectError;
+
+    fn first(&mut self) -> BulkTurn {
+        self.next_entry()
+    }
+
+    fn next(&mut self, result: IoResult) -> BulkTurn {
+        let result = result.child::<DeleteObjectResult, DeleteObjectError>()?;
+        if let Some(entry) = self.running.take() {
+            self.outcomes.push(BulkDeleteOutcome {
+                key: entry.key,
+                requested_version_id: entry.version_id,
+                result,
+            });
+        }
+        self.next_entry()
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::drive;
+    use crate::driver::{DriverContext, drive};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig};
     use aruna_core::structs::storage::routing::RoutingSnapshot;
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::{TempDir, tempdir};
@@ -92,7 +132,7 @@ mod test {
         std::fs::create_dir_all(&blob_root).unwrap();
 
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
             .await
             .unwrap();
         let blob_handle = BlobHandler::new(
@@ -161,6 +201,62 @@ mod test {
         .unwrap();
     }
 
+    fn batch(entries: Vec<BulkDeleteEntry>) -> BulkDeleteInput {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        BulkDeleteInput {
+            bucket: "mybucket".to_string(),
+            entries,
+            group_id: Ulid::from_bytes([2; 16]),
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            deleted_by: UserId::nil(realm_id),
+            restrictions: None,
+            guards: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_batch_finishes() {
+        let mut operation = BulkDeleteOperation::new(batch(Vec::new()));
+        assert_eq!(operation.first(), Ok(Next::Done(Vec::new())));
+    }
+
+    #[test]
+    fn outcomes_follow_entries() {
+        // A failed entry stays in its place and the next entry still runs.
+        let version = Ulid::from_bytes([4; 16]);
+        let mut operation = BulkDeleteOperation::new(batch(vec![
+            BulkDeleteEntry {
+                key: "first".to_string(),
+                version_id: Some(version),
+            },
+            BulkDeleteEntry {
+                key: "second".to_string(),
+                version_id: None,
+            },
+        ]));
+        let missing = || {
+            let failed = Err::<DeleteObjectResult, _>(DeleteObjectError::NoSuchVersion);
+            IoResult::Child(ChildOutcome::new(failed))
+        };
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert!(matches!(
+            operation.next(missing()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let Ok(Next::Done(outcomes)) = operation.next(missing()) else {
+            panic!("the last entry ends the batch");
+        };
+        let keys: Vec<_> = outcomes
+            .iter()
+            .map(|outcome| (outcome.key.as_str(), outcome.requested_version_id))
+            .collect();
+        assert_eq!(keys, [("first", Some(version)), ("second", None)]);
+    }
+
     #[tokio::test]
     async fn mixed_batch_processed() {
         let (_temp, context) = test_context().await;
@@ -180,9 +276,8 @@ mod test {
         .await;
 
         let missing_version = Ulid::generate();
-        let outcomes = delete_objects(
-            &context,
-            BulkDeleteInput {
+        let outcomes = drive(
+            BulkDeleteOperation::new(BulkDeleteInput {
                 bucket: "mybucket".to_string(),
                 entries: vec![
                     BulkDeleteEntry {
@@ -204,9 +299,11 @@ mod test {
                 deleted_by: user_id,
                 restrictions: None,
                 guards: Vec::new(),
-            },
+            }),
+            &context,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(outcomes.len(), 3);
 
@@ -236,9 +333,8 @@ mod test {
         )
         .await;
 
-        let outcomes = delete_objects(
-            &context,
-            BulkDeleteInput {
+        let outcomes = drive(
+            BulkDeleteOperation::new(BulkDeleteInput {
                 bucket: "mybucket".to_string(),
                 entries: vec![
                     BulkDeleteEntry {
@@ -256,9 +352,11 @@ mod test {
                 deleted_by: user_id,
                 restrictions: None,
                 guards: Vec::new(),
-            },
+            }),
+            &context,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(outcomes.len(), 2);
         assert!(matches!(

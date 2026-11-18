@@ -706,7 +706,7 @@ pub(crate) mod test {
         Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
     };
     use aruna_core::structs::storage::format::Compression;
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
     use aruna_storage::storage;
     use axum::{Router, routing::get};
     use futures_util::StreamExt;
@@ -735,7 +735,7 @@ pub(crate) mod test {
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
         storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
             .await
             .unwrap();
         let blob_handle = BlobHandler::with_egress(
@@ -773,7 +773,7 @@ pub(crate) mod test {
         root: &std::path::Path,
     ) -> DriverContext {
         let storage_handle = context.storage_handle.clone();
-        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
             .await
             .unwrap();
         let config = BackendConfig {

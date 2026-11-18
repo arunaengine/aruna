@@ -14,7 +14,7 @@ use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::workflow::workspace::LOCKED_INPUT;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::managed_read;
+use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 /// The staged bytes of one input plus the size the caller writes with.
@@ -89,7 +89,7 @@ pub async fn stage_remote_input(
                 known_refs: Vec::new(),
                 range: None,
             };
-            match managed_read(context, holder, request).await {
+            match drive(ManagedReadOperation::new(holder, request), context).await {
                 Ok(BaoReadOutput::Stream { blob, size, .. }) => {
                     debug!(peer = %holder, "Input staged from a remote holder");
                     return Ok(StagedInput { blob, size });

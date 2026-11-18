@@ -21,7 +21,6 @@ use aruna_operations::metadata::warmup::spawn_metadata_warmup;
 use aruna_operations::node::recovery_run::RecoveryConfig;
 use aruna_operations::plugin_host::repair::spawn_repair;
 use aruna_operations::plugin_host::worker::spawn_worker;
-use aruna_operations::s3::sweeps::{spawn_cutoff_sweep, spawn_session_sweep};
 use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
@@ -30,6 +29,7 @@ use tracing::warn;
 
 use crate::application::{Service, ServiceExit};
 use crate::startup::realm::CoreAnnouncement;
+use crate::startup::sweeps::{spawn_cutoff_sweep, spawn_session_sweep};
 use crate::startup::test_hooks;
 
 const FEED_IDLE: Duration = Duration::from_secs(2);

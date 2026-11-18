@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
+use crate::auth::request_authorization::BucketAccessOperation;
+use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::rename::tests::{
     BUCKET, access, get, group, head_key, object, realm, setup, store_job,
 };
@@ -26,10 +28,12 @@ async fn stored(context: &DriverContext) -> LinkedJob {
 async fn step(
     context: &DriverContext,
     plan: &RemapPlan,
-    scope: &RemapScope<'_>,
+    scope: &RemapScope,
 ) -> (JobStep, LinkedJob) {
     let job = stored(context).await;
-    let step = job_page(context, plan, scope, &job).await.unwrap();
+    let step = drive(RemapJobOperation::new(plan, scope, &job), context)
+        .await
+        .unwrap();
     (step, stored(context).await)
 }
 
@@ -42,23 +46,20 @@ fn plan() -> RemapPlan {
     }
 }
 
-async fn load(context: &DriverContext) -> BucketAccess {
+async fn load(context: &DriverContext) -> Arc<BucketAccess> {
     let auth = access(context).await;
-    let load = crate::auth::request_authorization::BucketAccessOperation::new(
-        &auth,
-        (realm(), group(), node(4)),
-        BUCKET,
-    );
-    crate::driver::drive(load, context).await.unwrap()
+    let scope = (realm(), group(), node(4));
+    let load = BucketAccessOperation::new(&auth, scope, BUCKET);
+    Arc::new(drive(load, context).await.unwrap())
 }
 
-fn scope(access: &BucketAccess) -> RemapScope<'_> {
+fn scope(access: &Arc<BucketAccess>) -> RemapScope {
     RemapScope {
         realm_id: realm(),
         group_id: group(),
         node_id: node(4),
-        bucket: BUCKET,
-        access,
+        bucket: BUCKET.to_string(),
+        access: access.clone(),
     }
 }
 
@@ -97,9 +98,12 @@ async fn pages_every_key() {
     let scope = scope(&access);
     let (mut after, mut seen) = (None, Vec::new());
     loop {
-        let page = preview_page(&context, &plan(), &scope, (None, after, MAX_PAGE))
-            .await
-            .unwrap();
+        let page = drive(
+            RemapPreviewOperation::new(&plan(), &scope, (None, after, MAX_PAGE)),
+            &context,
+        )
+        .await
+        .unwrap();
         assert_eq!((page.total, page.complete), (2500, true));
         seen.extend(page.entries.iter().map(|entry| entry.from.clone()));
         match page.next {
@@ -112,9 +116,12 @@ async fn pages_every_key() {
         .collect();
     assert_eq!(seen, wanted);
     // A filter narrows the totals and the entries alike.
-    let page = preview_page(&context, &plan(), &scope, (Some("f0001"), None, 5))
-        .await
-        .unwrap();
+    let page = drive(
+        RemapPreviewOperation::new(&plan(), &scope, (Some("f0001"), None, 5)),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(page.total, 10);
     assert_eq!(page.entries.len(), 5);
     assert_eq!(page.entries[0].to, "proteins/f00010.faa.gz");
@@ -135,9 +142,12 @@ async fn reports_collisions() {
     let access = load(&context).await;
     let scope = scope(&access);
 
-    let page = preview_page(&context, &plan(), &scope, (None, None, DEFAULT_PAGE))
-        .await
-        .unwrap();
+    let page = drive(
+        RemapPreviewOperation::new(&plan(), &scope, (None, None, DEFAULT_PAGE)),
+        &context,
+    )
+    .await
+    .unwrap();
     let reasons: Vec<_> = page
         .entries
         .iter()
@@ -189,9 +199,12 @@ async fn skips_denied_keys() {
         ..plan()
     };
     // Keys the caller may not read are neither counted nor shown, nor named by a cursor.
-    let page = preview_page(&context, &plan, &scope, (None, None, 1))
-        .await
-        .unwrap();
+    let page = drive(
+        RemapPreviewOperation::new(&plan, &scope, (None, None, 1)),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!((page.total, page.entries.len(), page.next), (0, 0, None));
     begin(&context, u64::MAX).await;
     let (page, job) = step(&context, &plan, &scope).await;
@@ -217,7 +230,9 @@ async fn resumes_after_cursor() {
         done: 7,
         ..job.clone()
     };
-    let refused = job_page(&context, &plan(), &scope, &stale).await.unwrap();
+    let refused = drive(RemapJobOperation::new(&plan(), &scope, &stale), &context)
+        .await
+        .unwrap();
     assert_eq!(refused.cursor, stale.cursor);
     assert_eq!(stored(&context).await, job);
     // An interrupted job starts again from its stored cursor and redoes nothing.
@@ -228,9 +243,12 @@ async fn resumes_after_cursor() {
         }
     }
     assert_eq!(stored(&context).await.done, 600);
-    let page = preview_page(&context, &plan(), &scope, (None, None, MAX_PAGE))
-        .await
-        .unwrap();
+    let page = drive(
+        RemapPreviewOperation::new(&plan(), &scope, (None, None, MAX_PAGE)),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(page.total, 0);
     assert!(
         get(
@@ -254,16 +272,41 @@ async fn bounds_large_totals() {
     many(&context, TOTAL_SCAN).await;
     let access = load(&context).await;
     let scope = scope(&access);
-    let page = preview_page(&context, &plan(), &scope, (None, None, DEFAULT_PAGE))
-        .await
-        .unwrap();
+    let page = drive(
+        RemapPreviewOperation::new(&plan(), &scope, (None, None, DEFAULT_PAGE)),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!((page.total, page.complete), (TOTAL_SCAN as u64, false));
     assert_eq!(page.entries.len(), DEFAULT_PAGE);
     assert!(page.next.is_some());
     // A filter that matches nothing still stops at the key bound and names where.
-    let page = preview_page(&context, &plan(), &scope, (Some("absent"), None, 100))
-        .await
-        .unwrap();
+    let page = drive(
+        RemapPreviewOperation::new(&plan(), &scope, (Some("absent"), None, 100)),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!((page.total, page.complete), (0, false));
     assert!(page.entries.is_empty() && page.next.is_some());
+}
+
+#[tokio::test]
+async fn counts_selected_keys() {
+    let (_directory, context) = setup().await;
+    many(&context, 3).await;
+    let access = load(&context).await;
+    let count = CountSelectedOperation::new(&plan(), &scope(&access), None);
+    assert_eq!(drive(count, &context).await, Ok((3, true)));
+}
+
+#[tokio::test]
+async fn invalid_plan_refused() {
+    let (_directory, context) = setup().await;
+    let access = load(&context).await;
+    let mut bad = plan();
+    bad.template = String::new();
+    let mut preview = RemapPreviewOperation::new(&bad, &scope(&access), (None, None, 1));
+    assert!(matches!(preview.first(), Err(RenameError::Invalid(_))));
 }

@@ -9,6 +9,7 @@ pub mod listeners;
 pub mod realm;
 pub mod recovery;
 pub mod resources;
+mod sweeps;
 pub mod test_hooks;
 
 pub use resources::NodeResources;
