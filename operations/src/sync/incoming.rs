@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::driver::{DriverContext, drive};
+use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::after_sync::{apply_metadata, run_maintenance};
@@ -30,6 +31,7 @@ use aruna_core::task::TaskKey;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
+use aruna_net::job_control::{read_request, write_answer};
 use aruna_net::streams::BiStream;
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
@@ -579,16 +581,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     Box::pin(receive_heartbeat(self.context.as_ref(), stream, node_id)).await
                 }
                 Alpn::JobControl => {
-                    Box::pin(async {
-                        crate::jobs::protocol::handle_job_stream(
-                            self.context.as_ref(),
-                            &self.jobs_runtime,
-                            stream,
-                            node_id,
-                        )
-                        .await;
-                    })
-                    .await
+                    Box::pin(self.answer_job_stream(stream, node_id)).await
                 }
                 Alpn::Dht => {
                     warn!(
@@ -600,6 +593,24 @@ impl InboundEventHandler for OperationsInboundHandler {
         }
         .instrument(span)
         .await;
+    }
+
+    /// Answers one job-control request and signals the attempts a cancel reached.
+    async fn answer_job_stream(&self, mut stream: BiStream, peer: NodeId) {
+        let Some(request) = read_request(&mut stream, peer).await else {
+            return;
+        };
+        let context = self.context.as_ref();
+        let serving = context.node_and_realm();
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let serve = JobRequestOperation::new(peer, request, serving, now_ms);
+        let answer = drive(serve, context)
+            .await
+            .unwrap_or_else(JobAnswer::unavailable);
+        for job_id in answer.running {
+            self.jobs_runtime.request_cancel(job_id);
+        }
+        write_answer(stream, peer, &answer.response, answer.body).await;
     }
 
     async fn handle_evicted_documents(&self, documents: Vec<DocumentEvictedDocument>) -> bool {

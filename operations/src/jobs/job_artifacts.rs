@@ -10,7 +10,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, JobControlEffect, NetEffect};
 use aruna_core::events::{BlobEvent, Event, JobControlEvent, NetEvent};
 use aruna_core::id::NodeId;
-use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
+use aruna_core::jobs::{JobRequest, JobResponse, WireArtifact, WireRange};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::rows::event;
@@ -50,6 +50,31 @@ impl OwnedArtifact {
 
     pub fn same_content(&self, other: &Self) -> bool {
         self.blake3 == other.blake3 && self.size == other.size
+    }
+}
+
+impl From<&OwnedArtifact> for WireArtifact {
+    fn from(owned: &OwnedArtifact) -> Self {
+        Self {
+            job_id: owned.job_id,
+            created_by: owned.created_by,
+            blake3: owned.blake3,
+            size: owned.size,
+            filename: owned.filename.clone(),
+        }
+    }
+}
+
+impl From<WireArtifact> for OwnedArtifact {
+    fn from(owned: WireArtifact) -> Self {
+        Self {
+            job_id: owned.job_id,
+            created_by: owned.created_by,
+            blake3: owned.blake3,
+            size: owned.size,
+            filename: owned.filename,
+            artifact: None,
+        }
     }
 }
 

@@ -9,11 +9,13 @@ use aruna_core::alpn::Alpn;
 use aruna_core::events::JobControlEvent;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::stream::BackendStream;
+use futures::{Stream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
+use tracing::warn;
 
 use crate::NetHandle;
 use crate::streams::{BiStream, RecvStream, SendStream};
@@ -74,6 +76,62 @@ pub async fn send_request(
         None
     };
     Ok(JobReply { response, body })
+}
+
+/// Reads the request a peer opened a job-control stream with.
+pub async fn read_request(stream: &mut BiStream, peer: NodeId) -> Option<JobRequest> {
+    match timeout(JOB_IO_TIMEOUT, read_frame::<JobRequest>(&mut stream.1)).await {
+        Ok(Ok(request)) => Some(request),
+        Ok(Err(error)) => {
+            warn!(%peer, %error, "Failed to read job-control request");
+            None
+        }
+        Err(_) => {
+            warn!(%peer, "Timed out reading job-control request");
+            None
+        }
+    }
+}
+
+/// Writes the answer and its artifact bytes. Each source poll is bounded, so a stalled artifact
+/// reader releases its blob-read and inbound-handler permits instead of pinning them.
+pub async fn write_answer<B, C, E>(
+    mut stream: BiStream,
+    peer: NodeId,
+    response: &JobResponse,
+    body: Option<B>,
+) where
+    B: Stream<Item = Result<C, E>> + Unpin,
+    C: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let written = timeout(JOB_IO_TIMEOUT, write_frame(&mut stream.0, response)).await;
+    if !matches!(written, Ok(Ok(()))) {
+        return;
+    }
+    if let Some(mut body) = body {
+        loop {
+            let chunk = match timeout(JOB_IO_TIMEOUT, body.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(None) => break,
+                Ok(Some(Err(error))) => {
+                    warn!(%peer, %error, "Failed to read job artifact");
+                    stream.0.reset(1u32.into()).ok();
+                    return;
+                }
+                Err(_) => {
+                    warn!(%peer, "Timed out reading job artifact source");
+                    stream.0.reset(1u32.into()).ok();
+                    return;
+                }
+            };
+            let sent = timeout(JOB_IO_TIMEOUT, stream.0.write_all(chunk.as_ref())).await;
+            if !matches!(sent, Ok(Ok(()))) {
+                return;
+            }
+        }
+    }
+    stream.0.finish().ok();
 }
 
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {

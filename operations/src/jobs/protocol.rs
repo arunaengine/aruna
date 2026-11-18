@@ -1,323 +1,382 @@
-//! Carries job requests between nodes: sends one over the wire and serves an incoming stream.
+//! Answers job-control requests from other nodes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::jobs::lifecycle::alias::AliasFamilyOperation;
-use crate::jobs::route::JobRouteError;
-use std::sync::Arc;
-
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::PeerAuthRefusal;
+use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange};
 use aruna_core::metadata::AuthToken;
+use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobPayload};
+use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobRecord, KeyWait};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::time::unix_timestamp_millis;
-use aruna_net::job_control::{JOB_IO_TIMEOUT, read_frame, send_request, write_frame};
-use aruna_net::streams::BiStream;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use bytes::Bytes;
-use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
-use tokio::time::timeout;
-use tokio_util::io::ReaderStream;
-use tracing::warn;
 
-use super::runtime::JobsRuntime;
-use super::service::{
-    ArtifactLookup, CancelJobOutcome, JobReportLookup, OwnedArtifact, cancel_owned_job,
-    local_status, read_artifact_range, read_owned_artifact, read_owned_job, read_visible_report,
-    resolve_job_owner,
+use super::job_artifacts::{
+    ArtifactLookup, ArtifactRangeOperation, ArtifactRead, OwnedArtifact, OwnedArtifactOperation,
 };
-use super::staging::read_staging_checkpoint;
-use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::family_reads::FamilyStatusOperation;
-use crate::jobs::lifecycle::held::HeldReservations;
+use super::job_cancel::{
+    CancelJobOutcome, CancelOwnedOperation, CancelReport, MatchingRunsOperation,
+};
+use super::job_reads::{
+    JobOwnerOperation, JobReadError, LocalStatusOperation, RecordData, RecordDataOperation,
+};
+use super::job_reports::{JobReportLookup, JobReportOperation, ReportQuery};
+use super::key_locks::KeyCheckError;
+use super::lifecycle::alias::AliasFamilyOperation;
+use super::lifecycle::cancel::CancelFamilyOperation;
+use super::lifecycle::family_reads::FamilyStatusOperation;
+use super::records::pages::ServingNode;
+use super::records::verify::FamilyView;
+use super::remote_key::{AcceptWakeOperation, RegisterWaitsOperation};
+use super::route::{JobRouteError, RoutedJobStatus};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::write_peer::WritePeerOperation;
 
-use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange};
-
-impl From<&OwnedArtifact> for WireArtifact {
-    fn from(owned: &OwnedArtifact) -> Self {
-        Self {
-            job_id: owned.job_id,
-            created_by: owned.created_by,
-            blake3: owned.blake3,
-            size: owned.size,
-            filename: owned.filename.clone(),
-        }
-    }
-}
-
-impl From<WireArtifact> for OwnedArtifact {
-    fn from(owned: WireArtifact) -> Self {
-        Self {
-            job_id: owned.job_id,
-            created_by: owned.created_by,
-            blake3: owned.blake3,
-            size: owned.size,
-            filename: owned.filename,
-            artifact: None,
-        }
-    }
-}
-
-pub(crate) struct RemoteJobReply {
+/// What a job-control request is answered with. `running` names the local attempts the
+/// receiving node must signal, because a cancel reached them.
+#[derive(Debug, PartialEq)]
+pub struct JobAnswer {
     pub response: JobResponse,
     pub body: Option<BackendStream<Result<Bytes, StreamError>>>,
+    pub running: Vec<JobId>,
 }
 
-pub(crate) async fn send_job_request(
-    context: &DriverContext,
-    owner: NodeId,
-    request: JobRequest,
-) -> Result<RemoteJobReply, JobRouteError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
-    let reply = send_request(net_handle, owner, request)
-        .await
-        .map_err(JobRouteError::Unavailable)?;
-    Ok(RemoteJobReply {
-        response: reply.response,
-        body: reply
-            .body
-            .map(|stream| BackendStream::new(ReaderStream::new(stream.into_recv()))),
-    })
-}
-
-pub(crate) async fn handle_job_stream(
-    context: &DriverContext,
-    runtime: &Arc<JobsRuntime>,
-    mut stream: BiStream,
-    peer: NodeId,
-) {
-    let request = match timeout(JOB_IO_TIMEOUT, read_frame::<JobRequest>(&mut stream.1)).await {
-        Ok(Ok(request)) => request,
-        Ok(Err(error)) => {
-            warn!(%peer, %error, "Failed to read job-control request");
-            return;
-        }
-        Err(_) => {
-            warn!(%peer, "Timed out reading job-control request");
-            return;
-        }
-    };
-    let mut prepared = prepare_response(context, runtime, peer, request).await;
-    if !matches!(
-        timeout(
-            JOB_IO_TIMEOUT,
-            write_frame(&mut stream.0, &prepared.response)
-        )
-        .await,
-        Ok(Ok(()))
-    ) {
-        return;
-    }
-    if let Some(body) = prepared.body.as_mut() {
-        loop {
-            // Bound the source poll so a stalled artifact reader releases its
-            // blob-read and inbound-handler permits instead of pinning them.
-            let next = match timeout(JOB_IO_TIMEOUT, body.next()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    warn!(%peer, "Timed out reading job artifact source");
-                    stream.0.reset(1u32.into()).ok();
-                    return;
-                }
-            };
-            let Some(chunk) = next else {
-                break;
-            };
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    warn!(%peer, %error, "Failed to read job artifact");
-                    stream.0.reset(1u32.into()).ok();
-                    return;
-                }
-            };
-            if !matches!(
-                timeout(JOB_IO_TIMEOUT, stream.0.write_all(&chunk)).await,
-                Ok(Ok(()))
-            ) {
-                return;
-            }
-        }
-    }
-    stream.0.finish().ok();
-}
-
-struct PreparedResponse {
-    response: JobResponse,
-    body: Option<BackendStream<Result<Bytes, StreamError>>>,
-}
-
-impl PreparedResponse {
-    fn new(response: JobResponse) -> Self {
+impl JobAnswer {
+    pub fn new(response: JobResponse) -> Self {
         Self {
             response,
             body: None,
+            running: Vec::new(),
         }
+    }
+
+    pub fn unavailable(reason: impl std::fmt::Display) -> Self {
+        Self::new(JobResponse::Unavailable(reason.to_string()))
     }
 }
 
-async fn prepare_response(
-    context: &DriverContext,
-    runtime: &Arc<JobsRuntime>,
-    peer: NodeId,
-    request: JobRequest,
-) -> PreparedResponse {
-    let auth = match drive(WritePeerOperation::new(peer, request.auth_token()), context).await {
-        Ok(auth) => auth,
-        Err(PeerAuthRefusal::Unauthorized) => {
-            return PreparedResponse::new(JobResponse::Unauthorized);
-        }
-        Err(PeerAuthRefusal::Unavailable(reason)) => {
-            return PreparedResponse::new(JobResponse::Unavailable(reason));
-        }
-    };
-    let Some(local_realm_id) = context.net_handle.as_ref().map(|net| *net.realm_id()) else {
-        return PreparedResponse::new(JobResponse::Unavailable(
-            "job-control network handle unavailable".to_string(),
-        ));
-    };
-    if !auth_realm_matches(&auth, local_realm_id) {
-        return PreparedResponse::new(JobResponse::Forbidden);
-    }
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    match request {
-        // Owner-directed operations: only the immutable owner may answer them.
-        JobRequest::Status { job_id, .. } => {
-            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
-                return rejected;
-            }
-            prepare_status(context, &auth, job_id).await
-        }
-        JobRequest::Report {
-            job_id,
-            expected_digest,
-            last_key,
-            limit,
-            ..
-        } => {
-            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
-                return rejected;
-            }
-            prepare_report(
-                context,
-                &auth,
-                job_id,
-                expected_digest,
-                last_key,
-                usize::from(limit),
-            )
-            .await
-        }
-        JobRequest::Artifact { job_id, range, .. } => {
-            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
-                return rejected;
-            }
-            prepare_artifact(
-                context,
-                auth.user_id,
-                job_id,
-                unix_timestamp_millis(),
-                range,
-            )
-            .await
-        }
-        JobRequest::Cancel {
-            job_id, auth_token, ..
-        } => {
-            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
-                return rejected;
-            }
-            prepare_cancel(context, runtime, &auth, auth_token, job_id).await
-        }
-        JobRequest::Record { job_id, .. } => {
-            if let Some(rejected) = owner_gate(context, job_id, local_node).await {
-                return rejected;
-            }
-            prepare_record(context, auth.user_id, job_id).await
-        }
-        // Key waits address the node that holds the content or the job, not the job owner.
-        JobRequest::AwaitKeys {
-            job_id, targets, ..
-        } => PreparedResponse::new(match local_node {
-            Some(node) => {
-                let nodes = (node, peer);
-                let waits =
-                    super::remote_key::register_waits(context, nodes, &auth, job_id, &targets);
-                match waits.await {
-                    Ok(locked) => JobResponse::KeysLocked(locked),
-                    Err(error) => JobResponse::Unavailable(error),
-                }
-            }
-            None => JobResponse::Unavailable("job-control network handle unavailable".into()),
-        }),
-        JobRequest::KeyWake { job_id, key, .. } => PreparedResponse::new(
-            match super::remote_key::accept_wake(context, peer, &auth, job_id, key).await {
-                Ok(true) => JobResponse::KeyWakeAcked,
-                Ok(false) => JobResponse::Unavailable("job is still parking".to_string()),
-                Err(error) => JobResponse::Unavailable(error),
-            },
-        ),
-    }
+type AnswerNext = Result<Next<JobAnswer>, IoError>;
+
+fn answer(response: JobResponse) -> AnswerNext {
+    Ok(Next::Done(JobAnswer::new(response)))
 }
 
-async fn prepare_record(
-    context: &DriverContext,
+fn refuse(reason: impl std::fmt::Display) -> AnswerNext {
+    Ok(Next::Done(JobAnswer::unavailable(reason)))
+}
+
+/// Opens the requested artifact range, which a plain lookup leaves closed.
+#[derive(Debug, PartialEq)]
+pub struct ServeArtifactOperation {
     user_id: UserId,
     job_id: JobId,
-) -> PreparedResponse {
-    let record = match read_owned_job(context, user_id, job_id).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return PreparedResponse::new(JobResponse::NotFound),
-        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
-    };
-    let checkpoint = if matches!(&record.payload, JobPayload::Staging(_)) {
-        match read_staging_checkpoint(context, job_id).await {
-            Ok(checkpoint) => checkpoint,
-            Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
-        }
-    } else {
-        None
-    };
-    PreparedResponse::new(JobResponse::Record {
-        record: Box::new(record),
-        checkpoint,
-    })
+    now_ms: u64,
+    range: Option<WireRange>,
+    ready: Option<WireArtifact>,
 }
 
-/// Who may answer for a job here: its immutable owner, or any node that knows
-/// the request family the alias belongs to. Only the derived owner is absence
-/// authority: others answer `Unavailable`, and an invalid id is `NotFound`.
-async fn owner_gate(
-    context: &DriverContext,
-    job_id: JobId,
-    local_node: Option<NodeId>,
-) -> Option<PreparedResponse> {
-    match drive(AliasFamilyOperation::new(job_id), context).await {
-        Ok(Some(_)) => return None,
-        Ok(None) => {}
-        Err(error) => {
-            return Some(PreparedResponse::new(JobResponse::Unavailable(
-                error.to_string(),
-            )));
+impl ServeArtifactOperation {
+    pub fn new(user_id: UserId, job_id: JobId, now_ms: u64, range: Option<WireRange>) -> Self {
+        Self {
+            user_id,
+            job_id,
+            now_ms,
+            range,
+            ready: None,
         }
     }
-    match resolve_job_owner(context, job_id).await {
-        Ok(owner) if local_node == Some(owner) => None,
-        Ok(_) => Some(PreparedResponse::new(JobResponse::Unavailable(
-            "receiving node does not own this job".to_string(),
-        ))),
-        Err(JobRouteError::NotFound) => Some(PreparedResponse::new(JobResponse::NotFound)),
-        Err(error) => Some(PreparedResponse::new(JobResponse::Unavailable(
-            error.to_string(),
-        ))),
+
+    fn found(&mut self, owned: OwnedArtifact) -> AnswerNext {
+        let wire = WireArtifact::from(&owned);
+        let Some(range) = self.range.as_ref() else {
+            return answer(JobResponse::ArtifactReady {
+                owned: wire,
+                stream_size: 0,
+            });
+        };
+        if range.start >= range.end || range.end > owned.size {
+            return refuse("invalid job artifact range");
+        }
+        let Some(artifact) = owned.source() else {
+            return refuse("local artifact source is unavailable");
+        };
+        let read = ArtifactRangeOperation::new(artifact, range.start..range.end);
+        self.ready = Some(wire);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn opened(&self, wire: WireArtifact, read: ArtifactRead) -> AnswerNext {
+        let expected = self.range.as_ref().map(|range| range.end - range.start);
+        if Some(read.stream_size) != expected {
+            return refuse("artifact reader returned an unexpected range size");
+        }
+        Ok(Next::Done(JobAnswer {
+            response: JobResponse::ArtifactReady {
+                owned: wire,
+                stream_size: read.stream_size,
+            },
+            body: Some(read.blob),
+            running: Vec::new(),
+        }))
+    }
+}
+
+impl Operation for ServeArtifactOperation {
+    type Output = JobAnswer;
+    type Error = IoError;
+
+    fn first(&mut self) -> AnswerNext {
+        let read = OwnedArtifactOperation::new(self.user_id, self.job_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> AnswerNext {
+        if let Some(wire) = self.ready.take() {
+            return match result.child::<ArtifactRead, JobReadError>()? {
+                Ok(read) => self.opened(wire, read),
+                Err(error) => refuse(error),
+            };
+        }
+        match result.child::<ArtifactLookup, JobReadError>()? {
+            Ok(ArtifactLookup::NotFound) => answer(JobResponse::NotFound),
+            Ok(ArtifactLookup::Pending(state)) => answer(JobResponse::ArtifactPending(state)),
+            Ok(ArtifactLookup::Gone) => answer(JobResponse::ArtifactGone),
+            Ok(ArtifactLookup::Ready(owned)) => self.found(owned),
+            Err(error) => refuse(error),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CancelStep {
+    Alias,
+    Config,
+    Publish,
+    Runs,
+    Stop,
+    Status,
+    Local,
+}
+
+/// Serves a cancel that reached this node. A family holder publishes the record and stops its
+/// own executions. Any other node answers only for its executions and never forwards again,
+/// since divergent holder views would bounce the cancel.
+#[derive(Debug, PartialEq)]
+pub struct ServeCancelOperation {
+    auth: AuthContext,
+    token: AuthToken,
+    job_id: JobId,
+    serving: ServingNode,
+    now_ms: u64,
+    step: CancelStep,
+    family: Option<JobFamilyId>,
+    holds: bool,
+    /// Physical jobs still to stop, the next one last.
+    pending: Vec<JobId>,
+    stopped: Option<(Box<JobRecord>, bool)>,
+    running: Vec<JobId>,
+}
+
+fn route_refusal(error: JobRouteError) -> JobResponse {
+    match error {
+        JobRouteError::Forbidden => JobResponse::Forbidden,
+        JobRouteError::Unauthorized => JobResponse::Unauthorized,
+        JobRouteError::NotFound => JobResponse::NotFound,
+        error => JobResponse::Unavailable(error.to_string()),
+    }
+}
+
+impl ServeCancelOperation {
+    pub fn new(
+        auth: &AuthContext,
+        token: AuthToken,
+        job_id: JobId,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            auth: auth.clone(),
+            token,
+            job_id,
+            serving,
+            now_ms,
+            step: CancelStep::Alias,
+            family: None,
+            holds: false,
+            pending: Vec::new(),
+            stopped: None,
+            running: Vec::new(),
+        }
+    }
+
+    fn done(&mut self, response: JobResponse) -> AnswerNext {
+        Ok(Next::Done(JobAnswer {
+            response,
+            body: None,
+            running: std::mem::take(&mut self.running),
+        }))
+    }
+
+    fn matching_runs(&mut self) -> AnswerNext {
+        self.step = CancelStep::Runs;
+        let runs = MatchingRunsOperation::new(self.job_id, self.family);
+        Ok(Next::Call(IoCall::child(runs)))
+    }
+
+    fn cancel_local(&mut self, job_id: JobId, step: CancelStep) -> AnswerNext {
+        self.step = step;
+        let cancel = CancelOwnedOperation::new(self.auth.user_id, job_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(cancel)))
+    }
+
+    fn configured(&mut self, config: &RealmConfigDocument) -> AnswerNext {
+        let (Some((local, realm_id)), Some(family)) = (self.serving, self.family) else {
+            return self.done(JobResponse::Unavailable(
+                JobRouteError::Unavailable("network handle unavailable".to_string()).to_string(),
+            ));
+        };
+        let Some(view) = FamilyView::resolve(config, realm_id, family) else {
+            let error = JobRouteError::Unavailable("job family holder view unavailable".into());
+            return self.done(JobResponse::Unavailable(error.to_string()));
+        };
+        self.holds = view.holds(local);
+        if !self.holds {
+            return self.matching_runs();
+        }
+        self.step = CancelStep::Publish;
+        let cancel = CancelFamilyOperation::new(
+            &self.auth,
+            self.job_id,
+            Some(self.token.clone()),
+            self.serving,
+            self.now_ms,
+        );
+        Ok(Next::Call(IoCall::child(cancel)))
+    }
+
+    fn stop_next(&mut self) -> AnswerNext {
+        if let Some(job_id) = self.pending.pop() {
+            return self.cancel_local(job_id, CancelStep::Stop);
+        }
+        if self.holds {
+            self.step = CancelStep::Status;
+            let status = FamilyStatusOperation::new(&self.auth, self.job_id, self.now_ms);
+            return Ok(Next::Call(IoCall::child(status)));
+        }
+        if let Some((record, terminal)) = self.stopped.take() {
+            let mut job = JobStatusView::from(&*record);
+            job.job_id = self.job_id;
+            return self.done(JobResponse::Cancelled { job, terminal });
+        }
+        if self.family.is_some() {
+            // Availability, never a verdict: the caller keeps asking the holders its own view
+            // names instead of this node forwarding a second hop.
+            return self.done(JobResponse::Unavailable(
+                "this node does not hold the job family".to_string(),
+            ));
+        }
+        self.cancel_local(self.job_id, CancelStep::Local)
+    }
+
+    fn stopped_run(&mut self, result: IoResult) -> AnswerNext {
+        let report = match result.child::<CancelReport<CancelJobOutcome>, JobReadError>()? {
+            Ok(report) => report,
+            Err(error) => return self.done(JobResponse::Unavailable(error.0)),
+        };
+        self.running.extend(report.running);
+        match report.outcome {
+            CancelJobOutcome::AlreadyTerminal(record) => {
+                self.stopped = Some((Box::new(record), true));
+            }
+            CancelJobOutcome::Requested(record) => {
+                self.stopped = Some((Box::new(record), false));
+            }
+            CancelJobOutcome::NotFound => {}
+        }
+        self.stop_next()
+    }
+
+    fn local_answer(&mut self, result: IoResult) -> AnswerNext {
+        let report = match result.child::<CancelReport<CancelJobOutcome>, JobReadError>()? {
+            Ok(report) => report,
+            Err(error) => return self.done(JobResponse::Unavailable(error.0)),
+        };
+        self.running.extend(report.running);
+        self.done(match report.outcome {
+            CancelJobOutcome::NotFound => JobResponse::NotFound,
+            CancelJobOutcome::AlreadyTerminal(record) => JobResponse::Cancelled {
+                job: JobStatusView::from(&record),
+                terminal: true,
+            },
+            CancelJobOutcome::Requested(record) => JobResponse::Cancelled {
+                job: JobStatusView::from(&record),
+                terminal: false,
+            },
+        })
+    }
+}
+
+impl Operation for ServeCancelOperation {
+    type Output = JobAnswer;
+    type Error = IoError;
+
+    fn first(&mut self) -> AnswerNext {
+        let alias = AliasFamilyOperation::new(self.job_id);
+        Ok(Next::Call(IoCall::child(alias)))
+    }
+
+    fn next(&mut self, result: IoResult) -> AnswerNext {
+        match self.step {
+            CancelStep::Alias => match result.child::<Option<JobFamilyId>, JobRouteError>()? {
+                Ok(None) => self.matching_runs(),
+                Ok(Some(family)) => {
+                    let Some((_, realm_id)) = self.serving else {
+                        let error = JobRouteError::Unavailable("network handle unavailable".into());
+                        return self.done(JobResponse::Unavailable(error.to_string()));
+                    };
+                    self.family = Some(family);
+                    self.step = CancelStep::Config;
+                    Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+                }
+                Err(error) => self.done(JobResponse::Unavailable(error.to_string())),
+            },
+            CancelStep::Config => match result.child::<RealmConfigDocument, GetConfigError>()? {
+                Ok(config) => self.configured(&config),
+                Err(_) => {
+                    let error = JobRouteError::Unavailable("realm config unavailable".into());
+                    self.done(JobResponse::Unavailable(error.to_string()))
+                }
+            },
+            CancelStep::Publish => match result.child::<Option<()>, JobRouteError>()? {
+                Ok(Some(())) => self.matching_runs(),
+                Ok(None) => self.cancel_local(self.job_id, CancelStep::Local),
+                Err(error) => self.done(route_refusal(error)),
+            },
+            CancelStep::Runs => match result.child::<Vec<JobId>, JobRouteError>()? {
+                Ok(mut runs) => {
+                    runs.reverse();
+                    self.pending = runs;
+                    self.stop_next()
+                }
+                Err(error) => self.done(JobResponse::Unavailable(error.to_string())),
+            },
+            CancelStep::Stop => self.stopped_run(result),
+            CancelStep::Status => {
+                match result.child::<Option<RoutedJobStatus>, JobRouteError>()? {
+                    Ok(Some(status)) => self.done(JobResponse::Cancelled {
+                        terminal: status.job.state.is_terminal(),
+                        job: status.job,
+                    }),
+                    Ok(None) => self.done(JobResponse::NotFound),
+                    Err(error) => self.done(route_refusal(error)),
+                }
+            }
+            CancelStep::Local => self.local_answer(result),
+        }
     }
 }
 
@@ -326,317 +385,253 @@ fn auth_realm_matches(auth: &AuthContext, realm_id: RealmId) -> bool {
     auth.realm_id == realm_id && (auth.user_id.realm_id == realm_id || !auth.user_id.is_nil())
 }
 
-async fn prepare_status(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-) -> PreparedResponse {
-    match local_status(context, auth, job_id).await {
-        Ok(status) => PreparedResponse::new(JobResponse::Status {
+fn status_answer(result: Result<RoutedJobStatus, JobRouteError>) -> JobResponse {
+    match result {
+        Ok(status) => JobResponse::Status {
             job: status.job,
             run_crate: status.run_crate.map(|value| value.to_string()),
-        }),
-        Err(JobRouteError::NotFound) => PreparedResponse::new(JobResponse::NotFound),
-        Err(error) => PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
+        },
+        Err(JobRouteError::NotFound) => JobResponse::NotFound,
+        Err(error) => JobResponse::Unavailable(error.to_string()),
     }
 }
 
-async fn prepare_report(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-    expected_digest: Option<[u8; 32]>,
-    last_key: Option<Vec<u8>>,
-    limit: usize,
-) -> PreparedResponse {
-    let response =
-        match read_visible_report(context, auth, job_id, expected_digest, last_key, limit).await {
-            Ok(JobReportLookup::NotFound) => JobResponse::NotFound,
-            Ok(JobReportLookup::Pending(state)) => JobResponse::ReportPending(state),
-            Ok(JobReportLookup::CursorConflict) => JobResponse::ReportConflict,
-            Ok(JobReportLookup::Ready {
-                job,
-                rows,
-                next_key,
-            }) => JobResponse::ReportReady {
-                job,
-                rows: rows
-                    .into_iter()
-                    .map(|(key, value)| (key, value.as_ref().to_vec()))
-                    .collect(),
-                next_key,
-            },
-            Err(error) => JobResponse::Unavailable(error),
-        };
-    PreparedResponse::new(response)
+fn report_answer(result: Result<JobReportLookup, JobReadError>) -> JobResponse {
+    match result {
+        Ok(JobReportLookup::NotFound) => JobResponse::NotFound,
+        Ok(JobReportLookup::Pending(state)) => JobResponse::ReportPending(state),
+        Ok(JobReportLookup::CursorConflict) => JobResponse::ReportConflict,
+        Ok(JobReportLookup::Ready {
+            job,
+            rows,
+            next_key,
+        }) => JobResponse::ReportReady {
+            job,
+            rows: rows
+                .into_iter()
+                .map(|(key, value)| (key, value.as_ref().to_vec()))
+                .collect(),
+            next_key,
+        },
+        Err(error) => JobResponse::Unavailable(error.0),
+    }
 }
 
-async fn prepare_artifact(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
+fn record_answer(result: Result<Option<RecordData>, JobReadError>) -> JobResponse {
+    match result {
+        Ok(Some((record, checkpoint))) => JobResponse::Record {
+            record: Box::new(record),
+            checkpoint,
+        },
+        Ok(None) => JobResponse::NotFound,
+        Err(error) => JobResponse::Unavailable(error.0),
+    }
+}
+
+fn waits_answer(result: Result<Vec<KeyWait>, KeyCheckError>) -> JobResponse {
+    match result {
+        Ok(locked) => JobResponse::KeysLocked(locked),
+        Err(error) => JobResponse::Unavailable(error.0),
+    }
+}
+
+fn wake_answer(result: Result<bool, KeyCheckError>) -> JobResponse {
+    match result {
+        Ok(true) => JobResponse::KeyWakeAcked,
+        Ok(false) => JobResponse::Unavailable("job is still parking".to_string()),
+        Err(error) => JobResponse::Unavailable(error.0),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum RequestStep {
+    Auth,
+    Alias,
+    Owner,
+    Status,
+    Report,
+    Served,
+    Record,
+    Waits,
+    Wake,
+}
+
+/// Authenticates one job-control request and answers it. Owner-directed requests are answered
+/// by the immutable owner or a node that knows the job's family; key waits address the node
+/// that holds the content or the job instead. Every refusal is an answer to the peer.
+#[derive(Debug, PartialEq)]
+pub struct JobRequestOperation {
+    peer: NodeId,
+    request: Option<JobRequest>,
+    serving: ServingNode,
     now_ms: u64,
-    range: Option<WireRange>,
-) -> PreparedResponse {
-    let owned = match read_owned_artifact(context, user_id, job_id, now_ms).await {
-        Ok(ArtifactLookup::NotFound) => {
-            return PreparedResponse::new(JobResponse::NotFound);
-        }
-        Ok(ArtifactLookup::Pending(state)) => {
-            return PreparedResponse::new(JobResponse::ArtifactPending(state));
-        }
-        Ok(ArtifactLookup::Gone) => {
-            return PreparedResponse::new(JobResponse::ArtifactGone);
-        }
-        Ok(ArtifactLookup::Ready(owned)) => owned,
-        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
-    };
-    let Some(range) = range else {
-        return PreparedResponse::new(JobResponse::ArtifactReady {
-            owned: WireArtifact::from(&owned),
-            stream_size: 0,
-        });
-    };
-    if range.start >= range.end || range.end > owned.size {
-        return PreparedResponse::new(JobResponse::Unavailable(
-            "invalid job artifact range".to_string(),
-        ));
-    }
-    let Some(artifact) = owned.source() else {
-        return PreparedResponse::new(JobResponse::Unavailable(
-            "local artifact source is unavailable".to_string(),
-        ));
-    };
-    let read = match read_artifact_range(context, artifact, range.start..range.end).await {
-        Ok(read) => read,
-        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
-    };
-    if read.stream_size != range.end - range.start {
-        return PreparedResponse::new(JobResponse::Unavailable(
-            "artifact reader returned an unexpected range size".to_string(),
-        ));
-    }
-    PreparedResponse {
-        response: JobResponse::ArtifactReady {
-            owned: WireArtifact::from(&owned),
-            stream_size: read.stream_size,
-        },
-        body: Some(read.blob),
-    }
+    auth: Option<AuthContext>,
+    step: RequestStep,
 }
 
-async fn prepare_cancel(
-    context: &DriverContext,
-    runtime: &Arc<JobsRuntime>,
-    auth: &AuthContext,
-    auth_token: AuthToken,
-    job_id: JobId,
-) -> PreparedResponse {
-    let requested_family = match drive(AliasFamilyOperation::new(job_id), context).await {
-        Ok(family) => family,
-        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
-    };
-    let holds = match holds_family(context, requested_family).await {
-        Ok(holds) => holds,
-        Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
-    };
-    // A cancel that already reached this node is never forwarded again: divergent
-    // holder views would bounce it. A non-holder answers only for its executions.
-    if !holds {
-        let reservations = match drive(HeldReservations::all(), context).await {
-            Ok(reservations) => reservations,
-            Err(error) => {
-                return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+impl JobRequestOperation {
+    pub fn new(peer: NodeId, request: JobRequest, serving: ServingNode, now_ms: u64) -> Self {
+        Self {
+            peer,
+            request: Some(request),
+            serving,
+            now_ms,
+            auth: None,
+            step: RequestStep::Auth,
+        }
+    }
+
+    fn job_id(&self) -> Option<JobId> {
+        match self.request.as_ref()? {
+            JobRequest::Status { job_id, .. }
+            | JobRequest::Report { job_id, .. }
+            | JobRequest::Artifact { job_id, .. }
+            | JobRequest::Cancel { job_id, .. }
+            | JobRequest::Record { job_id, .. } => Some(*job_id),
+            JobRequest::AwaitKeys { .. } | JobRequest::KeyWake { .. } => None,
+        }
+    }
+
+    fn authenticated(&mut self, auth: AuthContext) -> AnswerNext {
+        let Some((_, realm_id)) = self.serving else {
+            return refuse("job-control network handle unavailable");
+        };
+        if !auth_realm_matches(&auth, realm_id) {
+            return answer(JobResponse::Forbidden);
+        }
+        self.auth = Some(auth);
+        match self.job_id() {
+            Some(job_id) => {
+                self.step = RequestStep::Alias;
+                let alias = AliasFamilyOperation::new(job_id);
+                Ok(Next::Call(IoCall::child(alias)))
+            }
+            None => self.serve(),
+        }
+    }
+
+    fn serve(&mut self) -> AnswerNext {
+        let (Some(request), Some(auth), Some((local, _))) =
+            (self.request.take(), self.auth.as_ref(), self.serving)
+        else {
+            return refuse("job-control network handle unavailable");
+        };
+        let serving = self.serving;
+        let now_ms = self.now_ms;
+        let (step, call) = match request {
+            JobRequest::Status { job_id, .. } => (
+                RequestStep::Status,
+                IoCall::child(LocalStatusOperation::new(auth, job_id, serving)),
+            ),
+            JobRequest::Report {
+                job_id,
+                expected_digest,
+                last_key,
+                limit,
+                ..
+            } => {
+                let query = ReportQuery {
+                    expected_digest,
+                    last_key,
+                    limit: usize::from(limit),
+                };
+                let read = JobReportOperation::visible(auth, job_id, query, serving, now_ms);
+                (RequestStep::Report, IoCall::child(read))
+            }
+            JobRequest::Artifact { job_id, range, .. } => {
+                let serve = ServeArtifactOperation::new(auth.user_id, job_id, now_ms, range);
+                (RequestStep::Served, IoCall::child(serve))
+            }
+            JobRequest::Cancel {
+                job_id, auth_token, ..
+            } => {
+                let serve = ServeCancelOperation::new(auth, auth_token, job_id, serving, now_ms);
+                (RequestStep::Served, IoCall::child(serve))
+            }
+            JobRequest::Record { job_id, .. } => (
+                RequestStep::Record,
+                IoCall::child(RecordDataOperation::new(auth.user_id, job_id)),
+            ),
+            JobRequest::AwaitKeys {
+                job_id, targets, ..
+            } => {
+                let nodes = (local, self.peer);
+                let register = RegisterWaitsOperation::new(nodes, auth, job_id, &targets);
+                (RequestStep::Waits, IoCall::child(register))
+            }
+            JobRequest::KeyWake { job_id, key, .. } => {
+                let accept = AcceptWakeOperation::new(self.peer, auth.user_id, job_id, key, now_ms);
+                (RequestStep::Wake, IoCall::child(accept))
             }
         };
-        let mut stopped = None;
-        for reservation in reservations {
-            let matches = match reservation_matches(
-                context,
-                job_id,
-                requested_family,
-                reservation.logical_job_id,
-            )
-            .await
-            {
-                Ok(matches) => matches,
-                Err(error) => {
-                    return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
-                }
-            };
-            if !matches {
-                continue;
-            }
-            match cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await {
-                Ok(CancelJobOutcome::AlreadyTerminal(record)) => {
-                    stopped = Some((record, true));
-                }
-                Ok(CancelJobOutcome::Requested(record)) => {
-                    stopped = Some((record, false));
-                }
-                Ok(CancelJobOutcome::NotFound) => {}
-                Err(error) => {
-                    return PreparedResponse::new(JobResponse::Unavailable(error));
-                }
-            }
-        }
-        if let Some((record, terminal)) = stopped {
-            let mut job = JobStatusView::from(&record);
-            job.job_id = job_id;
-            return PreparedResponse::new(JobResponse::Cancelled { job, terminal });
-        }
-        if requested_family.is_some() {
-            // Availability, never a verdict: the caller keeps asking the holders
-            // its own view names instead of this node forwarding a second hop.
-            return PreparedResponse::new(JobResponse::Unavailable(
-                "this node does not hold the job family".to_string(),
-            ));
-        }
-        return local_cancel(context, runtime, auth.user_id, job_id).await;
+        self.step = step;
+        Ok(Next::Call(call))
     }
-    // A forwarded cancel reaches a family holder here: it publishes the record
-    // and then still stops its own local execution row if it has one.
-    match drive(
-        crate::jobs::lifecycle::cancel::CancelFamilyOperation::new(
-            auth,
-            job_id,
-            Some(auth_token.clone()),
-            context.node_and_realm(),
-            aruna_core::time::unix_timestamp_millis(),
-        ),
-        context,
-    )
-    .await
-    .transpose()
-    {
-        Some(Ok(())) => {
-            let reservations = match drive(HeldReservations::all(), context).await {
-                Ok(reservations) => reservations,
-                Err(error) => {
-                    return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
-                }
-            };
-            for reservation in reservations {
-                let matches = match reservation_matches(
-                    context,
-                    job_id,
-                    requested_family,
-                    reservation.logical_job_id,
-                )
-                .await
-                {
-                    Ok(matches) => matches,
-                    Err(error) => {
-                        return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
-                    }
-                };
-                if !matches {
-                    continue;
-                }
-                if let Err(error) =
-                    cancel_owned_job(context, runtime, auth.user_id, reservation.job_id).await
-                {
-                    return PreparedResponse::new(JobResponse::Unavailable(error));
-                }
-            }
-            return match drive(
-                FamilyStatusOperation::new(auth, job_id, aruna_core::time::unix_timestamp_millis()),
-                context,
-            )
-            .await
-            .transpose()
-            {
-                Some(Ok(status)) => PreparedResponse::new(JobResponse::Cancelled {
-                    terminal: status.job.state.is_terminal(),
-                    job: status.job,
-                }),
-                Some(Err(JobRouteError::Forbidden)) => {
-                    PreparedResponse::new(JobResponse::Forbidden)
-                }
-                Some(Err(JobRouteError::Unauthorized)) => {
-                    PreparedResponse::new(JobResponse::Unauthorized)
-                }
-                Some(Err(JobRouteError::NotFound)) | None => {
-                    PreparedResponse::new(JobResponse::NotFound)
-                }
-                Some(Err(error)) => {
-                    PreparedResponse::new(JobResponse::Unavailable(error.to_string()))
-                }
-            };
+
+    fn owner_known(&mut self, owner: Result<NodeId, JobRouteError>) -> AnswerNext {
+        match owner {
+            Ok(owner) if self.serving.map(|(local, _)| local) == Some(owner) => self.serve(),
+            Ok(_) => refuse("receiving node does not own this job"),
+            Err(JobRouteError::NotFound) => answer(JobResponse::NotFound),
+            Err(error) => refuse(error),
         }
-        Some(Err(error)) => {
-            return PreparedResponse::new(match error {
-                JobRouteError::Forbidden => JobResponse::Forbidden,
-                JobRouteError::Unauthorized => JobResponse::Unauthorized,
-                JobRouteError::NotFound => JobResponse::NotFound,
-                error => JobResponse::Unavailable(error.to_string()),
-            });
-        }
-        None => {}
     }
-    local_cancel(context, runtime, auth.user_id, job_id).await
 }
 
-/// Stops the local execution row of one job, whatever the family decided.
-async fn local_cancel(
-    context: &DriverContext,
-    runtime: &Arc<JobsRuntime>,
-    user_id: UserId,
-    job_id: JobId,
-) -> PreparedResponse {
-    let response = match cancel_owned_job(context, runtime, user_id, job_id).await {
-        Ok(CancelJobOutcome::NotFound) => JobResponse::NotFound,
-        Ok(CancelJobOutcome::AlreadyTerminal(record)) => JobResponse::Cancelled {
-            job: JobStatusView::from(&record),
-            terminal: true,
-        },
-        Ok(CancelJobOutcome::Requested(record)) => JobResponse::Cancelled {
-            job: JobStatusView::from(&record),
-            terminal: false,
-        },
-        Err(error) => JobResponse::Unavailable(error),
-    };
-    PreparedResponse::new(response)
-}
+impl Operation for JobRequestOperation {
+    type Output = JobAnswer;
+    type Error = IoError;
 
-async fn holds_family(
-    context: &DriverContext,
-    family: Option<JobFamilyId>,
-) -> Result<bool, JobRouteError> {
-    let Some(family) = family else {
-        return Ok(false);
-    };
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
-    let config = crate::realm::load_config::load_realm_config(context, *net.realm_id())
-        .await
-        .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
-    let view = crate::jobs::records::verify::FamilyView::resolve(&config, *net.realm_id(), family)
-        .ok_or_else(|| {
-            JobRouteError::Unavailable("job family holder view unavailable".to_string())
-        })?;
-    Ok(view.holds(net.node_id()))
-}
+    fn first(&mut self) -> AnswerNext {
+        let Some(request) = self.request.as_ref() else {
+            return Err(IoError::Unfinished);
+        };
+        let check = WritePeerOperation::new(self.peer, request.auth_token());
+        Ok(Next::Call(IoCall::child(check)))
+    }
 
-async fn reservation_matches(
-    context: &DriverContext,
-    requested_alias: JobId,
-    requested_family: Option<JobFamilyId>,
-    reservation_alias: JobId,
-) -> Result<bool, JobRouteError> {
-    match requested_family {
-        Some(family) => {
-            Ok(drive(AliasFamilyOperation::new(reservation_alias), context).await? == Some(family))
+    fn next(&mut self, result: IoResult) -> AnswerNext {
+        match self.step {
+            RequestStep::Auth => match result.child::<AuthContext, PeerAuthRefusal>()? {
+                Ok(auth) => self.authenticated(auth),
+                Err(PeerAuthRefusal::Unauthorized) => answer(JobResponse::Unauthorized),
+                Err(PeerAuthRefusal::Unavailable(reason)) => {
+                    answer(JobResponse::Unavailable(reason))
+                }
+            },
+            RequestStep::Alias => match result.child::<Option<JobFamilyId>, JobRouteError>()? {
+                Ok(Some(_)) => self.serve(),
+                Ok(None) => {
+                    let Some(job_id) = self.job_id() else {
+                        return Err(IoError::Unfinished);
+                    };
+                    self.step = RequestStep::Owner;
+                    let owner = JobOwnerOperation::new(job_id, self.serving);
+                    Ok(Next::Call(IoCall::child(owner)))
+                }
+                Err(error) => refuse(error),
+            },
+            RequestStep::Owner => {
+                let owner = result.child::<NodeId, JobRouteError>()?;
+                self.owner_known(owner)
+            }
+            RequestStep::Status => answer(status_answer(result.child()?)),
+            RequestStep::Report => answer(report_answer(result.child()?)),
+            RequestStep::Record => answer(record_answer(result.child()?)),
+            RequestStep::Waits => answer(waits_answer(result.child()?)),
+            RequestStep::Wake => answer(wake_answer(result.child()?)),
+            RequestStep::Served => match result.child::<JobAnswer, IoError>()? {
+                Ok(served) => Ok(Next::Done(served)),
+                Err(error) => refuse(error),
+            },
         }
-        None => Ok(requested_alias == reservation_alias),
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+    use crate::jobs::job_reads::tests::{auth_of, child, is_child, job_id, node, owner, realm};
     use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
     use ulid::Ulid;
 
@@ -644,6 +639,214 @@ mod pure_tests {
 
     fn user(realm_id: RealmId) -> UserId {
         UserId::new(Ulid::from_bytes([2u8; 16]), realm_id)
+    }
+
+    fn serving() -> ServingNode {
+        Some((node(1), realm()))
+    }
+
+    fn token() -> AuthToken {
+        AuthToken::internal(auth_of(owner()))
+    }
+
+    fn status_request() -> JobRequest {
+        JobRequest::Status {
+            auth_token: token(),
+            job_id: job_id(),
+        }
+    }
+
+    fn authed(request: JobRequest) -> JobRequestOperation {
+        let mut serve = JobRequestOperation::new(node(2), request, serving(), 5);
+        assert!(is_child(&serve.first().unwrap()));
+        assert!(is_child(
+            &serve
+                .next(child(Ok::<_, PeerAuthRefusal>(auth_of(owner()))))
+                .unwrap()
+        ));
+        serve
+    }
+
+    fn done_response(next: AnswerNext) -> JobResponse {
+        match next.unwrap() {
+            Next::Done(answer) => answer.response,
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+
+    // A refused peer gets its verdict, and no network means no answer for it.
+    #[test]
+    fn peer_refusals_answered() {
+        let mut serve = JobRequestOperation::new(node(2), status_request(), serving(), 5);
+        let denied = child(Err::<AuthContext, _>(PeerAuthRefusal::Unauthorized));
+        assert_eq!(done_response(serve.next(denied)), JobResponse::Unauthorized);
+        let mut offline = JobRequestOperation::new(node(2), status_request(), None, 5);
+        let accepted = child(Ok::<_, PeerAuthRefusal>(auth_of(owner())));
+        assert!(matches!(
+            done_response(offline.next(accepted)),
+            JobResponse::Unavailable(_)
+        ));
+    }
+
+    // A known family skips the owner check, and a foreign owner is refused.
+    #[test]
+    fn owner_gate_applies() {
+        let family = JobFamilyId {
+            submission_id: Ulid::from_bytes([7u8; 16]),
+            request_digest: [8u8; 32],
+        };
+        let mut serve = authed(status_request());
+        let known = child(Ok::<_, JobRouteError>(Some(family)));
+        assert!(is_child(&serve.next(known).unwrap()));
+        assert_eq!(serve.step, RequestStep::Status);
+
+        let mut serve = authed(status_request());
+        let unknown = child(Ok::<Option<JobFamilyId>, JobRouteError>(None));
+        assert!(is_child(&serve.next(unknown).unwrap()));
+        assert_eq!(serve.step, RequestStep::Owner);
+        let foreign = child(Ok::<_, JobRouteError>(node(9)));
+        assert!(matches!(
+            done_response(serve.next(foreign)),
+            JobResponse::Unavailable(reason) if reason.contains("does not own")
+        ));
+
+        let mut serve = authed(status_request());
+        serve
+            .next(child(Ok::<Option<JobFamilyId>, JobRouteError>(None)))
+            .unwrap();
+        let invalid = child(Err::<NodeId, _>(JobRouteError::NotFound));
+        assert_eq!(done_response(serve.next(invalid)), JobResponse::NotFound);
+    }
+
+    // Key waits are answered without the owner check.
+    #[test]
+    fn key_wake_ungated() {
+        let wake = JobRequest::KeyWake {
+            auth_token: token(),
+            job_id: job_id(),
+            key: aruna_core::structs::storage::encryption::BucketKeyRef::new(
+                Ulid::from_bytes([8u8; 16]),
+                1,
+            ),
+        };
+        let mut serve = authed(wake);
+        assert_eq!(serve.step, RequestStep::Wake);
+        let parking = child(Ok::<_, KeyCheckError>(false));
+        assert!(matches!(
+            done_response(serve.next(parking)),
+            JobResponse::Unavailable(reason) if reason.contains("parking")
+        ));
+    }
+
+    fn artifact(range: Option<WireRange>) -> ServeArtifactOperation {
+        ServeArtifactOperation::new(owner(), job_id(), 5, range)
+    }
+
+    fn ready() -> OwnedArtifact {
+        OwnedArtifact::from(WireArtifact {
+            job_id: job_id(),
+            created_by: owner(),
+            blake3: [8u8; 32],
+            size: 4,
+            filename: "artifact.zip".to_string(),
+        })
+    }
+
+    // A lookup answers without bytes, and a range outside the artifact is refused.
+    #[test]
+    fn artifact_ranges_checked() {
+        let found = || child(Ok::<_, JobReadError>(ArtifactLookup::Ready(ready())));
+        assert!(matches!(
+            done_response(artifact(None).next(found())),
+            JobResponse::ArtifactReady { stream_size: 0, .. }
+        ));
+        let beyond = WireRange { start: 2, end: 9 };
+        assert!(matches!(
+            done_response(artifact(Some(beyond)).next(found())),
+            JobResponse::Unavailable(reason) if reason.contains("invalid")
+        ));
+        let inside = WireRange { start: 1, end: 2 };
+        assert!(matches!(
+            done_response(artifact(Some(inside)).next(found())),
+            JobResponse::Unavailable(reason) if reason.contains("source")
+        ));
+    }
+
+    fn cancel() -> ServeCancelOperation {
+        ServeCancelOperation::new(&auth_of(owner()), token(), job_id(), serving(), 5)
+    }
+
+    fn record() -> JobRecord {
+        crate::jobs::job_reads::tests::record_of(crate::jobs::job_reads::tests::probe())
+    }
+
+    fn report(outcome: CancelJobOutcome, running: Vec<JobId>) -> IoResult {
+        child(Ok::<_, JobReadError>(CancelReport { outcome, running }))
+    }
+
+    // A non-holder stops its runs and answers under the requested id.
+    #[test]
+    fn nonholder_stops_runs() {
+        let physical = JobId::from_bytes([9u8; 16]);
+        let mut serve = cancel();
+        assert!(is_child(&serve.first().unwrap()));
+        let plain = child(Ok::<Option<JobFamilyId>, JobRouteError>(None));
+        assert!(is_child(&serve.next(plain).unwrap()));
+        assert_eq!(serve.step, CancelStep::Runs);
+        let runs = child(Ok::<_, JobRouteError>(vec![physical]));
+        assert!(is_child(&serve.next(runs).unwrap()));
+        let stopped = report(CancelJobOutcome::Requested(record()), vec![physical]);
+        let Next::Done(answer) = serve.next(stopped).unwrap() else {
+            panic!("expected the answer");
+        };
+        assert_eq!(answer.running, vec![physical]);
+        assert!(matches!(
+            answer.response,
+            JobResponse::Cancelled { job, terminal: false } if job.job_id == job_id()
+        ));
+    }
+
+    // Without a run or a family the job itself is cancelled here.
+    #[test]
+    fn plain_job_cancelled() {
+        let mut serve = cancel();
+        serve.step = CancelStep::Runs;
+        let none = child(Ok::<_, JobRouteError>(Vec::<JobId>::new()));
+        assert!(is_child(&serve.next(none).unwrap()));
+        assert_eq!(serve.step, CancelStep::Local);
+        let absent = report(CancelJobOutcome::NotFound, Vec::new());
+        assert_eq!(done_response(serve.next(absent)), JobResponse::NotFound);
+    }
+
+    // A non-holder of a known family gives availability, never a verdict.
+    #[test]
+    fn nonholder_family_unavailable() {
+        let mut serve = cancel();
+        serve.step = CancelStep::Runs;
+        serve.family = Some(JobFamilyId {
+            submission_id: Ulid::from_bytes([7u8; 16]),
+            request_digest: [8u8; 32],
+        });
+        let none = child(Ok::<_, JobRouteError>(Vec::<JobId>::new()));
+        assert!(matches!(
+            done_response(serve.next(none)),
+            JobResponse::Unavailable(reason) if reason.contains("does not hold")
+        ));
+    }
+
+    // A holder answers from the family projection after stopping its runs.
+    #[test]
+    fn holder_reports_status() {
+        let mut serve = cancel();
+        serve.holds = true;
+        serve.step = CancelStep::Publish;
+        let published = child(Ok::<_, JobRouteError>(Some(())));
+        assert!(is_child(&serve.next(published).unwrap()));
+        let none = child(Ok::<_, JobRouteError>(Vec::<JobId>::new()));
+        assert!(is_child(&serve.next(none).unwrap()));
+        assert_eq!(serve.step, CancelStep::Status);
+        let gone = child(Err::<Option<RoutedJobStatus>, _>(JobRouteError::Forbidden));
+        assert_eq!(done_response(serve.next(gone)), JobResponse::Forbidden);
     }
 
     #[test]
