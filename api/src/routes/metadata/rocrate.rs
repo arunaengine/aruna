@@ -30,7 +30,7 @@ use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
 use aruna_operations::metadata::forward::routed_export::{
     RoutedExportOperation, ensure_export_limit,
 };
-use aruna_operations::metadata::forward::write::route_metadata_update as run_update_metadata_document;
+use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -424,7 +424,7 @@ pub async fn submit_rocrate_export(
         Box::pin(ensure_requirements(&state, &auth, document_id, &view)).await?;
         destination.credential = Some(
             seal_token(
-                &state.get_ctx(),
+                &state.get_ctx().node_scope(),
                 auth.user_id,
                 &view,
                 None,
@@ -576,18 +576,26 @@ pub async fn replace_metadata_rocrate(
         .map(str::parse::<ulid::Ulid>)
         .transpose()
         .map_err(|_| ServerError::BadRequestMessage("expected_revision is not a ULID".into()))?;
-    let updated = run_update_metadata_document(
+    let updated = aruna_operations::driver::drive(
+        RouteUpdateOperation::new(
+            (
+                actor(&state, &auth),
+                ctx.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            (record.clone(), document_id),
+            DocumentUpdate {
+                public: request.public,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: serialize_jsonld_object(
+                        &with_global_ids(&state, &request.rocrate).await?,
+                    )?,
+                },
+                expected_revision,
+                commit_message: message,
+            },
+            forwarded_auth_token(bearer_token)?,
+        ),
         &ctx,
-        actor(&state, &auth),
-        record.as_ref(),
-        document_id,
-        request.public,
-        UpdateDocumentMutation::ReplaceRoCrate {
-            jsonld: serialize_jsonld_object(&with_global_ids(&state, &request.rocrate).await?)?,
-        },
-        expected_revision,
-        forwarded_auth_token(bearer_token)?,
-        message,
     )
     .await
     .map_err(map_write_error)?;
@@ -681,18 +689,24 @@ pub async fn add_data_entity(
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = run_update_metadata_document(
+    let updated = aruna_operations::driver::drive(
+        RouteUpdateOperation::new(
+            (
+                actor(&state, &auth),
+                ctx.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            (record.clone(), document_id),
+            DocumentUpdate {
+                public: None,
+                mutation: UpdateDocumentMutation::UpsertDataEntity {
+                    jsonld: serialize_jsonld_entity(&with_global_ids(&state, &entity).await?)?,
+                },
+                expected_revision: None,
+                commit_message: None,
+            },
+            forwarded_auth_token(bearer_token)?,
+        ),
         &ctx,
-        actor(&state, &auth),
-        record.as_ref(),
-        document_id,
-        None,
-        UpdateDocumentMutation::UpsertDataEntity {
-            jsonld: serialize_jsonld_entity(&with_global_ids(&state, &entity).await?)?,
-        },
-        None,
-        forwarded_auth_token(bearer_token)?,
-        None,
     )
     .await
     .map_err(map_write_error)?;
@@ -781,16 +795,22 @@ pub async fn remove_data_entity(
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = run_update_metadata_document(
+    let updated = aruna_operations::driver::drive(
+        RouteUpdateOperation::new(
+            (
+                actor(&state, &auth),
+                ctx.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            (record.clone(), document_id),
+            DocumentUpdate {
+                public: None,
+                mutation: UpdateDocumentMutation::RemoveDataEntity { id: query.id },
+                expected_revision: Some(expected_revision),
+                commit_message: None,
+            },
+            forwarded_auth_token(bearer_token)?,
+        ),
         &ctx,
-        actor(&state, &auth),
-        record.as_ref(),
-        document_id,
-        None,
-        UpdateDocumentMutation::RemoveDataEntity { id: query.id },
-        Some(expected_revision),
-        forwarded_auth_token(bearer_token)?,
-        None,
     )
     .await
     .map_err(map_write_error)?;
@@ -881,18 +901,24 @@ pub async fn add_contextual_entity(
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = run_update_metadata_document(
+    let updated = aruna_operations::driver::drive(
+        RouteUpdateOperation::new(
+            (
+                actor(&state, &auth),
+                ctx.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            (record.clone(), document_id),
+            DocumentUpdate {
+                public: None,
+                mutation: UpdateDocumentMutation::UpsertContextualEntity {
+                    jsonld: serialize_jsonld_entity(&entity)?,
+                },
+                expected_revision: None,
+                commit_message: None,
+            },
+            forwarded_auth_token(bearer_token)?,
+        ),
         &ctx,
-        actor(&state, &auth),
-        record.as_ref(),
-        document_id,
-        None,
-        UpdateDocumentMutation::UpsertContextualEntity {
-            jsonld: serialize_jsonld_entity(&entity)?,
-        },
-        None,
-        forwarded_auth_token(bearer_token)?,
-        None,
     )
     .await
     .map_err(map_write_error)?;

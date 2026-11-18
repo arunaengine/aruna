@@ -18,6 +18,7 @@ use aruna_core::structs::identity::realm::RealmId;
 pub struct SyncTopicsOperation {
     realm_id: RealmId,
     effect: Option<DocumentEffect>,
+    fetched: Option<DocumentNetEvent>,
     reconciling: bool,
 }
 
@@ -32,11 +33,41 @@ impl SyncTopicsOperation {
         Self::with(realm_id, DocumentEffect::SyncDocument { topic, peers })
     }
 
+    /// Reconciles after a fetch that already ended with `fetched`.
+    pub(crate) fn after_fetch(realm_id: RealmId, fetched: DocumentNetEvent) -> Self {
+        Self {
+            realm_id,
+            effect: None,
+            fetched: Some(fetched),
+            reconciling: false,
+        }
+    }
+
     fn with(realm_id: RealmId, effect: DocumentEffect) -> Self {
         Self {
             realm_id,
             effect: Some(effect),
+            fetched: None,
             reconciling: false,
+        }
+    }
+
+    fn reconcile(
+        &mut self,
+        fetched: DocumentNetEvent,
+    ) -> Result<Next<DocumentReconcileResult>, ApplyError> {
+        match fetched {
+            DocumentNetEvent::DocumentsSynced { topics } => {
+                self.reconciling = true;
+                let reconcile = ReconcileTopicsOperation::new(self.realm_id, topics);
+                Ok(Next::Call(IoCall::child(reconcile)))
+            }
+            DocumentNetEvent::Error { error, .. } => Err(ApplyError::Failed(error)),
+            _ => Err(IoError::Unexpected {
+                expected: "DocumentNetEvent::DocumentsSynced",
+                got: "another document sync event",
+            }
+            .into()),
         }
     }
 }
@@ -46,6 +77,9 @@ impl Operation for SyncTopicsOperation {
     type Error = ApplyError;
 
     fn first(&mut self) -> Result<Next<DocumentReconcileResult>, ApplyError> {
+        if let Some(fetched) = self.fetched.take() {
+            return self.reconcile(fetched);
+        }
         let effect = self.effect.take().ok_or(IoError::Unfinished)?;
         let effect = Effect::Net(NetEffect::DocumentSync(effect));
         Ok(Next::Call(IoCall::Effect(Box::new(effect))))
@@ -57,14 +91,7 @@ impl Operation for SyncTopicsOperation {
             return Ok(Next::Done(reconciled));
         }
         match event(result)? {
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsSynced { topics })) => {
-                self.reconciling = true;
-                let reconcile = ReconcileTopicsOperation::new(self.realm_id, topics);
-                Ok(Next::Call(IoCall::child(reconcile)))
-            }
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
-                Err(ApplyError::Failed(error))
-            }
+            Event::Net(NetEvent::DocumentSync(fetched)) => self.reconcile(fetched),
             Event::Net(NetEvent::Error(error)) => Err(ApplyError::Failed(format!("{error:?}"))),
             other => Err(IoError::Unexpected {
                 expected: "DocumentNetEvent::DocumentsSynced",
@@ -113,6 +140,28 @@ mod tests {
         let done = DocumentReconcileResult::default();
         let answer = IoResult::Child(ChildOutcome::new(Ok::<_, ApplyError>(done.clone())));
         assert_eq!(operation.next(answer), Ok(Next::Done(done)));
+    }
+
+    #[test]
+    fn fetched_topics_reconcile() {
+        let fetched = DocumentNetEvent::DocumentsSynced {
+            topics: vec![topic()],
+        };
+        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched);
+        let reconcile = ReconcileTopicsOperation::new(realm(), vec![topic()]);
+        let expected = Next::Call(IoCall::child(reconcile));
+        assert_eq!(operation.first(), Ok(expected));
+    }
+
+    #[test]
+    fn failed_fetch_fails() {
+        let fetched = DocumentNetEvent::Error {
+            target: None,
+            error: "no peer".to_string(),
+        };
+        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched);
+        let expected = ApplyError::Failed("no peer".to_string());
+        assert_eq!(operation.first(), Err(expected));
     }
 
     #[test]

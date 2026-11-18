@@ -22,12 +22,14 @@ use aruna_core::structs::storage::replication::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
-use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version, content_resolved, resolved};
+use aruna_operations::distribution::resolve::{
+    GlobalResolution, content_resolved, resolve_content, resolve_version, resolved,
+};
 use aruna_operations::distribution::ticket::{
-    RedeemError, TicketInput, issue_ticket, redeem_ticket,
+    RedeemError, TicketInput, redeem_ticket, unsigned_ticket,
 };
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::{drive, drive_until};
+use aruna_operations::driver::{DriverContext, drive, drive_until};
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -939,6 +941,17 @@ async fn serve_download(
     response
 }
 
+/// Signs a ticket for one redirect with this node's key; `now` is Unix seconds.
+fn issue_ticket(context: &DriverContext, input: TicketInput, now: u64) -> Option<SignedTicket> {
+    let net = context.net_handle.as_ref()?;
+    let ticket = unsigned_ticket((net.node_id(), *net.realm_id()), input, now);
+    let bytes = ticket.signing_bytes().ok()?;
+    Some(SignedTicket {
+        signature: net.sign(&bytes),
+        ticket,
+    })
+}
+
 /// Redeems a download ticket for `object_id`; a refusal is the response to send.
 async fn redeem(
     state: &Arc<ServerState>,
@@ -948,7 +961,9 @@ async fn redeem(
     let refused = || drs_error(StatusCode::FORBIDDEN, "download ticket refused");
     let signed = SignedTicket::decode(encoded).map_err(|_| refused())?;
     let now = unix_timestamp_millis() / 1000;
-    match redeem_ticket(&state.get_ctx(), &signed, object_id, now).await {
+    let context = state.get_ctx();
+    let redeem = redeem_ticket(context.node_and_realm(), &signed, object_id, now);
+    match drive(redeem, &context).await {
         Ok(auth) => Ok(auth),
         Err(RedeemError::Unavailable) => Err(DrsError::unavailable().into_response()),
         Err(_) => Err(refused()),
@@ -1225,7 +1240,14 @@ async fn resolve_distributed_hash(
     hash: [u8; 32],
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
-    let resolution = content_resolved(drive_until(resolve_content(&state.get_ctx(), hash, deadline), &state.get_ctx(), deadline).await);
+    let resolution = content_resolved(
+        drive_until(
+            resolve_content(state.get_ctx().node_and_realm(), hash, deadline),
+            &state.get_ctx(),
+            deadline,
+        )
+        .await,
+    );
     let realm_id = state.get_realm_id();
     let mut denied = false;
     for found in resolution.versions {
@@ -1258,7 +1280,14 @@ async fn resolve_global(
         return Ok(ResolveOutcome::NotFound);
     }
     let context = state.get_ctx();
-    let found = match resolved(drive_until(resolve_version(&context, version_id, deadline), &context, deadline).await) {
+    let found = match resolved(
+        drive_until(
+            resolve_version(context.node_and_realm(), version_id, deadline),
+            &context,
+            deadline,
+        )
+        .await,
+    ) {
         GlobalResolution::Found(found) => found,
         GlobalResolution::NotFound => return Ok(ResolveOutcome::NotFound),
         GlobalResolution::Unavailable => return Ok(ResolveOutcome::Unavailable),

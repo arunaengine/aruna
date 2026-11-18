@@ -981,7 +981,7 @@ fn group_resume_advances() {
 }
 
 #[test]
-fn zero_limit_reads_nothing() {
+fn zero_limit_skips() {
     let mut operation = ListBucketOperation::new(delimiter_input(0, None, None));
     let Ok(Next::Done(result)) = operation.first() else {
         panic!("a page of no keys needs no read");

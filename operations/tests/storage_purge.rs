@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::job_calls::insert_job;
+use crate::job_calls::put_purge_checkpoint;
+use crate::job_calls::{claim_job, complete_job, fail_job, transition_to_running};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -42,14 +45,9 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::store::put_purge_checkpoint;
-use aruna_operations::jobs::store::query::insert_job;
-use aruna_operations::jobs::store::state::{
-    ClaimOutcome, claim_job, complete_job, fail_job, transition_to_running,
-};
-use aruna_operations::jobs::workflow::purge::run_storage_purge;
+use aruna_operations::jobs::store::state::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::multipart::complete::{
@@ -63,7 +61,7 @@ use aruna_operations::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation,
 };
 use aruna_operations::s3::object::copy::{
-    CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
+    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
@@ -75,6 +73,7 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
+use aruna_operations::tasks::job_host::run_storage_purge;
 use aruna_operations::testing::read_value;
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
@@ -273,27 +272,30 @@ async fn scoped_fence_isolates() {
     ));
 
     assert!(matches!(
-        copy_object(
-            &context.driver,
-            CopyObjectInput {
-                source_bucket: "bucket".to_string(),
-                source_key: "source.txt".to_string(),
-                source_version_id: None,
-                source_group_id: context.group_id,
-                source_auth_context: auth(&context),
-                dest_bucket: "bucket".to_string(),
-                dest_key: "blocked/copy.txt".to_string(),
-                user_id: context.user_id,
-                group_id: context.group_id,
-                realm_id: context.realm_id,
-                node_id: context.node_id,
-                quota_ceiling: None,
-                conditions: CopySourceConditions::default(),
-                metadata: None,
-                restrictions: None,
-                references: CopyReferences::Materialize,
-                job_id: None,
-            },
+        drive(
+            CopyObjectOperation::new(
+                CopyObjectInput {
+                    source_bucket: "bucket".to_string(),
+                    source_key: "source.txt".to_string(),
+                    source_version_id: None,
+                    source_group_id: context.group_id,
+                    source_auth_context: auth(&context),
+                    dest_bucket: "bucket".to_string(),
+                    dest_key: "blocked/copy.txt".to_string(),
+                    user_id: context.user_id,
+                    group_id: context.group_id,
+                    realm_id: context.realm_id,
+                    node_id: context.node_id,
+                    quota_ceiling: None,
+                    conditions: CopySourceConditions::default(),
+                    metadata: None,
+                    restrictions: None,
+                    references: CopyReferences::Materialize,
+                    job_id: None,
+                },
+                node_routing(&context.driver)
+            ),
+            &context.driver
         )
         .await,
         Err(CopyObjectError::Put(PutObjectError::PurgeFence(
@@ -1095,11 +1097,10 @@ async fn cancelled_queue_releases() {
     cancel_owned_job(&context.driver, &runtime, context.user_id, job_id)
         .await
         .unwrap();
-    let stored =
-        aruna_operations::jobs::store::state::read_job_record(&context.driver, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+    let stored = crate::job_calls::read_job_record(&context.driver, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(stored.state.is_terminal());
     // The version still reads its file, so the release keeps it and the plan is settled.
     let backend = aruna_core::structs::storage::group_backend::GroupStorage {

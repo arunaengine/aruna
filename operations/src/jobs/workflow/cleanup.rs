@@ -3,10 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
+use aruna_core::compute::effect::{ComputeAnswer, ComputeRequest};
 use aruna_core::compute::{BackendError, ExecutorKind, FenceContext, TombstoneSpec};
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     AttemptControl, AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload,
@@ -17,6 +15,7 @@ use ulid::Ulid;
 use super::super::executor::JobRunOutcome;
 use super::super::store::JobMutationError;
 use super::super::store::job_calls::{authorize_cleanup, record_attempt_tombstone};
+use super::compute::{attempt_call, compute_answer};
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 
 #[derive(Debug, PartialEq)]
@@ -75,12 +74,7 @@ impl TerminalCleanupOperation {
             || ExecutorKind::from_wire(""),
             |intent| ExecutorKind::from_wire(&intent.executor_kind),
         );
-        let effect = ComputeEffect {
-            kind,
-            fence: fence.clone(),
-            request,
-        };
-        Next::Call(IoCall::Effect(Box::new(Effect::Compute(Box::new(effect)))))
+        Next::Call(attempt_call(&kind, fence, request))
     }
 
     /// The error of an answer that names no usable backend.
@@ -185,17 +179,6 @@ impl TerminalCleanupOperation {
 
 fn unexpected_answer() -> JobError {
     JobError::retryable("the compute backend gave an unexpected answer")
-}
-
-/// The answer of the compute call that `result` belongs to.
-fn compute_answer(result: IoResult) -> Result<ComputeAnswer, JobError> {
-    match result.event()? {
-        Event::Compute(answer) => Ok(*answer),
-        other => Err(JobError::retryable(format!(
-            "unexpected compute result: {}",
-            other.label()
-        ))),
-    }
 }
 
 impl Operation for TerminalCleanupOperation {
@@ -319,8 +302,7 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::executor::{JobContext, ProgressReporter};
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::record_attempt_intent;
+    use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;

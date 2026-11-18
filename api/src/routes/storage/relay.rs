@@ -135,7 +135,9 @@ pub(crate) async fn read_holders(
     let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? else {
         return Ok(None);
     };
-    let mut holders = drive(key_holders(binding.set_id, key), context.as_ref()).await.unwrap_or_default();
+    let mut holders = drive(key_holders(binding.set_id, key), context.as_ref())
+        .await
+        .unwrap_or_default();
     holders.retain(|holder| *holder != state.get_node_id() && *holder != node_id);
     holders.push(node_id);
     let forward = |node_id| RestForward {
@@ -311,7 +313,7 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
     let Some(base) = urls.and_then(|urls| urls.api) else {
         return Err(unreachable(
             forward,
-            &node_reach(state.get_ctx().as_ref(), forward.node_id).hint(),
+            &node_reach(&state.get_ctx().heard(), forward.node_id).hint(),
         ));
     };
     let response = CLIENT
@@ -333,7 +335,7 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
             );
             return Err(unreachable(
                 forward,
-                &node_reach(state.get_ctx().as_ref(), forward.node_id).hint(),
+                &node_reach(&state.get_ctx().heard(), forward.node_id).hint(),
             ));
         }
     };

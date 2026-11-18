@@ -133,7 +133,7 @@ async fn busy_reservation_retries() -> Result<(), Box<dyn std::error::Error>> {
         .active_job
         .ok_or("no push")?;
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+        crate::job_calls::read_job_record(&fixture.context, job_id, None)
             .await?
             .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
@@ -169,7 +169,7 @@ async fn cancelled_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     let job_id = started.active_job.ok_or("no push")?;
     let storage = &fixture.context.storage_handle;
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+        crate::job_calls::read_job_record(&fixture.context, job_id, None)
             .await?
             .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
@@ -378,7 +378,7 @@ async fn community_reviews_first() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(accepted.remote.record_id.as_deref(), Some("1"));
     // The review published outside a push, so accepting it registers the record's identifiers.
     let key = format!("identifiers/{}/1", link.link_id);
-    let queued = aruna_operations::jobs::store::query::find_dedup_plan(
+    let queued = crate::job_calls::find_dedup_plan(
         &fixture.context,
         link.created_by,
         key.as_bytes(),
@@ -493,7 +493,7 @@ async fn removal_cancels_push() -> Result<(), Box<dyn std::error::Error>> {
     let job_id = running.active_job.ok_or("no push")?;
     change_link(fixture.context.as_ref(), &running, LinkChange::Delete).await?;
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+        crate::job_calls::read_job_record(&fixture.context, job_id, None)
             .await?
             .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {

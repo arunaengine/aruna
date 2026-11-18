@@ -153,7 +153,7 @@ async fn resolves_session_alias() {
     physical.state = aruna_core::structs::execution::job::JobState::Succeeded;
     physical.finished_at_ms = Some(now);
     physical.report_digest = Some([4; 32]);
-    crate::jobs::store::query::insert_job(&ctx, &physical)
+    crate::jobs::store::test_calls::insert_job(&ctx, &physical)
         .await
         .unwrap();
     let auth = |user_id: aruna_core::UserId| aruna_core::structs::identity::auth::AuthContext {

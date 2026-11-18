@@ -60,7 +60,7 @@ enum AfterPersist {
 #[derive(Debug, PartialEq)]
 pub struct BackendImportOperation {
     job: ImportJob,
-    checkpoint: BackendImportCheckpoint,
+    pub(super) checkpoint: BackendImportCheckpoint,
     run: Option<ImportRun>,
     shared_run: Option<Arc<ImportRun>>,
     objects: VecDeque<ExternalObject>,
@@ -260,7 +260,8 @@ impl Operation for BackendImportOperation {
             },
             Step::Reads => match result.child::<PageReads, ItemError>()? {
                 Ok(page) => {
-                    let run = self.run_mut()?;
+                    let run = (self.run.as_mut())
+                        .ok_or_else(|| ImportRunError("the run lost its page".to_string()))?;
                     run.page = page;
                     let taken = TakenPathsOperation::new(&run.shared, &self.listed);
                     self.step = Step::Taken;

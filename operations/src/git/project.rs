@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::state::{Ancestry, GitState, reduce};
-use super::{GitError, objects, publish, records};
-use crate::driver::DriverContext;
+use super::{GitError, download, publish, records};
+use crate::driver::{DriverContext, drive};
 use aruna_blob::git::GitStore;
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -85,7 +85,7 @@ pub async fn recent(
     if !store.configured(document.document_id).await {
         return Ok(None);
     }
-    let holders = publish::holders(context, document).await?;
+    let holders = drive(publish::holders(context.node_id(), document), context).await?;
     let unchanged = record_writes(document.document_id) == projection.writes;
     Ok((holders == projection.holders && unchanged).then_some(projection))
 }
@@ -166,13 +166,13 @@ pub async fn project(
     store: &GitStore,
     document: &MetadataRegistryRecord,
 ) -> Result<Projection, GitError> {
-    let holders = publish::holders(context, document).await?;
+    let holders = drive(publish::holders(context.node_id(), document), context).await?;
     let id = document.document_id;
     let actor = UserId::nil(document.realm_id);
     execute(store, GitEffect::Initialize(id), actor).await?;
     // Read first, so a record stored during this projection makes the next one run again.
     let writes = record_writes(id);
-    let records = time_stage("git_records", records::scan(context, id)).await?;
+    let records = time_stage("git_records", drive(records::scan(id), context)).await?;
     let (mut state, mut needs) = reduce(&records, &Ancestry::new());
     let GitEvent::Imported(known) = execute(store, GitEffect::Imported(id), actor).await? else {
         return Err(GitError::Unavailable);
@@ -190,7 +190,7 @@ pub async fn project(
             _ => false,
         };
         let owner = records.iter().find(named).ok_or(GitError::Unavailable)?;
-        let read = objects::pack_bytes(context, document, pack, owner);
+        let read = download::pack_bytes(context, document, pack, owner);
         let bytes = time_stage("git_pack_read", read).await?;
         let digest = pack.sha256.clone();
         let effect = GitEffect::Import {

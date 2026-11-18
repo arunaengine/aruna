@@ -525,9 +525,9 @@ mod tests {
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::GroupId;
-    use aruna_operations::driver::DriverContext;
+    use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_operations::jobs::store::query::list_user_jobs;
+    use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
     use aruna_storage::FjallStorage;
     use serde::Serialize;
     use std::collections::BTreeMap;
@@ -963,7 +963,7 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
-        let (jobs, _) = list_user_jobs(&context, user(), None, 10, |_| true)
+        let (jobs, _) = drive(ListJobsOperation::new(user(), None, 10, |_| true), &context)
             .await
             .unwrap();
         let listed: Vec<JobId> = jobs.iter().map(|job| job.job_id).collect();

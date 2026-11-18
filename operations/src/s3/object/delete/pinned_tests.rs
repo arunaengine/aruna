@@ -150,7 +150,7 @@ fn is_child<T: std::fmt::Debug>(turn: &Result<Next<T>, PinnedError>) -> bool {
 }
 
 #[test]
-fn no_queries_no_reads() {
+fn queryless_reads_nothing() {
     let info = info();
     let mut operation = VersionPinsOperation::new(scope(&info), &auth(), Vec::new());
     assert_eq!(operation.first(), Ok(Next::Done((Vec::new(), Vec::new()))));

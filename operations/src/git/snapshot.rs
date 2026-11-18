@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::revision_read::RawDisplayOperation;
 use super::changes::summary;
 use super::project::{Projection, author, forget, project, recent, remember};
 use super::versions::{copied, plain};
@@ -11,16 +10,16 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::distribution::resolve::{RESOLVE_BUDGET, resolve_version, version_found};
-use tokio::time::Instant;
-use crate::driver::{DriverContext, drive_until};
 use crate::driver::drive;
+use crate::driver::{DriverContext, drive_until};
 use crate::metadata::materialization_queue::capture_pending;
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::replication::bao_read::BaoReadOutput;
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::GetObjectInput;
-use crate::s3::object::read::get_object_info;
+use crate::s3::object::read::ObjectInfoOperation;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,
@@ -48,6 +47,7 @@ use aruna_core::telemetry::time_stage;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
+use tokio::time::Instant;
 use ulid::Ulid;
 
 /// How long other holders leave a new revision to the first holder before generating it.
@@ -94,10 +94,12 @@ pub(super) async fn current(
     if let Some(raw) = raw {
         return Ok(Some((raw.winning_event_id, raw.jsonld)));
     }
-    let projected: Option<MaterializationStatusRecord> = records::load(
+    let projected: Option<MaterializationStatusRecord> = drive(
+        records::load(
+            MATERIALIZATION_STATUS_KEYSPACE,
+            materialization_status_key(document.document_id).to_vec(),
+        ),
         context,
-        MATERIALIZATION_STATUS_KEYSPACE,
-        materialization_status_key(document.document_id).to_vec(),
     )
     .await?;
     if !projected.is_some_and(|status| {
@@ -162,7 +164,7 @@ async fn resolve(
             realm_id: auth.realm_id,
             node_id: node,
         };
-        let info = get_object_info(context, input, None)
+        let info = drive(ObjectInfoOperation::new(input, None), context)
             .await
             .map_err(|_| GitError::NotFound)?;
         let global = bucket.distribution.as_ref().map(|_| GlobalId::Version {
@@ -275,14 +277,19 @@ async fn located(
             .filter(|global| global.realm_id() == realm_id),
         node,
     ) {
-        match crate::metadata::global_entries::local_version(context, *version_id).await {
+        match drive(
+            crate::metadata::global_entries::LocalVersionOperation::new(*version_id),
+            context,
+        )
+        .await
+        {
             Ok(Some((bucket, key))) => {
                 found
                     .extend(VersionedObjectArn::new(realm_id, node, bucket, key, *version_id).ok());
             }
             _ => {
                 let deadline = Instant::now() + RESOLVE_BUDGET;
-                let resolve = resolve_version(context, *version_id, deadline);
+                let resolve = resolve_version(context.node_and_realm(), *version_id, deadline);
                 let holders = version_found(drive_until(resolve, context, deadline).await);
                 if let Some(resolved) = holders {
                     found.extend(resolved.holders.iter().take(4).filter_map(|holder| {
@@ -295,11 +302,14 @@ async fn located(
     }
     if let (Some(location), Some(node)) = (&identity.location, node)
         && let Ok(bucket) = drive(GetBucketOperation::new(location.bucket.clone()), context).await
-        && let Ok(Some(object)) = objects::described(
+        && let Ok(Some(object)) = drive(
+            objects::described(
+                context.node_id(),
+                (&location.bucket, bucket.group_id),
+                &location.key,
+                None,
+            ),
             context,
-            (&location.bucket, bucket.group_id),
-            &location.key,
-            None,
         )
         .await
         && identity.hash.is_none_or(|hash| hash == object.blake3)
@@ -370,7 +380,7 @@ pub(super) async fn linked(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(jsonld) else {
         return Vec::new();
     };
-    let location = super::location::effective(context, document)
+    let location = drive(super::location::effective(document), context)
         .await
         .map(|(location, _)| location)
         .ok();
@@ -499,20 +509,24 @@ async fn generate(
     digest: Option<[u8; 32]>,
 ) -> Result<(), GitError> {
     let (event_id, jsonld) = source;
-    let event: Option<MetadataEventRecord> = records::load(
+    let event: Option<MetadataEventRecord> = drive(
+        records::load(
+            EVENT_LOG_KEYSPACE,
+            event_log_key(document.document_id, event_id).to_vec(),
+        ),
         context,
-        EVENT_LOG_KEYSPACE,
-        event_log_key(document.document_id, event_id).to_vec(),
     )
     .await?;
     let user = event
         .as_ref()
         .map_or(UserId::nil(document.realm_id), |event| event.user_id);
     let occurred_at_ms = event.map_or(document.updated_at_ms, |event| event.occurred_at_ms);
-    let message: Option<String> = records::load(
+    let message: Option<String> = drive(
+        records::load(
+            COMMIT_MESSAGE_KEYSPACE,
+            event_log_key(document.document_id, event_id).to_vec(),
+        ),
         context,
-        COMMIT_MESSAGE_KEYSPACE,
-        event_log_key(document.document_id, event_id).to_vec(),
     )
     .await?;
     // Trailer lines stay reserved for Aruna, so an author cannot forge a trusted one.
@@ -558,7 +572,7 @@ async fn generate(
                 commit: refs.get("refs/heads/aruna").cloned(),
                 error: Some(error),
             };
-            return records::save(context, STATUS, status_key, &status).await;
+            return drive(records::save(STATUS, status_key, &status), context).await;
         }
         _ => return Err(GitError::Unavailable),
     };
@@ -604,10 +618,24 @@ async fn generate(
         } => Some(pack.clone()),
         _ => None,
     };
-    let publishing = publish::publish_with(context, document, user, change, (pack, Vec::new()));
+    let publishing = drive(
+        publish::publish_with(
+            context.node_id(),
+            document,
+            user,
+            change,
+            (pack, Vec::new()),
+        ),
+        context,
+    );
     time_stage("git_publish", publishing).await?;
     if let Some(pack) = &marked {
-        objects::mark_imported(context, (document.document_id, user), pack).await;
+        drive(
+            objects::mark_imported((document.document_id, user), pack),
+            context,
+        )
+        .await
+        .ok();
     }
     let status = GitStatus {
         event_id,
@@ -616,7 +644,7 @@ async fn generate(
     };
     time_stage(
         "git_status",
-        records::save(context, STATUS, status_key, &status),
+        drive(records::save(STATUS, status_key, &status), context),
     )
     .await
 }
@@ -645,9 +673,12 @@ async fn checkpoint(
         revision: state.revision,
         covered: state.coverable(),
     }));
-    publish::publish(context, document, owner, change)
-        .await
-        .map(|_| ())
+    drive(
+        publish::publish(context.node_id(), document, owner, change),
+        context,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Projects the records, then publishes a missing snapshot or a due checkpoint. The first
@@ -665,7 +696,7 @@ pub async fn refresh(
     let projection = update(context, store, document, None, false).await?;
     // Pushed metadata that still waits must be retried by the next refresh.
     let prefix = document.document_id.to_bytes().to_vec();
-    if records::prefixed::<PendingMerge>(context, PENDING, prefix)
+    if drive(records::prefixed::<PendingMerge>(PENDING, prefix), context)
         .await
         .is_ok_and(|rows| rows.is_empty())
     {
@@ -693,7 +724,7 @@ pub async fn view(
     }
     let projection = project(context, store, document).await?;
     let prefix = document.document_id.to_bytes().to_vec();
-    let waiting = !records::prefixed::<PendingMerge>(context, PENDING, prefix)
+    let waiting = !drive(records::prefixed::<PendingMerge>(PENDING, prefix), context)
         .await?
         .is_empty();
     let pending = waiting
@@ -886,7 +917,11 @@ pub async fn status(
     GitError,
 > {
     let store = super::store(context)?;
-    let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
+    let (document, _) = drive(
+        super::repository(context.node_id(), auth, id, Permission::READ),
+        context,
+    )
+    .await?;
     // Status never waits for a first snapshot either; it reports an empty pending state.
     let (projection, pending) = match store.try_lock(id) {
         Some(guard) => {
@@ -907,7 +942,7 @@ pub async fn status(
             ),
         },
     };
-    let status = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
+    let status = drive(records::load(STATUS, id.to_bytes().to_vec()), context).await?;
     let layout = match projection.state.refs.get("refs/heads/main") {
         Some(main) => {
             let effect = GitEffect::Layout {
@@ -931,7 +966,7 @@ pub async fn export(
     revision: String,
 ) -> Result<Bytes, GitError> {
     let store = super::store(context)?;
-    let document = document(context, auth, id, Permission::READ).await?;
+    let document = drive(document(auth, id, Permission::READ), context).await?;
     read_view(context, store, &document).await?;
     let known = GitEffect::Resolve {
         document_id: id,

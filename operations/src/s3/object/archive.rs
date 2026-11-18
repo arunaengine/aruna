@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_blob::archive::zip_entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 
@@ -26,14 +27,13 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::route_read;
 use crate::driver::drive;
-use crate::jobs::export::archive::zip_entry;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::pages::{
     Caller, ListRequest, PageObject, PageScope, RangeRelay, listing_path, object_page,
 };
-use crate::s3::object::read::get_object_routed;
+use crate::s3::object::read::GetRoutedOperation;
 use aruna_core::archive_path::safe_zip_path;
 
 /// Bucket names never contain `_`, so these paths cannot meet a `bucket/key` path.
@@ -467,7 +467,12 @@ impl<W: AsyncWrite + Unpin> Archive<W> {
         let restrictions = auth.path_restrictions.clone();
         let blob = match blob {
             Some(blob) => blob,
-            None => match get_object_routed(scope.context, input, restrictions).await {
+            None => match drive(
+                GetRoutedOperation::new(input, restrictions, None),
+                scope.context,
+            )
+            .await
+            {
                 Ok(read) => read.blob,
                 Err(error) => return Ok(Err(read_status(&error))),
             },

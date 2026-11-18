@@ -389,6 +389,7 @@ enum Family {
     Outbound,
     Compute,
     Job,
+    Git,
 }
 
 impl Wait {
@@ -411,6 +412,7 @@ impl Wait {
             Self::Family(Family::Outbound) => "an outbound event",
             Self::Family(Family::Compute) => "a compute event",
             Self::Family(Family::Job) => "a job host event",
+            Self::Family(Family::Git) => "a Git store event",
             Self::Child => "the child's event",
             Self::Group => "GroupEvent::Finished",
             Self::Window => "GroupEvent::Member or GroupEvent::Closed",
@@ -864,12 +866,13 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::LocalFile(_) => Ok(Family::LocalFile),
         Effect::Net(_) => Ok(Family::Net),
         Effect::Metadata(_) => Ok(Family::Metadata),
-        Effect::Task(_) => Ok(Family::Task),
+        Effect::Task(_) | Effect::Background(_) => Ok(Family::Task),
         Effect::Index(_) => Ok(Family::Index),
         Effect::Session(_) => Ok(Family::Session),
         Effect::Outbound(_) => Ok(Family::Outbound),
         Effect::Compute(_) => Ok(Family::Compute),
         Effect::Job(_) => Ok(Family::Job),
+        Effect::Git(_) => Ok(Family::Git),
         Effect::Storage(
             StorageEffect::StartTransaction { .. }
             | StorageEffect::CommitTransaction { .. }
@@ -901,6 +904,7 @@ fn event_family(event: &Event) -> Option<Family> {
         Event::Outbound(_) => Some(Family::Outbound),
         Event::Compute(_) => Some(Family::Compute),
         Event::Job(_) => Some(Family::Job),
+        Event::Git(_) => Some(Family::Git),
         Event::SubOperation(_)
         | Event::Search()
         | Event::Stream()

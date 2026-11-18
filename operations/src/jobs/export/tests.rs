@@ -2,13 +2,57 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::archive::*;
+use super::assemble::tests::{ReadyEntry, write_archive};
+use super::consent::UnheldBucketOperation;
+use super::open::OpenCandidateOperation;
+use super::probe::{CandidateFailures, ProbeSourcesOperation};
+use super::resolve::CandidateSource;
+use super::sources::{
+    AliasState, HashCandidatesOperation, HashFound, ResolveEntriesOperation, alias_allowed,
+    cache_aliases, collect_aliases, learn_probe_hash, merge_candidates,
+};
 use super::*;
+use crate::auth::enforcement::PolicyBulkOperation;
+use crate::auth::permission_rules::PermissionRulesConfig;
+use crate::auth::permission_rules::PermissionRulesOperation;
+use crate::blob::permission_paths::MAX_HASH_ALIASES;
+use crate::driver::DriverContext;
+use crate::driver::drive;
+use crate::jobs::executor::JobContext;
+use crate::jobs::executor::JobRunOutcome;
+use crate::jobs::key_locks::AskWaitsOperation;
+use crate::jobs::repository::test_support::{
+    artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
+};
+use crate::replication::plaintext::HolderCheckOperation;
+use aruna_blob::archive::zip_date;
+use aruna_blob::archive::zip_entry;
+use aruna_core::archive_path::safe_zip_path;
+use aruna_core::archive_path::synthesized_path;
+use aruna_core::effects::BlobEffect;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::BlobEvent;
+use aruna_core::events::Event;
+use aruna_core::events::StorageEvent;
+use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::stream::BackendStream;
+use aruna_core::stream::StreamError;
+use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::structs::storage::blob::{
     BlobVersion, BucketInfo, VersionKey, object_permission_path,
 };
+use aruna_core::structs::storage::encryption::BucketEncryption;
+use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
+use bytes::Bytes;
+use serde_json::Value as JsonValue;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use crate::inbound::initialize_incoming_fixture;
 use crate::jobs::executor::ProgressReporter;
@@ -627,11 +671,11 @@ async fn assert_roundtrip(handle: &BlobHandle, eln: bool, version: &str, seed: u
         .entities
         .iter()
         .enumerate()
-        .map(|(entity_index, entity)| PlannedEntry {
+        .map(|(entity_index, entity)| ReadyEntry {
             entity_index,
             candidate_index: 0,
             path: entity.zip_path.clone().unwrap(),
-            source: PlannedSource::Ready(byte_stream(FIXTURE_BYTES)),
+            stream: byte_stream(FIXTURE_BYTES),
             expected_blake3: payload_hash,
             modified_ms: FIXTURE_MOMENT_MS,
         })
@@ -1037,14 +1081,17 @@ async fn alias_needs_scopes() {
     };
     let spec = remote_spec(owner.realm_id, owner);
     let ctx = job_context(node.driver.clone(), node.net.node_id());
-    let mut rules = BTreeMap::new();
-    load_rules(&ctx, &spec, &mut rules, [*group_id])
-        .await
-        .unwrap();
-    let mut policies = BTreeMap::new();
-    load_policies(&ctx, &spec, &mut policies, [*group_id])
-        .await
-        .unwrap();
+    let auth = &spec.auth_context;
+    let config = PermissionRulesConfig {
+        auth_context: auth.clone(),
+        path: format!("/{}/g/{group_id}", auth.realm_id),
+    };
+    let loaded = drive(PermissionRulesOperation::new(config), ctx.driver.as_ref());
+    let rules = BTreeMap::from([(*group_id, loaded.await.unwrap())]);
+    let scope = (auth.realm_id, *group_id);
+    let loaded = drive(PolicyBulkOperation::new([scope]), ctx.driver.as_ref());
+    let evaluator = loaded.await.unwrap().remove(&scope).unwrap();
+    let policies = BTreeMap::from([(*group_id, evaluator)]);
 
     assert!(alias_allowed(&spec, *group_id, permission_path, &rules, &policies).unwrap());
     assert!(!alias_allowed(&spec, *group_id, "/other/object", &rules, &policies).unwrap());
@@ -1091,28 +1138,12 @@ async fn denies_foreign_alias() {
 
     let spec = remote_spec(realm_id, owner);
     let ctx = job_context(node.driver.clone(), node.net.node_id());
-    let mut candidates = Vec::new();
-    let mut denied = false;
-    extend_hash_candidates(
-        &ctx,
-        &spec,
-        hash,
-        None,
-        &mut candidates,
-        &mut denied,
-        &mut BTreeMap::new(),
-        &mut BTreeMap::new(),
-        &mut BTreeSet::new(),
-        &mut BTreeSet::new(),
-        &mut BTreeMap::new(),
-        &mut BTreeMap::new(),
-        &mut BTreeMap::new(),
-    )
-    .await
-    .expect("a foreign group must deny instead of failing the export");
+    let found = hash_lookup(&ctx, &spec, hash)
+        .await
+        .expect("a foreign group must deny instead of failing the export");
 
-    assert!(denied);
-    assert!(!candidates.iter().any(|candidate| matches!(
+    assert!(found.denied);
+    assert!(!found.candidates.iter().any(|candidate| matches!(
         &candidate.source,
         CandidateSource::Local { group_id, .. } if *group_id == foreign
     )));
@@ -1151,20 +1182,12 @@ async fn foreign_arn_located() {
         ..Default::default()
     };
     let ctx = job_context(node.driver.clone(), node.net.node_id());
-    resolve_entries(
-        &ctx,
-        &remote_spec(realm_id, owner),
-        &mut checkpoint,
-        &mut BTreeMap::new(),
-        &mut BTreeMap::new(),
-        &mut BTreeSet::new(),
-        &mut BTreeSet::new(),
-        &mut BTreeMap::new(),
-        &mut BTreeMap::new(),
-        &mut BTreeMap::new(),
-    )
-    .await
-    .unwrap();
+    let resolve = ResolveEntriesOperation::new(
+        scope_of(&ctx, &remote_spec(realm_id, owner)),
+        std::mem::take(&mut checkpoint.entities),
+        AliasState::default(),
+    );
+    checkpoint.entities = drive(resolve, ctx.driver.as_ref()).await.unwrap().entities;
     let entity = &checkpoint.entities[0];
     assert_eq!(entity.omission, None);
     assert!(entity.candidates.iter().any(|found| matches!(
@@ -1202,25 +1225,9 @@ async fn selection_skips_discovery() {
     };
     for (selection, unavailable) in [(None, true), (Some(selection), false)] {
         spec.selection = selection;
-        let mut candidates = Vec::new();
-        let found = extend_hash_candidates(
-            &ctx,
-            &spec,
-            [154; 32],
-            None,
-            &mut candidates,
-            &mut false,
-            &mut BTreeMap::new(),
-            &mut BTreeMap::new(),
-            &mut BTreeSet::new(),
-            &mut BTreeSet::new(),
-            &mut BTreeMap::new(),
-            &mut BTreeMap::new(),
-            &mut BTreeMap::new(),
-        )
-        .await;
-        assert_eq!(found.unwrap(), unavailable);
-        assert!(candidates.is_empty());
+        let found = hash_lookup(&ctx, &spec, [154; 32]).await.unwrap();
+        assert_eq!(found.unavailable, unavailable);
+        assert!(found.candidates.is_empty());
     }
 }
 
@@ -1413,19 +1420,19 @@ async fn sample_archive() -> Vec<u8> {
         writer,
         b"metadata".to_vec(),
         vec![
-            PlannedEntry {
+            ReadyEntry {
                 entity_index: 0,
                 candidate_index: 0,
                 path: "data/b".to_string(),
-                source: PlannedSource::Ready(byte_stream(b"b")),
+                stream: byte_stream(b"b"),
                 expected_blake3: *blake3::hash(b"b").as_bytes(),
                 modified_ms: FIXTURE_MOMENT_MS,
             },
-            PlannedEntry {
+            ReadyEntry {
                 entity_index: 1,
                 candidate_index: 0,
                 path: "data/a".to_string(),
-                source: PlannedSource::Ready(byte_stream(b"a")),
+                stream: byte_stream(b"a"),
                 expected_blake3: *blake3::hash(b"a").as_bytes(),
                 modified_ms: FIXTURE_MOMENT_MS,
             },
@@ -1983,11 +1990,11 @@ async fn dates_follow_versions() {
     let task = tokio::spawn(write_archive(
         writer,
         b"metadata".to_vec(),
-        vec![PlannedEntry {
+        vec![ReadyEntry {
             entity_index: 0,
             candidate_index: 0,
             path: "data/a".to_string(),
-            source: PlannedSource::Ready(byte_stream(b"a")),
+            stream: byte_stream(b"a"),
             expected_blake3: *blake3::hash(b"a").as_bytes(),
             modified_ms: version.timestamp_ms(),
         }],
@@ -2088,11 +2095,11 @@ async fn signals_corrupt_candidate() {
     let task = tokio::spawn(write_archive(
         writer,
         b"metadata".to_vec(),
-        vec![PlannedEntry {
+        vec![ReadyEntry {
             entity_index: 4,
             candidate_index: 2,
             path: "data/corrupt".to_string(),
-            source: PlannedSource::Ready(byte_stream(b"wrong")),
+            stream: byte_stream(b"wrong"),
             expected_blake3: [0; 32],
             modified_ms: FIXTURE_MOMENT_MS,
         }],
@@ -2122,13 +2129,13 @@ async fn cancels_streaming_archive() {
     let task = tokio::spawn(write_archive(
         writer,
         b"metadata".to_vec(),
-        vec![PlannedEntry {
+        vec![ReadyEntry {
             entity_index: 0,
             candidate_index: 0,
             path: "data/pending".to_string(),
-            source: PlannedSource::Ready(BackendStream::new(futures_util::stream::pending::<
+            stream: BackendStream::new(futures_util::stream::pending::<
                 Result<Bytes, std::io::Error>,
-            >())),
+            >()),
             expected_blake3: [0; 32],
             modified_ms: FIXTURE_MOMENT_MS,
         }],
@@ -2569,18 +2576,24 @@ async fn plaintext_export_parks() {
         false,
     )
     .await;
-    let Err(error @ ExportFailure::RemoteLocked { .. }) = opened else {
+    let Err(ExportFailure::RemoteLocked {
+        node_id,
+        target,
+        auth,
+    }) = opened
+    else {
         panic!("a locked remote input must be typed, got another outcome")
     };
 
     // The source registers the wait and names the dependency, so the export parks.
-    let ctx = job_context(client.driver.clone(), client.net.node_id());
-    let mut checkpoint = ExportCheckpoint::default();
-    let outcome = finish_export(&ctx, &mut checkpoint, error).await;
-
-    let JobRunOutcome::AwaitingKey(waits) = outcome else {
-        panic!("the export must park on the source's key")
-    };
+    let ask = AskWaitsOperation::new(
+        &auth,
+        JobId::from_bytes([84; 16]),
+        node_id,
+        std::slice::from_ref(&target),
+        client.driver.node_and_realm(),
+    );
+    let waits = drive(ask, client.driver.as_ref()).await.unwrap();
     assert_eq!(waits.len(), 1);
     assert_eq!(waits[0].node_id, source.net.node_id());
     assert_eq!(waits[0].bucket, "remote");
@@ -3025,13 +3038,12 @@ async fn consent_resolves_hashes() {
     let foreign = UserId::new(viewer.user_ulid, RealmId::from_bytes([140; 32]));
     let mut foreign_spec = spec(viewer);
     foreign_spec.auth_context.user_id = foreign;
-    let CandidateSource::Local {
-        location, bucket, ..
-    } = &candidates[0].source
-    else {
+    let CandidateSource::Local { bucket, .. } = &candidates[0].source else {
         panic!("a local copy")
     };
-    let allowed = holder_allows(node.driver.as_ref(), &foreign_spec, location, bucket, None).await;
+    let auth = &foreign_spec.auth_context;
+    let holder = HolderCheckOperation::new(auth.realm_id, bucket, auth.user_id);
+    let allowed = drive(holder, node.driver.as_ref()).await;
     assert!(matches!(allowed, Ok(false)));
     node.net.shutdown().await;
 }
@@ -3087,4 +3099,183 @@ fn context_trick_resolves() {
         (key.bucket.as_str(), key.key.as_str()),
         ("private", "secret.bin")
     );
+}
+
+fn scope_of(ctx: &JobContext, spec: &ExportRoCrateSpec) -> SourceScope {
+    SourceScope {
+        spec: Arc::new(spec.clone()),
+        owner_node: ctx.owner_node_id,
+    }
+}
+
+async fn open_candidate(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    candidate: &ExportCandidate,
+    metadata_only: bool,
+) -> Result<CandidateOpen, ExportFailure> {
+    let scope = SourceScope {
+        spec: Arc::new(spec.clone()),
+        owner_node: owner_node(),
+    };
+    let open = OpenCandidateOperation::new(scope, candidate.clone(), metadata_only);
+    drive(open, driver).await
+}
+
+async fn hash_lookup(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    hash: [u8; 32],
+) -> Result<HashFound, ExportFailure> {
+    let lookup = HashCandidatesOperation::new(
+        scope_of(ctx, spec),
+        hash,
+        None,
+        Vec::new(),
+        AliasState::default(),
+    );
+    drive(lookup, ctx.driver.as_ref()).await
+}
+
+async fn probe_sources(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    checkpoint: &mut ExportCheckpoint,
+    failures: &CandidateFailures,
+) -> Result<Vec<ProbedEntry>, ExportFailure> {
+    let probe = ProbeSourcesOperation::new(
+        scope_of(ctx, spec),
+        checkpoint.entities.clone(),
+        failures.clone(),
+        AliasState::default(),
+    );
+    let probed = drive(probe, ctx.driver.as_ref()).await?;
+    checkpoint.entities = probed.entities;
+    Ok(probed.entries)
+}
+
+async fn unheld_bucket(
+    driver: &DriverContext,
+    spec: &ExportRoCrateSpec,
+    node_id: NodeId,
+    jsonld: &str,
+) -> Result<Option<String>, String> {
+    let check = UnheldBucketOperation::new(spec.clone(), node_id, jsonld.to_string());
+    drive(check, driver).await.map_err(|error| error.0)
+}
+
+pub(super) fn realm_user() -> AuthContext {
+    AuthContext {
+        user_id: UserId::local(Ulid::from_parts(8, 8), realm()),
+        realm_id: realm(),
+        path_restrictions: None,
+        session: None,
+    }
+}
+
+pub(super) fn op_spec() -> ExportRoCrateSpec {
+    ExportRoCrateSpec {
+        destination: None,
+        auth_context: realm_user(),
+        document_id: Ulid::from_parts(3, 3),
+        limits: RoCrateLimits::default(),
+        selection: None,
+    }
+}
+
+pub(super) fn selected_spec() -> ExportRoCrateSpec {
+    let mut spec = op_spec();
+    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
+        files: vec!["a".to_string()],
+        audience: RealmId::from_bytes([9; 32]),
+        intent_digest: String::new(),
+    });
+    spec
+}
+
+pub(super) fn source_scope() -> SourceScope {
+    SourceScope {
+        spec: Arc::new(op_spec()),
+        owner_node: owner_node(),
+    }
+}
+
+pub(super) fn selected_scope() -> SourceScope {
+    SourceScope {
+        spec: Arc::new(selected_spec()),
+        owner_node: owner_node(),
+    }
+}
+
+pub(super) fn export_scope() -> ExportScope {
+    ExportScope {
+        spec: Arc::new(op_spec()),
+        job_id: job_id(1),
+        claim_token: Ulid::from_parts(9, 9),
+        owner_node: owner_node(),
+        local_node: Some(owner_node()),
+        scope: local_scope(),
+        job: scoped_job(),
+    }
+}
+
+pub(super) fn destination() -> aruna_core::repository::RepositoryDestination {
+    aruna_core::repository::RepositoryDestination {
+        group_id: Ulid::from_parts(2, 2),
+        connector_id: Ulid::from_parts(4, 4),
+        draft_id: None,
+        published_id: None,
+        metadata_json: "{}".to_string(),
+        publish: false,
+        public_files: false,
+        credential: None,
+        link: None,
+    }
+}
+
+pub(super) fn plain_entity(id: &str) -> ExportEntity {
+    ExportEntity {
+        entity_id: id.to_string(),
+        local_path: None,
+        storage_key: None,
+        exact: None,
+        hash: None,
+        hash_realm: None,
+        candidates: Vec::new(),
+        omission: None,
+        message: None,
+        zip_path: None,
+        report_source: None,
+        resolved_version: None,
+        path_synthesized: false,
+        content: None,
+    }
+}
+
+pub(super) fn local_candidate() -> ExportCandidate {
+    ExportCandidate {
+        source: CandidateSource::Local {
+            location: artifact().location,
+            group_id: Ulid::from_parts(2, 2),
+            permission_path: "/realm/g/group/object".to_string(),
+            node_id: owner_node(),
+            bucket: "data".to_string(),
+            key: "a".to_string(),
+        },
+        report_source: ExportReportSource::Local,
+        resolved_version: Some(Ulid::from_parts(5, 5)),
+        expected_blake3: Some([1; 32]),
+    }
+}
+
+pub(super) fn remote_candidate() -> ExportCandidate {
+    ExportCandidate {
+        source: CandidateSource::RemoteHash {
+            node_id: other_node(),
+            hash: [1; 32],
+        },
+        report_source: ExportReportSource::Hash,
+        resolved_version: None,
+        expected_blake3: Some([1; 32]),
+    }
 }

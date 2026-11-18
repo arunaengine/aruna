@@ -11,10 +11,10 @@ use crate::distribution::inventory::{
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::UsageUpdateError;
-use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
+use aruna_core::errors::StorageReadError;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{

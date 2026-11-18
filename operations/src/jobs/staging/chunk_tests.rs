@@ -10,6 +10,8 @@ use super::*;
 use crate::jobs::staging::pure_tests::{child_answer, test_bucket, test_connector, test_run};
 use crate::jobs::staging::{StagingRun, initial_checkpoint};
 use crate::jobs::store::JobMutationError;
+use crate::s3::object::get::ObjectInfo;
+use aruna_core::structs::storage::multipart::MultipartChecksumType;
 
 fn table_run() -> StagingRun {
     let run = test_run();
@@ -233,6 +235,31 @@ fn object_reader() -> ChunkReadOperation {
     ChunkReadOperation::new(table_run(), origin, read, None, 16)
 }
 
+fn found_object(version: Ulid) -> GetObjectResult {
+    GetObjectResult {
+        blob: stream(),
+        location: None,
+        metadata: Default::default(),
+        info: ObjectInfo {
+            size: 3,
+            version_created_at: None,
+            etag: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            hashes: Default::default(),
+            composite_hashes: Default::default(),
+            part_count: None,
+        },
+        source_metadata: None,
+        source_binding: None,
+        last_refresh: None,
+        version_id: Some(version),
+        resolved_version_id: None,
+        resolved_range: None,
+        source_policies: Vec::new(),
+        served_source: None,
+    }
+}
+
 // An uploaded table is pinned to the version its first read found.
 #[test]
 fn object_version_pinned() {
@@ -244,21 +271,11 @@ fn object_version_pinned() {
         chunk.next(bucket),
         Ok(Next::Call(IoCall::Child(_)))
     ));
-    let Ok(Next::Call(IoCall::Effect(read))) = chunk.next(allowed()) else {
-        panic!("expected the object read");
-    };
-    let Effect::Job(JobEffect::ReadObject(read)) = *read else {
-        panic!("expected the object read");
-    };
-    assert_eq!(read.range, Some((0, 15)));
+    let expected = chunk.object_call(Some((0, 15))).unwrap();
+    assert_eq!(chunk.next(allowed()), Ok(Next::Call(expected)));
     let version = Ulid::from_bytes([3; 16]);
-    let body = ObjectBody {
-        stream: stream(),
-        version_id: Some(version),
-        size: 3,
-    };
     assert!(matches!(
-        chunk.next(job_event(JobEvent::Object(Ok(body)))),
+        chunk.next(child_answer(Ok::<_, GetObjectError>(found_object(version)))),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
     let bytes = job_event(JobEvent::Collected(Ok(b"abc".to_vec())));
@@ -278,20 +295,20 @@ fn object_failures_map() {
         if let Origin::Object { group_id, .. } = &mut chunk.origin {
             *group_id = Some(Ulid::nil());
         }
-        chunk.next(job_event(JobEvent::Object(Err(failure))))
+        chunk.next(child_answer(Err::<GetObjectResult, _>(failure)))
     };
-    let Ok(Next::Done(read)) = opened(ObjectReadFailure::InvalidRange) else {
+    let Ok(Next::Done(read)) = opened(GetObjectError::InvalidRange) else {
         panic!("expected the end of the table");
     };
     assert!(read.chunk.complete);
     assert!(matches!(
-        opened(ObjectReadFailure::Gone("no key".to_string())),
+        opened(GetObjectError::NoSuchKey),
         Err(ChunkFailure::Lasting(_))
     ));
-    assert_eq!(
-        opened(ObjectReadFailure::Failed("busy".to_string())),
-        Err(ChunkFailure::Retry("busy".to_string()))
-    );
+    assert!(matches!(
+        opened(GetObjectError::NoTransactionFound),
+        Err(ChunkFailure::Retry(_))
+    ));
 }
 
 fn step(checkpoint: &StagingJobCheckpoint) -> TableChunkOperation {

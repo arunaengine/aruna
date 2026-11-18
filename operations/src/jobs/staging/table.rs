@@ -9,10 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, StagingSourceError};
 use aruna_core::events::Event;
-use aruna_core::jobs::{
-    ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent, ObjectBody, ObjectRead,
-    ObjectReadFailure,
-};
+use aruna_core::jobs::{ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent};
 use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
@@ -56,12 +53,14 @@ use crate::replication::queue::{
     BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use crate::s3::object::read::GetRoutedOperation;
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::QuotaGateError;
 use crate::staging::head_source::{
@@ -286,18 +285,19 @@ impl ChunkReadOperation {
         let group_id = group_id.ok_or_else(|| ChunkFailure::Retry("no bucket".to_string()))?;
         let spec = &self.run.spec;
         let auth = &spec.auth_context;
-        let read = ObjectRead {
+        let input = GetObjectInput {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: self.read.version_id,
-            range,
+            range: range.map(|(start, end)| ObjectRangeRequest::StartEnd { start, end }),
             group_id,
-            user_id: auth.user_id,
+            user_identity: auth.user_id,
             realm_id: auth.realm_id,
             node_id: spec.node_id,
-            restrictions: auth.path_restrictions.clone(),
         };
-        Ok(job_call(JobEffect::ReadObject(Box::new(read))))
+        let restrictions = auth.path_restrictions.clone();
+        let read = GetRoutedOperation::new(input, restrictions, None);
+        Ok(IoCall::child(read))
     }
 
     /// The decompressed chunk, read on from a stream an earlier step left open at this version,
@@ -353,18 +353,20 @@ impl ChunkReadOperation {
                     Err(error) => Err(ChunkFailure::Retry(error.to_string())),
                 }
             }
-            Origin::Object { .. } => match object_answer(result)? {
-                Ok(body) => Ok(OpenedTable::Stream(
-                    body.stream,
-                    body.version_id,
-                    Some(body.size),
+            Origin::Object { .. } => match result.child::<GetObjectResult, GetObjectError>()? {
+                Ok(found) => Ok(OpenedTable::Stream(
+                    found.blob,
+                    found.resolved_version_id.or(found.version_id),
+                    Some(found.info.size),
                 )),
                 // A range from the table's end on reads nothing.
-                Err(ObjectReadFailure::InvalidRange) => Ok(OpenedTable::Past),
-                Err(ObjectReadFailure::Gone(error)) => {
-                    Err(ChunkFailure::Lasting(format!("table unavailable: {error}")))
-                }
-                Err(ObjectReadFailure::Failed(error)) => Err(ChunkFailure::Retry(error)),
+                Err(GetObjectError::InvalidRange) => Ok(OpenedTable::Past),
+                Err(
+                    error @ (GetObjectError::NoSuchKey
+                    | GetObjectError::NoSuchVersion
+                    | GetObjectError::DeleteMarker),
+                ) => Err(ChunkFailure::Lasting(format!("table unavailable: {error}"))),
+                Err(error) => Err(ChunkFailure::Retry(error.to_string())),
             },
         }
     }
@@ -429,18 +431,6 @@ enum OpenedTable {
 
 fn job_call(effect: JobEffect) -> IoCall {
     IoCall::Effect(Box::new(Effect::Job(effect)))
-}
-
-/// The answer to an object read.
-fn object_answer(result: IoResult) -> Result<Result<ObjectBody, ObjectReadFailure>, IoError> {
-    let event = result.event()?;
-    match event {
-        Event::Job(JobEvent::Object(body)) => Ok(body),
-        other => Err(IoError::Unexpected {
-            expected: "the opened object",
-            got: other.label(),
-        }),
-    }
 }
 
 impl Operation for ChunkReadOperation {

@@ -8,7 +8,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::VaultQuery;
-use aruna_core::events::{Event, WritePeerRefusal};
+use aruna_core::events::{Event, PeerAuthRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::placement::{holds_placement, target_placement_ref};
@@ -24,10 +24,10 @@ use super::write::{
     AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended, VaultRefusal,
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::authorize::{peer_answer, peer_check};
 use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;
+use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 
 #[derive(Debug, Error, PartialEq)]
@@ -142,17 +142,19 @@ impl Operation for VaultCallerOperation {
     type Error = MetadataReadError;
 
     fn first(&mut self) -> Result<Next<UserId>, MetadataReadError> {
-        if !matches!(self.auth_token, Some(AuthToken::Bearer(_))) {
+        let Some(token @ AuthToken::Bearer(_)) = self.auth_token.take() else {
             return Err(MetadataReadError::Unauthorized);
-        }
-        Ok(Next::Call(peer_check(self.peer, self.auth_token.take())))
+        };
+        let check = WritePeerOperation::new(self.peer, token);
+        Ok(Next::Call(IoCall::child(check)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<UserId>, MetadataReadError> {
         let Some(auth) = self.auth.take() else {
-            let auth = peer_answer(result)?.map_err(|refusal| match refusal {
-                WritePeerRefusal::Unauthorized => MetadataReadError::Unauthorized,
-                WritePeerRefusal::Unavailable(_) => MetadataReadError::Unavailable,
+            let checked = result.child::<AuthContext, PeerAuthRefusal>()?;
+            let auth = checked.map_err(|refusal| match refusal {
+                PeerAuthRefusal::Unauthorized => MetadataReadError::Unauthorized,
+                PeerAuthRefusal::Unavailable(_) => MetadataReadError::Unavailable,
             })?;
             self.auth = Some(auth);
             let read = GetConfigOperation::new(self.realm_id);

@@ -663,9 +663,10 @@ impl Operation for DeliverWakesOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::store::key_wait::park_job;
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
+    use crate::jobs::store::test_calls::park_job;
+    use crate::jobs::store::test_calls::insert_job;
+    use crate::jobs::store::state::ClaimOutcome;
+    use crate::jobs::store::test_calls::{claim_job, read_job_record};
     use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;

@@ -7,13 +7,12 @@ use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     DocumentSyncRevision, DocumentTarget,
 };
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE,
-    METADATA_INDEX_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
@@ -42,7 +41,7 @@ use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 
-pub use crate::storage_read::StorageReadError;
+pub use aruna_core::errors::StorageReadError;
 
 pub const LIST_METADATA_SIZE: usize = 128;
 // Cache fills sweep whole keyspaces; large pages keep the number of storage
@@ -77,20 +76,6 @@ pub(crate) fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> E
     Effect::Storage(StorageEffect::Read {
         key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
         key: graph_lifecycle_key(graph_iri),
-        txn_id,
-    })
-}
-
-pub(crate) fn iter_registry_effect(
-    group_id: GroupId,
-    start_after: Option<Key>,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: METADATA_INDEX_KEYSPACE.to_string(),
-        prefix: Some(metadata_registry_prefix(group_id)),
-        start: start_after.map(IterStart::After),
-        limit: LIST_METADATA_SIZE,
         txn_id,
     })
 }

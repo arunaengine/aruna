@@ -28,17 +28,15 @@ use aruna_operations::jobs::command::{
 use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
 use aruna_operations::jobs::lifecycle::family_reads::{FamilyReportOperation, SessionJobOperation};
 use aruna_operations::jobs::lifecycle::ids::SubmissionScope;
-use aruna_operations::jobs::lifecycle::ingress::ingress_node;
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
-use aruna_operations::jobs::local_run::{
-    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
-};
+use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalExecutionError};
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::tasks::job_node::{ingress_node, local_run};
 use ulid::Ulid;
 
 use crate::auth::{ValidatedBearer, require_owner, require_unrestricted_auth};
@@ -361,12 +359,9 @@ async fn local_submit(
         workspace_mode,
         retention_ms: state.rocrate_limits().artifact_retention_ms,
     };
-    let result = drive(
-        LocalRunOperation::on_node(config, &context),
-        context.as_ref(),
-    )
-    .await
-    .map_err(JobRequestError::from_local)?;
+    let result = drive(local_run(config, &context), context.as_ref())
+        .await
+        .map_err(JobRequestError::from_local)?;
     // A replay answers with the state the device already reduced for that job.
     let state = read_owned_job(&context, auth.user_id, result.job_id)
         .await

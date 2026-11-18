@@ -21,6 +21,7 @@ use aruna_core::calls::ChildOutcome;
 use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -458,7 +459,8 @@ fn spawn_driver(
         publish_full_usage,
     };
     let stop = RecoveryStop::new(cancelled.clone());
-    let recovery = RecoveryOperation::new(&node.context, config, status.clone(), stop);
+    let serving = node.context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let recovery = RecoveryOperation::new(config, serving, status.clone(), stop);
     let context = node.context.clone();
     let driver = tokio::spawn(async move {
         drive(recovery, &context).await.expect("recovery runs");

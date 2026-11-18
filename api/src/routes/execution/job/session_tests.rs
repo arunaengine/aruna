@@ -5,9 +5,10 @@
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use aruna_compute::ExecutorRegistry;
-use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
+use aruna_compute::executor::{ExecutorBackend, SessionChannel};
 use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::UserId;
+use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::session::SessionPhase;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
@@ -38,11 +39,10 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::put_job_entry;
-use aruna_operations::jobs::store::query::insert_job;
-use aruna_operations::jobs::store::state::{
-    ClaimOutcome, cancel_running_job, claim_job, read_job_record,
-};
+use crate::job_test_calls::put_job_entry;
+use crate::job_test_calls::insert_job;
+use aruna_operations::jobs::store::state::ClaimOutcome;
+use crate::job_test_calls::{cancel_running_job, claim_job, read_job_record};
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -232,9 +232,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
     );
     record.state = JobState::Running;
     record.workspace_bucket = Some("lab-data".to_string());
-    insert_job(&ctx, &record)
-        .await
-        .expect("the job is stored");
+    insert_job(&ctx, &record).await.expect("the job is stored");
     registry.sessions().open(
         SessionConfig {
             job_id: job_id.to_string(),

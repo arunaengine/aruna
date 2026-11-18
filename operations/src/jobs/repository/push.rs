@@ -6,6 +6,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{
     LinkStatus, LinkTarget, PushOutcome, RepositoryDestination, RepositoryLink, RepositoryRecord,
 };
@@ -21,7 +22,7 @@ use super::link_store::{
     ApplyChangeOperation, ReadLinkOperation, link_row, parse_link, parse_secret, secret_row,
 };
 use super::links::{LinkChange, LinkError};
-use super::{JobScope, NodeScope, TransferError};
+use super::{JobScope, TransferError};
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::export::ExportCheckpoint;
 use crate::jobs::store::{JobMutationError, job_rows::PutRowsOperation};

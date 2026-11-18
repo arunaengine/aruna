@@ -8,6 +8,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{
     LinkStatus, RepositoryCredential, RepositoryLink, link_key, link_prefix,
 };
@@ -18,7 +19,6 @@ use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use ulid::Ulid;
 
-use super::NodeScope;
 use super::links::{ChangeLinkOperation, LinkChange, LinkError, id_key};
 use super::push::creator_auth;
 use super::submit::{LinkJob, LinkJobOperation};

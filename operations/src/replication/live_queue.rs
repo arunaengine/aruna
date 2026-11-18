@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn no_net_no_emit() {
+    fn netless_skips_emit() {
         let mut operation = asking();
         assert_eq!(operation.next(holders(None)), Ok(Next::Done(())));
     }

@@ -14,13 +14,13 @@ use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN}
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::error::token_grant;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
 use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
 use aruna_operations::s3::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
 use aruna_operations::s3::imports::cron::next_due;
-use aruna_operations::s3::imports::discovery::{RenameGuardsOperation, authorized_renames};
+use aruna_operations::s3::imports::discovery::{AuthorizedRenamesOperation, RenameGuardsOperation};
 use aruna_operations::s3::imports::remove::RemoveImportOperation;
 use aruna_operations::s3::imports::schedule::{
     ImportRunInput, StartRunOperation, WakeScheduleOperation,
@@ -832,7 +832,9 @@ pub async fn get_renames(
     Path((group_id, import_id)): Path<(String, String)>,
     axum::extract::Query(page): axum::extract::Query<RenamePageQuery>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
-    use aruna_operations::blob::migration::misplaced::{DEFAULT_PAGE, MAX_PAGE, rename_page};
+    use aruna_operations::blob::migration::misplaced::{
+        AccessRule, DEFAULT_PAGE, MAX_PAGE, RenamePageOperation, RenameQuery,
+    };
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let limit = page.limit.unwrap_or(DEFAULT_PAGE);
@@ -857,16 +859,20 @@ pub async fn get_renames(
     )
     .await
     .map_err(map_error)?;
-    let readable = |key: &str| access.allows(Some(key), &Permission::READ);
-    let writable = |key: &str| access.allows(Some(key), &Permission::WRITE);
-    let found = rename_page(
-        &context,
-        &rule,
-        (&readable, &writable),
-        (page.filter.as_deref(), after, limit),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?;
+    let access = Arc::new(access);
+    let rules = (
+        AccessRule::new(access.clone(), Permission::READ),
+        AccessRule::new(access, Permission::WRITE),
+    );
+    let query = RenameQuery {
+        filter: page.filter.clone(),
+        after,
+        limit,
+    };
+    let plan = RenamePageOperation::new(node_routing(&context), &rule, rules, query);
+    let found = drive(plan, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let status = drive(
         MigrationStatusOperation::new(rule.bucket.clone()),
         &state.get_ctx(),
@@ -980,9 +986,10 @@ pub async fn start_renames(
     let guards = drive(RenameGuardsOperation::new(&rule), &state.get_ctx())
         .await
         .map_err(map_error)?;
-    let checked = authorized_renames(&state.get_ctx(), caller, &rule, Permission::WRITE)
-        .await
-        .map_err(map_error)?;
+    let context = state.get_ctx();
+    let plan =
+        AuthorizedRenamesOperation::new(node_routing(&context), caller, &rule, Permission::WRITE);
+    let checked = drive(plan, &context).await.map_err(map_error)?;
     if checked.withheld_files > 0 {
         return Err(ServerError::Forbidden);
     }

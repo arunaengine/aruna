@@ -3,29 +3,35 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::any::Any;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use aruna_core::compute::AttemptPhase;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
+use aruna_core::jobs::{JobReport, JobStops};
+use aruna_core::operation::Runnable;
 use aruna_core::structs::execution::job::{
     JobError, JobExecutionClass, JobId, JobPayload, JobRecord, JobState,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use futures_util::future::FutureExt;
+use futures_util::future::{BoxFuture, FutureExt};
 use tokio::sync::RwLockReadGuard;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::jobs::executor::{
-    JobContext, JobRunOutcome, PayloadHandler, ProgressReporter, RangeTurns, dispatch_payload,
-    run_cleanup,
-};
+use super::job_context::{JobContext, PayloadHandler};
+use super::job_dispatch::dispatch_payload;
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::effect_adapters::job::{JobHost, with_job_host};
+use crate::jobs::executor::{JobRunOutcome, ProgressReporter, RangeTurns, run_cleanup};
 use crate::jobs::runtime::{Admission, JobShutdownReport, JobsRuntime, RecoveredAdmission};
 use crate::jobs::runtime_steps::{
     LeasePageOperation, RecoverJobOperation, Recovery, SettleRunOperation, TerminalWrite,
@@ -38,7 +44,18 @@ use crate::jobs::store::job_calls::{
 };
 use crate::jobs::store::row_calls::read_job_record;
 use crate::jobs::submit::schedule_drain_effect;
+use crate::jobs::workflow::ExecutionRunOperation;
+use crate::jobs::workflow::attempt::{AttemptScope, RunWiring};
+use crate::jobs::workflow::purge::{
+    PurgeRun, PurgeStop, PurgeTurn, PurgeTurnOperation, fence_error,
+};
+use crate::jobs::workflow::reconcile::{
+    AdoptAttemptOperation, AdoptedEnd, Adoption, ResumeAttemptOperation, SettleAdoptedOperation,
+};
+use crate::jobs::workflow::supervise::AbandonSessionOperation;
 use crate::jobs::{FLUSH_INTERVAL_MS, JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
+use crate::s3::fence_store::AcquireFenceOperation;
+use crate::tasks::job_reconcile::ExternalReconciler;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -312,10 +329,7 @@ pub(crate) async fn run_job(
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
     if record.execution_class == JobExecutionClass::ExternalAttempt {
-        Box::pin(crate::jobs::workflow::run_execution_job(
-            context, record, cancel,
-        ))
-        .await;
+        Box::pin(run_execution_job(context, record, cancel)).await;
         return;
     }
 
@@ -478,6 +492,219 @@ async fn heartbeat_loop(
                     Err(error) => warn!(job_id = %job_id, error = %error, "Progress flush failed"),
                 }
             }
+        }
+    }
+}
+
+/// The stop signal of an execution run: only a cancel stops it. A node shutdown leaves the
+/// container running and hands the attempt back for adoption.
+struct ExecutionHost {
+    cancel: CancellationToken,
+}
+
+impl JobHost for ExecutionHost {
+    fn stops(&self) -> JobStops {
+        JobStops {
+            cancelled: self.cancel.is_cancelled(),
+            shutdown: false,
+        }
+    }
+
+    fn report(&self, _report: JobReport) {}
+
+    fn stopped(&self) -> BoxFuture<'_, ()> {
+        Box::pin(self.cancel.cancelled())
+    }
+
+    fn take_turns<'a>(
+        &'a self,
+        _turns: &'a BTreeSet<(Ulid, Ulid)>,
+    ) -> BoxFuture<'a, Box<dyn Any + Send>> {
+        Box::pin(std::future::ready(Box::new(()) as Box<dyn Any + Send>))
+    }
+}
+
+/// The host of an execution run with this cancel signal.
+pub(crate) fn execution_host(cancel: CancellationToken) -> Arc<dyn JobHost> {
+    Arc::new(ExecutionHost { cancel })
+}
+
+/// What this node gives every execution run.
+pub fn run_wiring(context: &DriverContext) -> RunWiring {
+    RunWiring {
+        serving: context.node_and_realm(),
+        routing: node_routing(context),
+        encryption_key: (context.net_handle.as_ref()).map(|net| net.credential_encryption_key()),
+    }
+}
+
+/// Drives `operation` of one execution while its lease is renewed. `None` means the claim was
+/// lost first: another execution took over, so the work is abandoned.
+pub async fn under_lease<O, K>(
+    context: &DriverContext,
+    (job_id, token): (JobId, Ulid),
+    cancel: CancellationToken,
+    operation: O,
+) -> Option<Result<O::Output, O::Error>>
+where
+    O: Runnable<K>,
+{
+    let stop = CancellationToken::new();
+    let heartbeat = tokio::spawn(execution_heartbeat(
+        context.clone(),
+        (job_id, token),
+        cancel.clone(),
+        stop.clone(),
+    ));
+    tokio::pin!(heartbeat);
+    let work = with_job_host(execution_host(cancel), drive(operation, context));
+    let work = Box::pin(work);
+    tokio::select! {
+        result = work => {
+            stop.cancel();
+            let _ = (&mut heartbeat).await;
+            Some(result)
+        }
+        _ = &mut heartbeat => None,
+    }
+}
+
+/// Renews the lease and surfaces a cancel request. Returns on a lost token, which the run reads
+/// as a takeover.
+async fn execution_heartbeat(
+    context: DriverContext,
+    (job_id, token): (JobId, Ulid),
+    cancel: CancellationToken,
+    stop: CancellationToken,
+) {
+    let mut interval = interval(Duration::from_millis(JOB_HEARTBEAT_MS));
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = interval.tick() => {
+                let renew = renew_lease(job_id, token, unix_timestamp_millis(), None);
+                match drive(renew, &context).await {
+                    Ok(renew) => if renew.cancel_requested { cancel.cancel(); }
+                    Err(JobMutationError::TokenMismatch) => return,
+                    Err(error) => {
+                        warn!(job_id = %job_id, error = %error, "Execution lease renew failed")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Ends the bookkeeping of a run driven under its lease.
+async fn finish_run<E: std::fmt::Display>(
+    context: &DriverContext,
+    job_id: JobId,
+    finished: Option<Result<(), E>>,
+) {
+    match finished {
+        Some(Ok(())) => {}
+        Some(Err(error)) => warn!(job_id = %job_id, %error, "Execution run failed"),
+        // This node no longer owns the attempt, so its session stops here even though nothing
+        // else delivered an end for it.
+        None => {
+            info!(job_id = %job_id, "Execution supervisor superseded; abandoning");
+            if let Err(error) = drive(AbandonSessionOperation::new(job_id), context).await {
+                warn!(job_id = %job_id, %error, "Abandoned session did not close");
+            }
+        }
+    }
+}
+
+/// Runs one claimed execution job from prepare to its terminal state.
+pub async fn run_execution_job(
+    context: Arc<DriverContext>,
+    record: JobRecord,
+    cancel: CancellationToken,
+) {
+    let job_id = record.job_id;
+    let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+        warn!(job_id = %job_id, "Execution job has no claim token; skipping");
+        return;
+    };
+    let run = ExecutionRunOperation::new(record, run_wiring(&context));
+    let finished = under_lease(&context, (job_id, token), cancel, run).await;
+    finish_run(&context, job_id, finished).await;
+}
+
+/// Supervises an adopted attempt.
+pub(crate) async fn resume_attempt(
+    context: Arc<DriverContext>,
+    scope: Arc<AttemptScope>,
+    record: Arc<JobRecord>,
+    phase: AttemptPhase,
+    cancel: CancellationToken,
+) {
+    let ids = (scope.job_id, scope.token);
+    let resume = ResumeAttemptOperation::new(scope, record, phase);
+    let finished = under_lease(&context, ids, cancel, resume).await;
+    finish_run(&context, ids.0, finished).await;
+}
+
+/// The reconcile seam of the node: a lost external attempt is adopted by name and resolved by
+/// evidence. It never submits a new attempt name, so a container is never run twice.
+pub struct ComputeReconciler {
+    context: Arc<DriverContext>,
+    runtime: Weak<JobsRuntime>,
+}
+
+impl ComputeReconciler {
+    pub fn new(context: Arc<DriverContext>, runtime: Weak<JobsRuntime>) -> Arc<Self> {
+        Arc::new(Self { context, runtime })
+    }
+
+    /// Adopts a live container without blocking the drain, registering its supervisor with the
+    /// runtime for caps, cancellation and shutdown.
+    async fn resume(&self, scope: Arc<AttemptScope>, record: Arc<JobRecord>, phase: AttemptPhase) {
+        let (job_id, token) = (scope.job_id, scope.token);
+        let context = self.context.clone();
+        let supervised = record.clone();
+        let supervisor = move |cancel| resume_attempt(context, scope, supervised, phase, cancel);
+        let registered = self.runtime.upgrade().is_some_and(|runtime| {
+            runtime.spawn_recovered(self.context.clone(), &record, supervisor)
+        });
+        if registered {
+            return;
+        }
+        let handoff = handoff_external_attempt(job_id, token, unix_timestamp_millis());
+        if let Err(error) = drive(handoff, &self.context).await {
+            warn!(job_id = %job_id, error = %error, "Failed to hand off unregistered recovered attempt");
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExternalReconciler for ComputeReconciler {
+    async fn reconcile_lost_attempt(&self, context: &DriverContext, record: JobRecord) {
+        let job_id = record.job_id;
+        if !matches!(record.payload, JobPayload::Execution(_)) {
+            return;
+        }
+        let holder = (self.context.net_handle.as_ref())
+            .map(|net| net.node_id())
+            .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public());
+        let adopt = AdoptAttemptOperation::new(job_id, holder, run_wiring(&self.context));
+        let (scope, adopted) = match drive(adopt, context).await {
+            Ok(Adoption::Adopted { scope, record }) => (scope, record),
+            Ok(Adoption::Done) => return,
+            Err(error) => {
+                warn!(job_id = %job_id, %error, "Adoption failed");
+                return;
+            }
+        };
+        let ids = (job_id, scope.token);
+        let settle = SettleAdoptedOperation::new(scope.clone(), adopted.clone());
+        let cancel = CancellationToken::new();
+        match under_lease(context, ids, cancel, settle).await {
+            Some(Ok(AdoptedEnd::Resume(phase))) => self.resume(scope, adopted, phase).await,
+            Some(Ok(AdoptedEnd::Settled)) => {}
+            Some(Err(error)) => warn!(job_id = %job_id, %error, "Adopted attempt failed"),
+            None => info!(job_id = %job_id, "Reconcile finalizer superseded; abandoning"),
         }
     }
 }

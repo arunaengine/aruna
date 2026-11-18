@@ -18,7 +18,7 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_operations::distribution::routing::read_coordinator;
 use aruna_operations::distribution::routing::route_read;
-use aruna_operations::s3::object::copy::{CopySourceConditions, read_copy_source, source_origin};
+use aruna_operations::s3::object::copy::{CopySourceConditions, ReadCopyOperation, source_origin};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use futures_util::TryStreamExt;
 use http::Method;
@@ -343,7 +343,9 @@ impl ArunaS3Service {
             node_id: self.node_id,
         };
         let restrictions = source.auth.path_restrictions.clone();
-        read_copy_source(&self.state, input, restrictions, source.conditions, token)
+        let conditions = source.conditions;
+        let read = ReadCopyOperation::new(input, restrictions, conditions, token.cloned());
+        drive(read, &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)
     }

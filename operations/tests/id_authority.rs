@@ -21,20 +21,18 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::store::query::find_dedup_job;
-use aruna_operations::jobs::store::state::read_job_record;
+use crate::job_calls::find_dedup_job;
+use crate::job_calls::read_job_record;
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::forward::write::route_metadata_delete;
-use aruna_operations::metadata::persistent_id::forward::submit_mint_pid;
-use aruna_operations::metadata::persistent_id::forward::{
-    mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
+use crate::metadata_calls::{
+    mint_pid_routed, read_mapping, resolve_pid_routed, route_metadata_delete, submit_mint_pid,
+    withdraw_pid_routed,
 };
-use aruna_operations::metadata::persistent_id::read_mapping;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::testing::replay_event_log;

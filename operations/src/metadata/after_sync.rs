@@ -10,9 +10,8 @@ use aruna_core::document::{DocumentReconcileResult, DocumentTarget};
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use aruna_core::operation::Operation;
 use aruna_core::task::TaskKey;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
-use crate::driver::DriverContext;
 use crate::metadata::projection::{
     LoggedProjection, MetadataProjectionError, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
     ProjectLoggedOperation, ProjectionWakeOperation, max_clock_skew,
@@ -178,36 +177,10 @@ impl Operation for AfterSyncOperation {
     }
 }
 
-/// Reconciles the metadata store with document sync and prunes deleted graphs.
-pub(crate) async fn run_maintenance(context: &DriverContext, source: &'static str, attempt: usize) {
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
-        return;
-    };
-    if let Err(error) = metadata_handle.reconcile_document_sync(context).await {
-        warn!(
-            source,
-            attempt,
-            error = ?error,
-            "Metadata document sync reconciliation failed"
-        );
-    }
-    match metadata_handle.prune_deleted_graphs(context).await {
-        Ok(pruned) if pruned > 0 => {
-            debug!(source, attempt, pruned, "Metadata graph prune completed")
-        }
-        Ok(_) => {}
-        Err(error) => warn!(
-            source,
-            attempt,
-            error = ?error,
-            "Metadata graph prune failed"
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::DriverContext;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
     use aruna_core::task::PersistedTaskTimer;

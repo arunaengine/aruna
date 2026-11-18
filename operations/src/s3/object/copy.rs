@@ -5,42 +5,48 @@
 pub mod sealed;
 
 use crate::distribution::held::record_only;
-use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::{GateContextError, GateOperation};
-use crate::s3::bucket::get::GetBucketOperation;
+use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::fence_store::FenceCheckOperation;
-use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
+use crate::s3::object::copy::sealed::{
+    SealedCopyError, SealedCopyInput, SealedCopyOperation, SealedCopyResult,
+};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, reference_archive};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::object::read::{TokenRead, read_source};
+use crate::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
+use crate::s3::object::read::{ReadSourceOperation, TokenRead};
+use crate::s3::purge_fence::PurgeFenceError;
 use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
 };
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::BackendLocation;
+use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo};
 use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::storage::routing::resolve_backend;
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot, resolve_backend};
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -119,6 +125,14 @@ pub enum CopyObjectError {
     #[error("At least one of the preconditions you specified did not hold.")]
     PreconditionFailed,
 }
+
+impl From<IoError> for CopyObjectError {
+    fn from(error: IoError) -> Self {
+        Self::Get(error.into())
+    }
+}
+
+type CopyTurn<T> = Result<Next<T>, CopyObjectError>;
 
 /// A sealed copy fails like the write it stands in for, or like a missing source.
 fn sealed_error(error: SealedCopyError) -> CopyObjectError {
@@ -217,287 +231,6 @@ pub(crate) fn evaluate_source_conditions(
     Ok(())
 }
 
-pub async fn copy_object(
-    context: &DriverContext,
-    input: CopyObjectInput,
-) -> Result<CopyResultData, CopyObjectError> {
-    copy_object_tracked(context, input, None).await
-}
-
-/// `copy_object` with the bytes pulled so far published on `progress`, so a
-/// job can report a long source read while it runs.
-pub async fn copy_object_tracked(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    progress: Option<Arc<AtomicU64>>,
-) -> Result<CopyResultData, CopyObjectError> {
-    copy_inner(context, input, progress, (None, None)).await
-}
-
-/// `copy_object_tracked` that writes the version `version_id`, minted once by the caller, so a
-/// retry after a lost answer replays that version instead of writing another one.
-pub async fn copy_object_at(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    version_id: Ulid,
-    progress: Option<Arc<AtomicU64>>,
-) -> Result<CopyResultData, CopyObjectError> {
-    copy_inner(context, input, progress, (None, Some(version_id))).await
-}
-
-/// `copy_object` where `token` admits the source read while its bucket key is locked.
-/// Reads a copy source a member streams to the destination's coordinator; the conditions are
-/// checked before any byte moves.
-pub async fn read_copy_source(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    conditions: &CopySourceConditions,
-    token: Option<&TokenRead>,
-) -> Result<GetObjectResult, CopyObjectError> {
-    let source = read_source(context, input, restrictions, token).await?;
-    let last_modified = (source.info.version_created_at)
-        .or_else(|| source.location.as_ref().map(|location| location.created_at))
-        .or_else(|| (source.source_metadata.as_ref()).and_then(|metadata| metadata.last_modified));
-    let etag = (source.location.as_ref())
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| (source.source_metadata.as_ref()).and_then(|metadata| metadata.etag.clone()));
-    evaluate_source_conditions(conditions, etag.as_deref(), last_modified, true)?;
-    Ok(source)
-}
-
-pub async fn copy_object_token(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    token: Option<TokenRead>,
-) -> Result<CopyResultData, CopyObjectError> {
-    copy_inner(context, input, None, (token.as_ref(), None)).await
-}
-
-async fn copy_inner(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    progress: Option<Arc<AtomicU64>>,
-    (token, version): (Option<&TokenRead>, Option<Ulid>),
-) -> Result<CopyResultData, CopyObjectError> {
-    // A given version that already exists was written by an earlier attempt whose answer was
-    // lost; it is answered without the source, which may be gone by now.
-    if let Some(version_id) = version
-        && let Some(committed) = committed_copy(context, &input, version_id).await?
-    {
-        return Ok(committed);
-    }
-    drive(
-        FenceCheckOperation::new(&input.dest_bucket, &input.dest_key),
-        context,
-    )
-    .await
-    .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
-    // The description touches no source, so a reference can be kept without
-    // contacting its connector.
-    let head = drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: input.source_bucket.clone(),
-            key: input.source_key.clone(),
-            version_id: input.source_version_id,
-        }),
-        context,
-    )
-    .await
-    .map_err(head_error)?;
-    let source_last_modified = head
-        .version_created_at
-        .or_else(|| head.location.as_ref().map(|location| location.created_at))
-        .or_else(|| {
-            head.source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.last_modified)
-        });
-    let source_etag = head
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| {
-            head.source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.etag.clone())
-        });
-    evaluate_source_conditions(
-        &input.conditions,
-        source_etag.as_deref(),
-        source_last_modified,
-        true,
-    )?;
-    // A record-only version of a distributed bucket is read through a holder, never kept.
-    let record_only = (head.source_binding.as_ref()).is_some_and(record_only);
-    if head.location.is_none() && input.references == CopyReferences::Preserve && !record_only {
-        // Another bucket reads the reference without the source's lock, so admit it here.
-        if input.source_bucket != input.dest_bucket {
-            admit_source(context, &input).await?;
-        }
-        let source = (head, source_last_modified);
-        return preserve_reference(context, input, source, version).await;
-    }
-    // A sealed source in the same bucket is aliased, never read, so it copies while locked. Its
-    // version cannot be given, so a copy with a given version reads the source instead.
-    if let Some(location) = head.location.clone().filter(|location| {
-        location.format.bucket_key().is_some()
-            && input.source_bucket == input.dest_bucket
-            && version.is_none()
-    }) {
-        return sealed_copy(context, input, head, location, source_last_modified).await;
-    }
-
-    let source_names = (input.source_bucket.clone(), input.source_key.clone());
-    let source_input = GetObjectInput {
-        bucket: input.source_bucket,
-        key: input.source_key,
-        version_id: input.source_version_id,
-        range: None,
-        group_id: input.source_group_id,
-        user_identity: input.source_auth_context.user_id,
-        realm_id: input.source_auth_context.realm_id,
-        node_id: input.node_id,
-    };
-    let restrictions = input.source_auth_context.path_restrictions.clone();
-    let source = read_source(context, source_input, restrictions, token).await?;
-
-    let source_version_id = source.version_id;
-    let materialized = source.location.is_some();
-    let content_length = source.location.as_ref().map(|location| location.blob_size);
-    let version_source = if materialized {
-        source.source_binding.clone()
-    } else {
-        source
-            .source_binding
-            .clone()
-            .map(|binding| VersionSourceBinding {
-                strategy: StagingStrategy::Snapshot,
-                ..binding
-            })
-    };
-    let mut metadata = input.metadata.unwrap_or(source.metadata);
-    // A copy is never a release, even of a release crate.
-    strip_release_keys(&mut metadata);
-    let routing = drive(
-        SnapshotOperation::new(
-            &node_routing(context),
-            input.group_id,
-            BucketRules::Named(input.dest_bucket.to_string()),
-        ),
-        context,
-    )
-    .await?;
-    // Bytes the destination's backend already holds in the destination's encoding
-    // are adopted, not streamed; another encoding gets its own copy. A key under a
-    // backend import folder streams, so its file appears at the folder's path.
-    let (bucket, key) = (&input.dest_bucket, &input.dest_key);
-    let plain = routing.plain_target(bucket, key, Ulid::nil()).is_some();
-    let adopt = source.location.clone().filter(|location| {
-        !plain
-            && resolve_backend(&routing, &input.dest_bucket, &input.dest_key).is_ok_and(
-                |resolved| {
-                    resolved.backend == location.backend
-                        && EncodingClass::from(resolved.compression) == location.format.encoding()
-                },
-            )
-    });
-    let body = match (adopt.is_some(), progress) {
-        (true, _) => None,
-        (false, Some(pulled)) => Some(BackendStream(Box::pin(source.blob.inspect(move |chunk| {
-            if let Ok(bytes) = chunk {
-                pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            }
-        })))),
-        (false, None) => Some(source.blob),
-    };
-
-    // Materialized source bytes are kept only when they match every recorded full-object digest.
-    let expected_checksums = source
-        .source_metadata
-        .as_ref()
-        .map(SourceMetadata::enforced_checksums)
-        .unwrap_or_default();
-    let gate = drive(
-        GateOperation::new(input.realm_id, unix_timestamp_millis()),
-        context,
-    )
-    .await?;
-    let origin = copy_origin(
-        context,
-        (input.realm_id, input.node_id),
-        (&source_names.0, &source_names.1),
-        (source_version_id, input.job_id),
-    )
-    .await;
-    let mut operation = PutObjectOperation::new(PutObjectConfig {
-        user_id: input.user_id,
-        group_id: input.group_id,
-        realm_id: input.realm_id,
-        node_id: input.node_id,
-        request: PutObjectInput {
-            bucket: input.dest_bucket,
-            key: input.dest_key,
-            content_length,
-            body,
-        },
-        expected_checksums,
-        checksum_type: None,
-        exists: false,
-        version_source,
-        preassigned_version_id: version,
-        quota_ceiling: input.quota_ceiling,
-        routing,
-    })
-    .without_envelope()
-    .with_metadata(metadata)
-    .with_version_origin(origin)
-    .with_inherited_policies(source.source_policies.clone())
-    .with_restrictions(input.restrictions.clone());
-    if let Some(location) = adopt {
-        operation = operation.with_adopted(location);
-    }
-    if let Some(gate) = gate {
-        operation = operation.with_gate(gate);
-    }
-    let put_result = drive(operation, context).await?;
-
-    // The new version time owns copy time when dedup reuses an older location.
-    let created_at = UNIX_EPOCH + Duration::from_millis(put_result.version_id.timestamp_ms());
-
-    Ok(CopyResultData {
-        size: put_result.location.blob_size,
-        location: Some(put_result.location),
-        source_metadata: None,
-        version_id: put_result.version_id,
-        created_at,
-        source_version_id,
-        source_last_modified,
-    })
-}
-
-/// A copy's origin: its exact source version, by global id in a distributed bucket.
-async fn copy_origin(
-    context: &DriverContext,
-    (realm_id, node_id): (RealmId, NodeId),
-    (bucket, key): (&str, &str),
-    (version_id, job_id): (Option<Ulid>, Option<Ulid>),
-) -> Option<VersionOrigin> {
-    let version_id = version_id?;
-    let source = drive(GetBucketOperation::new(bucket.to_string()), context)
-        .await
-        .ok()?;
-    let distributed = source.distribution.is_some();
-    source_origin(
-        (realm_id, node_id),
-        (bucket, key),
-        (version_id, job_id),
-        distributed,
-    )
-}
-
 /// The origin of a copy of `version_id`: its global id in a distributed bucket, else its ARN.
 pub fn source_origin(
     (realm_id, node_id): (RealmId, NodeId),
@@ -517,180 +250,698 @@ pub fn source_origin(
     Some(VersionOrigin::Copy { from, job_id })
 }
 
-/// Publishes the destination as a new version of the source's archive and grants.
-async fn sealed_copy(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    head: HeadObjectResult,
-    location: BackendLocation,
-    source_last_modified: Option<SystemTime>,
-) -> Result<CopyResultData, CopyObjectError> {
-    let source_version_id = head
-        .version_id
-        .ok_or(CopyObjectError::Get(GetObjectError::NoSuchVersion))?;
-    let operation = SealedCopyOperation::new(SealedCopyInput {
-        bucket: input.dest_bucket,
-        source_key: input.source_key,
-        source_version_id,
-        location: location.clone(),
-        source_policies: head.source_policies,
-        size: location.blob_size,
-        dest_key: input.dest_key,
-        metadata: input.metadata,
-        user_id: input.user_id,
-        group_id: input.group_id,
-        realm_id: input.realm_id,
-        node_id: input.node_id,
-        quota_ceiling: input.quota_ceiling,
-        job_id: input.job_id,
-    });
-    let operation = match drive(
-        GateOperation::new(input.realm_id, unix_timestamp_millis()),
-        context,
-    )
-    .await?
-    {
-        Some(gate) => operation.with_gate(gate),
-        None => operation,
-    };
-    let version_id = drive(operation, context)
-        .await
-        .map_err(sealed_error)?
-        .version_id;
-    Ok(CopyResultData {
-        size: location.blob_size,
-        location: Some(location),
-        source_metadata: None,
-        version_id,
-        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
-        source_version_id: Some(source_version_id),
-        source_last_modified,
-    })
+/// When a source was last modified, as far as its version record or observation tells.
+fn source_modified(
+    created_at: Option<SystemTime>,
+    location: Option<&BackendLocation>,
+    metadata: Option<&SourceMetadata>,
+) -> Option<SystemTime> {
+    created_at
+        .or_else(|| location.map(|location| location.created_at))
+        .or_else(|| metadata.and_then(|metadata| metadata.last_modified))
 }
 
-/// The destination version `version_id` when it exists, described as the copy that wrote it.
-async fn committed_copy(
-    context: &DriverContext,
-    input: &CopyObjectInput,
-    version_id: Ulid,
-) -> Result<Option<CopyResultData>, CopyObjectError> {
-    let head = HeadObjectInput {
-        bucket: input.dest_bucket.clone(),
-        key: input.dest_key.clone(),
-        version_id: Some(version_id),
-    };
-    let head = match drive(HeadObjectOperation::new(head), context).await {
-        Ok(head) => head,
-        Err(HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion) => return Ok(None),
-        Err(error) => return Err(head_error(error)),
-    };
-    let size = (head.location.as_ref().map(|location| location.blob_size))
-        .or_else(|| (head.source_metadata.as_ref()).map(|metadata| metadata.content_length))
-        .unwrap_or_default();
-    Ok(Some(CopyResultData {
-        location: head.location,
-        size,
-        source_metadata: head.source_metadata,
-        version_id,
-        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
-        source_version_id: None,
-        source_last_modified: None,
-    }))
+fn source_etag(
+    location: Option<&BackendLocation>,
+    metadata: Option<&SourceMetadata>,
+) -> Option<String> {
+    (location.and_then(|location| location.hashes.get(HASH_MD5)))
+        .map(hex::encode)
+        .or_else(|| metadata.and_then(|metadata| metadata.etag.clone()))
+}
+
+fn version_time(version_id: Ulid) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms())
+}
+
+/// The bytes a copy pulled so far, shared with whoever reports them.
+#[derive(Clone, Debug)]
+struct PulledBytes(Arc<AtomicU64>);
+
+impl PartialEq for PulledBytes {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The version a copy writes and the clock it writes under.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CopyStamp {
+    version: Option<Ulid>,
+    fresh: Ulid,
+    now_ms: u64,
+}
+
+/// Reads a copy source a member streams to the destination's coordinator; the conditions are
+/// checked before any byte moves.
+#[derive(Debug, PartialEq)]
+pub struct ReadCopyOperation {
+    read: Option<ReadSourceOperation>,
+    conditions: CopySourceConditions,
+}
+
+impl ReadCopyOperation {
+    pub fn new(
+        input: GetObjectInput,
+        restrictions: Option<Vec<PathRestriction>>,
+        conditions: &CopySourceConditions,
+        token: Option<TokenRead>,
+    ) -> Self {
+        Self {
+            read: Some(ReadSourceOperation::new(input, restrictions, token)),
+            conditions: conditions.clone(),
+        }
+    }
+}
+
+impl Operation for ReadCopyOperation {
+    type Output = GetObjectResult;
+    type Error = CopyObjectError;
+
+    fn first(&mut self) -> CopyTurn<GetObjectResult> {
+        let read = self.read.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<GetObjectResult> {
+        let source = result.child::<GetObjectResult, GetObjectError>()??;
+        let (location, metadata) = (source.location.as_ref(), source.source_metadata.as_ref());
+        let modified = source_modified(source.info.version_created_at, location, metadata);
+        let etag = source_etag(location, metadata);
+        evaluate_source_conditions(&self.conditions, etag.as_deref(), modified, true)?;
+        Ok(Next::Done(source))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CopyStep {
+    Committed,
+    Fence,
+    Head,
+    Finish,
+}
+
+/// Copies an object to another key. The source's description decides how: a reference stays
+/// one, a sealed source in the same bucket is aliased, anything else moves its bytes.
+#[derive(Debug, PartialEq)]
+pub struct CopyObjectOperation {
+    input: Option<CopyObjectInput>,
+    routing: NodeRouting,
+    progress: Option<PulledBytes>,
+    token: Option<TokenRead>,
+    stamp: CopyStamp,
+    step: CopyStep,
+}
+
+impl CopyObjectOperation {
+    pub fn new(input: CopyObjectInput, routing: NodeRouting) -> Self {
+        Self {
+            input: Some(input),
+            routing,
+            progress: None,
+            token: None,
+            stamp: CopyStamp {
+                version: None,
+                fresh: Ulid::generate(),
+                now_ms: 0,
+            },
+            step: CopyStep::Fence,
+        }
+    }
+
+    /// Publishes the bytes pulled so far, so a job can report a long source read.
+    pub fn with_progress(mut self, pulled: Arc<AtomicU64>) -> Self {
+        self.progress = Some(PulledBytes(pulled));
+        self
+    }
+
+    /// Writes `version_id`, minted once by the caller, so a retry after a lost answer replays
+    /// that version instead of writing another one.
+    pub fn at_version(mut self, version_id: Ulid) -> Self {
+        self.stamp.version = Some(version_id);
+        self
+    }
+
+    /// Lets `token` admit the source read while its bucket key is locked.
+    pub fn with_token(mut self, token: Option<TokenRead>) -> Self {
+        self.token = token;
+        self
+    }
+
+    fn input(&self) -> Result<&CopyObjectInput, IoError> {
+        self.input.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn check_fence(&mut self) -> CopyTurn<CopyResultData> {
+        let input = self.input()?;
+        let fence = FenceCheckOperation::new(&input.dest_bucket, &input.dest_key);
+        self.step = CopyStep::Fence;
+        Ok(Next::Call(IoCall::child(fence)))
+    }
+
+    /// A given version that already exists was written by an earlier attempt whose answer was
+    /// lost; it is answered without the source, which may be gone by now.
+    fn committed(
+        &mut self,
+        version_id: Ulid,
+        head: Result<HeadObjectResult, HeadObjectError>,
+    ) -> CopyTurn<CopyResultData> {
+        let head = match head {
+            Ok(head) => head,
+            Err(HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion) => {
+                return self.check_fence();
+            }
+            Err(error) => return Err(head_error(error)),
+        };
+        let size = (head.location.as_ref().map(|location| location.blob_size))
+            .or_else(|| (head.source_metadata.as_ref()).map(|metadata| metadata.content_length))
+            .unwrap_or_default();
+        Ok(Next::Done(CopyResultData {
+            location: head.location,
+            size,
+            source_metadata: head.source_metadata,
+            version_id,
+            created_at: version_time(version_id),
+            source_version_id: None,
+            source_last_modified: None,
+        }))
+    }
+
+    /// The description touches no source, so a reference is kept without contacting its
+    /// connector.
+    fn described(&mut self, head: HeadObjectResult) -> CopyTurn<CopyResultData> {
+        let input = self.input.take().ok_or(IoError::Unfinished)?;
+        let (location, metadata) = (head.location.as_ref(), head.source_metadata.as_ref());
+        let modified = source_modified(head.version_created_at, location, metadata);
+        let etag = source_etag(location, metadata);
+        evaluate_source_conditions(&input.conditions, etag.as_deref(), modified, true)?;
+        let stamp = self.stamp;
+        self.step = CopyStep::Finish;
+        // A record-only version of a distributed bucket is read through a holder, never kept.
+        let record_only = (head.source_binding.as_ref()).is_some_and(record_only);
+        if head.location.is_none() && input.references == CopyReferences::Preserve && !record_only {
+            let keep = KeepReferenceOperation::new(input, head, modified, stamp);
+            return Ok(Next::Call(IoCall::child(keep)));
+        }
+        // A sealed source in the same bucket is aliased, never read, so it copies while locked.
+        // Its version cannot be given, so a copy with a given version reads the source instead.
+        let sealed = head.location.clone().filter(|location| {
+            location.format.bucket_key().is_some()
+                && input.source_bucket == input.dest_bucket
+                && stamp.version.is_none()
+        });
+        if let Some(location) = sealed {
+            let alias = AliasSealedOperation::new(input, head, location, modified, stamp.now_ms)?;
+            return Ok(Next::Call(IoCall::child(alias)));
+        }
+        let bytes = CopyBytesOperation {
+            input,
+            routing: self.routing.clone(),
+            progress: self.progress.take(),
+            token: self.token.take(),
+            modified,
+            stamp,
+            source: None,
+            snapshot: None,
+            gate: None,
+            source_version: None,
+            step: BytesStep::Source,
+        };
+        Ok(Next::Call(IoCall::child(bytes)))
+    }
+}
+
+impl Operation for CopyObjectOperation {
+    type Output = CopyResultData;
+    type Error = CopyObjectError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.stamp.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> CopyTurn<CopyResultData> {
+        let Some(version_id) = self.stamp.version else {
+            return self.check_fence();
+        };
+        let input = self.input()?;
+        let head = HeadObjectOperation::new(HeadObjectInput {
+            bucket: input.dest_bucket.clone(),
+            key: input.dest_key.clone(),
+            version_id: Some(version_id),
+        });
+        self.step = CopyStep::Committed;
+        Ok(Next::Call(IoCall::child(head)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<CopyResultData> {
+        match self.step {
+            CopyStep::Committed => {
+                let version_id = self.stamp.version.ok_or(IoError::Unfinished)?;
+                self.committed(version_id, result.child()?)
+            }
+            CopyStep::Fence => {
+                (result.child::<(), PurgeFenceError>()?)
+                    .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
+                let input = self.input()?;
+                let head = HeadObjectOperation::new(HeadObjectInput {
+                    bucket: input.source_bucket.clone(),
+                    key: input.source_key.clone(),
+                    version_id: input.source_version_id,
+                });
+                self.step = CopyStep::Head;
+                Ok(Next::Call(IoCall::child(head)))
+            }
+            CopyStep::Head => {
+                let head = result.child::<HeadObjectResult, HeadObjectError>()?;
+                self.described(head.map_err(head_error)?)
+            }
+            CopyStep::Finish => Ok(Next::Done(
+                result.child::<CopyResultData, CopyObjectError>()??,
+            )),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum BytesStep {
+    Source,
+    Routing,
+    Gate,
+    Origin,
+    Put,
+}
+
+/// Reads the source and writes its bytes at the destination, or adopts them where the
+/// destination's backend already holds them.
+#[derive(Debug, PartialEq)]
+struct CopyBytesOperation {
+    input: CopyObjectInput,
+    routing: NodeRouting,
+    progress: Option<PulledBytes>,
+    token: Option<TokenRead>,
+    modified: Option<SystemTime>,
+    stamp: CopyStamp,
+    source: Option<GetObjectResult>,
+    snapshot: Option<RoutingSnapshot>,
+    gate: Option<GateContext>,
+    source_version: Option<Ulid>,
+    step: BytesStep,
+}
+
+impl CopyBytesOperation {
+    /// A copy's origin names its exact source version, so the source bucket is read for it.
+    fn read_origin(&mut self) -> CopyTurn<CopyResultData> {
+        if self.source_version.is_none() {
+            return self.write(None);
+        }
+        let bucket = GetBucketOperation::new(self.input.source_bucket.clone());
+        self.step = BytesStep::Origin;
+        Ok(Next::Call(IoCall::child(bucket)))
+    }
+
+    fn origin(&self, distributed: bool) -> Option<VersionOrigin> {
+        let input = &self.input;
+        source_origin(
+            (input.realm_id, input.node_id),
+            (&input.source_bucket, &input.source_key),
+            (self.source_version?, input.job_id),
+            distributed,
+        )
+    }
+
+    fn write(&mut self, origin: Option<VersionOrigin>) -> CopyTurn<CopyResultData> {
+        let source = self.source.take().ok_or(IoError::Unfinished)?;
+        let routing = self.snapshot.take().ok_or(IoError::Unfinished)?;
+        let input = &mut self.input;
+        let content_length = source.location.as_ref().map(|location| location.blob_size);
+        let version_source = match source.location.is_some() {
+            true => source.source_binding.clone(),
+            false => (source.source_binding.clone()).map(|binding| VersionSourceBinding {
+                strategy: StagingStrategy::Snapshot,
+                ..binding
+            }),
+        };
+        let mut metadata = input.metadata.take().unwrap_or(source.metadata);
+        // A copy is never a release, even of a release crate.
+        strip_release_keys(&mut metadata);
+        // Bytes the destination's backend already holds in the destination's encoding are
+        // adopted; another encoding gets its own copy. A key under a backend import folder
+        // streams, so its file appears at the folder's path.
+        let (bucket, key) = (&input.dest_bucket, &input.dest_key);
+        let plain = routing.plain_target(bucket, key, Ulid::nil()).is_some();
+        let adopt = source.location.clone().filter(|location| {
+            !plain
+                && resolve_backend(&routing, bucket, key).is_ok_and(|resolved| {
+                    resolved.backend == location.backend
+                        && EncodingClass::from(resolved.compression) == location.format.encoding()
+                })
+        });
+        let body = match (adopt.is_some(), self.progress.take()) {
+            (true, _) => None,
+            (false, Some(PulledBytes(pulled))) => {
+                Some(BackendStream(Box::pin(source.blob.inspect(move |chunk| {
+                    if let Ok(bytes) = chunk {
+                        pulled.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    }
+                }))))
+            }
+            (false, None) => Some(source.blob),
+        };
+        // Materialized source bytes are kept only when they match every recorded digest.
+        let expected_checksums = (source.source_metadata.as_ref())
+            .map(SourceMetadata::enforced_checksums)
+            .unwrap_or_default();
+        let mut put = PutObjectOperation::new(PutObjectConfig {
+            user_id: input.user_id,
+            group_id: input.group_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            request: PutObjectInput {
+                bucket: input.dest_bucket.clone(),
+                key: input.dest_key.clone(),
+                content_length,
+                body,
+            },
+            expected_checksums,
+            checksum_type: None,
+            exists: false,
+            version_source,
+            preassigned_version_id: self.stamp.version,
+            quota_ceiling: input.quota_ceiling,
+            routing,
+        })
+        .without_envelope()
+        .with_metadata(metadata)
+        .with_version_origin(origin)
+        .with_inherited_policies(source.source_policies)
+        .with_restrictions(input.restrictions.clone());
+        if let Some(location) = adopt {
+            put = put.with_adopted(location);
+        }
+        if let Some(gate) = self.gate.take() {
+            put = put.with_gate(gate);
+        }
+        self.step = BytesStep::Put;
+        Ok(Next::Call(IoCall::child(put)))
+    }
+}
+
+impl Operation for CopyBytesOperation {
+    type Output = CopyResultData;
+    type Error = CopyObjectError;
+
+    fn first(&mut self) -> CopyTurn<CopyResultData> {
+        let input = &self.input;
+        let source = GetObjectInput {
+            bucket: input.source_bucket.clone(),
+            key: input.source_key.clone(),
+            version_id: input.source_version_id,
+            range: None,
+            group_id: input.source_group_id,
+            user_identity: input.source_auth_context.user_id,
+            realm_id: input.source_auth_context.realm_id,
+            node_id: input.node_id,
+        };
+        let restrictions = input.source_auth_context.path_restrictions.clone();
+        let read = ReadSourceOperation::new(source, restrictions, self.token.take());
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<CopyResultData> {
+        match self.step {
+            BytesStep::Source => {
+                let source = result.child::<GetObjectResult, GetObjectError>()??;
+                self.source_version = source.version_id;
+                self.source = Some(source);
+                let input = &self.input;
+                let rules = BucketRules::Named(input.dest_bucket.clone());
+                let snapshot = SnapshotOperation::new(&self.routing, input.group_id, rules);
+                self.step = BytesStep::Routing;
+                Ok(Next::Call(IoCall::child(snapshot)))
+            }
+            BytesStep::Routing => {
+                self.snapshot = Some(result.child::<RoutingSnapshot, RoutingInputsError>()??);
+                let gate = GateOperation::new(self.input.realm_id, self.stamp.now_ms);
+                self.step = BytesStep::Gate;
+                Ok(Next::Call(IoCall::child(gate)))
+            }
+            BytesStep::Gate => {
+                self.gate = result.child::<Option<GateContext>, GateContextError>()??;
+                self.read_origin()
+            }
+            BytesStep::Origin => {
+                // An unreadable source bucket leaves the copy without an origin.
+                let origin = (result.child::<BucketInfo, GetBucketError>()?)
+                    .ok()
+                    .and_then(|bucket| self.origin(bucket.distribution.is_some()));
+                self.write(origin)
+            }
+            BytesStep::Put => {
+                let put = result.child::<PutObjectResult, PutObjectError>()??;
+                // The new version time owns copy time when dedup reuses an older location.
+                Ok(Next::Done(CopyResultData {
+                    size: put.location.blob_size,
+                    location: Some(put.location),
+                    source_metadata: None,
+                    version_id: put.version_id,
+                    created_at: version_time(put.version_id),
+                    source_version_id: self.source_version,
+                    source_last_modified: self.modified,
+                }))
+            }
+        }
+    }
+}
+
+/// Publishes the destination as a new version of the source's archive and grants.
+#[derive(Debug, PartialEq)]
+struct AliasSealedOperation {
+    realm_id: RealmId,
+    now_ms: u64,
+    copy: Option<SealedCopyOperation>,
+    location: BackendLocation,
+    source_version_id: Ulid,
+    modified: Option<SystemTime>,
+}
+
+impl AliasSealedOperation {
+    fn new(
+        input: CopyObjectInput,
+        head: HeadObjectResult,
+        location: BackendLocation,
+        modified: Option<SystemTime>,
+        now_ms: u64,
+    ) -> Result<Self, CopyObjectError> {
+        let source_version_id = head
+            .version_id
+            .ok_or(CopyObjectError::Get(GetObjectError::NoSuchVersion))?;
+        let copy = SealedCopyOperation::new(SealedCopyInput {
+            bucket: input.dest_bucket,
+            source_key: input.source_key,
+            source_version_id,
+            location: location.clone(),
+            source_policies: head.source_policies,
+            size: location.blob_size,
+            dest_key: input.dest_key,
+            metadata: input.metadata,
+            user_id: input.user_id,
+            group_id: input.group_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            quota_ceiling: input.quota_ceiling,
+            job_id: input.job_id,
+        });
+        Ok(Self {
+            realm_id: input.realm_id,
+            now_ms,
+            copy: Some(copy),
+            location,
+            source_version_id,
+            modified,
+        })
+    }
+}
+
+impl Operation for AliasSealedOperation {
+    type Output = CopyResultData;
+    type Error = CopyObjectError;
+
+    fn first(&mut self) -> CopyTurn<CopyResultData> {
+        let gate = GateOperation::new(self.realm_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(gate)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<CopyResultData> {
+        if let Some(copy) = self.copy.take() {
+            let copy = match result.child::<Option<GateContext>, GateContextError>()?? {
+                Some(gate) => copy.with_gate(gate),
+                None => copy,
+            };
+            return Ok(Next::Call(IoCall::child(copy)));
+        }
+        let copied = result.child::<SealedCopyResult, SealedCopyError>()?;
+        let version_id = copied.map_err(sealed_error)?.version_id;
+        Ok(Next::Done(CopyResultData {
+            size: self.location.blob_size,
+            location: Some(self.location.clone()),
+            source_metadata: None,
+            version_id,
+            created_at: version_time(version_id),
+            source_version_id: Some(self.source_version_id),
+            source_last_modified: self.modified,
+        }))
+    }
 }
 
 /// Admits a plaintext read of the source bucket the way GET does: an encrypting bucket must be
 /// unlocked, since a token opens single objects only. No bytes move, so the lease ends at once.
-async fn admit_source(
-    context: &DriverContext,
-    input: &CopyObjectInput,
-) -> Result<(), CopyObjectError> {
-    let failed = || CopyObjectError::Get(GetObjectError::GetObjectFailed);
-    let read = StorageEffect::Read {
-        key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-        key: input.source_bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) =
-        context.storage_handle.send_storage_effect(read).await
-    else {
-        return Err(failed());
-    };
-    let settings = BucketEncryption::from_row(value.as_deref())
-        .map_err(|error| CopyObjectError::Get(GetObjectError::ConversionError(error)))?;
-    let Some(key) = settings.active_key() else {
-        return Ok(());
-    };
-    let blob_handle = context.blob_handle.as_ref().ok_or_else(failed)?;
-    let archive = reference_archive(key);
-    let locked = |error| {
-        CopyObjectError::Get(GetObjectError::ConversionError(ConversionError::BucketKey(
-            error,
-        )))
-    };
-    let admit = BlobEffect::AdmitRead {
-        key,
-        archive: archive.clone(),
-    };
-    match blob_handle.send_blob_effect(admit).await {
-        Event::Blob(BlobEvent::ReadAdmitted { .. }) => Ok(()),
-        Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
-        _ => Err(failed()),
+#[derive(Debug, PartialEq)]
+struct AdmitSourceOperation {
+    bucket: String,
+    admitting: bool,
+}
+
+impl Operation for AdmitSourceOperation {
+    type Output = ();
+    type Error = CopyObjectError;
+
+    fn first(&mut self) -> CopyTurn<()> {
+        let key = self.bucket.as_bytes().to_vec();
+        Ok(Next::Call(read_row(BUCKET_ENCRYPTION_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<()> {
+        if self.admitting {
+            return match result.event()? {
+                Event::Blob(BlobEvent::ReadAdmitted { .. }) => Ok(Next::Done(())),
+                Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
+                    Err(CopyObjectError::Get(GetObjectError::ConversionError(
+                        ConversionError::BucketKey(error),
+                    )))
+                }
+                _ => Err(CopyObjectError::Get(GetObjectError::GetObjectFailed)),
+            };
+        }
+        let value = result.value()?;
+        let settings = BucketEncryption::from_row(value.as_deref())
+            .map_err(|error| CopyObjectError::Get(GetObjectError::ConversionError(error)))?;
+        let Some(key) = settings.active_key() else {
+            return Ok(Next::Done(()));
+        };
+        let archive = reference_archive(key);
+        self.admitting = true;
+        let admit = BlobEffect::AdmitRead { key, archive };
+        Ok(Next::Call(Effect::Blob(admit).into()))
     }
 }
 
-/// Records a reference of the source's binding at the destination, carrying
-/// the source's refs. No byte moves.
-async fn preserve_reference(
-    context: &DriverContext,
-    input: CopyObjectInput,
-    (head, source_last_modified): (HeadObjectResult, Option<SystemTime>),
-    version: Option<Ulid>,
-) -> Result<CopyResultData, CopyObjectError> {
-    let (Some(binding), Some(metadata)) = (head.source_binding, head.source_metadata) else {
-        return Err(CopyObjectError::Get(GetObjectError::GetObjectFailed));
-    };
-    let (version_id, _changed) = drive(
-        WriteReferenceOperation::new(
-            ReferenceWrite {
-                preassigned_version_id: version,
-                group_id: input.group_id,
-                user_id: input.user_id,
-                realm_id: input.realm_id,
-                node_id: input.node_id,
-                bucket: input.dest_bucket,
-                key: input.dest_key,
-                expected_bucket: None,
-                version_source: VersionSourceBinding {
-                    strategy: StagingStrategy::Reference,
-                    ..binding
-                },
-                metadata: metadata.clone(),
-                inherited_policies: head.source_policies,
-                connector_guard: None,
-                mirror_guards: Vec::new(),
-                restrictions: input.restrictions,
-                job_id: input.job_id,
+/// Records a reference of the source's binding at the destination, carrying the source's refs.
+/// No byte moves; another bucket reads the reference without the source's lock, so it is
+/// admitted there first.
+#[derive(Debug, PartialEq)]
+struct KeepReferenceOperation {
+    input: Option<CopyObjectInput>,
+    head: Option<HeadObjectResult>,
+    modified: Option<SystemTime>,
+    stamp: CopyStamp,
+    metadata: Option<SourceMetadata>,
+    source_version_id: Option<Ulid>,
+    admitting: bool,
+}
+
+impl KeepReferenceOperation {
+    fn new(
+        input: CopyObjectInput,
+        head: HeadObjectResult,
+        modified: Option<SystemTime>,
+        stamp: CopyStamp,
+    ) -> Self {
+        Self {
+            input: Some(input),
+            source_version_id: head.version_id,
+            head: Some(head),
+            modified,
+            stamp,
+            metadata: None,
+            admitting: false,
+        }
+    }
+
+    fn write(&mut self) -> CopyTurn<CopyResultData> {
+        let input = self.input.take().ok_or(IoError::Unfinished)?;
+        let head = self.head.take().ok_or(IoError::Unfinished)?;
+        let (Some(binding), Some(metadata)) = (head.source_binding, head.source_metadata) else {
+            return Err(CopyObjectError::Get(GetObjectError::GetObjectFailed));
+        };
+        self.metadata = Some(metadata.clone());
+        self.admitting = false;
+        let write = ReferenceWrite {
+            preassigned_version_id: self.stamp.version,
+            group_id: input.group_id,
+            user_id: input.user_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            bucket: input.dest_bucket,
+            key: input.dest_key,
+            expected_bucket: None,
+            version_source: VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                ..binding
             },
-            std::time::SystemTime::now(),
-            ulid::Ulid::generate(),
-        ),
-        context,
-    )
-    .await?;
-    Ok(CopyResultData {
-        location: None,
-        size: metadata.content_length,
-        source_metadata: Some(metadata),
-        version_id,
-        created_at: UNIX_EPOCH + Duration::from_millis(version_id.timestamp_ms()),
-        source_version_id: head.version_id,
-        source_last_modified,
-    })
+            metadata,
+            inherited_policies: head.source_policies,
+            connector_guard: None,
+            mirror_guards: Vec::new(),
+            restrictions: input.restrictions,
+            job_id: input.job_id,
+        };
+        let now = UNIX_EPOCH + Duration::from_millis(self.stamp.now_ms);
+        let write = WriteReferenceOperation::new(write, now, self.stamp.fresh);
+        Ok(Next::Call(IoCall::child(write)))
+    }
+}
+
+impl Operation for KeepReferenceOperation {
+    type Output = CopyResultData;
+    type Error = CopyObjectError;
+
+    fn first(&mut self) -> CopyTurn<CopyResultData> {
+        let input = self.input.as_ref().ok_or(IoError::Unfinished)?;
+        if input.source_bucket == input.dest_bucket {
+            return self.write();
+        }
+        let admit = AdmitSourceOperation {
+            bucket: input.source_bucket.clone(),
+            admitting: false,
+        };
+        self.admitting = true;
+        Ok(Next::Call(IoCall::child(admit)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CopyTurn<CopyResultData> {
+        if self.admitting {
+            result.child::<(), CopyObjectError>()??;
+            return self.write();
+        }
+        let written = result.child::<(Ulid, bool), MaterializeReferenceError>()?;
+        let (version_id, _changed) = written?;
+        let metadata = self.metadata.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Done(CopyResultData {
+            location: None,
+            size: metadata.content_length,
+            source_metadata: Some(metadata),
+            version_id,
+            created_at: version_time(version_id),
+            source_version_id: self.source_version_id,
+            source_last_modified: self.modified,
+        }))
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
+    use crate::driver::{DriverContext, drive, node_routing};
     use crate::s3::object::get::{GetObjectOperation, MAX_AUTO_ADVANCES};
     #[allow(unused_imports)]
     pub(crate) use crate::testing_objects::{put_config, seed_bucket, with_blob};
@@ -719,6 +970,196 @@ pub(crate) mod test {
 
     fn test_node_id() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
+    }
+
+    async fn copy_object(
+        context: &DriverContext,
+        input: CopyObjectInput,
+    ) -> Result<CopyResultData, CopyObjectError> {
+        drive(
+            CopyObjectOperation::new(input, node_routing(context)),
+            context,
+        )
+        .await
+    }
+
+    async fn copy_object_at(
+        context: &DriverContext,
+        input: CopyObjectInput,
+        version_id: Ulid,
+    ) -> Result<CopyResultData, CopyObjectError> {
+        let copy = CopyObjectOperation::new(input, node_routing(context)).at_version(version_id);
+        drive(copy, context).await
+    }
+
+    async fn copy_object_tracked(
+        context: &DriverContext,
+        input: CopyObjectInput,
+        pulled: Option<Arc<AtomicU64>>,
+    ) -> Result<CopyResultData, CopyObjectError> {
+        let copy = CopyObjectOperation::new(input, node_routing(context));
+        match pulled {
+            Some(pulled) => drive(copy.with_progress(pulled), context).await,
+            None => drive(copy, context).await,
+        }
+    }
+
+    fn step_input(conditions: CopySourceConditions) -> CopyObjectInput {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
+        CopyObjectInput {
+            source_bucket: "source".to_string(),
+            source_key: "a".to_string(),
+            source_version_id: None,
+            source_group_id: Ulid::from_bytes([3; 16]),
+            source_auth_context: auth_context(user_id),
+            dest_bucket: "dest".to_string(),
+            dest_key: "b".to_string(),
+            user_id,
+            group_id: Ulid::from_bytes([3; 16]),
+            realm_id,
+            node_id: test_node_id(),
+            quota_ceiling: None,
+            conditions,
+            metadata: None,
+            restrictions: None,
+            references: CopyReferences::Materialize,
+            job_id: None,
+        }
+    }
+
+    fn step_head() -> HeadObjectResult {
+        HeadObjectResult {
+            location: None,
+            metadata: HashMap::new(),
+            source_metadata: None,
+            last_refresh: None,
+            version_created_at: None,
+            version_id: None,
+            resolved_version_id: None,
+            checksum_type:
+                aruna_core::structs::storage::multipart::MultipartChecksumType::FullObject,
+            composite_hashes: HashMap::new(),
+            part_count: None,
+            source_policies: Vec::new(),
+            source_binding: None,
+        }
+    }
+
+    fn step_copy(conditions: CopySourceConditions) -> CopyObjectOperation {
+        CopyObjectOperation::new(step_input(conditions), NodeRouting::default())
+    }
+
+    fn child<T, E>(outcome: Result<T, E>) -> IoResult
+    where
+        T: std::fmt::Debug + PartialEq + Send + 'static,
+        E: std::fmt::Debug + PartialEq + Send + 'static,
+    {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(outcome))
+    }
+
+    #[test]
+    fn failed_condition_stops() {
+        let mut copy = step_copy(CopySourceConditions {
+            if_match: Some("other".to_string()),
+            ..Default::default()
+        });
+        assert!(matches!(copy.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let fenced = copy.next(child::<(), PurgeFenceError>(Ok(())));
+        assert!(matches!(fenced, Ok(Next::Call(IoCall::Child(_)))));
+        let answer = copy.next(child::<_, HeadObjectError>(Ok(step_head())));
+        assert_eq!(answer, Err(CopyObjectError::PreconditionFailed));
+    }
+
+    #[test]
+    fn missing_source_fails() {
+        let mut copy = step_copy(CopySourceConditions::default());
+        copy.first().unwrap();
+        copy.next(child::<(), PurgeFenceError>(Ok(()))).unwrap();
+        let missing = child::<HeadObjectResult, _>(Err(HeadObjectError::NoSuchKey));
+        let answer = copy.next(missing);
+        assert_eq!(answer, Err(CopyObjectError::Get(GetObjectError::NoSuchKey)));
+    }
+
+    #[test]
+    fn committed_version_answers() {
+        let version = Ulid::from_bytes([4; 16]);
+        let mut copy = step_copy(CopySourceConditions::default()).at_version(version);
+        copy.first().unwrap();
+        let answer = copy.next(child::<_, HeadObjectError>(Ok(step_head())));
+        let Ok(Next::Done(done)) = answer else {
+            panic!("a committed version answers the copy");
+        };
+        assert_eq!(done.version_id, version);
+        assert_eq!(done.source_version_id, None);
+    }
+
+    #[test]
+    fn absent_version_copies() {
+        let version = Ulid::from_bytes([4; 16]);
+        let mut copy = step_copy(CopySourceConditions::default()).at_version(version);
+        copy.first().unwrap();
+        let missing = child::<HeadObjectResult, _>(Err(HeadObjectError::NoSuchVersion));
+        assert!(matches!(
+            copy.next(missing),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(copy.step, CopyStep::Fence);
+    }
+
+    #[test]
+    fn unbound_reference_fails() {
+        let input = step_input(CopySourceConditions::default());
+        let stamp = CopyStamp {
+            version: None,
+            fresh: Ulid::from_bytes([5; 16]),
+            now_ms: 1,
+        };
+        let mut keep = KeepReferenceOperation::new(input, step_head(), None, stamp);
+        assert!(matches!(keep.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let answer = keep.next(child::<(), CopyObjectError>(Ok(())));
+        assert_eq!(
+            answer,
+            Err(CopyObjectError::Get(GetObjectError::GetObjectFailed))
+        );
+    }
+
+    #[test]
+    fn plain_source_admitted() {
+        let mut admit = AdmitSourceOperation {
+            bucket: "source".to_string(),
+            admitting: false,
+        };
+        assert!(matches!(admit.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let answer = admit.next(IoResult::Values(vec![None]));
+        assert_eq!(answer, Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn locked_source_refused() {
+        let settings = BucketEncryption {
+            mode: aruna_core::structs::storage::encryption::EncryptionMode::VaultLocked,
+            bucket_id: Some(Ulid::from_bytes([6; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let mut admit = AdmitSourceOperation {
+            bucket: "source".to_string(),
+            admitting: false,
+        };
+        admit.first().unwrap();
+        let row = settings.to_bytes().unwrap();
+        let read = admit.next(IoResult::Values(vec![Some(row.into())]));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Effect(_)))));
+        let error = aruna_core::structs::storage::encryption::BucketKeyError::InvalidToken;
+        let event = Event::Blob(BlobEvent::Error(BlobError::BucketKey(error)));
+        let answer = admit.next(IoResult::Event(Box::new(event)));
+        assert!(matches!(
+            answer,
+            Err(CopyObjectError::Get(GetObjectError::ConversionError(
+                ConversionError::BucketKey(_)
+            )))
+        ));
     }
 
     fn auth_context(user_id: UserId) -> AuthContext {
@@ -1045,12 +1486,8 @@ pub(crate) mod test {
             job_id: None,
         };
         let version = Ulid::generate();
-        let first = copy_object_at(&context, input(), version, None)
-            .await
-            .unwrap();
-        let again = copy_object_at(&context, input(), version, None)
-            .await
-            .unwrap();
+        let first = copy_object_at(&context, input(), version).await.unwrap();
+        let again = copy_object_at(&context, input(), version).await.unwrap();
         assert_eq!((first.version_id, again.version_id), (version, version));
         let head = HeadObjectInput {
             bucket: "bucket".to_string(),
@@ -1097,7 +1534,7 @@ pub(crate) mod test {
             job_id: None,
         };
         let version = Ulid::generate();
-        let first = copy_object_at(&context, input(), version, None).await;
+        let first = copy_object_at(&context, input(), version).await;
         assert_eq!(first.unwrap().size, 5);
         let delete = DeleteObjectInput {
             bucket: "bucket".to_string(),
@@ -1111,11 +1548,9 @@ pub(crate) mod test {
         drive(DeleteObjectOperation::new(delete), &context)
             .await
             .unwrap();
-        let fresh = copy_object_at(&context, input(), Ulid::generate(), None).await;
+        let fresh = copy_object_at(&context, input(), Ulid::generate()).await;
         assert!(fresh.is_err(), "a new copy of the deleted source must fail");
-        let again = copy_object_at(&context, input(), version, None)
-            .await
-            .unwrap();
+        let again = copy_object_at(&context, input(), version).await.unwrap();
         assert_eq!((again.version_id, again.size), (version, 5));
     }
 
@@ -1429,7 +1864,8 @@ pub(crate) mod test {
             },
             limits: RoCrateLimits::default(),
         });
-        let refused = copy_object_token(&context, request("plain"), token).await;
+        let copy = CopyObjectOperation::new(request("plain"), node_routing(&context));
+        let refused = drive(copy.with_token(token), &context).await;
         assert!(matches!(
             refused,
             Err(CopyObjectError::Get(GetObjectError::ConversionError(

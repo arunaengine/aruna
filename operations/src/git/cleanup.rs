@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::state::{Ancestry, reduce};
-use super::{GitError, lfs, objects, records};
+use super::{GitError, download, lfs, objects, records};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
@@ -24,7 +24,12 @@ pub async fn remove_objects(context: &DriverContext) {
     let Some(realm_id) = context.net_handle.as_ref().map(|net| *net.realm_id()) else {
         return;
     };
-    let rows = match records::prefixed::<StoredObject>(context, LOCAL_OBJECTS, Vec::new()).await {
+    let rows = match drive(
+        records::prefixed::<StoredObject>(LOCAL_OBJECTS, Vec::new()),
+        context,
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(error) => return warn!(%error, "Local Git objects unreadable"),
     };
@@ -68,7 +73,7 @@ async fn settled(
     document: &MetadataRegistryRecord,
     object: &StoredObject,
 ) -> Result<Result<(), &'static str>, GitError> {
-    let history = records::scan(context, document.document_id).await?;
+    let history = drive(records::scan(document.document_id), context).await?;
     let pack = GitPack {
         sha256: object.sha256.clone(),
         size: object.size,
@@ -104,9 +109,12 @@ async fn moved(
 ) -> Result<Result<(), &'static str>, GitError> {
     let digest = pack.digest().ok_or(GitError::Invalid)?;
     let key = git_pack_key(document.document_id, &digest).to_vec();
-    if records::load::<GitPackRecord>(context, GIT_PACK_KEYSPACE, key)
-        .await?
-        .is_some()
+    if drive(
+        records::load::<GitPackRecord>(GIT_PACK_KEYSPACE, key),
+        context,
+    )
+    .await?
+    .is_some()
     {
         return Ok(Ok(()));
     }
@@ -114,7 +122,7 @@ async fn moved(
         matches!(&record.change, GitChange::Objects { pack: Some(own), .. } if own == pack)
     });
     match owner {
-        Some(owner) => objects::pack_bytes(context, document, pack, owner)
+        Some(owner) => download::pack_bytes(context, document, pack, owner)
             .await
             .map(|_| Ok(())),
         None => Ok(Ok(())),
@@ -145,10 +153,12 @@ async fn original(
         })
         .map_or(UserId::nil(document.realm_id), |record| record.user_id);
     let auth = super::project::author(pusher);
-    Ok(match lfs::readable(context, &auth, &original).await {
-        true => Ok(()),
-        false => Err("the original is unreadable, so this copy may be the last one"),
-    })
+    Ok(
+        match drive(lfs::readable(context.node_id(), &auth, &original), context).await {
+            true => Ok(()),
+            false => Err("the original is unreadable, so this copy may be the last one"),
+        },
+    )
 }
 
 /// Whether the exact version still exists on this node.
@@ -157,9 +167,17 @@ async fn stored(context: &DriverContext, object: &StoredObject) -> bool {
         return false;
     };
     let found = (object.bucket.as_str(), group_id);
-    objects::described(context, found, &object.key, Some(object.version_id))
-        .await
-        .is_ok_and(|described| described.is_some())
+    drive(
+        objects::described(
+            context.node_id(),
+            found,
+            &object.key,
+            Some(object.version_id),
+        ),
+        context,
+    )
+    .await
+    .is_ok_and(|described| described.is_some())
 }
 
 /// Deletes the exact version through the normal S3 delete; a version that is already gone
@@ -187,5 +205,5 @@ async fn delete(
         .await
         .map_err(|_| GitError::Unavailable)?;
     }
-    records::remove(context, LOCAL_OBJECTS, key).await
+    drive(records::remove(LOCAL_OBJECTS, key), context).await
 }

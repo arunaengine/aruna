@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn no_rules_no_scan() {
+    fn ruleless_skips_scan() {
         let mut operation =
             SecondCopiesOperation::new(None, (BUCKET, "gone/a"), &[Ulid::nil()]).unwrap();
         assert_eq!(operation.first(), Ok(Next::Done(Vec::new())));

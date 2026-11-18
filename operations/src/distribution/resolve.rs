@@ -29,11 +29,10 @@ use thiserror::Error;
 use tokio::time::Instant;
 use ulid::Ulid;
 
-use aruna_core::structs::identity::realm::NodeRealm;
 use crate::distribution::counts::MAX_SETS;
 use crate::distribution::version_key::{MemberAnswer, VersionKeyError, VersionKeyOperation};
-use crate::driver::DriverContext;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::structs::identity::realm::NodeRealm;
 
 /// At most this many candidate sets are looked at for one id.
 const MAX_CANDIDATES: usize = 4;
@@ -536,11 +535,11 @@ pub struct ResolveVersionOperation {
 
 /// The resolution of `version_id` by `deadline`; see [`ResolveVersionOperation`].
 pub fn resolve_version(
-    context: &DriverContext,
+    ids: NodeRealm,
     version_id: Ulid,
     deadline: Instant,
 ) -> ResolveVersionOperation {
-    ResolveVersionOperation::new(context.node_and_realm(), version_id, deadline)
+    ResolveVersionOperation::new(ids, version_id, deadline)
 }
 
 /// The resolution a run reached; a run that did not finish in time resolves nothing now.
@@ -787,12 +786,12 @@ pub struct ResolveContentOperation {
 
 /// The resolution of a content identity by `deadline`; see [`ResolveContentOperation`].
 pub fn resolve_content(
-    context: &DriverContext,
+    ids: NodeRealm,
     identity: [u8; 32],
     deadline: Instant,
 ) -> ResolveContentOperation {
     ResolveContentOperation {
-        ids: context.node_and_realm(),
+        ids,
         identity,
         deadline,
         step: ContentStep::Sets,

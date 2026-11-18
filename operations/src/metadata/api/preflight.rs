@@ -416,16 +416,15 @@ pub(crate) async fn references_preflight_local(
         let mut after = None;
         let mut found = 0usize;
         loop {
-            let page = crate::metadata::iri_index::read_backlinks(
-                &context.storage_handle,
-                iri,
-                None,
-                after,
-                request.limit.saturating_add(1),
-                &mut budget,
-            )
-            .await
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+            let read = crate::metadata::iri_index::BacklinksOperation::new(
+                (iri, None),
+                (after, request.limit.saturating_add(1)),
+                budget,
+            );
+            let (page, left) = drive(read, context)
+                .await
+                .map_err(|_| MetadataApiError::ServiceUnavailable)?;
+            budget = left;
             for (document_id, postings) in page.documents {
                 let record = match records.get(&document_id) {
                     Some(record) => record.clone(),
@@ -576,33 +575,6 @@ pub(super) fn visible_prefix(
         .map(|(content_w3id, _, document_id)| (content_w3id, document_id))
         .collect();
     (selected, saturated)
-}
-
-pub(super) async fn resolve_graph_reference(
-    context: &DriverContext,
-    realm_id: RealmId,
-    request: &MetadataReferencesRequest,
-    registry: &[MetadataRegistryRecord],
-) -> Result<Option<MetadataReferenceEntry>, MetadataApiError> {
-    let Some(record) = registry
-        .iter()
-        .find(|record| record.graph_iri == request.iri)
-    else {
-        return Ok(None);
-    };
-    if !can_read_record(context, realm_id, request.auth.as_ref(), record).await? {
-        return Ok(None);
-    }
-    let title = reference_document_title(context, record).await;
-    Ok(Some(MetadataReferenceEntry {
-        document_id: record.document_id.to_string(),
-        group_id: record.group_id.to_string(),
-        document_path: record.document_path.clone(),
-        graph_iri: record.graph_iri.clone(),
-        predicate: None,
-        subject_iris: Vec::new(),
-        title,
-    }))
 }
 
 pub(super) async fn reference_document_title(

@@ -167,7 +167,10 @@ fn pending(job_id: &str) -> PendingInput {
 }
 
 fn report(ledger: SessionLedger) -> SessionReportOperation {
-    SessionReportOperation::new(job(), Ulid::from_bytes([2; 16]), ledger, EndReason::Ended)
+    let token = Ulid::from_bytes([2; 16]);
+    let mut report = SessionReportOperation::new(job(), token, false, EndReason::Ended);
+    report.take_ledger(ledger);
+    report
 }
 
 fn written() -> IoResult {
@@ -255,4 +258,16 @@ fn failed_write_stops() {
     report.first().unwrap();
     let failed = child(Err::<(), _>(JobMutationError::NotFound));
     assert_eq!(report.next(failed), Ok(Next::Done(())));
+}
+
+// A live session is asked for its ledger first; one that is gone reports only the end.
+#[test]
+fn reads_live_ledger() {
+    let token = Ulid::from_bytes([2; 16]);
+    let mut report = SessionReportOperation::new(job(), token, true, EndReason::Idle);
+    assert!(is_child(&report.first()));
+    assert_eq!(report.step, ReportStep::Ledger);
+    let missing = child(Ok::<_, IoError>(SessionAnswer::Missing));
+    assert!(is_child(&report.next(missing)));
+    assert_eq!(keys(&report), Vec::<String>::new());
 }

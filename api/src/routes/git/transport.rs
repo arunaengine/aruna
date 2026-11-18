@@ -9,6 +9,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::{GitEvent, GitRequest, MAX_GIT_BYTES};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_operations::driver::drive;
 use aruna_operations::git;
 use axum::Extension;
 use axum::body::{Body, Bytes, to_bytes};
@@ -46,15 +47,18 @@ pub async fn advertise(
         return Err(ServerError::BadRequest);
     }
     refuse_scoped_push(&auth, query.service == "git-receive-pack")?;
-    git::repository(
+    drive(
+        git::repository(
+            state.get_ctx().node_id(),
+            &auth,
+            repository_id(&repository)?,
+            if query.service == "git-receive-pack" {
+                Permission::WRITE
+            } else {
+                Permission::READ
+            },
+        ),
         &state.get_ctx(),
-        &auth,
-        repository_id(&repository)?,
-        if query.service == "git-receive-pack" {
-            Permission::WRITE
-        } else {
-            Permission::READ
-        },
     )
     .await
     .map_err(map_error)?;
@@ -92,15 +96,18 @@ pub async fn rpc(
         return Err(ServerError::NotFound);
     }
     refuse_scoped_push(&auth, service == "git-receive-pack")?;
-    git::repository(
+    drive(
+        git::repository(
+            state.get_ctx().node_id(),
+            &auth,
+            repository_id(&repository)?,
+            if service == "git-receive-pack" {
+                Permission::WRITE
+            } else {
+                Permission::READ
+            },
+        ),
         &state.get_ctx(),
-        &auth,
-        repository_id(&repository)?,
-        if service == "git-receive-pack" {
-            Permission::WRITE
-        } else {
-            Permission::READ
-        },
     )
     .await
     .map_err(map_error)?;
@@ -140,9 +147,12 @@ async fn serve(
         Permission::READ
     };
     refuse_scoped_push(&auth, permission == Permission::WRITE)?;
-    let (_, repository) = git::repository(&state.get_ctx(), &auth, id, permission)
-        .await
-        .map_err(map_error)?;
+    let (_, repository) = drive(
+        git::repository(state.get_ctx().node_id(), &auth, id, permission),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     let request = GitRequest {
         repository,
         method: method.into(),

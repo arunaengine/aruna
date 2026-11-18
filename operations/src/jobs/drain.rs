@@ -520,9 +520,10 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_LEASE_MS;
-    use crate::jobs::reconcile::ExternalReconciler;
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::read_job_record;
+    use crate::jobs::store::test_calls::insert_job;
+    use crate::jobs::store::test_calls::read_job_record;
+    use crate::storage_read::iter_prefix_page;
+    use crate::tasks::job_reconcile::ExternalReconciler;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;
@@ -537,6 +538,7 @@ mod tests {
     use aruna_core::time::unix_timestamp_millis;
     use aruna_storage::FjallStorage;
     use aruna_tasks::TaskHandle;
+    use byteview::ByteView;
     use std::sync::Arc;
     use std::sync::Mutex;
     use tempfile::tempdir;
@@ -577,7 +579,11 @@ mod tests {
         drive(timer, context).await.expect("timer scan");
     }
 
-    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
         IoResult::Child(ChildOutcome::new(result))
     }
 

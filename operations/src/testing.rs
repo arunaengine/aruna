@@ -250,9 +250,7 @@ pub async fn process_prune_batch(
     crate::metadata::prune_queue::GraphDrainResult,
     crate::metadata::prune_queue::MetadataGraphError,
 > {
-    let batch = crate::metadata::prune_queue::PruneBatchOperation::new(
-        crate::jobs::repository::NodeScope::of(context),
-    );
+    let batch = crate::metadata::prune_queue::PruneBatchOperation::new(context.node_scope());
     crate::driver::drive(batch, context).await
 }
 

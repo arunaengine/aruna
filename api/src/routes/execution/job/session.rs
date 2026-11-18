@@ -18,10 +18,10 @@ use aruna_core::structs::execution::job::{CopyJobSpec, JobId, JobPayload, JobRec
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::s3::object::copy::{
-    CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
+    CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use axum::Json;
@@ -1033,7 +1033,9 @@ async fn copy_inline(
     dest_key: &str,
 ) -> ServerResult<StagedInputResponse> {
     let bucket = input.dest_bucket.clone();
-    let result = copy_object(&state.get_ctx(), input)
+    let context = state.get_ctx();
+    let copy = CopyObjectOperation::new(input, node_routing(&context));
+    let result = drive(copy, &context)
         .await
         .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
     let linked = result.location.is_none();

@@ -7,7 +7,11 @@ use aruna_core::calls::ChildOutcome;
 use super::*;
 use crate::tests::records::{Family, REALM, node};
 
-fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
     IoResult::Child(ChildOutcome::new(result))
 }
 
@@ -106,7 +110,7 @@ fn family_read_required() {
         RoundOutcome::Retry { after_ms: base }
     );
     let mut operation = configured(&fixture);
-    let empty = child(Ok::<_, FamilyReadError>(Vec::new()));
+    let empty = child(Ok::<_, FamilyReadError>(Vec::<JobRecordEnvelope>::new()));
     assert_eq!(
         outcome(operation.next(empty)),
         RoundOutcome::Retry { after_ms: base }

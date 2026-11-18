@@ -9,7 +9,7 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::driver::node_facts;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
@@ -420,7 +420,7 @@ async fn remote_version_downloads() -> TestResult<()> {
                 api: joiner.config.api_public_url.clone(),
                 s3: joiner.config.s3_public_url.clone(),
             },
-            NodeFacts::gather(joiner.context.as_ref()),
+            node_facts(joiner.context.as_ref()),
             true,
         );
         aruna_operations::driver::drive(publish, joiner.context.as_ref())

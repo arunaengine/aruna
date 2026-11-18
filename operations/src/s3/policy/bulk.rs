@@ -1295,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn first_pass_stores_run() {
+    fn first_pass_stores() {
         let group_id = Ulid::generate();
         let mut capture = capture(group_id);
         capture.first().unwrap();

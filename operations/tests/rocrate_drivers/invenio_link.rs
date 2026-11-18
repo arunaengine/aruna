@@ -17,7 +17,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
-use aruna_operations::jobs::store::state::{complete_job, fail_job};
+use crate::job_calls::{complete_job, fail_job};
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
@@ -203,7 +203,7 @@ pub(super) async fn run_push(
         .active_job
         .ok_or("no running push")?;
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+        crate::job_calls::read_job_record(&fixture.context, job_id, None)
             .await?
             .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
@@ -308,7 +308,7 @@ pub(super) async fn run_registration(
     created_by: UserId,
 ) -> Result<AuthContext, Box<dyn std::error::Error>> {
     let key = format!("identifiers/{for_job}");
-    let (job_id, _) = aruna_operations::jobs::store::query::find_dedup_plan(
+    let (job_id, _) = crate::job_calls::find_dedup_plan(
         &fixture.context,
         created_by,
         key.as_bytes(),
@@ -317,7 +317,7 @@ pub(super) async fn run_registration(
     .await?
     .ok_or("no registration queued")?;
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+        crate::job_calls::read_job_record(&fixture.context, job_id, None)
             .await?
             .ok_or("registration job missing")?;
     let JobPayload::RegisterIdentifiers(spec) = record.payload.clone() else {
@@ -428,7 +428,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
         .active_job
         .ok_or("no push")?;
     let pusher =
-        aruna_operations::jobs::store::state::read_job_record(&fixture.context, push_job, None)
+        crate::job_calls::read_job_record(&fixture.context, push_job, None)
             .await?
             .ok_or("push job missing")?
             .created_by;
@@ -438,15 +438,16 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(published.remote.record_id.as_deref(), Some("1"));
     assert_eq!(published.remote.identifier.as_deref(), Some("10.1234/1"));
     let auth = Box::pin(run_registration(&fixture, push_job, pusher)).await?;
-    let found = Box::pin(aruna_operations::metadata::identifier_lookup::lookup_local(
-        &fixture.context,
-        fixture.actor.realm_id,
-        Some(&auth),
-        SecondaryIdKind::Doi,
-        "10.1234/1",
-        None,
-    ))
-    .await?;
+    use aruna_operations::metadata::identifier_lookup::{
+        IdentifierLookupOperation, IdentifierQuery,
+    };
+    let query = IdentifierQuery {
+        kind: SecondaryIdKind::Doi,
+        value: "10.1234/1".to_string(),
+        endpoint: None,
+    };
+    let lookup = IdentifierLookupOperation::new(fixture.actor.realm_id, Some(auth), query);
+    let found = Box::pin(aruna_operations::driver::drive(lookup, &fixture.context)).await?;
     assert_eq!(
         found
             .iter()
@@ -971,7 +972,8 @@ async fn has_row(fixture: &Fixture, key_space: &str, link: &RepositoryLink) -> b
 async fn cancelled_queue_settles() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::change_link;
     use super::driven::{current_event, start_push};
-    use aruna_operations::jobs::store::attempt::{CancelRequestOutcome, set_cancel_requested};
+    use aruna_operations::jobs::store::attempt::CancelRequestOutcome;
+    use crate::job_calls::set_cancel_requested;
     for paused in [false, true] {
         let fixture = build_fixture(false).await?;
         let server = remote(LINK_TOKEN).await;

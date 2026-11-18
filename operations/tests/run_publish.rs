@@ -6,6 +6,7 @@ use crate::topology;
 
 use std::time::{Duration, SystemTime};
 
+use crate::job_calls::prune_job_batch;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -24,11 +25,10 @@ use aruna_operations::device::publish_run::{
 use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use crate::job_calls::prune_job_batch;
-use aruna_operations::jobs::store::attempt::{put_crate_status, read_crate_status, read_run_link};
-use aruna_operations::jobs::store::query::insert_job;
-use aruna_operations::jobs::store::state::read_job_record;
-use aruna_operations::jobs::workflow::run_crate::write_run_crate;
+use crate::job_calls::{put_crate_status, read_crate_status, read_run_link};
+use crate::job_calls::insert_job;
+use crate::job_calls::read_job_record;
+use aruna_operations::jobs::workflow::run_crate::{WriteCrateOperation, crate_outcome};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -38,6 +38,11 @@ use topology::{TestNode, TestResult, Topology, read_group_auth, wait_until};
 use ulid::Ulid;
 
 const REMOTE_BUCKET: &str = "lab-data";
+
+async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome {
+    let write = WriteCrateOperation::new(for_job, ctx.driver.node_and_realm());
+    crate_outcome(drive(write, &ctx.driver).await)
+}
 const LOCAL_BUCKET: &str = "run-out";
 const OUTPUT: &[u8] = b">contig1\nACGT\n";
 /// Only ends a hung exchange; never a performance assertion.
@@ -201,7 +206,12 @@ async fn publishes_local_run() -> TestResult<()> {
     let server = realm.node(0);
     // A node lists a new group a little later, so a fetch can miss it; the device must hold it.
     wait_until("the group on the device", device.node_id(), || async {
-        drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false)
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context,
+        )
+        .await
+        .unwrap_or(false)
             && matches!(read_group_auth(device, group_id).await, Ok(Some(_)))
     })
     .await?;
@@ -226,7 +236,11 @@ async fn publishes_local_run() -> TestResult<()> {
         },
     };
 
-    let published = publish_run(&device.context, input()).await?;
+    let published = drive(
+        publish_run(device.context.node_and_realm(), input()),
+        &device.context,
+    )
+    .await?;
     assert_eq!(published.outputs.len(), 1);
     assert_eq!(
         published.outputs[0].key,
@@ -242,7 +256,11 @@ async fn publishes_local_run() -> TestResult<()> {
         OUTPUT
     );
 
-    let replayed = publish_run(&device.context, input()).await?;
+    let replayed = drive(
+        publish_run(device.context.node_and_realm(), input()),
+        &device.context,
+    )
+    .await?;
     assert_eq!(
         replayed.outputs[0].version_id,
         published.outputs[0].version_id
@@ -257,7 +275,11 @@ async fn publishes_local_run() -> TestResult<()> {
     let mut moved = input();
     moved.target.prefix = "runs/other".to_string();
     assert!(matches!(
-        publish_run(&device.context, moved).await,
+        drive(
+            publish_run(device.context.node_and_realm(), moved),
+            &device.context
+        )
+        .await,
         Err(PublishRunError::TargetChanged)
     ));
     Ok(())
@@ -303,7 +325,7 @@ async fn crate_stays_local() -> TestResult<()> {
         Some(RunCrateStatus::Local)
     );
     // The device keeps the run's crate itself, rooted at the crate folder.
-    let local = local_run_crate(&device.context, job_id, record.created_by).await?;
+    let local = drive(local_run_crate(job_id, record.created_by), &device.context).await?;
     let root = local["@graph"]
         .as_array()
         .ok_or("the crate has a graph")?
@@ -313,7 +335,7 @@ async fn crate_stays_local() -> TestResult<()> {
     assert_eq!(root["@id"], "./");
     let stranger = aruna_core::UserId::local(Ulid::from(9u128), realm.realm_id);
     assert!(
-        local_run_crate(&device.context, job_id, stranger)
+        drive(local_run_crate(job_id, stranger), &device.context)
             .await
             .is_err()
     );
@@ -351,7 +373,7 @@ async fn crate_stays_local() -> TestResult<()> {
             .is_none()
     );
     assert!(
-        local_run_crate(&device.context, job_id, record.created_by)
+        drive(local_run_crate(job_id, record.created_by), &device.context)
             .await
             .is_ok()
     );
@@ -366,7 +388,14 @@ async fn checks_empty_target() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let device = realm.user_node();
     let server = realm.node(0);
-    assert!(drive(fetch_realm_documents(&device.context, FETCH_BUDGET), &device.context).await.unwrap_or(false));
+    assert!(
+        drive(
+            fetch_realm_documents(device.context.node_and_realm(), FETCH_BUDGET),
+            &device.context
+        )
+        .await
+        .unwrap_or(false)
+    );
     let job_id = finished_run(
         (&realm, device),
         group_id,
@@ -375,18 +404,21 @@ async fn checks_empty_target() -> TestResult<()> {
     )
     .await?;
 
-    let refused = publish_run(
-        &device.context,
-        PublishRunInput {
-            job_id,
-            owner: realm.user_id,
-            node_id: device.node_id(),
-            target: RemoteBinding {
-                node_id: server.node_id(),
-                bucket: "missing-bucket".to_string(),
-                prefix: String::new(),
+    let refused = drive(
+        publish_run(
+            device.context.node_and_realm(),
+            PublishRunInput {
+                job_id,
+                owner: realm.user_id,
+                node_id: device.node_id(),
+                target: RemoteBinding {
+                    node_id: server.node_id(),
+                    bucket: "missing-bucket".to_string(),
+                    prefix: String::new(),
+                },
             },
-        },
+        ),
+        &device.context,
     )
     .await;
     assert!(matches!(

@@ -50,14 +50,14 @@ pub async fn apply(
     document: &MetadataRegistryRecord,
 ) -> Result<(), GitError> {
     let prefix = document.document_id.to_bytes().to_vec();
-    for (key, merge) in records::prefixed::<PendingMerge>(context, PENDING, prefix).await? {
+    for (key, merge) in drive(records::prefixed::<PendingMerge>(PENDING, prefix), context).await? {
         // Boxed: the metadata update is a deep future and Git refresh already nests deeply.
         match Box::pin(apply_one(context, store, document, &merge)).await {
-            Ok(()) => records::remove(context, PENDING, key).await?,
+            Ok(()) => drive(records::remove(PENDING, key), context).await?,
             Err(GitError::Refused(reason)) => {
                 warn!(document_id = %document.document_id, commit = %merge.new, %reason,
                     "Pushed metadata could not be merged into the document");
-                records::remove(context, PENDING, key).await?;
+                drive(records::remove(PENDING, key), context).await?;
             }
             // Later merges build on this one, so they wait too.
             Err(error) => return Err(error),
@@ -187,7 +187,12 @@ async fn drain(context: &DriverContext) {
     let Ok(store) = super::store(context) else {
         return;
     };
-    let rows = match records::prefixed::<PendingMerge>(context, PENDING, Vec::new()).await {
+    let rows = match drive(
+        records::prefixed::<PendingMerge>(PENDING, Vec::new()),
+        context,
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(error) => return warn!(%error, "Pending metadata merges unreadable"),
     };
@@ -255,12 +260,15 @@ mod tests {
             .map(|id| entry(Ulid::from(id), &merge).expect("row"))
             .collect();
         let keys: Vec<_> = rows.iter().map(|row| row.1.to_vec()).collect();
-        records::commit(&context, rows, &Default::default())
+        drive(records::commit(rows, &Default::default()), &context)
             .await
             .expect("commit");
-        let read = records::prefixed::<PendingMerge>(&context, PENDING, Vec::new())
-            .await
-            .expect("read");
+        let read = drive(
+            records::prefixed::<PendingMerge>(PENDING, Vec::new()),
+            &context,
+        )
+        .await
+        .expect("read");
         assert_eq!(read.into_iter().map(|row| row.0).collect::<Vec<_>>(), keys);
     }
 }

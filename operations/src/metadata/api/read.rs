@@ -2,28 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::preflight::{reference_document_title, resolve_graph_reference};
 use super::read_types::{
-    ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
-    MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
+    MetadataQueryExecution, MetadataQueryRequest, MetadataReferenceEntry,
+    MetadataReferencesExecution, MetadataReferencesRequest,
 };
 use super::{
-    AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
-    DISTRIBUTED_QUERY_DEADLINE, Event, GroupId, ListGroupOperation, MetadataApiError,
-    MetadataFanoutScope, MetadataFanoutStats, MetadataQueryResults, MetadataReadError,
-    MetadataRegistryRecord, NodeId, Permission, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT,
-    REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect, StorageEvent, StorageReadError, TxnId, Ulid,
-    check_policy_limit, map_query_error, merge_pending_records, query_fingerprint,
-    replica_query_nodes, warn,
+    AuthContext, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
+    DISTRIBUTED_QUERY_DEADLINE, Event, GroupId, MetadataApiError, MetadataFanoutScope,
+    MetadataRegistryRecord, NodeId, Permission, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, RealmId,
+    StorageEffect, StorageEvent, StorageReadError, TxnId, Ulid, query_fingerprint,
 };
 use crate::driver::{DriverContext, drive};
-use crate::metadata::record_reads::{DocumentRecordOperation, RecordMaterializedOperation};
+use crate::metadata::record_reads::DocumentRecordOperation;
 
 use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;
 use crate::auth::enforcement::EnforcePolicyOperation;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::document_repository::GetConfigOperation;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 
@@ -61,118 +56,6 @@ pub async fn query_metadata(
     })
 }
 
-/// Postings one references page may read, so a page never scans the index.
-const REFERENCE_BUDGET: LinkBudget = LinkBudget {
-    seeks: 1100,
-    rows: 4096,
-};
-
-/// Reads one local page of the documents naming `iri` as an object, by document id after
-/// `after`; each must be live at the posting's cursor and readable. An empty first page for a
-/// known graph IRI, or `resolve`, returns one predicate-less summary.
-pub async fn references_metadata(
-    context: &DriverContext,
-    realm_id: RealmId,
-    request: MetadataReferencesRequest,
-) -> Result<MetadataReferencesExecution, MetadataApiError> {
-    if request.iri.trim().is_empty() || oxrdf::NamedNode::new(&request.iri).is_err() {
-        return Err(MetadataApiError::BadRequest);
-    }
-    if request
-        .predicate
-        .as_deref()
-        .is_some_and(|iri| oxrdf::NamedNode::new(iri).is_err())
-    {
-        return Err(MetadataApiError::BadRequest);
-    }
-    let limit = request
-        .limit
-        .unwrap_or(REFERENCES_LIMIT)
-        .clamp(1, REFERENCES_MAX_LIMIT);
-
-    if request.resolve {
-        let registry = graph_record(context, &request.iri).await?;
-        let entry =
-            resolve_graph_reference(context, realm_id, &request, registry.as_slice()).await?;
-        return Ok(MetadataReferencesExecution {
-            references: entry.into_iter().collect(),
-            next_after: None,
-        });
-    }
-
-    let mut budget = REFERENCE_BUDGET;
-    let page = crate::metadata::iri_index::read_backlinks(
-        &context.storage_handle,
-        &request.iri,
-        request.predicate.as_deref(),
-        request.after,
-        limit,
-        &mut budget,
-    )
-    .await
-    .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-
-    let mut references = Vec::new();
-    for (document_id, postings) in page.documents {
-        let record = match load_live_record(context, document_id).await {
-            Ok(record) => record,
-            Err(MetadataApiError::NotFound) => continue,
-            Err(error) => return Err(error),
-        };
-        let current: Vec<_> = postings
-            .into_iter()
-            .filter(|posting| posting.document_cursor == record.last_event_id)
-            .collect();
-        if current.is_empty()
-            || !can_read_record(context, realm_id, request.auth.as_ref(), &record).await?
-        {
-            continue;
-        }
-        let title = reference_document_title(context, &record).await;
-        for posting in current {
-            references.push(MetadataReferenceEntry {
-                document_id: record.document_id.to_string(),
-                group_id: record.group_id.to_string(),
-                document_path: record.document_path.clone(),
-                graph_iri: record.graph_iri.clone(),
-                predicate: Some(posting.predicate_iri),
-                subject_iris: posting.subject_iris,
-                title: title.clone(),
-            });
-        }
-    }
-
-    if references.is_empty() && request.after.is_none() && page.next.is_none() {
-        let registry = graph_record(context, &request.iri).await?;
-        if let Some(entry) =
-            resolve_graph_reference(context, realm_id, &request, registry.as_slice()).await?
-        {
-            references.push(entry);
-        }
-    }
-
-    Ok(MetadataReferencesExecution {
-        references,
-        next_after: page.next,
-    })
-}
-
-/// The live record whose graph IRI is `iri`, by one point read of the document it names; never
-/// a walk over the registry.
-async fn graph_record(
-    context: &DriverContext,
-    iri: &str,
-) -> Result<Option<MetadataRegistryRecord>, MetadataApiError> {
-    let Some(document_id) = MetadataRegistryRecord::graph_document(iri) else {
-        return Ok(None);
-    };
-    match load_live_record(context, document_id).await {
-        Ok(record) => Ok((record.graph_iri == iri).then_some(record)),
-        Err(MetadataApiError::NotFound) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 impl From<LiveRecordsError> for MetadataApiError {
     fn from(error: LiveRecordsError) -> Self {
         match error {
@@ -193,20 +76,6 @@ pub(crate) async fn load_live_record(
             .next()
             .ok_or(MetadataApiError::NotFound),
         Ok(None) => Err(MetadataApiError::NotFound),
-        Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
-        Err(StorageReadError::Conversion(error)) => {
-            Err(MetadataApiError::Internal(error.to_string()))
-        }
-    }
-}
-
-pub(super) async fn ensure_record_materialized(
-    context: &DriverContext,
-    record: &MetadataRegistryRecord,
-) -> Result<(), MetadataApiError> {
-    match drive(RecordMaterializedOperation::new(record), context).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(MetadataApiError::ServiceUnavailable),
         Err(StorageReadError::Storage(error)) => Err(MetadataApiError::Internal(error.to_string())),
         Err(StorageReadError::Conversion(error)) => {
             Err(MetadataApiError::Internal(error.to_string()))

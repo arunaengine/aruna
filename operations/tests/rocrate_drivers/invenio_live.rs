@@ -541,10 +541,10 @@ async fn complete(
         return Ok(());
     };
     let record =
-        aruna_operations::jobs::store::state::read_job_record(&fixture.context, ctx.job_id, None)
+        crate::job_calls::read_job_record(&fixture.context, ctx.job_id, None)
             .await?
             .ok_or("job missing")?;
-    aruna_operations::jobs::store::state::complete_job(
+    crate::job_calls::complete_job(
         &fixture.context,
         ctx.job_id,
         ctx.claim_token,
@@ -825,7 +825,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         }
     })
     .await??;
-    let record = aruna_operations::jobs::store::state::read_job_record(&fixture.context, job, None)
+    let record = crate::job_calls::read_job_record(&fixture.context, job, None)
         .await?
         .ok_or("pull job missing")?;
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {
@@ -880,7 +880,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .await?;
     let mapping =
-        aruna_operations::metadata::persistent_id::read_mapping(&fixture.context, doc_id(2))
+        crate::metadata_calls::read_mapping(&fixture.context, doc_id(2))
             .await?
             .ok_or("pulled dataset has no mapping")?;
     let doi = second.identifier.as_deref().ok_or("v2 has no DOI")?;

@@ -118,7 +118,7 @@ use aruna_operations::s3::object::attributes::{
     GetAttributesInput as GOAI, GetAttributesOperation,
 };
 use aruna_operations::s3::object::copy::{
-    CopyObjectInput as CopyObjectData, CopyReferences, copy_object_token,
+    CopyObjectInput as CopyObjectData, CopyObjectOperation, CopyReferences,
 };
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput as DOSI, BulkDeleteOperation,
@@ -129,7 +129,7 @@ use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOpera
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
 use aruna_operations::s3::object::read::{
-    TokenRead, get_object_info, get_object_keyed, get_object_token,
+    GetRoutedOperation, KeyedReadOperation, ObjectInfoOperation, TokenRead,
 };
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
 use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
@@ -1392,33 +1392,36 @@ impl S3 for ArunaS3Service {
             session: None,
         };
 
-        let result = copy_object_token(
+        let result = drive(
+            CopyObjectOperation::new(
+                CopyObjectData {
+                    source_bucket,
+                    source_key,
+                    source_version_id,
+                    source_group_id: source_bucket_info.group_id,
+                    dest_bucket: dest_bucket.clone(),
+                    dest_key: dest_key.clone(),
+                    user_id: user_access.user_identity,
+                    group_id: dest_group_id,
+                    realm_id: self.realm_id,
+                    node_id: self.node_id,
+                    quota_ceiling,
+                    conditions,
+                    metadata: metadata_replace.then(|| {
+                        object_metadata(
+                            req.input.metadata.clone().unwrap_or_default(),
+                            req.input.content_type.as_deref(),
+                        )
+                    }),
+                    source_auth_context,
+                    restrictions: replication_auth.path_restrictions.clone(),
+                    references: CopyReferences::Preserve,
+                    job_id: VersionOrigin::copy_job(&user_access.access_key),
+                },
+                node_routing(&self.state),
+            )
+            .with_token(token),
             &self.state,
-            CopyObjectData {
-                source_bucket,
-                source_key,
-                source_version_id,
-                source_group_id: source_bucket_info.group_id,
-                dest_bucket: dest_bucket.clone(),
-                dest_key: dest_key.clone(),
-                user_id: user_access.user_identity,
-                group_id: dest_group_id,
-                realm_id: self.realm_id,
-                node_id: self.node_id,
-                quota_ceiling,
-                conditions,
-                metadata: metadata_replace.then(|| {
-                    object_metadata(
-                        req.input.metadata.clone().unwrap_or_default(),
-                        req.input.content_type.as_deref(),
-                    )
-                }),
-                source_auth_context,
-                restrictions: replication_auth.path_restrictions.clone(),
-                references: CopyReferences::Preserve,
-                job_id: VersionOrigin::copy_job(&user_access.access_key),
-            },
-            token,
         )
         .await
         .map_err(IntoS3Error::into_s3_error)?;
@@ -2200,9 +2203,13 @@ impl S3 for ArunaS3Service {
         let result = match req.extensions.get::<ObjectKey>() {
             Some(ObjectKey(Ok(Some(private)))) => {
                 let (private, limits) = (private.clone(), &self.rocrate_limits);
-                get_object_keyed(&self.state, input, restrictions, private, limits).await
+                let read = KeyedReadOperation::new(input, restrictions, private, limits);
+                drive(read, &self.state).await
             }
-            _ => get_object_token(&self.state, input, restrictions, token).await,
+            _ => {
+                let read = GetRoutedOperation::new(input, restrictions, token);
+                drive(read, &self.state).await
+            }
         };
         // A link is read at its target, under the caller's own rights there.
         if let Err(aruna_operations::s3::object::get::GetObjectError::Link(linked)) = &result {
@@ -2367,19 +2374,21 @@ impl S3 for ArunaS3Service {
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
             Some(
-                get_object_info(
+                drive(
+                    ObjectInfoOperation::new(
+                        GOI {
+                            bucket,
+                            key,
+                            version_id,
+                            range: None,
+                            group_id,
+                            user_identity: user_access.user_identity,
+                            realm_id: self.realm_id,
+                            node_id: self.node_id,
+                        },
+                        user_access.path_restrictions.clone(),
+                    ),
                     &self.state,
-                    GOI {
-                        bucket,
-                        key,
-                        version_id,
-                        range: None,
-                        group_id,
-                        user_identity: user_access.user_identity,
-                        realm_id: self.realm_id,
-                        node_id: self.node_id,
-                    },
-                    user_access.path_restrictions.clone(),
                 )
                 .await
                 .map_err(IntoS3Error::into_s3_error)?,
@@ -2532,19 +2541,21 @@ impl S3 for ArunaS3Service {
         // A reference answers from its source observation without opening a source read.
         let remote_info = if result.location.is_none() && result.source_metadata.is_none() {
             Some(
-                get_object_info(
+                drive(
+                    ObjectInfoOperation::new(
+                        GOI {
+                            bucket,
+                            key,
+                            version_id,
+                            range: None,
+                            group_id,
+                            user_identity: user_access.user_identity,
+                            realm_id: self.realm_id,
+                            node_id: self.node_id,
+                        },
+                        user_access.path_restrictions.clone(),
+                    ),
                     &self.state,
-                    GOI {
-                        bucket,
-                        key,
-                        version_id,
-                        range: None,
-                        group_id,
-                        user_identity: user_access.user_identity,
-                        realm_id: self.realm_id,
-                        node_id: self.node_id,
-                    },
-                    user_access.path_restrictions.clone(),
                 )
                 .await
                 .map_err(IntoS3Error::into_s3_error)?,

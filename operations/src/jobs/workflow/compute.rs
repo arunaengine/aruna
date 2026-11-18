@@ -2,7 +2,42 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::{AttemptPhase, ReconcileEvidence, ResumePoint};
+use aruna_core::calls::{IoCall, IoError, IoResult};
+use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
+use aruna_core::compute::{
+    AttemptPhase, ExecutorKind, FenceContext, ReconcileEvidence, ResumePoint,
+};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+
+/// The call that carries one compute effect.
+pub(super) fn compute_call(effect: ComputeEffect) -> IoCall {
+    IoCall::Effect(Box::new(Effect::Compute(Box::new(effect))))
+}
+
+/// The call that asks the backend of `kind` about a fenced attempt.
+pub(super) fn attempt_call(
+    kind: &ExecutorKind,
+    fence: &FenceContext,
+    request: ComputeRequest,
+) -> IoCall {
+    compute_call(ComputeEffect::Attempt {
+        kind: kind.clone(),
+        fence: fence.clone(),
+        request,
+    })
+}
+
+/// The answer of the compute call `result` belongs to.
+pub(super) fn compute_answer(result: IoResult) -> Result<ComputeAnswer, IoError> {
+    match result.event()? {
+        Event::Compute(answer) => Ok(*answer),
+        other => Err(IoError::Unexpected {
+            expected: "Event::Compute",
+            got: other.label(),
+        }),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryAction {

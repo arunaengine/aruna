@@ -4,15 +4,13 @@
 
 use std::collections::VecDeque;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::SystemTime;
 
-use aruna_compute::ExecutorBackend;
-use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::compute::FenceContext;
 use aruna_core::compute::quota::JobReservationRecord;
-use aruna_core::compute::session::{EndReason, PendingInput, StagedInput, TouchedObject};
+use aruna_core::compute::session::{
+    EndReason, PendingInput, SessionAnswer, SessionLedger, SessionRequest, TouchedObject,
+};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
@@ -28,10 +26,9 @@ use ulid::Ulid;
 use super::credential::{MintCredentialOperation, RunIdentity, WorkspaceCredential};
 use super::input_view::{view_bucket, view_entries};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
-use crate::jobs::lifecycle::ids::session_of;
+use crate::jobs::session::SessionOperation;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::put_job_entry;
 use crate::jobs::store::row_calls::read_job_record;
@@ -176,64 +173,9 @@ impl Operation for SessionPlanOperation {
     }
 }
 
-/// Registers the interactive session of a session job. `None` is an ordinary
-/// run, or a node with no compute plane.
-pub(super) async fn start_session(
-    context: &Arc<DriverContext>,
-    backend: &Arc<dyn ExecutorBackend>,
-    fence: &FenceContext,
-    job_id: JobId,
-    spec: &ExecutionSpec,
-    bucket: &str,
-) -> Option<Arc<Session>> {
-    let requested = session_of(spec)?;
-    let registry = context.compute_handle.as_ref()?.sessions().clone();
-    let net = context.net_handle.as_ref()?;
-    let node_id = net.node_id();
-    let inputs = SessionInputs {
-        realm_id: *net.realm_id(),
-        node_id,
-        mounts: super::prepare::backend_mounts(context, spec),
-        encryption_key: Some(net.credential_encryption_key()),
-        now: SystemTime::now(),
-    };
-    let plan = SessionPlanOperation::new(job_id, spec, bucket, requested.idle_after_ms, inputs);
-    let plan = Box::pin(drive(plan, context)).await.ok()??;
-    Some(registry.open(
-        SessionConfig {
-            job_id: job_id.to_string(),
-            public_job_id: plan.public_job_id.to_string(),
-            runtime: requested.runtime,
-            workspace_bucket: bucket.to_string(),
-            executor_node_id: node_id.to_string(),
-            idle_after_ms: plan.idle_after_ms,
-            credential_expires_ms: plan.credential_expires_ms,
-        },
-        backend.clone(),
-        fence.clone(),
-    ))
-}
-
-/// What a session recorded about the objects it brought in and touched.
-#[derive(Debug, Default, PartialEq)]
-pub struct SessionLedger {
-    pub inputs: Vec<StagedInput>,
-    pub pending: Vec<PendingInput>,
-    pub touched: Vec<TouchedObject>,
-}
-
-impl SessionLedger {
-    pub(super) fn of(session: &Session) -> Self {
-        Self {
-            inputs: session.inventory(),
-            pending: session.pending(),
-            touched: session.touched(),
-        }
-    }
-}
-
 #[derive(Debug, PartialEq)]
 enum ReportStep {
+    Ledger,
     Pending(PendingInput),
     Write,
 }
@@ -244,6 +186,7 @@ enum ReportStep {
 pub struct SessionReportOperation {
     job_id: JobId,
     token: Ulid,
+    live: bool,
     pending: VecDeque<PendingInput>,
     touched: Vec<TouchedObject>,
     reason: EndReason,
@@ -253,9 +196,25 @@ pub struct SessionReportOperation {
 }
 
 impl SessionReportOperation {
-    pub fn new(job_id: JobId, token: Ulid, ledger: SessionLedger, reason: EndReason) -> Self {
-        let next_input = ledger.inputs.len();
-        let rows = (ledger.inputs.into_iter().enumerate())
+    /// With `live` the ledger is read from the session first; without it the report only says
+    /// why the run ended.
+    pub fn new(job_id: JobId, token: Ulid, live: bool, reason: EndReason) -> Self {
+        Self {
+            job_id,
+            token,
+            live,
+            pending: VecDeque::new(),
+            touched: Vec::new(),
+            reason,
+            next_input: 0,
+            rows: VecDeque::new(),
+            step: ReportStep::Ledger,
+        }
+    }
+
+    fn take_ledger(&mut self, ledger: SessionLedger) {
+        self.next_input = ledger.inputs.len();
+        self.rows = (ledger.inputs.into_iter().enumerate())
             .map(|(index, input)| SessionReportRow {
                 entry_key: format!("input/{index:04}"),
                 detail: SessionReportDetail::Input {
@@ -267,16 +226,8 @@ impl SessionReportOperation {
                 },
             })
             .collect();
-        Self {
-            job_id,
-            token,
-            pending: ledger.pending.into(),
-            touched: ledger.touched,
-            reason,
-            next_input,
-            rows,
-            step: ReportStep::Write,
-        }
+        self.pending = ledger.pending.into();
+        self.touched = ledger.touched;
     }
 
     /// Reads the next queued copy whose id parses, or starts writing the rows.
@@ -346,11 +297,23 @@ impl Operation for SessionReportOperation {
     type Error = IoError;
 
     fn first(&mut self) -> Result<Next<()>, IoError> {
+        if self.live {
+            let job_id = self.job_id;
+            return Ok(Next::Call(session_call(job_id, SessionRequest::Ledger)));
+        }
         self.advance()
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         match std::mem::replace(&mut self.step, ReportStep::Write) {
+            ReportStep::Ledger => {
+                if let Ok(SessionAnswer::Ledger(ledger)) =
+                    result.child::<SessionAnswer, IoError>()?
+                {
+                    self.take_ledger(ledger);
+                }
+                self.advance()
+            }
             ReportStep::Pending(pending) => {
                 let record = result.child::<Option<JobRecord>, JobMutationError>()?;
                 self.add_copy(pending, record.ok().flatten());
@@ -368,19 +331,9 @@ impl Operation for SessionReportOperation {
     }
 }
 
-/// Writes the report of `session`, or of a run that kept none.
-pub(super) async fn report_session(
-    context: &DriverContext,
-    job_id: JobId,
-    token: Ulid,
-    session: Option<&Arc<Session>>,
-    reason: EndReason,
-) {
-    let ledger = session.map_or_else(SessionLedger::default, |session| SessionLedger::of(session));
-    let report = SessionReportOperation::new(job_id, token, ledger, reason);
-    if let Err(error) = Box::pin(drive(report, context)).await {
-        warn!(job_id = %job_id, error = %error, "Session report failed");
-    }
+/// One request to the live session of `job_id`.
+pub(super) fn session_call(job_id: JobId, request: SessionRequest) -> IoCall {
+    IoCall::child(SessionOperation::new(job_id.to_string(), request))
 }
 
 #[cfg(test)]

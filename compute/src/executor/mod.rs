@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::compute::offer::{BackendCaps, WorkerSite};
 use aruna_core::compute::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, GrantedResources,
     LogLimits, LogTails, ReconcileEvidence, ResourceEnvelope, TaskOutput, TaskSpec,
     TombstoneEvidence, TombstoneSpec, UserSpec,
 };
 use async_trait::async_trait;
-use std::collections::BTreeMap;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::{Duration, sleep};
@@ -34,40 +34,11 @@ pub mod docker;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BackendCaps {
-    pub file_staging: bool,
-    pub direct_s3: bool,
-    pub s3_mount: bool,
-    /// The backend proves where workers run and enforces their network
-    /// isolation, which protected data requires before open networking.
-    pub network_policy: bool,
-    /// The workload runs on the controller host, so it inherits the
-    /// controller's execution subject.
-    pub local_site: bool,
-    /// Where a non-local backend's workers run. `None` means their placement is
-    /// unproven, so the advertisement carries no site details at all.
-    pub worker_site: Option<WorkerSite>,
-    /// Static ceilings; `None` is unmeasured and never filters.
-    pub limits: ResourceEnvelope,
-    /// The backend can open a byte channel to a running attempt, which an
-    /// interactive session needs.
-    pub session: bool,
-}
-
 /// One bidirectional byte channel to the helper inside a running attempt. The
 /// node forwards bytes over it and never interprets what a cell contains.
 pub struct SessionChannel {
     pub input: Pin<Box<dyn AsyncWrite + Send>>,
     pub output: Pin<Box<dyn AsyncRead + Send>>,
-}
-
-/// The operator-declared execution site of workers that do not run on the
-/// controller host.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WorkerSite {
-    pub location: String,
-    pub labels: BTreeMap<String, String>,
 }
 
 /// The ceiling one attempt runs under: the stored request's own, else the

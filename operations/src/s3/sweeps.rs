@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_bucket_ends_check() {
+    fn unknown_bucket_ends() {
         let group = Ulid::from_bytes([3; 16]);
         let mut check = RecoveryCheckOperation::new(origin(), "b", group, 1);
         assert!(matches!(check.first(), Ok(Next::Call(IoCall::Child(_)))));

@@ -70,6 +70,8 @@ pub enum Event {
     Compute(Box<crate::compute::effect::ComputeAnswer>),
     /// The answer of a running job's host; never persisted.
     Job(crate::jobs::JobEvent),
+    /// Answers `Effect::Git`; never persisted.
+    Git(Box<crate::git::GitAnswer>),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -191,6 +193,10 @@ pub enum BlobEvent {
     DeleteFinished,
     ReservationReleased {
         id: Ulid,
+    },
+    /// Whether the reservation is settled; `false` keeps it for a later pass.
+    ReservationReconciled {
+        done: bool,
     },
     HiddenSpooled {
         location: BackendLocation,
@@ -523,12 +529,8 @@ pub enum NetEvent {
     TopicPeers(Result<(), TopicPeerError>),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
-    /// The caller a forwarded credential names, or why the peer may not act for it.
-    WritePeerChecked(Result<Box<crate::structs::identity::auth::AuthContext>, WritePeerRefusal>),
     /// The verified claims of a token named for revocation, or why it is invalid.
     RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
-    /// The end of a routed harvest metadata write.
-    HarvestWrite(Result<(), crate::repository::remote::HarvestWriteFailure>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
 }
@@ -556,7 +558,7 @@ pub enum ShardNetEvent {
     Closed(Result<bool, String>),
     Outcome(Result<(), String>),
     Probed(GenesisProbe),
-    /// What a pull brought, for this node and realm to apply.
+    /// How the fetch of a pull ended, for this node and realm to reconcile and apply.
     Pulled {
         node_id: NodeId,
         realm_id: RealmId,
@@ -578,13 +580,6 @@ pub enum ShardNetEvent {
 pub enum TopicPeerError {
     NoNetwork,
     Failed(String),
-}
-
-/// Why a forwarded credential was not accepted.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WritePeerRefusal {
-    Unauthorized,
-    Unavailable(String),
 }
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
@@ -906,6 +901,8 @@ impl MetadataEvent {
                 BatchMerged,
                 CacheGeneration,
                 CachedGroup,
+                DocumentTitle,
+                GraphFlushed,
                 ProfileShapes,
                 ProfileChecked,
                 Error,
@@ -925,6 +922,7 @@ impl Event {
                     ReadFinished,
                     DeleteFinished,
                     ReservationReleased,
+                    ReservationReconciled,
                     HiddenSpooled,
                     HiddenRead,
                     LocalSpooled,
@@ -1032,13 +1030,11 @@ impl Event {
                     GrantedRead,
                     DelegatedRead,
                     DatasetSummary,
-                    HarvestWrite,
                     WritePeerAuth,
                     GrantSign,
                     Shard,
                     TopicPeers,
                     DeletePlanSigned,
-                    WritePeerChecked,
                     RevocationClaims,
                     Notification,
                     InboxWoken,
@@ -1086,6 +1082,7 @@ impl Event {
                 TaskEvent {
                     TimerScheduled,
                     TimerCancelled,
+                    BackgroundStarted,
                     RunningHandlersAborted,
                     Error,
                 }
@@ -1102,6 +1099,7 @@ impl Event {
             Event::Hung { .. } => "Event::Hung",
             Event::Child(_) => "Event::Child",
             Event::Job(_) => "Event::Job",
+            Event::Git(_) => "Event::Git",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(

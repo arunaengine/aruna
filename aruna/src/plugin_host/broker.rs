@@ -17,7 +17,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::api::export_types::RoCrateExportView;
-use aruna_operations::metadata::forward::write::route_metadata_update;
+use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::plugins::check::RunScope;
 use aruna_operations::plugins::creates::{FinishCreate, stored_created, write_outcome};
@@ -156,16 +156,20 @@ impl RunBroker {
             user_id: install.account,
             realm_id: self.scope.realm_id,
         };
-        let update = route_metadata_update(
+        let local_node = self.ctx.net_handle.as_ref().map(|net| net.node_id());
+        let update = drive(
+            RouteUpdateOperation::new(
+                (actor, local_node),
+                (Some((*ready.record).clone()), ready.document_id),
+                DocumentUpdate {
+                    public: None,
+                    mutation: mutation(ready.entity),
+                    expected_revision: Some(ready.expected),
+                    commit_message: Some(change_message(&install, self.scope.run.run_id)),
+                },
+                Some(AuthToken::Internal(auth)),
+            ),
             &self.ctx,
-            actor,
-            Some(&ready.record),
-            ready.document_id,
-            None,
-            mutation(ready.entity),
-            Some(ready.expected),
-            Some(AuthToken::Internal(auth)),
-            Some(change_message(&install, self.scope.run.run_id)),
         );
         let outcome = update
             .await

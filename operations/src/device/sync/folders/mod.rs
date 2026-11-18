@@ -329,9 +329,12 @@ mod tests {
             .expect("base encodes");
         assert!(write_rows(&context, vec![row], None).await);
 
-        drive(finish_unbind(&context, folder.folder_id, node()), &context)
-            .await
-            .expect("a resumed unbind finishes");
+        drive(
+            finish_unbind(context.node_and_realm(), folder.folder_id, node()),
+            &context,
+        )
+        .await
+        .expect("a resumed unbind finishes");
 
         assert_eq!(
             drive(read_bound(folder.folder_id), &context).await,
@@ -404,7 +407,7 @@ mod tests {
         };
 
         assert!(matches!(
-            drive(apply_action(&context, input), &context).await,
+            drive(apply_action(context.node_and_realm(), input), &context).await,
             Err(ActionError::Folder(FolderError::NotFound))
         ));
         let (actions, _) = drive(list_actions(folder.folder_id, None), &context)
@@ -485,7 +488,11 @@ mod tests {
         for attempt in ["withdrawn offer", "deleted bucket"] {
             store_folder(&context, &folder).await.expect("row stored");
             assert_eq!(
-                drive(finish_unbind(&context, folder.folder_id, node()), &context).await,
+                drive(
+                    finish_unbind(context.node_and_realm(), folder.folder_id, node()),
+                    &context
+                )
+                .await,
                 Ok(()),
                 "{attempt}"
             );
@@ -601,7 +608,11 @@ mod tests {
             Err(OfferedDirectoryError::ReadOnly(bucket.clone()))
         );
         assert_eq!(
-            drive(finish_unbind(&context, folder.folder_id, node()), &context).await,
+            drive(
+                finish_unbind(context.node_and_realm(), folder.folder_id, node()),
+                &context
+            )
+            .await,
             Ok(())
         );
         assert!(bucket_gone(&context, &bucket).await);
@@ -628,7 +639,11 @@ mod tests {
         store_upload(&context, &upload).await;
 
         assert_eq!(
-            drive(finish_unbind(&context, folder.folder_id, node()), &context).await,
+            drive(
+                finish_unbind(context.node_and_realm(), folder.folder_id, node()),
+                &context
+            )
+            .await,
             Err(FolderError::AbortUpload(
                 AbortUploadError::CompletionInProgress
             ))
@@ -645,7 +660,11 @@ mod tests {
         upload.completing_since_ms = None;
         store_upload(&context, &upload).await;
         assert_eq!(
-            drive(finish_unbind(&context, folder.folder_id, node()), &context).await,
+            drive(
+                finish_unbind(context.node_and_realm(), folder.folder_id, node()),
+                &context
+            )
+            .await,
             Ok(())
         );
         assert!(bucket_gone(&context, &bucket).await);
@@ -767,7 +786,11 @@ mod tests {
             let folder_id = folder.folder_id;
             async move {
                 let _pass = folder_gate(folder_id).lock().await;
-                drive(finish_unbind(&context, folder_id, node()), &context).await
+                drive(
+                    finish_unbind(context.node_and_realm(), folder_id, node()),
+                    &context,
+                )
+                .await
             }
         });
         let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())

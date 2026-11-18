@@ -2,14 +2,28 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
-use crate::blob::release::release_renamed;
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::BucketAccessOperation;
+use crate::blob::release::{ReleaseFile, ReleaseRenamedOperation};
+use crate::driver::{DriverContext, drive, node_routing};
 use crate::s3::bucket::rename::tests::{BUCKET, access, group, put, realm, rule, setup, store_job};
+use crate::storage_read::iter_prefix_page;
 use crate::tests::records::node;
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
+use aruna_core::effects::StorageEffect;
+use aruna_core::keyspaces::{
+    BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, DELETE_CLAIM_KEYSPACE,
+    IMPORTED_OBJECT_KEYSPACE, LINKED_JOB_KEYSPACE, MANAGED_COPY_KEYSPACE, PATHS_INDEX_KEYSPACE,
+};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, HashIndex};
+use aruna_core::structs::storage::backend_import::{
+    ImportedObject, claim_key, object_key, version_key,
+};
+use aruna_core::structs::storage::blob::{
+    BlobCleanupWork, BlobHeadKey, CurrentVersionPointer, HashIndex, ManagedCopyRecord,
+};
 use aruna_core::structs::storage::format::{StoredFormat, StoredLayout};
 use aruna_core::structs::storage::linked_job::LinkedTask;
+use std::time::SystemTime;
 
 fn file(path: &str, ulid: Ulid, hash: u8) -> BackendLocation {
     BackendLocation {
@@ -98,14 +112,94 @@ async fn twins(context: &DriverContext, key: &str, at: u64) -> (BackendLocation,
     (old, new)
 }
 
-async fn load(context: &DriverContext) -> BucketAccess {
+async fn load(context: &DriverContext) -> Arc<BucketAccess> {
     let auth = access(context).await;
-    let load = crate::auth::request_authorization::BucketAccessOperation::new(
-        &auth,
-        (realm(), group(), node(4)),
-        BUCKET,
-    );
-    crate::driver::drive(load, context).await.unwrap()
+    let load = BucketAccessOperation::new(&auth, (realm(), group(), node(4)), BUCKET);
+    let loaded: Result<BucketAccess, AuthorizeError> = drive(load, context).await;
+    Arc::new(loaded.unwrap())
+}
+
+async fn preview_page(
+    context: &DriverContext,
+    (bucket, prefix): (&str, &str),
+    access: &Arc<BucketAccess>,
+    (filter, after, limit): (Option<&str>, Option<Cursor>, usize),
+) -> Result<UnifyPage, MigrationError> {
+    let query = PreviewQuery {
+        prefix: prefix.to_string(),
+        filter: filter.map(str::to_string),
+        after,
+        limit,
+    };
+    let routing = node_routing(context);
+    let preview = PreviewPageOperation::new(routing, bucket, access.clone(), query);
+    drive(preview, context).await
+}
+
+async fn job_page(
+    context: &DriverContext,
+    scope: (&str, &str),
+    access: &Arc<BucketAccess>,
+    job: &LinkedJob,
+) -> Result<JobStep, MigrationError> {
+    let routing = node_routing(context);
+    let page = UnifyJobOperation::new(routing, scope, access.clone(), job);
+    drive(page, context).await
+}
+
+async fn unify(
+    context: &DriverContext,
+    scope: (&str, aruna_core::types::GroupId),
+    found: &Duplicate,
+) -> Result<Unified, MigrationError> {
+    drive(UnifyOperation::new(scope, found.clone(), None), context).await
+}
+
+#[test]
+fn walk_groups_keys() {
+    let row = |key: &str, id: u8| {
+        let version = VersionKey::new("bucket", key, Ulid::from_bytes([id; 16]));
+        let key = Key::from(version.to_bytes().unwrap());
+        (key, Value::from(vec![id]))
+    };
+    let mut walk = KeyWalk::new("bucket", None);
+    assert!(matches!(walk.advance(), Ok(WalkStep::Read(_))));
+    let page = IoResult::Page {
+        rows: vec![row("a", 1), row("a", 2), row("b", 3)],
+        next: None,
+    };
+    walk.fill(page).unwrap();
+    let Ok(WalkStep::Key(key, versions)) = walk.advance() else {
+        panic!("the first key follows its page");
+    };
+    assert_eq!((key.as_str(), versions.len()), ("a", 2));
+    let Ok(WalkStep::Key(key, versions)) = walk.advance() else {
+        panic!("the last key ends the rows");
+    };
+    assert_eq!((key.as_str(), versions.len()), ("b", 1));
+    assert_eq!(walk.advance(), Ok(WalkStep::End));
+}
+
+#[test]
+fn capped_walk_cuts() {
+    let row = |id: u8| {
+        let version = VersionKey::new("bucket", "a", Ulid::from_bytes([id; 16]));
+        (
+            Key::from(version.to_bytes().unwrap()),
+            Value::from(vec![id]),
+        )
+    };
+    let mut walk = KeyWalk::new("bucket", None).capped(1);
+    walk.advance().unwrap();
+    let page = IoResult::Page {
+        rows: vec![row(1), row(2)],
+        next: None,
+    };
+    walk.fill(page).unwrap();
+    assert!(matches!(walk.advance(), Ok(WalkStep::Key(..))));
+    assert!(walk.cut);
+    assert!(matches!(walk.advance(), Ok(WalkStep::Read(_))));
+    assert!(!walk.cut);
 }
 
 #[tokio::test]
@@ -241,15 +335,14 @@ async fn keeps_shared_copies() {
     job_page(&context, (BUCKET, ""), &access, &unifying(&context).await)
         .await
         .unwrap();
-    let kept = release_renamed(
-        &context,
-        old.clone(),
-        rule().import_id,
-        Ulid::from_parts(10, 1),
-        "p1".to_string(),
-    )
-    .await;
-    assert!(kept);
+    let release = ReleaseRenamedOperation::new(ReleaseFile {
+        location: old.clone(),
+        import_id: rule().import_id,
+        version_id: Ulid::from_parts(10, 1),
+        version: "p1".to_string(),
+        has_blob: context.blob_handle.is_some(),
+    });
+    assert!(drive(release, &context).await.unwrap());
     let row = read(
         &context,
         BLOB_LOCATIONS_KEYSPACE,
@@ -431,9 +524,7 @@ async fn skips_deleting_files() {
     let [entry] = page.entries.as_slice() else {
         panic!("expected one key with copies, got {:?}", page.entries)
     };
-    let unified = unify(&context, (BUCKET, group()), entry, None)
-        .await
-        .unwrap();
+    let unified = unify(&context, (BUCKET, group()), entry).await.unwrap();
     assert_eq!(unified, Unified::Changed);
 }
 

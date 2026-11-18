@@ -12,7 +12,6 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::{info, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::driver::DriverContext;
 use crate::node::usage_publish::{PublishUsageOperation, PublishedUsage, UsagePublishError};
 use crate::placement::process_placements::{
     PlacementReconcileOutcome, PlacementReconcileStatus, ReconcilePlacementsOperation,
@@ -153,17 +152,8 @@ pub struct RecoveryOperation {
 }
 
 impl RecoveryOperation {
+    /// `serving_realm` is the realm this node serves, when it runs a net transport.
     pub fn new(
-        context: &DriverContext,
-        config: RecoveryConfig,
-        status: RecoveryStatus,
-        stop: RecoveryStop,
-    ) -> Self {
-        let serving_realm = context.node_and_realm().map(|(_, realm_id)| realm_id);
-        Self::serving(config, serving_realm, status, stop)
-    }
-
-    fn serving(
         config: RecoveryConfig,
         serving_realm: Option<RealmId>,
         status: RecoveryStatus,
@@ -307,7 +297,7 @@ impl RecoveryOperation {
         }
         self.stage = RecoveryStage::Usage;
         let keys = (self.config.node_id, self.config.realm_id);
-        let publish = PublishUsageOperation::on_realm(keys, self.serving_realm, true, true);
+        let publish = PublishUsageOperation::new(keys, self.serving_realm, true, true);
         Ok(Next::Call(IoCall::child(publish)))
     }
 
@@ -465,7 +455,7 @@ mod tests {
             publish_full_usage: false,
         };
         let status = RecoveryStatus::new();
-        let operation = RecoveryOperation::serving(config, Some(realm()), status.clone(), stop);
+        let operation = RecoveryOperation::new(config, Some(realm()), status.clone(), stop);
         (operation, status)
     }
 

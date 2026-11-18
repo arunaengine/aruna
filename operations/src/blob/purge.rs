@@ -7,8 +7,12 @@ use crate::blob::import_rows::{
     BackendRulesOperation, BucketRoutingOperation, ImportRowsError, SecondCopiesOperation,
     SecondCopy,
 };
-use crate::blob::unify::second_copies;
-use crate::driver::DriverContext;
+use crate::blob::migration::misplaced::KeyRule;
+use crate::blob::migration::shared::{MigrationError, routing_call, routing_result};
+use crate::s3::object::versions::{
+    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
+    ListVersionsResult,
+};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
@@ -27,7 +31,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
 use aruna_core::types::{GroupId, Key, Value};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::string::FromUtf8Error;
 use thiserror::Error;
 use ulid::Ulid;
@@ -484,134 +488,209 @@ pub struct ScopeTotals {
     pub complete: bool,
 }
 
-/// Counts what a purge of `scope` removes, from the version listing alone.
-pub async fn scope_totals(
-    context: &DriverContext,
-    scope: &StoragePurgeScope,
-    readable: &(dyn Fn(&str) -> bool + Sync),
-) -> Result<ScopeTotals, String> {
-    use crate::s3::object::versions::{
-        ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-    };
-    let mut totals = ScopeTotals::default();
-    let mut seen = std::collections::HashSet::new();
-    let (mut key_marker, mut version_marker) = (None, None);
-    let mut last_key = None::<String>;
-    let mut scanned = 0u64;
-    let routing = crate::blob::migration::drain::move_routing(context, scope.bucket()).await?;
-    let routing = routing.as_ref();
-    // The versions of the key passed over last, whose second copies count once it ends.
-    let mut ids = Vec::new();
-    loop {
+#[derive(Debug, PartialEq)]
+enum TotalsStep {
+    Routing,
+    Listing,
+    /// The second copies of the key that ended, before the rest of the walk.
+    Copies(AfterCopies),
+}
+
+#[derive(Debug, PartialEq)]
+enum AfterCopies {
+    /// A version of the next key, with its location.
+    Version(Ulid, Option<BackendLocation>),
+    /// The end of the count; whether it covered everything.
+    End(bool),
+}
+
+type TotalsTurn = Result<Next<ScopeTotals>, MigrationError>;
+
+/// Counts what a purge of `scope` removes, from the version listing alone. Only keys `readable`
+/// allows count.
+#[derive(Debug, PartialEq)]
+pub struct ScopeTotalsOperation<R> {
+    routing: NodeRouting,
+    scope: StoragePurgeScope,
+    readable: R,
+    step: TotalsStep,
+    snapshot: Option<RoutingSnapshot>,
+    totals: ScopeTotals,
+    seen: HashSet<Ulid>,
+    key_marker: Option<String>,
+    version_marker: Option<Ulid>,
+    last_key: Option<String>,
+    scanned: u64,
+    /// The versions of the key passed over last, whose second copies count once it ends.
+    ids: Vec<Ulid>,
+    items: VecDeque<ListVersionsItem>,
+    truncated: bool,
+}
+
+impl<R: KeyRule> ScopeTotalsOperation<R> {
+    pub fn new(routing: NodeRouting, scope: &StoragePurgeScope, readable: R) -> Self {
+        Self {
+            routing,
+            scope: scope.clone(),
+            readable,
+            step: TotalsStep::Routing,
+            snapshot: None,
+            totals: ScopeTotals::default(),
+            seen: HashSet::new(),
+            key_marker: None,
+            version_marker: None,
+            last_key: None,
+            scanned: 0,
+            ids: Vec::new(),
+            items: VecDeque::new(),
+            truncated: false,
+        }
+    }
+
+    fn finish(&mut self) -> TotalsTurn {
+        Ok(Next::Done(std::mem::take(&mut self.totals)))
+    }
+
+    fn list(&mut self) -> TotalsTurn {
         let input = ListVersionsInput {
-            bucket: scope.bucket().to_string(),
-            prefix: scope.list_prefix().map(str::to_string),
+            bucket: self.scope.bucket().to_string(),
+            prefix: self.scope.list_prefix().map(str::to_string),
             delimiter: None,
-            key_marker: key_marker.take(),
-            version_id_marker: version_marker.take(),
+            key_marker: self.key_marker.take(),
+            version_id_marker: self.version_marker.take(),
             max_keys: Some(LIST_PAGE),
         };
         // A listing may read one key past its page to tell whether more follow.
-        let budget = (TOTAL_VERSIONS - scanned.min(TOTAL_VERSIONS)) as usize + LIST_PAGE;
+        let budget = (TOTAL_VERSIONS - self.scanned.min(TOTAL_VERSIONS)) as usize + LIST_PAGE;
         let listing = ListVersionsOperation::new(input).with_row_budget(budget);
-        let page = match crate::driver::drive(listing, context).await {
-            Ok(page) => page,
-            // A key with more versions than the budget leaves the totals as lower bounds.
-            Err(ListVersionsError::TooManyVersions) => return Ok(totals),
-            Err(error) => return Err(error.to_string()),
+        self.step = TotalsStep::Listing;
+        Ok(Next::Call(IoCall::child(listing)))
+    }
+
+    /// Counts the second copies an import registered for the versions of the key that ended,
+    /// then goes on with `after`.
+    fn key_ended(&mut self, key: Option<String>, after: AfterCopies) -> TotalsTurn {
+        let ids = std::mem::take(&mut self.ids);
+        let Some(key) = key.filter(|_| !ids.is_empty()) else {
+            return self.after_copies(after);
         };
-        for item in &page.items {
+        let scope = (self.scope.bucket(), key.as_str());
+        let copies = SecondCopiesOperation::new(self.snapshot.as_ref(), scope, &ids)?;
+        self.step = TotalsStep::Copies(after);
+        Ok(Next::Call(IoCall::child(copies)))
+    }
+
+    fn after_copies(&mut self, after: AfterCopies) -> TotalsTurn {
+        match after {
+            AfterCopies::Version(id, location) => {
+                self.count_version(id, location);
+                self.next_item()
+            }
+            AfterCopies::End(complete) => {
+                self.totals.complete = complete;
+                self.finish()
+            }
+        }
+    }
+
+    fn count_file(&mut self, location: &BackendLocation) {
+        if self.seen.insert(location.ulid) {
+            self.totals.storage_files += 1;
+            self.totals.storage_bytes += location.blob_size;
+        }
+    }
+
+    fn count_version(&mut self, id: Ulid, location: Option<BackendLocation>) {
+        self.ids.push(id);
+        let Some(location) = location else {
+            return;
+        };
+        self.totals.bytes += location.blob_size;
+        if location.is_external() && !location.staging && !location.partial {
+            self.count_file(&location);
+        }
+    }
+
+    fn next_item(&mut self) -> TotalsTurn {
+        while let Some(item) = self.items.pop_front() {
             let (key, id, location) = match item {
                 ListVersionsItem::Version {
                     key,
                     version_id,
                     location,
                     ..
-                } => (key, *version_id, location.as_ref()),
+                } => (key, version_id, location),
                 ListVersionsItem::DeleteMarker {
                     key, version_id, ..
-                } => (key, *version_id, None),
+                } => (key, version_id, None),
             };
             // The bound counts every version passed over, also the hidden ones.
-            scanned += 1;
-            if !scope.matches_key(scope.bucket(), key) || !readable(key) {
+            self.scanned += 1;
+            let bucket = self.scope.bucket();
+            if !self.scope.matches_key(bucket, &key) || !self.readable.allows(&key) {
                 continue;
             }
-            totals.versions += 1;
-            if last_key.as_deref() != Some(key.as_str()) {
-                let ended = (last_key.as_deref(), std::mem::take(&mut ids));
-                count_copies(
-                    context,
-                    (scope.bucket(), routing),
-                    ended,
-                    (&mut totals, &mut seen),
-                )
-                .await?;
-                totals.keys += 1;
-                last_key = Some(key.clone());
+            self.totals.versions += 1;
+            if self.last_key.as_deref() != Some(key.as_str()) {
+                self.totals.keys += 1;
+                let ended = self.last_key.replace(key);
+                return self.key_ended(ended, AfterCopies::Version(id, location));
             }
-            ids.push(id);
-            let Some(location) = location else {
-                continue;
-            };
-            totals.bytes += location.blob_size;
-            let linked = location.is_external() && !location.staging && !location.partial;
-            if linked && seen.insert(location.ulid) {
-                totals.storage_files += 1;
-                totals.storage_bytes += location.blob_size;
-            }
+            self.count_version(id, location);
         }
-        if scanned >= TOTAL_VERSIONS && page.is_truncated {
-            let ended = (last_key.as_deref(), ids);
-            count_copies(
-                context,
-                (scope.bucket(), routing),
-                ended,
-                (&mut totals, &mut seen),
-            )
-            .await?;
-            return Ok(totals);
+        self.page_done()
+    }
+
+    fn page_done(&mut self) -> TotalsTurn {
+        let last = self.last_key.take();
+        if self.scanned >= TOTAL_VERSIONS && self.truncated {
+            return self.key_ended(last, AfterCopies::End(false));
         }
-        match (page.is_truncated, page.next_key_marker) {
-            (true, Some(next)) => {
-                (key_marker, version_marker) = (Some(next), page.next_version_marker)
-            }
-            _ => {
-                let ended = (last_key.as_deref(), ids);
-                count_copies(
-                    context,
-                    (scope.bucket(), routing),
-                    ended,
-                    (&mut totals, &mut seen),
-                )
-                .await?;
-                totals.complete = true;
-                return Ok(totals);
-            }
+        if self.truncated && self.key_marker.is_some() {
+            self.last_key = last;
+            return self.list();
         }
+        self.key_ended(last, AfterCopies::End(true))
     }
 }
 
-/// Counts the second copies an import registered for the versions `ids` of `key`.
-async fn count_copies(
-    context: &DriverContext,
-    (bucket, routing): (
-        &str,
-        Option<&aruna_core::structs::storage::routing::RoutingSnapshot>,
-    ),
-    (key, ids): (Option<&str>, Vec<Ulid>),
-    (totals, seen): (&mut ScopeTotals, &mut std::collections::HashSet<Ulid>),
-) -> Result<(), String> {
-    let Some(key) = key.filter(|_| !ids.is_empty()) else {
-        return Ok(());
-    };
-    for (file, ..) in second_copies(context, routing, (bucket, key), &ids).await? {
-        if seen.insert(file.ulid) {
-            totals.storage_files += 1;
-            totals.storage_bytes += file.blob_size;
+impl<R: KeyRule> Operation for ScopeTotalsOperation<R> {
+    type Output = ScopeTotals;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> TotalsTurn {
+        let call = routing_call(self.routing.clone(), self.scope.bucket());
+        Ok(Next::Call(call))
+    }
+
+    fn next(&mut self, result: IoResult) -> TotalsTurn {
+        match std::mem::replace(&mut self.step, TotalsStep::Listing) {
+            TotalsStep::Routing => {
+                self.snapshot = routing_result(result)?;
+                self.list()
+            }
+            TotalsStep::Listing => match result.child::<ListVersionsResult, ListVersionsError>()? {
+                Ok(page) => {
+                    self.items = page.items.into();
+                    self.truncated = page.is_truncated;
+                    self.key_marker = page.next_key_marker;
+                    self.version_marker = page.next_version_marker;
+                    self.next_item()
+                }
+                // A key with more versions than the budget leaves the totals as lower bounds.
+                Err(ListVersionsError::TooManyVersions) => self.finish(),
+                Err(error) => Err(MigrationError::failed(error)),
+            },
+            TotalsStep::Copies(after) => {
+                let copies = (result.child::<Vec<SecondCopy>, ImportRowsError>()?)
+                    .map_err(MigrationError::failed)?;
+                for (file, ..) in &copies {
+                    self.count_file(file);
+                }
+                self.after_copies(after)
+            }
         }
     }
-    Ok(())
 }
 
 fn plan_key(job_id: Ulid, location: Ulid) -> Key {

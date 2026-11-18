@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::node_routing;
 use crate::federation::registration::PublishRegistrationOperation;
+use std::time::SystemTime;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
 
@@ -33,7 +35,7 @@ async fn durable_rearm_loop(
             return;
         };
         ticks = ticks.saturating_add(1);
-        restore_blob_timer(&context.storage_handle, &task_handle).await;
+        drive(RestoreDrainOperation::default(), &context).await.ok();
         let refresh = crate::s3::object::metadata_drain::RestoreRefreshTimer::new();
         if let Err(error) = drive(refresh, &context).await {
             warn!(?error, "Failed to scan reference metadata refresh jobs");
@@ -43,7 +45,7 @@ async fn durable_rearm_loop(
             warn!(%error, "Failed to restore connector reference pruning");
         }
         restore_outbox_timer(&context).await;
-        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest(&context, &task_handle).await;
@@ -210,7 +212,7 @@ async fn install_task_handler(
 ) -> TaskQueues {
     let handler_context = context.clone();
     if context.compute_handle.is_some() {
-        jobs_runtime.set_reconciler(crate::jobs::workflow::reconcile::ComputeReconciler::new(
+        jobs_runtime.set_reconciler(crate::tasks::job_runner::ComputeReconciler::new(
             context.clone(),
             Arc::downgrade(&jobs_runtime),
         ));
@@ -273,13 +275,17 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_publish_timer(&context.storage_handle, &task_handle).await;
+        restore_publish_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }
         // Before the first refresh: a queued edit is the one local change no
         // holder would hand back.
-        crate::device::edit::replay_queued_edits(&context).await;
+        if context.metadata_handle.is_some() {
+            drive(crate::device::edit::replay_queued_edits(), &context)
+                .await
+                .ok();
+        }
         if stopped() {
             return;
         }
@@ -329,7 +335,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_blob_timer(&context.storage_handle, &task_handle).await;
+        drive(RestoreDrainOperation::default(), &context).await.ok();
         if stopped() {
             return;
         }
@@ -349,8 +355,14 @@ impl TaskQueues {
             return;
         }
         if context.blob_handle.is_some() {
-            restore_hidden_sweep(&context.storage_handle, &task_handle).await;
-            restore_reclaim_sweep(&context.storage_handle, &task_handle).await;
+            let arm = ArmSweepOperation::new(TaskKey::SweepHiddenBlobs);
+            if let Err(error) = drive(arm, &context).await {
+                warn!(error = %error, "Failed to schedule hidden blob sweep");
+            }
+            let arm = ArmSweepOperation::new(TaskKey::DrainReclaimQueue);
+            if let Err(error) = drive(arm, &context).await {
+                warn!(error = %error, "Failed to schedule blob reclaim sweep");
+            }
             handler
                 .reschedule_timer(TaskKey::DrainCleanupQueue, Duration::ZERO)
                 .await;
@@ -389,8 +401,8 @@ impl OperationsTaskHandler {
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
         let publish = crate::node::usage_publish::PublishUsageOperation::new(
-            &self.context,
             (node_id, realm_id),
+            Some(realm_id),
             false,
             true,
         );
@@ -420,7 +432,7 @@ impl OperationsTaskHandler {
                 node_id,
                 sequence,
                 Some(self.jobs_runtime.running_jobs()),
-                crate::node::info::facts::NodeFacts::gather(&self.context),
+                node_facts(&self.context),
             );
             if let Err(error) = drive(refresh, &self.context).await {
                 warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
@@ -501,12 +513,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.context.bulk();
-        match drive(
-            PruneBatchOperation::new(crate::jobs::repository::NodeScope::of(&bulk)),
-            &bulk,
-        )
-        .await
-        {
+        match drive(PruneBatchOperation::new(bulk.node_scope()), &bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
                     .await;
@@ -568,7 +575,12 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_replication_queue(&self) {
-        match process_blob_batch(&self.context).await {
+        let drain = ProcessBatchOperation::new(
+            MetadataPages,
+            node_routing(&self.context),
+            self.context.node_and_realm(),
+        );
+        match drive(drain, &self.context).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainReplicationQueue, Duration::ZERO)
                     .await;
@@ -650,7 +662,7 @@ impl OperationsTaskHandler {
     /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
     pub(super) async fn drain_link_queue(&self) {
         let drain = crate::jobs::repository::link_queue::DrainLinksOperation::new(
-            crate::jobs::repository::NodeScope::of(&self.context),
+            self.context.node_scope(),
         );
         let after = match drive(drain, &self.context).await {
             Ok(after) => after,
@@ -780,8 +792,11 @@ impl OperationsTaskHandler {
                     warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
                     continue;
                 };
-                if let Err(error) =
-                    release_job(&self.context, record.job_id, token, unix_timestamp_millis()).await
+                if let Err(error) = drive(
+                    job_calls::release_job(record.job_id, token, unix_timestamp_millis()),
+                    self.context.as_ref(),
+                )
+                .await
                 {
                     warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
                 }
@@ -830,7 +845,11 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_blob_cleanup(&self) {
-        let after = match process_cleanup_batch(&self.context).await {
+        let node = CleanupNode {
+            routing: node_routing(&self.context),
+            has_blob: self.context.blob_handle.is_some(),
+        };
+        let after = match drive(ProcessCleanupOperation::new(node), &self.context).await {
             Ok(outcome) if outcome.failed > 0 => BLOB_CLEANUP_RETRY,
             Ok(outcome) if outcome.more => std::time::Duration::from_secs(1),
             Ok(_) => BLOB_CLEANUP_AFTER,
@@ -841,44 +860,49 @@ impl OperationsTaskHandler {
         };
         // The parts a reclaimed upload frees become cleanup rows, so the sweep
         // rides the same timer that drains them.
-        if let Err(error) = sweep_stale_uploads(&self.context, unix_timestamp_millis()).await {
+        let sweep = SweepUploadsOperation::new(unix_timestamp_millis());
+        if let Err(error) = drive(sweep, &self.context).await {
             warn!(task_id = ?TaskKey::DrainCleanupQueue, error = %error, "Failed to sweep stale multipart uploads");
         }
         self.reschedule_timer(TaskKey::DrainCleanupQueue, after)
             .await;
     }
 
+    fn reclaim_sweep(&self) -> ReclaimSweepOperation {
+        let catalog = node_routing(&self.context).catalog;
+        ReclaimSweepOperation::new(catalog, SystemTime::now(), self.reclaim_start())
+    }
+
     pub(super) async fn drain_blob_reclaim(&self) {
         let key = TaskKey::DrainReclaimQueue;
         // A failed candidate earns the fast retry, then doubles up to the normal interval, so a permanently
         // failing one cannot hold a one-minute rescan of the whole queue forever.
-        let (after, drained) =
-            match process_reclaim_batch(&self.context, self.reclaim_start()).await {
-                Ok(outcome) => {
-                    self.set_reclaim_start(outcome.next_start_after);
-                    match (outcome.capped, outcome.failed) {
-                        (true, _) => {
-                            self.reset_backoff(&key);
-                            (RECLAIM_SWEEP_RETRY, false)
-                        }
-                        (false, 0) => {
-                            self.reset_backoff(&key);
-                            (RECLAIM_SWEEP_AFTER, true)
-                        }
-                        (false, _) => (
-                            self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                            true,
-                        ),
+        let (after, drained) = match drive(self.reclaim_sweep(), &self.context).await {
+            Ok(outcome) => {
+                self.set_reclaim_start(outcome.next_start_after);
+                match (outcome.capped, outcome.failed) {
+                    (true, _) => {
+                        self.reset_backoff(&key);
+                        (RECLAIM_SWEEP_RETRY, false)
                     }
-                }
-                Err(error) => {
-                    warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
-                    (
+                    (false, 0) => {
+                        self.reset_backoff(&key);
+                        (RECLAIM_SWEEP_AFTER, true)
+                    }
+                    (false, _) => (
                         self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                        false,
-                    )
+                        true,
+                    ),
                 }
-            };
+            }
+            Err(error) => {
+                warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
+                (
+                    self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
+                    false,
+                )
+            }
+        };
         // Removal walks whole keyspaces too, so it only rides a sweep that
         // reached the end of the queue, never the fast retries behind a backlog.
         if drained && let Err(error) = remove_drained_backends(&self.context).await {
@@ -888,7 +912,8 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn sweep_hidden_blobs(&self) {
-        let after = match process_hidden_sweep(&self.context).await {
+        let sweep = ProcessHiddenOperation::new(unix_timestamp_millis());
+        let after = match drive(sweep, &self.context).await {
             Ok(outcome) if outcome.cleanup_pending => HIDDEN_SWEEP_RETRY,
             Ok(_) => HIDDEN_SWEEP_AFTER,
             Err(error) => {

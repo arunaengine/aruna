@@ -226,9 +226,12 @@ pub async fn join_distributed(
             .collect::<ServerResult<_>>()?,
         sizes,
     };
-    let report = drive(join_member(&state.get_ctx(), (&auth, bearer), set_id, input), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let report = drive(
+        join_member(state.get_ctx().here(), (&auth, bearer), set_id, input),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok((StatusCode::CREATED, Json(admission_response(report))))
 }
 
@@ -267,9 +270,12 @@ pub async fn leave_distributed(
     Path((group_id, set_id, member_id)): Path<(Ulid, Ulid, Ulid)>,
 ) -> ServerResult<Json<ChangeResponse>> {
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
-    let revision = drive(leave_member(&state.get_ctx(), (&auth, bearer), set_id, member_id), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let revision = drive(
+        leave_member(state.get_ctx().here(), (&auth, bearer), set_id, member_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok(Json(change_response(set_id, revision)))
 }
 
@@ -328,9 +334,12 @@ pub async fn copy_distributed(
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
     let sizes = range_sizes(&state, relay.as_ref(), set_id).await?;
     let copy = (id(&request.range_id)?, id(&request.member_id)?, &sizes[..]);
-    let report = drive(add_copy(&state.get_ctx(), (&auth, bearer), set_id, copy), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let report = drive(
+        add_copy(state.get_ctx().here(), (&auth, bearer), set_id, copy),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok((StatusCode::ACCEPTED, Json(admission_response(report))))
 }
 
@@ -391,9 +400,12 @@ pub async fn split_distributed(
 ) -> ServerResult<Json<SplitResponse>> {
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
     let split = (id(&request.range_id)?, request.split_key, request.dry_run);
-    let (plan, revision) = drive(split_range(&state.get_ctx(), (&auth, bearer), set_id, split), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let (plan, revision) = drive(
+        split_range(state.get_ctx().here(), (&auth, bearer), set_id, split),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok(Json(SplitResponse {
         set_id: set_id.to_string(),
         revision: revision.map(|revision| revision.number),
@@ -463,9 +475,12 @@ pub async fn transfer_distributed(
         RoleName::Leave => TransferRole::Leave,
     };
     let plan = (id(&request.range_id)?, id(&request.to)?, role);
-    let revision = drive(transfer_range(&state.get_ctx(), (&auth, bearer), set_id, plan), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let revision = drive(
+        transfer_range(state.get_ctx().here(), (&auth, bearer), set_id, plan),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(change_response(set_id, revision)),
@@ -514,9 +529,12 @@ pub async fn settings_distributed(
 ) -> ServerResult<Json<ChangeResponse>> {
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
     let settings = settings_of(&request);
-    let revision = drive(change_settings(&state.get_ctx(), (&auth, bearer), set_id, settings), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let revision = drive(
+        change_settings(state.get_ctx().here(), (&auth, bearer), set_id, settings),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok(Json(change_response(set_id, revision)))
 }
 
@@ -557,9 +575,12 @@ pub async fn delete_distributed(
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<(StatusCode, Json<ChangeResponse>)> {
     let (auth, bearer) = admin(&state, auth, bearer, (group_id, set_id)).await?;
-    let revision = drive(delete_set(&state.get_ctx(), (&auth, bearer), set_id), &state.get_ctx())
-        .await
-        .map_err(map_create_error)?;
+    let revision = drive(
+        delete_set(state.get_ctx().here(), (&auth, bearer), set_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(change_response(set_id, revision)),

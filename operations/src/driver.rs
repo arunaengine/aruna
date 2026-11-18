@@ -9,8 +9,9 @@ use aruna_core::backoff::conflict_backoff;
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
-use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
+use aruna_core::heartbeat::{Heard, HeldHeartbeat, Here, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::node_facts::{NodeFacts, class_labels, permille_of};
 use aruna_core::operation::SubOperation;
 use aruna_core::operation::{AfterConflict, EffectOperation, HoldScope, Runnable};
 use aruna_core::structs::storage::routing::NodeRouting;
@@ -45,6 +46,37 @@ pub fn node_routing(context: &DriverContext) -> NodeRouting {
         .as_ref()
         .map(|handle| handle.routing())
         .unwrap_or_default()
+}
+
+/// What only this node's handles and host know, for a caller assembling node info.
+pub fn node_facts(context: &DriverContext) -> NodeFacts {
+    NodeFacts {
+        offers: (context.compute_handle.as_ref())
+            .map(|registry| registry.offers())
+            .unwrap_or_default(),
+        class_labels: (context.blob_handle.as_ref())
+            .map(|blob| class_labels(&blob.routing().catalog))
+            .unwrap_or_default(),
+        load_permille: read_load_permille(),
+        storage_capacity: node_routing(context).catalog.capacity(),
+        download_slots: (context.net_handle.as_ref()).map(|net| net.download_gauge().snapshot()),
+        serving: context.node_and_realm(),
+    }
+}
+
+/// 1-minute OS load average scaled to permille of logical core capacity, or
+/// `None` (with a warning) when the core count is unavailable.
+fn read_load_permille() -> Option<u32> {
+    match std::thread::available_parallelism() {
+        Ok(cores) => Some(permille_of(
+            sysinfo::System::load_average().one,
+            cores.get() as u64,
+        )),
+        Err(error) => {
+            warn!(%error, "failed to read logical core count for node info load");
+            None
+        }
+    }
 }
 
 /// Handles and capabilities one operation run may use. Only `storage_handle` is
@@ -89,6 +121,11 @@ impl DriverContext {
             .map_or(fallback, |net| *net.realm_id())
     }
 
+    /// This node; `None` on a node without a net transport.
+    pub fn node_id(&self) -> Option<aruna_core::NodeId> {
+        self.net_handle.as_ref().map(|net| net.node_id())
+    }
+
     /// This node and the realm it serves; `None` on a node without a net transport.
     pub fn node_and_realm(
         &self,
@@ -99,6 +136,19 @@ impl DriverContext {
         self.net_handle
             .as_ref()
             .map(|net| (net.node_id(), *net.realm_id()))
+    }
+
+    /// What repository and harvest operations need to know about this node.
+    pub fn node_scope(&self) -> aruna_core::repository::remote::NodeScope {
+        aruna_core::repository::remote::NodeScope {
+            node: self.node_and_realm(),
+            credential_key: self
+                .net_handle
+                .as_ref()
+                .map(|net| net.credential_encryption_key()),
+            has_blob: self.blob_handle.is_some(),
+            has_tasks: self.task_handle.is_some(),
+        }
     }
 
     /// This context with its storage effects on the bulk lane, so
@@ -125,6 +175,24 @@ impl DriverContext {
         (held.unwrap_or_default().into_iter())
             .map(|held| (held.node_id, held))
             .collect()
+    }
+
+    /// Who this node hears from now, from its heartbeats.
+    pub fn heard(&self) -> Heard {
+        let held = self.held_heartbeats();
+        Heard::of(
+            self.node_id(),
+            held.iter().map(|(node, held)| (*node, held)),
+        )
+    }
+
+    /// This node as distribution operations see it.
+    pub fn here(&self) -> Here {
+        Here {
+            ids: self.node_and_realm(),
+            capacity: node_routing(self).catalog.capacity(),
+            heard: self.heard(),
+        }
     }
 
     /// Fresh heartbeats held for each node; none without a net transport.
@@ -735,9 +803,11 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Compute(_)
         | Effect::Outbound(_)
         | Effect::SubOperation(_)
+        | Effect::Background(_)
         | Effect::Group(_)
         | Effect::Delay(_)
         | Effect::Job(_)
+        | Effect::Git(_)
         | Effect::Search()
         | Effect::Stream() => None,
     }
@@ -1199,8 +1269,15 @@ async fn take_hold(
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     match scope? {
         HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
-        HoldScope::DocumentWrite(document_id) => {
-            Some(context.graph_handle.as_ref()?.hold_document(document_id).await)
+        HoldScope::DocumentWrite(document_id) => Some(
+            context
+                .graph_handle
+                .as_ref()?
+                .hold_document(document_id)
+                .await,
+        ),
+        HoldScope::GitRepository(document_id) => {
+            Some(context.blob_handle.as_ref()?.git()?.lock(document_id).await)
         }
         scope => Some(local_hold(scope).lock_owned().await),
     }

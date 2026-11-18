@@ -4,23 +4,20 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult};
-use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::repository::remote::{
-    JobStop, RemoteAnswer, RemoteCall, RemoteFailure, RemoteRequest, StopReason,
+    JobStop, NodeScope, RemoteAnswer, RemoteCall, RemoteFailure, RemoteRequest, StopReason,
 };
 use aruna_core::repository::{ImportMode, LinkFailure, RepositoryCredential, descriptor};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec, JobId};
-use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
 use crate::harvest::read_connector::ConnectorView;
 
-use super::executor::{JobContext, ProgressReporter};
+use super::executor::ProgressReporter;
 
 pub mod check;
 pub mod connector;
@@ -35,39 +32,6 @@ mod submit;
 pub(crate) mod test_support;
 pub use invenio::query::RecordReference;
 
-/// What an operation needs to know about this node; the caller reads it before the run.
-#[derive(Clone, Debug, PartialEq)]
-pub struct NodeScope {
-    pub(crate) node: Option<(NodeId, RealmId)>,
-    pub(crate) credential_key: Option<CredentialEncryptionKey>,
-    pub(crate) has_blob: bool,
-    pub(crate) has_tasks: bool,
-}
-
-impl NodeScope {
-    pub fn of(context: &DriverContext) -> Self {
-        Self {
-            node: context.node_and_realm(),
-            credential_key: context
-                .net_handle
-                .as_ref()
-                .map(|net| net.credential_encryption_key()),
-            has_blob: context.blob_handle.is_some(),
-            has_tasks: context.task_handle.is_some(),
-        }
-    }
-
-    /// This node, or `fallback` on a node without a net transport.
-    pub(crate) fn node_or(&self, fallback: NodeId) -> NodeId {
-        self.node.map_or(fallback, |(node, _)| node)
-    }
-
-    /// The realm this node serves, or `fallback` on a node without a net transport.
-    pub(crate) fn realm_or(&self, fallback: RealmId) -> RealmId {
-        self.node.map_or(fallback, |(_, realm)| realm)
-    }
-}
-
 /// The running job an operation works for: its identity, stop signals and progress.
 #[derive(Clone)]
 pub struct JobScope {
@@ -76,18 +40,6 @@ pub struct JobScope {
     pub(crate) claim_token: Ulid,
     pub(crate) stop: JobStop,
     pub(crate) progress: ProgressReporter,
-}
-
-impl JobScope {
-    pub fn of(ctx: &JobContext) -> Self {
-        Self {
-            job_id: ctx.job_id,
-            owner_node: ctx.owner_node_id,
-            claim_token: ctx.claim_token,
-            stop: aruna_blob::remote::job_stop(ctx.cancel.clone(), ctx.shutdown.clone()),
-            progress: ctx.progress.clone(),
-        }
-    }
 }
 
 impl std::fmt::Debug for JobScope {
@@ -262,19 +214,18 @@ pub fn ensure_supported(
 
 /// Seals a user's token for the connector's endpoint, and for `link_id` when a link keeps it.
 pub fn seal_token(
-    context: &DriverContext,
+    scope: &NodeScope,
     user: aruna_core::UserId,
     view: &ConnectorView,
     link_id: Option<Ulid>,
     token: &str,
 ) -> Result<RepositoryCredential, TransferError> {
-    let key = context
-        .net_handle
+    let key = scope
+        .credential_key
         .as_ref()
-        .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?
-        .credential_encryption_key();
+        .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?;
     Ok(RepositoryCredential::seal_link(
-        &key,
+        key,
         user,
         view.connector.group_id,
         view.connector.connector_id,

@@ -5,7 +5,7 @@
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
 
 use crate::driver::DriverContext;
 use crate::tasks::task_persistence::persist_task_effect;
@@ -26,7 +26,7 @@ pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -
     } else {
         Event::Task(TaskEvent::Error {
             key: None,
-            message: "task handle unavailable".to_string(),
+            message: NO_TASK_HANDLE.to_string(),
         })
     }
 }

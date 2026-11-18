@@ -7,11 +7,13 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use tracing::warn;
+use ulid::Ulid;
 
 use super::admin::{AdminFollowUp, AdminOperationPlan, ConfigRunPlan};
 use super::create::PendingCreateApply;
 use super::distribution::{DistributionPlan, Handled, RetryParkedPlan};
 use super::events::{ApplyEventPlan, ApplyOutcome, family_target};
+use super::reconcile::net_answer;
 use super::validate::{ConfigSnapshot, ValidateAdminPlan};
 use super::{ApplyError, plan_call};
 use crate::admin_checks::coalescible_config_op;
@@ -19,7 +21,10 @@ use crate::admin_documents::{AdminDocumentEvent, AdminDocumentTarget};
 use crate::calls::{IoCall, IoResult, Next};
 use crate::config_authority::AdminEventValidation;
 use crate::deferred_topics::{DocumentSyncDependency, satisfied_dependencies};
-use crate::document::{BatchEvent, DocumentEvent, DocumentTarget};
+use crate::document::{
+    BatchEvent, DocumentEffect, DocumentEvent, DocumentNetEvent, DocumentTarget,
+};
+use crate::effects::{Effect, NetEffect};
 use crate::metadata::GraphLifecycleRecord;
 use crate::operation::Operation;
 use crate::structs::identity::realm::RealmId;
@@ -83,6 +88,8 @@ enum Wait {
     FlushedLast,
     Checked(Box<AdminItem>),
     Applied,
+    /// The stored Git record of an applied event is being counted.
+    GitNoted,
     AdminApplied(Box<AdminItem>),
     Synced(Option<RealmId>, Box<AdminItem>),
     Parked(Box<AdminItem>),
@@ -339,20 +346,19 @@ impl ApplyBatchOperation {
         }
     }
 
-    fn on_event(&mut self, outcome: ApplyOutcome) {
+    /// Folds one event outcome in; a stored Git record names its document.
+    fn on_event(&mut self, outcome: ApplyOutcome) -> Option<Ulid> {
         match outcome {
             ApplyOutcome::Applied {
                 target,
                 tombstone,
                 git_document,
             } => {
-                if let Some(document_id) = git_document {
-                    crate::git::record_written(document_id);
-                }
                 self.outcome
                     .graph_tombstones
                     .extend(tombstone.map(|record| *record));
                 self.outcome.applied_targets.push(target);
+                return git_document;
             }
             ApplyOutcome::Deferred(dependency) => {
                 warn!(topic_id = %self.topic_id, ?dependency, "Deferring a document until its dependency replicates");
@@ -368,6 +374,13 @@ impl ApplyBatchOperation {
             }
             ApplyOutcome::Skipped => {}
         }
+        None
+    }
+
+    fn note_git_record(&mut self, document_id: Ulid) -> BatchNext {
+        let effect = DocumentEffect::NoteGitRecord { document_id };
+        let effect = Effect::Net(NetEffect::DocumentSync(effect));
+        self.call(Wait::GitNoted, IoCall::Effect(Box::new(effect)))
     }
 
     fn start_retry(&mut self) -> BatchNext {
@@ -498,9 +511,17 @@ impl Operation for ApplyBatchOperation {
             }
             Wait::Applied => {
                 let outcome = result.child::<ApplyOutcome, ApplyError>()??;
-                self.on_event(outcome);
-                self.advance()
+                match self.on_event(outcome) {
+                    Some(document_id) => self.note_git_record(document_id),
+                    None => self.advance(),
+                }
             }
+            Wait::GitNoted => match net_answer(result, "DocumentNetEvent::GitRecordNoted")? {
+                DocumentNetEvent::GitRecordNoted => self.advance(),
+                other => Err(ApplyError::Failed(format!(
+                    "unexpected git record answer: {other:?}"
+                ))),
+            },
             Wait::AdminApplied(item) => {
                 let follow = result.child::<AdminFollowUp, ApplyError>()??;
                 self.follow_up(follow, *item)

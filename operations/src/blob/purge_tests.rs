@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
-use crate::driver::{drive, node_routing};
+use crate::blob::migration::misplaced::AnyKey;
+use crate::driver::{DriverContext, drive, node_routing};
 use crate::s3::bucket::rename::tests::{BUCKET, group, put, realm, rule, setup};
 use crate::tests::records::node;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
@@ -244,12 +245,18 @@ async fn plans_until_ended() {
         1,
         None,
     );
-    crate::jobs::store::query::insert_job(&context, &record)
+    crate::jobs::store::test_calls::insert_job(&context, &record)
         .await
         .unwrap();
-    crate::blob::cleanup::process_cleanup_batch(&context)
-        .await
-        .unwrap();
+    crate::driver::drive(
+        crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
+            routing: crate::driver::node_routing(&context),
+            has_blob: (&context).blob_handle.is_some(),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(works().await.len(), 1);
     let claim = aruna_core::structs::storage::backend_import::claim_key(&versioned, "p1").unwrap();
     let claimed = |context: &DriverContext| {
@@ -280,9 +287,15 @@ async fn plans_until_ended() {
         txn_id: None,
     };
     context.storage_handle.send_storage_effect(delete).await;
-    crate::blob::cleanup::process_cleanup_batch(&context)
-        .await
-        .unwrap();
+    crate::driver::drive(
+        crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
+            routing: crate::driver::node_routing(&context),
+            has_blob: (&context).blob_handle.is_some(),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
     // The release ran once the job was gone; the version still reads the file, so it stays
     // and its claim went again.
     assert!(works().await.is_empty());
@@ -373,7 +386,9 @@ async fn bounds_scope_totals() {
         let head_key = BlobHeadKey::new(BUCKET, key).to_bytes().unwrap();
         put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
     }
-    let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
+    let routing = node_routing(&context);
+    let totals = ScopeTotalsOperation::new(routing, &scope(), AnyKey);
+    let totals = drive(totals, &context).await.unwrap();
     assert_eq!((totals.versions, totals.complete), (TOTAL_VERSIONS, false));
 }
 
@@ -436,7 +451,9 @@ async fn bounds_long_histories() {
     let head = CurrentVersionPointer::new(last).to_bytes().unwrap();
     let head_key = BlobHeadKey::new(BUCKET, "gone/big").to_bytes().unwrap();
     put(&context, BLOB_HEAD_KEYSPACE, head_key, head).await;
-    let totals = scope_totals(&context, &scope(), &|_| true).await.unwrap();
+    let routing = node_routing(&context);
+    let totals = ScopeTotalsOperation::new(routing, &scope(), AnyKey);
+    let totals = drive(totals, &context).await.unwrap();
     assert!(!totals.complete);
 }
 

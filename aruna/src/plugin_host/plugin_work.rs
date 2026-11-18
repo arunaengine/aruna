@@ -18,18 +18,19 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use futures_util::future::BoxFuture;
 
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, PayloadHandler};
-use aruna_operations::jobs::key_wake::version_wait;
+use aruna_operations::driver::{DriverContext, drive, node_routing};
+use aruna_operations::jobs::executor::JobRunOutcome;
+use aruna_operations::jobs::key_locks::VersionWaitOperation;
 use aruna_operations::plugins::check::CopyGrants;
 use aruna_operations::plugins::objects::{LocalObject, Unmarked};
 use aruna_operations::plugins::transfer_steps::account;
 use aruna_operations::plugins::work::holds_job;
 use aruna_operations::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
+use aruna_operations::tasks::job_context::{JobContext, PayloadHandler};
 
 use super::transfers::{Download, Upload, download_work, upload_work};
 use aruna_operations::s3::object::copy::{
-    CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_at,
+    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
@@ -187,7 +188,12 @@ async fn copy_work(
     };
     let pulled = Arc::new(AtomicU64::new(0));
     // The version was minted once, so a retry after a lost answer replays it.
-    let copy = copy_object_at(&ctx.driver, input, *version_id, Some(pulled.clone()));
+    let copy = drive(
+        CopyObjectOperation::new(input, node_routing(&ctx.driver))
+            .at_version(*version_id)
+            .with_progress(pulled.clone()),
+        &ctx.driver,
+    );
     tokio::pin!(copy);
     let mut tick = tokio::time::interval(PROGRESS_TICK);
     let result = loop {
@@ -239,10 +245,10 @@ pub(super) async fn key_wait(
     };
     let version = VersionKey::new(bucket, key, version_id);
     let place = (ctx.owner_node_id, install.group_id);
-    match version_wait(&ctx.driver, place, &version).await {
+    match drive(VersionWaitOperation::new(place, version), &ctx.driver).await {
         Ok(Some(wait)) => JobRunOutcome::AwaitingKey(vec![wait]),
         Ok(None) => deferred("the source bucket was unlocked meanwhile".into()),
-        Err(error) => deferred(error),
+        Err(error) => deferred(error.0),
     }
 }
 

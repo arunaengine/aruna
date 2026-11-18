@@ -14,7 +14,7 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
-use aruna_operations::metadata::forward::read::route_profile_status as run_profile_validation_status;
+use aruna_operations::metadata::forward::routed_status::RoutedStatusOperation;
 use aruna_operations::metadata::profile::validation::{
     ProfileAssessOperation, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
 };
@@ -285,12 +285,17 @@ pub async fn get_validation_status(
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationResponse>)> {
     let document_id = parse_document_id(&document_id)?;
-    let status = run_profile_validation_status(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        GetVisibleRequest { document_id, auth },
-        forwarded_auth_token(bearer_token)?,
-        false,
+    let status = drive(
+        RoutedStatusOperation::new(
+            (
+                state.get_ctx().net_handle.as_ref().map(|net| net.node_id()),
+                state.get_realm_id(),
+            ),
+            GetVisibleRequest { document_id, auth },
+            forwarded_auth_token(bearer_token)?,
+            false,
+        ),
+        state.get_ctx().as_ref(),
     )
     .await
     .map_err(map_api_error)?;
@@ -340,15 +345,20 @@ pub async fn revalidate_profile(
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationResponse>)> {
     let document_id = parse_document_id(&document_id)?;
-    let status = run_profile_validation_status(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        GetVisibleRequest {
-            document_id,
-            auth: Some(auth),
-        },
-        forwarded_auth_token(bearer_token)?,
-        true,
+    let status = drive(
+        RoutedStatusOperation::new(
+            (
+                state.get_ctx().net_handle.as_ref().map(|net| net.node_id()),
+                state.get_realm_id(),
+            ),
+            GetVisibleRequest {
+                document_id,
+                auth: Some(auth),
+            },
+            forwarded_auth_token(bearer_token)?,
+            true,
+        ),
+        state.get_ctx().as_ref(),
     )
     .await
     .map_err(map_api_error)?;

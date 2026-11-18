@@ -38,15 +38,14 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::document_repository::{config_of, realm_config};
-use aruna_core::structs::identity::realm::NodeRealm;
 use crate::forward::transport::{peer_call_within, timed_answer};
-use crate::driver::DriverContext;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
 use crate::metadata::transport_message_kind;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
+use aruna_core::structs::identity::realm::NodeRealm;
 
 /// Attempts in which every answering peer served a copy the marker does not
 /// cover before the marker is treated as wrong. The realm agreeing against a
@@ -308,21 +307,24 @@ pub struct FetchDocumentsOperation {
 type Fetching = Result<Next<bool>, IoError>;
 
 /// The fetch of a device that holds its realm configuration.
-pub fn fetch_realm_documents(context: &DriverContext, budget: Duration) -> FetchDocumentsOperation {
-    FetchDocumentsOperation::new(context.node_and_realm(), FetchSource::Stored, budget)
+pub fn fetch_realm_documents(
+    ids: Option<(NodeId, RealmId)>,
+    budget: Duration,
+) -> FetchDocumentsOperation {
+    FetchDocumentsOperation::new(ids, FetchSource::Stored, budget)
 }
 
 /// The same fetch for a device that holds no realm configuration yet: owner and peers are
 /// supplied instead of read from a stored copy. This is the onboarding path, where the realm
 /// documents are what the device is missing.
 pub fn fetch_from_peers(
-    context: &DriverContext,
+    ids: Option<(NodeId, RealmId)>,
     owner: UserId,
     peers: Vec<NodeId>,
     budget: Duration,
 ) -> FetchDocumentsOperation {
     let source = FetchSource::Peers { owner, peers };
-    FetchDocumentsOperation::new(context.node_and_realm(), source, budget)
+    FetchDocumentsOperation::new(ids, source, budget)
 }
 
 impl FetchDocumentsOperation {
@@ -995,9 +997,7 @@ impl Operation for InstalledGroupsOperation {
                 })
             })
             .collect();
-        Ok(Next::Call(
-            outside_call(IoCall::Read(reads)),
-        ))
+        Ok(Next::Call(outside_call(IoCall::Read(reads))))
     }
 }
 
@@ -1187,9 +1187,7 @@ impl Operation for InstalledDisplaysOperation {
             realm_row(NODE_NAME_KEYSPACE, self.realm_id),
             realm_row(NODE_PLACE_KEYSPACE, self.realm_id),
         ];
-        Ok(Next::Call(
-            outside_call(IoCall::Read(reads)),
-        ))
+        Ok(Next::Call(outside_call(IoCall::Read(reads))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<NodeDisplays>, IoError> {

@@ -6,6 +6,7 @@
 #![recursion_limit = "256"]
 
 pub mod arc;
+pub mod archive;
 mod autoindex;
 pub mod bao_tree;
 pub mod blob;
@@ -23,6 +24,7 @@ pub mod native;
 pub mod opendal;
 pub mod pace;
 mod part_chain;
+pub mod receive_hook;
 pub mod remote;
 pub mod repo;
 pub mod rocrate;

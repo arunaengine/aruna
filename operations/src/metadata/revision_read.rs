@@ -367,13 +367,13 @@ mod call_tests {
     fn display_marks_projection() {
         let exact = displayed(
             Some(status(4, MaterializationState::Materialized)),
-            revision(4),
+            raw_revision(4),
         );
         assert_eq!(exact.projection_state, MaterializationState::Materialized);
         assert_eq!(exact.projected_event_id, Some(Ulid::from_bytes([4; 16])));
         let behind = displayed(
             Some(status(3, MaterializationState::Materialized)),
-            revision(4),
+            raw_revision(4),
         );
         assert_eq!(behind.projected_event_id, None);
         let missing = displayed(None, raw_revision(4));

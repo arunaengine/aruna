@@ -15,7 +15,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::error::token_grant;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::s3::bucket::linked::{
     BucketJob, BucketJobOperation, LinkedAction, LinkedError, RenameTotalOperation,
     ShownJobOperation,
@@ -539,15 +539,22 @@ pub async fn preview_duplicates(
         Some((key, shown)) => (key.to_string(), shown.parse().ok()),
         None => (after, None),
     });
-    let filter = page.filter.as_deref();
-    let found = unify::preview_page(
-        &state.get_ctx(),
-        (&rule.bucket, ""),
-        &access,
-        (filter, after, limit),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?;
+    let query = unify::PreviewQuery {
+        prefix: String::new(),
+        filter: page.filter.clone(),
+        after,
+        limit,
+    };
+    let context = state.get_ctx();
+    let preview = unify::PreviewPageOperation::new(
+        node_routing(&context),
+        &rule.bucket,
+        Arc::new(access),
+        query,
+    );
+    let found = drive(preview, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let file = |location: aruna_core::structs::storage::blob::BackendLocation| StoredFile {
         path: location.backend_path,
         bytes: location.blob_size,
@@ -610,14 +617,20 @@ pub async fn start_duplicates(
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<OrganizeJob>)> {
     let (rule, auth, access) = caller(&state, auth, (&group_id, &import_id)).await?;
-    let found = unify::preview_page(
-        &state.get_ctx(),
-        (&rule.bucket, ""),
-        &access,
-        (None, None, 1),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))?;
+    let query = unify::PreviewQuery {
+        limit: 1,
+        ..unify::PreviewQuery::default()
+    };
+    let context = state.get_ctx();
+    let preview = unify::PreviewPageOperation::new(
+        node_routing(&context),
+        &rule.bucket,
+        Arc::new(access),
+        query,
+    );
+    let found = drive(preview, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let task = LinkedTask::Unify {
         prefix: String::new(),
     };

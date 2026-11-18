@@ -32,7 +32,7 @@ use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::s3::object::read::get_object_routed;
+use aruna_operations::s3::object::read::GetRoutedOperation;
 use aruna_operations::staging::bucket_guard::BucketGuardOperation;
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use bytes::Bytes;
@@ -928,19 +928,22 @@ pub(crate) async fn read_text(
                 .ok_or_else(|| bad_request("offset and max_bytes overflow"))?,
         })
     };
-    let mut result = get_object_routed(
+    let mut result = drive(
+        GetRoutedOperation::new(
+            GetObjectInput {
+                bucket: input.bucket.clone(),
+                key: input.key.clone(),
+                version_id: None,
+                range,
+                group_id: bucket_info.group_id,
+                user_identity: auth.user_id,
+                realm_id: auth.realm_id,
+                node_id: server.state.get_node_id(),
+            },
+            auth.path_restrictions.clone(),
+            None,
+        ),
         &server.state.get_ctx(),
-        GetObjectInput {
-            bucket: input.bucket.clone(),
-            key: input.key.clone(),
-            version_id: None,
-            range,
-            group_id: bucket_info.group_id,
-            user_identity: auth.user_id,
-            realm_id: auth.realm_id,
-            node_id: server.state.get_node_id(),
-        },
-        auth.path_restrictions.clone(),
     )
     .await
     .map_err(map_get_error)?;

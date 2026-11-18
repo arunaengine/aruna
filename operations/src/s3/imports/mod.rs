@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn unstarted_rule_no_run() {
+    fn unstarted_rule_skipped() {
         let mut operation = LastRunOperation::new(&import_rule());
         assert_eq!(operation.first(), Ok(Next::Done(None)));
     }

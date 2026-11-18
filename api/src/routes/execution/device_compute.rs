@@ -290,8 +290,9 @@ async fn publish_device_run(
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let node_id = NodeId::from_str(&request.node_id)
         .map_err(|_| ServerError::BadRequestReason("node_id is not a node id".to_string()))?;
-    let published = publish_run(
-        &state.get_ctx(),
+    let context = state.get_ctx();
+    let publish = publish_run(
+        context.node_and_realm(),
         PublishRunInput {
             job_id,
             owner: auth.user_id,
@@ -302,9 +303,8 @@ async fn publish_device_run(
                 prefix: request.prefix,
             },
         },
-    )
-    .await
-    .map_err(map_publish_error)?;
+    );
+    let published = drive(publish, &context).await.map_err(map_publish_error)?;
     Ok(Json(published.into()))
 }
 
@@ -345,7 +345,7 @@ async fn get_local_crate(
     Path(job_id): Path<String>,
 ) -> ServerResult<Json<serde_json::Value>> {
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
-    let jsonld = local_run_crate(&state.get_ctx(), job_id, auth.user_id)
+    let jsonld = drive(local_run_crate(job_id, auth.user_id), &state.get_ctx())
         .await
         .map_err(map_publish_error)?;
     Ok(Json(jsonld))

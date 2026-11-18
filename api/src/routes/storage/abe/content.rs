@@ -10,7 +10,7 @@ use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;
 use crate::routes::storage::relay::relay_stream;
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use aruna_operations::s3::object::read::read_object;
+use aruna_operations::s3::object::read::ReadObjectOperation;
 use axum::response::Response;
 use http::{HeaderMap, header};
 
@@ -111,7 +111,8 @@ pub async fn content(
     let result = match private {
         Some(private) => {
             let limits = state.rocrate_limits();
-            read_object(&state.get_ctx(), input, restrictions, private, limits).await
+            let read = ReadObjectOperation::new(input, restrictions, private, limits);
+            drive(read, &state.get_ctx()).await
         }
         None => {
             let operation = GetObjectOperation::new(input).with_restrictions(restrictions);

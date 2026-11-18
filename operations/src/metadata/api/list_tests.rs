@@ -31,7 +31,7 @@ fn record(group_id: GroupId, document: u64) -> MetadataRegistryRecord {
         created_at_ms: 1,
         updated_at_ms: document,
         establishing_event_id: Ulid::from_parts(4, 4),
-        last_event_id: Ulid::from_parts(5, document),
+        last_event_id: Ulid::from_parts(5, u128::from(document)),
     }
 }
 
@@ -189,7 +189,7 @@ fn listing_skips_pending() {
         display_name: "listed".to_string(),
         group_id: group(),
         realm_id: realm(),
-        roles: Vec::new(),
+        roles: Default::default(),
         owner: UserId::nil(realm()),
     }];
     let turn = listing.next(child(Ok::<_, ListGroupError>(groups)));

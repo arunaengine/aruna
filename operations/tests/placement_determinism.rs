@@ -22,10 +22,10 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::{DocumentEffect, DocumentNetEvent, StructuredId};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
+use aruna_operations::driver::node_facts;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::node::info::facts::NodeFacts;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
@@ -137,7 +137,7 @@ async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
         s3: Some("https://s3.node-a.example.test".to_string()),
     };
 
-    let facts = NodeFacts::gather(publisher.context.as_ref());
+    let facts = node_facts(publisher.context.as_ref());
     let seed = SeedInfoOperation::new(realm_id, publisher_id, urls.clone(), facts, false);
     drive(seed, publisher.context.as_ref())
         .await

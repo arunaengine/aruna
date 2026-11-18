@@ -28,8 +28,8 @@ fn record(document: u64, path: &str) -> MetadataRegistryRecord {
         holder_node_ids: Vec::new(),
         created_at_ms: 1,
         updated_at_ms: 1,
-        establishing_event_id: Ulid::from_parts(4, document),
-        last_event_id: Ulid::from_parts(5, document),
+        establishing_event_id: Ulid::from_parts(4, u128::from(document)),
+        last_event_id: Ulid::from_parts(5, u128::from(document)),
     }
 }
 

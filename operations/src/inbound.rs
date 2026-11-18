@@ -6,13 +6,13 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::driver::{DriverContext, drive, drive_retry_until};
+use crate::driver::{DriverContext, drive, drive_retry_until, node_routing};
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::records::pages::ServePageOperation;
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
-use crate::metadata::after_sync::{AfterSyncOperation, run_maintenance};
+use crate::metadata::after_sync::AfterSyncOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
@@ -21,17 +21,25 @@ use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::PlacementReconcileOutcome;
 use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::plugins::peer::AnswerPeer;
-use crate::replication::catch_up::wake_bootstrap;
+use crate::replication::catch_up::WakeBootstrapOperation;
+use crate::replication::incoming::stream::{
+    BaoAdmission, BaoAdmissionOperation, BaoPeerStream, ServeBaoOperation,
+};
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
+use crate::staging::native_source::PrepareReferenceOperation;
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
 use crate::triggers::{PeerInput, peer_operation};
+use aruna_blob::blob::{InboundError, refuse_stream};
+use aruna_blob::native;
 use aruna_core::alpn::Alpn;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
+use aruna_core::native_reference::{NativeAuthority, NativeReferenceResponse};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::task::TaskKey;
@@ -217,7 +225,7 @@ async fn peer_request(
                 .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
         }
         MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-            let node = crate::jobs::lifecycle::target::launch_node(context, &launch);
+            let node = crate::tasks::job_node::launch_node(context, &launch);
             let serve = ServeLaunchOperation::new(peer, *launch, node);
             Ok(Box::pin(drive(serve, context.as_ref()))
                 .await
@@ -228,7 +236,7 @@ async fn peer_request(
             submission_id,
             request,
         } => {
-            let node = crate::jobs::lifecycle::ingress::ingress_node(context);
+            let node = crate::tasks::job_node::ingress_node(context);
             let admit = crate::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
                 peer,
                 auth_token,
@@ -243,7 +251,7 @@ async fn peer_request(
             auth_token,
             request,
         } => {
-            let result = match crate::jobs::lifecycle::ingress::ingress_node(context) {
+            let result = match crate::tasks::job_node::ingress_node(context) {
                 Some(node) => {
                     let serve = crate::jobs::lifecycle::serve_inputs::ServeInputsOperation::new(
                         peer, auth_token, &node, *request,
@@ -452,7 +460,7 @@ async fn reconcile_inbound_topics(
         warn!(%error, "Mail settings refresh stopped after a document sync");
     }
     // An installed record may name a member this node bootstraps.
-    wake_bootstrap(context).await;
+    drive(WakeBootstrapOperation::default(), context).await.ok();
     let refresh = RefreshInterestOperation::new(&targets.targets, *net_handle.realm_id());
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Watch interest refresh stopped after a document sync");
@@ -569,6 +577,104 @@ fn install_inbound_handler(
     Some(inbound_handler)
 }
 
+const INBOUND_BAO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded admission read: a slow store read must not hold the stream open.
+async fn bao_admission(
+    context: &DriverContext,
+    realm_id: RealmId,
+    local: NodeId,
+    peer: NodeId,
+) -> Option<BaoAdmission> {
+    let admission = BaoAdmissionOperation::new(realm_id, local, peer);
+    tokio::time::timeout(INBOUND_BAO_TIMEOUT, drive(admission, context))
+        .await
+        .ok()?
+        .ok()
+        .flatten()
+}
+
+/// The bao plane input: admits the peer, registers the stream, reads its first frame within
+/// bounds and hands the frame to its operation.
+async fn handle_bao_stream(
+    context: &DriverContext,
+    rocrate_limits: &RoCrateLimits,
+    stream: BiStream,
+    node_id: NodeId,
+) {
+    let Some(blob_handle) = context.blob_handle.clone() else {
+        error!("Cannot handle incoming bao stream without blob handle");
+        return;
+    };
+    let Some(net_handle) = context.net_handle.clone() else {
+        error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
+        return;
+    };
+    let realm_id = *net_handle.realm_id();
+    let local_node = net_handle.node_id();
+    // Only an authenticated sync-eligible realm peer may open the blob replication plane.
+    if bao_admission(context, realm_id, local_node, node_id)
+        .await
+        .is_none()
+    {
+        warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
+        refuse_stream(stream);
+        return;
+    }
+    let stream_id = match blob_handle
+        .accept_stream(node_id, stream, INBOUND_BAO_TIMEOUT)
+        .await
+    {
+        Ok(stream_id) => stream_id,
+        Err(InboundError::TimedOut) => {
+            warn!(peer = %node_id, "Timed out registering inbound bao stream");
+            return;
+        }
+        Err(err) => {
+            error!(peer = %node_id, error = ?err, "Failed to register inbound bao stream");
+            return;
+        }
+    };
+    let Some(admission) = bao_admission(context, realm_id, local_node, node_id).await else {
+        warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
+        blob_handle.close_stream(stream_id).await;
+        return;
+    };
+    let payload = match blob_handle
+        .first_frame(stream_id, INBOUND_BAO_TIMEOUT)
+        .await
+    {
+        Ok(payload) => payload,
+        Err(InboundError::TimedOut) => {
+            warn!(peer = %node_id, stream_id = %stream_id, "Timed out reading inbound bao control message");
+            blob_handle.close_stream(stream_id).await;
+            return;
+        }
+        Err(InboundError::Blob(err)) => {
+            error!(error = ?err, "Failed to read initial inbound bao payload");
+            blob_handle.close_stream(stream_id).await;
+            return;
+        }
+        Err(InboundError::Unexpected(event)) => {
+            error!(event, "Unexpected first event for inbound bao stream");
+            blob_handle.close_stream(stream_id).await;
+            return;
+        }
+    };
+    let peer_stream = BaoPeerStream {
+        realm_id,
+        local_node,
+        peer: node_id,
+        stream_id,
+    };
+    let routing = node_routing(context);
+    let serve = ServeBaoOperation::new(peer_stream, admission, payload, routing, rocrate_limits);
+    if let Err(error) = drive(serve, context).await {
+        error!(peer = %node_id, stream_id = %stream_id, error = ?error, "Failed to answer inbound bao stream");
+        blob_handle.close_stream(stream_id).await;
+    }
+}
+
 #[async_trait]
 impl InboundEventHandler for OperationsInboundHandler {
     #[tracing::instrument(
@@ -586,7 +692,7 @@ impl InboundEventHandler for OperationsInboundHandler {
             // protocol branch is boxed to keep only the active one on the stack.
             match alpn {
                 Alpn::Bao => {
-                    Box::pin(crate::replication::incoming::stream::handle_bao_stream(
+                    Box::pin(handle_bao_stream(
                         self.context.as_ref(),
                         &self.rocrate_limits,
                         stream,
@@ -601,7 +707,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     Box::pin(self.handle_metadata_stream(stream, node_id)).await;
                 }
                 Alpn::NativeReference => {
-                    Box::pin(crate::sync::native_serve::handle_native_stream(
+                    Box::pin(answer_native_stream(
                         self.context.as_ref(),
                         stream,
                         node_id,
@@ -699,6 +805,30 @@ fn schedule_sync_maintenance(
             run_maintenance(&context, "periodic", cycle).await;
         }
     });
+}
+
+/// Answers one native reference stream with what its request prepared.
+async fn answer_native_stream(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
+    let Some(request) = native::read_request(&mut stream, peer).await else {
+        return;
+    };
+    let relationship = matches!(request.authority, NativeAuthority::Relationship(_));
+    let prepare = PrepareReferenceOperation::new(context.node_and_realm(), peer, request);
+    let (response, body) = match drive(prepare, context).await {
+        Ok(prepared) => {
+            // Only a caller read names the group; a sync relationship knows its own bucket.
+            let response = match prepared.group_id.filter(|_| !relationship) {
+                None => NativeReferenceResponse::Content(prepared.metadata),
+                Some(group_id) => NativeReferenceResponse::Described {
+                    metadata: prepared.metadata,
+                    group_id,
+                },
+            };
+            (response, prepared.body)
+        }
+        Err(reject) => (NativeReferenceResponse::Rejected(reject), None),
+    };
+    native::write_answer(stream, peer, &response, body).await;
 }
 
 /// Serves one inbound notification stream: reads a request frame, runs the operation the trigger
@@ -848,6 +978,34 @@ async fn serve_shard_stream(
         warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
     }
     close_shard_stream(&mut stream).await;
+}
+
+
+/// Reconciles the metadata store with document sync and prunes deleted graphs.
+async fn run_maintenance(context: &DriverContext, source: &'static str, attempt: usize) {
+    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+        return;
+    };
+    if let Err(error) = metadata_handle.reconcile_document_sync(context).await {
+        warn!(
+            source,
+            attempt,
+            error = ?error,
+            "Metadata document sync reconciliation failed"
+        );
+    }
+    match metadata_handle.prune_deleted_graphs(context).await {
+        Ok(pruned) if pruned > 0 => {
+            debug!(source, attempt, pruned, "Metadata graph prune completed")
+        }
+        Ok(_) => {}
+        Err(error) => warn!(
+            source,
+            attempt,
+            error = ?error,
+            "Metadata graph prune failed"
+        ),
+    }
 }
 
 #[cfg(test)]

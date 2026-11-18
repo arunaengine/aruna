@@ -5,10 +5,10 @@
 use super::create::{CreateBackendError, CreateBackendInput};
 use super::validation::{check_identity, check_import_root, validate_backend_input};
 use super::{backend_key, record_writes};
-use crate::storage_read::StorageReadError;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::errors::StorageReadError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};

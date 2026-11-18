@@ -438,6 +438,7 @@ async fn publish_usage_snapshots(
     realm_id: RealmId,
     full: bool,
 ) -> Result<PublishedUsage, UsagePublishError> {
-    let publish = PublishUsageOperation::new(context, (node_id, realm_id), full, false);
+    let serving = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let publish = PublishUsageOperation::new((node_id, realm_id), serving, full, false);
     drive(publish, context).await
 }

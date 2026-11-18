@@ -12,8 +12,8 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::blob::migration::misplaced::count_misplaced;
-use aruna_operations::driver::drive;
+use aruna_operations::blob::migration::misplaced::CountMisplacedOperation;
+use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
 use aruna_operations::s3::bucket::storage_move::{StartMoveError, StartMoveOperation};
 use axum::Json;
@@ -126,7 +126,9 @@ pub async fn get_bucket_move(
     let group_id = bucket_info(&state, &bucket).await?.group_id;
     let path = bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), &bucket);
     crate::auth::ensure_permission(&state, &auth, path, Permission::READ).await?;
-    let counted = count_misplaced(&state.get_ctx(), &bucket, &query.prefix, None)
+    let context = state.get_ctx();
+    let count = CountMisplacedOperation::new(node_routing(&context), &bucket, &query.prefix);
+    let counted = drive(count, &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let status = drive(
