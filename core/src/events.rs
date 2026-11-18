@@ -1045,6 +1045,7 @@ impl Event {
                     LocalNode,
                     WatchHolders,
                     Heartbeat,
+                    HeartbeatSilence,
                     Recorded,
                 }
             ),

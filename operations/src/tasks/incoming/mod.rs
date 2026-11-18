@@ -109,8 +109,8 @@ async fn replay_event_log(
     }
 }
 use crate::metadata::prune_queue::{
-    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation, PruneTimerOperation,
-    TombstonesOperation, jobs_queued,
+    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation,
+    PruneTimerOperation as GraphPruneTimerOperation, TombstonesOperation, jobs_queued,
 };
 
 /// Arms the graph prune drain for its next due job at start.
@@ -118,7 +118,7 @@ async fn restore_graph_prune(
     context: &crate::driver::DriverContext,
     task_handle: &aruna_tasks::TaskHandle,
 ) {
-    match crate::driver::drive(PruneTimerOperation::new(), context).await {
+    match crate::driver::drive(GraphPruneTimerOperation::new(), context).await {
         Ok(None) => {}
         Ok(Some(after)) => {
             let wake =

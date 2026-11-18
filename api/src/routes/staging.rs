@@ -52,7 +52,7 @@ use aruna_operations::staging::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
 };
 use aruna_operations::staging::snapshot::{
-    MaterializeSnapshotError, MaterializeSnapshotInput, MaterializeSnapshotOperation,
+    MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
 };
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;

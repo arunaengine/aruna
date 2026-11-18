@@ -63,6 +63,24 @@ struct OperationsInboundHandler {
 }
 
 impl OperationsInboundHandler {
+    /// Answers one job-control request and signals the attempts a cancel reached.
+    async fn answer_job_stream(&self, mut stream: BiStream, peer: NodeId) {
+        let Some(request) = read_request(&mut stream, peer).await else {
+            return;
+        };
+        let context = self.context.as_ref();
+        let serving = context.node_and_realm();
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let serve = JobRequestOperation::new(peer, request, serving, now_ms);
+        let answer = drive(serve, context)
+            .await
+            .unwrap_or_else(JobAnswer::unavailable);
+        for job_id in answer.running {
+            self.jobs_runtime.request_cancel(job_id);
+        }
+        write_answer(stream, peer, &answer.response, answer.body).await;
+    }
+
     fn new(
         context: Arc<DriverContext>,
         rocrate_limits: RoCrateLimits,
@@ -612,24 +630,6 @@ impl InboundEventHandler for OperationsInboundHandler {
         }
         .instrument(span)
         .await;
-    }
-
-    /// Answers one job-control request and signals the attempts a cancel reached.
-    async fn answer_job_stream(&self, mut stream: BiStream, peer: NodeId) {
-        let Some(request) = read_request(&mut stream, peer).await else {
-            return;
-        };
-        let context = self.context.as_ref();
-        let serving = context.node_and_realm();
-        let now_ms = aruna_core::time::unix_timestamp_millis();
-        let serve = JobRequestOperation::new(peer, request, serving, now_ms);
-        let answer = drive(serve, context)
-            .await
-            .unwrap_or_else(JobAnswer::unavailable);
-        for job_id in answer.running {
-            self.jobs_runtime.request_cancel(job_id);
-        }
-        write_answer(stream, peer, &answer.response, answer.body).await;
     }
 
     async fn handle_evicted_documents(&self, documents: Vec<DocumentEvictedDocument>) -> bool {
