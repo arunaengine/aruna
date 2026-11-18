@@ -113,6 +113,12 @@ pub enum FolderError {
     AbortUpload(#[from] AbortUploadError),
 }
 
+impl From<IoError> for FolderError {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
 /// How much of a folder still needs attention. Every counter is derived from
 /// the base rows, so it always describes what the owner would see.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
