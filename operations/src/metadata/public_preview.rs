@@ -15,7 +15,6 @@ use serde_json::Value as JsonValue;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::permission_paths::ResolvePathsOperation;
@@ -23,6 +22,7 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_until};
 use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::LocationSummaryRequest;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 const FILE_TYPES: [&str; 4] = [
     "File",
@@ -264,14 +264,7 @@ async fn readable(
     auth: &AuthContext,
     path: &ObjectPath,
 ) -> Result<bool, AuthorizeError> {
-    match authorize(
-        context,
-        realm_id,
-        auth,
-        &path.path,
-        &Permission::READ,
-        PolicyRequestExtras::operation("s3.GetObject"),
-    )
+    match drive(AuthorizeOperation::new(realm_id, auth, &path.path, &Permission::READ, PolicyRequestExtras::operation("s3.GetObject")), context)
     .await
     {
         Ok(()) => Ok(true),

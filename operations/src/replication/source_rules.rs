@@ -11,6 +11,7 @@ use super::version_replication::{SourceAuthorization, SourceAuthorizationError};
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
 use crate::driver::{DriverContext, drive};
+use crate::auth::enforcement::PolicyLoadOperation;
 
 impl SourceAuthorization {
     pub(crate) async fn load(
@@ -28,7 +29,7 @@ impl SourceAuthorization {
         )
         .await
         .map_err(permission_error)?;
-        let policies = PolicyEvaluator::load(context, auth_context.realm_id, Some(group_id))
+        let policies = drive(PolicyLoadOperation::new(auth_context.realm_id, Some(group_id)), context)
             .await
             .map_err(|error| SourceAuthorizationError::Unavailable(error.to_string()))?;
         Ok(Self {

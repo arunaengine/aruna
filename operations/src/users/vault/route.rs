@@ -20,13 +20,13 @@ use super::write::{
 };
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::forward::entry::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use aruna_core::placement::{holds_placement, target_placement_ref};
+use crate::forward::routing::ForwardHoldersOperation;
 
 #[derive(Debug, Error)]
 pub enum VaultRouteError {
@@ -55,7 +55,7 @@ pub async fn append_vault_routed(
         change: Box::new(config.change),
         created_at_ms: config.now_ms,
     };
-    match forward_to_holders(context, &holders, message, None, false).await? {
+    match drive(ForwardHoldersOperation::new(context.node_and_realm().map(|(node_id, _)| node_id), &holders, &message, None, false), context).await.map_err(MetadataWriteError::from)? {
         MetadataTransportMessage::ForwardedVaultChange { result } => {
             result.map_err(VaultRouteError::Refused)
         }

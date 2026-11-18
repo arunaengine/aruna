@@ -8,6 +8,7 @@ use ulid::Ulid;
 
 use crate::session::create::pure_tests::session_config;
 use crate::session::index::MAX_USER_SESSIONS;
+use crate::auth::bearer_token::UserCutoffOperation;
 
 /// A realm whose user `session_config` creates sessions for, on real storage.
 async fn session_realm() -> (
@@ -113,11 +114,7 @@ async fn revokes_past_capacity() {
         let revoked = drive(revoke, &context).await.unwrap();
         assert!(revoked.is_some_and(|revoked| revoked.revoked));
     }
-    let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-        &context.storage_handle,
-        config.realm_id,
-        &config.user_id,
-    )
+    let cutoff = drive(UserCutoffOperation::new(config.realm_id, &config.user_id), &context)
     .await
     .unwrap();
     // The last revoked session and every older one are cut off.
@@ -166,11 +163,7 @@ async fn service_keeps_limit() {
             refused,
             Err(CreateSessionError::LimitReached { oldest: base })
         );
-        let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-            &context.storage_handle,
-            config.realm_id,
-            &config.user_id,
-        )
+        let cutoff = drive(UserCutoffOperation::new(config.realm_id, &config.user_id), &context)
         .await
         .unwrap();
         assert_eq!(cutoff, None);
@@ -240,11 +233,7 @@ async fn full_user_login() {
 
     create_making_room(&context, node_id, next).await.unwrap();
 
-    let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-        &context.storage_handle,
-        config.realm_id,
-        &config.user_id,
-    )
+    let cutoff = drive(UserCutoffOperation::new(config.realm_id, &config.user_id), &context)
     .await
     .unwrap();
     assert_eq!(cutoff, Some(base + 1));

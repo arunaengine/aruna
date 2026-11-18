@@ -16,6 +16,7 @@ use super::{
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
+use crate::auth::request_authorization::BucketAccessOperation;
 
 /// Loads the caller's access once, then runs the membership check.
 pub async fn release_members(
@@ -47,7 +48,7 @@ pub async fn load_access(
     auth: &AuthContext,
 ) -> Result<Access, ReleaseError> {
     let place = (scope.realm_id, scope.info.group_id, scope.node_id);
-    match BucketAccess::load(context, auth, place, scope.bucket).await {
+    match drive(BucketAccessOperation::new(auth, place, scope.bucket), context).await {
         Ok(access) => Ok(Access(Arc::new(access))),
         Err(AuthorizeError::Storage(error)) => Err(ReleaseError::Unavailable(error.to_string())),
         Err(error) => Err(ReleaseError::Unavailable(error.to_string())),

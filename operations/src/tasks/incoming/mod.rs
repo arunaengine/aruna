@@ -115,6 +115,7 @@ use crate::tasks::task_persistence::{
 };
 use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
+use crate::forward::realm::RelayAdminOperation;
 
 mod outbox;
 mod restore;
@@ -507,14 +508,7 @@ impl OperationsTaskHandler {
         if holders.is_empty() {
             return false;
         }
-        match crate::forward::entry::relay_admin_event(
-            &self.context,
-            &holders,
-            record.target.clone(),
-            event.clone(),
-            record.placement,
-            origin_signature,
-        )
+        match drive(RelayAdminOperation::new(self.context.node_and_realm().map(|(node_id, _)| node_id), &holders, record.target.clone(), event.clone(), record.placement, origin_signature), &self.context)
         .await
         {
             Ok(()) => {

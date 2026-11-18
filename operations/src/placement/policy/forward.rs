@@ -11,14 +11,15 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::{authorize_forwarded_caller, forward_auth_error};
-use crate::forward::entry::forward_to_holders;
+use crate::forward::authorize::forward_auth_error;
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::policy::create::{
     CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation,
 };
 use aruna_core::metadata::AuthToken;
+use crate::forward::authorize::ForwardedCallerOperation;
+use crate::forward::routing::ForwardHoldersOperation;
 
 /// Why a routed publication did not commit. The local outcome and the delivery
 /// outcome stay distinguishable, so a reused id is never reported as an
@@ -45,18 +46,11 @@ pub async fn create_policy_routed(
         Err(CreatePolicyError::NotHolder { holders }) => holders,
         Err(error) => return Err(error.into()),
     };
-    let response = forward_to_holders(
-        context,
-        &holders,
-        MetadataTransportMessage::ForwardCreatePolicy {
+    let response = drive(ForwardHoldersOperation::new(context.node_and_realm().map(|(node_id, _)| node_id), &holders, &MetadataTransportMessage::ForwardCreatePolicy {
             auth_token,
             policy: Box::new(policy),
             created_at_ms,
-        },
-        None,
-        false,
-    )
-    .await?;
+        }, None, false), context).await.map_err(MetadataWriteError::from)?;
     match response {
         MetadataTransportMessage::PlacementPolicyCreated { document } => Ok(*document),
         other => Err(MetadataWriteError::Undeliverable(format!(
@@ -78,7 +72,7 @@ pub(crate) async fn apply_forwarded_policy(
         return MetadataTransportMessage::ForwardedWriteUnavailable;
     };
     let realm_id = *net_handle.realm_id();
-    let auth = match authorize_forwarded_caller(context, peer, realm_id, &message).await {
+    let auth = match drive(ForwardedCallerOperation::new(peer, realm_id, &message), context).await {
         Ok(auth) => auth,
         Err(error) => return forward_auth_error(error),
     };

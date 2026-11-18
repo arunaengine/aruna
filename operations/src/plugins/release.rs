@@ -22,6 +22,7 @@ use super::grants::InstallScope;
 use super::rows::write_rows;
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::driver::{DriverContext, drive};
+use crate::auth::enforcement::PolicyLoadOperation;
 
 pub(crate) fn delivery_name(delivery: Delivery) -> &'static str {
     match delivery {
@@ -115,7 +116,7 @@ pub async fn release(
         body: None,
         session: None,
     };
-    let evaluator = PolicyEvaluator::load(ctx, config.realm_id, Some(install.group_id)).await;
+    let evaluator = drive(PolicyLoadOperation::new(config.realm_id, Some(install.group_id)), ctx).await;
     let evaluator = evaluator.map_err(|error| ReleaseError::Unavailable(error.to_string()))?;
     if evaluator.evaluate(&policy).is_err() {
         return Err(audit.refused(Refusal::Policy, Some(&selected)).await);

@@ -32,6 +32,7 @@ use aruna_core::structs::storage::discovery::{
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use ulid::Ulid;
+use crate::auth::request_authorization::BucketAccessOperation;
 
 /// Files one preview page lists.
 pub const PREVIEW_PAGE: usize = 200;
@@ -253,7 +254,7 @@ pub async fn bucket_access(
         return Err(ImportRuleError::Forbidden);
     }
     let scope = (auth.realm_id, rule.group_id, node_id);
-    let access = BucketAccess::load(context, auth, scope, &rule.bucket)
+    let access = drive(BucketAccessOperation::new(auth, scope, &rule.bucket), context)
         .await
         .map_err(|error| match error {
             AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => {

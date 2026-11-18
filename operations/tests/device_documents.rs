@@ -15,7 +15,6 @@ use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::auth::bearer_token::realm_token_revoked;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
@@ -33,6 +32,7 @@ use topology::{
     TestNode, TestResult, Topology, read_group_auth, read_group_record, read_realm_auth,
     read_realm_config, replicate_config, spawn_node, wait_for_convergence, write,
 };
+use aruna_operations::auth::bearer_token::TokenRevokedOperation;
 
 const MANAGEMENT_NODES: usize = 2;
 const REPLICATION_FACTOR: u32 = 1;
@@ -71,7 +71,7 @@ async fn device_fetches_revocation() -> TestResult<()> {
     // revocation: exactly what a device that was closed comes back to.
     let device = join_device(&realm).await?;
     assert!(
-        !realm_token_revoked(&device.context.storage_handle, realm_id, &token_hash).await?,
+        !drive(TokenRevokedOperation::new(realm_id, &token_hash), &device.context).await?,
         "the device must not know the revocation before it fetches anything"
     );
 
@@ -80,7 +80,7 @@ async fn device_fetches_revocation() -> TestResult<()> {
         "a realm node must serve the device the realm documents"
     );
     assert!(
-        realm_token_revoked(&device.context.storage_handle, realm_id, &token_hash).await?,
+        drive(TokenRevokedOperation::new(realm_id, &token_hash), &device.context).await?,
         "the device must deny a token the realm revoked while it was away"
     );
     Ok(())

@@ -8,6 +8,7 @@ use super::rename::{RenameError, RenameInput, RenameKeysOperation, RenamePlan, r
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
+use crate::auth::request_authorization::BucketAccessOperation;
 
 /// Plans or applies a rename only with WRITE, by role and policy, on every old and new key.
 /// A denial answers `Forbidden` before any key is shown or moved.
@@ -17,7 +18,7 @@ pub async fn authorized_rename(
     input: RenameInput,
 ) -> Result<RenamePlan, RenameError> {
     let scope = (input.realm_id, input.group_id, input.node_id);
-    let access = BucketAccess::load(context, auth, scope, &input.bucket)
+    let access = drive(BucketAccessOperation::new(auth, scope, &input.bucket), context)
         .await
         .map_err(access_error)?;
     let allowed = |key: &str| access.allows(Some(key), &Permission::WRITE);

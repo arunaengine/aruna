@@ -27,7 +27,6 @@ use super::{
     delete_peer,
 };
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
@@ -36,6 +35,7 @@ use crate::sync::sync_relationship::{
     SyncRelationshipDirection,
 };
 use aruna_core::metadata::AuthToken;
+use crate::auth::request_authorization::AuthorizeOperation;
 
 /// Forwards a user-authorized sync mirror creation request to the target
 /// node so routes never orchestrate metadata effects directly.
@@ -334,14 +334,7 @@ async fn authorize_repair(
         path_restrictions: None,
         session: None,
     };
-    match authorize(
-        context,
-        realm_id,
-        &auth,
-        path,
-        permission,
-        PolicyRequestExtras::operation(operation),
-    )
+    match drive(AuthorizeOperation::new(realm_id, &auth, path, permission, PolicyRequestExtras::operation(operation)), context)
     .await
     {
         Ok(()) => Ok(()),

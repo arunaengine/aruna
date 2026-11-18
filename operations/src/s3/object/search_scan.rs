@@ -28,6 +28,7 @@ use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::auth::enforcement::PolicyBulkOperation;
 
 #[path = "index_search.rs"]
 mod index_search;
@@ -203,7 +204,7 @@ async fn authorize(
     }
     let policy_scope = (input.realm_id, candidate.hit.group_id);
     if !evaluators.contains_key(&policy_scope) {
-        evaluators.extend(PolicyEvaluator::load_bulk(context, vec![policy_scope]).await?);
+        evaluators.extend(drive(PolicyBulkOperation::new(vec![policy_scope]), context).await?);
     }
     let request = policy_request_with(
         &path,

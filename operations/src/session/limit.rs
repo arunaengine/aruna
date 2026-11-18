@@ -5,6 +5,8 @@
 use super::create::{
     CreateSessionConfig, CreateSessionError, CreateSessionOperation, CreatedSession,
 };
+use crate::driver::drive;
+use crate::auth::bearer_token::UserCutoffOperation;
 
 /// Creates a session for the user. At the session limit the user's cutoff moves past the
 /// oldest active sessions, which signs them out, and creation runs again. A service account
@@ -15,7 +17,7 @@ pub async fn create_making_room(
     mut config: CreateSessionConfig,
 ) -> Result<CreatedSession, CreateSessionError> {
     let read_cutoff = |realm_id, user_id| async move {
-        crate::auth::bearer_token::realm_user_cutoff(&context.storage_handle, realm_id, &user_id)
+        drive(UserCutoffOperation::new(realm_id, &user_id), &context)
             .await
             .map_err(|error| CreateSessionError::Retire(error.to_string()))
     };

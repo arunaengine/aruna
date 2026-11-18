@@ -31,6 +31,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 use ulid::Ulid;
+use crate::auth::bearer_token::UserCutoffOperation;
 
 struct Fixture {
     _dir: TempDir,
@@ -502,11 +503,7 @@ async fn foreign_token_missing() {
 }
 
 async fn cutoff_of(fixture: &Fixture, user: UserId) -> Option<u64> {
-    crate::auth::bearer_token::realm_user_cutoff(
-        &fixture.context.storage_handle,
-        user.realm_id,
-        &user,
-    )
+    drive(UserCutoffOperation::new(user.realm_id, &user), &fixture.context)
     .await
     .unwrap()
 }

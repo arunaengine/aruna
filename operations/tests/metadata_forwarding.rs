@@ -43,7 +43,6 @@ use aruna_operations::device::publish_queue::{
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::forward::entry::forward_token_revoke;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
@@ -72,6 +71,7 @@ use ulid::Ulid;
 use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::{TestNode, spawn_replica, write};
+use aruna_operations::forward::token::ForwardRevokeOperation;
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine hang.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -280,12 +280,7 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let target = realm.bearer_string();
 
-    forward_token_revoke(
-        &user_node.context,
-        realm.realm_id,
-        realm.bearer_token(),
-        target.clone(),
-    )
+    drive(ForwardRevokeOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), realm.bearer_token(), target.clone(), ulid::Ulid::generate()), &user_node.context)
     .await?;
 
     let hash = bearer_token_hash(&target);
@@ -335,20 +330,10 @@ async fn scoped_revokes_itself() -> Result<(), Box<dyn std::error::Error>> {
     let scoped_string = scoped_string.as_str().to_string();
 
     let other = realm.bearer_string();
-    let refused = forward_token_revoke(
-        &user_node.context,
-        realm.realm_id,
-        scoped.clone(),
-        other.clone(),
-    )
+    let refused = drive(ForwardRevokeOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), scoped.clone(), other.clone(), ulid::Ulid::generate()), &user_node.context)
     .await;
     assert!(refused.is_err());
-    forward_token_revoke(
-        &user_node.context,
-        realm.realm_id,
-        scoped,
-        scoped_string.clone(),
-    )
+    drive(ForwardRevokeOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), scoped, scoped_string.clone(), ulid::Ulid::generate()), &user_node.context)
     .await?;
 
     let own = bearer_token_hash(&scoped_string);

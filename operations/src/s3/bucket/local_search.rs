@@ -17,6 +17,8 @@ use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::search_scan::{open_position, seal_position};
+use crate::auth::request_authorization::AuthorizeOperation;
+use crate::auth::enforcement::PolicyBulkOperation;
 
 /// Runs one node's bucket search, dropping hits denied by realm/group policies.
 /// Policy state is read once per candidate group; unreadable groups stay invisible,
@@ -75,7 +77,7 @@ pub(super) async fn search_with_budget(
             .filter(|group_id| !evaluators.contains_key(&(input.realm_id, *group_id)))
             .map(|group_id| (input.realm_id, group_id))
             .collect::<Vec<_>>();
-        evaluators.extend(PolicyEvaluator::load_bulk(context, pending).await?);
+        evaluators.extend(drive(PolicyBulkOperation::new(pending), context).await?);
         for mut hit in output.hits {
             if !policy_allows(&evaluators, &input, &hit) {
                 continue;
@@ -127,14 +129,7 @@ async fn anonymous_reads(
     let path = bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
     let anonymous = AuthContext::anonymous(input.realm_id);
     let extras = PolicyRequestExtras::operation("s3.ListBuckets");
-    crate::auth::request_authorization::authorize(
-        context,
-        input.realm_id,
-        &anonymous,
-        &path,
-        &Permission::READ,
-        extras,
-    )
+    drive(AuthorizeOperation::new(input.realm_id, &anonymous, &path, &Permission::READ, extras), context)
     .await
     .is_ok()
 }

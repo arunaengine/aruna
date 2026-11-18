@@ -30,7 +30,6 @@ use ulid::Ulid;
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::nonce::SpendNonceOperation;
 use crate::driver::{DriverContext, drive};
@@ -47,6 +46,7 @@ use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
 use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
+use crate::auth::request_authorization::AuthorizeOperation;
 
 struct PreparedReference {
     metadata: SourceMetadata,
@@ -446,18 +446,11 @@ async fn read_exact(
         &request.bucket,
         &request.key,
     );
-    if let Err(error) = authorize(
-        context,
-        auth_context.realm_id,
-        auth_context,
-        &path,
-        &Permission::READ,
-        PolicyRequestExtras::operation(if request.head {
+    if let Err(error) = drive(AuthorizeOperation::new(auth_context.realm_id, auth_context, &path, &Permission::READ, PolicyRequestExtras::operation(if request.head {
             HEAD_OPERATION
         } else {
             READ_OPERATION
-        }),
-    )
+        })), context)
     .await
     {
         match error {
