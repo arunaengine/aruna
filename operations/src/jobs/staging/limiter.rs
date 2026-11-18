@@ -3,14 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::StagingJobSpec;
-use rand::RngExt;
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+use aruna_core::jobs::{JobEffect, JobEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use ulid::Ulid;
+
+use super::StagingRun;
 
 /// Attempts of one request while its answers stay transient.
 const ATTEMPTS: u32 = 5;
@@ -53,7 +58,7 @@ impl<I: PartialEq, O: Operation> PartialEq for Retried<I, O> {
 
 impl<I: Clone, O: Operation> Retried<I, O> {
     pub(super) fn new(
-        spec: &StagingJobSpec,
+        (table, seed): (bool, u64),
         input: I,
         build: fn(I) -> O,
         transient: fn(&O::Error) -> bool,
@@ -62,9 +67,9 @@ impl<I: Clone, O: Operation> Retried<I, O> {
             input,
             build,
             transient,
-            table: spec.table.is_some(),
+            table,
             attempt: 0,
-            seed: rand::rng().random(),
+            seed,
             waiting: false,
         }
     }
@@ -111,11 +116,89 @@ where
     }
 }
 
+/// The call that sends one source request of `run`. A table import sends it again after a
+/// transient answer, and a cancel or shutdown ends the request and its waits.
+pub(super) fn retried_call<I, O>(
+    run: &StagingRun,
+    input: I,
+    build: fn(I) -> O,
+    transient: fn(&O::Error) -> bool,
+) -> IoCall
+where
+    I: Clone + Debug + PartialEq + Send + 'static,
+    O: Operation + 'static,
+    O::Output: PartialEq + 'static,
+    O::Error: 'static,
+{
+    let table = run.spec.table.is_some();
+    let retried = Retried::new((table, run.seed), input, build, transient);
+    if !table {
+        return IoCall::child(retried);
+    }
+    let child = boxed_suboperation(retried, |result| Event::Child(ChildOutcome::new(result)));
+    IoCall::Effect(Box::new(Effect::Job(JobEffect::UntilStop(child))))
+}
+
+/// The answer to [`retried_call`]; a request the stop ended fails as aborted.
+pub(super) fn retried_result<T, E>(result: IoResult) -> Result<Result<T, E>, IoError>
+where
+    T: 'static,
+    E: From<IoError> + 'static,
+{
+    let event = match result {
+        child @ IoResult::Child(_) => return child.child::<T, E>(),
+        other => other.event()?,
+    };
+    match event {
+        Event::Job(JobEvent::Finished(finished)) => child_of::<T, E>(*finished),
+        Event::Job(JobEvent::Stopped) => Ok(Err(IoError::Aborted.into())),
+        other => Err(IoError::Unexpected {
+            expected: "the end of a source request",
+            got: other.label(),
+        }),
+    }
+}
+
+/// Runs `operation` while this node's `turns` are held.
+pub(super) fn in_turns<O>(turns: BTreeSet<(Ulid, Ulid)>, operation: O) -> IoCall
+where
+    O: Operation + 'static,
+    O::Output: PartialEq + 'static,
+    O::Error: 'static,
+{
+    let child = boxed_suboperation(operation, |result| Event::Child(ChildOutcome::new(result)));
+    IoCall::Effect(Box::new(Effect::Job(JobEffect::InTurns { turns, child })))
+}
+
+/// The answer to [`in_turns`].
+pub(super) fn turns_result<T: 'static, E: 'static>(
+    result: IoResult,
+) -> Result<Result<T, E>, IoError> {
+    match result.event()? {
+        Event::Job(JobEvent::Finished(finished)) => child_of::<T, E>(*finished),
+        other => Err(IoError::Unexpected {
+            expected: "the end of the held turns",
+            got: other.label(),
+        }),
+    }
+}
+
+/// The typed outcome a child's event carries.
+pub(super) fn child_of<T: 'static, E: 'static>(event: Event) -> Result<Result<T, E>, IoError> {
+    let got = event.label();
+    let wrong = IoError::Unexpected {
+        expected: "a child of the expected type",
+        got,
+    };
+    match event {
+        Event::Child(outcome) => outcome.take::<T, E>().ok_or(wrong),
+        _ => Err(wrong),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::table::{TableImport, TableSource};
 
     /// A request that always answers its input.
     #[derive(Debug, PartialEq)]
@@ -134,24 +217,12 @@ mod tests {
         }
     }
 
-    fn spec(table: bool) -> StagingJobSpec {
-        let mut spec = crate::jobs::staging::pure_tests::test_spec();
-        let rows = serde_json::json!({ "kind": "file", "source": "{a}", "target": "{a}" });
-        spec.table = table.then(|| TableImport {
-            source: TableSource::Connector("list.csv".to_string()),
-            format: Default::default(),
-            rows: serde_json::from_value(rows).unwrap(),
-            rate: Some(10),
-        });
-        spec
-    }
-
     fn answer(result: Result<u8, IoError>) -> IoResult {
         IoResult::Child(ChildOutcome::new(result))
     }
 
     fn retried(table: bool) -> Retried<u8, Echo> {
-        Retried::new(&spec(table), 1, Echo, |error| *error == IoError::Unfinished)
+        Retried::new((table, 7), 1, Echo, |error| *error == IoError::Unfinished)
     }
 
     // A transient answer is sent again after a backoff; a lasting one returns at once.
@@ -201,6 +272,26 @@ mod tests {
         assert_eq!(
             operation.next(answer(Err(IoError::Unfinished))),
             Err(IoError::Unfinished)
+        );
+    }
+
+    // A stop ends a table request as aborted; a finished one carries its child's outcome.
+    #[test]
+    fn stopped_request_aborts() {
+        let stopped = IoResult::Event(Box::new(Event::Job(JobEvent::Stopped)));
+        assert_eq!(
+            retried_result::<u8, IoError>(stopped),
+            Ok(Err(IoError::Aborted))
+        );
+        let finished = Event::Child(ChildOutcome::new(Ok::<u8, IoError>(4)));
+        let event = Event::Job(JobEvent::Finished(Box::new(finished)));
+        assert_eq!(
+            retried_result::<u8, IoError>(IoResult::Event(Box::new(event))),
+            Ok(Ok(4))
+        );
+        assert_eq!(
+            retried_result::<u8, IoError>(answer(Ok(2))),
+            Ok(Ok(2))
         );
     }
 }
