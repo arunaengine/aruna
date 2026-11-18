@@ -645,221 +645,236 @@ mod tests {
         }
     }
 
-    if job_count > 0 {
-        info!(
-            event = "pipeline.reference_metadata_refresh.summary",
-            jobs = job_count,
-            succeeded,
-            failed,
-            scan_ms = duration_ms(scan_elapsed),
-            total_ms = duration_ms(batch_started.elapsed()),
-            oldest_lag_ms,
-            has_more_due,
-            "Reference metadata refresh batch summary"
+    fn refresh(metadata: Option<SourceMetadata>, seconds: u64) -> ReferenceRefresh {
+        ReferenceRefresh {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::from_parts(1, 1),
+            metadata,
+            refreshed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            auth_context: AuthContext {
+                user_id: Default::default(),
+                realm_id: RealmId([9; 32]),
+                path_restrictions: None,
+                session: None,
+            },
+        }
+    }
+
+    fn reference(cached: SourceMetadata, seconds: u64) -> BlobVersion {
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::new(),
+                source_path: "a".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+                namespace: None,
+                root: None,
+            },
+            connector_id: None,
+            mirrors: Vec::new(),
+        };
+        BlobVersion::reference(
+            source,
+            cached,
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+        )
+    }
+
+    fn row(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Into::into)])
+    }
+
+    fn page(rows: Vec<Key>, next: Option<Key>) -> IoResult {
+        IoResult::Page {
+            rows: rows
+                .into_iter()
+                .map(|row| (row, Value::from(Vec::new())))
+                .collect(),
+            next,
+        }
+    }
+
+    #[test]
+    fn matching_observation_moves_time() {
+        let version = reference(observation(1), 10);
+        let mut apply = RefreshApply::new(refresh(Some(observation(1)), 20));
+        assert_eq!(apply.transaction(), TransactionMode::Write);
+        assert!(matches!(apply.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let turn = apply.next(row(Some(version.to_bytes().unwrap())));
+        let Ok(Next::Call(IoCall::Write(writes))) = &turn else {
+            panic!("expected the version write, got {turn:?}");
+        };
+        let written = BlobVersion::from_bytes(writes[0].2.as_ref()).unwrap();
+        let BlobVersionState::Reference { last_refresh, .. } = written.state else {
+            panic!("the version stays a reference");
+        };
+        assert_eq!(
+            last_refresh,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(20)
+        );
+        assert_eq!(apply.next(IoResult::Done), Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn stale_observation_writes_nothing() {
+        for (metadata, seconds) in [(observation(1), 10), (observation(2), 5)] {
+            let mut apply = RefreshApply::new(refresh(Some(metadata), seconds));
+            apply.first().unwrap();
+            let version = reference(observation(1), 10);
+            let turn = apply.next(row(Some(version.to_bytes().unwrap())));
+            assert_eq!(turn, Ok(Next::Done(false)));
+        }
+    }
+
+    #[test]
+    fn changed_source_mints() {
+        let mut apply = RefreshApply::new(refresh(Some(observation(2)), 20));
+        apply.first().unwrap();
+        let version = reference(observation(1), 10);
+        let turn = apply.next(row(Some(version.to_bytes().unwrap())));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        assert!(matches!(apply.state, ApplyState::Mint(_)));
+    }
+
+    #[test]
+    fn missing_observation_fails() {
+        let mut apply = RefreshApply::new(refresh(None, 20));
+        apply.first().unwrap();
+        let version = reference(observation(1), 10);
+        assert_eq!(
+            apply.next(row(Some(version.to_bytes().unwrap()))),
+            Err(RefreshRunError::NoObservation)
         );
     }
 
-    Ok(ReferenceDrainResult {
-        processed: job_count,
-        succeeded,
-        failed,
-        has_more_due,
-        next_due_after: if has_more_due {
-            None
-        } else {
-            next_due_ms.map(|due_at_ms| due_after(unix_timestamp_millis(), due_at_ms))
-        },
-    })
-}
-
-/// The first `limit` due index rows and whether more follow.
-async fn first_due(
-    storage: &StorageHandle,
-    limit: usize,
-) -> Result<(Vec<(Key, ByteView)>, bool), ReferenceRefreshError> {
-    let event = send(
-        storage,
-        StorageEffect::Iter {
-            key_space: REFRESH_DUE_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit,
-            txn_id: None,
-        },
-    )
-    .await?;
-    match event {
-        StorageEvent::IterResult {
-            values,
-            next_start_after,
-        } => Ok((values, next_start_after.is_some())),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(
-            Event::Storage(other).label().to_string(),
-        )),
-    }
-}
-
-/// Walks one page of the due index in due order, with a point read per due row.
-async fn scan_due_jobs(
-    storage: &StorageHandle,
-    now_ms: u64,
-    limit: usize,
-) -> Result<ReferenceRefreshScan, ReferenceRefreshError> {
-    let (rows, more_rows) = first_due(storage, REFRESH_SCAN_PAGE).await?;
-    let mut jobs = Vec::new();
-    for (row, _) in rows {
-        let Some((due_at_ms, key)) = split_due(&row) else {
-            delete_rows(storage, vec![(REFRESH_DUE_KEYSPACE.to_string(), row)], None).await?;
-            continue;
+    #[test]
+    fn minted_refresh_schedules() {
+        let mut operation = RefreshReferenceOperation::new(refresh(Some(observation(1)), 20));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let applied = IoResult::Child(ChildOutcome::new(Ok::<_, RefreshRunError>(true)));
+        let Ok(Next::Then { calls, .. }) = operation.next(applied) else {
+            panic!("a minted successor wakes the publisher and the drain");
         };
-        if due_at_ms > now_ms {
-            return Ok(ReferenceRefreshScan {
-                jobs,
-                has_more_due: false,
-                next_due_ms: Some(due_at_ms),
-            });
-        }
-        if jobs.len() >= limit {
-            return Ok(ReferenceRefreshScan {
-                jobs,
-                has_more_due: true,
-                next_due_ms: None,
-            });
-        }
-        let mut stale = vec![(REFRESH_DUE_KEYSPACE.to_string(), row.clone())];
-        match read_job(storage, key, None).await? {
-            Some(Ok(job)) if job.due_at_ms == due_at_ms => {
-                jobs.push((key.to_vec(), job));
-                continue;
-            }
-            Some(Ok(_)) | None => {}
-            Some(Err(error)) => {
-                warn!(error = %error, key = ?key, "Deleting malformed reference metadata refresh job");
-                let key = ByteView::from(key.to_vec());
-                stale.push((REFRESH_JOB_KEYSPACE.to_string(), key));
-            }
-        }
-        delete_rows(storage, stale, None).await?;
+        assert_eq!(calls.len(), 2);
     }
-    Ok(ReferenceRefreshScan {
-        jobs,
-        has_more_due: more_rows,
-        next_due_ms: None,
-    })
-}
 
-async fn send(
-    storage: &StorageHandle,
-    effect: StorageEffect,
-) -> Result<StorageEvent, ReferenceRefreshError> {
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        Event::Storage(event) => Ok(event),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(
-            other.label().to_string(),
-        )),
+    #[test]
+    fn observes_when_missing() {
+        // Without an observation the source is asked first, then the result is applied.
+        let mut operation = RefreshReferenceOperation::new(refresh(None, 20));
+        operation.first().unwrap();
+        assert_eq!(operation.step, RefreshStep::Observe);
+        let observed = ChildOutcome::new(Ok::<_, ObserveError>(observation(3)));
+        let turn = operation.next(IoResult::Child(observed));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.refresh.metadata, Some(observation(3)));
+        assert_eq!(operation.step, RefreshStep::Apply);
     }
-}
 
-async fn read_job(
-    storage: &StorageHandle,
-    key: &[u8],
-    txn_id: Option<Ulid>,
-) -> Result<Option<Result<ReferenceRefreshRecord, postcard::Error>>, ReferenceRefreshError> {
-    let effect = StorageEffect::Read {
-        key_space: REFRESH_JOB_KEYSPACE.to_string(),
-        key: ByteView::from(key.to_vec()),
-        txn_id,
-    };
-    match send(storage, effect).await? {
-        StorageEvent::ReadResult { value, .. } => {
-            Ok(value.map(|value| postcard::from_bytes(&value)))
-        }
-        other => Err(ReferenceRefreshError::UnexpectedEvent(
-            Event::Storage(other).label().to_string(),
-        )),
+    fn job(due_at_ms: u64) -> ReferenceRefreshRecord {
+        ReferenceRefreshRecord::new(refresh(Some(observation(1)), 20), due_at_ms)
     }
-}
 
-async fn delete_rows(
-    storage: &StorageHandle,
-    deletes: Vec<(String, Key)>,
-    txn_id: Option<Ulid>,
-) -> Result<(), ReferenceRefreshError> {
-    match send(storage, StorageEffect::BatchDelete { deletes, txn_id }).await? {
-        StorageEvent::BatchDeleteResult { .. } => Ok(()),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(
-            Event::Storage(other).label().to_string(),
-        )),
+    #[test]
+    fn settle_keeps_newer_job() {
+        // A job a newer request replaced stays queued.
+        let mut settle = SettleJob::new(b"key".to_vec(), job(5), None);
+        assert_eq!(settle.transaction(), TransactionMode::Write);
+        settle.first().unwrap();
+        let newer = postcard::to_allocvec(&job(9)).unwrap();
+        assert_eq!(settle.next(row(Some(newer))), Ok(Next::Done(())));
     }
-}
 
-/// Removes a finished job, or replaces it with `next`, unless a newer request replaced it.
-pub(super) async fn settle_job(
-    storage: &StorageHandle,
-    key: &[u8],
-    job: &ReferenceRefreshRecord,
-    next: Option<&ReferenceRefreshRecord>,
-) -> Result<(), ReferenceRefreshError> {
-    let txn_id = match send(storage, StorageEffect::StartTransaction { read: false }).await? {
-        StorageEvent::TransactionStarted { txn_id } => txn_id,
-        other => {
-            return Err(ReferenceRefreshError::UnexpectedEvent(
-                Event::Storage(other).label().to_string(),
-            ));
-        }
-    };
-    let result = async {
-        if !matches!(read_job(storage, key, Some(txn_id)).await?, Some(Ok(stored)) if stored == *job)
-        {
-            return Ok(());
-        }
-        let mut deletes = vec![(
-            REFRESH_DUE_KEYSPACE.to_string(),
-            due_key(job.due_at_ms, key),
-        )];
-        let Some(next) = next else {
-            let key = ByteView::from(key.to_vec());
-            deletes.push((REFRESH_JOB_KEYSPACE.to_string(), key));
-            return delete_rows(storage, deletes, Some(txn_id)).await;
+    #[test]
+    fn settle_replaces_job() {
+        let next = job(9);
+        let mut settle = SettleJob::new(b"key".to_vec(), job(5), Some(next.clone()));
+        settle.first().unwrap();
+        let stored = postcard::to_allocvec(&job(5)).unwrap();
+        let turn = settle.next(row(Some(stored)));
+        let Ok(Next::Call(IoCall::Delete(deletes))) = &turn else {
+            panic!("expected the due row delete, got {turn:?}");
         };
-        delete_rows(storage, deletes, Some(txn_id)).await?;
-        let writes = job_entries(next)?;
-        match send(storage, StorageEffect::BatchWrite { writes, txn_id: Some(txn_id) }).await? {
-            StorageEvent::BatchWriteResult { .. } => Ok(()),
-            other => Err(ReferenceRefreshError::UnexpectedEvent(Event::Storage(other).label().to_string())),
-        }
+        assert_eq!(deletes.len(), 1);
+        assert_eq!(
+            settle.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Write(job_entries(&next).unwrap())))
+        );
+        assert_eq!(settle.next(IoResult::Done), Ok(Next::Done(())));
     }
-    .await;
-    let effect = match result {
-        Ok(()) => StorageEffect::CommitTransaction { txn_id },
-        Err(error) => {
-            let _ = send(storage, StorageEffect::AbortTransaction { txn_id }).await;
-            return Err(error);
-        }
-    };
-    match send(storage, effect).await? {
-        StorageEvent::TransactionCommitted { .. } => Ok(()),
-        other => Err(ReferenceRefreshError::UnexpectedEvent(
-            Event::Storage(other).label().to_string(),
-        )),
-    }
-}
 
-async fn reschedule_job(
-    storage: &StorageHandle,
-    key: &[u8],
-    job: &ReferenceRefreshRecord,
-    error: String,
-) -> Result<u64, ReferenceRefreshError> {
-    let attempts = job.attempts.saturating_add(1);
-    let due_at_ms = unix_timestamp_millis().saturating_add(retry_delay_ms(attempts));
-    let next_job = ReferenceRefreshRecord {
-        refresh: job.refresh.clone(),
-        due_at_ms,
-        attempts,
-        last_error: Some(error),
-    };
-    settle_job(storage, key, job, Some(&next_job)).await?;
-    Ok(due_at_ms)
+    #[test]
+    fn drain_drops_broken_rows() {
+        // A due row too short to name a job is deleted, and the scan goes on.
+        let mut drain = DrainRefreshOperation::new();
+        drain.first().unwrap();
+        let turn = drain.next(page(vec![Key::from(vec![1])], None));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+        let Ok(Next::Done(result)) = drain.next(IoResult::Done) else {
+            panic!("an empty batch ends the drain");
+        };
+        assert_eq!(result.processed, 0);
+        assert!(!result.has_more_due);
+    }
+
+    #[test]
+    fn drain_stops_at_future() {
+        let mut drain = DrainRefreshOperation::new();
+        drain.first().unwrap();
+        let later = u64::MAX;
+        let Ok(Next::Done(result)) = drain.next(page(vec![due_key(later, b"key")], None)) else {
+            panic!("a row due later ends the scan");
+        };
+        assert_eq!(result.processed, 0);
+        assert!(result.next_due_after.is_some());
+    }
+
+    #[test]
+    fn failed_job_reschedules() {
+        let mut drain = DrainRefreshOperation::new();
+        drain.first().unwrap();
+        let queued = job(0);
+        let row_key = due_key(0, b"key");
+        let turn = drain.next(page(vec![row_key], None));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        let stored = postcard::to_allocvec(&queued).unwrap();
+        let turn = drain.next(row(Some(stored)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let failed = Err::<(), _>(RefreshRunError::NoObservation);
+        let turn = drain.next(IoResult::Child(ChildOutcome::new(failed)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let settled = Ok::<(), ReferenceRefreshError>(());
+        let Ok(Next::Done(result)) = drain.next(IoResult::Child(ChildOutcome::new(settled))) else {
+            panic!("the batch ends after its only job");
+        };
+        assert_eq!((result.processed, result.failed), (1, 1));
+        assert!(result.next_due_after.is_some());
+    }
+
+    #[test]
+    fn restores_earliest_timer() {
+        let mut restore = RestoreRefreshTimer::new();
+        restore.first().unwrap();
+        let turn = restore.next(page(vec![due_key(0, b"key")], None));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Effect(_)))));
+        let set = Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainRefreshQueue,
+            after: Duration::ZERO,
+        });
+        let answer = IoResult::Event(Box::new(set));
+        assert_eq!(restore.next(answer), Ok(Next::Done(())));
+        let mut empty = RestoreRefreshTimer::new();
+        empty.first().unwrap();
+        assert_eq!(empty.next(page(Vec::new(), None)), Ok(Next::Done(())));
+    }
 }
