@@ -8,8 +8,8 @@ use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::{
-    CopyJobSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobPayload, StagingJobCheckpoint,
-    StagingJobSpec, WorkspaceMode, pid_dedup_key, user_dedup_key,
+    CopyJobSpec, ExportRoCrateSpec, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
+    StagingJobCheckpoint, StagingJobSpec, WorkspaceMode, pid_dedup_key, user_dedup_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
@@ -21,6 +21,8 @@ use ulid::Ulid;
 use super::JOB_RETENTION_MS;
 use super::records::pages::ServingNode;
 use super::staging::{SeedCheckpointOperation, StagingStoreError};
+use super::store::JobMutationError;
+use super::store::row_calls::{find_dedup_plan, read_job_record};
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
 };
@@ -487,6 +489,101 @@ impl Operation for HandedJobOperation {
     }
 }
 
+/// The job and plan digest a dedup key names, if that job's record still exists.
+#[derive(Debug, PartialEq)]
+pub struct DedupJobOperation {
+    created_by: UserId,
+    dedup_key: Vec<u8>,
+    found: Option<(JobId, [u8; 32])>,
+}
+
+type DedupNext = Result<Next<Option<(JobId, [u8; 32])>>, SubmitJobError>;
+
+fn store_failed(error: JobMutationError) -> SubmitJobError {
+    SubmitJobError::UnexpectedEvent(error.to_string())
+}
+
+impl DedupJobOperation {
+    pub fn new(created_by: UserId, dedup_key: &[u8]) -> Self {
+        Self {
+            created_by,
+            dedup_key: dedup_key.to_vec(),
+            found: None,
+        }
+    }
+}
+
+impl Operation for DedupJobOperation {
+    type Output = Option<(JobId, [u8; 32])>;
+    type Error = SubmitJobError;
+
+    fn first(&mut self) -> DedupNext {
+        let plan = find_dedup_plan(self.created_by, &self.dedup_key);
+        Ok(Next::Call(IoCall::child(plan)))
+    }
+
+    fn next(&mut self, result: IoResult) -> DedupNext {
+        if let Some(found) = self.found.take() {
+            let record = result
+                .child::<Option<JobRecord>, JobMutationError>()?
+                .map_err(store_failed)?;
+            return Ok(Next::Done(record.map(|_| found)));
+        }
+        let plan = result
+            .child::<Option<(JobId, [u8; 32])>, JobMutationError>()?
+            .map_err(store_failed)?;
+        let Some(found) = plan else {
+            return Ok(Next::Done(None));
+        };
+        self.found = Some(found);
+        Ok(Next::Call(IoCall::child(read_job_record(found.0))))
+    }
+}
+
+/// The job an idempotency key already names. The same key with another plan is a conflict.
+#[derive(Debug, PartialEq)]
+pub struct DedupLookupOperation {
+    created_by: UserId,
+    dedup_key: Vec<u8>,
+    plan_digest: [u8; 32],
+}
+
+impl DedupLookupOperation {
+    pub fn new(created_by: UserId, idempotency_key: &str, plan_digest: [u8; 32]) -> Self {
+        Self {
+            created_by,
+            dedup_key: user_dedup_key(created_by, idempotency_key),
+            plan_digest,
+        }
+    }
+}
+
+impl Operation for DedupLookupOperation {
+    type Output = Option<SubmitJobResult>;
+    type Error = SubmitJobError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, SubmitJobError> {
+        let find = DedupJobOperation::new(self.created_by, &self.dedup_key);
+        Ok(Next::Call(IoCall::child(find)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SubmitJobError> {
+        let found = result.child::<Option<(JobId, [u8; 32])>, SubmitJobError>()??;
+        let Some((job_id, digest)) = found else {
+            return Ok(Next::Done(None));
+        };
+        if digest != self.plan_digest {
+            return Err(SubmitJobError::JobPlanConflict {
+                existing_job_id: job_id,
+            });
+        }
+        Ok(Next::Done(Some(SubmitJobResult {
+            job_id,
+            created: false,
+        })))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +680,40 @@ mod tests {
         };
         let done = submit.next(child(Ok::<_, SubmitJobError>(result())));
         assert_eq!(done, Ok(Next::Done(result())));
+    }
+
+    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+    }
+
+    // A dedup row without its job record names nothing.
+    #[test]
+    fn dedup_needs_record() {
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let mut find = DedupJobOperation::new(user(), b"key");
+        assert!(matches!(find.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let plan = child(Ok::<_, JobMutationError>(Some((job_id, [1u8; 32]))));
+        assert!(matches!(find.next(plan), Ok(Next::Call(IoCall::Child(_)))));
+        let missing = child(Ok::<Option<JobRecord>, JobMutationError>(None));
+        assert!(matches!(find.next(missing), Ok(Next::Done(None))));
+    }
+
+    // The same key with the same plan joins the job, and another plan conflicts.
+    #[test]
+    fn dedup_compares_plan() {
+        let job_id = JobId::from_bytes([3u8; 16]);
+        let found = || child(Ok::<_, SubmitJobError>(Some((job_id, [1u8; 32]))));
+        let mut same = DedupLookupOperation::new(user(), "key", [1u8; 32]);
+        assert!(matches!(
+            same.next(found()),
+            Ok(Next::Done(Some(result))) if result.job_id == job_id && !result.created
+        ));
+        let mut other = DedupLookupOperation::new(user(), "key", [2u8; 32]);
+        assert_eq!(
+            other.next(found()).unwrap_err(),
+            SubmitJobError::JobPlanConflict {
+                existing_job_id: job_id
+            }
+        );
     }
 }
