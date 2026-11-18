@@ -95,14 +95,18 @@ async fn peer_denies_token() -> TestResult<()> {
         "the revocation never reached the peer node",
         || async {
             Ok(usize::from(
-                !drive(TokenRevokedOperation::new(realm_id, &token_hash), &nodes[1].context)
-                    .await?,
+                !drive(
+                    TokenRevokedOperation::new(realm_id, &token_hash),
+                    &nodes[1].context,
+                )
+                .await?,
             ))
         },
     )
     .await?;
 
-    let error = peer.decode(&token)
+    let error = peer
+        .decode(&token)
         .await
         .expect_err("peer rejects the revoked token");
     assert!(matches!(error, ArunaBearerError::TokenRevoked));
@@ -160,9 +164,12 @@ async fn peer_applies_cutoff() -> TestResult<()> {
         "the user cutoff never reached the peer node",
         || async {
             Ok(usize::from(
-                drive(UserCutoffOperation::new(realm_id, &user_id), &nodes[1].context)
-                    .await?
-                    .is_none(),
+                drive(
+                    UserCutoffOperation::new(realm_id, &user_id),
+                    &nodes[1].context,
+                )
+                .await?
+                .is_none(),
             ))
         },
     )

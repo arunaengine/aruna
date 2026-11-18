@@ -67,14 +67,25 @@ async fn manifest_rows_match() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "receiver manifest entry did not arrive",
         || async {
-            let manifest =
-                drive(AssembleManifestOperation::new(realm_id, placement), nodes[1].context.as_ref()).await?;
+            let manifest = drive(
+                AssembleManifestOperation::new(realm_id, placement),
+                nodes[1].context.as_ref(),
+            )
+            .await?;
             Ok(usize::from(!manifest_contains(&manifest, &target)))
         },
     )
     .await?;
-    let receiver = drive(AssembleManifestOperation::new(realm_id, placement), nodes[1].context.as_ref()).await?;
-    let origin = drive(AssembleManifestOperation::new(realm_id, placement), nodes[0].context.as_ref()).await?;
+    let receiver = drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        nodes[1].context.as_ref(),
+    )
+    .await?;
+    let origin = drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
 
     assert!(
         manifest_contains(&origin, &target),

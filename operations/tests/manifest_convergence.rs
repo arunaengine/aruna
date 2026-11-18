@@ -24,8 +24,8 @@ use ulid::Ulid;
 use crate::convergence;
 use crate::topology::store_realm_config;
 use crate::topology::{TestNode, announce_nodes, spawn_replicas};
-use convergence::wait_for_convergence;
 use aruna_operations::shard::AssembleManifestOperation;
+use convergence::wait_for_convergence;
 
 /// A fixed structured id (handle 1, bucket 0) for the strategy-resolution sample,
 /// which does not exercise the create-mint flow.
@@ -76,8 +76,16 @@ async fn interleaved_writes_converge() -> Result<(), Box<dyn std::error::Error>>
     let manifest_rows = document_ids.len() * 2;
     wait_manifest_agreement(&nodes[0], &nodes[1], realm_id, placement, manifest_rows).await?;
 
-    let left = drive(AssembleManifestOperation::new(realm_id, placement), nodes[0].context.as_ref()).await?;
-    let right = drive(AssembleManifestOperation::new(realm_id, placement), nodes[1].context.as_ref()).await?;
+    let left = drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    let right = drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        nodes[1].context.as_ref(),
+    )
+    .await?;
     assert_eq!(left.entries.len(), manifest_rows);
     assert_eq!(sorted_entries(&left), sorted_entries(&right));
     assert_eq!(left.digest, right.digest);
@@ -104,10 +112,16 @@ async fn interleaved_writes_converge() -> Result<(), Box<dyn std::error::Error>>
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "delete tombstone did not converge across holders",
         || async {
-            let left =
-                drive(AssembleManifestOperation::new(realm_id, placement), nodes[0].context.as_ref()).await?;
-            let right =
-                drive(AssembleManifestOperation::new(realm_id, placement), nodes[1].context.as_ref()).await?;
+            let left = drive(
+                AssembleManifestOperation::new(realm_id, placement),
+                nodes[0].context.as_ref(),
+            )
+            .await?;
+            let right = drive(
+                AssembleManifestOperation::new(realm_id, placement),
+                nodes[1].context.as_ref(),
+            )
+            .await?;
             let left_tomb = left
                 .entries
                 .iter()
@@ -130,8 +144,16 @@ async fn interleaved_writes_converge() -> Result<(), Box<dyn std::error::Error>>
     )
     .await?;
 
-    let left = drive(AssembleManifestOperation::new(realm_id, placement), nodes[0].context.as_ref()).await?;
-    let right = drive(AssembleManifestOperation::new(realm_id, placement), nodes[1].context.as_ref()).await?;
+    let left = drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    let right = drive(
+        AssembleManifestOperation::new(realm_id, placement),
+        nodes[1].context.as_ref(),
+    )
+    .await?;
     assert_eq!(
         left.entries.len(),
         manifest_rows,
@@ -245,10 +267,16 @@ async fn wait_manifest_agreement(
     expected: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_convergence("manifests did not converge", || async {
-        let left_manifest =
-            drive(AssembleManifestOperation::new(realm_id, placement), left.context.as_ref()).await?;
-        let right_manifest =
-            drive(AssembleManifestOperation::new(realm_id, placement), right.context.as_ref()).await?;
+        let left_manifest = drive(
+            AssembleManifestOperation::new(realm_id, placement),
+            left.context.as_ref(),
+        )
+        .await?;
+        let right_manifest = drive(
+            AssembleManifestOperation::new(realm_id, placement),
+            right.context.as_ref(),
+        )
+        .await?;
         Ok(usize::from(
             !(left_manifest.entries.len() == expected
                 && right_manifest.entries.len() == expected

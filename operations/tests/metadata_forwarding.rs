@@ -45,8 +45,7 @@ use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use aruna_operations::groups::forward::{ForwardGroupCreateOperation, ForwardGroupError};
-use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::groups::forward::{ForwardGroupError, ForwardGroupOperation};
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
     mint_local_document,
@@ -280,7 +279,19 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let target = realm.bearer_string();
 
-    drive(ForwardRevokeOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), realm.bearer_token(), target.clone(), ulid::Ulid::generate()), &user_node.context)
+    drive(
+        ForwardRevokeOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            realm.bearer_token(),
+            target.clone(),
+            ulid::Ulid::generate(),
+        ),
+        &user_node.context,
+    )
     .await?;
 
     let hash = bearer_token_hash(&target);
@@ -330,10 +341,34 @@ async fn scoped_revokes_itself() -> Result<(), Box<dyn std::error::Error>> {
     let scoped_string = scoped_string.as_str().to_string();
 
     let other = realm.bearer_string();
-    let refused = drive(ForwardRevokeOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), scoped.clone(), other.clone(), ulid::Ulid::generate()), &user_node.context)
+    let refused = drive(
+        ForwardRevokeOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            scoped.clone(),
+            other.clone(),
+            ulid::Ulid::generate(),
+        ),
+        &user_node.context,
+    )
     .await;
     assert!(refused.is_err());
-    drive(ForwardRevokeOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), scoped, scoped_string.clone(), ulid::Ulid::generate()), &user_node.context)
+    drive(
+        ForwardRevokeOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            scoped,
+            scoped_string.clone(),
+            ulid::Ulid::generate(),
+        ),
+        &user_node.context,
+    )
     .await?;
 
     let own = bearer_token_hash(&scoped_string);
@@ -372,7 +407,20 @@ async fn forwards_group_create() -> Result<(), Box<dyn std::error::Error>> {
     let (nodes, _config) = build_realm(&realm, 3, 1).await?;
     let user_node = nodes.last().expect("user node");
 
-    let (group, authorization) = drive(ForwardGroupCreateOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), realm.bearer_token(), "Device Group".to_string(), Ulid::generate()), &user_node.context).await?;
+    let (group, authorization) = drive(
+        ForwardGroupOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            realm.bearer_token(),
+            "Device Group".to_string(),
+            Ulid::generate(),
+        ),
+        &user_node.context,
+    )
+    .await?;
     assert_eq!(group.owner, realm.user_id);
     assert_eq!(group.realm_id, realm.realm_id);
     assert_eq!(authorization.group_id, group.group_id);
@@ -408,7 +456,20 @@ async fn foreign_token_refused() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let stranger = UserId::local(Ulid::generate(), realm.realm_id);
 
-    let error = drive(ForwardGroupCreateOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), realm.token_for(stranger), "Stranger Group".to_string(), Ulid::generate()), &user_node.context).await
+    let error = drive(
+        ForwardGroupOperation::new(
+            realm.realm_id,
+            user_node
+                .context
+                .node_and_realm()
+                .map(|(node_id, _)| node_id),
+            realm.token_for(stranger),
+            "Stranger Group".to_string(),
+            Ulid::generate(),
+        ),
+        &user_node.context,
+    )
+    .await
     .expect_err("a device must not forward another user's write");
     assert!(
         matches!(error, ForwardGroupError::Forbidden),
