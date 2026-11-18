@@ -702,7 +702,9 @@ impl CleanupWorkOperation {
         record: Result<Option<JobRecord>, JobMutationError>,
     ) -> WorkTurn {
         match record {
-            Ok(record) if record.is_none_or(|record| record.is_settled()) => self.release(file),
+            Ok(record) if record.as_ref().is_none_or(|record| record.is_settled()) => {
+                self.release(file)
+            }
             Ok(_) => Ok(Next::Done(RowOutcome::Kept)),
             Err(error) => {
                 warn!(%error, "A purge job could not be read");

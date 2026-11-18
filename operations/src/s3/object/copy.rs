@@ -951,7 +951,6 @@ pub(crate) mod test {
     use aruna_core::egress::EgressPolicy;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-    use aruna_core::stream::BackendStream;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::PortableSourceDescriptor;
