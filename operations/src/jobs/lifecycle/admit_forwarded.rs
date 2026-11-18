@@ -36,13 +36,13 @@ use crate::realm::peer_trust::peer_acts_for;
 
 /// Whether the caller may write in a group: its grants, then the request policies.
 #[derive(Debug, PartialEq)]
-struct GroupWriteOperation {
+pub(super) struct GroupWriteOperation {
     check: CheckPermissionsConfig,
     group_id: GroupId,
 }
 
 impl GroupWriteOperation {
-    fn new(auth: &AuthContext, group_id: GroupId, local: NodeId) -> Self {
+    pub(super) fn new(auth: &AuthContext, group_id: GroupId, local: NodeId) -> Self {
         let check = CheckPermissionsConfig {
             auth_context: auth.clone(),
             path: group_permission_path(auth.realm_id, group_id, local),
