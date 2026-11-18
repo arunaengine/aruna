@@ -790,15 +790,26 @@ impl Operation for UnifyJobOperation {
         Ok(Next::Call(routing_call(self.routing.clone(), &self.bucket)))
     }
 
-async fn read(context: &DriverContext, space: &str, key: Key) -> Result<Option<Vec<u8>>, String> {
-    let read = StorageEffect::Read {
-        key_space: space.to_string(),
-        key,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|v| v.to_vec())),
-        other => Err(format!("could not read {space}: {}", other.label())),
+    fn next(&mut self, result: IoResult) -> Turn<JobStep> {
+        match std::mem::replace(&mut self.stage, JobStage::Page) {
+            JobStage::Routing => {
+                self.snapshot = routing_result(result)?.map(Arc::new);
+                self.next_key()
+            }
+            JobStage::Page => {
+                self.walk.fill(result)?;
+                self.next_key()
+            }
+            JobStage::Key(key, allowed) => {
+                let found = result.child::<Vec<Duplicate>, MigrationError>()??;
+                self.found = found.into();
+                self.next_duplicate(key, allowed)
+            }
+            JobStage::Unify(key, allowed, next) => {
+                let outcome = result.child::<Unified, MigrationError>()??;
+                self.unified((key, allowed, *next), outcome)
+            }
+        }
     }
 }
 
