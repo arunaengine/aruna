@@ -335,9 +335,19 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;
+    use aruna_core::structs::execution::job::JobRecord;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
     use ulid::Ulid;
+
+    fn owner_auth(record: &JobRecord, realm_id: RealmId) -> AuthContext {
+        AuthContext {
+            user_id: record.created_by,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
 
     #[tokio::test]
     async fn wake_requires_parked() {

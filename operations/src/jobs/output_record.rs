@@ -361,6 +361,8 @@ mod tests {
     use super::super::store::attempt::{read_attempt_control, reserve_output_commits};
     use super::*;
     use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::read_output_record as read_stored;
+    use aruna_core::structs::execution::job::JobId;
 
     const TOKEN: Ulid = Ulid(0x5EA1);
 
@@ -490,7 +492,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored.output_record, Some(digest));
 
-        let envelope = read_output_record(&context, record.job_id, control.attempt_epoch)
+        let envelope = read_stored(&context, record.job_id, control.attempt_epoch)
             .await
             .unwrap()
             .unwrap();

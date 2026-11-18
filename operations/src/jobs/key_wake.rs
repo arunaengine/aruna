@@ -169,11 +169,19 @@ pub(crate) async fn park_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::key_locks::LockedInputsOperation;
     use crate::jobs::store::key_wait::park_job;
     use crate::jobs::store::query::insert_job;
     use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
     use aruna_core::UserId;
+    use aruna_core::keyspaces::{
+        BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+        PATHS_INDEX_KEYSPACE,
+    };
+    use aruna_core::structs::execution::job::CapturedInput;
     use aruna_core::structs::execution::job::{JobId, JobPayload, JobState};
+    use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion};
+    use aruna_core::structs::storage::encryption::BucketEncryption;
     use byteview::ByteView;
 
     #[tokio::test]
@@ -285,6 +293,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.state, JobState::Queued);
+    }
+
+    async fn locked_inputs(
+        context: &DriverContext,
+        inputs: &[CapturedInput],
+        node_id: NodeId,
+    ) -> Result<Vec<KeyWait>, KeyCheckError> {
+        drive(LockedInputsOperation::new(inputs, node_id), context).await
     }
 
     /// A node holding one copy of content `[9; 32]`, sealed with a locked key of bucket "sealed".
