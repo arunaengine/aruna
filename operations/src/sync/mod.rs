@@ -7,6 +7,7 @@ pub mod document_outbox;
 mod evicted;
 pub mod incoming;
 pub mod mirror_repair;
+mod native_serve;
 pub mod outbox_record;
 mod reconcile;
 pub mod replicate_documents;

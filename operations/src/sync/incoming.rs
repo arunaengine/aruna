@@ -546,7 +546,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     Box::pin(self.handle_metadata_stream(stream, node_id)).await;
                 }
                 Alpn::NativeReference => {
-                    Box::pin(crate::staging::native_source::handle_native_stream(
+                    Box::pin(super::native_serve::handle_native_stream(
                         self.context.as_ref(),
                         stream,
                         node_id,

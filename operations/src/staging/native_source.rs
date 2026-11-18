@@ -2,38 +2,41 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_blob::native::{NATIVE_IO_TIMEOUT, read_frame, send_request, write_frame};
+use std::ops::Range;
+
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StagingSourceError;
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::native_reference::{
-    NativeAuthority, NativeRange, NativeReferenceReject, NativeReferenceRequest,
-    NativeReferenceResponse,
+    DelegatedBody, DelegatedReadEffect, NativeAuthority, NativeRange, NativeReferenceReject,
+    NativeReferenceRequest,
 };
-use aruna_core::stream::BackendStream;
+use aruna_core::operation::Operation;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::storage::distribution::delegation::SignedDelegation;
 use aruna_core::structs::storage::read_grant::{
     self, GrantScope, HEAD_OPERATION, MAX_REQUEST_SECS, READ_OPERATION, SignedRequest,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{SyncRelationship, SyncState};
-use aruna_net::NetHandle;
-use aruna_net::streams::{BiStream, SendStream};
-use futures_util::StreamExt;
-use tokio::io::AsyncWriteExt;
-use tokio::time::timeout;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::types::GroupId;
+use bytes::Bytes;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::error::AuthorizeError;
-use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::authorize;
+use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::nonce::SpendNonceOperation;
-use crate::driver::{DriverContext, drive};
-use crate::realm::load_config::load_realm_config;
+use crate::distribution::delegate::{DelegationInput, unsigned_delegation};
+use crate::distribution::nonce::{NonceError, SpendNonceOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
@@ -42,426 +45,562 @@ use crate::s3::object::get::{
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
+use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation, SyncMirrorError};
 use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
 
-struct PreparedReference {
-    metadata: SourceMetadata,
-    group_id: Option<aruna_core::types::GroupId>,
-    body: Option<BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>>,
+/// This node and its realm.
+type Ids = (NodeId, RealmId);
+
+type Reject = NativeReferenceReject;
+
+/// What a peer's request prepared: the answer's metadata and, for a read, its bytes.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PreparedReference {
+    pub(crate) metadata: SourceMetadata,
+    pub(crate) group_id: Option<GroupId>,
+    pub(crate) body: Option<BackendStream<Result<Bytes, StreamError>>>,
 }
 
-/// One exact version read from `holder` for a caller this node verified itself, bound by a
+fn request_operation(request: &NativeReferenceRequest) -> &'static str {
+    match request.head {
+        true => HEAD_OPERATION,
+        false => READ_OPERATION,
+    }
+}
+
+/// One exact version read from the holder for a caller this node verified itself, bound by a
 /// D33 delegation to this operation, version and range.
-pub(crate) async fn delegated_read(
-    context: &DriverContext,
-    caller: crate::distribution::delegate::DelegationInput,
+pub(crate) fn delegated_read(
+    ids: Option<Ids>,
+    caller: DelegationInput,
     arn: &VersionedObjectArn,
-    range: Option<std::ops::Range<u64>>,
+    range: Option<Range<u64>>,
     head: bool,
-) -> Result<(SourceMetadata, Option<aruna_core::types::GroupId>, BiStream), StagingSourceError> {
-    let range = NativeRange::checked(range)?;
-    let operation = if head { HEAD_OPERATION } else { READ_OPERATION };
-    let scope = GrantScope::Version(arn.clone());
-    let digest = read_grant::request_digest(
-        operation,
-        &scope,
-        range.map(|range| (range.start, range.end)),
-    )
-    .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
-    let input = crate::distribution::delegate::DelegationInput {
-        target: arn.node_id,
-        operation: operation.to_string(),
-        bucket: arn.bucket.clone(),
-        key: arn.key.clone(),
-        request_digest: digest,
-        ..caller
-    };
-    let now = aruna_core::time::unix_timestamp_millis() / 1000;
-    let signed = crate::distribution::delegate::issue_delegation(context, input, now)
-        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
-    let request = NativeReferenceRequest {
-        authority: NativeAuthority::Delegated(Box::new(signed)),
-        bucket: arn.bucket.clone(),
-        key: arn.key.clone(),
-        version_id: arn.version,
-        head,
+) -> DelegatedReadOperation {
+    DelegatedReadOperation {
+        ids,
+        caller: Some(caller),
+        arn: arn.clone(),
         range,
-    };
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or(StagingSourceError::HandleMissing)?;
-    let (response, stream) = send_request(net, arn.node_id, request).await?;
-    match response {
-        NativeReferenceResponse::Content(metadata) => Ok((metadata, None, stream)),
-        NativeReferenceResponse::Described { metadata, group_id } => {
-            Ok((metadata, Some(group_id), stream))
-        }
-        NativeReferenceResponse::Rejected(reject) => Err(reject.into()),
+        head,
     }
 }
 
-pub(crate) async fn handle_native_stream(
-    context: &DriverContext,
-    mut stream: BiStream,
-    peer: NodeId,
-) {
-    let request = match timeout(
-        NATIVE_IO_TIMEOUT,
-        read_frame::<NativeReferenceRequest>(&mut stream.1),
-    )
-    .await
-    {
-        Ok(Ok(request)) => request,
-        Ok(Err(error)) => {
-            warn!(%peer, %error, "Failed to read native reference request");
-            return;
-        }
-        Err(_) => {
-            warn!(%peer, "Timed out reading native reference request");
-            return;
-        }
-    };
+#[derive(Debug, PartialEq)]
+pub(crate) struct DelegatedReadOperation {
+    ids: Option<Ids>,
+    caller: Option<DelegationInput>,
+    arn: VersionedObjectArn,
+    range: Option<Range<u64>>,
+    head: bool,
+}
 
-    match prepare_reference(context, peer, &request).await {
-        Ok(mut prepared) => {
-            // Only a caller read names the group; a sync relationship knows its own bucket.
-            let response = match (&request.authority, prepared.group_id) {
-                (NativeAuthority::Relationship(_), _) | (_, None) => {
-                    NativeReferenceResponse::Content(prepared.metadata)
-                }
-                (_, Some(group_id)) => NativeReferenceResponse::Described {
-                    metadata: prepared.metadata,
-                    group_id,
-                },
-            };
-            if write_response(&mut stream.0, &response).await.is_err() {
-                return;
+impl Operation for DelegatedReadOperation {
+    type Output = DelegatedBody;
+    type Error = StagingSourceError;
+
+    fn first(&mut self) -> Result<Next<DelegatedBody>, StagingSourceError> {
+        let range = NativeRange::checked(self.range.clone())?;
+        let operation = match self.head {
+            true => HEAD_OPERATION,
+            false => READ_OPERATION,
+        };
+        let arn = &self.arn;
+        let scope = GrantScope::Version(arn.clone());
+        let digest = read_grant::request_digest(
+            operation,
+            &scope,
+            range.map(|range| (range.start, range.end)),
+        )
+        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+        let ids = self.ids.ok_or(StagingSourceError::HandleMissing)?;
+        let caller = self.caller.take().ok_or(IoError::Unfinished)?;
+        let input = DelegationInput {
+            target: arn.node_id,
+            operation: operation.to_string(),
+            bucket: arn.bucket.clone(),
+            key: arn.key.clone(),
+            request_digest: digest,
+            ..caller
+        };
+        let now = unix_timestamp_millis() / 1000;
+        let read = DelegatedReadEffect {
+            delegation: unsigned_delegation(ids, input, now),
+            version_id: arn.version,
+            head: self.head,
+            range,
+        };
+        let effect = Effect::Net(NetEffect::DelegatedRead(Box::new(read)));
+        Ok(Next::Call(IoCall::from(effect)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<DelegatedBody>, StagingSourceError> {
+        match result.event()? {
+            Event::Net(NetEvent::DelegatedRead(answer)) => Ok(Next::Done(*answer?)),
+            other => Err(IoError::Unexpected {
+                expected: "Event::Net(NetEvent::DelegatedRead)",
+                got: other.label(),
             }
-            if let Some(body) = prepared.body.as_mut() {
-                while let Some(chunk) = body.next().await {
-                    let chunk = match chunk {
-                        Ok(chunk) => chunk,
-                        Err(error) => {
-                            warn!(%peer, %error, "Failed to read native reference source");
-                            stream.0.reset(1u32.into()).ok();
-                            return;
-                        }
-                    };
-                    if !matches!(
-                        timeout(NATIVE_IO_TIMEOUT, stream.0.write_all(&chunk)).await,
-                        Ok(Ok(()))
-                    ) {
-                        return;
-                    }
-                }
-            }
-        }
-        Err(reject) => {
-            if write_response(&mut stream.0, &NativeReferenceResponse::Rejected(reject))
-                .await
-                .is_err()
-            {
-                return;
-            }
+            .into()),
         }
     }
-    stream.0.finish().ok();
 }
 
-async fn write_response(
-    send: &mut SendStream,
-    response: &NativeReferenceResponse,
-) -> Result<(), String> {
-    timeout(NATIVE_IO_TIMEOUT, write_frame(send, response))
-        .await
-        .map_err(|_| "native response timed out".to_string())?
+/// What a signed grant or delegation vouches for, once its signature and scope are checked.
+#[derive(Debug, PartialEq)]
+struct VouchedRead {
+    issuer: NodeId,
+    nonce: [u8; 16],
+    expires: u64,
+    now: u64,
+    auth: AuthContext,
 }
 
-async fn prepare_reference(
-    context: &DriverContext,
-    peer: NodeId,
+fn version_scope((node_id, realm_id): Ids, request: &NativeReferenceRequest) -> GrantScope {
+    GrantScope::Version(VersionedObjectArn {
+        realm_id,
+        node_id,
+        bucket: request.bucket.clone(),
+        key: request.key.clone(),
+        version: request.version_id,
+    })
+}
+
+fn request_digest(
+    scope: &GrantScope,
     request: &NativeReferenceRequest,
-) -> Result<PreparedReference, NativeReferenceReject> {
-    let net_handle = context.net_handle.as_ref().ok_or_else(|| {
-        NativeReferenceReject::Unavailable("network handle unavailable".to_string())
-    })?;
-    let relationship_id = match &request.authority {
-        NativeAuthority::Relationship(relationship_id) => *relationship_id,
-        NativeAuthority::Granted(signed) => {
-            return Box::pin(prepare_granted(context, peer, request, signed)).await;
-        }
-        NativeAuthority::Delegated(signed) => {
-            return Box::pin(prepare_delegated(context, peer, request, signed)).await;
-        }
-    };
-    let relationship = drive(
-        GetRelationshipOperation::new(relationship_id, SyncRelationshipDirection::Outgoing),
-        context,
-    )
-    .await
-    .map_err(map_relationship_error)?;
-    validate_relationship(net_handle, peer, &relationship, request)?;
-    let auth_context = AuthContext {
-        user_id: relationship.created_by,
-        realm_id: relationship.source.realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    let read = read_exact(context, &auth_context, relationship.source.node_id, request).await;
-    if matches!(read, Err(NativeReferenceReject::AccessDenied)) {
-        mark_access_denied(context, relationship).await;
-    }
-    read
+) -> Result<[u8; 32], Reject> {
+    let range = request.range.map(|range| (range.start, range.end));
+    read_grant::request_digest(request_operation(request), scope, range)
+        .map_err(|_| Reject::AccessDenied)
 }
 
-/// A read a grant of this node covers: the reading node signed it, is realm infrastructure,
-/// sent it once, and asks exactly the version and range the grant and request name.
-async fn prepare_granted(
-    context: &DriverContext,
-    peer: NodeId,
+/// A read a grant of this node covers: signed by the reading node, for exactly the version and
+/// range the grant and request name.
+fn vouched_grant(
+    ids: Ids,
     request: &NativeReferenceRequest,
     signed: &SignedRequest,
-) -> Result<PreparedReference, NativeReferenceReject> {
-    let net = context.net_handle.as_ref().ok_or_else(|| {
-        NativeReferenceReject::Unavailable("network handle unavailable".to_string())
-    })?;
-    let now = aruna_core::time::unix_timestamp_millis() / 1000;
-    let granted = signed
-        .verify(*net.realm_id(), net.node_id(), now)
-        .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    let config = load_realm_config(context, *net.realm_id())
-        .await
-        .ok_or_else(|| {
-            NativeReferenceReject::Unavailable("realm config unavailable".to_string())
-        })?;
-    if granted.issuer != peer || !is_sync_eligible(&config, peer) {
-        return Err(NativeReferenceReject::AccessDenied);
-    }
+    now: u64,
+) -> Result<VouchedRead, Reject> {
+    let granted = (signed.verify(ids.1, ids.0, now)).map_err(|_| Reject::AccessDenied)?;
     let grant = &granted.grant.grant;
-    let scope = GrantScope::Version(VersionedObjectArn {
-        realm_id: *net.realm_id(),
-        node_id: net.node_id(),
-        bucket: request.bucket.clone(),
-        key: request.key.clone(),
-        version: request.version_id,
-    });
-    let operation = if request.head {
-        HEAD_OPERATION
-    } else {
-        READ_OPERATION
-    };
-    let range = request.range.map(|range| (range.start, range.end));
-    let digest = read_grant::request_digest(operation, &scope, range)
-        .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    if grant.scope != scope || granted.operation != operation || granted.request_digest != digest {
-        return Err(NativeReferenceReject::AccessDenied);
+    let scope = version_scope(ids, request);
+    let digest = request_digest(&scope, request)?;
+    if grant.scope != scope
+        || granted.operation != request_operation(request)
+        || granted.request_digest != digest
+    {
+        return Err(Reject::AccessDenied);
     }
-    let expires = granted.issued_at.saturating_add(2 * MAX_REQUEST_SECS);
-    drive(
-        SpendNonceOperation::new(granted.nonce, expires, now),
-        context,
-    )
-    .await
-    .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    let auth_context = AuthContext {
-        user_id: grant.user_id,
-        realm_id: grant.realm_id,
-        path_restrictions: grant.restrictions.clone(),
-        session: None,
-    };
-    refuse_governed(context, request).await?;
-    read_exact(context, &auth_context, net.node_id(), request).await
+    Ok(VouchedRead {
+        issuer: granted.issuer,
+        nonce: granted.nonce,
+        expires: granted.issued_at.saturating_add(2 * MAX_REQUEST_SECS),
+        now,
+        auth: AuthContext {
+            user_id: grant.user_id,
+            realm_id: grant.realm_id,
+            path_restrictions: grant.restrictions.clone(),
+            session: None,
+        },
+    })
 }
 
-/// A read the reading node vouches for in one D33 delegation: signed by a realm
-/// infrastructure node, unused, and naming this exact version, operation and range.
-async fn prepare_delegated(
-    context: &DriverContext,
-    peer: NodeId,
+/// A read the reading node vouches for in one D33 delegation naming this exact version,
+/// operation and range.
+fn vouched_delegation(
+    ids: Ids,
     request: &NativeReferenceRequest,
     signed: &SignedDelegation,
-) -> Result<PreparedReference, NativeReferenceReject> {
-    let net = context.net_handle.as_ref().ok_or_else(|| {
-        NativeReferenceReject::Unavailable("network handle unavailable".to_string())
-    })?;
-    let now = aruna_core::time::unix_timestamp_millis() / 1000;
-    let delegation = signed
-        .verify(*net.realm_id(), net.node_id(), now)
-        .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    let config = load_realm_config(context, *net.realm_id())
-        .await
-        .ok_or_else(|| {
-            NativeReferenceReject::Unavailable("realm config unavailable".to_string())
-        })?;
-    if delegation.issuer != peer || !is_sync_eligible(&config, peer) {
-        return Err(NativeReferenceReject::AccessDenied);
-    }
-    let scope = GrantScope::Version(VersionedObjectArn {
-        realm_id: *net.realm_id(),
-        node_id: net.node_id(),
-        bucket: request.bucket.clone(),
-        key: request.key.clone(),
-        version: request.version_id,
-    });
-    let operation = if request.head {
-        HEAD_OPERATION
-    } else {
-        READ_OPERATION
-    };
-    let range = request.range.map(|range| (range.start, range.end));
-    let digest = read_grant::request_digest(operation, &scope, range)
-        .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    if delegation.operation != operation
+    now: u64,
+) -> Result<VouchedRead, Reject> {
+    let delegation = (signed.verify(ids.1, ids.0, now)).map_err(|_| Reject::AccessDenied)?;
+    let digest = request_digest(&version_scope(ids, request), request)?;
+    if delegation.operation != request_operation(request)
         || delegation.bucket != request.bucket
         || delegation.key != request.key
         || delegation.request_digest != digest
     {
-        return Err(NativeReferenceReject::AccessDenied);
+        return Err(Reject::AccessDenied);
     }
-    let expires = delegation.issued_at.saturating_add(2 * MAX_REQUEST_SECS);
-    drive(
-        SpendNonceOperation::new(delegation.nonce, expires, now),
-        context,
-    )
-    .await
-    .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    let auth_context = AuthContext {
-        user_id: delegation.user_id,
-        realm_id: delegation.realm_id,
-        path_restrictions: delegation.restrictions.clone(),
-        session: None,
-    };
-    refuse_governed(context, request).await?;
-    read_exact(context, &auth_context, net.node_id(), request).await
+    Ok(VouchedRead {
+        issuer: delegation.issuer,
+        nonce: delegation.nonce,
+        expires: delegation.issued_at.saturating_add(2 * MAX_REQUEST_SECS),
+        now,
+        auth: AuthContext {
+            user_id: delegation.user_id,
+            realm_id: delegation.realm_id,
+            path_restrictions: delegation.restrictions.clone(),
+            session: None,
+        },
+    })
 }
 
-/// Governed content answers only the managed read's destination challenge.
-async fn refuse_governed(
-    context: &DriverContext,
-    request: &NativeReferenceRequest,
-) -> Result<(), NativeReferenceReject> {
-    let head = drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: request.bucket.clone(),
-            key: request.key.clone(),
-            version_id: Some(request.version_id),
-        }),
-        context,
-    )
-    .await
-    .map_err(map_head_error)?;
-    match head.source_policies.is_empty() {
-        true => Ok(()),
-        false => Err(NativeReferenceReject::AccessDenied),
+/// What the pending call of preparing a peer's read answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrepareStep {
+    Relationship,
+    RelationshipRead,
+    Denied,
+    Config,
+    Nonce,
+    Governed,
+    VouchedRead,
+}
+
+/// Checks a peer's read under its relationship, grant or delegation, then prepares the answer.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PrepareReferenceOperation {
+    ids: Option<Ids>,
+    peer: NodeId,
+    request: NativeReferenceRequest,
+    step: PrepareStep,
+    vouched: Option<VouchedRead>,
+    relationship: Option<SyncRelationship>,
+}
+
+type PrepareTurn = Result<Next<PreparedReference>, Reject>;
+
+impl PrepareReferenceOperation {
+    pub(crate) fn new(ids: Option<Ids>, peer: NodeId, request: NativeReferenceRequest) -> Self {
+        Self {
+            ids,
+            peer,
+            request,
+            step: PrepareStep::Relationship,
+            vouched: None,
+            relationship: None,
+        }
+    }
+
+    fn ids(&self) -> Result<Ids, Reject> {
+        (self.ids).ok_or_else(|| Reject::Unavailable("network handle unavailable".to_string()))
+    }
+
+    fn head_call(&self) -> IoCall {
+        IoCall::child(HeadObjectOperation::new(HeadObjectInput {
+            bucket: self.request.bucket.clone(),
+            key: self.request.key.clone(),
+            version_id: Some(self.request.version_id),
+        }))
+    }
+
+    fn read_call(&self, auth: AuthContext, node_id: NodeId) -> IoCall {
+        IoCall::child(ReadExactOperation::new(auth, node_id, self.request.clone()))
+    }
+
+    fn vouched(&mut self, vouched: VouchedRead) -> PrepareTurn {
+        let realm_id = self.ids()?.1;
+        self.vouched = Some(vouched);
+        self.step = PrepareStep::Config;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn vouched_read(&self) -> Result<&VouchedRead, IoError> {
+        self.vouched.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn configured(&mut self, config: Result<RealmConfigDocument, GetConfigError>) -> PrepareTurn {
+        let config = config.map_err(|error| {
+            warn!(%error, "realm config unavailable; querying the local replica");
+            Reject::Unavailable("realm config unavailable".to_string())
+        })?;
+        let vouched = self.vouched_read()?;
+        if vouched.issuer != self.peer || !is_sync_eligible(&config, self.peer) {
+            return Err(Reject::AccessDenied);
+        }
+        let spend = SpendNonceOperation::new(vouched.nonce, vouched.expires, vouched.now);
+        self.step = PrepareStep::Nonce;
+        Ok(Next::Call(IoCall::child(spend)))
     }
 }
 
-/// Authorizes `auth_context` like an S3 read of the exact version, then reads it.
-async fn read_exact(
-    context: &DriverContext,
-    auth_context: &AuthContext,
+impl Operation for PrepareReferenceOperation {
+    type Output = PreparedReference;
+    type Error = Reject;
+
+    fn first(&mut self) -> PrepareTurn {
+        let ids = self.ids()?;
+        let now = unix_timestamp_millis() / 1000;
+        match &self.request.authority {
+            NativeAuthority::Relationship(relationship_id) => {
+                let direction = SyncRelationshipDirection::Outgoing;
+                let get = GetRelationshipOperation::new(*relationship_id, direction);
+                Ok(Next::Call(IoCall::child(get)))
+            }
+            NativeAuthority::Granted(signed) => {
+                let vouched = vouched_grant(ids, &self.request, signed, now)?;
+                self.vouched(vouched)
+            }
+            NativeAuthority::Delegated(signed) => {
+                let vouched = vouched_delegation(ids, &self.request, signed, now)?;
+                self.vouched(vouched)
+            }
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> PrepareTurn {
+        match self.step {
+            PrepareStep::Relationship => {
+                let relationship = result.child::<SyncRelationship, SyncRelationshipError>()?;
+                let relationship = relationship.map_err(map_relationship_error)?;
+                let ids = self.ids()?;
+                validate_relationship(ids, self.peer, &relationship, &self.request)?;
+                let auth = AuthContext {
+                    user_id: relationship.created_by,
+                    realm_id: relationship.source.realm_id,
+                    path_restrictions: None,
+                    session: None,
+                };
+                let call = self.read_call(auth, relationship.source.node_id);
+                self.relationship = Some(relationship);
+                self.step = PrepareStep::RelationshipRead;
+                Ok(Next::Call(call))
+            }
+            PrepareStep::RelationshipRead => match result.child::<PreparedReference, Reject>()? {
+                Err(Reject::AccessDenied) => {
+                    let relationship = self.relationship.take().ok_or(IoError::Unfinished)?;
+                    self.step = PrepareStep::Denied;
+                    let mark = MarkDeniedOperation::new(relationship);
+                    Ok(Next::Call(IoCall::child(mark)))
+                }
+                read => Ok(Next::Done(read?)),
+            },
+            PrepareStep::Denied => {
+                result.child::<(), IoError>()?.ok();
+                Err(Reject::AccessDenied)
+            }
+            PrepareStep::Config => {
+                self.configured(result.child::<RealmConfigDocument, GetConfigError>()?)
+            }
+            PrepareStep::Nonce => {
+                let spent = result.child::<(), NonceError>()?;
+                spent.map_err(|_| Reject::AccessDenied)?;
+                self.step = PrepareStep::Governed;
+                Ok(Next::Call(self.head_call()))
+            }
+            // Governed content answers only the managed read's destination challenge.
+            PrepareStep::Governed => {
+                let head = result.child::<HeadObjectResult, HeadObjectError>()?;
+                if !head.map_err(map_head_error)?.source_policies.is_empty() {
+                    return Err(Reject::AccessDenied);
+                }
+                let node_id = self.ids()?.0;
+                let auth = self.vouched_read()?.auth.clone();
+                self.step = PrepareStep::VouchedRead;
+                Ok(Next::Call(self.read_call(auth, node_id)))
+            }
+            PrepareStep::VouchedRead => {
+                Ok(Next::Done(result.child::<PreparedReference, Reject>()??))
+            }
+        }
+    }
+}
+
+/// What the pending call of an authorized read answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadStep {
+    Bucket,
+    Authorize,
+    Head,
+    Get,
+}
+
+/// Authorizes the caller like an S3 read of the exact version, then reads it.
+#[derive(Debug, PartialEq)]
+struct ReadExactOperation {
+    auth: AuthContext,
     node_id: NodeId,
-    request: &NativeReferenceRequest,
-) -> Result<PreparedReference, NativeReferenceReject> {
-    let bucket_info = match drive(GetBucketOperation::new(request.bucket.clone()), context).await {
-        Ok(info) => info,
-        Err(GetBucketError::NotFound) => {
-            return Err(NativeReferenceReject::NotFound);
-        }
-        Err(error) => {
-            return Err(NativeReferenceReject::Unavailable(error.to_string()));
-        }
-    };
-    let path = object_permission_path(
-        auth_context.realm_id,
-        bucket_info.group_id,
-        node_id,
-        &request.bucket,
-        &request.key,
-    );
-    if let Err(error) = authorize(
-        context,
-        auth_context.realm_id,
-        auth_context,
-        &path,
-        &Permission::READ,
-        PolicyRequestExtras::operation(if request.head {
-            HEAD_OPERATION
-        } else {
-            READ_OPERATION
-        }),
-    )
-    .await
-    {
-        match error {
-            AuthorizeError::PermissionDenied
-            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => {
-                return Err(NativeReferenceReject::AccessDenied);
-            }
-            AuthorizeError::Policy(PolicyEnforcementError::Unavailable(error)) => {
-                return Err(NativeReferenceReject::Unavailable(error));
-            }
-            AuthorizeError::CheckFailed(error) => {
-                return Err(NativeReferenceReject::Unavailable(error));
-            }
-            AuthorizeError::Storage(error) => {
-                return Err(NativeReferenceReject::Unavailable(error.to_string()));
-            }
+    request: NativeReferenceRequest,
+    step: ReadStep,
+    group_id: Option<GroupId>,
+}
+
+type ReadTurn = Result<Next<PreparedReference>, Reject>;
+
+impl ReadExactOperation {
+    fn new(auth: AuthContext, node_id: NodeId, request: NativeReferenceRequest) -> Self {
+        Self {
+            auth,
+            node_id,
+            request,
+            step: ReadStep::Bucket,
+            group_id: None,
         }
     }
 
-    if request.head {
-        let result = drive(
-            HeadObjectOperation::new(HeadObjectInput {
+    fn group(&self) -> Result<GroupId, IoError> {
+        self.group_id.ok_or(IoError::Unfinished)
+    }
+
+    fn authorize(&mut self, bucket: BucketInfo) -> ReadTurn {
+        self.group_id = Some(bucket.group_id);
+        let request = &self.request;
+        let path = object_permission_path(
+            self.auth.realm_id,
+            bucket.group_id,
+            self.node_id,
+            &request.bucket,
+            &request.key,
+        );
+        let extras = PolicyRequestExtras::operation(request_operation(request));
+        let authorize = AuthorizeOperation::new(
+            self.auth.realm_id,
+            self.auth.clone(),
+            path,
+            Permission::READ,
+            extras,
+        );
+        self.step = ReadStep::Authorize;
+        Ok(Next::Call(IoCall::child(authorize)))
+    }
+
+    fn read(&mut self) -> ReadTurn {
+        let request = &self.request;
+        if request.head {
+            self.step = ReadStep::Head;
+            let head = HeadObjectOperation::new(HeadObjectInput {
                 bucket: request.bucket.clone(),
                 key: request.key.clone(),
                 version_id: Some(request.version_id),
-            }),
-            context,
-        )
-        .await
-        .map_err(map_head_error)?;
-        let metadata = head_metadata(&result, request.version_id)?;
-        return Ok(PreparedReference {
-            metadata,
-            group_id: Some(bucket_info.group_id),
-            body: None,
+            });
+            return Ok(Next::Call(IoCall::child(head)));
+        }
+        let range = request.range.map(|range| ObjectRangeRequest::StartEnd {
+            start: range.start,
+            end: range.end.saturating_sub(1),
         });
-    }
-
-    let range = request.range.map(|range| ObjectRangeRequest::StartEnd {
-        start: range.start,
-        end: range.end.saturating_sub(1),
-    });
-    let result = drive(
-        GetObjectOperation::new(GetObjectInput {
+        let get = GetObjectOperation::new(GetObjectInput {
             bucket: request.bucket.clone(),
             key: request.key.clone(),
             version_id: Some(request.version_id),
             range,
-            group_id: bucket_info.group_id,
-            user_identity: auth_context.user_id,
-            realm_id: auth_context.realm_id,
-            node_id,
-        }),
-        context,
-    )
-    .await
-    .map_err(map_get_error)?;
-    let metadata = result_metadata(&result, request.version_id)?;
-    Ok(PreparedReference {
-        metadata,
-        group_id: Some(bucket_info.group_id),
-        body: Some(result.blob),
-    })
+            group_id: self.group()?,
+            user_identity: self.auth.user_id,
+            realm_id: self.auth.realm_id,
+            node_id: self.node_id,
+        });
+        self.step = ReadStep::Get;
+        Ok(Next::Call(IoCall::child(get)))
+    }
+}
+
+impl Operation for ReadExactOperation {
+    type Output = PreparedReference;
+    type Error = Reject;
+
+    fn first(&mut self) -> ReadTurn {
+        let bucket = GetBucketOperation::new(self.request.bucket.clone());
+        Ok(Next::Call(IoCall::child(bucket)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ReadTurn {
+        let version_id = self.request.version_id;
+        match self.step {
+            ReadStep::Bucket => match result.child::<BucketInfo, GetBucketError>()? {
+                Ok(bucket) => self.authorize(bucket),
+                Err(GetBucketError::NotFound) => Err(Reject::NotFound),
+                Err(error) => Err(Reject::Unavailable(error.to_string())),
+            },
+            ReadStep::Authorize => {
+                let allowed = result.child::<(), AuthorizeError>()?;
+                allowed.map_err(map_authorize_error)?;
+                self.read()
+            }
+            ReadStep::Head => {
+                let head = result.child::<HeadObjectResult, HeadObjectError>()?;
+                let head = head.map_err(map_head_error)?;
+                Ok(Next::Done(PreparedReference {
+                    metadata: head_metadata(&head, version_id)?,
+                    group_id: Some(self.group()?),
+                    body: None,
+                }))
+            }
+            ReadStep::Get => {
+                let get = result.child::<GetObjectResult, GetObjectError>()?;
+                let get = get.map_err(map_get_error)?;
+                Ok(Next::Done(PreparedReference {
+                    metadata: result_metadata(&get, version_id)?,
+                    group_id: Some(self.group()?),
+                    body: Some(get.blob),
+                }))
+            }
+        }
+    }
+}
+
+/// Fails a relationship whose creator lost read access. A detached stub has no visible status
+/// entry, and marking it failed would stop retained reads, so only the request reports denial.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MarkDeniedOperation {
+    relationship: SyncRelationship,
+    kicking: bool,
+}
+
+impl MarkDeniedOperation {
+    fn new(relationship: SyncRelationship) -> Self {
+        Self {
+            relationship,
+            kicking: false,
+        }
+    }
+}
+
+impl Operation for MarkDeniedOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let relationship = &mut self.relationship;
+        if relationship.state == SyncState::Detached {
+            return Ok(Next::Done(()));
+        }
+        relationship.state = SyncState::Failed {
+            reason: "access_denied".to_string(),
+        };
+        relationship.status.last_error = Some("access_denied".to_string());
+        let counters = &mut relationship.status.counters;
+        counters.failures = counters.failures.saturating_add(1);
+        counters.consecutive_failures = counters.consecutive_failures.saturating_add(1);
+        let store = StoreStatusOperation::new(relationship.clone());
+        Ok(Next::Call(IoCall::child(store)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.kicking {
+            result.child::<(), SyncMirrorError>()?.ok();
+            return Ok(Next::Done(()));
+        }
+        match result.child::<bool, SyncMirrorError>()? {
+            Ok(true) => {
+                self.kicking = true;
+                Ok(Next::Call(IoCall::child(KickRepairOperation::new())))
+            }
+            Ok(false) => Ok(Next::Done(())),
+            Err(error) => {
+                warn!(%error, "Failed to persist native reference denial");
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+fn map_authorize_error(error: AuthorizeError) -> Reject {
+    match error {
+        AuthorizeError::PermissionDenied
+        | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => Reject::AccessDenied,
+        AuthorizeError::Policy(PolicyEnforcementError::Unavailable(error))
+        | AuthorizeError::CheckFailed(error) => Reject::Unavailable(error),
+        AuthorizeError::Storage(error) => Reject::Unavailable(error.to_string()),
+    }
 }
 
 fn validate_relationship(
-    net_handle: &NetHandle,
+    (node_id, realm_id): Ids,
     peer: NodeId,
     relationship: &SyncRelationship,
     request: &NativeReferenceRequest,
@@ -474,8 +613,8 @@ fn validate_relationship(
     // Other disabled states refuse access.
     if !relationship.serves_references()
         || !matches!(relationship.state, SyncState::Enabled | SyncState::Detached)
-        || relationship.source.realm_id != *net_handle.realm_id()
-        || relationship.source.node_id != net_handle.node_id()
+        || relationship.source.realm_id != realm_id
+        || relationship.source.node_id != node_id
         || relationship.target.node_id != peer
         || relationship.source.bucket() != Some(request.bucket.as_str())
         || !valid_prefix
@@ -577,35 +716,88 @@ fn head_metadata(
     Ok(metadata)
 }
 
-async fn mark_access_denied(context: &DriverContext, mut relationship: SyncRelationship) {
-    if relationship.state == SyncState::Detached {
-        // Detached stubs have no visible status entry. Marking them failed would stop retained
-        // reads, so only the request reports denial.
-        return;
-    }
-    relationship.state = SyncState::Failed {
-        reason: "access_denied".to_string(),
-    };
-    relationship.status.last_error = Some("access_denied".to_string());
-    relationship.status.counters.failures = relationship.status.counters.failures.saturating_add(1);
-    relationship.status.counters.consecutive_failures = relationship
-        .status
-        .counters
-        .consecutive_failures
-        .saturating_add(1);
-    match drive(StoreStatusOperation::new(relationship.clone()), context).await {
-        Ok(true) => _ = drive(KickRepairOperation::new(), context).await,
-        Ok(false) => {}
-        Err(error) => warn!(%error, "Failed to persist native reference denial"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
     use aruna_storage::storage::FjallStorage;
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn ids() -> Ids {
+        let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        (node, RealmId::from_bytes([2; 32]))
+    }
+
+    fn read_request(authority: NativeAuthority) -> NativeReferenceRequest {
+        NativeReferenceRequest {
+            authority,
+            bucket: "source".to_string(),
+            key: "data.txt".to_string(),
+            version_id: Ulid::from_bytes([3; 16]),
+            head: false,
+            range: None,
+        }
+    }
+
+    // Without a network there is no identity to check a peer's read against.
+    #[test]
+    fn needs_network_ids() {
+        let peer = ids().0;
+        let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
+        let mut prepare = PrepareReferenceOperation::new(None, peer, read_request(authority));
+        assert!(matches!(prepare.first(), Err(Reject::Unavailable(_))));
+    }
+
+    // An unknown relationship is denied, so its existence stays hidden.
+    #[test]
+    fn unknown_relationship_denied() {
+        let peer = ids().0;
+        let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
+        let mut prepare =
+            PrepareReferenceOperation::new(Some(ids()), peer, read_request(authority));
+        prepare.first().unwrap();
+        let answer = prepare.next(child(Err::<SyncRelationship, _>(
+            SyncRelationshipError::NotFound,
+        )));
+        assert_eq!(answer, Err(Reject::AccessDenied));
+    }
+
+    // A missing bucket answers not found before any permission is checked.
+    #[test]
+    fn missing_bucket_found() {
+        let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
+        let auth = AuthContext {
+            user_id: aruna_core::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
+            realm_id: ids().1,
+            path_restrictions: None,
+            session: None,
+        };
+        let mut read = ReadExactOperation::new(auth, ids().0, read_request(authority));
+        read.first().unwrap();
+        let answer = read.next(child(Err::<BucketInfo, _>(GetBucketError::NotFound)));
+        assert_eq!(answer, Err(Reject::NotFound));
+    }
+
+    // A denied policy is a denial; a failed check stays retryable.
+    #[test]
+    fn maps_authorize_errors() {
+        assert_eq!(
+            map_authorize_error(AuthorizeError::PermissionDenied),
+            Reject::AccessDenied
+        );
+        let failed = map_authorize_error(AuthorizeError::CheckFailed("down".to_string()));
+        assert_eq!(failed, Reject::Unavailable("down".to_string()));
+    }
 
     // The relaying peer must learn that a pinned observation is gone (NotFound)
     // rather than treating it as a transient origin failure.
@@ -686,7 +878,9 @@ mod tests {
         };
         storage.send_storage_effect(write).await;
 
-        mark_access_denied(&context, relationship.clone()).await;
+        drive(MarkDeniedOperation::new(relationship.clone()), &context)
+            .await
+            .unwrap();
 
         let pending = aruna_core::plugin_runs::PENDING_ROW;
         let page = crate::plugins::journal::journal_page(pending, None, 10);
@@ -697,18 +891,14 @@ mod tests {
         assert!(rows[0].1.source.starts_with(&transition));
     }
 
-    #[tokio::test]
-    async fn preserve_allows_native() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let net = NetHandle::new(crate::testing::local_net(), storage)
-            .await
-            .unwrap();
-        let peer = iroh::SecretKey::generate().public();
-        let realm_id = *net.realm_id();
+    #[test]
+    fn preserve_allows_native() {
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let realm_id = RealmId::from_bytes([8; 32]);
+        let peer = iroh::SecretKey::from_bytes(&[9; 32]).public();
         let mut relationship = SyncRelationship {
             id: Ulid::generate(),
-            source: ArunaArn::s3_bucket(realm_id, net.node_id(), "source").unwrap(),
+            source: ArunaArn::s3_bucket(realm_id, node, "source").unwrap(),
             target: ArunaArn::s3_bucket(realm_id, peer, "target").unwrap(),
             mode: SyncMode::Continuous,
             reference_handling: ReferenceHandling::Materialize,
@@ -729,12 +919,12 @@ mod tests {
         };
 
         assert_eq!(
-            validate_relationship(&net, peer, &relationship, &request),
+            validate_relationship((node, realm_id), peer, &relationship, &request),
             Err(NativeReferenceReject::AccessDenied)
         );
         relationship.set_reference_handling(ReferenceHandling::Preserve);
-        assert!(validate_relationship(&net, peer, &relationship, &request).is_ok());
+        assert!(validate_relationship((node, realm_id), peer, &relationship, &request).is_ok());
         relationship.set_reference_handling(ReferenceHandling::Materialize);
-        assert!(validate_relationship(&net, peer, &relationship, &request).is_ok());
+        assert!(validate_relationship((node, realm_id), peer, &relationship, &request).is_ok());
     }
 }
