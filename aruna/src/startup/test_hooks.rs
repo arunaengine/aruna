@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use aruna_operations::driver::DriverContext;
 use aruna_operations::node::recovery::RecoveryStatus;
-use aruna_operations::node::startup::{RecoveryConfig, run_recovery};
+use aruna_operations::shard::restore::{RecoveryConfig, run_recovery};
 #[cfg(debug_assertions)]
 use tokio_util::sync::CancellationToken;
 #[cfg(debug_assertions)]

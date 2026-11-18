@@ -10,7 +10,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::node::document_sync::{apply_metadata, run_maintenance};
+use crate::metadata::after_sync::{apply_metadata, run_maintenance};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;

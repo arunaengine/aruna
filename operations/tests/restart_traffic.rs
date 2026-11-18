@@ -15,7 +15,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::node::restore_plan::RESTORE_TOPIC_COUNT;
-use aruna_operations::node::startup::restore_shard_subscriptions;
+use aruna_operations::shard::restore::restore_shard_subscriptions;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -437,7 +437,7 @@ fn spawn_recovery(
     tokio::task::JoinHandle<()>,
 ) {
     use aruna_operations::node::recovery::RecoveryStatus;
-    use aruna_operations::node::startup::{RecoveryConfig, run_recovery};
+    use aruna_operations::shard::restore::{RecoveryConfig, run_recovery};
     use tokio_util::sync::CancellationToken;
 
     let status = RecoveryStatus::new();
@@ -555,7 +555,7 @@ async fn finish_outage(
     );
     // Each restored peer runs its own restore, as every configured node does.
     for peer in &nodes[1..] {
-        aruna_operations::node::startup::restore_shard_subscriptions(
+        aruna_operations::shard::restore::restore_shard_subscriptions(
             &peer.context,
             peer.net.node_id(),
             realm_id,

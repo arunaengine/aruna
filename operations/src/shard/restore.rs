@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
-use crate::node::document_sync::apply_metadata;
+use crate::metadata::after_sync::apply_metadata;
 use crate::node::recovery::{
     PhaseOutcome, RecoveryDecision, RecoveryError, RecoveryOutcome, RecoveryPass, RecoveryRotation,
     RecoveryStatus, apply_recovery_pass,
@@ -346,13 +346,13 @@ async fn usage_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    let result = crate::node::usage_publish::publish_refresh_snapshots(
+    let publish = crate::node::usage_publish::PublishUsageOperation::new(
         context.as_ref(),
-        config.node_id,
-        config.realm_id,
+        (config.node_id, config.realm_id),
         true,
-    )
-    .await;
+        true,
+    );
+    let result = drive(publish, context.as_ref()).await;
     match result {
         Ok(_) => {
             *pending = false;
