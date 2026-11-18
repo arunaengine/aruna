@@ -941,189 +941,6 @@ impl Operation for ForgetRemovedOperation {
                 Ok(Next::Done(self.left))
             }
         }
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => return Ok(queued),
-        }
-    }
-}
-
-async fn exists(
-    storage: &StorageHandle,
-    key_space: &str,
-    key: Vec<u8>,
-    txn_id: Option<TxnId>,
-) -> Result<bool, String> {
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        txn_id,
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-        other => Err(format!("could not read {key_space}: {}", other.label())),
-    }
-}
-
-/// Stores progress unless a newer change replaced it; retirement keeps the queue until copies wake.
-async fn store(
-    storage: &StorageHandle,
-    bucket: &str,
-    record: &mut EncryptionTransition,
-) -> Result<bool, String> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => {
-            return Err(format!(
-                "could not start a progress transaction: {}",
-                other.label()
-            ));
-        }
-    };
-    let staged = stage(storage, txn_id, bucket, record).await;
-    if !matches!(staged, Ok(true)) {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return staged;
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        other => Err(format!(
-            "transition progress was not stored: {}",
-            other.label()
-        )),
-    }
-}
-
-async fn stage(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    bucket: &str,
-    record: &mut EncryptionTransition,
-) -> Result<bool, String> {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let read = StorageEffect::Read {
-        key_space: TRANSITION_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: Some(txn_id),
-    };
-    let stored = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => EncryptionTransition::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
-        other => {
-            return Err(format!(
-                "could not read transition progress: {}",
-                other.label()
-            ));
-        }
-    };
-    if stored.started_at_ms != record.started_at_ms || stored.kind != record.kind {
-        return Ok(false);
-    }
-    if record.state == TransitionState::Finished {
-        let pending = pending_on_source(storage, record, txn_id).await?
-            + envelopes_on_source(storage, txn_id, bucket, record).await?;
-        let versions = source_versions(storage, txn_id, bucket, record).await?;
-        if pending + versions > 0 {
-            record.finished_at_ms = None;
-            record.cursor = None;
-            record.remaining = pending + versions;
-            record.state = if versions > 0 {
-                TransitionState::Running
-            } else {
-                TransitionState::Blocked
-            };
-            record.blocked_reason = (versions == 0).then(|| PENDING_REASON.to_string());
-            record.retry_at_ms = Some(
-                aruna_core::time::unix_timestamp_millis()
-                    .saturating_add(RECHECK.as_millis() as u64),
-            );
-        }
-    }
-    let value = record.to_bytes().map_err(|error| error.to_string())?;
-    let mut effects = vec![StorageEffect::Write {
-        key_space: TRANSITION_KEYSPACE.to_string(),
-        key: key.clone(),
-        value: value.into(),
-        txn_id: Some(txn_id),
-    }];
-    if record.finished_at_ms.is_some() {
-        effects.push(StorageEffect::Delete {
-            key_space: TRANSITION_QUEUE_KEYSPACE.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        });
-    } else if record.state == TransitionState::Finished {
-        effects.extend(retire_source(storage, txn_id, record).await?);
-    }
-    for effect in effects {
-        match storage.send_storage_effect(effect).await {
-            Event::Storage(
-                StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-            ) => {}
-            other => {
-                return Err(format!(
-                    "could not store transition progress: {}",
-                    other.label()
-                ));
-            }
-        }
-    }
-    Ok(true)
-}
-
-async fn source_versions(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    bucket: &str,
-    record: &EncryptionTransition,
-) -> Result<u64, String> {
-    let (mut after, mut count) = (None, 0);
-    let prefix: Key = VersionKey::bucket_prefix(bucket)
-        .map_err(|e| e.to_string())?
-        .into();
-    loop {
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            BLOB_VERSIONS_KEYSPACE,
-            Some(prefix.clone()),
-            after,
-            PAGE,
-            Some(txn_id),
-        )
-        .await?;
-        for (_, value) in rows {
-            let version = BlobVersion::from_bytes(&value).map_err(|e| e.to_string())?;
-            let Some(key) = version.location_key() else {
-                continue;
-            };
-            let read = StorageEffect::Read {
-                key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
-                key: key.to_bytes().into(),
-                txn_id: Some(txn_id),
-            };
-            let Event::Storage(StorageEvent::ReadResult {
-                value: Some(value), ..
-            }) = storage.send_storage_effect(read).await
-            else {
-                return Err("could not read a remaining version's location".to_string());
-            };
-            let location = BackendLocation::from_bytes(&value).map_err(|e| e.to_string())?;
-            count += u64::from(record.needs(&location));
-        }
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => return Ok(count),
-        }
     }
 }
 
@@ -1138,71 +955,213 @@ fn envelope_key(bytes: &[u8]) -> Option<BucketKeyRef> {
     Some(envelope.context.parameters.key)
 }
 
-/// Envelopes and pending copy rows of `bucket` that still need the retiring generation.
-async fn envelopes_on_source(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    bucket: &str,
-    record: &EncryptionTransition,
-) -> Result<u64, String> {
-    let Some(source) = retiring(record) else {
-        return Ok(0);
-    };
-    let prefix: Key = VersionKey::bucket_prefix(bucket)
-        .map_err(|e| e.to_string())?
-        .into();
-    let (mut after, mut count) = (None, 0);
-    loop {
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            ABE_VERSION_KEYSPACE,
-            Some(prefix.clone()),
-            after,
-            PAGE,
-            Some(txn_id),
-        )
-        .await?;
-        let reads = rows
-            .into_iter()
-            .map(|(_, id)| (ABE_ENVELOPE_KEYSPACE.to_string(), id))
-            .collect();
-        let read = StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        };
-        let Event::Storage(StorageEvent::BatchReadResult { values }) =
-            storage.send_storage_effect(read).await
-        else {
-            return Err("could not read envelopes".to_string());
-        };
-        let used = values.iter().filter_map(|(_, value)| value.as_deref());
-        count += used
-            .filter(|value| envelope_key(value) == Some(source))
-            .count() as u64;
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => break,
+#[derive(Debug, PartialEq)]
+enum ScanPhase {
+    Pending,
+    Envelopes,
+    EnvelopeRows,
+    Copies,
+    Versions,
+    VersionRows,
+}
+
+/// Walks, inside the caller's transaction, what still needs the source generation: pending
+/// archives on every backend, envelopes and pending copies of the bucket, and its versions.
+#[derive(Debug, PartialEq)]
+struct SourceScan {
+    prefix: Key,
+    record: EncryptionTransition,
+    phase: ScanPhase,
+    pages: PrefixPages,
+    /// Archives, envelopes and copies that use the source.
+    pending: u64,
+    /// Versions whose copy still needs the transition.
+    versions: u64,
+}
+
+impl SourceScan {
+    fn new(bucket: &str, record: &EncryptionTransition) -> Result<Self, MigrationError> {
+        Ok(Self {
+            prefix: VersionKey::bucket_prefix(bucket)?.into(),
+            record: record.clone(),
+            phase: ScanPhase::Pending,
+            pages: PrefixPages::new(PENDING_LOCATION_KEYSPACE, empty_prefix(), PAGE),
+            pending: 0,
+            versions: 0,
+        })
+    }
+
+    fn enter(&mut self, phase: ScanPhase, space: &str, prefix: Key) -> IoCall {
+        self.phase = phase;
+        self.pages = PrefixPages::new(space, prefix, PAGE);
+        self.pages.call()
+    }
+
+    fn start(&mut self) -> IoCall {
+        match self.record.source {
+            Some(_) => self.pages.call(),
+            None => self.after_pending(),
         }
     }
-    let prefix: Key = source.bucket_id.to_bytes().to_vec().into();
-    let mut after = None;
-    loop {
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            ABE_COPY_KEYSPACE,
-            Some(prefix.clone()),
-            after,
-            PAGE,
-            Some(txn_id),
-        )
-        .await?;
-        for (_, row) in rows {
-            let pending = PendingCopy::from_bytes(&row).map_err(|e| e.to_string())?;
-            count += u64::from(pending.source.context.parameters.key == source);
+
+    fn after_pending(&mut self) -> IoCall {
+        match retiring(&self.record) {
+            Some(_) => {
+                let prefix = self.prefix.clone();
+                self.enter(ScanPhase::Envelopes, ABE_VERSION_KEYSPACE, prefix)
+            }
+            None => self.enter_versions(),
         }
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => return Ok(count),
+    }
+
+    fn enter_versions(&mut self) -> IoCall {
+        let prefix = self.prefix.clone();
+        self.enter(ScanPhase::Versions, BLOB_VERSIONS_KEYSPACE, prefix)
+    }
+
+    fn after_envelopes(&mut self) -> IoCall {
+        match retiring(&self.record) {
+            Some(source) => {
+                let prefix = source.bucket_id.to_bytes().to_vec().into();
+                self.enter(ScanPhase::Copies, ABE_COPY_KEYSPACE, prefix)
+            }
+            None => self.enter_versions(),
+        }
+    }
+
+    fn envelopes_next(&mut self) -> IoCall {
+        match self.pages.done() {
+            true => self.after_envelopes(),
+            false => self.pages.call(),
+        }
+    }
+
+    fn versions_next(&self) -> Option<IoCall> {
+        (!self.pages.done()).then(|| self.pages.call())
+    }
+
+    /// Takes the answer to the last call and names the next one; `None` ends the walk.
+    fn step(&mut self, result: IoResult) -> Result<Option<IoCall>, MigrationError> {
+        match self.phase {
+            ScanPhase::Pending => {
+                let rows = self.pages.take(result)?;
+                let locations = rows
+                    .iter()
+                    .map(|(_, value)| BackendLocation::from_bytes(value.as_ref()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(source) = self.record.source {
+                    self.pending += uses_key(&locations, source, &self.record);
+                }
+                Ok(Some(match self.pages.done() {
+                    true => self.after_pending(),
+                    false => self.pages.call(),
+                }))
+            }
+            ScanPhase::Envelopes => {
+                let rows = self.pages.take(result)?;
+                let reads: Vec<_> = rows
+                    .into_iter()
+                    .map(|(_, id)| (ABE_ENVELOPE_KEYSPACE.to_string(), id))
+                    .collect();
+                if reads.is_empty() {
+                    return Ok(Some(self.envelopes_next()));
+                }
+                self.phase = ScanPhase::EnvelopeRows;
+                Ok(Some(IoCall::Read(reads)))
+            }
+            ScanPhase::EnvelopeRows => {
+                let source = retiring(&self.record);
+                let values = result.values()?;
+                let used = values.iter().filter_map(|value| value.as_deref());
+                self.pending += used.filter(|value| envelope_key(value) == source).count() as u64;
+                self.phase = ScanPhase::Envelopes;
+                Ok(Some(self.envelopes_next()))
+            }
+            ScanPhase::Copies => {
+                let source = retiring(&self.record);
+                for (_, row) in self.pages.take(result)? {
+                    let pending = PendingCopy::from_bytes(&row).map_err(MigrationError::failed)?;
+                    let key = pending.source.context.parameters.key;
+                    self.pending += u64::from(Some(key) == source);
+                }
+                Ok(Some(match self.pages.done() {
+                    true => self.enter_versions(),
+                    false => self.pages.call(),
+                }))
+            }
+            ScanPhase::Versions => {
+                let mut reads = Vec::new();
+                for (_, value) in self.pages.take(result)? {
+                    let version = BlobVersion::from_bytes(&value)?;
+                    if let Some(key) = version.location_key() {
+                        reads.push((BLOB_LOCATIONS_KEYSPACE.to_string(), key.to_bytes().into()));
+                    }
+                }
+                if reads.is_empty() {
+                    return Ok(self.versions_next());
+                }
+                self.phase = ScanPhase::VersionRows;
+                Ok(Some(IoCall::Read(reads)))
+            }
+            ScanPhase::VersionRows => {
+                for value in result.values()? {
+                    let Some(value) = value else {
+                        return Err(MigrationError::Failed(
+                            "could not read a remaining version's location".to_string(),
+                        ));
+                    };
+                    let location = BackendLocation::from_bytes(&value)?;
+                    self.versions += u64::from(self.record.needs(&location));
+                }
+                self.phase = ScanPhase::Versions;
+                Ok(self.versions_next())
+            }
+        }
+    }
+}
+
+/// A transition after its store, and whether the store still owned its row.
+#[derive(Debug, PartialEq)]
+struct StoredTransition {
+    stored: bool,
+    record: EncryptionTransition,
+}
+
+#[derive(Debug, PartialEq)]
+enum StoreStep {
+    Current,
+    Scan(Box<SourceScan>),
+    SourceKey,
+    Written(Option<VaultEntry>),
+    Left,
+    Vault,
+}
+
+/// Stores progress unless a newer change replaced it; retirement keeps the queue until copies
+/// wake.
+#[derive(Debug, PartialEq)]
+struct StoreTransitionOperation {
+    key: Key,
+    bucket: String,
+    record: EncryptionTransition,
+    now_ms: u64,
+    step: StoreStep,
+}
+
+impl StoreTransitionOperation {
+    fn new(bucket: &str, record: EncryptionTransition) -> Self {
+        Self {
+            key: bucket.as_bytes().to_vec().into(),
+            bucket: bucket.to_string(),
+            record,
+            now_ms: 0,
+            step: StoreStep::Current,
+        }
+    }
+
+    fn done(&mut self, stored: bool) -> Turn<StoredTransition> {
+        let record = self.record.clone();
+        Ok(Next::Done(StoredTransition { stored, record }))
         }
     }
 }
