@@ -13,7 +13,7 @@ use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::registry_delete_entries;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
+    ImportRoCrateTarget, JobState, LogicalJobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
@@ -24,6 +24,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
+use aruna_operations::jobs::lifecycle::ingress::submit_external_job;
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
@@ -194,6 +195,41 @@ async fn record_routes_owner() -> TestResult<()> {
     );
 
     realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn holder_admits_submission() -> TestResult<()> {
+    // A holder of the family signs and commits the submission through the node key, and a
+    // retry settles on the same alias. A node that holds nothing cannot admit it here.
+    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
+    let submit = async |node: &TestNode| {
+        submit_external_job(
+            node.context.as_ref(),
+            execution_spec(44),
+            realm.user_id,
+            Some("holder-admission".to_string()),
+            WorkspaceMode::None,
+            None,
+            aruna_operations::jobs::JOB_RETENTION_MS,
+            None,
+        )
+        .await
+    };
+    let mut accepted = None;
+    for node in &realm.nodes {
+        if let Ok(first) = submit(node).await {
+            accepted = Some((node, first));
+            break;
+        }
+    }
+    let (holder, first) = accepted.ok_or("no node admitted the submission")?;
+    assert!(first.created);
+    assert_eq!(first.state, LogicalJobState::Queued);
+    let retried = submit(holder).await?;
+    assert!(!retried.created);
+    assert_eq!(retried.job_id, first.job_id);
+    assert_eq!(retried.state, LogicalJobState::Queued);
     Ok(())
 }
 

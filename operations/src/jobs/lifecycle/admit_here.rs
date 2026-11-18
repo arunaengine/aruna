@@ -449,3 +449,201 @@ impl Operation for AdmitHereOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{Family, payload, user};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION;
+    use aruna_core::structs::execution::job::{JobProjection, OutputSet, WorkspaceMode};
+    use aruna_core::types::{Key, Value};
+
+    use super::super::ids::{SubmissionScope, store_workspace};
+
+    fn admission(family: &Family) -> LocalAdmission {
+        let mut spec = payload();
+        store_workspace(&mut spec, WorkspaceMode::None, None).expect("workspace stored");
+        let local = family.holder.public();
+        let request = SubmissionRequest {
+            created_by: user(),
+            spec,
+            scope: SubmissionScope::Keyed("idempotency".to_string()),
+            retention_ms: 60_000,
+            ingress_node_id: local,
+            captured_inputs: Vec::new(),
+            output_policies: Vec::new(),
+            input_pages: None,
+        };
+        LocalAdmission {
+            identity: request.identity().expect("identity derives"),
+            request,
+            config: family.config.clone(),
+            local,
+            job_id: JobId::from_bytes([7u8; 16]),
+            now_ms: 1_000,
+            fresh: BTreeMap::new(),
+        }
+    }
+
+    /// Answers one sign call with the record signed by the family holder.
+    fn signed(family: &Family, next: AdmitNext) -> IoResult {
+        let Ok(Next::Call(IoCall::Effect(effect))) = next else {
+            panic!("a record is signed");
+        };
+        let Effect::Net(NetEffect::ExecutionSign(claim)) = *effect else {
+            panic!("the node key signs");
+        };
+        let envelope = family.sign(&family.holder, claim.record);
+        let event = ExecutionSignEvent::Signed(Box::new(envelope));
+        IoResult::Event(Box::new(Event::Net(NetEvent::ExecutionSign(event))))
+    }
+
+    /// An admission that signed its records and asked for the claims of its family.
+    fn at_claims(family: &Family) -> AdmitHereOperation {
+        let mut operation = AdmitHereOperation::new(admission(family));
+        let spec = operation.first();
+        let claim = operation.next(signed(family, spec));
+        let page = operation.next(signed(family, claim));
+        assert!(matches!(page, Ok(Next::Call(IoCall::Page { .. }))));
+        operation
+    }
+
+    fn claims(rows: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Page { rows, next: None }
+    }
+
+    fn admitted(family: &Family, created: bool) -> IoResult {
+        let result = Ok::<_, LifecycleError>(AdmittedSubmission {
+            job_id: JobId::from_bytes([7u8; 16]),
+            family: family.family(),
+            created,
+        });
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    // A family this node already claimed is a replay: no quota view is read for it.
+    #[test]
+    fn replay_skips_quota() {
+        let family = Family::new([1u8; 32]);
+        let mut fresh = at_claims(&family);
+        assert!(matches!(
+            fresh.next(claims(Vec::new())),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(fresh.step, AdmitStep::Quota);
+
+        let mut replay = at_claims(&family);
+        let row = (Key::from(vec![1u8]), Value::from(vec![1u8]));
+        assert!(matches!(
+            replay.next(claims(vec![row])),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(replay.step, AdmitStep::Admit);
+    }
+
+    /// An admission waiting for the answer of its admit child.
+    fn at_admit(family: &Family) -> AdmitHereOperation {
+        let mut operation = at_claims(family);
+        let row = (Key::from(vec![1u8]), Value::from(vec![1u8]));
+        operation.next(claims(vec![row])).expect("admit child");
+        operation
+    }
+
+    // A fresh admission is queued and arms its family and the outbox after the commit; a replay
+    // reports the state this holder observes.
+    #[test]
+    fn accepts_with_state() {
+        let family = Family::new([2u8; 32]);
+        let mut fresh = at_admit(&family);
+        let Ok(Next::Then { output, calls }) = fresh.next(admitted(&family, true)) else {
+            panic!("a fresh admission is accepted");
+        };
+        assert_eq!(
+            (output.created, output.state),
+            (true, LogicalJobState::Queued)
+        );
+        assert!(matches!(
+            calls.as_slice(),
+            [IoCall::Child(_), IoCall::Effect(_)]
+        ));
+
+        let mut replay = at_admit(&family);
+        replay.next(admitted(&family, false)).expect("state child");
+        let state = Ok::<_, IoError>(LogicalJobState::Running);
+        let answer = IoResult::Child(ChildOutcome::new(state));
+        let Ok(Next::Then { output, .. }) = replay.next(answer) else {
+            panic!("a replay is accepted");
+        };
+        assert_eq!(
+            (output.created, output.state),
+            (false, LogicalJobState::Running)
+        );
+    }
+
+    // A lost admission decides again until the attempts run out.
+    #[test]
+    fn retries_lost_admission() {
+        let family = Family::new([3u8; 32]);
+        let lost = || {
+            let error = LifecycleError::Storage(StorageError::TransactionConflict);
+            IoResult::Child(ChildOutcome::new(Err::<AdmittedSubmission, _>(error)))
+        };
+        let row = || vec![(Key::from(vec![1u8]), Value::from(vec![1u8]))];
+        let mut operation = at_admit(&family);
+        for _ in 1..ADMISSION_ATTEMPTS {
+            let again = operation.next(lost());
+            assert!(matches!(again, Ok(Next::Call(IoCall::Page { .. }))));
+            operation.next(claims(row())).expect("admit child");
+        }
+        assert!(matches!(
+            operation.next(lost()),
+            Err(SubmitJobError::PlacementUnavailable(_))
+        ));
+    }
+
+    fn cached(family: JobFamilyId, stale: bool) -> IoResult {
+        let cache = ProjectionCache {
+            version: PROJECTION_CACHE_VERSION,
+            revision: 1,
+            stale,
+            projection: Some(JobProjection {
+                submission_id: family.submission_id,
+                request_digest: family.request_digest,
+                canonical_job_id: JobId::from_bytes([7u8; 16]),
+                aliases: Vec::new(),
+                state: LogicalJobState::Succeeded,
+                canonical_execution_id: None,
+                executions: Vec::new(),
+                outputs: OutputSet::new(Vec::new()).expect("empty outputs"),
+                cancel_requested: false,
+            }),
+        };
+        let value = Value::from(postcard::to_allocvec(&cache).expect("cache encodes"));
+        claims(vec![(Key::from(vec![1u8]), value)])
+    }
+
+    // A current cache answers; a stale one reduces the family, and a failed reduction is
+    // indeterminate, never queued.
+    #[test]
+    fn observes_family_state() {
+        let family = Family::new([4u8; 32]).family();
+        let mut current = ObservedStateOperation::new(family, 1);
+        current.first().expect("cache page");
+        assert_eq!(
+            current.next(cached(family, false)),
+            Ok(Next::Done(LogicalJobState::Succeeded))
+        );
+
+        let mut stale = ObservedStateOperation::new(family, 1);
+        stale.first().expect("cache page");
+        assert!(matches!(
+            stale.next(cached(family, true)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let failed = Err::<ProjectedFamily, _>(RecordStoreError::UnknownAlias);
+        assert_eq!(
+            stale.next(IoResult::Child(ChildOutcome::new(failed))),
+            Ok(Next::Done(LogicalJobState::Indeterminate))
+        );
+    }
+}
