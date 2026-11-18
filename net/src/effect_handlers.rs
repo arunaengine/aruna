@@ -20,6 +20,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::dataset_description::DescriptionError;
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
+use aruna_core::structs::storage::read_grant::{ReadGrant, SignedGrant};
 use parking_lot::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -242,6 +243,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::ExecutionSign(claim) => {
             NetEvent::ExecutionSign(sign_execution(&ctx.secret_key, *claim))
         }
+        NetEffect::GrantSign(grant) => NetEvent::GrantSign(sign_grant(&ctx.secret_key, *grant)),
         NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
@@ -312,6 +314,15 @@ pub(crate) fn sign_statement(key: &iroh::SecretKey, claim: StatementClaim) -> St
         signer: claim.signer,
         statement: claim.statement,
     }))
+}
+
+/// Signs a read grant with this node's key, only when the grant names this node as issuer.
+pub(crate) fn sign_grant(key: &iroh::SecretKey, grant: ReadGrant) -> Option<Box<SignedGrant>> {
+    if grant.issuer != key.public() {
+        return None;
+    }
+    let signature = key.sign(&grant.signing_bytes().ok()?);
+    Some(Box::new(SignedGrant { signature, grant }))
 }
 
 /// Signs a job record with this node's key, only when the claim names this node as publisher.
@@ -601,6 +612,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::MetadataRequest(_) => "metadata_request",
         NetEffect::DatasetSummary(_) => "dataset_summary",
         NetEffect::WritePeerAuth(_) => "write_peer_auth",
+        NetEffect::GrantSign(_) => "grant_sign",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",

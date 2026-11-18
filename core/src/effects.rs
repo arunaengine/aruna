@@ -789,6 +789,9 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Signs a read grant; only a grant naming this node as issuer. Answers
+    /// `NetEvent::GrantSign`.
+    GrantSign(Box<crate::structs::storage::read_grant::ReadGrant>),
     /// Checks a forwarded caller's token for a write from `peer`; answers
     /// `NetEvent::WritePeerAuth`.
     WritePeerAuth(Box<WritePeerRequest>),

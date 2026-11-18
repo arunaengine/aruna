@@ -508,6 +508,8 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// The signed read grant, or `None` when this node cannot sign it.
+    GrantSign(Option<Box<crate::structs::storage::read_grant::SignedGrant>>),
     /// The caller a forwarded token stands for, or why it is not accepted from that peer.
     WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
     /// The JSON-LD summary of a dataset, or why it could not be read.
@@ -946,6 +948,7 @@ impl Event {
                     MetadataAnswer,
                     DatasetSummary,
                     WritePeerAuth,
+                    GrantSign,
                     Notification,
                     InboxWoken,
                     Heartbeat,
