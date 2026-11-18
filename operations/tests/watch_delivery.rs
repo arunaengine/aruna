@@ -27,9 +27,6 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{DocumentEffect, NodeId, UserId};
 use aruna_operations::driver::drive;
-use aruna_operations::notifications::dispatch::{
-    create_for_user, delete_for_user, list_for_user, list_watches,
-};
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::user_call::WatchDispatchError;
@@ -45,6 +42,7 @@ use ulid::Ulid;
 use crate::convergence::wait_for_convergence;
 use crate::topology::store_realm_config;
 use crate::topology::{TestNode, realm_config_for, spawn_replicas, user_with_holder};
+use crate::user_calls::{create_for_user, delete_for_user, list_for_user, list_watches};
 
 const LIST_LIMIT: usize = LIST_MAX_LIMIT;
 
