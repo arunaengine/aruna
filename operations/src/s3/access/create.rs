@@ -364,27 +364,43 @@ impl CreateUserOperation {
         let Some(plan) = self.tokens.as_ref() else {
             return self.write_credentials();
         };
-        let Some(access) = self.access.as_ref() else {
-            return self.handle_error(CreateUserError::CreateAccessFailed);
-        };
-        let bytes = match access.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(err) => return self.handle_error(err.into()),
-        };
-        let index_value = match encode_index(&index) {
-            Ok(value) => value,
-            Err(err) => return self.handle_error(err.into()),
-        };
+        let reads = (plan.buckets.iter())
+            .flat_map(|bucket| {
+                let key: Key = bucket.as_bytes().to_vec().into();
+                [
+                    (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+                    (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
+                ]
+            })
+            .collect();
+        self.call(CreateStep::TokenBuckets, IoCall::Read(reads))
+    }
+
+    /// Every bucket must exist and encrypt; then the credential is written.
+    fn token_buckets_read(&mut self, read: Vec<Option<Value>>) -> CreateTurn {
+        let caller = self.config.user_identity;
+        let group = self.config.group_id;
+        let access_key = self.new_access()?.access_key.clone();
+        let plan = self
+            .tokens
+            .as_mut()
+            .ok_or(CreateUserError::CreateAccessFailed)?;
+        plan.check_buckets(read, caller, &access_key, group)?;
+        self.write_credentials()
+    }
+
+    fn write_credentials(&mut self) -> CreateTurn {
+        let access = self.new_access()?;
         let mut writes = vec![
             (
                 USER_ACCESS_KEYSPACE.to_string(),
                 access.access_key.as_bytes().into(),
-                bytes.into(),
+                access.to_bytes()?.into(),
             ),
             (
                 ACCESS_OWNER_KEYSPACE.to_string(),
                 owner_key(self.config.user_identity),
-                index_value,
+                encode_index(&self.index)?,
             ),
         ];
         if let Some(actor) = self.issuer {
@@ -392,122 +408,63 @@ impl CreateUserOperation {
             let mut audit = AdminAuditRecord::new(action, actor, self.config.user_identity);
             audit.group_id = Some(self.config.group_id);
             audit.session_id = Some(access.access_key.clone());
-            match audit.entries() {
-                Ok(entries) => writes.extend(entries),
-                Err(err) => return self.handle_error(err.into()),
-            }
+            writes.extend(audit.entries()?);
         }
         if let Some(plan) = self.tokens.as_mut() {
             writes.append(&mut plan.written);
         }
-        self.state = CreateUserState::WriteCredentials;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+        self.call(CreateStep::WriteCredentials, IoCall::Write(writes))
     }
 
-    fn handle_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.handle_error(CreateUserError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: (event).label(),
-            });
-        };
-
-        let Some(access) = self.access.clone() else {
-            return self.handle_error(CreateUserError::CreateAccessFailed);
-        };
-        let Some(secret) = self.pending_secret.take() else {
-            return self.handle_error(CreateUserError::CreateAccessFailed);
-        };
-        self.output = Ok((access.access_key.clone(), secret, access));
-        let Some(txn_id) = self.txn_id else {
-            return self.handle_error(CreateUserError::CreateAccessFailed);
-        };
-        self.state = CreateUserState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_committed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
-                self.state = CreateUserState::Finish;
-                smallvec![]
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                if !matches!(&error, &StorageError::QueueFull) {
-                    self.txn_id = None;
-                }
-                self.handle_error(error.into())
-            }
-            other => self.handle_error(CreateUserError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: (other).label(),
-            }),
-        }
-    }
-
-    pub fn handle_error(&mut self, error: CreateUserError) -> Effects {
-        self.state = CreateUserState::Error;
-        self.output = Err(error);
-        self.abort()
+    fn finish(&mut self) -> CreateTurn {
+        let access = self
+            .access
+            .take()
+            .ok_or(CreateUserError::CreateAccessFailed)?;
+        let secret = (self.pending_secret.take()).ok_or(CreateUserError::CreateAccessFailed)?;
+        Ok(Next::Done((access.access_key.clone(), secret, access)))
     }
 }
 
-impl EffectOperation for CreateUserOperation {
+impl Operation for CreateUserOperation {
     type Output = (String, Secret, UserAccess);
     type Error = CreateUserError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> CreateTurn {
+        self.prepare()?;
+        let reads = vec![
+            (
+                ACCESS_OWNER_KEYSPACE.to_string(),
+                owner_key(self.config.user_identity),
+            ),
+            group_fence_key(self.config.group_id),
+        ];
+        self.call(CreateStep::OwnerIndex, IoCall::Read(reads))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            CreateUserState::Init => self.handle_init(),
-            CreateUserState::StartTransaction => self.handle_started(event),
-            CreateUserState::ReadOwnerIndex => self.handle_index(event),
-            CreateUserState::ReadCredentials { ref index, replace } => {
-                self.handle_credentials(event, index.clone(), replace)
+    fn next(&mut self, result: IoResult) -> CreateTurn {
+        match self.step {
+            CreateStep::OwnerIndex => self.index_read(values::<2>(result)?),
+            CreateStep::Credentials => self.credentials_read(result.values()?),
+            CreateStep::DeleteStale => {
+                result.done()?;
+                self.scan_tokens()
             }
-            CreateUserState::DeleteStale { ref index } => {
-                self.handle_stale_deleted(event, index.clone())
+            CreateStep::TokenPage => self.token_page(result),
+            CreateStep::TokenDeletes => {
+                result.done()?;
+                self.tokens_deleted()
             }
-            CreateUserState::WriteCredentials => self.handle_written(event),
-            CreateUserState::CommitTransaction => self.handle_committed(event),
-            CreateUserState::Finish => smallvec![],
-            CreateUserState::Error => self.abort(),
-            CreateUserState::ReadTokenBuckets { ref index } => {
-                self.token_buckets_read(event, index.clone())
-            }
-            CreateUserState::ScanStaleTokens { ref index } => {
-                self.stale_tokens_scanned(event, index.clone())
-            }
-            CreateUserState::DeleteStaleTokens { ref index } => {
-                self.stale_tokens_deleted(event, index.clone())
+            CreateStep::TokenBuckets => self.token_buckets_read(result.values()?),
+            CreateStep::WriteCredentials => {
+                result.done()?;
+                self.finish()
             }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, CreateUserState::Finish | CreateUserState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        // A finished operation carries its success, a failed one its initiating
-        // error; any other state is an explicit premature-finalization failure.
-        match self.state {
-            CreateUserState::Finish | CreateUserState::Error => self.output,
-            _ => Err(CreateUserError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -515,19 +472,15 @@ impl EffectOperation for CreateUserOperation {
 mod pure_tests {
     use super::*;
     use crate::s3::access::index::owner_key;
-    use aruna_core::effects::IterStart;
     use aruna_core::keyspaces::{
-        ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, ADMIN_AUDIT_KEYSPACE, TOKEN_GRANT_KEYSPACE,
+        ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, ADMIN_AUDIT_KEYSPACE, GROUP_DELETE_KEYSPACE,
+        TOKEN_GRANT_KEYSPACE,
     };
     use aruna_core::structs::storage::abe_access::token_prefix;
+    use ulid::Ulid;
 
-    fn owner_read(op: &CreateUserOperation, value: Option<aruna_core::types::Value>) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (owner_key(op.config.user_identity), value),
-                (op.config.group_id.to_bytes().into(), None),
-            ],
-        })
+    fn owner_read(value: Option<Value>) -> IoResult {
+        IoResult::Values(vec![value, None])
     }
 
     fn test_issuer() -> [u8; 32] {
@@ -554,42 +507,65 @@ mod pure_tests {
         }
     }
 
-    fn make_user_identity() -> UserId {
-        UserId::default()
+    fn stored(access_key: &str, user_identity: UserId, expiry: SystemTime) -> Value {
+        let access = UserAccess {
+            access_key: access_key.to_string(),
+            user_identity,
+            group_id: Ulid::from_parts(5, 5),
+            secret: EncryptedS3Secret::empty(),
+            expiry,
+            path_restrictions: None,
+            issued_by: test_issuer(),
+            revoked_at: None,
+        };
+        access.to_bytes().unwrap().into()
+    }
+
+    fn index_of(keys: &[&str]) -> Value {
+        let keys = keys.iter().map(|key| key.to_string()).collect();
+        encode_index(&keys).unwrap()
+    }
+
+    /// The operation for key `newkey` of `user`, waiting for its credential reads.
+    fn with_index(user: UserId, index: &[&str]) -> CreateUserOperation {
+        let config = make_config(user, Ulid::from_parts(3, 3));
+        let key = "newkey".to_string();
+        let mut op = CreateUserOperation::new_with_key(config, key, test_key());
+        op.first().unwrap();
+        op.next(owner_read(Some(index_of(index)))).unwrap();
+        op
+    }
+
+    fn writes_of(turn: CreateTurn) -> Vec<(String, Key, Value)> {
+        match turn {
+            Ok(Next::Call(IoCall::Write(writes))) => writes,
+            other => panic!("expected the credential writes, got {:?}", other.is_ok()),
+        }
+    }
+
+    fn error_of(turn: CreateTurn) -> CreateUserError {
+        match turn {
+            Err(error) => error,
+            Ok(_) => panic!("the credential was created"),
+        }
     }
 
     #[test]
     fn creates_user_access() {
-        let user_identity = make_user_identity();
+        let user_identity = UserId::default();
         let group_id = Ulid::from_parts(1, 1);
         let mut op = CreateUserOperation::new(make_config(user_identity, group_id), test_key());
+        assert_eq!(op.transaction(), TransactionMode::Write);
 
-        // Start opens the transaction before the owner index is checked.
-        let effects = op.start();
-        assert_eq!(effects.len(), 1);
-        assert_eq!(op.state, CreateUserState::StartTransaction);
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::StartTransaction { read: false })
-        ));
-
-        let txn_id = Ulid::from_parts(2, 2);
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(read_txn),
-            ..
-        }) = &effects[0]
-        else {
-            panic!("Expected owner index read");
+        // The owner index is read with the group's deletion fence.
+        let Ok(Next::Call(IoCall::Read(reads))) = op.first() else {
+            panic!("expected the owner index read");
         };
-        assert_eq!(reads[0].0, aruna_core::keyspaces::ACCESS_OWNER_KEYSPACE);
-        assert_eq!(reads[1].0, aruna_core::keyspaces::GROUP_DELETE_KEYSPACE);
-        assert_eq!(*read_txn, txn_id);
+        assert_eq!(reads[0].0, ACCESS_OWNER_KEYSPACE);
+        assert_eq!(reads[0].1, owner_key(user_identity));
+        assert_eq!(reads[1].0, GROUP_DELETE_KEYSPACE);
 
-        let Some(access) = op.access.as_ref() else {
-            panic!("Expected generated access");
-        };
+        let access = op.access.as_ref().unwrap();
         assert_eq!(access.user_identity, user_identity);
         assert_eq!(access.group_id, group_id);
         assert_eq!(access.open_secret(&test_key()).unwrap().len(), 30);
@@ -597,43 +573,22 @@ mod pure_tests {
         assert_eq!(access.issued_by, test_issuer());
         assert_eq!(access.revoked_at, None);
 
-        // An empty index still probes the fresh key for a collision in the txn.
+        // An empty index still probes the fresh key for a collision in the transaction.
         let access_key = access.access_key.clone();
-        let effects = op.step(owner_read(&op, None));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(id), .. })] if *id == txn_id
-        ));
-        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(access_key.as_bytes().into(), None)],
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(id), .. })] if *id == txn_id
-        ));
-        let effects = op.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
-        ));
-        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(effects.is_empty());
-        assert_eq!(op.state, CreateUserState::Finish);
-        assert!(op.is_complete());
-
-        // 4. Finalize returns the tuple directly, never a nested result.
-        let (access_key, plaintext, returned_access) =
-            op.finalize().expect("finished operation finalizes");
-        assert_eq!(returned_access.user_identity, user_identity);
-        assert_eq!(returned_access.group_id, group_id);
-        assert_eq!(returned_access.access_key, access_key);
+        let Ok(Next::Call(IoCall::Read(reads))) = op.next(owner_read(None)) else {
+            panic!("expected the collision probe");
+        };
+        assert_eq!(reads[0].1.as_ref(), access_key.as_bytes());
+        writes_of(op.next(IoResult::Values(vec![None])));
+        let Ok(Next::Done((access_key, plaintext, returned))) = op.next(IoResult::Done) else {
+            panic!("the written credential is returned");
+        };
+        assert_eq!(returned.user_identity, user_identity);
+        assert_eq!(returned.group_id, group_id);
+        assert_eq!(returned.access_key, access_key);
         // The one-time plaintext opens the stored ciphertext on the issuing key.
         assert_eq!(
-            returned_access.open_secret(&test_key()).unwrap(),
+            returned.open_secret(&test_key()).unwrap(),
             plaintext.expose()
         );
     }
@@ -646,22 +601,11 @@ mod pure_tests {
             UserId::default(),
         );
         let group_id = Ulid::from_parts(1, 2);
-        let written = |op: CreateUserOperation| {
-            let mut op = op;
-            op.start();
-            op.step(Event::Storage(StorageEvent::TransactionStarted {
-                txn_id: Ulid::from_parts(2, 2),
-            }));
-            op.step(owner_read(&op, None));
+        let written = |mut op: CreateUserOperation| {
+            op.first().unwrap();
+            op.next(owner_read(None)).unwrap();
             let access_key = op.access.as_ref().unwrap().access_key.clone();
-            let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![(access_key.as_bytes().into(), None)],
-            }));
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice()
-            else {
-                panic!("expected the credential writes, got {effects:?}");
-            };
-            (access_key, writes.clone())
+            (access_key, writes_of(op.next(IoResult::Values(vec![None]))))
         };
         let plain = CreateUserOperation::new(make_config(owner, group_id), test_key());
         let (_, writes) = written(plain);
@@ -688,74 +632,39 @@ mod pure_tests {
 
     #[test]
     fn replaces_stale() {
-        let user_identity = make_user_identity();
-        let stale_key = "newkey".to_string();
-        let mut op = CreateUserOperation::new_with_key(
-            make_config(user_identity, Ulid::from_parts(3, 3)),
-            "newkey".to_string(),
-            test_key(),
-        );
-        op.start();
-        let txn_id = Ulid::from_parts(4, 4);
-        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        op.step(owner_read(
-            &op,
-            Some(encode_index(&std::collections::BTreeSet::from([stale_key.clone()])).unwrap()),
-        ));
-        let stale = UserAccess {
-            access_key: stale_key.clone(),
-            user_identity,
-            group_id: Ulid::from_parts(5, 5),
-            secret: EncryptedS3Secret::empty(),
-            expiry: SystemTime::UNIX_EPOCH,
-            path_restrictions: None,
-            issued_by: test_issuer(),
-            revoked_at: None,
+        let user = UserId::default();
+        let stale_key = "newkey";
+        let mut op = with_index(user, &[stale_key]);
+        let record = stored(stale_key, user, SystemTime::UNIX_EPOCH);
+        let turn = op.next(IoResult::Values(vec![Some(record)]));
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the stale credential delete");
         };
-        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(
-                stale_key.clone().into(),
-                Some(stale.to_bytes().unwrap().into()),
-            )],
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id: Some(id) })]
-                if *id == txn_id && deletes.len() == 1
-        ));
-        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
+        assert_eq!(deletes.len(), 1);
         // The stale credential's token grants go in the same transaction: one full page, then
         // the rest after its cursor.
-        let [
-            Effect::Storage(StorageEffect::Iter {
-                key_space,
-                prefix,
-                start: None,
-                txn_id: Some(id),
-                ..
-            }),
-        ] = effects.as_slice()
+        let Ok(Next::Call(IoCall::Page {
+            space,
+            prefix,
+            after: None,
+            ..
+        })) = op.next(IoResult::Done)
         else {
-            panic!("expected the token index scan, got {effects:?}");
+            panic!("expected the token index scan");
         };
-        assert_eq!((key_space.as_str(), *id), (TOKEN_GRANT_KEYSPACE, txn_id));
-        let prefix = prefix.clone().unwrap();
-        assert_eq!(prefix.as_ref(), token_prefix(&stale_key).as_slice());
+        assert_eq!(space, TOKEN_GRANT_KEYSPACE);
+        assert_eq!(prefix.as_ref(), token_prefix(stale_key).as_slice());
         let request = |bucket: u8| vec![bucket; 80];
-        let row = |bucket: u8| [token_prefix(&stale_key), request(bucket)].concat();
+        let row = |bucket: u8| [token_prefix(stale_key), request(bucket)].concat();
         let page = |bucket: u8, next: bool| {
             let key = Key::from(row(bucket));
-            Event::Storage(StorageEvent::IterResult {
-                values: vec![(key.clone(), Value::from(Vec::new()))],
-                next_start_after: next.then_some(key),
-            })
+            IoResult::Page {
+                rows: vec![(key.clone(), Value::from(Vec::new()))],
+                next: next.then_some(key),
+            }
         };
-        let effects = op.step(page(1, true));
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
-        else {
-            panic!("expected the token deletes, got {effects:?}");
+        let Ok(Next::Call(IoCall::Delete(deletes))) = op.next(page(1, true)) else {
+            panic!("expected the token deletes");
         };
         let deleted: Vec<_> = deletes
             .iter()
@@ -769,47 +678,36 @@ mod pure_tests {
                 (TOKEN_GRANT_KEYSPACE, row(1)),
             ]
         );
-        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
+        let turn = op.next(IoResult::Done);
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(after)), .. })]
+            turn,
+            Ok(Next::Call(IoCall::Page { after: Some(after), .. }))
                 if after.as_ref() == row(1).as_slice()
         ));
-        op.step(page(2, false));
-        let effects = op.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(id), .. })]
-                if *id == txn_id
-        ));
-    }
-
-    #[test]
-    fn rejects_early_finalize() {
-        let mut op = CreateUserOperation::new(
-            make_config(make_user_identity(), Ulid::from_parts(20, 20)),
-            test_key(),
-        );
-        op.start();
-
-        assert_eq!(
-            op.finalize(),
-            Err(CreateUserError::NotFinished),
-            "premature finalization must be an explicit failure"
-        );
+        op.next(page(2, false)).unwrap();
+        writes_of(op.next(IoResult::Done));
     }
 
     #[test]
     fn rejects_active_collision() {
-        let user_identity = make_user_identity();
-        let mut op = CreateUserOperation::new_with_key(
-            make_config(user_identity, Ulid::from_parts(6, 6)),
-            "newkey".to_string(),
-            test_key(),
+        let user = UserId::default();
+        let mut op = with_index(user, &["newkey"]);
+        let record = stored("newkey", user, active_expiry());
+        assert_eq!(
+            error_of(op.next(IoResult::Values(vec![Some(record)]))),
+            CreateUserError::IndexInconsistent
+        );
+    }
+
+    #[test]
+    fn rejects_taken_key() {
+        // A fresh key whose record already exists is outside the owner index.
+        let user = UserId::default();
+        let mut op = with_index(user, &[]);
+        let record = stored("newkey", UserId::default(), active_expiry());
+        assert_eq!(
+            error_of(op.next(IoResult::Values(vec![Some(record)]))),
+            CreateUserError::IndexInconsistent
         );
         op.start();
         let txn_id = Ulid::from_parts(7, 7);
