@@ -120,7 +120,7 @@ fn granted_restricts_account() {
 }
 
 #[test]
-fn read_refuses_bad_resource() {
+fn read_refuses_resource() {
     let view = RoCrateExportView::Full;
     let mut read = ReadDataset::new(place(), "not an id", view);
     assert!(read.first().is_err());
@@ -264,7 +264,7 @@ fn up_to_written(prepare: &mut PrepareChange) {
 }
 
 #[test]
-fn change_refuses_bad_revision() {
+fn change_refuses_revision() {
     let refused = PrepareChange::new(
         place(),
         (&resource(), "x"),
@@ -311,7 +311,7 @@ fn create_checks_arguments() {
 }
 
 #[test]
-fn create_keeps_mint_failure() {
+fn create_keeps_failure() {
     let mut create = PrepareCreate::new(&scope(), ("a", "key"), "{}", intent()).unwrap();
     create.granted = Some(access());
     create.phase = CreatePhase::Mint;
@@ -393,7 +393,7 @@ fn reply_context() -> RequestContext {
 }
 
 #[test]
-fn reply_hidden_when_refused() {
+fn refused_reply_hidden() {
     let mut check = CheckReply::new(&scope(), &reply_context());
     assert!(is_child(&check.first()));
     let denied = child_result(Err::<PluginInstall, _>(refusal()));

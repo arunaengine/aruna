@@ -252,7 +252,7 @@ mod operations {
     }
 
     #[test]
-    fn retire_keeps_live_installs() {
+    fn retire_keeps_live() {
         let config = fixtures::config(&fixtures::install(), json!({}));
         let mut retire = RetireWork::new(&config, 5);
         retire.first().unwrap();
@@ -261,7 +261,7 @@ mod operations {
     }
 
     #[test]
-    fn retire_drops_gone_jobs() {
+    fn retire_drops_gone() {
         let mut config = fixtures::config(&fixtures::install(), json!({}));
         config.installs.clear();
         let mut retire = RetireWork::new(&config, 5);
