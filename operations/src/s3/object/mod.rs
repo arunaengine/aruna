@@ -14,6 +14,7 @@ mod lookup;
 #[cfg(test)]
 #[path = "managed_copy_tests.rs"]
 mod managed_copy_tests;
+pub mod member_read;
 pub mod metadata;
 pub mod metadata_drain;
 pub mod origin;
