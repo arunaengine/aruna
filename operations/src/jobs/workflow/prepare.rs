@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use aruna_compute::executor::BackendCaps;
+use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AttemptRef, ExecutorKind, NetworkAccess, ResourceRequest, S3Mount, Secret, SecurityContext,

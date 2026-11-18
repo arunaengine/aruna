@@ -5,9 +5,10 @@
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use aruna_compute::ExecutorRegistry;
-use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
+use aruna_compute::executor::{ExecutorBackend, SessionChannel};
 use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::UserId;
+use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::session::SessionPhase;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
@@ -232,9 +233,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
     );
     record.state = JobState::Running;
     record.workspace_bucket = Some("lab-data".to_string());
-    insert_job(&ctx, &record)
-        .await
-        .expect("the job is stored");
+    insert_job(&ctx, &record).await.expect("the job is stored");
     registry.sessions().open(
         SessionConfig {
             job_id: job_id.to_string(),
