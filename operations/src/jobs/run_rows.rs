@@ -136,3 +136,75 @@ impl Operation for SettledRowsOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+
+    fn operation() -> SettledRowsOperation {
+        SettledRowsOperation::new(
+            JobId::from_bytes([1; 16]),
+            Ulid::from_bytes([2; 16]),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn answer(error: Option<JobMutationError>) -> IoResult {
+        let result = error.map_or(Ok(()), Err);
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    // A lost conflict pauses and writes again; the write then ends the operation.
+    #[test]
+    fn conflict_writes_again() {
+        let mut rows = operation();
+        assert!(matches!(
+            rows.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let pause = rows.next(answer(Some(JobMutationError::Conflict)));
+        assert_eq!(
+            pause,
+            Ok(Next::Call(IoCall::Delay(Duration::from_millis(1))))
+        );
+        assert!(matches!(
+            rows.next(IoResult::Woke),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(rows.next(answer(None)), Ok(Next::Done(())));
+    }
+
+    // The last attempt turns the conflict into a storage failure the job retries.
+    #[test]
+    fn conflicts_run_out() {
+        let mut rows = operation();
+        rows.attempt = MUTATE_MAX_ATTEMPTS - 1;
+        let ended = rows.next(answer(Some(JobMutationError::Conflict)));
+        assert!(matches!(ended, Err(JobMutationError::Storage(_))));
+    }
+
+    // A stored state row decodes; a missing row is none and a malformed one an error.
+    #[test]
+    fn state_read_decodes() {
+        let job_id = JobId::from_bytes([1; 16]);
+        let read = || ReadStateOperation::<u32>::new(job_id);
+        let key = ByteView::from(job_id.to_bytes().to_vec());
+        let row = (JOB_STATE_KEYSPACE.to_string(), key);
+        assert_eq!(read().first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+        let value = ByteView::from(postcard::to_allocvec(&7u32).unwrap());
+        let found = IoResult::Values(vec![Some(value)]);
+        assert_eq!(read().next(found), Ok(Next::Done(Some(7))));
+        assert_eq!(read().next(IoResult::Values(vec![None])), Ok(Next::Done(None)));
+        let broken = IoResult::Values(vec![Some(ByteView::from(Vec::new()))]);
+        assert!(read().next(broken).is_err());
+    }
+
+    // A lost claim is no conflict and ends the write at once.
+    #[test]
+    fn lost_claim_ends() {
+        let ended = operation().next(answer(Some(JobMutationError::TokenMismatch)));
+        assert_eq!(ended, Err(JobMutationError::TokenMismatch));
+    }
+}

@@ -118,3 +118,7 @@ pub(crate) fn intent_path(key: &[u8]) -> Option<&str> {
     (key[end] == 0).then_some(())?;
     std::str::from_utf8(path).ok()
 }
+
+#[cfg(test)]
+#[path = "page_intents_tests.rs"]
+mod tests;
