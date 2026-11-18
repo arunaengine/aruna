@@ -1112,6 +1112,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Release(_)) => "release",
         Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
         Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
+        Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
         Effect::Net(NetEffect::DatasetSummary(_)) => "dataset_summary",
         Effect::Net(NetEffect::WritePeerAuth(_)) => "write_peer_auth",
         Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
