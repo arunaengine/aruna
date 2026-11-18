@@ -24,9 +24,12 @@ fn auth(realm_id: RealmId) -> AuthContext {
     }
 }
 
-fn checked(result: Result<AuthContext, WritePeerRefusal>) -> IoResult {
-    let event = NetEvent::WritePeerChecked(result.map(Box::new));
-    IoResult::Event(Box::new(Event::Net(event)))
+fn checked(result: Result<AuthContext, PeerAuthRefusal>) -> IoResult {
+    IoResult::Child(ChildOutcome::new(result))
+}
+
+fn bearer() -> AuthToken {
+    AuthToken::bearer("caller-token").unwrap()
 }
 
 fn config_child(config: RealmConfigDocument) -> IoResult {
@@ -35,7 +38,7 @@ fn config_child(config: RealmConfigDocument) -> IoResult {
 
 fn message() -> MetadataTransportMessage {
     MetadataTransportMessage::ForwardDeleteDocument {
-        auth_token: None,
+        auth_token: Some(bearer()),
         config_digest: [0; 32],
         document_id: Ulid::from_bytes([3; 16]),
     }
@@ -45,20 +48,26 @@ fn caller() -> ForwardedCallerOperation {
     let mut operation = ForwardedCallerOperation::new(node(1), realm(), &message());
     assert!(matches!(
         operation.first(),
-        Ok(Next::Call(IoCall::Effect(_)))
+        Ok(Next::Call(IoCall::Child(_)))
     ));
     operation
+}
+
+#[test]
+fn missing_token_unauthorized() {
+    let mut operation = ForwardedCallerOperation::for_token(node(1), realm(), None);
+    assert_eq!(operation.first(), Err(ForwardAuthError::Unauthorized));
 }
 
 #[test]
 fn refusals_keep_kind() {
     let mut denied = caller();
     assert_eq!(
-        denied.next(checked(Err(WritePeerRefusal::Unauthorized))),
+        denied.next(checked(Err(PeerAuthRefusal::Unauthorized))),
         Err(ForwardAuthError::Unauthorized)
     );
     let mut down = caller();
-    let refusal = WritePeerRefusal::Unavailable("down".to_string());
+    let refusal = PeerAuthRefusal::Unavailable("down".to_string());
     assert_eq!(
         down.next(checked(Err(refusal))),
         Err(ForwardAuthError::Unavailable("down".to_string()))
@@ -104,7 +113,7 @@ fn device_bound_owner() {
 
 #[test]
 fn token_skips_owner() {
-    let mut operation = ForwardedCallerOperation::for_token(node(1), realm(), None);
+    let mut operation = ForwardedCallerOperation::for_token(node(1), realm(), Some(bearer()));
     operation.first().unwrap();
     assert_eq!(
         operation.next(checked(Ok(auth(realm())))),

@@ -4,7 +4,6 @@
 
 use super::*;
 use crate::users::vault_write::VaultChange;
-use aruna_core::events::NetEvent;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 
 fn node(seed: u8) -> NodeId {
@@ -51,9 +50,8 @@ where
     IoResult::Child(ChildOutcome::new(result))
 }
 
-fn checked(result: Result<AuthContext, WritePeerRefusal>) -> IoResult {
-    let event = NetEvent::WritePeerChecked(result.map(Box::new));
-    IoResult::Event(Box::new(Event::Net(event)))
+fn checked(result: Result<AuthContext, PeerAuthRefusal>) -> IoResult {
+    answer(result)
 }
 
 fn config_answer(config: RealmConfigDocument) -> IoResult {
@@ -128,7 +126,7 @@ fn caller() -> VaultCallerOperation {
     let mut operation = VaultCallerOperation::new(node(2), realm(), bearer());
     assert!(matches!(
         operation.first(),
-        Ok(Next::Call(IoCall::Effect(_)))
+        Ok(Next::Call(IoCall::Child(_)))
     ));
     operation
 }
@@ -166,7 +164,7 @@ fn restricted_caller_forbidden() {
 #[test]
 fn refused_peer_stops() {
     assert_eq!(
-        caller().next(checked(Err(WritePeerRefusal::Unauthorized))),
+        caller().next(checked(Err(PeerAuthRefusal::Unauthorized))),
         Err(MetadataReadError::Unauthorized)
     );
 }

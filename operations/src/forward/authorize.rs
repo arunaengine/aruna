@@ -8,14 +8,13 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
+use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent, WritePeerRefusal};
+use aruna_core::events::PeerAuthRefusal;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -59,27 +58,6 @@ pub(crate) fn forward_auth_error(error: ForwardAuthError) -> MetadataTransportMe
             warn!(%error, "Forwarded metadata authorization is unavailable");
             MetadataTransportMessage::ForwardedWriteUnavailable
         }
-    }
-}
-
-/// The call that checks a forwarded credential; [`peer_answer`] reads its result.
-pub(crate) fn peer_check(peer: NodeId, auth_token: Option<AuthToken>) -> IoCall {
-    let auth_token = auth_token.map(Box::new);
-    IoCall::Effect(Box::new(Effect::Net(NetEffect::AuthorizeWritePeer {
-        peer,
-        auth_token,
-    })))
-}
-
-pub(crate) fn peer_answer(
-    result: IoResult,
-) -> Result<Result<AuthContext, WritePeerRefusal>, IoError> {
-    match event(result)? {
-        Event::Net(NetEvent::WritePeerChecked(checked)) => Ok(checked.map(|auth| *auth)),
-        other => Err(IoError::Unexpected {
-            expected: "a peer check",
-            got: other.label(),
-        }),
     }
 }
 
@@ -140,14 +118,20 @@ impl Operation for ForwardedCallerOperation {
     type Error = ForwardAuthError;
 
     fn first(&mut self) -> Result<Next<AuthContext>, ForwardAuthError> {
-        Ok(Next::Call(peer_check(self.peer, self.auth_token.take())))
+        let token = self
+            .auth_token
+            .take()
+            .ok_or(ForwardAuthError::Unauthorized)?;
+        let check = WritePeerOperation::new(self.peer, token);
+        Ok(Next::Call(IoCall::child(check)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AuthContext>, ForwardAuthError> {
         let Some(auth) = self.auth.take() else {
-            let auth = peer_answer(result)?.map_err(|refusal| match refusal {
-                WritePeerRefusal::Unauthorized => ForwardAuthError::Unauthorized,
-                WritePeerRefusal::Unavailable(error) => ForwardAuthError::Unavailable(error),
+            let checked = result.child::<AuthContext, PeerAuthRefusal>()?;
+            let auth = checked.map_err(|refusal| match refusal {
+                PeerAuthRefusal::Unauthorized => ForwardAuthError::Unauthorized,
+                PeerAuthRefusal::Unavailable(error) => ForwardAuthError::Unavailable(error),
             })?;
             if auth.realm_id != self.realm_id {
                 return Err(ForwardAuthError::Forbidden);

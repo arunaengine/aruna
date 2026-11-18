@@ -12,8 +12,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE,
-    METADATA_INDEX_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE, METADATA_INDEX_KEYSPACE,
 };
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
@@ -42,7 +41,7 @@ use aruna_core::storage_entries::lifecycle_revision_change;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 
-pub use crate::storage_read::StorageReadError;
+pub use aruna_core::errors::StorageReadError;
 
 pub const LIST_METADATA_SIZE: usize = 128;
 // Cache fills sweep whole keyspaces; large pages keep the number of storage

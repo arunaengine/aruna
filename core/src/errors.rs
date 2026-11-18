@@ -285,6 +285,22 @@ pub enum StreamError {
     Other(String),
 }
 
+/// Why a stored row could not be read or decoded.
+#[derive(Debug, Error, PartialEq)]
+pub enum StorageReadError {
+    #[error(transparent)]
+    Storage(StorageError),
+    #[error(transparent)]
+    Conversion(ConversionError),
+}
+
+/// A runner failure as a storage failure; one that is none reads as a read error.
+impl From<crate::calls::IoError> for StorageReadError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::Storage(StorageError::from(error))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConversionError {
     #[error(transparent)]

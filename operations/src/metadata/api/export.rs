@@ -20,7 +20,7 @@ use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::raw_events::RawReadError;
 use crate::metadata::record_reads::RecordMaterializedOperation;
 use crate::metadata::revision_read::{MetadataRawView, RawDisplayOperation};
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataApiError>;
 

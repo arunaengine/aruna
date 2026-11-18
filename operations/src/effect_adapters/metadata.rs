@@ -3,11 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::effects::{MetadataRequestEffect, WritePeerRequest};
-use aruna_core::events::{
-    Event, MetadataAnswer, NetEvent, PeerAuthRefusal, PeerRequestError, WritePeerRefusal,
-};
+use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerAuthRefusal, PeerRequestError};
 use aruna_core::metadata::{AuthToken, MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::repository::remote::{HarvestWrite, HarvestWriteFailure};
 use aruna_core::structs::storage::dataset_description::DatasetSummaryRequest;
@@ -24,7 +21,7 @@ use crate::metadata::create_document::{
 use crate::metadata::forward::read::dataset_summary;
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::write::{route_metadata_delete, route_metadata_update};
-use crate::metadata::handle::{MetadataRequestDelivery, WritePeerError};
+use crate::metadata::handle::MetadataRequestDelivery;
 use crate::metadata::update_document::UpdateDocumentMutation;
 
 // A boxed future: the metadata effect path reads authorization through the runner again,
@@ -191,28 +188,6 @@ pub(super) async fn dispatch_request(
         elapsed: started.elapsed(),
         result,
     })))
-}
-
-/// Checks a forwarded caller with the metadata service's token state.
-pub(super) async fn dispatch_peer_check(
-    peer: NodeId,
-    auth_token: Option<AuthToken>,
-    context: &DriverContext,
-) -> Event {
-    let result = match &context.metadata_handle {
-        None => Err(WritePeerRefusal::Unavailable(
-            "forwarded writes need a metadata handle".to_string(),
-        )),
-        Some(handle) => (handle.authorize_write_peer(peer, auth_token).await)
-            .map(Box::new)
-            .map_err(|error| match error {
-                WritePeerError::Unauthorized => WritePeerRefusal::Unauthorized,
-                WritePeerError::Unavailable(error) => {
-                    WritePeerRefusal::Unavailable(error.to_string())
-                }
-            }),
-    };
-    Event::Net(NetEvent::WritePeerChecked(result))
 }
 
 /// Verifies a token named for revocation; it may already be revoked.

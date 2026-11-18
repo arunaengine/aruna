@@ -12,7 +12,8 @@ use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceR
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
 
-use crate::storage_read::{StorageReadError, parse_storage_read};
+use crate::storage_read::parse_storage_read;
+use aruna_core::errors::StorageReadError;
 
 /// The record row of a root; a blind write, as every version of the root writes the same row.
 pub fn root_write(root: &SourceRoot) -> Result<(KeySpace, Key, Value), ConversionError> {
