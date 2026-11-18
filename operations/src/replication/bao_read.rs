@@ -4,16 +4,17 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, Event, SubOperationEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
+    DISTRIBUTION_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
+use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
@@ -33,18 +34,15 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
-use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::held::{HeldElsewhere, kept_location, kept_reads};
 use crate::placement::policy::{
@@ -53,6 +51,7 @@ use crate::placement::policy::{
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::ensure_realm_peer;
 use crate::s3::object::get::reference_archive;
+use crate::s3::object::put::abe::keyed;
 use aruna_core::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
@@ -144,7 +143,7 @@ pub struct BaoReadOperation {
     accepted_hashes: HashMap<String, Vec<u8>>,
 }
 
-fn blob_call(effect: BlobEffect) -> Next<BaoReadOutput> {
+fn blob_call<T>(effect: BlobEffect) -> Next<T> {
     Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect))))
 }
 
@@ -311,7 +310,6 @@ pub enum IncomingBaoResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IncomingBaoState {
     Init,
-    StartTransaction,
     ReadRealm,
     /// A logical version target is looked up in this node's member bucket of the set.
     LocateVersion,
@@ -332,13 +330,11 @@ enum IncomingBaoState {
     SendAccepted,
     ServeRead,
     CloseMetadata,
-    CommitTransaction,
     SendRefusal,
     CloseRefusal,
-    AbortTransaction,
-    Finish,
-    Error,
 }
+
+type ServeTurn = Result<Next<IncomingBaoResult>, BaoReadError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PolicyNext {
@@ -362,11 +358,10 @@ pub struct IncomingBaoOperation {
     candidates_ready: bool,
     had_denial: bool,
     refusal: Option<BaoReadRefusal>,
-    output: Option<Result<IncomingBaoResult, BaoReadError>>,
+    /// The operation ended itself with an error, so the stream only closes.
+    failed: bool,
     policy_paths: HashSet<String>,
     snapshot: bool,
-    txn_id: Option<TxnId>,
-    result: Option<IncomingBaoResult>,
     policy_path: Option<String>,
     policy_group: Option<GroupId>,
     policy_next: Option<PolicyNext>,
@@ -425,11 +420,9 @@ impl IncomingBaoOperation {
             candidates_ready: false,
             had_denial: false,
             refusal: None,
-            output: None,
+            failed: false,
             policy_paths: HashSet::new(),
             snapshot: false,
-            txn_id: None,
-            result: None,
             policy_path: None,
             policy_group: None,
             policy_next: None,
@@ -491,52 +484,52 @@ impl IncomingBaoOperation {
         }
     }
 
-    fn read_realm(&mut self) -> Effects {
-        self.state = IncomingBaoState::ReadRealm;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(self.request.realm_id.as_bytes().to_vec()),
-            txn_id: self.txn_id,
-        })]
+    fn read_one(&mut self, state: IncomingBaoState, space: &str, key: impl Into<Key>) -> ServeTurn {
+        self.state = state;
+        Ok(Next::Call(read_row(space, key)))
     }
 
-    fn read_exact_version(&mut self) -> Effects {
-        let target = self
-            .exact_target()
-            .expect("exact target required in exact-version state");
-        let key = match VersionKey::new(&target.bucket, &target.key, target.version).to_bytes() {
+    fn read_rows(&mut self, state: IncomingBaoState, reads: Vec<(KeySpace, Key)>) -> ServeTurn {
+        self.state = state;
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn read_realm(&mut self) -> ServeTurn {
+        let key = self.request.realm_id.as_bytes().to_vec();
+        self.read_one(IncomingBaoState::ReadRealm, REALM_CONFIG_KEYSPACE, key)
+    }
+
+    fn read_exact_version(&mut self) -> ServeTurn {
+        let Some(target) = self.exact_target() else {
+            return self.fail(BaoReadError::NotFinished);
+        };
+        let key = VersionKey::new(&target.bucket, &target.key, target.version).to_bytes();
+        let key = match key {
             Ok(key) => key,
             Err(error) => return self.fail(error.into()),
         };
-        self.state = IncomingBaoState::ReadExactVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: self.txn_id,
-        })]
+        self.read_one(
+            IncomingBaoState::ReadExactVersion,
+            BLOB_VERSIONS_KEYSPACE,
+            key,
+        )
     }
 
-    fn read_exact_bucket(&mut self) -> Effects {
-        let bucket = self
-            .exact_target()
-            .expect("exact target required while reading bucket")
-            .bucket
-            .clone();
-        self.state = IncomingBaoState::ReadExactBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: bucket.as_bytes().into(),
-            txn_id: self.txn_id,
-        })]
+    fn read_exact_bucket(&mut self) -> ServeTurn {
+        let Some(target) = self.exact_target() else {
+            return self.fail(BaoReadError::NotFinished);
+        };
+        let key = target.bucket.as_bytes().to_vec();
+        self.read_one(IncomingBaoState::ReadExactBucket, S3_BUCKET_KEYSPACE, key)
     }
 
-    fn start_policy(&mut self, group_id: GroupId, path: String, next: PolicyNext) -> Effects {
+    fn start_policy(&mut self, group_id: GroupId, path: String, next: PolicyNext) -> ServeTurn {
         self.policy_group = Some(group_id);
         self.policy_path = Some(path.clone());
         self.policy_next = Some(next);
-        let Some(txn_id) = self.txn_id else {
+        if !self.snapshot {
             return self.continue_policy(self.policy_paths.contains(&path));
-        };
+        }
         let mut reads = vec![
             (
                 REALM_CONFIG_KEYSPACE.to_string(),
@@ -549,11 +542,7 @@ impl IncomingBaoOperation {
             Ok(roles) => reads.extend(roles),
             Err(_) => return self.continue_policy(false),
         }
-        self.state = IncomingBaoState::ReadPolicy;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        self.read_rows(IncomingBaoState::ReadPolicy, reads)
     }
 
     fn read_check(&self, path: String) -> CheckPermissionsConfig {
@@ -564,7 +553,7 @@ impl IncomingBaoOperation {
         }
     }
 
-    fn continue_policy(&mut self, allowed: bool) -> Effects {
+    fn continue_policy(&mut self, allowed: bool) -> ServeTurn {
         let Some(next) = self.policy_next else {
             return self.fail(BaoReadError::NotFinished);
         };
@@ -594,24 +583,20 @@ impl IncomingBaoOperation {
                         Ok(key) => key,
                         Err(error) => return self.fail(error.into()),
                     };
-                self.state = IncomingBaoState::ReadHashVersion;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                    key: key.into(),
-                    txn_id: self.txn_id,
-                })]
+                self.read_one(
+                    IncomingBaoState::ReadHashVersion,
+                    BLOB_VERSIONS_KEYSPACE,
+                    key,
+                )
             }
         }
     }
 
-    fn handle_policy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
-        let Some((_, Some(realm_value))) = values.first() else {
+    fn handle_policy(&mut self, values: Vec<Option<Value>>) -> ServeTurn {
+        let Some(Some(realm_value)) = values.first() else {
             return self.continue_policy(false);
         };
-        let Some((_, Some(group_value))) = values.get(1) else {
+        let Some(Some(group_value)) = values.get(1) else {
             return self.continue_policy(false);
         };
         let Ok(realm) = RealmConfigDocument::from_bytes(realm_value) else {
@@ -645,12 +630,12 @@ impl IncomingBaoOperation {
         };
         self.policy_current = matches!(realm_set.evaluate(&request), PolicyDecision::Allowed)
             && matches!(group_set.evaluate(&request), PolicyDecision::Allowed);
-        let roles = values.iter().skip(2).map(|(_, value)| value.clone());
-        let allowed = self.read_check(path.to_string()).allowed(roles.collect());
+        let roles = values[2..].to_vec();
+        let allowed = self.read_check(path.to_string()).allowed(roles);
         self.continue_policy(self.policy_current && matches!(allowed, Ok(true)))
     }
 
-    fn next_candidate(&mut self) -> Effects {
+    fn next_candidate(&mut self) -> ServeTurn {
         let Some(candidate) = self.candidates.pop_front() else {
             return self.send_refusal(if self.had_denial {
                 BaoReadRefusal::ReadDenied
@@ -664,16 +649,16 @@ impl IncomingBaoOperation {
         self.start_policy(group_id, path, PolicyNext::Hash)
     }
 
-    fn read_location(&mut self) -> Effects {
+    fn read_location(&mut self) -> ServeTurn {
         let Some(key) = self.location_key.clone() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
-        self.state = IncomingBaoState::ReadLocation;
-        smallvec![blob_location_read(&key, self.txn_id)]
+        let key = key.to_bytes();
+        self.read_one(IncomingBaoState::ReadLocation, BLOB_LOCATIONS_KEYSPACE, key)
     }
 
     /// A sealed copy is offered only once its bucket admits the read; a locked bucket refuses.
-    fn send_accepted(&mut self, location: BackendLocation) -> Effects {
+    fn send_accepted(&mut self, location: BackendLocation) -> ServeTurn {
         if self.request.metadata_only {
             return self.offer_location(location);
         }
@@ -681,25 +666,21 @@ impl IncomingBaoOperation {
             let archive = ArchiveKey::of(&location);
             self.location = Some(location);
             self.state = IncomingBaoState::AdmitSealed;
-            return smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })];
+            return Ok(blob_call(BlobEffect::AdmitRead { key, archive }));
         }
         // A plain copy of an encrypting bucket, not converted yet, needs the bucket unlocked too.
         let Some(version) = self.version_key.clone() else {
             return self.offer_location(location);
         };
         self.location = Some(location);
-        self.state = IncomingBaoState::ReadContentSettings;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: version.bucket.as_bytes().into(),
-            txn_id: self.txn_id,
-        })]
+        self.read_one(
+            IncomingBaoState::ReadContentSettings,
+            BUCKET_ENCRYPTION_KEYSPACE,
+            version.bucket.as_bytes().to_vec(),
+        )
     }
 
-    fn content_settings_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn content_settings_read(&mut self, value: Option<Value>) -> ServeTurn {
         // An observation has no location; it is offered from its source once admitted.
         let location = self.location.take();
         let settings = match BucketEncryption::from_row(value.as_deref()) {
@@ -716,10 +697,10 @@ impl IncomingBaoOperation {
         self.plain_key = Some(key);
         self.location = location;
         self.state = IncomingBaoState::AdmitSealed;
-        smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })]
+        Ok(blob_call(BlobEffect::AdmitRead { key, archive }))
     }
 
-    fn handle_admission(&mut self, event: Event) -> Effects {
+    fn handle_admission(&mut self, event: Event) -> ServeTurn {
         let location = self.location.take();
         let sealed = location
             .as_ref()
@@ -750,14 +731,14 @@ impl IncomingBaoOperation {
     }
 
     /// Offers the admitted copy, or the observation when no location was resolved.
-    fn offer_admitted(&mut self, location: Option<BackendLocation>) -> Effects {
+    fn offer_admitted(&mut self, location: Option<BackendLocation>) -> ServeTurn {
         match location {
             Some(location) => self.offer_location(location),
             None => self.accept_observation(),
         }
     }
 
-    fn offer_location(&mut self, location: BackendLocation) -> Effects {
+    fn offer_location(&mut self, location: BackendLocation) -> ServeTurn {
         let Some(blake3) = self.blob_hash else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
@@ -777,77 +758,61 @@ impl IncomingBaoOperation {
         };
         self.location = Some(location);
         self.state = IncomingBaoState::SendAccepted;
-        smallvec![Effect::Blob(BlobEffect::SendMessage {
+        Ok(blob_call(BlobEffect::SendMessage {
             stream_id: self.stream_id,
             payload,
-        })]
+        }))
     }
 
-    fn send_refusal(&mut self, refusal: BaoReadRefusal) -> Effects {
+    fn send_refusal(&mut self, refusal: BaoReadRefusal) -> ServeTurn {
         let payload = match VersionReplicationMessage::BaoReadRefused(refusal).to_bytes() {
             Ok(payload) => payload,
             Err(error) => return self.fail(error.into()),
         };
         self.refusal = Some(refusal);
         self.state = IncomingBaoState::SendRefusal;
-        smallvec![Effect::Blob(BlobEffect::SendMessage {
+        Ok(blob_call(BlobEffect::SendMessage {
             stream_id: self.stream_id,
             payload,
-        })]
+        }))
     }
 
-    fn handle_start(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected(event);
-        };
-        self.txn_id = Some(txn_id);
-        self.read_realm()
+    fn fail(&mut self, error: BaoReadError) -> ServeTurn {
+        self.failed = true;
+        Err(error)
     }
 
-    fn commit_result(&mut self, result: IncomingBaoResult) -> Effects {
-        self.result = Some(result);
-        let Some(txn_id) = self.txn_id else {
-            self.output = Some(Ok(result));
-            self.state = IncomingBaoState::Finish;
-            return smallvec![];
-        };
-        self.state = IncomingBaoState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_commit(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected(event);
-        };
-        self.txn_id = None;
-        self.state = IncomingBaoState::Finish;
-        self.output = Some(Ok(self.result.take().unwrap_or(IncomingBaoResult::Probed)));
-        smallvec![]
-    }
-
-    fn handle_abort(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
-            return self.unexpected(event);
-        };
-        self.txn_id = None;
-        self.state = IncomingBaoState::Finish;
-        let refusal = self
-            .refusal
-            .take()
-            .unwrap_or(BaoReadRefusal::BackendFailure);
-        self.output = Some(Ok(IncomingBaoResult::Refused(refusal)));
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: BaoReadError) -> Effects {
-        self.state = IncomingBaoState::Error;
-        self.output = Some(Err(error));
-        smallvec![Effect::Blob(BlobEffect::CloseConnection {
+    fn close(&mut self, state: IncomingBaoState) -> ServeTurn {
+        self.state = state;
+        Ok(blob_call(BlobEffect::CloseConnection {
             stream_id: self.stream_id,
-        })]
+        }))
     }
 
-    fn unexpected(&mut self, event: Event) -> Effects {
+    /// The event answering a stream call; a failed stream ends the serve.
+    fn stream_event(&mut self, result: IoResult) -> Result<Event, BaoReadError> {
+        match result.event()? {
+            Event::Blob(BlobEvent::Error(error)) => {
+                self.failed = true;
+                Err(error.into())
+            }
+            event => Ok(event),
+        }
+    }
+
+    /// Whether the reader was already answered, so a failure can only close the stream.
+    fn answered(&self) -> bool {
+        matches!(
+            self.state,
+            IncomingBaoState::SendAccepted
+                | IncomingBaoState::ServeRead
+                | IncomingBaoState::CloseMetadata
+                | IncomingBaoState::SendRefusal
+                | IncomingBaoState::CloseRefusal
+        )
+    }
+
+    fn unexpected(&mut self, event: Event) -> ServeTurn {
         self.fail(BaoReadError::Unexpected {
             state: self.state_name(),
             event: event.label().to_string(),
@@ -857,7 +822,6 @@ impl IncomingBaoOperation {
     fn state_name(&self) -> &'static str {
         match self.state {
             IncomingBaoState::Init => "init",
-            IncomingBaoState::StartTransaction => "start_transaction",
             IncomingBaoState::ReadRealm => "read_realm",
             IncomingBaoState::LocateVersion => "locate_version",
             IncomingBaoState::ReadExactVersion => "read_exact_version",
@@ -874,12 +838,8 @@ impl IncomingBaoOperation {
             IncomingBaoState::SendAccepted => "send_accepted",
             IncomingBaoState::ServeRead => "serve_read",
             IncomingBaoState::CloseMetadata => "close_metadata",
-            IncomingBaoState::CommitTransaction => "commit_transaction",
             IncomingBaoState::SendRefusal => "send_refusal",
             IncomingBaoState::CloseRefusal => "close_refusal",
-            IncomingBaoState::AbortTransaction => "abort_transaction",
-            IncomingBaoState::Finish => "finish",
-            IncomingBaoState::Error => "error",
         }
     }
 
@@ -901,10 +861,7 @@ impl IncomingBaoOperation {
         None
     }
 
-    fn handle_realm(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn handle_realm(&mut self, value: Option<Value>) -> ServeTurn {
         let Some(value) = value else {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
         };
@@ -930,17 +887,14 @@ impl IncomingBaoOperation {
             }
             BaoReadTarget::Version { set_id, version_id } => {
                 let (set_id, version_id) = (*set_id, *version_id);
-                self.state = IncomingBaoState::LocateVersion;
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (DISTRIBUTION_KEYSPACE.to_string(), set_id.to_bytes().into()),
-                        (
-                            VERSION_INDEX_KEYSPACE.to_string(),
-                            index_key(set_id, version_id).into(),
-                        ),
-                    ],
-                    txn_id: self.txn_id,
-                })]
+                let reads = vec![
+                    (DISTRIBUTION_KEYSPACE.to_string(), set_id.to_bytes().into()),
+                    (
+                        VERSION_INDEX_KEYSPACE.to_string(),
+                        index_key(set_id, version_id).into(),
+                    ),
+                ];
+                self.read_rows(IncomingBaoState::LocateVersion, reads)
             }
             BaoReadTarget::Blake3(hash) => {
                 if self
@@ -960,15 +914,11 @@ impl IncomingBaoOperation {
 
     /// Finds a logical version in this node's member bucket: the record names the bucket, the
     /// version id index the key. The bucket read that follows checks the binding.
-    fn handle_located(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
+    fn handle_located(&mut self, values: Vec<Option<Value>>) -> ServeTurn {
         let BaoReadTarget::Version { set_id, version_id } = self.request.target else {
             return self.send_refusal(BaoReadRefusal::InvalidTarget);
         };
-        let (Some((_, Some(record))), Some((_, Some(index)))) = (values.first(), values.get(1))
-        else {
+        let (Some(Some(record)), Some(Some(index))) = (values.first(), values.get(1)) else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
         let bucket = match DistributionView::from_bytes(record) {
@@ -992,10 +942,7 @@ impl IncomingBaoOperation {
         self.read_exact_bucket()
     }
 
-    fn handle_exact_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn handle_exact_version(&mut self, value: Option<Value>) -> ServeTurn {
         let Some(value) = value else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
@@ -1064,7 +1011,7 @@ impl IncomingBaoOperation {
 
     /// Serves an attachment or cache entry of a version this node keeps only the record of,
     /// under the same checks as a materialized copy; governed versions are never kept.
-    fn read_kept(&mut self, held: HeldElsewhere) -> Effects {
+    fn read_kept(&mut self, held: HeldElsewhere) -> ServeTurn {
         if !self.policy_allowed {
             return self.send_refusal(BaoReadRefusal::ReadDenied);
         }
@@ -1080,7 +1027,6 @@ impl IncomingBaoOperation {
         self.version_key = self
             .exact_target()
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
-        self.state = IncomingBaoState::ReadKept;
         let mut reads = kept_reads(&held);
         // An exact read of a record without a copy here names a holder of its bytes instead.
         if let BaoReadTarget::ExactVersion(_) = self.request.target {
@@ -1090,21 +1036,15 @@ impl IncomingBaoOperation {
             ));
         }
         self.kept = Some(held);
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.read_rows(IncomingBaoState::ReadKept, reads)
     }
 
-    fn handle_kept(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
+    fn handle_kept(&mut self, values: Vec<Option<Value>>) -> ServeTurn {
         let Some(held) = self.kept.take() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
-        let Some(location) = kept_location(&held, &values) else {
-            let record = values.get(2).and_then(|(_, value)| value.as_deref());
+        let Some(location) = kept_location(&held, &keyed(&values)) else {
+            let record = values.get(2).and_then(|value| value.as_deref());
             let holder = record.and_then(|record| self.byte_holder(record));
             return self.send_refusal(match holder {
                 Some(holder) => BaoReadRefusal::HeldBy {
@@ -1149,7 +1089,7 @@ impl IncomingBaoOperation {
     /// Serves one version this node never materialized: a device streams the
     /// owner's own file from the staging source, under the identity the
     /// requester named and the fingerprint the observation recorded.
-    fn serve_observation(&mut self, version: BlobVersion) -> Effects {
+    fn serve_observation(&mut self, version: BlobVersion) -> ServeTurn {
         // A realm node holds no observations, so it answers as it always did.
         let Some(owner) = self.local_owner else {
             return self.send_refusal(BaoReadRefusal::NotFound);
@@ -1190,29 +1130,29 @@ impl IncomingBaoOperation {
             .exact_target()
             .map(|target| VersionKey::new(&target.bucket, &target.key, target.version));
         self.state = IncomingBaoState::ResolveSource;
-        smallvec![resolve_binding_effect(ResolveBindingInput {
+        let resolve = resolve_binding_effect(ResolveBindingInput {
             source,
             group_id: None,
-        },)]
+        });
+        Ok(Next::Call(resolve.into()))
     }
 
     /// An observation of an encrypting bucket is served only under its bucket lease.
-    fn observation_settings(&mut self) -> Effects {
+    fn observation_settings(&mut self) -> ServeTurn {
         let Some(version) = self.version_key.clone() else {
             return self.accept_observation();
         };
         self.location = None;
-        self.state = IncomingBaoState::ReadContentSettings;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: version.bucket.as_bytes().into(),
-            txn_id: self.txn_id,
-        })]
+        self.read_one(
+            IncomingBaoState::ReadContentSettings,
+            BUCKET_ENCRYPTION_KEYSPACE,
+            version.bucket.as_bytes().to_vec(),
+        )
     }
 
     /// Announces an observation the same way a materialized copy is announced,
     /// from the size the observation recorded rather than a blob location.
-    fn accept_observation(&mut self) -> Effects {
+    fn accept_observation(&mut self) -> ServeTurn {
         let (Some(blake3), Some(size)) = (self.blob_hash, self.source_size) else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
@@ -1228,16 +1168,13 @@ impl IncomingBaoOperation {
             Err(error) => return self.fail(error.into()),
         };
         self.state = IncomingBaoState::SendAccepted;
-        smallvec![Effect::Blob(BlobEffect::SendMessage {
+        Ok(blob_call(BlobEffect::SendMessage {
             stream_id: self.stream_id,
             payload,
-        })]
+        }))
     }
 
-    fn handle_exact_bucket(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn handle_exact_bucket(&mut self, value: Option<Value>) -> ServeTurn {
         let Some(value) = value else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
@@ -1264,10 +1201,7 @@ impl IncomingBaoOperation {
         self.start_policy(bucket.group_id, path, PolicyNext::Exact)
     }
 
-    fn handle_hash_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn handle_hash_version(&mut self, value: Option<Value>) -> ServeTurn {
         let Some(value) = value else {
             return self.next_candidate();
         };
@@ -1290,10 +1224,7 @@ impl IncomingBaoOperation {
         self.read_location()
     }
 
-    fn handle_location(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn handle_location(&mut self, value: Option<Value>) -> ServeTurn {
         let Some(value) = value else {
             return if matches!(&self.request.target, BaoReadTarget::Blake3(_)) {
                 self.next_candidate()
@@ -1319,25 +1250,22 @@ impl IncomingBaoOperation {
 
     /// A governed copy is only offered from a registration this node can still
     /// serve, and only to a destination it evaluated itself.
-    fn check_managed_copy(&mut self, location: BackendLocation) -> Effects {
+    fn check_managed_copy(&mut self, location: BackendLocation) -> ServeTurn {
         let Some(version) = self.version_key.clone() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
         let key = ManagedCopyKey::new(version, location.backend.clone());
-        let effect = match serve_reads(&key, self.txn_id) {
-            Ok(effect) => effect,
+        let reads = match serve_reads(&key, None) {
+            Ok(Effect::Storage(StorageEffect::BatchRead { reads, .. })) => reads,
+            Ok(_) => return self.fail(BaoReadError::NotFinished),
             Err(error) => return self.fail(error.into()),
         };
         self.pending_location = Some(location);
-        self.state = IncomingBaoState::CheckManagedCopy;
-        smallvec![effect]
+        self.read_rows(IncomingBaoState::CheckManagedCopy, reads)
     }
 
-    fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
-        let Some((copy, subject)) = split_serve_reads(values).ok() else {
+    fn handle_managed_copy(&mut self, values: Vec<Option<Value>>) -> ServeTurn {
+        let Some((copy, subject)) = split_serve_reads(keyed(&values)).ok() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
         };
         let (Some(location), Some(version)) =
@@ -1375,7 +1303,7 @@ impl IncomingBaoOperation {
     /// Teaches the requester every unresolved rule, then evaluates the authenticated
     /// destination independently. Authorization already passed, so refs may be
     /// disclosed; echoing one is never authority.
-    fn challenge_destination(&mut self, location: BackendLocation) -> Effects {
+    fn challenge_destination(&mut self, location: BackendLocation) -> ServeTurn {
         let missing: Vec<PlacementPolicyRef> = self
             .version_refs
             .iter()
@@ -1405,20 +1333,18 @@ impl IncomingBaoOperation {
             Ok(None) => self.send_accepted(location),
             Ok(Some(gate)) => {
                 self.state = IncomingBaoState::PolicyChallenge;
-                let child =
-                    boxed_suboperation(gate, |outcome| Event::Child(ChildOutcome::new(outcome)));
-                smallvec![Effect::SubOperation(child)]
+                Ok(Next::Call(IoCall::child(gate)))
             }
             Err(_) => self.send_denied(Vec::new()),
         }
     }
 
-    fn finish_challenge(&mut self, outcome: ChildOutcome) -> Effects {
+    fn finish_challenge(
+        &mut self,
+        outcome: Result<PolicyGateOutcome, ReadPolicyError>,
+    ) -> ServeTurn {
         let Some(location) = self.pending_location.clone() else {
             return self.send_refusal(BaoReadRefusal::NotFound);
-        };
-        let Some(outcome) = outcome.take::<PolicyGateOutcome, ReadPolicyError>() else {
-            return self.send_denied(Vec::new());
         };
         let decision = outcome
             .map_err(PolicyGateError::from)
@@ -1432,33 +1358,104 @@ impl IncomingBaoOperation {
         }
     }
 
-    fn send_required(&mut self, refs: Vec<PlacementPolicyRef>) -> Effects {
+    fn send_required(&mut self, refs: Vec<PlacementPolicyRef>) -> ServeTurn {
         self.send_policy(VersionReplicationMessage::PlacementPolicyRequired { refs })
     }
 
-    fn send_denied(&mut self, policy_ids: Vec<Ulid>) -> Effects {
+    fn send_denied(&mut self, policy_ids: Vec<Ulid>) -> ServeTurn {
         self.send_policy(VersionReplicationMessage::PlacementPolicyDenied { policy_ids })
     }
 
-    fn send_policy(&mut self, message: VersionReplicationMessage) -> Effects {
+    fn send_policy(&mut self, message: VersionReplicationMessage) -> ServeTurn {
         let payload = match message.to_bytes() {
             Ok(payload) => payload,
             Err(error) => return self.fail(error.into()),
         };
         self.refusal = Some(BaoReadRefusal::ReadDenied);
         self.state = IncomingBaoState::SendRefusal;
-        smallvec![Effect::Blob(BlobEffect::SendMessage {
+        Ok(blob_call(BlobEffect::SendMessage {
             stream_id: self.stream_id,
             payload,
-        })]
+        }))
     }
 }
 
-impl EffectOperation for IncomingBaoOperation {
+impl IncomingBaoOperation {
+    /// The accepted frame went out: closes a probe, otherwise serves the bytes.
+    fn serve_accepted(&mut self) -> ServeTurn {
+        if self.request.metadata_only {
+            return self.close(IncomingBaoState::CloseMetadata);
+        }
+        let Some(expected_blake3) = self.blob_hash else {
+            return self.fail(BaoReadError::NotFinished);
+        };
+        let stream_id = self.stream_id;
+        if let Some(access) = self.source_access.clone() {
+            let (Some(size), Some(fingerprint)) =
+                (self.source_size, self.source_fingerprint.clone())
+            else {
+                return self.fail(BaoReadError::NotFinished);
+            };
+            self.state = IncomingBaoState::ServeRead;
+            return Ok(blob_call(BlobEffect::ServeSourceRead {
+                stream_id,
+                access,
+                size,
+                expected_blake3,
+                fingerprint,
+            }));
+        }
+        let Some(location) = self.location.clone() else {
+            return self.fail(BaoReadError::NotFinished);
+        };
+        self.state = IncomingBaoState::ServeRead;
+        let range = self.request.range.clone();
+        if let Some(lease) = self.lease.take() {
+            return Ok(blob_call(BlobEffect::ServeSealedRead {
+                stream_id,
+                location,
+                expected_blake3,
+                lease: Box::new(lease),
+                range,
+            }));
+        }
+        Ok(blob_call(BlobEffect::ServeRead {
+            stream_id,
+            location,
+            expected_blake3,
+            range,
+        }))
+    }
+
+    /// The next step after a stream call answered.
+    fn stream_step(&mut self, event: Event) -> ServeTurn {
+        match (self.state, event) {
+            (IncomingBaoState::SendAccepted, Event::Blob(BlobEvent::MessageSent { .. })) => {
+                self.serve_accepted()
+            }
+            (IncomingBaoState::ServeRead, Event::Blob(BlobEvent::ReadServed { .. })) => {
+                Ok(Next::Done(IncomingBaoResult::Served))
+            }
+            (IncomingBaoState::CloseMetadata, Event::Blob(BlobEvent::ConnectionClosed { .. })) => {
+                Ok(Next::Done(IncomingBaoResult::Probed))
+            }
+            (IncomingBaoState::SendRefusal, Event::Blob(BlobEvent::MessageSent { .. })) => {
+                self.close(IncomingBaoState::CloseRefusal)
+            }
+            (IncomingBaoState::CloseRefusal, Event::Blob(BlobEvent::ConnectionClosed { .. })) => {
+                let refusal = self.refusal.unwrap_or(BaoReadRefusal::BackendFailure);
+                Ok(Next::Done(IncomingBaoResult::Refused(refusal)))
+            }
+            (_, event) => self.unexpected(event),
+        }
+    }
+}
+
+impl Operation for IncomingBaoOperation {
     type Output = IncomingBaoResult;
     type Error = BaoReadError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> ServeTurn {
         let user_id = self.request.auth_context.user_id;
         if self.request.realm_id != self.local_realm
             || self.request.auth_context.realm_id != self.request.realm_id
@@ -1466,40 +1463,17 @@ impl EffectOperation for IncomingBaoOperation {
         {
             return self.send_refusal(BaoReadRefusal::RealmPeerDenied);
         }
-        if self.snapshot {
-            self.state = IncomingBaoState::StartTransaction;
-            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: true
-            })];
-        }
         self.read_realm()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { .. })
-                if !matches!(
-                    self.state,
-                    IncomingBaoState::CommitTransaction | IncomingBaoState::AbortTransaction
-                ) =>
-            {
-                return self.send_refusal(BaoReadRefusal::BackendFailure);
-            }
-            // A refused admission becomes a typed refusal to the reader, not a failed serve.
-            Event::Blob(BlobEvent::Error(error)) if self.state != IncomingBaoState::AdmitSealed => {
-                return self.fail(error.into());
-            }
-            event => event,
-        };
-
+    fn next(&mut self, result: IoResult) -> ServeTurn {
         match self.state {
-            IncomingBaoState::StartTransaction => self.handle_start(event),
-            IncomingBaoState::ReadRealm => self.handle_realm(event),
-            IncomingBaoState::LocateVersion => self.handle_located(event),
-            IncomingBaoState::ReadExactVersion => self.handle_exact_version(event),
-            IncomingBaoState::ReadKept => self.handle_kept(event),
-            IncomingBaoState::ReadExactBucket => self.handle_exact_bucket(event),
-            IncomingBaoState::ResolveSource => match event {
+            IncomingBaoState::ReadRealm => self.handle_realm(result.value()?),
+            IncomingBaoState::LocateVersion => self.handle_located(result.values()?),
+            IncomingBaoState::ReadExactVersion => self.handle_exact_version(result.value()?),
+            IncomingBaoState::ReadKept => self.handle_kept(result.values()?),
+            IncomingBaoState::ReadExactBucket => self.handle_exact_bucket(result.value()?),
+            IncomingBaoState::ResolveSource => match result.event()? {
                 Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                     result: Ok(access),
                 }) => {
@@ -1511,128 +1485,53 @@ impl EffectOperation for IncomingBaoOperation {
                 }) => self.send_refusal(BaoReadRefusal::NotFound),
                 other => self.unexpected(other),
             },
-            IncomingBaoState::ReadPolicy => self.handle_policy(event),
-            IncomingBaoState::ReadHashVersion => self.handle_hash_version(event),
-            IncomingBaoState::ReadLocation => self.handle_location(event),
-            IncomingBaoState::CheckManagedCopy => self.handle_managed_copy(event),
-            IncomingBaoState::PolicyChallenge => match event {
-                Event::Child(outcome) => self.finish_challenge(outcome),
-                other => self.unexpected(other),
-            },
-            IncomingBaoState::ReadContentSettings => self.content_settings_read(event),
-            IncomingBaoState::AdmitSealed => self.handle_admission(event),
-            IncomingBaoState::SendAccepted => {
-                let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-                    return self.unexpected(event);
-                };
-                if self.request.metadata_only {
-                    self.state = IncomingBaoState::CloseMetadata;
-                    return smallvec![Effect::Blob(BlobEffect::CloseConnection {
-                        stream_id: self.stream_id,
-                    })];
-                }
-                let Some(expected_blake3) = self.blob_hash else {
-                    return self.fail(BaoReadError::NotFinished);
-                };
-                if let Some(access) = self.source_access.clone() {
-                    let (Some(size), Some(fingerprint)) =
-                        (self.source_size, self.source_fingerprint.clone())
-                    else {
-                        return self.fail(BaoReadError::NotFinished);
-                    };
-                    self.state = IncomingBaoState::ServeRead;
-                    return smallvec![Effect::Blob(BlobEffect::ServeSourceRead {
-                        stream_id: self.stream_id,
-                        access,
-                        size,
-                        expected_blake3,
-                        fingerprint,
-                    })];
-                }
-                let Some(location) = self.location.clone() else {
-                    return self.fail(BaoReadError::NotFinished);
-                };
-                self.state = IncomingBaoState::ServeRead;
-                if let Some(lease) = self.lease.take() {
-                    return smallvec![Effect::Blob(BlobEffect::ServeSealedRead {
-                        stream_id: self.stream_id,
-                        location,
-                        expected_blake3,
-                        lease: Box::new(lease),
-                        range: self.request.range.clone(),
-                    })];
-                }
-                smallvec![Effect::Blob(BlobEffect::ServeRead {
-                    stream_id: self.stream_id,
-                    location,
-                    expected_blake3,
-                    range: self.request.range.clone(),
-                })]
+            IncomingBaoState::ReadPolicy => self.handle_policy(result.values()?),
+            IncomingBaoState::ReadHashVersion => self.handle_hash_version(result.value()?),
+            IncomingBaoState::ReadLocation => self.handle_location(result.value()?),
+            IncomingBaoState::CheckManagedCopy => self.handle_managed_copy(result.values()?),
+            IncomingBaoState::PolicyChallenge => {
+                self.finish_challenge(result.child::<PolicyGateOutcome, ReadPolicyError>()?)
             }
-            IncomingBaoState::ServeRead => {
-                let Event::Blob(BlobEvent::ReadServed { .. }) = event else {
-                    return self.unexpected(event);
-                };
-                self.commit_result(IncomingBaoResult::Served)
+            IncomingBaoState::ReadContentSettings => self.content_settings_read(result.value()?),
+            // A refused admission becomes a typed refusal to the reader, not a failed serve.
+            IncomingBaoState::AdmitSealed => self.handle_admission(result.event()?),
+            IncomingBaoState::SendAccepted
+            | IncomingBaoState::ServeRead
+            | IncomingBaoState::CloseMetadata
+            | IncomingBaoState::SendRefusal
+            | IncomingBaoState::CloseRefusal => {
+                let event = self.stream_event(result)?;
+                self.stream_step(event)
             }
-            IncomingBaoState::CloseMetadata => {
-                let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-                    return self.unexpected(event);
-                };
-                self.commit_result(IncomingBaoResult::Probed)
-            }
-            IncomingBaoState::SendRefusal => {
-                let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-                    return self.unexpected(event);
-                };
-                self.state = IncomingBaoState::CloseRefusal;
-                smallvec![Effect::Blob(BlobEffect::CloseConnection {
-                    stream_id: self.stream_id,
-                })]
-            }
-            IncomingBaoState::CloseRefusal => {
-                let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-                    return self.unexpected(event);
-                };
-                let refusal = self
-                    .refusal
-                    .take()
-                    .unwrap_or(BaoReadRefusal::BackendFailure);
-                self.refusal = Some(refusal);
-                let Some(txn_id) = self.txn_id else {
-                    self.state = IncomingBaoState::Finish;
-                    self.output = Some(Ok(IncomingBaoResult::Refused(refusal)));
-                    return smallvec![];
-                };
-                self.state = IncomingBaoState::AbortTransaction;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            IncomingBaoState::CommitTransaction => self.handle_commit(event),
-            IncomingBaoState::AbortTransaction => self.handle_abort(event),
-            IncomingBaoState::Init => self.unexpected(event),
-            IncomingBaoState::Finish | IncomingBaoState::Error => smallvec![],
+            IncomingBaoState::Init => self.fail(BaoReadError::Unexpected {
+                state: self.state_name(),
+                event: result.label().to_string(),
+            }),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            IncomingBaoState::Finish | IncomingBaoState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(BaoReadError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        let effects = self.fail(BaoReadError::NotFinished);
-        if let Some(txn_id) = self.txn_id.take() {
-            let mut effects = effects;
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-            return effects;
+    /// One read snapshot covers the whole serve when the caller asks for it.
+    fn transaction(&self) -> TransactionMode {
+        match self.snapshot {
+            true => TransactionMode::ReadSnapshot,
+            false => TransactionMode::None,
         }
-        effects
+    }
+
+    /// A storage failure or a cut-off before any answer still tells the reader, as a backend
+    /// refusal; every failed serve closes its stream.
+    fn abort(&mut self) -> Vec<IoCall> {
+        let stream_id = self.stream_id;
+        let mut calls = Vec::new();
+        if !self.failed && !self.answered() {
+            let refusal = VersionReplicationMessage::BaoReadRefused(BaoReadRefusal::BackendFailure);
+            if let Ok(payload) = refusal.to_bytes() {
+                let send = BlobEffect::SendMessage { stream_id, payload };
+                calls.push(Effect::Blob(send).into());
+            }
+        }
+        calls.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }).into());
+        calls
     }
 }
 
