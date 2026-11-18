@@ -677,185 +677,309 @@ fn auth_matches(auth: &AuthContext, realm_id: RealmId) -> bool {
     auth.realm_id == realm_id && (auth.user_id.realm_id == realm_id || !auth.user_id.is_nil())
 }
 
-async fn manifest_policy(
-    context: &DriverContext,
-    local_realm: RealmId,
-    local_node: NodeId,
-    manifest: &VersionReplicationManifest,
-) -> Result<(Option<String>, Option<String>), String> {
-    // Denied like a missing policy, so the sender stops and no destination is created. An unbound
-    // folder stays `Deleting` until its row is gone, so checking before the create suffices.
-    match drive(BucketGuardOperation::new(manifest.bucket.as_str()), context)
-        .await
-        .map_err(OfferedDirectoryError::from)
-    {
-        Ok(()) => {}
-        Err(OfferedDirectoryError::ReadOnly(_)) => return Ok((None, None)),
-        Err(error) => return Err(error.to_string()),
-    }
-    let group_id = match drive(GetBucketOperation::new(manifest.bucket.clone()), context).await {
-        Ok(info) => info.group_id,
-        Err(GetBucketError::NotFound) => manifest.group_id,
-        Err(error) => return Err(error.to_string()),
-    };
-    // The member admits a publication against its record of the set, not a user's grants.
-    if manifest.distribution.is_some() {
-        return Ok((None, None));
-    }
-    let path = if manifest.key.is_empty() {
-        bucket_permission_path(local_realm, group_id, local_node, &manifest.bucket)
-    } else {
-        object_permission_path(
-            local_realm,
-            group_id,
-            local_node,
-            &manifest.bucket,
-            &manifest.key,
-        )
-    };
-    if manifest.reference_advance.is_some() {
-        // The sync-eligible publisher attests source READ for this advance.
-        return Ok(if auth_matches(&manifest.auth_context, local_realm) {
-            (Some(path), None)
-        } else {
-            (None, None)
-        });
-    }
-    let operation = if manifest.kind == ReplicationItemKind::DeleteMarker {
-        "s3.DeleteObject"
-    } else {
-        "s3.PutObject"
-    };
-    if !auth_matches(&manifest.auth_context, local_realm)
-        || !allow_policy(
-            context,
-            &manifest.auth_context,
-            &path,
-            &Permission::WRITE,
-            operation,
-        )
-        .await?
-    {
-        return Ok((None, None));
-    }
-    let manifest_path = Some(path.clone());
-    let writer_path = if let Some(auth) = manifest.writer_auth_context.as_ref()
-        && auth_matches(auth, local_realm)
-    {
-        if allow_policy(context, auth, &path, &Permission::WRITE, operation).await? {
-            Some(path)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    Ok((manifest_path, writer_path))
+/// Whether the caller's request policy allows `permission` on a path; a denial is an answer.
+#[derive(Debug, PartialEq)]
+struct AllowPolicyOperation {
+    check: Option<AuthorizeOperation>,
 }
 
-async fn bao_policy(
-    context: &DriverContext,
+impl AllowPolicyOperation {
+    fn new(auth: &AuthContext, path: &str, permission: &Permission, operation: &str) -> Self {
+        let extras = PolicyRequestExtras::operation(operation);
+        let check = AuthorizeOperation::new(auth.realm_id, auth, path, permission, extras);
+        Self { check: Some(check) }
+    }
+}
+
+impl Operation for AllowPolicyOperation {
+    type Output = bool;
+    type Error = StreamPolicyError;
+
+    fn first(&mut self) -> Result<Next<bool>, StreamPolicyError> {
+        let check = self.check.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, StreamPolicyError> {
+        match result.child::<(), AuthorizeError>()? {
+            Ok(()) => Ok(Next::Done(true)),
+            Err(AuthorizeError::PermissionDenied)
+            | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => {
+                Ok(Next::Done(false))
+            }
+            Err(error) => Err(policy_failed(error)),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ManifestStep {
+    Guard,
+    Bucket,
+    Manifest(String, &'static str),
+    Writer(String),
+}
+
+/// The policy paths a manifest may publish under, for its publisher and its writer.
+#[derive(Debug, PartialEq)]
+struct ManifestPolicyOperation {
     local_realm: RealmId,
     local_node: NodeId,
-    request: &crate::replication::protocol::BaoReadRequest,
-) -> Result<(HashSet<String>, Vec<HashIndex>, bool), String> {
-    let mut paths = HashSet::new();
-    if request.realm_id != local_realm || !auth_matches(&request.auth_context, request.realm_id) {
-        return Ok((paths, Vec::new(), false));
-    }
-    match &request.target {
-        crate::replication::protocol::BaoReadTarget::ExactVersion(target) => {
-            if target.realm_id != request.realm_id || target.node_id != local_node {
-                return Ok((paths, Vec::new(), false));
-            }
-            let group_id =
-                match drive(GetBucketOperation::new(target.bucket.clone()), context).await {
-                    Ok(info) => info.group_id,
-                    Err(GetBucketError::NotFound) => {
-                        return Ok((paths, Vec::new(), false));
-                    }
-                    Err(error) => return Err(error.to_string()),
-                };
-            let path = object_permission_path(
-                request.realm_id,
-                group_id,
-                local_node,
-                &target.bucket,
-                &target.key,
-            );
-            if allow_policy(
-                context,
-                &request.auth_context,
-                &path,
-                &Permission::READ,
-                "s3.GetObject",
-            )
-            .await?
-            {
-                paths.insert(path);
-            }
-            Ok((paths, Vec::new(), false))
+    manifest: VersionReplicationManifest,
+    step: ManifestStep,
+}
+
+type ManifestTurn = Result<Next<ManifestPaths>, StreamPolicyError>;
+
+impl ManifestPolicyOperation {
+    fn new(
+        local_realm: RealmId,
+        local_node: NodeId,
+        manifest: &VersionReplicationManifest,
+    ) -> Self {
+        Self {
+            local_realm,
+            local_node,
+            manifest: manifest.clone(),
+            step: ManifestStep::Guard,
         }
-        crate::replication::protocol::BaoReadTarget::Blake3(hash) => {
-            let candidates = drive(ResolvePathsOperation::new(*hash), context)
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut unique = BTreeMap::new();
-            for candidate in candidates {
-                if candidate.realm_id != request.realm_id
-                    || candidate.node_id != local_node
-                    || candidate.blake3_hash != *hash
-                {
-                    continue;
+    }
+
+    fn bucket_known(&mut self, group_id: Ulid) -> ManifestTurn {
+        let (realm, node) = (self.local_realm, self.local_node);
+        let manifest = &self.manifest;
+        // The member admits a publication against its record of the set, not a user's grants.
+        if manifest.distribution.is_some() {
+            return Ok(Next::Done((None, None)));
+        }
+        let path = if manifest.key.is_empty() {
+            bucket_permission_path(realm, group_id, node, &manifest.bucket)
+        } else {
+            object_permission_path(realm, group_id, node, &manifest.bucket, &manifest.key)
+        };
+        let matches = auth_matches(&manifest.auth_context, realm);
+        if manifest.reference_advance.is_some() {
+            // The sync-eligible publisher attests source READ for this advance.
+            return Ok(Next::Done((matches.then_some(path), None)));
+        }
+        if !matches {
+            return Ok(Next::Done((None, None)));
+        }
+        let operation = match manifest.kind {
+            ReplicationItemKind::DeleteMarker => "s3.DeleteObject",
+            _ => "s3.PutObject",
+        };
+        let auth = &manifest.auth_context;
+        let allow = AllowPolicyOperation::new(auth, &path, &Permission::WRITE, operation);
+        self.step = ManifestStep::Manifest(path, operation);
+        Ok(Next::Call(IoCall::child(allow)))
+    }
+}
+
+impl Operation for ManifestPolicyOperation {
+    type Output = ManifestPaths;
+    type Error = StreamPolicyError;
+
+    fn first(&mut self) -> ManifestTurn {
+        let guard = BucketGuardOperation::new(self.manifest.bucket.as_str());
+        Ok(Next::Call(IoCall::child(guard)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ManifestTurn {
+        match std::mem::replace(&mut self.step, ManifestStep::Bucket) {
+            ManifestStep::Guard => {
+                // Denied like a missing policy, so the sender stops and no destination is
+                // created. An unbound folder stays `Deleting` until its row is gone.
+                let guard = result.child::<(), BucketGuardError>()?;
+                match guard.map_err(OfferedDirectoryError::from) {
+                    Ok(()) => {}
+                    Err(OfferedDirectoryError::ReadOnly(_)) => return Ok(Next::Done((None, None))),
+                    Err(error) => return Err(policy_failed(error)),
                 }
-                let key = candidate.to_bytes().map_err(|error| error.to_string())?;
-                unique.entry(key).or_insert(candidate);
+                let bucket = GetBucketOperation::new(self.manifest.bucket.clone());
+                Ok(Next::Call(IoCall::child(bucket)))
             }
-            let candidates = unique.into_values().collect::<Vec<_>>();
-            let evaluators = drive(
-                PolicyBulkOperation::new(
-                    candidates
-                        .iter()
-                        .map(|candidate| (candidate.realm_id, candidate.group_id)),
-                ),
-                context,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            let permissions = drive(
-                GroupRulesOperation::new(
-                    Some(&request.auth_context),
-                    candidates.iter().map(|candidate| candidate.group_id),
-                ),
-                context,
-            )
-            .await
-            .unwrap_or_default();
-            let mut allowed = Vec::with_capacity(candidates.len());
-            let mut had_denial = false;
-            for candidate in candidates {
-                let path = candidate.permission_path();
-                if !permissions.allows(candidate.group_id, &path, &Permission::READ) {
-                    had_denial = true;
-                    continue;
+            ManifestStep::Bucket => match result.child::<BucketInfo, GetBucketError>()? {
+                Ok(info) => self.bucket_known(info.group_id),
+                Err(GetBucketError::NotFound) => self.bucket_known(self.manifest.group_id),
+                Err(error) => Err(policy_failed(error)),
+            },
+            ManifestStep::Manifest(path, operation) => {
+                if !result.child::<bool, StreamPolicyError>()?? {
+                    return Ok(Next::Done((None, None)));
                 }
-                let request = policy_request_with(
-                    &path,
-                    &Permission::READ,
-                    Some(&request.auth_context),
-                    PolicyRequestExtras::operation("s3.GetObject"),
-                );
-                let evaluator = evaluators
-                    .get(&(candidate.realm_id, candidate.group_id))
-                    .ok_or_else(|| "hash policy evaluator is unavailable".to_string())?;
-                match evaluator.evaluate(&request) {
-                    Ok(()) => {
-                        paths.insert(path);
-                        allowed.push(candidate);
-                    }
-                    Err(PolicyEnforcementError::Denied { .. }) => had_denial = true,
-                    Err(error) => return Err(error.to_string()),
+                let writer = (self.manifest.writer_auth_context.as_ref())
+                    .filter(|auth| auth_matches(auth, self.local_realm));
+                let Some(auth) = writer else {
+                    return Ok(Next::Done((Some(path), None)));
+                };
+                let allow = AllowPolicyOperation::new(auth, &path, &Permission::WRITE, operation);
+                self.step = ManifestStep::Writer(path);
+                Ok(Next::Call(IoCall::child(allow)))
+            }
+            ManifestStep::Writer(path) => {
+                let allowed = result.child::<bool, StreamPolicyError>()??;
+                let writer = allowed.then(|| path.clone());
+                Ok(Next::Done((Some(path), writer)))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadPolicyStep {
+    Bucket,
+    Allowed(String),
+    Paths,
+    Evaluators(Vec<HashIndex>),
+    Rules(Vec<HashIndex>, PolicyEvaluators),
+}
+
+/// The paths and hash candidates a bao read may be served from, and whether a candidate was
+/// denied.
+#[derive(Debug, PartialEq)]
+struct ReadPolicyOperation {
+    local_realm: RealmId,
+    local_node: NodeId,
+    request: BaoReadRequest,
+    step: ReadPolicyStep,
+}
+
+type ReadPolicyTurn = Result<Next<ReadPolicy>, StreamPolicyError>;
+
+fn no_read() -> ReadPolicyTurn {
+    Ok(Next::Done((HashSet::new(), Vec::new(), false)))
+}
+
+impl ReadPolicyOperation {
+    fn new(local_realm: RealmId, local_node: NodeId, request: &BaoReadRequest) -> Self {
+        Self {
+            local_realm,
+            local_node,
+            request: request.clone(),
+            step: ReadPolicyStep::Bucket,
+        }
+    }
+
+    fn bucket_known(&mut self, group_id: Ulid) -> ReadPolicyTurn {
+        let request = &self.request;
+        let BaoReadTarget::ExactVersion(target) = &request.target else {
+            return Err(IoError::Unfinished.into());
+        };
+        let path = object_permission_path(
+            request.realm_id,
+            group_id,
+            self.local_node,
+            &target.bucket,
+            &target.key,
+        );
+        let auth = &request.auth_context;
+        let allow = AllowPolicyOperation::new(auth, &path, &Permission::READ, "s3.GetObject");
+        self.step = ReadPolicyStep::Allowed(path);
+        Ok(Next::Call(IoCall::child(allow)))
+    }
+
+    fn resolved(&mut self, candidates: Vec<HashIndex>) -> ReadPolicyTurn {
+        let request = &self.request;
+        let BaoReadTarget::Blake3(hash) = &request.target else {
+            return Err(IoError::Unfinished.into());
+        };
+        let mut unique = BTreeMap::new();
+        for candidate in candidates {
+            if candidate.realm_id != request.realm_id
+                || candidate.node_id != self.local_node
+                || candidate.blake3_hash != *hash
+            {
+                continue;
+            }
+            unique
+                .entry(candidate.to_bytes().map_err(policy_failed)?)
+                .or_insert(candidate);
+        }
+        let candidates = unique.into_values().collect::<Vec<_>>();
+        let scopes = candidates.iter().map(|c| (c.realm_id, c.group_id));
+        let bulk = PolicyBulkOperation::new(scopes);
+        self.step = ReadPolicyStep::Evaluators(candidates);
+        Ok(Next::Call(IoCall::child(bulk)))
+    }
+
+    fn evaluate(
+        &self,
+        candidates: Vec<HashIndex>,
+        evaluators: &PolicyEvaluators,
+        permissions: &GroupPermissionRules,
+    ) -> ReadPolicyTurn {
+        let auth = &self.request.auth_context;
+        let mut paths = HashSet::new();
+        let mut allowed = Vec::with_capacity(candidates.len());
+        let mut had_denial = false;
+        for candidate in candidates {
+            let path = candidate.permission_path();
+            if !permissions.allows(candidate.group_id, &path, &Permission::READ) {
+                had_denial = true;
+                continue;
+            }
+            let extras = PolicyRequestExtras::operation("s3.GetObject");
+            let asked = policy_request_with(&path, &Permission::READ, Some(auth), extras);
+            let evaluator = evaluators
+                .get(&(candidate.realm_id, candidate.group_id))
+                .ok_or_else(|| policy_failed("hash policy evaluator is unavailable"))?;
+            match evaluator.evaluate(&asked) {
+                Ok(()) => {
+                    paths.insert(path);
+                    allowed.push(candidate);
                 }
+                Err(PolicyEnforcementError::Denied { .. }) => had_denial = true,
+                Err(error) => return Err(policy_failed(error)),
+            }
+        }
+        Ok(Next::Done((paths, allowed, had_denial)))
+    }
+}
+
+impl Operation for ReadPolicyOperation {
+    type Output = ReadPolicy;
+    type Error = StreamPolicyError;
+
+    fn first(&mut self) -> ReadPolicyTurn {
+        let request = &self.request;
+        if request.realm_id != self.local_realm
+            || !auth_matches(&request.auth_context, request.realm_id)
+        {
+            return no_read();
+        }
+        match &request.target {
+            BaoReadTarget::ExactVersion(target) => {
+                if target.realm_id != request.realm_id || target.node_id != self.local_node {
+                    return no_read();
+                }
+                let bucket = GetBucketOperation::new(target.bucket.clone());
+                Ok(Next::Call(IoCall::child(bucket)))
+            }
+            BaoReadTarget::Blake3(hash) => {
+                self.step = ReadPolicyStep::Paths;
+                let resolve = ResolvePathsOperation::new(*hash);
+                Ok(Next::Call(IoCall::child(resolve)))
+            }
+            // The serve finds the version in its member bucket and checks the caller in its
+            // snapshot transaction, as for every target.
+            BaoReadTarget::Version { .. } => no_read(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> ReadPolicyTurn {
+        match std::mem::replace(&mut self.step, ReadPolicyStep::Paths) {
+            ReadPolicyStep::Bucket => match result.child::<BucketInfo, GetBucketError>()? {
+                Ok(info) => self.bucket_known(info.group_id),
+                Err(GetBucketError::NotFound) => no_read(),
+                Err(error) => Err(policy_failed(error)),
+            },
+            ReadPolicyStep::Allowed(path) => {
+                let mut paths = HashSet::new();
+                if result.child::<bool, StreamPolicyError>()?? {
+                    paths.insert(path);
+                }
+                Ok(Next::Done((paths, Vec::new(), false)))
             }
             Ok((paths, allowed, had_denial))
         }
