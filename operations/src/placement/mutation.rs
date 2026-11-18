@@ -26,8 +26,8 @@ use crate::realm::mutate_placement::{
 };
 
 /// Arms the document outbox drain when records wait, keeping a persisted retry deadline.
-#[derive(Debug, PartialEq)]
-struct KickDrainOperation {
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct KickDrainOperation {
     scanned: bool,
 }
 
@@ -153,7 +153,7 @@ impl Operation for PlacementMutationOperation {
                     }
                     Ok(config) if self.drains_local() => {
                         self.stage = MutationStage::Kick(Box::new(config));
-                        let kick = KickDrainOperation { scanned: false };
+                        let kick = KickDrainOperation::default();
                         Ok(Next::Call(IoCall::child(kick)))
                     }
                     outcome => Ok(Next::Done(outcome?)),

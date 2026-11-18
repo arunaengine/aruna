@@ -99,7 +99,7 @@ fn plain_mutation_finishes() {
 
 #[test]
 fn kick_needs_outbox_rows() {
-    let mut kick = KickDrainOperation { scanned: false };
+    let mut kick = KickDrainOperation::default();
     kick.first().unwrap();
     let empty = IoResult::Page {
         rows: Vec::new(),

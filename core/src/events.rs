@@ -504,6 +504,7 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    Shard(Box<ShardNetEvent>),
     /// Whether sync topics took the requested peers.
     TopicPeers(Result<(), TopicPeerError>),
     /// This node's signature over a group deletion plan.
@@ -514,6 +515,40 @@ pub enum NetEvent {
     RevocationClaims(Result<Box<crate::structs::identity::auth::TokenClaims>, String>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
+}
+
+/// What peers said about topics this node lacks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenesisProbe {
+    /// Topics at least one reached peer holds.
+    pub known_co_holder: std::collections::BTreeSet<irokle::TopicId>,
+    /// Topics a reached peer may hold; creating them could fork the topic.
+    pub unconfirmed: std::collections::BTreeSet<irokle::TopicId>,
+    pub unreachable: Vec<NodeId>,
+}
+
+/// The answer to a [`crate::effects::ShardNetEffect`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShardNetEvent {
+    /// This node has no net transport.
+    NoNetwork,
+    Existing(std::collections::BTreeSet<irokle::TopicId>),
+    /// How many topics could not be reopened.
+    Reopened { failed: usize },
+    Closed(Result<bool, String>),
+    Outcome(Result<(), String>),
+    Probed(GenesisProbe),
+    /// Whether what the pull brought was applied.
+    Pulled { applied: bool },
+    Flag(bool),
+    Facts {
+        holder: NodeId,
+        digest: [u8; 32],
+        cursor: Vec<u8>,
+    },
+    Root(Result<[u8; 32], String>),
+    Proof(crate::structs::placement::transition::CompletionProof),
+    Manifest(Result<Box<crate::document::ShardManifest>, String>),
 }
 
 /// Why sync topics did not take the requested peers.
@@ -945,6 +980,7 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    Shard,
                     TopicPeers,
                     DeletePlanSigned,
                     WritePeerChecked,

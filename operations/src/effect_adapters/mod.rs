@@ -6,6 +6,7 @@ mod audit;
 mod blob;
 mod metadata;
 mod net;
+pub(crate) mod shard;
 mod session;
 mod storage;
 mod task;
@@ -99,6 +100,9 @@ async fn dispatch_unboxed(
         // The metadata transport lives in the metadata handle the runner holds.
         Effect::Net(NetEffect::MetadataRequest(request)) => {
             Box::pin(metadata::dispatch_request(*request, context)).await
+        }
+        Effect::Net(NetEffect::Shard(effect)) => {
+            Box::pin(shard::dispatch_shard(*effect, context)).await
         }
         Effect::Net(NetEffect::AuthorizeWritePeer { peer, auth_token }) => {
             let auth_token = auth_token.map(|token| *token);

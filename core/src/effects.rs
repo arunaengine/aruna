@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::structs::placement::transition::ProofClaim;
+use crate::structs::placement::record::PlacementRef;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::UserId;
@@ -789,6 +792,8 @@ pub enum NetEffect {
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
     /// Sends one encoded metadata protocol request to one peer and reads its answer.
     MetadataRequest(Box<MetadataRequestEffect>),
+    /// Works on this node's shard topics; answers `NetEvent::Shard`.
+    Shard(Box<ShardNetEffect>),
     /// Creates shared sync topics with these peers; answers `NetEvent::TopicPeers`.
     EnsureTopics {
         topics: Vec<irokle::TopicId>,
@@ -839,6 +844,60 @@ pub enum NetEffect {
 
 /// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter
 /// sends it to `peer`, waits at most `timeout`, and never routes or retries.
+/// The exact membership a set of shard topics should have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardMembership {
+    pub topics: Vec<irokle::TopicId>,
+    pub members: Vec<NodeId>,
+    pub publishers: Vec<NodeId>,
+    pub retained: BTreeSet<NodeId>,
+    pub verified: BTreeSet<irokle::TopicId>,
+}
+
+/// Shard topic work the network side of this node carries out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShardNetEffect {
+    /// Which of these topics have a local genesis.
+    Existing(Vec<irokle::TopicId>),
+    /// Reopens topics this node holds again.
+    Reopen(Vec<irokle::TopicId>),
+    /// Closes a topic this node left; says whether a sync still runs on it.
+    Close(irokle::TopicId),
+    Membership(ShardMembership),
+    /// Asks peers which of these topics they already hold.
+    Probe {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Pulls these topics from peers and applies what arrived.
+    Pull {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Creates topics held by this node alone.
+    EnsureLocal(Vec<irokle::TopicId>),
+    /// Creates topics shared with these peers.
+    EnsureShared {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Whether an eviction hand-off for this bucket is still journalled.
+    EvictionPending(PlacementRef),
+    /// The topic's fingerprint and clock.
+    TopicFacts(irokle::TopicId),
+    /// The hash binding a topic's genesis and the operations at a frontier.
+    FrontierRoot {
+        topic: irokle::TopicId,
+        frontier: irokle::ActorClock,
+    },
+    SignProof(ProofClaim),
+    FetchManifest {
+        peer: NodeId,
+        realm_id: RealmId,
+        placement: PlacementRef,
+    },
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct MetadataRequestEffect {
     pub peer: NodeId,
