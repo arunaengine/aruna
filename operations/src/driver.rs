@@ -738,6 +738,7 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Group(_)
         | Effect::Delay(_)
         | Effect::Job(_)
+        | Effect::Git(_)
         | Effect::Search()
         | Effect::Stream() => None,
     }
@@ -1199,8 +1200,15 @@ async fn take_hold(
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     match scope? {
         HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
-        HoldScope::DocumentWrite(document_id) => {
-            Some(context.graph_handle.as_ref()?.hold_document(document_id).await)
+        HoldScope::DocumentWrite(document_id) => Some(
+            context
+                .graph_handle
+                .as_ref()?
+                .hold_document(document_id)
+                .await,
+        ),
+        HoldScope::GitRepository(document_id) => {
+            Some(context.blob_handle.as_ref()?.git()?.lock(document_id).await)
         }
         scope => Some(local_hold(scope).lock_owned().await),
     }

@@ -5,7 +5,6 @@
 pub mod changes;
 pub mod cleanup;
 mod dataset;
-pub mod hook;
 pub mod lfs;
 pub mod location;
 pub mod locks;

@@ -3,9 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::push::{PushRequest, encode};
-use aruna_blob::git::command;
-use aruna_core::git::{LfsObject, RefUpdate, ZERO_OID, refs_clash};
+use crate::git::command;
+use aruna_core::git::{LfsObject, PushRequest, RefUpdate, ZERO_OID, encode_push, refs_clash};
 use aruna_core::repo_layout::Layout;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashSet};
@@ -134,9 +133,9 @@ pub async fn validate() -> std::io::Result<()> {
             }
         }
         if Layout::detect(paths.iter().map(String::as_str)) == Layout::RoCrate {
-            aruna_blob::rocrate::check(directory, &revision).await?;
+            crate::rocrate::check(directory, &revision).await?;
         } else {
-            let converted = aruna_blob::arc::export(directory, &revision).await?;
+            let converted = crate::arc::export(directory, &revision).await?;
             if let Some(error) = converted["error"].as_str() {
                 return Err(std::io::Error::other(error.to_string()));
             }
@@ -172,7 +171,7 @@ pub async fn validate() -> std::io::Result<()> {
     for update in &updates {
         let moves = update.old != ZERO_OID && update.new != ZERO_OID;
         if moves && update.name.starts_with("refs/heads/") {
-            aruna_blob::rocrate::kept(directory, &update.old, &update.new).await?;
+            crate::rocrate::kept(directory, &update.old, &update.new).await?;
         }
     }
     let url = std::env::var("ARUNA_GIT_LFS_URL").map_err(|_| invalid())?;
@@ -182,7 +181,7 @@ pub async fn validate() -> std::io::Result<()> {
     for chunk in objects.chunks(100) {
         let body = serde_json::to_vec(&json!({"operation": "upload", "objects": chunk}))
             .map_err(std::io::Error::other)?;
-        let bytes = aruna_blob::git::lfs_exchange(&url, &token, body).await?;
+        let bytes = crate::git::lfs_exchange(&url, &token, body).await?;
         let response: Value = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
         let returned = response["objects"].as_array().ok_or_else(invalid)?;
         if returned.len() != chunk.len()
@@ -267,12 +266,9 @@ async fn unlocked(lfs_url: &str, paths: &[String], token: &str) -> std::io::Resu
     }
     let url = lfs_url.replace("/objects/batch", "/locks/verify");
     let body = serde_json::to_vec(&json!({})).map_err(std::io::Error::other)?;
-    let reply = aruna_blob::git::metadata_request(
-        &url,
-        token,
-        Some(("application/vnd.git-lfs+json", body)),
-    )
-    .await?;
+    let reply =
+        crate::git::metadata_request(&url, token, Some(("application/vnd.git-lfs+json", body)))
+            .await?;
     let reply: Value = serde_json::from_slice(&reply)?;
     let paths: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
     for lock in reply["theirs"].as_array().into_iter().flatten() {
@@ -353,19 +349,16 @@ async fn publish(
     let pack = if include.is_empty() {
         bytes::Bytes::new()
     } else {
-        let existing: Vec<String> = aruna_blob::repo::refs(directory)
-            .await?
-            .into_values()
-            .collect();
-        aruna_blob::repo::pack(directory, &include, &existing).await?
+        let existing: Vec<String> = crate::repo::refs(directory).await?.into_values().collect();
+        crate::repo::pack(directory, &include, &existing).await?
     };
     let request = PushRequest {
         refs: updates,
         lfs: objects.into_iter().map(|object| object.oid).collect(),
         paths,
     };
-    let body = encode(&request, &pack).map_err(std::io::Error::other)?;
-    aruna_blob::git::metadata_request(
+    let body = encode_push(&request, &pack).ok_or_else(invalid)?;
+    crate::git::metadata_request(
         &format!("{url}/git/push"),
         token,
         Some(("application/x-aruna-git-push", body)),
@@ -379,7 +372,7 @@ async fn publish(
 async fn mergeable(directory: &Path, old: &str, new: &str, token: &str) -> std::io::Result<()> {
     let url = std::env::var("ARUNA_GIT_METADATA_URL").map_err(|_| invalid())?;
     let fetch = async |path: &str| -> std::io::Result<Value> {
-        let bytes = aruna_blob::git::metadata_request(&format!("{url}{path}"), token, None).await?;
+        let bytes = crate::git::metadata_request(&format!("{url}{path}"), token, None).await?;
         Ok(serde_json::from_slice::<Value>(&bytes)?)
     };
     // Scaffolded documents have no raw revision until their first replacement.
@@ -389,7 +382,7 @@ async fn mergeable(directory: &Path, old: &str, new: &str, token: &str) -> std::
     };
     let old = (!old.bytes().all(|byte| byte == b'0')).then_some(old);
     let graph = serde_json::to_string(&current)?;
-    match aruna_blob::arc::merge_metadata(directory, (old, new), &graph, None).await? {
+    match crate::arc::merge_metadata(directory, (old, new), &graph, None).await? {
         Ok(_) => Ok(()),
         Err(error) => Err(std::io::Error::other(error)),
     }

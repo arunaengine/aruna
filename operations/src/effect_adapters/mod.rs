@@ -5,6 +5,7 @@
 mod audit;
 mod blob;
 mod compute;
+mod git;
 pub(crate) mod job;
 mod metadata;
 mod net;
@@ -206,6 +207,7 @@ async fn dispatch_unboxed(
         Effect::Compute(effect) => {
             Event::Compute(Box::new(compute::dispatch_compute(*effect, context).await))
         }
+        Effect::Git(call) => Event::Git(Box::new(git::dispatch_git(*call, context).await)),
         Effect::Job(effect) => Box::pin(job::dispatch_job(effect, context, depth, deadline)).await,
     };
 
@@ -246,6 +248,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Outbound(_) => "outbound",
         Effect::Delay(_) => "delay",
         Effect::Job(_) => "job",
+        Effect::Git(_) => "git",
     }
 }
 
