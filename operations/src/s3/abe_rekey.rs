@@ -655,124 +655,162 @@ mod tests {
             (progress.cursor, progress.rekeyed),
             (row("foo/a").to_vec(), 1)
         );
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        let (progress, done) = operation.finalize().unwrap();
-        assert_eq!((progress.rekeyed, done), (1, false));
+        let end = page_end(&mut operation);
+        assert_eq!(
+            (end.progress.rekeyed, end.done, end.stopped),
+            (1, false, None)
+        );
     }
 
     #[test]
     fn locked_version_keeps() {
         // The cursor stays before a version the locked key could not re-key.
         let mut operation = scanning(4);
-        scanned(&mut operation, &["foo/a", "foo/b"]);
-        ended(&mut operation, RekeyOutcome::Moved);
-        ended(&mut operation, RekeyOutcome::Locked);
-        let progress = written(&saved(&mut operation, None));
-        assert_eq!(progress.cursor, row("foo/a").0.to_vec());
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert_eq!(operation.finalize(), Err(KeyError::Locked));
-    }
-
-    fn committed(operation: &mut RekeyOperation) {
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
+        scanned(&mut operation, &["foo/a", "foo/b"]).unwrap();
+        ended(&mut operation, RewriteOutcome::Moved).unwrap();
+        ended(&mut operation, RewriteOutcome::AwaitingKey).unwrap();
+        let progress = written(saved(&mut operation, Some(seen_row())));
+        assert_eq!(progress.cursor, row("foo/a").to_vec());
+        assert_eq!(page_end(&mut operation).stopped, Some(KeyError::Locked));
     }
 
     #[test]
     fn unfinished_version_stops() {
         // A pending version keeps the pass open with the cursor before it, on the last page too.
         let mut operation = scanning(4);
-        scanned(&mut operation, &["foo/a", "foo/b", "foo/c"]);
-        ended(&mut operation, RekeyOutcome::Moved);
-        ended(&mut operation, RekeyOutcome::Unfinished);
-        let progress = written(&saved(&mut operation, None));
+        scanned(&mut operation, &["foo/a", "foo/b", "foo/c"]).unwrap();
+        ended(&mut operation, RewriteOutcome::Moved).unwrap();
+        ended(&mut operation, RewriteOutcome::Unfinished).unwrap();
+        let progress = written(saved(&mut operation, Some(seen_row())));
         assert_eq!(
             (progress.cursor, progress.rekeyed),
-            (row("foo/a").0.to_vec(), 1)
+            (row("foo/a").to_vec(), 1)
         );
-        committed(&mut operation);
-        assert_eq!(operation.finalize(), Err(KeyError::Unfinished));
+        assert_eq!(page_end(&mut operation).stopped, Some(KeyError::Unfinished));
     }
 
-    /// A first page for `prefix` that waits for the progress row read in its claim.
-    fn claiming(prefix: &str) -> RekeyOperation {
-        let mut operation = scanning(1);
-        operation.prefix = prefix.into();
-        operation.progress.as_mut().unwrap().prefix = prefix.into();
-        operation.txn = Some(TxnId::generate());
-        operation.step = Step::ClaimRead;
+    #[test]
+    fn failed_rewrite_stops() {
+        let mut operation = scanning(4);
+        scanned(&mut operation, &["foo/a"]).unwrap();
+        let failed =
+            Err::<RewriteOutcome, _>(RewriteError::from(aruna_core::calls::IoError::Conflict));
         operation
+            .next(IoResult::Child(ChildOutcome::new(failed)))
+            .unwrap();
+        written(saved(&mut operation, Some(seen_row())));
+        assert_eq!(page_end(&mut operation).stopped, Some(KeyError::Storage));
     }
 
-    fn claim_read(operation: &mut RekeyOperation, value: Option<Value>) -> Effects {
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value,
-        }))
+    fn claiming(prefix: &str) -> ClaimRekey {
+        let mut claim = ClaimRekey {
+            id: Key::from(vec![1; 16]),
+            prefix: prefix.into(),
+            fresh: progress(prefix),
+            claimed: None,
+        };
+        assert_eq!(claim.transaction(), TransactionMode::Write);
+        claim.first().unwrap();
+        claim
     }
 
     #[test]
     fn claims_before_rewriting() {
         // Two first pages for different prefixes: the second stops before changing any version.
         let mut first = claiming("foo/");
-        let effects = claim_read(&mut first, None);
-        let claimed = written(&effects);
-        assert_eq!(claimed.prefix, "foo/");
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("one claim write");
+        let turn = first.next(IoResult::Values(vec![None]));
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("one claim write: {turn:?}");
         };
-        let row = writes[0].2.clone();
+        let stored = writes[0].2.clone();
         let mut second = claiming("bar/");
-        let effects = claim_read(&mut second, Some(row));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(second.finalize(), Err(KeyError::Busy));
-        // The first scans only after its claim committed.
-        first.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let txn_id = TxnId::generate();
-        first.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        let txn_id = TxnId::generate();
-        first.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let seen = first.seen.clone();
-        let effects = claim_read(&mut first, seen);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { .. })]
-        ));
+        let refused = second.next(IoResult::Values(vec![Some(stored.clone())]));
+        assert_eq!(refused, Err(KeyError::Busy));
+        // The first page starts only from the claim that committed.
+        assert_eq!(
+            first.next(IoResult::Done),
+            Ok(Next::Done((progress("foo/"), stored)))
+        );
+    }
+
+    #[test]
+    fn claim_restarts_raised() {
+        // A pass saved under an older epoch starts over.
+        let mut saved = progress("foo/");
+        (saved.epoch, saved.rekeyed) = (1, 5);
+        let row = postcard::to_allocvec(&saved).unwrap();
+        let mut claim = claiming("foo/");
+        claim
+            .next(IoResult::Values(vec![Some(row.into())]))
+            .unwrap();
+        let Ok(Next::Done((claimed, _))) = claim.next(IoResult::Done) else {
+            panic!("the claim commits");
+        };
+        assert_eq!(claimed, progress("foo/"));
     }
 
     #[test]
     fn last_page_finishes() {
         let mut operation = scanning(4);
-        scanned(&mut operation, &["bar/x", "foo/a"]);
-        ended(&mut operation, RekeyOutcome::Skipped);
-        let effects = saved(&mut operation, None);
+        scanned(&mut operation, &["bar/x", "foo/a"]).unwrap();
+        ended(&mut operation, RewriteOutcome::Skipped).unwrap();
+        let turn = saved(&mut operation, Some(seen_row()));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+        assert!(page_end(&mut operation).done);
+    }
+
+    #[test]
+    fn moved_pass_stands() {
+        // Another call saved the pass during this page, so this page writes nothing.
+        let mut operation = scanning(4);
+        scanned(&mut operation, &[]).unwrap();
+        let other = Value::from(vec![9]);
+        let turn = saved(&mut operation, Some(other));
+        assert!(matches!(turn, Ok(Next::Done(PageEnd { done: false, .. }))));
+    }
+
+    #[test]
+    fn lost_conflict_resumes() {
+        // A page that lost its commit keeps the stored pass open for the next call.
+        let mut operation = RekeyOperation::new("bucket", "foo/", 1, None, UNIX_EPOCH);
+        operation.step = Step::Page;
+        operation.stored = Some(progress("foo/"));
+        let lost = Err::<PageEnd, _>(KeyError::Conflict);
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(lost))),
+            Ok(Next::Done((progress("foo/"), false)))
+        );
+    }
+
+    #[test]
+    fn stopped_page_fails() {
+        let mut operation = RekeyOperation::new("bucket", "foo/", 1, None, UNIX_EPOCH);
+        operation.step = Step::Page;
+        let end = Ok::<_, KeyError>(PageEnd {
+            progress: progress("foo/"),
+            done: false,
+            stopped: Some(KeyError::Locked),
+        });
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(end))),
+            Err(KeyError::Locked)
+        );
+    }
+
+    #[test]
+    fn missing_config_unlimited() {
+        // A realm without a config document charges no quota.
+        let realm = RealmId::from_bytes([1; 32]);
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut operation =
+            RekeyOperation::new("bucket", "foo/", 1, Some((realm, node)), UNIX_EPOCH);
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { .. })]
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
+        let absent = Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound);
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(absent)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(operation.scope.quota, None);
     }
 }
