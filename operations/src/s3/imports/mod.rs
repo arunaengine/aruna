@@ -6,6 +6,7 @@ pub mod change;
 pub mod create;
 pub mod cron;
 pub mod discovery;
+pub mod folders;
 pub mod remove;
 pub mod schedule;
 pub mod shared;
@@ -30,6 +31,8 @@ use smallvec::smallvec;
 use std::path::Path;
 use thiserror::Error;
 use ulid::Ulid;
+
+pub use folders::folders_overlap;
 
 const RULE_PAGE: usize = 256;
 
@@ -154,11 +157,6 @@ pub fn validate_folder(field: &str, folder: &str) -> Result<(), ImportRuleError>
     ensure_confined_path(Path::new(folder)).map_err(|error| invalid(&error.to_string()))
 }
 
-/// Whether two folders of one bucket share keys.
-pub fn folders_overlap(left: &str, right: &str) -> bool {
-    left.starts_with(right) || right.starts_with(left)
-}
-
 /// Why a bucket linked whole to a provider bucket keeps raw bytes.
 pub const MAPPED_REASON: &str =
     "This bucket is stored 1:1 in a provider bucket, so it cannot be compressed or encrypted.";
@@ -200,7 +198,9 @@ impl LinkScan {
             let rule = BackendImport::from_bytes(&value)?;
             self.linked |= rule.bucket == self.bucket && rule.mapped;
         }
-        Ok(next.filter(|_| !self.linked).map(|next| self.page(Some(next))))
+        Ok(next
+            .filter(|_| !self.linked)
+            .map(|next| self.page(Some(next))))
     }
 }
 

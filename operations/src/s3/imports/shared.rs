@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::discovery::read_discovery;
-use super::{ImportRuleError, folders_overlap, list_imports, read_earlier};
+use super::folders::shares_folder;
+use super::{ImportRuleError, list_imports, read_earlier};
 use crate::driver::DriverContext;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -32,13 +33,6 @@ pub enum Claim {
     Other,
     /// No single rule names the file, so none imports it.
     Conflict,
-}
-
-/// Whether `other` is another rule that reads an overlapping folder of the same backend.
-pub fn shares_folder(rule: &BackendImport, other: &BackendImport) -> bool {
-    other.import_id != rule.import_id
-        && other.backend_id == rule.backend_id
-        && folders_overlap(&other.backend_prefix, &rule.backend_prefix)
 }
 
 /// The other rules of the group that read an overlapping folder of the same backend.
