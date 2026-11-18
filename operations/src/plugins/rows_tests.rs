@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::ChildOutcome;
+
 use super::*;
 
 const SPACE: &str = "plugin_state";
@@ -50,10 +52,6 @@ fn single_requests() {
     let stored = vec![Some(b"1".to_vec())];
     let answer = read.next(values_result(stored.clone())).unwrap();
     assert_eq!(answer, Next::Done(stored));
-    let mut page = PageRows(Some(page_call(SPACE, Vec::new(), None, 1)));
-    page.first().unwrap();
-    let answer = page.next(page_result(Vec::new(), None)).unwrap();
-    assert_eq!(answer, Next::Done((Vec::new(), None)));
     let mut change = Change(Some(IoCall::Sync));
     assert_eq!(change.first().unwrap(), Next::Call(IoCall::Sync));
     assert_eq!(change.next(IoResult::Done).unwrap(), Next::Done(()));
@@ -77,4 +75,33 @@ fn modes_and_conflicts() {
     assert!(!<Writes as Operation>::is_conflict(&StoreError(
         "other".into()
     )));
+}
+
+/// The answer to a read, from plain bytes.
+pub(crate) fn values_result(values: Vec<Option<Vec<u8>>>) -> IoResult {
+    IoResult::Values(
+        values
+            .into_iter()
+            .map(|value| value.map(Into::into))
+            .collect(),
+    )
+}
+
+/// The answer to a page, from plain bytes.
+pub(crate) fn page_result(rows: Rows, next: Option<Vec<u8>>) -> IoResult {
+    IoResult::Page {
+        rows: (rows.into_iter())
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+        next: next.map(Into::into),
+    }
+}
+
+/// The answer to a child call that ended with `result`.
+pub(crate) fn child_result<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoResult::Child(ChildOutcome::new(result))
 }

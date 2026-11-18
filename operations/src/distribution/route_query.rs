@@ -17,13 +17,15 @@ use aruna_core::structs::storage::distribution::{
 use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
-use crate::distribution::guard::{GuardError, bound_record, read_target, target_for};
+use crate::distribution::guard::{
+    GuardError, authority_reads, bound_record, read_target, target_for,
+};
 
 /// Decides a routing question from its arguments and the rows read for it.
 pub(super) type Decide<A, T> = fn(&A, &[Option<Value>]) -> Result<T, GuardError>;
 
 /// Reads the rows of one routing question, then decides it without further I/O.
-pub(super) struct RouteOperation<A, T> {
+pub(crate) struct RouteOperation<A, T> {
     pub(super) reads: Vec<(KeySpace, Key)>,
     pub(super) args: A,
     pub(super) decide: Decide<A, T>,
@@ -80,7 +82,7 @@ pub(super) fn bound(
     bound_record(binding, row(values, 0))
 }
 
-pub(super) type Bound<A> = (DistributionBinding, A);
+pub(crate) type Bound<A> = (DistributionBinding, A);
 
 pub(super) fn read_route(
     (binding, (key, listing)): &Bound<(String, bool)>,
@@ -107,7 +109,20 @@ pub(super) fn fence_row(_: &(), rows: &[Option<Value>]) -> Result<LocalFence, Gu
     Ok(LocalFence::decode(row(rows, 0))?)
 }
 
-pub(super) fn coordinator_of(
+/// The range id and node of the coordinator of `key`'s range, or `None` when this member
+/// coordinates it and has not fenced it for a transfer.
+pub(crate) fn coordinator_read(
+    binding: DistributionBinding,
+    key: String,
+) -> RouteOperation<Bound<String>, Option<(Ulid, NodeId)>> {
+    RouteOperation {
+        reads: authority_reads(binding.set_id),
+        args: (binding, key),
+        decide: coordinator_of,
+    }
+}
+
+fn coordinator_of(
     (binding, key): &Bound<String>,
     rows: &[Option<Value>],
 ) -> Result<Option<(Ulid, NodeId)>, GuardError> {
@@ -318,5 +333,36 @@ mod tests {
         );
         let failed = GuardError::from(IoError::Storage(StorageError::Timeout));
         assert!(matches!(failed, GuardError::Unreadable(_)));
+    }
+
+    // The coordinator of another member's range is named; this member's own range is not.
+    #[test]
+    fn finds_read_coordinator() {
+        let (snapshot, bytes) = record(true);
+        let own = binding(&snapshot, 1, 5);
+        let ask = |key: &str| coordinator_read(own.clone(), key.to_string());
+        let rows = || IoResult::Values(vec![Some(Value::from(bytes.clone())), None]);
+        let mut remote = ask("x");
+        let reads = IoCall::Read(authority_reads(own.set_id));
+        assert_eq!(remote.first(), Ok(Next::Call(reads)));
+        let upper = &snapshot.config.ranges[1];
+        let node_id = snapshot.member(upper.coordinator).unwrap().node_id;
+        let named = Some((upper.range_id, node_id));
+        assert_eq!(remote.next(rows()), Ok(Next::Done(named)));
+        let mut local = ask("a");
+        local.first().unwrap();
+        assert_eq!(local.next(rows()), Ok(Next::Done(None)));
+    }
+
+    // A set whose record has not arrived yet cannot be routed.
+    #[test]
+    fn coordinator_needs_record() {
+        let (snapshot, _) = record(true);
+        let mut read = coordinator_read(binding(&snapshot, 1, 5), "a".to_string());
+        read.first().unwrap();
+        assert_eq!(
+            read.next(IoResult::Values(vec![None, None])),
+            Err(GuardError::RecordMissing(snapshot.set_id()))
+        );
     }
 }

@@ -37,6 +37,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
+use crate::jobs::records::pages::{SpecInputsOperation, StoreEntriesOperation};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::realm::load_config::load_realm_config;
@@ -151,7 +152,8 @@ async fn build_plan(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or_else(|| PlanBuildError::Unavailable("network handle unavailable".to_string()))?;
-    let spec = crate::jobs::records::pages::with_inputs(context, spec)
+    let fill = SpecInputsOperation::new(spec, context.node_and_realm());
+    let spec = drive(fill, context)
         .await
         .map_err(|error| PlanBuildError::Unavailable(error.to_string()))?;
     let round = PlanRound {
@@ -481,11 +483,13 @@ async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64) ->
         created_at_ms: now_ms,
     };
     // Planned inputs too large for the launch record go to pages this node serves.
-    if crate::jobs::records::pages::page_launch(context, &mut launch)
-        .await
-        .is_err()
-    {
-        return RoundOutcome::Retry { after_ms: base };
+    match drive(StoreEntriesOperation::launch(&launch), context).await {
+        Ok(Some(manifest)) => {
+            launch.inputs.clear();
+            launch.input_pages = Some(manifest);
+        }
+        Ok(None) => {}
+        Err(_) => return RoundOutcome::Retry { after_ms: base },
     }
     let Some(frame) = sign_record(context, realm_id, JobFamilyRecord::Launch(Box::new(launch)))
     else {

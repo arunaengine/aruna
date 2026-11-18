@@ -4,8 +4,14 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
+use ulid::Ulid;
 
+use crate::calls::IoError;
+use crate::metadata::AuthToken;
+use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::identifier::{Identifier, IdentifierTarget};
+use crate::structs::identity::realm::RealmId;
 
 /// What a dataset's root entity says: `name`, `description`, `version`, `license` and the
 /// `identifier` values that link to a web page. The field order is part of stored job records.
@@ -17,6 +23,33 @@ pub struct DatasetDescription {
     /// A license URL or SPDX id.
     pub license: Option<String>,
     pub identifiers: Vec<Identifier>,
+}
+
+/// Why a bucket's dataset gives no description.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum DescriptionError {
+    #[error("the dataset does not exist or the caller may not read it")]
+    Unreadable,
+    #[error("{0}")]
+    Invalid(String),
+    #[error("the dataset could not be read now")]
+    Unavailable,
+}
+
+/// A failed call leaves the dataset unread, which a later attempt may change.
+impl From<IoError> for DescriptionError {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
+/// Asks the dataset's holders for its summary, with the caller's own access.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatasetSummaryRequest {
+    pub realm_id: RealmId,
+    pub dataset: Ulid,
+    pub auth: Option<AuthContext>,
+    pub token: Option<AuthToken>,
 }
 
 const DESCRIPTOR: &str = "ro-crate-metadata.json";

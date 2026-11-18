@@ -255,7 +255,7 @@ fn answered(index: usize, stored: Result<bool, String>) -> IoResult {
 }
 
 fn sent(node_id: NodeId, artifact: &[u8], index: u32) -> Effect {
-    let chunk = super::chunk_of("sha256:d", artifact, index);
+    let chunk = chunk_of("sha256:d", artifact, index);
     Effect::Net(NetEffect::ArtifactStore(Box::new(ArtifactStore {
         node_id,
         chunk,
@@ -264,7 +264,7 @@ fn sent(node_id: NodeId, artifact: &[u8], index: u32) -> Effect {
 
 #[test]
 fn copies_in_window() {
-    use crate::plugins::copies::CHUNK;
+    use crate::plugins::copy_rows::CHUNK;
     let artifact = vec![7u8; CHUNK + 1];
     let (first, second) = (node(1), node(2));
     let mut copy = copy_artifact(vec![first, second], "sha256:d".into(), artifact.clone());

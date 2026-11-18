@@ -15,7 +15,7 @@ use aruna_core::types::{Key, KeySpace};
 use ulid::Ulid;
 
 use super::route_query::{
-    Bound, Decide, RouteOperation, coordinator_of, copied_interval, fence_row, held_view,
+    Bound, Decide, RouteOperation, coordinator_read, copied_interval, fence_row, held_view,
     interval, listed_interval, listed_tags, range_coordinated, range_holders, range_kept,
     range_readers, read_route, record_read, tag_of, upload_held, write_route,
 };
@@ -122,7 +122,7 @@ pub async fn read_coordinator(
     binding: &DistributionBinding,
     key: &str,
 ) -> Result<Option<(Ulid, NodeId)>, GuardError> {
-    ask_authority(context, binding, key.to_string(), coordinator_of).await
+    drive(coordinator_read(binding.clone(), key.to_string()), context).await
 }
 
 /// Names a new upload of `key` by the range and epoch this member coordinates it under.
@@ -132,7 +132,11 @@ pub async fn upload_tag(
     key: &str,
     upload_id: Ulid,
 ) -> Result<UploadTag, GuardError> {
-    tag_of(binding, upload_id, route_write(context, binding, key).await?)
+    tag_of(
+        binding,
+        upload_id,
+        route_write(context, binding, key).await?,
+    )
 }
 
 /// Whether this member still holds the authority the upload `tag` was opened under: the key's
@@ -143,7 +147,13 @@ pub async fn upload_route(
     key: &str,
     tag: &UploadTag,
 ) -> Result<(), GuardError> {
-    ask_record(context, binding, (key.to_string(), tag.clone()), upload_held).await
+    ask_record(
+        context,
+        binding,
+        (key.to_string(), tag.clone()),
+        upload_held,
+    )
+    .await
 }
 
 /// The tags of listed uploads, from the range and epoch that hold each key now.
@@ -163,7 +173,13 @@ pub async fn delegated_range(
     range_id: Ulid,
     key: &str,
 ) -> Result<(), GuardError> {
-    ask_record(context, binding, (range_id, key.to_string()), range_coordinated).await
+    ask_record(
+        context,
+        binding,
+        (range_id, key.to_string()),
+        range_coordinated,
+    )
+    .await
 }
 
 /// Resolves the range a forwarded read names to the key's range, whose records this ready
