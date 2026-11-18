@@ -67,6 +67,7 @@ pub mod register;
 pub mod repo_layout;
 pub mod repository;
 pub mod request_policy;
+pub mod rocrate_archive;
 pub mod row_plan;
 pub mod rows;
 pub mod scheduling;
