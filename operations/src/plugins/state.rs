@@ -279,7 +279,7 @@ mod tests {
     use crate::driver::drive;
     use crate::plugins::broker::call_intent;
     use crate::plugins::intents::{Begun, begin};
-    use crate::plugins::rows::{page_result, values_result};
+    use crate::plugins::rows::tests::{page_result, values_result};
     use crate::plugins::runs::tests::opened;
     use aruna_plugins::broker::Intent;
 

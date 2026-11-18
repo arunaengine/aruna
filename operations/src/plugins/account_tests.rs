@@ -6,7 +6,7 @@ use aruna_core::calls::ChildOutcome;
 use ulid::Ulid;
 
 use super::*;
-use crate::plugins::rows::values_result;
+use crate::plugins::rows::tests::values_result;
 use crate::plugins::work::tests::sample_install;
 
 fn realm() -> RealmId {

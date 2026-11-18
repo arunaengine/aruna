@@ -204,36 +204,6 @@ impl Operation for ScanRows {
     }
 }
 
-/// At most `limit` rows below `prefix` after the key `after`, and the key to continue after.
-pub(crate) fn page_rows(
-    space: &'static str,
-    prefix: Vec<u8>,
-    after: Option<Vec<u8>>,
-    limit: usize,
-) -> PageRows {
-    PageRows(Some(page_call(space, prefix, after, limit)))
-}
-
-#[derive(Debug, PartialEq)]
-pub struct PageRows(Option<IoCall>);
-
-impl Operation for PageRows {
-    type Output = (Rows, Option<Vec<u8>>);
-    type Error = StoreError;
-
-    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
-        let page = self
-            .0
-            .take()
-            .ok_or_else(|| StoreError("paged twice".into()))?;
-        Ok(Next::Call(page))
-    }
-
-    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
-        Ok(Next::Done(page_of(answer)?))
-    }
-}
-
 /// Writes rows, then deletes rows, in one transaction.
 pub fn writes(rows: Vec<Row>, deletes: Vec<(&'static str, Vec<u8>)>) -> Writes {
     Writes {
@@ -323,28 +293,6 @@ pub fn unexpected(result: IoResult) -> StoreError {
     StoreError(format!("unexpected answer {}", result.label()))
 }
 
-/// The answer to a read, from plain bytes.
-#[cfg(test)]
-pub(crate) fn values_result(values: Vec<Option<Vec<u8>>>) -> IoResult {
-    IoResult::Values(
-        values
-            .into_iter()
-            .map(|value| value.map(Into::into))
-            .collect(),
-    )
-}
-
-/// The answer to a page, from plain bytes.
-#[cfg(test)]
-pub(crate) fn page_result(rows: Rows, next: Option<Vec<u8>>) -> IoResult {
-    IoResult::Page {
-        rows: (rows.into_iter())
-            .map(|(key, value)| (key.into(), value.into()))
-            .collect(),
-        next: next.map(Into::into),
-    }
-}
-
 #[cfg(test)]
 #[path = "rows_tests.rs"]
-mod tests;
+pub(crate) mod tests;

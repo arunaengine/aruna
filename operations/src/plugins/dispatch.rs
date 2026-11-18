@@ -7,15 +7,15 @@ use std::time::Instant;
 
 use aruna_core::NodeId;
 use aruna_core::injection::verify_request;
-use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall};
-use aruna_core::plugin_runs::{HookRequest, MAX_INPUT, PluginRun, RunTrigger, SourceEvent};
+use aruna_core::plugin_installs::{BoundScope, InstallState};
+use aruna_core::plugin_runs::{HookRequest, MAX_INPUT, PluginRun, RunTrigger};
 use aruna_core::plugins::ReleaseRequest;
 use aruna_core::secrets::Delivery;
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugins::manifest::SecretKind;
-use aruna_plugins::trigger::{Trigger, TriggerKind};
+use aruna_plugins::trigger::TriggerKind;
 use ulid::Ulid;
 
 use super::bound::{check_node_binding, delivery_clash, select, vault_kind};
@@ -23,11 +23,10 @@ use super::finished::retry_run;
 use super::held::{HeldSecrets, ask_release};
 use super::hooks::{AdmitHook, DROPPED, HookError};
 use super::install::{InstallError, check_admin, pick_version, read_config, read_manifest};
-use super::matcher::event_trigger;
 use super::rate::take_hook;
 use super::receiver::lost_reason;
 use super::rows::StoreError;
-use super::runs::{ADMISSIONS, RunError, admit, enqueue_timer, new_run};
+use super::runs::{ADMISSIONS, RunError, admit, declared_trigger, enqueue_timer, new_run};
 use super::settings::{SettingError, check_fields};
 use crate::driver::{DriverContext, drive};
 
@@ -50,26 +49,6 @@ pub enum StartError {
     Form(SettingError),
     #[error(transparent)]
     Run(#[from] RunError),
-}
-
-/// The trigger's name when the install's pinned version declares it; the guest picks its
-/// function by this name.
-fn handler(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    kind: TriggerKind,
-) -> Option<String> {
-    trigger(config, install, kind).map(|_| kind.as_str().to_string())
-}
-
-/// The trigger of `kind` the install's pinned version declares.
-fn trigger(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    kind: TriggerKind,
-) -> Option<Trigger> {
-    let plugin = pick_version(config, &install.plugin, Some(&install.digest)).ok()?;
-    read_manifest(&plugin).ok()?.triggers.remove(&kind)
 }
 
 /// Queues a manual run for a group admin with the form's values, defaults filled in. Only the
@@ -103,7 +82,8 @@ pub async fn start_run(
         .flatten()
         .ok_or(StartError::Input)?;
     let manual = TriggerKind::Manual;
-    let form = trigger(&config, install, manual).ok_or(StartError::NoTrigger("manual"))?;
+    let form = declared_trigger(&config, install, manual);
+    let form = form.ok_or(StartError::NoTrigger("manual"))?;
     let checked = check_fields(&form.form, &values).map_err(StartError::Form)?;
     let input = serde_json::Value::Object(checked).to_string();
     if input.len() > MAX_INPUT {
@@ -117,19 +97,6 @@ pub async fn start_run(
     let _admitting = ADMISSIONS.lock().await;
     drive(admit(run.clone()), ctx).await?;
     Ok(run)
-}
-
-/// A run of the install's handler for the event's kind, due at `now_ms`, or `None` when the
-/// manifest has no trigger of that kind.
-pub(crate) fn event_run(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    event: &SourceEvent,
-    now_ms: u64,
-) -> Option<PluginRun> {
-    let handler = handler(config, install, event_trigger(event.kind))?;
-    let trigger = RunTrigger::Event(event.clone());
-    Some(new_run(install, handler, trigger, now_ms))
 }
 
 /// Queues the due `every` occurrence of each active install this node receives. Missed

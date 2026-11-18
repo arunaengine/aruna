@@ -7,7 +7,7 @@ use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
-use crate::plugins::rows::{page_result, values_result};
+use crate::plugins::rows::tests::{page_result, values_result};
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
 const DIGEST: &str = "sha256:d";
