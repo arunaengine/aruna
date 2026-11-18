@@ -112,7 +112,10 @@ impl<'a> InvenioClient<'a> {
             .await
             .map_err(|_| InvenioError::Transport)?
         {
-            let left = self.access.metadata_limit().saturating_sub(body.len() as u64);
+            let left = self
+                .access
+                .metadata_limit()
+                .saturating_sub(body.len() as u64);
             if chunk.len() as u64 > left {
                 return Err(InvenioError::Limit);
             }

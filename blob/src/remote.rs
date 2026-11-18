@@ -109,7 +109,9 @@ impl BlobHandle {
                     (Some(revision), Some(body)) => client.update(url, body, revision).await,
                     _ => client.json(http_method(method), url, body.as_ref()).await,
                 };
-                answer.map(RemoteAnswer::Json).map_err(RemoteFailure::Invenio)
+                answer
+                    .map(RemoteAnswer::Json)
+                    .map_err(RemoteFailure::Invenio)
             }
             RemoteCall::InvenioDelete { access, url } => InvenioClient::new(self.egress(), access)
                 .delete(url)
@@ -442,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopped_job_starts_nothing() {
+    async fn stopped_job_refused() {
         let (job, cancel, shutdown) = stop();
         shutdown.cancel();
         cancel.cancel();
@@ -452,7 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_ends_running_call() {
+    async fn stop_ends_call() {
         let (job, _cancel, shutdown) = stop();
         let work = std::future::pending::<Result<(), RemoteFailure>>();
         let (result, ()) = tokio::join!(until_stop(Some(&job), work), async { shutdown.cancel() });
@@ -460,7 +462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_signal_runs_call() {
+    async fn unwatched_call_runs() {
         let result = until_stop(None, async { Ok::<_, RemoteFailure>(7) }).await;
         assert_eq!(result, Ok(7));
     }

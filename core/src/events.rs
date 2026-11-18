@@ -360,7 +360,9 @@ pub enum BlobEvent {
         deleted: bool,
     },
     /// The answer to a repository, provider or stored artifact call.
-    Remote(Result<crate::repository::remote::RemoteAnswer, crate::repository::remote::RemoteFailure>),
+    Remote(
+        Result<crate::repository::remote::RemoteAnswer, crate::repository::remote::RemoteFailure>,
+    ),
 }
 
 #[derive(Debug, PartialEq)]

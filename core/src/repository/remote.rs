@@ -225,8 +225,14 @@ pub enum RemoteCall {
         if_match: Option<u64>,
     },
     /// Deletes a repository resource; a missing one counts as deleted.
-    InvenioDelete { access: InvenioAccess, url: Url },
-    InvenioHead { access: InvenioAccess, url: Url },
+    InvenioDelete {
+        access: InvenioAccess,
+        url: Url,
+    },
+    InvenioHead {
+        access: InvenioAccess,
+        url: Url,
+    },
     /// Streams a stored range to `url` and answers the digests of the bytes sent.
     InvenioUpload {
         access: InvenioAccess,
@@ -249,7 +255,9 @@ pub enum RemoteCall {
     /// Writes the import archive into hidden storage while its files download.
     SpoolArchive(Box<ArchiveSpool>),
     /// Fetches one OAI-PMH response as text.
-    OaiFetch { url: Url },
+    OaiFetch {
+        url: Url,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

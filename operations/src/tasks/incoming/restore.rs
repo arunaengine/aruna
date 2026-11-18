@@ -753,13 +753,8 @@ impl OperationsTaskHandler {
                     warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
                     continue;
                 };
-                if let Err(error) = release_job(
-                    &self.context,
-                    record.job_id,
-                    token,
-                    unix_timestamp_millis(),
-                )
-                .await
+                if let Err(error) =
+                    release_job(&self.context, record.job_id, token, unix_timestamp_millis()).await
                 {
                     warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
                 }

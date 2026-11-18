@@ -128,15 +128,15 @@ pub async fn search_records(
     aruna_operations::driver::drive(search, context.as_ref())
         .await
         .map(Json)
-    .map_err(|error| match error {
-        aruna_operations::jobs::repository::TransferError::Permanent(message) => {
-            ServerError::BadRequestReason(message)
-        }
-        error @ aruna_operations::jobs::repository::TransferError::Refused(_) => {
-            ServerError::BadRequestReason(error.to_string())
-        }
-        _ => ServerError::ServiceUnavailableReason("repository search unavailable".into()),
-    })
+        .map_err(|error| match error {
+            aruna_operations::jobs::repository::TransferError::Permanent(message) => {
+                ServerError::BadRequestReason(message)
+            }
+            error @ aruna_operations::jobs::repository::TransferError::Refused(_) => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            _ => ServerError::ServiceUnavailableReason("repository search unavailable".into()),
+        })
 }
 
 /// Names the record by exactly one of record_id, doi or url.
@@ -315,12 +315,12 @@ pub async fn import_record(
             aruna_operations::driver::drive(resolve, context.as_ref())
                 .await
                 .map_err(|error| match error {
-                TransferError::Permanent(message) => ServerError::BadRequestReason(message),
-                error @ TransferError::Refused(_) => {
-                    ServerError::BadRequestReason(error.to_string())
-                }
-                _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
-            })?
+                    TransferError::Permanent(message) => ServerError::BadRequestReason(message),
+                    error @ TransferError::Refused(_) => {
+                        ServerError::BadRequestReason(error.to_string())
+                    }
+                    _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
+                })?
         }
     };
     super::rocrate_import::submit_import(

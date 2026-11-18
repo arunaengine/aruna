@@ -302,7 +302,7 @@ async fn process_prune_job(
             context,
         )
         .await
-            .map_err(|error| format!("queueing the repository links failed: {error}")),
+        .map_err(|error| format!("queueing the repository links failed: {error}")),
         Err(error) => Err(error.to_string()),
     };
     match pruned {

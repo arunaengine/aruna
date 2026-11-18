@@ -22,9 +22,7 @@ use aruna_operations::jobs::repository::link_store::{
     ApplyChangeOperation, ListLinksOperation, ReadLinkOperation,
 };
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
-use aruna_operations::jobs::repository::{
-    Action, NodeScope, TransferError, seal_token, supports,
-};
+use aruna_operations::jobs::repository::{Action, NodeScope, TransferError, seal_token, supports};
 use aruna_operations::metadata::profile::validation::check_profile;
 use axum::Json;
 use axum::extract::{Path, State};
