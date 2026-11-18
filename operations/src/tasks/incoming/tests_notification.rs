@@ -152,7 +152,7 @@ async fn notification_delivers_holder() {
         compute_handle: None,
         outbound_handle: None,
     });
-    crate::sync::incoming::initialize_incoming_fixture(context_b.clone());
+    crate::inbound::initialize_incoming_fixture(context_b.clone());
 
     let context_a = Arc::new(DriverContext {
         storage_handle: storage_a.clone(),
@@ -273,8 +273,8 @@ async fn drain_retries_queueing() {
         &key,
         None,
     )
-        .await
-        .expect("dedup read");
+    .await
+    .expect("dedup read");
     assert!(queued.is_some(), "the retry queues the held record");
 }
 

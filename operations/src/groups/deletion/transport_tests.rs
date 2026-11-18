@@ -12,8 +12,8 @@ use aruna_core::structs::identity::group_delete::{
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 
 use super::tests::{Fixture, read};
+use crate::inbound::initialize_incoming_fixture;
 use crate::metadata::MetadataHandle;
-use crate::sync::incoming::initialize_incoming_fixture;
 
 async fn connect_fixture(fixture: &mut Fixture, seed: u8) -> NetHandle {
     let net = NetHandle::new(
