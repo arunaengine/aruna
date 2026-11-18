@@ -15,7 +15,7 @@ use aruna_core::structs::storage::dataset_description::{DatasetDescription, Desc
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
-use aruna_operations::metadata::forward::write::route_metadata_delete;
+use aruna_operations::metadata::forward::routed_write::RouteDeleteOperation;
 use aruna_operations::s3::bucket::dataset::{BucketMetadataOperation, DatasetSummaryOperation};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -260,7 +260,9 @@ async fn remove_dataset(
     let actor = actor(state, auth);
     let token = forwarded_auth_token(bearer)?;
     let ctx = state.get_ctx();
-    route_metadata_delete(&ctx, actor, record.as_ref(), dataset, token)
+    let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+    let delete = RouteDeleteOperation::new((actor, local_node), record, dataset, token);
+    drive(delete, ctx.as_ref())
         .await
         .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))
 }

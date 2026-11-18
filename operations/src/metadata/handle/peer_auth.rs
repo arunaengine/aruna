@@ -5,7 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::effects::{StorageEffect, WritePeerRequest};
 use aruna_core::events::{Event, PeerAuthRefusal, StorageEvent};
-use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::pinned::PinnedCreate;
-use super::route_create::RouteCreateOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
@@ -19,9 +17,7 @@ use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::create_document::CreateDocumentOperation;
 use crate::metadata::create_document::CreateDocumentPayload;
-use crate::metadata::create_document::CreateDocumentResult;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::create_document::{mint_forward_document, mint_local_document};
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};
@@ -32,21 +28,16 @@ use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
-use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
-use aruna_core::metadata::MetadataBatch;
-use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataError;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::GroupId;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
@@ -54,94 +45,24 @@ use ulid::Ulid;
 
 use super::read::device_replica;
 use crate::document_repository::GetConfigOperation;
-use crate::forward::authorize::AuthorizeCreateOperation;
-use crate::forward::authorize::CreateScope;
 use crate::forward::authorize::ForwardAuthError;
 use crate::forward::authorize::ForwardedCallerOperation;
 use crate::forward::authorize::forward_auth_error;
 use crate::forward::authorize::write_check;
 use crate::forward::replay::HeldRecordError;
 use crate::forward::replay::HeldRecordOperation;
-use crate::forward::replay::create_record_matches;
 use crate::forward::replay::routed_record_matches;
 use crate::forward::replay::{CreateRowsOperation, replay_answer};
 use crate::forward::routing::ForwardHoldersOperation;
-use crate::forward::routing::create_forward_holders;
-use crate::forward::routing::distinct_holders;
 use crate::forward::routing::holder_intersection;
 use crate::forward::routing::holds_metadata_id;
-use crate::forward::routing::is_user_origin;
 use crate::forward::transport::MetadataWriteError;
-use crate::forward::transport::RetryDisposition;
 use crate::forward::transport::forwarded_unavailable;
 use crate::forward::transport::read_error;
 use crate::forward::transport::reject;
-use crate::forward::transport::retry_disposition;
 use crate::forward::transport::unexpected_response;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::realm::load_config::config_unavailable;
-use aruna_core::StructuredId;
-
-/// Sends the create of `document_id` to the holders of its bucket, or to the `pinned` one only,
-/// and checks the record the answering holder returns.
-async fn forward_create(
-    context: &Arc<DriverContext>,
-    realm_config: &RealmConfigDocument,
-    config: &CreateDocumentConfig,
-    (document_id, pinned): (Ulid, Option<NodeId>),
-    (auth_token, commit_message): (Option<AuthToken>, Option<String>),
-) -> Result<CreateDocumentResult, MetadataWriteError> {
-    let (placement, mut holders) = create_forward_holders(realm_config, config, document_id)
-        .ok_or_else(|| {
-            MetadataWriteError::Undeliverable(
-                "document id has no resolvable metadata placement".to_string(),
-            )
-        })?;
-    if let Some(pinned) = pinned {
-        holders = vec![pinned];
-    }
-    let config_digest = realm_config
-        .digest()
-        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    let response = drive(
-        ForwardHoldersOperation::new(
-            context.node_and_realm().map(|(node_id, _)| node_id),
-            &holders,
-            &MetadataTransportMessage::ForwardCreateDocument {
-                auth_token,
-                config_digest,
-                group_id: config.group_id,
-                document_id,
-                document_path: config.document_path.clone(),
-                public: config.public,
-                payload: config.payload.clone(),
-                commit_message,
-            },
-            None,
-            false,
-        ),
-        context,
-    )
-    .await
-    .map_err(MetadataWriteError::from)?;
-    match response {
-        MetadataTransportMessage::ForwardedRecord { record }
-            if create_record_matches(config, document_id, &placement, &record) =>
-        {
-            Ok(CreateDocumentResult {
-                event_id: record.last_event_id,
-                record: *record,
-            })
-        }
-        MetadataTransportMessage::ForwardedRecord { .. } => Err(MetadataWriteError::Undeliverable(
-            "holder returned a metadata create record for another document".to_string(),
-        )),
-        MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
-            CreateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)).into(),
-        ),
-        other => Err(unexpected_response(other)),
-    }
-}
 
 /// Errors of the shared authorized create flow. Every variant maps onto the
 /// same transport status the former REST-local sequence produced.
@@ -166,183 +87,6 @@ impl From<aruna_core::calls::IoError> for CreateAuthorizedError {
     fn from(error: aruna_core::calls::IoError) -> Self {
         Self::Write(error.into())
     }
-}
-
-/// Shared metadata create used by REST and MCP: normalize the path, mint the document id, run
-/// the non-user-origin permission checks, route the create to a holder and emit the post-commit
-/// watch event. The caller owns bearer conversion and the transport status mapping.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_metadata_authorized(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    local_node_id: NodeId,
-    auth: &AuthContext,
-    extras: PolicyRequestExtras,
-    auth_token: Option<AuthToken>,
-    group_id: GroupId,
-    path: String,
-    public: bool,
-    payload: CreateDocumentPayload,
-    commit_message: Option<String>,
-) -> Result<MetadataRegistryRecord, CreateAuthorizedError> {
-    let path = MetadataRegistryRecord::normalize_document_path(&path);
-    if path.is_empty() {
-        return Err(CreateAuthorizedError::EmptyPath);
-    }
-    let realm_config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or(MetadataApiError::ServiceUnavailable)?;
-    let user_origin =
-        is_user_origin(&realm_config, local_node_id).ok_or(MetadataApiError::ServiceUnavailable)?;
-    let actor = Actor {
-        node_id: local_node_id,
-        user_id: auth.user_id,
-        realm_id,
-    };
-    let document_id = if user_origin {
-        mint_forward_document(&realm_config, &actor, group_id, &path)?.as_ulid()
-    } else {
-        match mint_local_document(&realm_config, &actor, group_id, &path) {
-            Ok(document_id) => document_id.as_ulid(),
-            Err(CreateDocumentError::HoldsNoBucket) => {
-                mint_forward_document(&realm_config, &actor, group_id, &path)?.as_ulid()
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
-    if !user_origin {
-        if auth.realm_id != realm_id {
-            return Err(CreateAuthorizedError::Forbidden);
-        }
-        aruna_core::telemetry::time_stage(
-            "permission",
-            drive(
-                AuthorizeCreateOperation::new(
-                    realm_id,
-                    auth,
-                    extras,
-                    group_id,
-                    &path,
-                    document_id,
-                    CreateScope::Group,
-                ),
-                context,
-            ),
-        )
-        .await?;
-    }
-    let created = drive(
-        RouteCreateOperation::new(
-            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-                actor,
-                group_id,
-                document_id,
-                document_path: path,
-                public,
-                payload,
-            })
-            .with_message(commit_message),
-            context.net_handle.as_ref().map(|net| net.node_id()),
-            auth_token,
-        ),
-        &context,
-    )
-    .await?;
-    let event_id = created.event_id;
-    let record = created.record;
-
-    // Post-commit, best-effort resource-watch emission. A failed emission only
-    // warns and never affects the already-successful create.
-    let emit = EmitEventOperation::metadata_created(
-        realm_id,
-        auth.user_id,
-        record.group_id,
-        record.document_id,
-        &record.document_path,
-        event_id,
-    );
-    let _ = drive(emit, context).await;
-
-    Ok(record)
-}
-
-/// Creates the pinned document on its target only, authorized on the document's own path, so a
-/// retry meets the holder's replay of an accepted create. Emits the watch event like REST.
-pub async fn create_with_id(
-    context: &Arc<DriverContext>,
-    actor: Actor,
-    (auth, extras): (&AuthContext, PolicyRequestExtras),
-    create: &PinnedCreate,
-) -> Result<MetadataRegistryRecord, CreateAuthorizedError> {
-    let realm_id = actor.realm_id;
-    if auth.realm_id != realm_id {
-        return Err(CreateAuthorizedError::Forbidden);
-    }
-    let (group_id, document_id) = (create.group_id, create.document_id);
-    let scope = CreateScope::Document;
-    aruna_core::telemetry::time_stage(
-        "permission",
-        drive(
-            AuthorizeCreateOperation::new(
-                realm_id,
-                auth,
-                extras,
-                group_id,
-                &create.path,
-                document_id,
-                scope,
-            ),
-            context,
-        ),
-    )
-    .await?;
-    let local = create.target == actor.node_id;
-    let config = CreateDocumentConfig {
-        actor,
-        group_id,
-        document_id,
-        document_path: create.path.clone(),
-        public: false,
-        payload: create.payload.clone(),
-    };
-    let created = if local {
-        let operation =
-            CreateDocumentOperation::new_generated_id(config).with_message(create.message.clone());
-        drive(
-            CreateEntryOperation::new(
-                operation,
-                context.net_handle.as_ref().map(|net| net.node_id()),
-            ),
-            &context,
-        )
-        .await?
-    } else {
-        let realm_config = drive(GetConfigOperation::new(realm_id), context)
-            .await
-            .inspect_err(config_unavailable)
-            .ok()
-            .ok_or(MetadataApiError::ServiceUnavailable)?;
-        let token = Some(AuthToken::Internal(auth.clone()));
-        let target = (document_id, Some(create.target));
-        let sent = (token, create.message.clone());
-        forward_create(context, &realm_config, &config, target, sent).await?
-    };
-    let record = created.record;
-    let path = &record.document_path;
-    let (user, group) = (auth.user_id, record.group_id);
-    let emit = EmitEventOperation::metadata_created(
-        realm_id,
-        user,
-        group,
-        document_id,
-        path,
-        created.event_id,
-    );
-    // Failures only warn inside the operation.
-    let _ = drive(emit, context).await;
-    Ok(record)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -497,69 +241,6 @@ pub async fn route_metadata_update(
     }
 }
 
-/// Forwards one edit a device made on its replica to a holder.
-/// The batch is idempotent by its dot, but an ambiguous delivery stops the
-/// attempt: replaying would append a second event for a merge that changes nothing.
-pub async fn apply_batch_routed(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    document_id: Ulid,
-    batch: Box<MetadataBatch>,
-    authored: MetadataBatchSource,
-    auth_token: AuthToken,
-) -> Result<MetadataRegistryRecord, MetadataWriteError> {
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or_else(|| {
-            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
-        })?;
-    let config_digest = config
-        .digest()
-        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    let placement = resolve_metadata_id(&config, realm_id, None, document_id)
-        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    let metadata = context.metadata_handle.as_ref().ok_or_else(|| {
-        MetadataWriteError::Undeliverable("no metadata handle to forward with".to_string())
-    })?;
-    let message = MetadataTransportMessage::ForwardApplyBatch {
-        auth_token,
-        config_digest,
-        document_id,
-        batch,
-        authored,
-    };
-    let mut detail = String::from("the document's bucket has no reachable holder");
-    for holder in distinct_holders(&resolve_shard_holders(&config, &placement)) {
-        match metadata
-            .request_forwarded_write(holder, message.clone())
-            .await
-        {
-            Ok(MetadataTransportMessage::ForwardedApplyBatch { result: Ok(record) }) => {
-                return Ok(*record);
-            }
-            Ok(MetadataTransportMessage::ForwardedApplyBatch {
-                result: Err(SyncRefusal::Unavailable),
-            }) => detail = format!("{holder}: holder could not apply the device edit"),
-            Ok(MetadataTransportMessage::ForwardedApplyBatch {
-                result: Err(refusal),
-            }) => return Err(batch_refusal(refusal)),
-            Ok(other) => return Err(unexpected_response(other)),
-            Err(error) => {
-                warn!(holder = %holder, error = %error, "Failed to forward a device edit to holder");
-                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
-                    return Err(MetadataWriteError::Undeliverable(format!(
-                        "forward to holder `{holder}` may have applied the device edit before failing; refusing to replay it: {error}"
-                    )));
-                }
-                detail = format!("{holder}: {error}");
-            }
-        }
-    }
-    Err(MetadataWriteError::Undeliverable(detail))
-}
-
 /// An offline edit's verdict, as the metadata routes report it.
 pub(super) fn device_edit_error(error: DeviceEditError) -> MetadataWriteError {
     match error {
@@ -586,87 +267,6 @@ pub(super) fn batch_refusal(refusal: SyncRefusal) -> MetadataWriteError {
         SyncRefusal::Coordinator(node) => {
             MetadataWriteError::Undeliverable(format!("node {node} coordinates this key"))
         }
-    }
-}
-
-pub async fn route_metadata_delete(
-    context: &Arc<DriverContext>,
-    actor: Actor,
-    record: Option<&MetadataRegistryRecord>,
-    document_id: Ulid,
-    auth_token: Option<AuthToken>,
-) -> Result<(), MetadataWriteError> {
-    let config = drive(GetConfigOperation::new(actor.realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or_else(|| {
-            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
-        })?;
-    let placement = resolve_metadata_id(
-        &config,
-        actor.realm_id,
-        record.map(|record| record.group_id),
-        document_id,
-    )
-    .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    let config_digest = config
-        .digest()
-        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    if record.is_some_and(|record| {
-        !routed_record_matches(&config, actor.realm_id, document_id, &placement, record)
-    }) {
-        return Err(MetadataWriteError::Undeliverable(
-            "local metadata registry record does not match the routed document".to_string(),
-        ));
-    }
-    let local_node_id = actor.node_id;
-    let current_holders = resolve_shard_holders(&config, &placement);
-    let holders = record.map_or_else(
-        || current_holders.clone(),
-        |record| holder_intersection(&current_holders, &record.holder_node_ids),
-    );
-    if record.is_some() && holders.is_empty() {
-        return Err(MetadataWriteError::Undeliverable(
-            "metadata document has no active frozen holder with history capacity".to_string(),
-        ));
-    }
-    let authority = pid_authority_node(&config, actor.realm_id, document_id).ok_or_else(|| {
-        MetadataWriteError::Undeliverable("persistent id authority is unavailable".to_string())
-    })?;
-    let local_holds = holders.contains(&local_node_id);
-    if local_node_id == authority
-        && local_holds
-        && let Some(record) = record
-    {
-        delete_metadata_document(
-            DeleteDocumentOperation::new(actor, record.group_id, document_id),
-            context.as_ref(),
-            document_id,
-        )
-        .await
-        .map_err(MetadataWriteError::from)?;
-        return Ok(());
-    }
-    let response = drive(
-        ForwardHoldersOperation::new(
-            context.node_and_realm().map(|(node_id, _)| node_id),
-            &holders,
-            &MetadataTransportMessage::ForwardDeleteDocument {
-                auth_token,
-                config_digest,
-                document_id,
-            },
-            (local_holds && record.is_none()).then_some(local_node_id),
-            false,
-        ),
-        context,
-    )
-    .await
-    .map_err(MetadataWriteError::from)?;
-    match response {
-        MetadataTransportMessage::ForwardedDelete => Ok(()),
-        other => Err(unexpected_response(other)),
     }
 }
 
@@ -1028,7 +628,7 @@ pub(crate) async fn apply_forwarded_write(
         }
         other => reject(format!(
             "unexpected forwarded metadata message: {}",
-            crate::metadata::handle::transport_message_kind(&other)
+            crate::metadata::message_kind::transport_message_kind(&other)
         )),
     }
 }

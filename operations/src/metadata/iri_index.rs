@@ -39,7 +39,6 @@ use super::repository::{
 };
 
 const INDEX_PAGE_SIZE: usize = 128;
-const INDEX_BATCH_SIZE: usize = 128;
 
 /// Keeps the storage cause intact so callers can tell an overloaded backend
 /// apart from a genuine index or document problem.
@@ -512,51 +511,6 @@ fn expect_batch(event: Event) -> Result<(), MetadataIriError> {
     }
 }
 
-/// Postings and per-document rows of one document, from its own rows. Each posting comes
-/// before its per-document row, so an interrupted deletion never orphans a posting.
-async fn document_keys(
-    storage: &StorageHandle,
-    document_id: Ulid,
-) -> Result<Vec<(String, ByteView)>, MetadataIriError> {
-    let mut keys = Vec::new();
-    for key in document_rows(storage, DOCUMENT_IRI_KEYSPACE, document_id).await? {
-        let document_row = ByteView::from(document_key(document_id, &key));
-        keys.push((IRI_INDEX_KEYSPACE.to_string(), ByteView::from(key)));
-        keys.push((DOCUMENT_IRI_KEYSPACE.to_string(), document_row));
-    }
-    Ok(keys)
-}
-
-/// Keys for the given documents, read through each document's own rows, so a deletion
-/// prunes its postings without touching any other document.
-pub(crate) async fn document_iri_keys(
-    storage: &StorageHandle,
-    document_ids: &BTreeSet<Ulid>,
-) -> Result<Vec<(String, ByteView)>, MetadataError> {
-    let mut keys = Vec::new();
-    for document_id in document_ids {
-        keys.extend(document_keys(storage, *document_id).await?);
-    }
-    Ok(keys)
-}
-
-pub(crate) async fn delete_keys(
-    storage: &StorageHandle,
-    keys: Vec<(String, ByteView)>,
-) -> Result<(), MetadataError> {
-    for chunk in keys.chunks(INDEX_BATCH_SIZE) {
-        expect_batch(
-            storage
-                .send_storage_effect(StorageEffect::BatchDelete {
-                    deletes: chunk.to_vec(),
-                    txn_id: None,
-                })
-                .await,
-        )?;
-    }
-    Ok(())
-}
-
 fn collect_iri_matches(
     records: Vec<IriIndexRecord>,
     registry_records: &[MetadataRegistryRecord],
@@ -605,7 +559,7 @@ async fn read_materialization_status(
 
 #[cfg(test)]
 mod tests {
-    use super::super::data_links::apply_rows;
+    use super::super::data_links::tests::apply_rows;
     use super::*;
     use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
     use aruna_core::storage_entries::{iri_reference_key, materialization_status_entry};
@@ -966,47 +920,6 @@ mod tests {
             .await
             .expect_err("malformed row fails to decode");
         assert!(matches!(error, MetadataIriError::Conversion(_)));
-    }
-
-    #[tokio::test]
-    async fn deletes_document_rows() {
-        // The deletion path reads only the deleted document's own rows.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let deleted = Ulid::from_parts(1, 1);
-        let kept = Ulid::from_parts(2, 1);
-        let cursor = Ulid::from_parts(1, 1);
-        write_document(
-            &storage,
-            deleted,
-            &[
-                record(deleted, cursor, "p", "o1"),
-                record(deleted, cursor, "p", "o2"),
-            ],
-        )
-        .await;
-        write_document(&storage, kept, &[record(kept, cursor, "p", "o1")]).await;
-
-        let keys = document_iri_keys(&storage, &BTreeSet::from([deleted]))
-            .await
-            .unwrap();
-        assert_eq!(keys.len(), 4);
-        delete_keys(&storage, keys).await.unwrap();
-
-        let page = read_backlinks(&storage, "o1", None, None, 10, &mut open_budget())
-            .await
-            .unwrap();
-        let ids: Vec<_> = page.documents.keys().copied().collect();
-        assert_eq!(ids, vec![kept]);
-        let kept_key = iri_reference_key("p", "o1", kept).to_vec();
-        assert!(
-            row_exists(
-                &storage,
-                DOCUMENT_IRI_KEYSPACE,
-                document_key(kept, &kept_key)
-            )
-            .await
-        );
     }
 
     #[tokio::test]

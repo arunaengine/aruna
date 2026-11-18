@@ -6,153 +6,275 @@
 #[path = "persistent_id_forward.rs"]
 pub mod forward;
 
-use aruna_core::UserId;
-use aruna_core::handle::Handle;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{PersistentIdFailure, PersistentIdMapping};
+use aruna_core::NodeId;
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::events::Event;
+use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
+use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::rows::{read_row, value};
+use aruna_core::structs::PersistentIdMapping;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::persistent_id::persistent_id_key;
+use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use ulid::Ulid;
 
-use crate::document_repository::GetConfigOperation;
-use crate::driver::drive;
-use crate::driver::{DriverContext, drive_retry};
-use crate::metadata::id_mapping::{
-    MappingRoute, PersistentIdError, mapping_route_for, parse_mapping_read, read_mapping_effect,
-};
-use crate::metadata::pid_transition::{PidTransition, PidTransitionOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::metadata::id_mapping::{MappingRoute, PersistentIdError, mapping_route_for};
+use crate::metadata::pid_transition::{PidOutcome, PidTransition, PidTransitionOperation};
+use crate::metadata::secondary_ids::{AddIdentifiersInput, AddIdentifiersOperation};
 use crate::realm::load_config::config_unavailable;
 use crate::sync::outbox_record::schedule_drain_effect;
 
-pub async fn read_mapping(
-    ctx: &DriverContext,
+/// Reads one document's persistent identifier mapping, if it has one.
+#[derive(Debug, PartialEq)]
+pub struct MappingReadOperation {
     document_id: Ulid,
-) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
-    let event = ctx
-        .storage_handle
-        .send_effect(read_mapping_effect(document_id, None))
-        .await;
-    parse_mapping_read(event)
 }
 
-/// Activate the Conceptual PID selected by the create transaction. Returns the
-/// authoritative mapping and whether this call activated it; if projection has
-/// not produced the registry row, `Processing` is committed and the caller defers.
-pub async fn mint_persistent_id(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    document_id: Ulid,
-    minted_by: aruna_core::UserId,
-    minted_at_ms: u64,
-) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
-    let route = mapping_route(ctx, realm_id, document_id).await?;
-    let transition = PidTransition::Mint {
-        minted_by,
-        minted_at_ms,
-    };
-    run_transition(ctx, route, document_id, transition).await
-}
-
-/// Adds external identifiers on this node's row; callers route to the PID authority first.
-pub(crate) async fn add_secondary_ids(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    document_id: Ulid,
-    identifiers: Vec<aruna_core::structs::secondary_id::SecondaryIdentifier>,
-    occurred_at_ms: u64,
-) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
-    let route = mapping_route(ctx, realm_id, document_id).await?;
-    let input = crate::metadata::secondary_ids::AddIdentifiersInput {
-        document_id,
-        identifiers,
-        route,
-        occurred_at_ms,
-    };
-    let build = || crate::metadata::secondary_ids::AddIdentifiersOperation::new(input.clone());
-    let result = drive_retry(build, ctx, &document_id.to_bytes()).await?;
-    if result.1 {
-        schedule_drain(ctx).await;
+impl MappingReadOperation {
+    pub fn new(document_id: Ulid) -> Self {
+        Self { document_id }
     }
-    Ok(result)
 }
 
-/// Record a terminal provider failure on the same intent. Projection absence
-/// must never call this path; the mint handler uses the non-terminal Processing
-/// transition above for that condition.
-pub(crate) async fn fail_persistent_id(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    document_id: Ulid,
-    failure: PersistentIdFailure,
-) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
-    let route = mapping_route(ctx, realm_id, document_id).await?;
-    run_transition(ctx, route, document_id, PidTransition::Fail { failure }).await
-}
+impl Operation for MappingReadOperation {
+    type Output = Option<PersistentIdMapping>;
+    type Error = PersistentIdError;
 
-/// Exceptional administrator-only withdrawal. Authorization is enforced at
-/// both routing hops; the transition stores the actor and required reason and
-/// writes the generic metadata audit row in the same transaction.
-pub(crate) async fn admin_withdraw_pid(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    document_id: Ulid,
-    withdrawn_by: UserId,
-    reason: String,
-    withdrawn_at_ms: u64,
-) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
-    let route = mapping_route(ctx, realm_id, document_id).await?;
-    let transition = PidTransition::Withdraw {
-        withdrawn_by,
-        reason,
-        withdrawn_at_ms,
-    };
-    run_transition(ctx, route, document_id, transition).await
-}
-
-/// Drives one transition and schedules the outbox drain after its commit.
-async fn run_transition(
-    ctx: &DriverContext,
-    route: Option<MappingRoute>,
-    document_id: Ulid,
-    transition: PidTransition,
-) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
-    let build = || PidTransitionOperation::new(route.clone(), document_id, transition.clone());
-    let outcome = drive_retry(build, ctx, &document_id.to_bytes()).await?;
-    if outcome.committed {
-        schedule_drain(ctx).await;
+    fn first(&mut self) -> Result<Next<Option<PersistentIdMapping>>, PersistentIdError> {
+        let key = persistent_id_key(self.document_id);
+        Ok(Next::Call(read_row(ID_MAPPING_KEYSPACE, key)))
     }
-    Ok((outcome.mapping, outcome.applied))
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<Option<PersistentIdMapping>>, PersistentIdError> {
+        let mapping = value(result)?
+            .map(|bytes| PersistentIdMapping::from_bytes(bytes.as_ref()))
+            .transpose()
+            .map_err(PersistentIdError::Conversion)?;
+        Ok(Next::Done(mapping))
+    }
 }
 
-pub(crate) async fn mapping_route(
-    ctx: &DriverContext,
+/// One change of a document's mapping on this node.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PidChange {
+    /// Mint, fail or withdraw the mapping. A mint without a projected registry row commits
+    /// `Processing` and the caller defers.
+    Transition(PidTransition),
+    /// Adds external identifiers; callers route to the PID authority first.
+    AddIdentifiers {
+        identifiers: Vec<SecondaryIdentifier>,
+        occurred_at_ms: u64,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+enum ChangeStage {
+    Config,
+    Change,
+}
+
+/// Applies one [`PidChange`] in a transaction that reruns after a lost conflict, fenced by the
+/// mapping's placement when this node has a network, and wakes the outbox drain after a commit.
+/// The output is the authoritative mapping and whether this change applied.
+#[derive(Debug, PartialEq)]
+pub struct PidChangeOperation {
     realm_id: RealmId,
+    local_node: Option<NodeId>,
     document_id: Ulid,
-) -> Result<Option<MappingRoute>, PersistentIdError> {
-    let Some(net_handle) = ctx.net_handle.as_ref() else {
-        return Ok(None);
-    };
-    let config = drive(GetConfigOperation::new(realm_id), ctx)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or_else(|| {
-            PersistentIdError::Unavailable("realm placement config is unavailable".to_string())
-        })?;
-    mapping_route_for(&config, realm_id, document_id, net_handle.node_id())
-        .ok_or_else(|| {
+    change: Option<PidChange>,
+    adding: bool,
+    stage: ChangeStage,
+}
+
+impl PidChangeOperation {
+    /// `local_node` is this node on the network; without one the change is not fenced.
+    pub fn new(
+        (realm_id, local_node): (RealmId, Option<NodeId>),
+        document_id: Ulid,
+        change: PidChange,
+    ) -> Self {
+        Self {
+            realm_id,
+            local_node,
+            document_id,
+            adding: matches!(change, PidChange::AddIdentifiers { .. }),
+            change: Some(change),
+            stage: ChangeStage::Config,
+        }
+    }
+
+    fn route(
+        &self,
+        config: &RealmConfigDocument,
+        node: NodeId,
+    ) -> Result<MappingRoute, PersistentIdError> {
+        mapping_route_for(config, self.realm_id, self.document_id, node).ok_or_else(|| {
             PersistentIdError::Unavailable("persistent id placement is unavailable".to_string())
         })
-        .map(Some)
+    }
+
+    fn change(
+        &mut self,
+        route: Option<MappingRoute>,
+    ) -> Result<Next<(PersistentIdMapping, bool)>, PersistentIdError> {
+        let change = self.change.take().ok_or_else(|| {
+            PersistentIdError::Unavailable("the change was already started".to_string())
+        })?;
+        let document_id = self.document_id;
+        let seed = document_id.to_bytes();
+        let child = match change {
+            PidChange::Transition(transition) => boxed_retry(
+                move || PidTransitionOperation::new(route.clone(), document_id, transition.clone()),
+                &seed,
+                |result| Event::Child(ChildOutcome::new(result)),
+            ),
+            PidChange::AddIdentifiers {
+                identifiers,
+                occurred_at_ms,
+            } => {
+                let input = AddIdentifiersInput {
+                    document_id,
+                    identifiers,
+                    route,
+                    occurred_at_ms,
+                };
+                boxed_retry(
+                    move || AddIdentifiersOperation::new(input.clone()),
+                    &seed,
+                    |result| Event::Child(ChildOutcome::new(result)),
+                )
+            }
+        };
+        self.stage = ChangeStage::Change;
+        Ok(Next::Call(IoCall::Child(child)))
+    }
+
+    /// The result, with a drain wake once a change committed.
+    fn changed(
+        &self,
+        (mapping, applied): (PersistentIdMapping, bool),
+        committed: bool,
+    ) -> Next<(PersistentIdMapping, bool)> {
+        let output = (mapping, applied);
+        match committed {
+            true => Next::Then {
+                output,
+                calls: vec![IoCall::from(schedule_drain_effect())],
+            },
+            false => Next::Done(output),
+        }
+    }
 }
 
-async fn schedule_drain(ctx: &DriverContext) {
-    if let Some(task_handle) = ctx.task_handle.as_ref() {
-        task_handle.send_effect(schedule_drain_effect()).await;
+impl Operation for PidChangeOperation {
+    type Output = (PersistentIdMapping, bool);
+    type Error = PersistentIdError;
+
+    fn first(&mut self) -> Result<Next<(PersistentIdMapping, bool)>, PersistentIdError> {
+        if self.local_node.is_none() {
+            return self.change(None);
+        }
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<(PersistentIdMapping, bool)>, PersistentIdError> {
+        match self.stage {
+            ChangeStage::Config => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                let config = config.map_err(|error| {
+                    config_unavailable(&error);
+                    PersistentIdError::Unavailable(
+                        "realm placement config is unavailable".to_string(),
+                    )
+                })?;
+                let node = self.local_node.ok_or_else(|| {
+                    PersistentIdError::Unavailable(
+                        "persistent id placement is unavailable".to_string(),
+                    )
+                })?;
+                let route = self.route(&config, node)?;
+                self.change(Some(route))
+            }
+            // Added identifiers commit exactly when they change the mapping.
+            ChangeStage::Change if self.adding => {
+                let added = result.child::<(PersistentIdMapping, bool), PersistentIdError>()??;
+                let committed = added.1;
+                Ok(self.changed(added, committed))
+            }
+            ChangeStage::Change => {
+                let outcome = result.child::<PidOutcome, PersistentIdError>()??;
+                let committed = outcome.committed;
+                Ok(self.changed((outcome.mapping, outcome.applied), committed))
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
+    use aruna_core::UserId;
+    use aruna_core::handle::Handle;
+
+    async fn change(
+        ctx: &DriverContext,
+        (realm_id, document_id): (RealmId, Ulid),
+        transition: PidTransition,
+    ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
+        let change = PidChange::Transition(transition);
+        drive(
+            PidChangeOperation::new((realm_id, None), document_id, change),
+            ctx,
+        )
+        .await
+    }
+
+    async fn mint_persistent_id(
+        ctx: &DriverContext,
+        realm_id: RealmId,
+        document_id: Ulid,
+        minted_by: UserId,
+        minted_at_ms: u64,
+    ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
+        let transition = PidTransition::Mint {
+            minted_by,
+            minted_at_ms,
+        };
+        change(ctx, (realm_id, document_id), transition).await
+    }
+
+    async fn admin_withdraw_pid(
+        ctx: &DriverContext,
+        realm_id: RealmId,
+        document_id: Ulid,
+        withdrawn_by: UserId,
+        reason: String,
+        withdrawn_at_ms: u64,
+    ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
+        let transition = PidTransition::Withdraw {
+            withdrawn_by,
+            reason,
+            withdrawn_at_ms,
+        };
+        change(ctx, (realm_id, document_id), transition).await
+    }
+
+    async fn read_mapping(
+        ctx: &DriverContext,
+        document_id: Ulid,
+    ) -> Result<Option<PersistentIdMapping>, PersistentIdError> {
+        drive(MappingReadOperation::new(document_id), ctx).await
+    }
     use crate::metadata::id_mapping::{TransitionEntry, mapping_revision, transition_entries};
     use crate::metadata::repository::metadata_audit_key;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -522,5 +644,92 @@ mod tests {
             }
             other => panic!("fence read failed: {}", other.label()),
         }
+    }
+
+    fn requested(document_id: Ulid) -> PersistentIdMapping {
+        PersistentIdMapping::requested(
+            document_id,
+            false,
+            user(),
+            JobId::from_bytes([7; 16]),
+            true,
+            record(document_id).permission_path,
+            mapping_revision(&None, 1),
+        )
+    }
+
+    #[test]
+    fn mapping_read_decodes() {
+        let id = Ulid::from_bytes([5; 16]);
+        let mut read = MappingReadOperation::new(id);
+        let key = persistent_id_key(id);
+        assert_eq!(
+            read.first(),
+            Ok(Next::Call(read_row(ID_MAPPING_KEYSPACE, key)))
+        );
+        assert_eq!(
+            read.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
+        let bytes = aruna_core::types::Value::from(requested(id).to_bytes().unwrap());
+        assert_eq!(
+            read.next(IoResult::Values(vec![Some(bytes)])),
+            Ok(Next::Done(Some(requested(id))))
+        );
+    }
+
+    #[test]
+    fn committed_change_wakes_drain() {
+        let id = Ulid::from_bytes([5; 16]);
+        let transition = PidTransition::Mint {
+            minted_by: user(),
+            minted_at_ms: 1,
+        };
+        let change = PidChange::Transition(transition);
+        let mut pid = PidChangeOperation::new((realm(), None), id, change.clone());
+        assert!(matches!(pid.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let outcome = PidOutcome {
+            mapping: requested(id),
+            applied: true,
+            committed: true,
+        };
+        let done = pid.next(IoResult::Child(ChildOutcome::new(
+            Ok::<_, PersistentIdError>(outcome),
+        )));
+        assert_eq!(
+            done,
+            Ok(Next::Then {
+                output: (requested(id), true),
+                calls: vec![IoCall::from(schedule_drain_effect())],
+            })
+        );
+
+        let mut replay = PidChangeOperation::new((realm(), None), id, change);
+        replay.first().unwrap();
+        let outcome = PidOutcome {
+            mapping: requested(id),
+            applied: false,
+            committed: false,
+        };
+        let done = replay.next(IoResult::Child(ChildOutcome::new(
+            Ok::<_, PersistentIdError>(outcome),
+        )));
+        assert_eq!(done, Ok(Next::Done((requested(id), false))));
+    }
+
+    #[test]
+    fn networked_change_needs_config() {
+        let id = Ulid::from_bytes([5; 16]);
+        let change = PidChange::AddIdentifiers {
+            identifiers: Vec::new(),
+            occurred_at_ms: 1,
+        };
+        let mut pid = PidChangeOperation::new((realm(), Some(node())), id, change);
+        assert!(matches!(pid.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let missing = Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound);
+        assert!(matches!(
+            pid.next(IoResult::Child(ChildOutcome::new(missing))),
+            Err(PersistentIdError::Unavailable(_))
+        ));
     }
 }

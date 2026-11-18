@@ -22,8 +22,8 @@ use aruna_operations::metadata::api::export_types::GetVisibleRequest;
 use aruna_operations::metadata::api::path::LookupPathOperation;
 use aruna_operations::metadata::api::path_types::MetadataLookupRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
-use aruna_operations::metadata::forward::read::get_metadata_routed as run_get_visible_metadata_document;
-use aruna_operations::metadata::forward::write::route_metadata_delete as run_delete_metadata_document;
+use aruna_operations::metadata::forward::routed_read::RoutedReadOperation;
+use aruna_operations::metadata::forward::routed_write::RouteDeleteOperation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -525,14 +525,11 @@ pub async fn get_metadata_document(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = run_get_visible_metadata_document(
-        &ctx,
-        state.get_realm_id(),
-        GetVisibleRequest { document_id, auth },
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_api_error)?;
+    let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+    let request = GetVisibleRequest { document_id, auth };
+    let token = forwarded_auth_token(bearer_token)?;
+    let read = RoutedReadOperation::new(local_node, state.get_realm_id(), request, token);
+    let record = drive(read, ctx.as_ref()).await.map_err(map_api_error)?;
     Ok((StatusCode::OK, Json(MetadataDocumentSummary::from(&record))))
 }
 
@@ -573,15 +570,15 @@ pub async fn delete_metadata_document(
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    run_delete_metadata_document(
-        &ctx,
-        actor(&state, &auth),
-        record.as_ref(),
+    let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+    let token = forwarded_auth_token(bearer_token)?;
+    let delete = RouteDeleteOperation::new(
+        (actor(&state, &auth), local_node),
+        record,
         document_id,
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_write_error)?;
+        token,
+    );
+    drive(delete, ctx.as_ref()).await.map_err(map_write_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }

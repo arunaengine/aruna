@@ -4786,16 +4786,19 @@ async fn lookup_hides_private() {
         )
         .unwrap(),
     ];
-    let (_, changed) = aruna_operations::metadata::persistent_id::forward::add_identifiers_routed(
-        &test.state.get_ctx(),
-        test.state.get_realm_id(),
-        document_id,
+    use aruna_operations::metadata::persistent_id::forward::{PidRouteOperation, outcome_mapping};
+    let ctx = test.state.get_ctx();
+    let request = aruna_operations::metadata::PersistentIdRequest::AddIdentifiers {
         identifiers,
-        aruna_core::time::unix_timestamp_millis(),
-        test.auth.clone(),
-    )
-    .await
-    .unwrap();
+        occurred_at_ms: aruna_core::time::unix_timestamp_millis(),
+    };
+    let node = (test.state.get_realm_id(), ctx.node_and_realm().map(|(node, _)| node));
+    let caller = (None, Some(test.auth.clone()));
+    let add = PidRouteOperation::new(node, document_id, request, caller);
+    let (_, changed) = aruna_operations::driver::drive(add, ctx.as_ref())
+        .await
+        .and_then(outcome_mapping)
+        .unwrap();
     assert!(changed);
 
     let lookup = |auth: Option<AuthContext>, value: &str| {

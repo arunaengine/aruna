@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
@@ -56,7 +56,6 @@ use self::list_types::{check_policy_limit, merge_pending_records};
 use self::path_types::select_fanout_nodes;
 use self::path_types::{deduplicate_fanout_nodes, replica_query_nodes};
 
-use self::read_types::metadata_read_request;
 use super::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
     MetadataTransportMessage,
@@ -69,9 +68,7 @@ use super::search_cursor::{
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::groups::list_groups::ListGroupOperation;
-use crate::metadata::repository::{
-    LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
-};
+use crate::metadata::repository::{LIST_METADATA_SIZE, StorageReadError};
 use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::search::{BucketPage, BucketSearchHit, SearchBucketsInput};

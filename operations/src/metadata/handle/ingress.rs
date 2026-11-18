@@ -22,10 +22,11 @@ use super::peer_auth::{
     bucket_search_auth, config_digest_matches, release_auth, search_reader_auth,
 };
 use super::query::query_local_graphs;
+use crate::metadata::message_kind::transport_message_kind;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
-    read_budget, transport_message_kind, write_body_at, write_message_at, write_stream_body,
+    read_budget, write_body_at, write_message_at, write_stream_body,
     write_transport_message,
 };
 use super::{
@@ -925,13 +926,18 @@ impl MetadataHandle {
                 .await
             }
             forward @ MetadataTransportMessage::ForwardPersistentId { .. } => {
-                Box::pin(async {
-                    crate::metadata::persistent_id::forward::apply_forwarded_pid(
-                        context, peer, forward,
-                    )
-                    .await
-                })
-                .await
+                use crate::metadata::persistent_id::forward::ServePidOperation;
+                let Some((node_id, realm_id)) = context.node_and_realm() else {
+                    return MetadataTransportMessage::ForwardedWriteUnavailable;
+                };
+                match ServePidOperation::new(peer, (realm_id, node_id), forward) {
+                    Some(serve) => Box::pin(drive(serve, context))
+                        .await
+                        .unwrap_or_else(|error| {
+                            reject(format!("persistent id request failed: {error}"))
+                        }),
+                    None => reject("unexpected forwarded persistent id message"),
+                }
             }
             MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
                 let result = match context.net_handle.as_ref() {
@@ -1149,16 +1155,21 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::identifier_lookup::lookup_local(
-                            context.as_ref(),
-                            *net_handle.realm_id(),
-                            auth.as_ref(),
-                            kind,
-                            &value,
-                            endpoint.as_deref(),
-                        )
-                        .await
-                        .map_err(|_| MetadataReadError::Unavailable),
+                        Some(net_handle) => {
+                            use crate::metadata::identifier_lookup::{
+                                IdentifierLookupOperation, IdentifierQuery,
+                            };
+                            let query = IdentifierQuery {
+                                kind,
+                                value,
+                                endpoint,
+                            };
+                            let lookup =
+                                IdentifierLookupOperation::new(*net_handle.realm_id(), auth, query);
+                            drive(lookup, context.as_ref())
+                                .await
+                                .map_err(|_| MetadataReadError::Unavailable)
+                        }
                         None => Err(MetadataReadError::Unavailable),
                     },
                     Err(error) => Err(error),

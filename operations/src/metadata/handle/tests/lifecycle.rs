@@ -6,6 +6,9 @@ use super::auth::{auth_storage, node_id_seed};
 use super::effect::memory_handle;
 use super::visibility::{group_record, registry_record};
 use super::*;
+use crate::driver::drive;
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::list::GroupRecordsOperation;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
@@ -50,7 +53,7 @@ async fn group_records_live() {
     store_entries(&storage, writes).await;
     let (_metadata_dir, handle) = memory_handle(storage);
 
-    let records = list_group_records(&handle, group_id, 16)
+    let records = drive(GroupRecordsOperation::new(group_id, 16), &handle)
         .await
         .expect("group listing succeeds");
 
@@ -73,16 +76,13 @@ async fn group_records_capped() {
     store_entries(&storage, writes).await;
     let (_metadata_dir, handle) = memory_handle(storage);
 
-    let within = list_group_records(&handle, group_id, 2)
+    let within = drive(GroupRecordsOperation::new(group_id, 2), &handle)
         .await
         .expect("group listing succeeds");
-    let over = list_group_records(&handle, group_id, 1).await;
+    let over = drive(GroupRecordsOperation::new(group_id, 1), &handle).await;
 
     assert_eq!(within.len(), 2);
-    assert!(matches!(
-        over,
-        Err(MetadataError::Backend(message)) if message.contains("candidate limit exceeded")
-    ));
+    assert_eq!(over, Err(MetadataApiError::ServiceUnavailable));
 }
 #[tokio::test]
 async fn tombstone_blocks_apply() {

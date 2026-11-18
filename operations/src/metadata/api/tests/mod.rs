@@ -5,14 +5,13 @@
 use super::fanout::run_metadata_fanout;
 use super::list::{GroupRecordsOperation, ListVisibleOperation, PendingRecordsOperation};
 use super::*;
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
 use crate::metadata::handle::QUERY_MAX_BYTES;
 
 use super::distributed_types::{
     MetadataQueryForm, aggregate_query_results, query_form, query_select_limit,
 };
 use super::export::raw_identity_matches;
-use super::export::{ExportOperation, VisibleRecordOperation};
 use super::export_types::{
     ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };

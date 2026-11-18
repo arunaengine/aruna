@@ -12,7 +12,7 @@ use crate::jobs::records::pages::ServePageOperation;
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
-use crate::metadata::after_sync::{AfterSyncOperation, run_maintenance};
+use crate::metadata::after_sync::AfterSyncOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
@@ -843,6 +843,34 @@ async fn serve_shard_stream(
         warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
     }
     close_shard_stream(&mut stream).await;
+}
+
+
+/// Reconciles the metadata store with document sync and prunes deleted graphs.
+async fn run_maintenance(context: &DriverContext, source: &'static str, attempt: usize) {
+    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+        return;
+    };
+    if let Err(error) = metadata_handle.reconcile_document_sync(context).await {
+        warn!(
+            source,
+            attempt,
+            error = ?error,
+            "Metadata document sync reconciliation failed"
+        );
+    }
+    match metadata_handle.prune_deleted_graphs(context).await {
+        Ok(pruned) if pruned > 0 => {
+            debug!(source, attempt, pruned, "Metadata graph prune completed")
+        }
+        Ok(_) => {}
+        Err(error) => warn!(
+            source,
+            attempt,
+            error = ?error,
+            "Metadata graph prune failed"
+        ),
+    }
 }
 
 #[cfg(test)]
