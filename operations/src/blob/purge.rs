@@ -429,20 +429,41 @@ impl ReadElsewhere {
                 continue;
             }
             let version = VersionKey::new(&alias.bucket, &alias.key, alias.version_id);
-            let version = version.to_bytes().map_err(|error| error.to_string())?;
-            let read = vec![(BLOB_VERSIONS_KEYSPACE.to_string(), version.into())];
-            let Some(Some(value)) = batch(context, read).await?.pop() else {
-                continue;
-            };
-            let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
-            if version.location_key() == Some(wanted.clone()) {
-                return Ok(Some(true));
+            self.reading = true;
+            let row = version.to_bytes()?;
+            return Ok(Next::Call(read_row(BLOB_VERSIONS_KEYSPACE, row)));
+        }
+        match self.more {
+            true => self.page(),
+            false => Ok(Next::Done((Some(false), self.budget))),
+        }
+    }
+}
+
+impl Operation for ReadElsewhere {
+    type Output = (Option<bool>, usize);
+    type Error = PurgeFilesError;
+
+    fn first(&mut self) -> ElsewhereTurn {
+        self.page()
+    }
+
+    fn next(&mut self, result: IoResult) -> ElsewhereTurn {
+        if !self.reading {
+            let (rows, next) = result.page()?;
+            self.aliases = rows.into_iter().map(|(key, _)| key).collect();
+            self.more = next.is_some();
+            self.after = next;
+            return self.next_alias();
+        }
+        self.reading = false;
+        if let Some(value) = result.value()? {
+            let version = BlobVersion::from_bytes(&value)?;
+            if version.location_key().as_ref() == Some(&self.wanted) {
+                return Ok(Next::Done((Some(true), self.budget)));
             }
         }
-        match next {
-            Some(next) => start = Some(next),
-            None => return Ok(Some(false)),
-        }
+        self.next_alias()
     }
 }
 
@@ -602,33 +623,44 @@ fn plan_key(job_id: Ulid, location: Ulid) -> Key {
 /// Plans the release of `files` in the cleanup queue before their versions go; the queue
 /// releases them once the purge has ended, whichever way. A file without a backend version
 /// is not planned.
-pub async fn plan_files(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct PlanFilesOperation {
     job_id: Ulid,
-    files: &[StorageFile],
-) -> Result<(), String> {
-    let mut writes = Vec::new();
-    for file in files {
-        let Some(work) = file.work(job_id) else {
-            continue;
-        };
-        let value = work.to_bytes().map_err(|error| error.to_string())?;
-        let key = plan_key(job_id, file.location.ulid);
-        writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
+    files: Vec<StorageFile>,
+}
+
+impl PlanFilesOperation {
+    pub fn new(job_id: Ulid, files: &[StorageFile]) -> Self {
+        Self {
+            job_id,
+            files: files.to_vec(),
+        }
     }
-    if writes.is_empty() {
-        return Ok(());
+}
+
+impl Operation for PlanFilesOperation {
+    type Output = ();
+    type Error = PurgeFilesError;
+
+    fn first(&mut self) -> Result<Next<()>, PurgeFilesError> {
+        let mut writes = Vec::new();
+        for file in &self.files {
+            let Some(work) = file.work(self.job_id) else {
+                continue;
+            };
+            let key = plan_key(self.job_id, file.location.ulid);
+            let value = work.to_bytes()?.into();
+            writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value));
+        }
+        if writes.is_empty() {
+            return Ok(Next::Done(()));
+        }
+        Ok(Next::Call(IoCall::Write(writes)))
     }
-    let write = StorageEffect::BatchWrite {
-        writes,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(format!(
-            "could not plan the file releases: {}",
-            other.label()
-        )),
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, PurgeFilesError> {
+        result.done()?;
+        Ok(Next::Done(()))
     }
 }
 
