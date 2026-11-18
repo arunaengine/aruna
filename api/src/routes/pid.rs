@@ -16,7 +16,11 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use aruna_core::NodeId;
+use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::secondary_id::{
     IdentifierOrigin, SecondaryIdKind, normalize_endpoint, normalize_value,
 };
@@ -28,18 +32,17 @@ use aruna_core::structs::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout::lookup_identifier_distributed;
 use aruna_operations::metadata::persistent_id::forward::{
-    read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
+    PidRouteOperation, outcome_mapping, outcome_resolution, outcome_status,
 };
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
-use aruna_core::NodeId;
-use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::secondary_ids::IdentifierMatch;
+use aruna_operations::metadata::{PersistentIdOutcome, PersistentIdRequest};
 
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};
@@ -145,13 +148,11 @@ async fn document_landing(
     page: Option<String>,
 ) -> Response {
     let ctx = state.get_ctx();
-    let resolved = resolve_pid_routed(
-        &ctx,
-        state.get_realm_id(),
-        document_id,
-        MetadataRegistryRecord::graph_iri_for(document_id),
-    )
-    .await;
+    let pid = MetadataRegistryRecord::graph_iri_for(document_id);
+    let request = PersistentIdRequest::Resolve { pid };
+    let resolved = pid_request(&ctx, state.get_realm_id(), document_id, request, None)
+        .await
+        .and_then(outcome_resolution);
     if matches!(resolved, Ok(PersistentIdResolution::Redirect)) {
         if let Some(page) = page {
             return redirect(&page);
@@ -215,13 +216,17 @@ async fn profile_landing(
     document_id: Ulid,
     page: Option<String>,
 ) -> Response {
-    let resolved = resolve_pid_routed(
+    let pid = PersistentIdMapping::profile_pid(document_id);
+    let request = PersistentIdRequest::Resolve { pid };
+    let resolved = pid_request(
         &state.get_ctx(),
         state.get_realm_id(),
         document_id,
-        PersistentIdMapping::profile_pid(document_id),
+        request,
+        None,
     )
-    .await;
+    .await
+    .and_then(outcome_resolution);
     match (resolved, page) {
         (Ok(PersistentIdResolution::Redirect), Some(page)) => redirect(&page),
         (resolved, _) => landing_response(document_id, resolved),
@@ -640,7 +645,10 @@ pub(crate) async fn list_persistent_ids(
     let record = drive(DocumentRecordOperation::new(document_id), &ctx)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
-    let routed = read_pid_routed(&ctx, state.get_realm_id(), document_id).await;
+    let status = PersistentIdRequest::Status;
+    let routed = pid_request(&ctx, state.get_realm_id(), document_id, status, None)
+        .await
+        .and_then(outcome_status);
     match routed {
         Ok(Some(mapping)) => {
             require_status_visibility(&state, auth.as_ref(), Some(&mapping), record.as_ref())
@@ -852,28 +860,42 @@ async fn withdraw_pid(
         Permission::WRITE,
     )
     .await?;
-    let existing = read_pid_routed(&ctx, state.get_realm_id(), document_id)
+    let status = PersistentIdRequest::Status;
+    let existing = pid_request(&ctx, state.get_realm_id(), document_id, status, None)
         .await
+        .and_then(outcome_status)
         .map_err(map_api_error)?
         .ok_or(ServerError::NotFound)?;
     if request.confirm_pid != existing.pid {
         return Err(ServerError::BadRequest);
     }
-    let mapping = withdraw_pid_routed(
-        &ctx,
-        state.get_realm_id(),
-        document_id,
-        auth.user_id,
+    let request = PersistentIdRequest::Withdraw {
+        withdrawn_by: auth.user_id,
         reason,
-        unix_timestamp_millis(),
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_api_error)?;
+        withdrawn_at_ms: unix_timestamp_millis(),
+    };
+    let token = forwarded_auth_token(bearer_token)?;
+    let (mapping, _) = pid_request(&ctx, state.get_realm_id(), document_id, request, token)
+        .await
+        .and_then(outcome_mapping)
+        .map_err(map_api_error)?;
     if mapping.status != PersistentIdStatus::AdminWithdrawn {
         return Err(ServerError::ServiceUnavailable);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Runs one PID request on the document's authority.
+async fn pid_request(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    document_id: Ulid,
+    request: PersistentIdRequest,
+    token: Option<AuthToken>,
+) -> Result<PersistentIdOutcome, MetadataApiError> {
+    let node = (realm_id, ctx.node_and_realm().map(|(node_id, _)| node_id));
+    let route = PidRouteOperation::new(node, document_id, request, (token, None));
+    drive(route, ctx).await
 }
 
 #[cfg(test)]

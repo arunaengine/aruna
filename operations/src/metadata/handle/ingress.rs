@@ -925,13 +925,18 @@ impl MetadataHandle {
                 .await
             }
             forward @ MetadataTransportMessage::ForwardPersistentId { .. } => {
-                Box::pin(async {
-                    crate::metadata::persistent_id::forward::apply_forwarded_pid(
-                        context, peer, forward,
-                    )
-                    .await
-                })
-                .await
+                use crate::metadata::persistent_id::forward::ServePidOperation;
+                let Some((node_id, realm_id)) = context.node_and_realm() else {
+                    return MetadataTransportMessage::ForwardedWriteUnavailable;
+                };
+                match ServePidOperation::new(peer, (realm_id, node_id), forward) {
+                    Some(serve) => Box::pin(drive(serve, context))
+                        .await
+                        .unwrap_or_else(|error| {
+                            reject(format!("persistent id request failed: {error}"))
+                        }),
+                    None => reject("unexpected forwarded persistent id message"),
+                }
             }
             MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
                 let result = match context.net_handle.as_ref() {

@@ -112,4 +112,7 @@ pub use handle::{
     warm_caches,
 };
 pub(crate) use handle::{export_summary_jsonld, search_local_filtered, transport_message_kind};
-pub use protocol::{MetadataPathWinner, MetadataReadError, PersistentIdResolution};
+pub use protocol::{
+    MetadataPathWinner, MetadataReadError, PersistentIdOutcome, PersistentIdRequest,
+    PersistentIdResolution,
+};
