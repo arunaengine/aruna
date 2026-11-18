@@ -3,11 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::ChildOutcome;
-use aruna_core::effects::Effect;
-use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, Operation, SubOperation, boxed_suboperation};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::{AuthorizationError, ConversionError};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
@@ -15,15 +13,13 @@ use aruna_core::structs::placement::policy::{
     PlacementPolicyRef, PlacementSubject, PolicyResolution,
 };
 use aruna_core::structs::storage::blob::{BucketIdentity, CurrentVersionPointer};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::permission_check;
+use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
@@ -31,8 +27,7 @@ use crate::placement::policy::resolve_set::{
     PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
 };
 use crate::s3::policy::successor::{
-    MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan, mint_child,
-    mint_outcome,
+    MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,19 +65,24 @@ pub enum PolicyMutationError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Successor(#[from] SuccessorError),
-    #[error("unexpected event during the policy mutation")]
+    #[error("unexpected answer during the policy mutation")]
     InvalidEvent,
 }
 
+impl From<IoError> for PolicyMutationError {
+    fn from(error: IoError) -> Self {
+        Self::Successor(SuccessorError::Storage(error.into()))
+    }
+}
+
+type MutationTurn = Result<Next<SuccessorOutcome>, PolicyMutationError>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MutationState {
-    Init,
-    AuthorizeGroup,
     Authorize,
+    AuthorizeGroup,
     Resolve,
     Mint,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, PartialEq)]
@@ -90,9 +90,6 @@ pub struct PolicyMutationOperation {
     config: PolicyMutationConfig,
     successor_version_id: Ulid,
     state: MutationState,
-    resolved: BTreeMap<Ulid, PolicyResolution>,
-    mint: Option<Box<dyn SubOperation>>,
-    output: Option<Result<SuccessorOutcome, PolicyMutationError>>,
 }
 
 impl PolicyMutationOperation {
@@ -105,10 +102,7 @@ impl PolicyMutationOperation {
         Self {
             config,
             successor_version_id,
-            state: MutationState::Init,
-            resolved: BTreeMap::new(),
-            mint: None,
-            output: None,
+            state: MutationState::Authorize,
         }
     }
 
@@ -116,22 +110,55 @@ impl PolicyMutationOperation {
         self.successor_version_id
     }
 
-    fn authorize(&self, path: String) -> Effects {
-        smallvec![permission_check(
-            self.config.auth_context.clone(),
+    fn call(&mut self, state: MutationState, call: IoCall) -> MutationTurn {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn authorize(&mut self, state: MutationState, path: String) -> MutationTurn {
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
             path,
-            Permission::WRITE,
-        )]
+            required_permission: Permission::WRITE,
+        });
+        self.call(state, IoCall::child(check))
     }
 
-    fn fail(&mut self, error: PolicyMutationError) -> Effects {
-        let cleanup = self.abort();
-        self.state = MutationState::Error;
-        self.output = Some(Err(error));
-        cleanup
+    /// A failed check counts as a denial.
+    fn allowed(result: Result<bool, AuthorizationError>) -> bool {
+        result.unwrap_or_else(|error| {
+            warn!(error = %error, "Policy mutation authorization check failed");
+            false
+        })
     }
 
-    fn resolve_refs(&mut self) -> Effects {
+    fn realm_checked(&mut self, result: Result<bool, AuthorizationError>) -> MutationTurn {
+        let failed = result.is_err();
+        if Self::allowed(result) {
+            return self.resolve_refs();
+        }
+        if failed {
+            return Err(PolicyMutationError::Unauthorized);
+        }
+        // A group administrator governs that group's own objects.
+        let (realm_id, group_id) = (
+            self.config.auth_context.realm_id,
+            self.config.context.group_id,
+        );
+        self.authorize(
+            MutationState::AuthorizeGroup,
+            group_admin_path(realm_id, group_id),
+        )
+    }
+
+    fn group_checked(&mut self, result: Result<bool, AuthorizationError>) -> MutationTurn {
+        match Self::allowed(result) {
+            true => self.resolve_refs(),
+            false => Err(PolicyMutationError::Unauthorized),
+        }
+    }
+
+    fn resolve_refs(&mut self) -> MutationTurn {
         let resolver = PolicySetResolver::new(
             self.config.auth_context.realm_id,
             self.config.subject.node_id,
@@ -139,34 +166,28 @@ impl PolicyMutationOperation {
             ResolveMode::Strict,
             &self.config.target_refs,
         );
-        self.state = MutationState::Resolve;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            resolver,
-            |result| { Event::Child(ChildOutcome::new(result)) }
-        ))]
+        self.call(MutationState::Resolve, IoCall::child(resolver))
     }
 
-    fn after_resolve(&mut self, result: Result<Resolutions, PolicySetError>) -> Effects {
-        match result {
-            Ok(resolved) => {
-                self.resolved = resolved;
-                match foreign_owner(&self.resolved, self.config.context.group_id) {
-                    Some(policy_id) => self.fail(PolicyMutationError::ForeignPolicy { policy_id }),
-                    None => self.start_mint(),
-                }
-            }
+    fn resolved(&mut self, result: Result<Resolutions, PolicySetError>) -> MutationTurn {
+        let resolved = match result {
+            Ok(resolved) => resolved,
             Err(PolicySetError::Unresolved { policy_ref, source }) => {
-                self.fail(PolicyMutationError::PolicyUnavailable {
+                return Err(PolicyMutationError::PolicyUnavailable {
                     policy_id: policy_ref.policy_id,
                     source,
-                })
+                });
             }
-            Err(PolicySetError::Io(_)) => self.fail(PolicyMutationError::InvalidEvent),
+            Err(PolicySetError::Io(_)) => return Err(PolicyMutationError::InvalidEvent),
+        };
+        if let Some(policy_id) = foreign_owner(&resolved, self.config.context.group_id) {
+            return Err(PolicyMutationError::ForeignPolicy { policy_id });
         }
+        self.start_mint(resolved)
     }
 
-    fn start_mint(&mut self) -> Effects {
-        let plan = SuccessorPlan {
+    fn start_mint(&mut self, resolved: BTreeMap<Ulid, PolicyResolution>) -> MutationTurn {
+        let mint = MintSuccessorOperation::new(SuccessorPlan {
             context: self.config.context.clone(),
             mutation_id: self.config.mutation_id,
             expected_head: self.config.expected_head.clone(),
@@ -179,117 +200,36 @@ impl PolicyMutationOperation {
             created_at: self.config.created_at,
             auth_context: self.config.auth_context.clone(),
             subject: self.config.subject.clone(),
-            resolved: self.resolved.clone(),
+            resolved,
             intent: None,
             captured_default: None,
-        };
-        let mut mint = mint_child(plan);
-        let effects = mint.start();
-        self.mint = Some(mint);
-        self.state = MutationState::Mint;
-        effects
+        });
+        self.call(MutationState::Mint, IoCall::child(mint))
     }
 }
 
-impl EffectOperation for PolicyMutationOperation {
+impl Operation for PolicyMutationOperation {
     type Output = SuccessorOutcome;
     type Error = PolicyMutationError;
 
-    fn start(&mut self) -> Effects {
-        self.state = MutationState::Authorize;
-        self.authorize(policy_admin_path(self.config.auth_context.realm_id))
+    fn first(&mut self) -> MutationTurn {
+        let path = policy_admin_path(self.config.auth_context.realm_id);
+        self.authorize(MutationState::Authorize, path)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> MutationTurn {
         match self.state {
-            MutationState::Init => self.start(),
             MutationState::Authorize => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(PolicyMutationError::InvalidEvent);
-                };
-                match allowed {
-                    Ok(true) => self.resolve_refs(),
-                    // A group administrator governs that group's own objects.
-                    Ok(false) => {
-                        self.state = MutationState::AuthorizeGroup;
-                        self.authorize(group_admin_path(
-                            self.config.auth_context.realm_id,
-                            self.config.context.group_id,
-                        ))
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "Policy mutation authorization check failed");
-                        self.fail(PolicyMutationError::Unauthorized)
-                    }
-                }
+                self.realm_checked(result.child::<bool, AuthorizationError>()?)
             }
             MutationState::AuthorizeGroup => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(PolicyMutationError::InvalidEvent);
-                };
-                match allowed {
-                    Ok(true) => self.resolve_refs(),
-                    Ok(false) => self.fail(PolicyMutationError::Unauthorized),
-                    Err(error) => {
-                        warn!(error = %error, "Policy mutation authorization check failed");
-                        self.fail(PolicyMutationError::Unauthorized)
-                    }
-                }
+                self.group_checked(result.child::<bool, AuthorizationError>()?)
             }
-            MutationState::Resolve => {
-                let Event::Child(outcome) = event else {
-                    return self.fail(PolicyMutationError::InvalidEvent);
-                };
-                match outcome.take::<Resolutions, PolicySetError>() {
-                    Some(result) => self.after_resolve(result),
-                    None => self.fail(PolicyMutationError::InvalidEvent),
-                }
-            }
+            MutationState::Resolve => self.resolved(result.child::<Resolutions, PolicySetError>()?),
             MutationState::Mint => {
-                let Some(mint) = self.mint.as_mut() else {
-                    return self.fail(PolicyMutationError::InvalidEvent);
-                };
-                let effects = mint.step(event);
-                if !mint.is_complete() {
-                    return effects;
-                }
-                let Some(mint) = self.mint.take() else {
-                    return self.fail(PolicyMutationError::InvalidEvent);
-                };
-                match mint_outcome(mint.finalize()) {
-                    Ok(outcome) => {
-                        self.output = Some(Ok(outcome));
-                        self.state = MutationState::Finish;
-                        effects
-                    }
-                    // The mint's own cleanup still has to run before the failure
-                    // is reported.
-                    Err(error) => {
-                        let mut cleanup = effects;
-                        cleanup.extend(self.fail(error.into()));
-                        cleanup
-                    }
-                }
+                let minted = result.child::<SuccessorOutcome, SuccessorError>()??;
+                Ok(Next::Done(minted))
             }
-            MutationState::Finish | MutationState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, MutationState::Finish | MutationState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(PolicyMutationError::InvalidEvent))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.mint.as_mut() {
-            Some(mint) => mint.abort(),
-            None => smallvec![],
         }
     }
 
@@ -306,25 +246,19 @@ impl EffectOperation for PolicyMutationOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{PolicyMutationConfig, PolicyMutationError, PolicyMutationOperation};
+    use super::*;
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::events::Event;
     use aruna_core::id::NodeId;
-    use aruna_core::operation::EffectOperation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::CurrentVersionPointer;
-    use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;
-    use ulid::Ulid;
-
-    use crate::blob::records::HeadAliasContext;
-    use crate::s3::policy::successor::SuccessorError;
 
     fn realm_id() -> RealmId {
         RealmId::from_bytes([1u8; 32])
@@ -388,10 +322,26 @@ mod pure_tests {
         }
     }
 
-    fn authorized(allowed: bool) -> Event {
-        Event::SubOperation(SubOperationEvent::AuthorizationResult {
-            allowed: Ok(allowed),
-        })
+    fn authorized(allowed: bool) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(allowed)))
+    }
+
+    /// The answer of the policy resolver, as the shared fixtures build it.
+    fn answer(event: Event) -> IoResult {
+        let Event::Child(outcome) = event else {
+            panic!("expected a child outcome");
+        };
+        IoResult::Child(outcome)
+    }
+
+    fn resolved(policy: &VerifiedPolicy) -> IoResult {
+        answer(crate::tests::policy::resolved_set(std::slice::from_ref(
+            policy,
+        )))
+    }
+
+    fn is_child(turn: &MutationTurn) -> bool {
+        matches!(turn, Ok(Next::Call(IoCall::Child(_))))
     }
 
     fn group_id() -> Ulid {
@@ -417,15 +367,27 @@ mod pure_tests {
 
     #[test]
     fn denies_non_admin() {
-        // Neither realm-configuration write nor admin write on the object's
-        // group leaves nothing to open.
+        // Neither realm-configuration write nor admin write on the object's group leaves
+        // nothing to open.
         let mut operation = PolicyMutationOperation::new(config(&[policy(1)]));
-        operation.start();
-        operation.step(authorized(false));
-        let effects = operation.step(authorized(false));
+        assert!(is_child(&operation.first()));
+        assert!(is_child(&operation.next(authorized(false))));
+        assert_eq!(
+            operation.next(authorized(false)),
+            Err(PolicyMutationError::Unauthorized)
+        );
+    }
 
-        assert!(effects.is_empty(), "a denied caller opens no transaction");
-        assert_eq!(operation.finalize(), Err(PolicyMutationError::Unauthorized));
+    #[test]
+    fn failed_check_denies() {
+        // A check that cannot run never falls through to the group check.
+        let mut operation = PolicyMutationOperation::new(config(&[policy(1)]));
+        operation.first().unwrap();
+        let failed = Err::<bool, _>(AuthorizationError::DocNotFound);
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(failed))),
+            Err(PolicyMutationError::Unauthorized)
+        );
     }
 
     #[test]
@@ -433,34 +395,22 @@ mod pure_tests {
         // The bucket's own group administers its objects' rules.
         let policy = owned(1, group_id());
         let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
-        operation.start();
-        operation.step(authorized(false));
-        operation.step(authorized(true));
-        let effects = operation.step(crate::tests::policy::resolved_set(std::slice::from_ref(
-            &policy,
-        )));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
+        operation.first().unwrap();
+        operation.next(authorized(false)).unwrap();
+        operation.next(authorized(true)).unwrap();
+        assert!(is_child(&operation.next(resolved(&policy))));
+        assert_eq!(operation.state, MutationState::Mint);
     }
 
     #[test]
     fn refuses_foreign_owner() {
         // A rule another group owns never governs this object.
-        let foreign = Ulid::from_bytes([9u8; 16]);
-        let policy = owned(1, foreign);
+        let policy = owned(1, Ulid::from_bytes([9u8; 16]));
         let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
-        operation.start();
-        operation.step(authorized(true));
-        let effects = operation.step(crate::tests::policy::resolved_set(std::slice::from_ref(
-            &policy,
-        )));
-
-        assert!(effects.is_empty(), "a foreign rule opens no transaction");
+        operation.first().unwrap();
+        operation.next(authorized(true)).unwrap();
         assert_eq!(
-            operation.finalize(),
+            operation.next(resolved(&policy)),
             Err(PolicyMutationError::ForeignPolicy {
                 policy_id: Ulid::from_bytes([1u8; 16])
             })
@@ -471,64 +421,39 @@ mod pure_tests {
     fn refuses_unresolved_ref() {
         // An unauthenticated ref must not reach a mint transaction.
         let mut operation = PolicyMutationOperation::new(config(&[policy(1)]));
-        operation.start();
-        operation.step(authorized(true));
+        operation.first().unwrap();
+        operation.next(authorized(true)).unwrap();
         let unresolved = crate::tests::policy::unresolved_set(policy(1).policy_ref());
-        let effects = operation.step(unresolved);
-
-        assert!(effects.is_empty(), "no transaction is opened");
         assert!(matches!(
-            operation.finalize(),
+            operation.next(answer(unresolved)),
             Err(PolicyMutationError::PolicyUnavailable { .. })
         ));
     }
 
     #[test]
     fn mints_after_resolve() {
-        // An authorized caller with an authenticated ref reaches the mint, and
-        // the mint owns the assigned successor id.
+        // An authorized caller with an authenticated ref reaches the mint, and the mint owns
+        // the assigned successor id.
         let policy = policy(1);
         let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
-        operation.start();
-        operation.step(authorized(true));
-        let effects = operation.step(crate::tests::policy::resolved_set(std::slice::from_ref(
-            &policy,
-        )));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
+        operation.first().unwrap();
+        operation.next(authorized(true)).unwrap();
+        assert!(is_child(&operation.next(resolved(&policy))));
         assert!(!operation.successor_version_id().is_nil());
     }
 
     #[test]
-    fn mint_failure_aborts() {
-        // The child mint's typed error must surface while its begun transaction
-        // is still aborted exactly once through the child cleanup.
+    fn mint_failure_surfaces() {
+        // The mint's typed error reaches the caller; the child cleans up after itself.
         let policy = policy(1);
         let mut operation = PolicyMutationOperation::new(config(std::slice::from_ref(&policy)));
-        operation.start();
-        operation.step(authorized(true));
-        operation.step(crate::tests::policy::resolved_set(std::slice::from_ref(
-            &policy,
-        )));
-        let txn_id = Ulid::from_bytes([5u8; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(Vec::new().into(), None)],
-        }));
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::CommitFailed,
-        }));
-
+        operation.first().unwrap();
+        operation.next(authorized(true)).unwrap();
+        operation.next(resolved(&policy)).unwrap();
+        let failed =
+            Err::<SuccessorOutcome, _>(SuccessorError::Storage(StorageError::CommitFailed));
         assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        );
-        assert_eq!(
-            operation.finalize(),
+            operation.next(IoResult::Child(ChildOutcome::new(failed))),
             Err(PolicyMutationError::Successor(SuccessorError::Storage(
                 StorageError::CommitFailed
             )))
