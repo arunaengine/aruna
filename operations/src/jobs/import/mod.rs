@@ -354,6 +354,22 @@ pub async fn run_rocrate_import(ctx: &JobContext, spec: &ImportRoCrateSpec) -> J
     }
 }
 
+/// The connector kind of a repository import in reference mode; `None` for any other import.
+async fn reference_kind(
+    ctx: &JobContext,
+    spec: &ImportRoCrateSpec,
+) -> Result<Option<aruna_core::structs::execution::harvest::RepositoryConnectorKind>, ImportFailure>
+{
+    let Some((group_id, connector_id)) = super::repository::reference_source(spec) else {
+        return Ok(None);
+    };
+    let connector = super::repository::connector::ConnectorViewOperation::new(group_id, connector_id);
+    let view = drive(connector, &ctx.driver)
+        .await
+        .map_err(transfer_failure)?;
+    Ok(Some(view.connector.kind))
+}
+
 fn transfer_failure(error: super::repository::TransferError) -> ImportFailure {
     use super::repository::TransferError;
     match error {
@@ -378,26 +394,48 @@ async fn acquire_source(
             options,
             pull,
         } => {
-            use super::repository::{Action, ensure_supported};
-            let kind = super::repository::connector_kind(&ctx.driver, *group_id, *connector_id)
+            use super::repository::connector::ConnectorViewOperation;
+            use super::repository::invenio::import::{AcquireOperation, AcquireRequest};
+            use super::repository::{Action, JobScope, NodeScope, ensure_supported};
+            let connector = ConnectorViewOperation::new(*group_id, *connector_id);
+            let kind = drive(connector, &ctx.driver)
                 .await
-                .map_err(transfer_failure)?;
+                .map_err(transfer_failure)?
+                .connector
+                .kind;
             ensure_supported(kind, Action::Import).map_err(transfer_failure)?;
             if pull.is_some() {
                 ensure_supported(kind, Action::Pull).map_err(transfer_failure)?;
             }
-            let (artifact, found, progress) = super::repository::acquire(
+            // A pull update merges into the dataset's current crate.
+            let current = match pull {
+                Some(aruna_core::repository::RepositoryPull::Update { .. }) => Some(
+                    Box::pin(crate::jobs::export::crate_jsonld(
+                        &ctx.driver,
+                        &spec.auth_context,
+                        spec.document_id,
+                        spec.limits.metadata_bytes,
+                    ))
+                    .await
+                    .map_err(transfer_failure)?,
+                ),
+                _ => None,
+            };
+            let acquire = AcquireOperation::new(AcquireRequest {
                 kind,
-                ctx,
-                spec,
-                *group_id,
-                *connector_id,
-                record_id,
-                options,
-                pull.as_ref(),
-            )
-            .await
-            .map_err(transfer_failure)?;
+                scope: NodeScope::of(&ctx.driver),
+                job: JobScope::of(ctx),
+                spec: spec.clone(),
+                group_id: *group_id,
+                connector_id: *connector_id,
+                record_id: record_id.clone(),
+                options: options.clone(),
+                pull: pull.clone(),
+                current,
+            });
+            let (artifact, found, progress) = Box::pin(drive(acquire, &ctx.driver))
+                .await
+                .map_err(transfer_failure)?;
             checkpoint.identifiers = found;
             checkpoint.pull = progress;
             Ok(ImportInput {
@@ -879,9 +917,8 @@ async fn write_next(
         ctx.shutdown.clone(),
     )
     .await?;
-    let reference = super::repository::reference_kind(&ctx.driver, spec)
-        .await
-        .map_err(transfer_failure)?
+    let reference = reference_kind(ctx, spec)
+        .await?
         .filter(|kind| super::repository::is_reference(*kind, &entry.path));
     if let Some(kind) = reference {
         let mut bytes = Vec::new();
@@ -896,14 +933,19 @@ async fn write_next(
         }
         let descriptor = serde_json::from_slice(&bytes)
             .map_err(|_| ImportFailure::Permanent("invalid reference descriptor".into()))?;
-        let metadata = super::repository::write_reference(
-            kind,
-            ctx,
-            spec,
-            bucket_info,
-            &entry.target_key,
-            entry.version_id,
-            &descriptor,
+        let metadata = drive(
+            super::repository::invenio::reference::WriteRepositoryReference::new(
+                kind,
+                super::repository::NodeScope::of(&ctx.driver),
+                super::repository::JobScope::of(ctx),
+                spec.clone(),
+                bucket_info,
+                entry.target_key.clone(),
+                entry.version_id,
+                descriptor,
+                Ulid::generate(),
+            ),
+            &ctx.driver,
         )
         .await
         .map_err(transfer_failure)?;
@@ -1049,9 +1091,7 @@ async fn rewrite_crate(
 ) -> Result<(), ImportFailure> {
     let validated = validate_document(&plan.metadata_json).map_err(validation_failure)?;
     let reports = load_reports(ctx).await?;
-    let reference = super::repository::reference_kind(&ctx.driver, spec)
-        .await
-        .map_err(transfer_failure)?;
+    let reference = reference_kind(ctx, spec).await?;
     let mut targets = HashMap::new();
     let mut used = BTreeSet::new();
     for entry in &plan.entries {
@@ -1193,7 +1233,12 @@ async fn update_document(
         ..
     } = &spec.source
     {
-        super::repository::pull::running(ctx, spec, *link_id)
+        let running = super::repository::pull::PullRunningOperation::new(
+            ctx.job_id,
+            spec.document_id,
+            *link_id,
+        );
+        drive(running, &ctx.driver)
             .await
             .map_err(transfer_failure)?;
     }
@@ -1322,14 +1367,15 @@ async fn cleanup_source(
         register_identifiers(ctx, spec, checkpoint.identifiers.clone()).await?;
         checkpoint.identifiers.clear();
     }
-    Box::pin(super::repository::pull::settle_import(
-        ctx,
-        spec,
-        checkpoint.pull.as_ref(),
-        checkpoint.failure.as_deref(),
-    ))
-    .await
-    .map_err(|error| {
+    let settle = super::repository::pull::SettleImportOperation::new(
+        super::repository::NodeScope::of(&ctx.driver),
+        ctx.job_id,
+        ctx.owner_node_id,
+        spec.clone(),
+        checkpoint.pull.clone(),
+        checkpoint.failure.clone(),
+    );
+    Box::pin(drive(settle, &ctx.driver)).await.map_err(|error| {
         ImportFailure::Retryable(format!("recording the pull link failed: {error}"))
     })?;
     checkpoint.phase = ImportPhase::Done;

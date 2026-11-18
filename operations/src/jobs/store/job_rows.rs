@@ -81,6 +81,10 @@ impl Operation for PutRowsOperation {
         TransactionMode::Write
     }
 
+    fn conflict_retries() -> u32 {
+        MUTATE_MAX_ATTEMPTS - 1
+    }
+
     fn first(&mut self) -> Result<Next<()>, JobMutationError> {
         let row = (JOB_CLAIM_KEYSPACE.to_string(), job_record_key(self.job_id));
         Ok(Next::Call(IoCall::Read(vec![row])))

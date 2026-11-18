@@ -263,14 +263,11 @@ pub async fn process_materialization_batch(
         .unwrap_or(0);
     let timings = process_job_groups(context, jobs).await?;
     // Finished jobs may queue link pushes, and the link drain stops once its queue is empty.
-    if timings.processed > 0
-        && let Some(task_handle) = &context.task_handle
-    {
-        crate::jobs::repository::link_queue::restore_link_timer(
-            context,
-            task_handle,
-        )
-        .await;
+    if timings.processed > 0 && context.task_handle.is_some() {
+        let timer = crate::jobs::repository::link_queue::LinkTimerOperation::new();
+        if let Err(error) = drive(timer, context).await {
+            warn!(%error, "Failed to arm the repository link queue");
+        }
     }
     if job_count > 0 {
         info!(
@@ -696,13 +693,28 @@ async fn plan_finish_chunk(
     }
 
     // Linked repositories learn of the change in the same commit as the new status.
-    match crate::jobs::repository::link_queue::queue_rows(storage, superseding.keys().copied())
-        .await
-    {
+    let queue_rows = crate::jobs::repository::link_queue::QueueRowsOperation::new(
+        superseding.keys().copied().collect::<Vec<_>>(),
+    );
+    match drive(queue_rows, &storage_context(storage)).await {
         Ok(rows) => plan.writes.extend(rows),
         Err(error) => warn!(%error, "Failed to queue repository link pushes after materialization"),
     }
     Ok(plan)
+}
+
+/// A context with storage and no other plane, for the storage-only link queue reads.
+fn storage_context(storage: &StorageHandle) -> DriverContext {
+    DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    }
 }
 
 // A status planned earlier in this chunk is newer than the snapshot, so it is

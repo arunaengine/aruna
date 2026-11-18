@@ -26,7 +26,8 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::repository::link_queue::queue_deleted;
+use crate::jobs::repository::NodeScope;
+use crate::jobs::repository::link_queue::QueueDeletedOperation;
 
 use crate::tasks::queue_backoff::due_after;
 
@@ -296,8 +297,11 @@ async fn process_prune_job(
 
     // A retry after a failed link queueing finds the graph already pruned, so it queues again.
     let pruned = match crate::metadata::prune_if_deleted(context, graph_iri.clone()).await {
-        Ok(_) => queue_deleted(context, &graph_iri)
-            .await
+        Ok(_) => drive(
+            QueueDeletedOperation::new(NodeScope::of(context), graph_iri.clone()),
+            context,
+        )
+        .await
             .map_err(|error| format!("queueing the repository links failed: {error}")),
         Err(error) => Err(error.to_string()),
     };
