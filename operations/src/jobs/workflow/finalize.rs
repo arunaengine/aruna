@@ -10,14 +10,11 @@ use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{
     AttemptPhase, AttemptStatus, BackendError, CancelEvidence, FenceContext, LogLimits, LogTails,
 };
-use aruna_core::events::Event;
-use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::tail_str;
 use aruna_core::structs::execution::job::{
     AttemptControl, ExecutionSpec, JobError, JobId, JobRecord, JobRecordError, JobResultPayload,
     MAX_MESSAGE_BYTES, OutputObject,
 };
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -27,7 +24,6 @@ use super::super::store::attempt::{
     read_attempt_control, record_attempt_started, transition_to_cancelling,
 };
 use super::super::store::state::{ExecutionCompleteOutcome, complete_execution, read_job_record};
-use super::super::submit::schedule_drain_effect;
 use super::inventory::CollectOutputsOperation;
 use super::prepare::job_bucket;
 use super::recovery::park_attempt;
@@ -644,16 +640,6 @@ pub(super) async fn fail_and_crate(
 ) {
     let result = execution_result(&job_bucket(record), None, Vec::new(), LogTails::default());
     end_run(context, job_id, token, RunEnding::Fail { error, result }).await;
-}
-
-/// Wake the drain for internal jobs persisted with terminalization.
-pub(crate) async fn finalize_followups(context: &DriverContext, job_id: JobId) {
-    if let Some(task_handle) = context.task_handle.as_ref()
-        && let Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(schedule_drain_effect()).await
-    {
-        warn!(job_id = %job_id, message = %message, "Failed to kick run-crate drain");
-    }
 }
 
 /// Physical execution identity of the fenced attempt. Without it no output can
