@@ -294,6 +294,15 @@ pub enum StorageReadError {
     Conversion(ConversionError),
 }
 
+impl From<StorageReadError> for SourceResolutionError {
+    fn from(value: StorageReadError) -> Self {
+        match value {
+            StorageReadError::Storage(error) => Self::StorageError(error),
+            StorageReadError::Conversion(error) => Self::ConversionError(error),
+        }
+    }
+}
+
 /// A runner failure as a storage failure; one that is none reads as a read error.
 impl From<crate::calls::IoError> for StorageReadError {
     fn from(error: crate::calls::IoError) -> Self {
