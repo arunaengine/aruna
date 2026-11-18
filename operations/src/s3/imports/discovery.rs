@@ -505,55 +505,118 @@ impl PreviewDiscoveryOperation {
         if self.objects.is_empty() {
             return self.read_shared();
         }
-    };
-    let shared = read_shared(context, rule).await?;
-    let earlier = read_earlier(context, rule.import_id).await?;
-    let intents = listed_intents(context, rule, &objects).await;
-    let intents = intents.map_err(ImportRuleError::Read)?;
-    let paths: Vec<&str> = objects.iter().map(|object| object.key.as_str()).collect();
-    let taken = taken_paths(context, &shared, &paths).await?;
-    let mut files = Vec::with_capacity(objects.len());
-    for (object, (_, row)) in objects.iter().zip(rows) {
-        let row = row
-            .map(|row| ImportedObject::from_bytes(&row))
-            .transpose()?;
-        let path = object.key.clone();
-        let names = (rule, earlier.as_slice(), rules);
-        let open = intents.get(&path).map_or(&[][..], Vec::as_slice);
-        // An empty file of an open write is its reservation, as a run finds too.
-        if object.size == 0 && !open.is_empty() {
-            continue;
-        }
-        let file = match row {
-            // A literal import whose name encodes a version is recovered as that version.
-            Some(row)
-                if open.is_empty() && (row.key.is_some() || !decodes(rule, &earlier, &path)) =>
-            {
-                PreviewFile {
-                    key: row_key(rule, &row, &path),
-                    version_id: None,
-                    claimed: Vec::new(),
-                    outcome: FileOutcome::Known,
-                    path,
-                }
-            }
-            // An open write is decided by a run that reads the file; until then it is unresolved.
-            Some(row) if !open.is_empty() => {
-                let mapped = row_key(rule, &row, &path);
-                intended(path, open, mapped)
-            }
-            _ if !open.is_empty() => intended(path, open, None),
-            Some(_) => named(names, path),
-            // A file of a shared folder that another rule takes is not listed here.
-            None => match claim_file(names, &shared, taken.contains(&path), &path) {
-                Claim::Other => continue,
-                Claim::Conflict => unresolved(path, Vec::new()),
-                Claim::Own => named(names, path),
-            },
-        };
-        files.push(file);
+        let reads = (self.objects.iter())
+            .map(|object| {
+                let key = object_key(self.rule.import_id, &object.key);
+                (IMPORTED_OBJECT_KEYSPACE.to_string(), key)
+            })
+            .collect();
+        self.call(PreviewStep::Rows, IoCall::Read(reads))
     }
-    Ok(DiscoveryPreview { files, next })
+
+    fn read_shared(&mut self) -> PreviewTurn {
+        let shared = ReadSharedOperation::new(&self.rule);
+        self.call(PreviewStep::Shared, IoCall::child(shared))
+    }
+
+    fn paths(&self) -> Vec<&str> {
+        (self.objects.iter())
+            .map(|object| object.key.as_str())
+            .collect()
+    }
+
+    /// Where a run would put each listed file.
+    fn placed(&mut self, taken: HashSet<String>) -> PreviewTurn {
+        let rule = &self.rule;
+        let earlier = self.earlier.as_slice();
+        let names = (rule, earlier, self.rules.as_slice());
+        let mut files = Vec::with_capacity(self.objects.len());
+        let rows = std::mem::take(&mut self.rows);
+        for (object, row) in self.objects.iter().zip(rows) {
+            let row = (row.as_deref())
+                .map(ImportedObject::from_bytes)
+                .transpose()?;
+            let path = object.key.clone();
+            let open = self.intents.get(&path).map_or(&[][..], Vec::as_slice);
+            // An empty file of an open write is its reservation, as a run finds too.
+            if object.size == 0 && !open.is_empty() {
+                continue;
+            }
+            let file = match row {
+                // A literal import whose name encodes a version is recovered as that version.
+                Some(row)
+                    if open.is_empty() && (row.key.is_some() || !decodes(rule, earlier, &path)) =>
+                {
+                    PreviewFile {
+                        key: row_key(rule, &row, &path),
+                        version_id: None,
+                        claimed: Vec::new(),
+                        outcome: FileOutcome::Known,
+                        path,
+                    }
+                }
+                // An open write is decided by a run that reads the file; until then it is
+                // unresolved.
+                Some(row) if !open.is_empty() => {
+                    let mapped = row_key(rule, &row, &path);
+                    intended(path, open, mapped)
+                }
+                _ if !open.is_empty() => intended(path, open, None),
+                Some(_) => named(names, path),
+                // A file of a shared folder that another rule takes is not listed here.
+                None => match claim_file(names, &self.shared, taken.contains(&path), &path) {
+                    Claim::Other => continue,
+                    Claim::Conflict => unresolved(path, Vec::new()),
+                    Claim::Own => named(names, path),
+                },
+            };
+            files.push(file);
+        }
+        Ok(Next::Done(DiscoveryPreview {
+            files,
+            next: self.next_page.take(),
+        }))
+    }
+}
+
+impl Operation for PreviewDiscoveryOperation {
+    type Output = DiscoveryPreview;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> PreviewTurn {
+        check_rules(&self.rules)?;
+        let backend = GetBackendOperation::new(self.rule.backend_id);
+        self.call(PreviewStep::Backend, IoCall::child(backend))
+    }
+
+    fn next(&mut self, result: IoResult) -> PreviewTurn {
+        match self.step {
+            PreviewStep::Backend => {
+                self.backend_read(result.child::<Option<GroupStorage>, GroupQueryError>()?)
+            }
+            PreviewStep::List => self.listed(result.child::<BlobEvent, BlobError>()?),
+            PreviewStep::Rows => {
+                self.rows = result.values()?;
+                self.read_shared()
+            }
+            PreviewStep::Shared => {
+                self.shared = result.child::<Vec<SharedRule>, ImportRuleError>()??;
+                let earlier = ReadEarlierOperation::new(self.rule.import_id);
+                self.call(PreviewStep::Earlier, IoCall::child(earlier))
+            }
+            PreviewStep::Earlier => {
+                self.earlier = result.child::<Vec<String>, ImportRuleError>()??;
+                let intents = PathIntentsOperation::new(self.rule.import_id, &self.paths());
+                self.call(PreviewStep::Intents, IoCall::child(intents))
+            }
+            PreviewStep::Intents => {
+                self.intents = result.child::<PathIntents, ImportRuleError>()??;
+                let taken = TakenPathsOperation::new(&self.shared, &self.paths());
+                self.call(PreviewStep::Taken, IoCall::child(taken))
+            }
+            PreviewStep::Taken => self.placed(result.child::<HashSet<String>, ImportRuleError>()??),
+        }
+    }
 }
 
 /// The key a row keeps its file at; an older row without one keeps the rule's own mapping.
@@ -646,7 +709,9 @@ mod tests {
         let scope = (realm, rule.group_id, node);
         let auth = crate::tests::access::seed_access(&context, scope, &secret).await;
 
-        let access = bucket_access(&context, &auth, node, &rule).await.unwrap();
+        let load =
+            |auth: &AuthContext| drive(RuleAccessOperation::new(auth, node, &rule), &context);
+        let access = load(&auth).await.unwrap();
         let file = |path: &str, key: Option<&str>| PreviewFile {
             path: path.to_string(),
             key: key.map(str::to_string),
@@ -667,11 +732,11 @@ mod tests {
 
         let mut restricted = auth.clone();
         restricted.path_restrictions = Some(Vec::new());
-        let refused = bucket_access(&context, &restricted, node, &rule).await;
+        let refused = load(&restricted).await;
         assert!(matches!(refused, Err(ImportRuleError::Forbidden)));
         let mut stranger = auth;
         stranger.user_id = aruna_core::UserId::local(Ulid::from_parts(9, 9), realm);
-        let refused = bucket_access(&context, &stranger, node, &rule).await;
+        let refused = load(&stranger).await;
         assert!(matches!(refused, Err(ImportRuleError::Forbidden)));
     }
     fn rules() -> Vec<DiscoveryRule> {
@@ -679,6 +744,50 @@ mod tests {
             pattern: "*.faa.gz".to_string(),
             folder: "proteins/".to_string(),
         }]
+    }
+
+    #[test]
+    fn restricted_token_refused() {
+        let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
+        let auth = AuthContext {
+            user_id: aruna_core::UserId::nil(realm),
+            realm_id: realm,
+            path_restrictions: Some(Vec::new()),
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let mut operation = RuleAccessOperation::new(&auth, node, &import_rule());
+        assert!(matches!(operation.first(), Err(ImportRuleError::Forbidden)));
+    }
+
+    #[test]
+    fn foreign_backend_refused() {
+        let mut operation = PreviewDiscoveryOperation::new(&import_rule(), &rules(), None);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert!(matches!(
+            operation.backend_read(Ok(None)),
+            Err(ImportRuleError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn guards_keep_rows() {
+        let rule = import_rule();
+        let mut operation = RenameGuardsOperation::new(&rule);
+        operation.first().unwrap();
+        let stored = Some(Value::from(vec![1]));
+        let turn = operation.next(IoResult::Values(vec![stored.clone(), None]));
+        let Ok(Next::Done(guards)) = turn else {
+            panic!("the guards are returned");
+        };
+        assert_eq!(
+            guards[0],
+            (BACKEND_IMPORT_KEYSPACE.to_string(), rule.key(), stored)
+        );
+        assert_eq!(guards[1].2, None);
     }
 
     #[test]
