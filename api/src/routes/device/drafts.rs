@@ -32,7 +32,7 @@ use aruna_operations::device::list_drafts::ListDraftsOperation;
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState, token_issued_at};
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
-use aruna_operations::metadata::public_preview::restricted_files;
+use aruna_operations::metadata::public_preview::RestrictedFilesOperation;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -430,16 +430,12 @@ async fn preview_draft(
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
+        let node = (state.get_realm_id(), state.get_node_id());
+        let restricted = RestrictedFilesOperation::new(node, auth.clone(), &request.rocrate);
         response.set_restricted(
-            restricted_files(
-                &state.get_ctx(),
-                state.get_realm_id(),
-                state.get_node_id(),
-                &auth,
-                &request.rocrate,
-            )
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?,
+            drive(restricted, state.get_ctx().as_ref())
+                .await
+                .map_err(|error| ServerError::InternalError(error.into()))?,
         );
     }
     Ok((StatusCode::OK, Json(response)))

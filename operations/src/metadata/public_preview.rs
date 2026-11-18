@@ -2,13 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::time::Duration;
 
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::blob::{HashIndex, object_permission_path};
 use aruna_core::structs::storage::data::identity::{DataIdentity, text_values};
 use aruna_core::types::GroupId;
 use serde_json::Value as JsonValue;
@@ -17,11 +22,10 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::blob::holders::GetHoldersOperation;
-use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive, drive_until};
-use crate::replication::locations::LocationSummaryOperation;
+use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
+use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
 use crate::replication::protocol::LocationSummaryRequest;
 
 const FILE_TYPES: [&str; 4] = [
@@ -34,6 +38,8 @@ const FILE_TYPES: [&str; 4] = [
 /// further; the preview is an advisory warning, not an authorization decision.
 const MAX_DRAFT_FILES: usize = 256;
 const MAX_ENTITY_PATHS: usize = 16;
+/// The whole preview's budget; files past it leave the preview incomplete.
+const PREVIEW_BUDGET_MS: u64 = 10_000;
 
 /// A draft data entity the realm's anonymous principal may not read. The
 /// location fields are omitted when the caller may not read the object either.
@@ -47,12 +53,13 @@ pub struct RestrictedFile {
     pub key: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct RestrictedFilesPreview {
     pub files: Vec<RestrictedFile>,
     pub complete: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct ObjectPath {
     group_id: GroupId,
     bucket: String,
@@ -60,228 +67,439 @@ struct ObjectPath {
     path: String,
 }
 
-struct ResolvedPaths {
-    paths: Vec<ObjectPath>,
-    complete: bool,
+/// What one draft file adds to the preview.
+#[derive(Debug, PartialEq)]
+pub(crate) enum FileAccess {
+    /// Anonymous READ reaches it.
+    Public,
+    /// Its paths or holders could not all be checked, so the preview is incomplete.
+    Unchecked,
+    Restricted(RestrictedFile),
 }
 
-/// Lists the draft's Aruna data entities that anonymous READ would not reach,
-/// so a public publish can warn about them. Only paths the caller may read are
-/// resolved; nothing beyond "not publicly readable" about a foreign object leaks.
-pub async fn restricted_files(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    auth: &AuthContext,
-    rocrate: &JsonValue,
-) -> Result<RestrictedFilesPreview, MetadataError> {
-    let anonymous = AuthContext::anonymous(realm_id);
-    let files = draft_files(rocrate);
-    let mut complete = files.len() <= MAX_DRAFT_FILES;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let remote_possible = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .map_or(true, |config| {
-            !config.has_node(node_id)
-                || config
-                    .nodes
-                    .iter()
-                    .any(|node| node.node_id != node_id.to_string())
-        });
-    let mut restricted = Vec::new();
-    for (entity_id, content_urls) in files.into_iter().take(MAX_DRAFT_FILES) {
-        if tokio::time::Instant::now() >= deadline {
-            complete = false;
-            break;
-        }
-        let identity = DataIdentity::read(&entity_id, &content_urls);
-        if !identity.is_aruna() {
-            continue;
-        }
-        let resolved =
-            match entity_paths(context, realm_id, node_id, auth, &identity, deadline).await {
-                Ok(resolved) => resolved,
-                Err(_) => {
-                    complete = false;
-                    continue;
-                }
-            };
-        if resolved.paths.is_empty() {
-            complete = false;
-            continue;
-        }
-        let mut checked = resolved.complete;
-        let mut visible = None;
-        let mut public = false;
-        for path in resolved.paths {
-            match readable(context, realm_id, &anonymous, &path).await {
-                Ok(true) => {
-                    public = true;
-                    break;
-                }
-                Ok(false) => {}
-                Err(_) => checked = false,
-            }
-            match readable(context, realm_id, auth, &path).await {
-                Ok(true) if visible.is_none() => visible = Some(path),
-                Ok(_) => {}
-                Err(_) => checked = false,
-            }
-        }
-        if public {
-            continue;
-        }
-        if remote_possible && let Some(hash) = identity.hash {
-            checked &= matches!(
-                drive_until(GetHoldersOperation::new(hash, realm_id, node_id), context, deadline).await,
-                Ok(holders) if holders.is_empty()
-            );
-        }
-        if !checked {
-            complete = false;
-            continue;
-        }
-        restricted.push(RestrictedFile {
-            entity_id,
-            group_id: visible.as_ref().map(|path| path.group_id),
-            permission_path: visible.as_ref().map(|path| path.path.clone()),
-            bucket: visible.as_ref().map(|path| path.bucket.clone()),
-            key: visible.as_ref().map(|path| path.key.clone()),
-        });
-    }
-    Ok(RestrictedFilesPreview {
-        files: restricted,
-        complete,
+/// One deadline-bounded call: a member that does not finish in `remaining` is unfinished.
+fn bounded<O>(operation: O, remaining: Duration) -> IoCall
+where
+    O: Operation + Send + 'static,
+    O::Output: std::fmt::Debug + Send + PartialEq + 'static,
+    O::Error: std::fmt::Debug + Send + PartialEq + 'static,
+{
+    let member = Effect::SubOperation(boxed_suboperation(operation, |result| {
+        Event::Child(ChildOutcome::new(result))
+    }));
+    IoCall::Group(EffectGroup {
+        members: vec![member],
+        limit: 1,
+        form: GroupForm::All {
+            deadline: Some(remaining),
+        },
     })
 }
 
-async fn entity_paths(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    auth: &AuthContext,
-    identity: &DataIdentity,
-    deadline: tokio::time::Instant,
-) -> Result<ResolvedPaths, MetadataError> {
-    let mut paths = Vec::new();
-    let mut complete = true;
-    let mut seen = BTreeSet::new();
-    let exact = identity
-        .exact
-        .as_ref()
-        .filter(|exact| exact.realm_id == realm_id)
-        .filter(|exact| exact.node_id == node_id)
-        .map(|exact| (exact.bucket.clone(), exact.key.clone(), Some(exact.version)));
-    // Without an exact version, an `s3://` location names the local object's current version.
-    let local = exact.or_else(|| {
-        identity
-            .location
-            .as_ref()
-            .filter(|_| identity.exact.is_none())
-            .map(|location| (location.bucket.clone(), location.key.clone(), None))
-    });
-    if let Some((bucket, key, version)) = local {
-        for principal in [&AuthContext::anonymous(realm_id), auth] {
-            let summary = drive_until(
-                LocationSummaryOperation::new_local(
-                    node_id,
-                    LocationSummaryRequest {
-                        realm_id,
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        version_id: version,
-                        auth_context: principal.clone(),
-                    },
-                )
-                .with_policy(true),
-                context,
-                deadline,
-            )
-            .await;
-            if let Ok(summary) = summary
-                && version.is_none_or(|version| summary.summary.version_id == Some(version))
-                && summary.summary.materialized
-                && summary.summary.blob_size.is_some()
-                && let Some(group_id) = summary.summary.group_id
-            {
-                let path = object_permission_path(realm_id, group_id, node_id, &bucket, &key);
-                seen.insert(path.clone());
-                paths.push(ObjectPath {
-                    group_id,
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    path,
-                });
-                break;
-            }
-        }
-        if paths.is_empty() && version.is_some() {
-            complete = false;
-        }
-    }
-    if identity
-        .exact
-        .as_ref()
-        .is_some_and(|exact| exact.node_id != node_id || exact.realm_id != realm_id)
-    {
-        complete = false;
-    }
-    let hash = identity
-        .hash
-        .filter(|_| identity.hash_realm.is_none_or(|realm| realm == realm_id));
-    let Some(hash) = hash else {
-        return Ok(ResolvedPaths { paths, complete });
+/// The answer of a [`bounded`] call; `None` when it ran out of time or failed to run.
+fn bounded_result<T: 'static, E: 'static>(result: IoResult) -> Option<Result<T, E>> {
+    let IoResult::Group(GroupEvent::Finished { results }) = result else {
+        return None;
     };
-    let aliases = drive(ResolvePathsOperation::new(hash), context)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    for alias in aliases.iter().filter(|alias| alias.realm_id == realm_id) {
-        if alias.node_id != node_id {
-            complete = false;
-            continue;
-        }
-        let path = alias.permission_path();
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        if paths.len() >= MAX_ENTITY_PATHS {
-            complete = false;
-            break;
-        }
-        paths.push(ObjectPath {
-            group_id: alias.group_id,
-            bucket: alias.bucket.clone(),
-            key: alias.key.clone(),
-            path,
-        });
+    match results.into_iter().next()? {
+        GroupResult::Done(event) => match *event {
+            Event::Child(outcome) => outcome.take(),
+            _ => None,
+        },
+        _ => None,
     }
-    Ok(ResolvedPaths { paths, complete })
 }
 
-async fn readable(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+enum FileStage {
+    /// The location summary of the local object, for the principal at this index.
+    Summary(usize),
+    Aliases,
+    /// The READ check of the path at this index, anonymous first, then the caller.
+    Read {
+        path: usize,
+        anonymous: bool,
+    },
+    Holders,
+}
+
+/// Checks one draft data entity: resolves the permission paths of its object here, then
+/// whether anonymous READ reaches any of them, which path the caller may read, and whether
+/// another node holds the content. Only paths the caller may read are reported.
+#[derive(Debug, PartialEq)]
+pub(crate) struct FileAccessOperation {
     realm_id: RealmId,
-    auth: &AuthContext,
-    path: &ObjectPath,
-) -> Result<bool, AuthorizeError> {
-    match drive(
-        AuthorizeOperation::new(
+    node_id: NodeId,
+    auth: AuthContext,
+    entity_id: String,
+    identity: DataIdentity,
+    remote_possible: bool,
+    deadline_ms: u64,
+    now_ms: u64,
+    local: Option<(String, String, Option<ulid::Ulid>)>,
+    paths: Vec<ObjectPath>,
+    seen: BTreeSet<String>,
+    complete: bool,
+    checked: bool,
+    visible: Option<ObjectPath>,
+    stage: FileStage,
+}
+
+impl FileAccessOperation {
+    fn new(
+        (realm_id, node_id, auth): (RealmId, NodeId, AuthContext),
+        (entity_id, identity): (String, DataIdentity),
+        (remote_possible, deadline_ms): (bool, u64),
+    ) -> Self {
+        let exact = (identity.exact.as_ref())
+            .filter(|exact| exact.realm_id == realm_id && exact.node_id == node_id)
+            .map(|exact| (exact.bucket.clone(), exact.key.clone(), Some(exact.version)));
+        // Without an exact version, an `s3://` location names the local object's current version.
+        let local = exact.or_else(|| {
+            (identity.location.as_ref())
+                .filter(|_| identity.exact.is_none())
+                .map(|location| (location.bucket.clone(), location.key.clone(), None))
+        });
+        Self {
             realm_id,
+            node_id,
             auth,
-            &path.path,
+            entity_id,
+            identity,
+            remote_possible,
+            deadline_ms,
+            now_ms: 0,
+            local,
+            paths: Vec::new(),
+            seen: BTreeSet::new(),
+            complete: true,
+            checked: true,
+            visible: None,
+            stage: FileStage::Summary(0),
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        Duration::from_millis(self.deadline_ms.saturating_sub(self.now_ms))
+    }
+
+    fn principal(&self, index: usize) -> AuthContext {
+        match index {
+            0 => AuthContext::anonymous(self.realm_id),
+            _ => self.auth.clone(),
+        }
+    }
+
+    fn summary(&mut self, index: usize) -> Result<Next<FileAccess>, MetadataError> {
+        let Some((bucket, key, version)) = self.local.clone() else {
+            return self.aliases();
+        };
+        if index > 1 {
+            if self.paths.is_empty() && version.is_some() {
+                self.complete = false;
+            }
+            return self.aliases();
+        }
+        let request = LocationSummaryRequest {
+            realm_id: self.realm_id,
+            bucket,
+            key,
+            version_id: version,
+            auth_context: self.principal(index),
+        };
+        let summary = LocationSummaryOperation::new_local(self.node_id, request).with_policy(true);
+        self.stage = FileStage::Summary(index);
+        Ok(Next::Call(bounded(summary, self.remaining())))
+    }
+
+    fn summarized(
+        &mut self,
+        index: usize,
+        result: IoResult,
+    ) -> Result<Next<FileAccess>, MetadataError> {
+        let (bucket, key, version) = self.local.clone().unwrap_or_default();
+        let summary =
+            bounded_result::<LocalSummary, LocationSummaryError>(result).and_then(Result::ok);
+        if let Some(summary) = summary
+            && version.is_none_or(|version| summary.summary.version_id == Some(version))
+            && summary.summary.materialized
+            && summary.summary.blob_size.is_some()
+            && let Some(group_id) = summary.summary.group_id
+        {
+            let path = object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key);
+            self.seen.insert(path.clone());
+            self.paths.push(ObjectPath {
+                group_id,
+                bucket,
+                key,
+                path,
+            });
+            return self.summary(2);
+        }
+        self.summary(index + 1)
+    }
+
+    fn aliases(&mut self) -> Result<Next<FileAccess>, MetadataError> {
+        let (realm_id, node_id) = (self.realm_id, self.node_id);
+        if (self.identity.exact.as_ref())
+            .is_some_and(|exact| exact.node_id != node_id || exact.realm_id != realm_id)
+        {
+            self.complete = false;
+        }
+        let hash = (self.identity.hash).filter(|_| {
+            self.identity
+                .hash_realm
+                .is_none_or(|realm| realm == realm_id)
+        });
+        let Some(hash) = hash else {
+            return self.check(0, true);
+        };
+        self.stage = FileStage::Aliases;
+        Ok(Next::Call(IoCall::child(ResolvePathsOperation::new(hash))))
+    }
+
+    fn aliased(&mut self, aliases: Vec<HashIndex>) -> Result<Next<FileAccess>, MetadataError> {
+        for alias in aliases
+            .iter()
+            .filter(|alias| alias.realm_id == self.realm_id)
+        {
+            if alias.node_id != self.node_id {
+                self.complete = false;
+                continue;
+            }
+            let path = alias.permission_path();
+            if !self.seen.insert(path.clone()) {
+                continue;
+            }
+            if self.paths.len() >= MAX_ENTITY_PATHS {
+                self.complete = false;
+                break;
+            }
+            self.paths.push(ObjectPath {
+                group_id: alias.group_id,
+                bucket: alias.bucket.clone(),
+                key: alias.key.clone(),
+                path,
+            });
+        }
+        self.check(0, true)
+    }
+
+    /// The READ check of one path for the anonymous principal or the caller.
+    fn check(&mut self, path: usize, anonymous: bool) -> Result<Next<FileAccess>, MetadataError> {
+        if self.paths.is_empty() {
+            return Ok(Next::Done(FileAccess::Unchecked));
+        }
+        if path == 0 && anonymous {
+            self.checked = self.complete;
+        }
+        let Some(object) = self.paths.get(path) else {
+            return self.holders();
+        };
+        let principal = match anonymous {
+            true => AuthContext::anonymous(self.realm_id),
+            false => self.auth.clone(),
+        };
+        let extras = PolicyRequestExtras::operation("s3.GetObject");
+        let authorize = AuthorizeOperation::new(
+            self.realm_id,
+            &principal,
+            &object.path,
             &Permission::READ,
-            PolicyRequestExtras::operation("s3.GetObject"),
-        ),
-        context,
-    )
-    .await
-    {
-        Ok(()) => Ok(true),
-        Err(
-            AuthorizeError::PermissionDenied
-            | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
-        ) => Ok(false),
-        Err(error) => Err(error),
+            extras,
+        );
+        self.stage = FileStage::Read { path, anonymous };
+        Ok(Next::Call(IoCall::child(authorize)))
+    }
+
+    fn read(
+        &mut self,
+        (path, anonymous): (usize, bool),
+        result: IoResult,
+    ) -> Result<Next<FileAccess>, MetadataError> {
+        let readable = match result.child::<(), AuthorizeError>()? {
+            Ok(()) => Some(true),
+            Err(
+                AuthorizeError::PermissionDenied
+                | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }),
+            ) => Some(false),
+            Err(_) => None,
+        };
+        if readable.is_none() {
+            self.checked = false;
+        }
+        if anonymous {
+            if readable == Some(true) {
+                return Ok(Next::Done(FileAccess::Public));
+            }
+            return self.check(path, false);
+        }
+        if readable == Some(true) && self.visible.is_none() {
+            self.visible = self.paths.get(path).cloned();
+        }
+        self.check(path + 1, true)
+    }
+
+    fn holders(&mut self) -> Result<Next<FileAccess>, MetadataError> {
+        match self.identity.hash.filter(|_| self.remote_possible) {
+            Some(hash) => {
+                let holders = GetHoldersOperation::new(hash, self.realm_id, self.node_id);
+                self.stage = FileStage::Holders;
+                Ok(Next::Call(bounded(holders, self.remaining())))
+            }
+            None => Ok(Next::Done(self.verdict())),
+        }
+    }
+
+    fn verdict(&mut self) -> FileAccess {
+        if !self.checked {
+            return FileAccess::Unchecked;
+        }
+        let visible = self.visible.take();
+        FileAccess::Restricted(RestrictedFile {
+            entity_id: std::mem::take(&mut self.entity_id),
+            group_id: visible.as_ref().map(|path| path.group_id),
+            permission_path: visible.as_ref().map(|path| path.path.clone()),
+            bucket: visible.as_ref().map(|path| path.bucket.clone()),
+            key: visible.map(|path| path.key),
+        })
+    }
+}
+
+impl Operation for FileAccessOperation {
+    type Output = FileAccess;
+    type Error = MetadataError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<FileAccess>, MetadataError> {
+        self.summary(0)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<FileAccess>, MetadataError> {
+        match self.stage {
+            FileStage::Summary(index) => self.summarized(index, result),
+            FileStage::Aliases => match result.child::<Vec<HashIndex>, ResolvePathsError>()? {
+                Ok(aliases) => self.aliased(aliases),
+                Err(_) => Ok(Next::Done(FileAccess::Unchecked)),
+            },
+            FileStage::Read { path, anonymous } => self.read((path, anonymous), result),
+            FileStage::Holders => {
+                let holders = bounded_result::<Vec<NodeId>, GetHoldersError>(result);
+                self.checked &= matches!(holders, Some(Ok(holders)) if holders.is_empty());
+                Ok(Next::Done(self.verdict()))
+            }
+        }
+    }
+}
+
+/// Lists the draft's Aruna data entities that anonymous READ would not reach, so a public
+/// publish can warn about them, within one time budget. Only paths the caller may read are
+/// resolved; nothing beyond "not publicly readable" about a foreign object leaks.
+#[derive(Debug, PartialEq)]
+pub struct RestrictedFilesOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    auth: AuthContext,
+    files: VecDeque<(String, DataIdentity)>,
+    complete: bool,
+    remote_possible: bool,
+    deadline_ms: Option<u64>,
+    now_ms: u64,
+    restricted: Vec<RestrictedFile>,
+    configured: bool,
+}
+
+impl RestrictedFilesOperation {
+    pub fn new(
+        (realm_id, node_id): (RealmId, NodeId),
+        auth: AuthContext,
+        rocrate: &JsonValue,
+    ) -> Self {
+        let files = draft_files(rocrate);
+        let complete = files.len() <= MAX_DRAFT_FILES;
+        let files = (files.into_iter().take(MAX_DRAFT_FILES))
+            .map(|(entity_id, content_urls)| {
+                let identity = DataIdentity::read(&entity_id, &content_urls);
+                (entity_id, identity)
+            })
+            .filter(|(_, identity)| identity.is_aruna())
+            .collect();
+        Self {
+            realm_id,
+            node_id,
+            auth,
+            files,
+            complete,
+            remote_possible: true,
+            deadline_ms: None,
+            now_ms: 0,
+            restricted: Vec::new(),
+            configured: false,
+        }
+    }
+
+    fn next_file(&mut self) -> Result<Next<RestrictedFilesPreview>, MetadataError> {
+        let deadline_ms = self.deadline_ms.unwrap_or(self.now_ms);
+        let Some((entity_id, identity)) = self.files.pop_front() else {
+            return Ok(Next::Done(self.preview()));
+        };
+        if self.now_ms >= deadline_ms {
+            self.complete = false;
+            return Ok(Next::Done(self.preview()));
+        }
+        let file = FileAccessOperation::new(
+            (self.realm_id, self.node_id, self.auth.clone()),
+            (entity_id, identity),
+            (self.remote_possible, deadline_ms),
+        );
+        Ok(Next::Call(IoCall::child(file)))
+    }
+
+    fn preview(&mut self) -> RestrictedFilesPreview {
+        RestrictedFilesPreview {
+            files: std::mem::take(&mut self.restricted),
+            complete: self.complete,
+        }
+    }
+}
+
+impl Operation for RestrictedFilesOperation {
+    type Output = RestrictedFilesPreview;
+    type Error = MetadataError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.deadline_ms
+            .get_or_insert(now_ms.saturating_add(PREVIEW_BUDGET_MS));
+    }
+
+    fn first(&mut self) -> Result<Next<RestrictedFilesPreview>, MetadataError> {
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<RestrictedFilesPreview>, MetadataError> {
+        if !self.configured {
+            self.configured = true;
+            let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+            let node = self.node_id;
+            // Another node may hold the content unless this node is the realm's only one.
+            self.remote_possible = config.map_or(true, |config| {
+                !config.has_node(node)
+                    || (config.nodes.iter()).any(|other| other.node_id != node.to_string())
+            });
+            return self.next_file();
+        }
+        match result.child::<FileAccess, MetadataError>()?? {
+            FileAccess::Public => {}
+            FileAccess::Unchecked => self.complete = false,
+            FileAccess::Restricted(file) => self.restricted.push(file),
+        }
+        self.next_file()
     }
 }
 
@@ -312,6 +530,37 @@ pub(crate) fn is_file(value: &JsonValue) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
+
+    async fn restricted_files(
+        context: &DriverContext,
+        realm_id: RealmId,
+        node_id: NodeId,
+        auth: &AuthContext,
+        rocrate: &JsonValue,
+    ) -> Result<RestrictedFilesPreview, MetadataError> {
+        let preview = RestrictedFilesOperation::new((realm_id, node_id), auth.clone(), rocrate);
+        drive(preview, context).await
+    }
+
+    #[test]
+    fn foreign_entities_skipped() {
+        // Entities without an Aruna identity need no reads beyond the realm config.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let rocrate = json!({"@graph": [{"@id": "https://example.test/a", "@type": "File"}]});
+        let auth = AuthContext::anonymous(realm_id);
+        let mut preview = RestrictedFilesOperation::new((realm_id, node_id), auth, &rocrate);
+        preview.stamp(1);
+        assert!(matches!(preview.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let config = Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound);
+        let done = preview.next(IoResult::Child(ChildOutcome::new(config)));
+        let expected = RestrictedFilesPreview {
+            files: Vec::new(),
+            complete: true,
+        };
+        assert_eq!(done, Ok(Next::Done(expected)));
+    }
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
