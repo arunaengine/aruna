@@ -16,7 +16,8 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
-use crate::jobs::lifecycle::publish::{publish_state, publish_terminal};
+use crate::jobs::lifecycle::publish::publish_terminal;
+use crate::jobs::lifecycle::updates::PublishStateOperation;
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
@@ -268,6 +269,12 @@ async fn bumps_dashboard_once() {
     assert!(publish_terminal(&ctx, &terminal).await);
     assert_eq!(*changes.borrow_and_update(), before + 1);
 
-    assert!(publish_state(&ctx, &chain, PhysicalExecutionState::Cancelled, None, 5_000).await);
+    let publish = PublishStateOperation::new(
+        chain,
+        (PhysicalExecutionState::Cancelled, None, 5_000),
+        ctx.node_and_realm(),
+        5_000,
+    );
+    assert!(crate::driver::drive(publish, &ctx).await.unwrap());
     assert_eq!(*changes.borrow_and_update(), before + 1);
 }

@@ -2,36 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{
-    JobId, JobRecord, PhysicalExecutionResult, PhysicalExecutionState,
-};
+use aruna_core::structs::execution::job::{JobId, JobRecord, PhysicalExecutionState};
 use aruna_core::time::unix_timestamp_millis;
 use tracing::warn;
 
 use super::LifecycleError;
-use super::chain::ExecutionChain;
-use super::updates::{
-    PublishProgressOperation, PublishStateOperation, PublishTerminalOperation,
-    SettleTerminalsOperation,
-};
+use super::updates::{PublishProgressOperation, PublishTerminalOperation};
 use crate::driver::{DriverContext, drive};
-
-/// Publishes one state of the local execution; see [`PublishStateOperation`].
-pub async fn publish_state(
-    context: &DriverContext,
-    chain: &ExecutionChain,
-    state: PhysicalExecutionState,
-    result: Option<PhysicalExecutionResult>,
-    observed_at_ms: u64,
-) -> bool {
-    let operation = PublishStateOperation::new(
-        *chain,
-        (state, result, observed_at_ms),
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    published(drive(operation, context).await)
-}
 
 /// Publishes a non-terminal state of a receipted execution. A job with no
 /// receipt here is a purely local execution and publishes nothing.
@@ -56,17 +33,6 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
         unix_timestamp_millis(),
     );
     published(drive(operation, context).await)
-}
-
-/// Retries terminal publication and capacity release for every durable local
-/// terminal execution that still has a reservation. `true` means at least one
-/// obligation stayed pending, so the caller must run this again.
-pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
-    let operation =
-        SettleTerminalsOperation::new(context.node_and_realm(), unix_timestamp_millis());
-    drive(operation, context)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 /// Whether a publication met its obligation.
