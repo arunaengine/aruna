@@ -128,7 +128,7 @@ pub(crate) fn holder_intersection(current: &[NodeId], frozen: &[NodeId]) -> Vec<
 
 /// Why no holder accepted a forwarded metadata write.
 #[derive(Debug, Error, PartialEq)]
-pub(crate) enum HolderWriteError {
+pub enum HolderWriteError {
     #[error("metadata write requires authentication")]
     Unauthorized,
     #[error("metadata write is forbidden")]
