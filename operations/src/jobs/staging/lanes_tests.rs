@@ -10,7 +10,6 @@ use crate::jobs::staging::pure_tests::{child_answer, test_connector, test_run};
 use aruna_core::events::GroupResult;
 use aruna_core::structs::execution::job::{StagingJobError, StagingJobPrefix};
 
-
 fn spec(targets: &[&str]) -> StagingJobSpec {
     let mut spec = crate::jobs::staging::pure_tests::test_spec();
     spec.prefixes = (targets.iter())
@@ -61,8 +60,9 @@ async fn s3_listing(keys: Vec<String>) -> (String, tokio::task::JoinHandle<()>) 
             let key = uri.path().trim_start_matches("/source/").to_string();
             let found = keys.contains(&key);
             return std::future::ready(match found {
-                true => (StatusCode::OK, [("content-length", "3"), ("etag", "\"e\"")])
-                    .into_response(),
+                true => {
+                    (StatusCode::OK, [("content-length", "3"), ("etag", "\"e\"")]).into_response()
+                }
                 false => StatusCode::NOT_FOUND.into_response(),
             });
         }
@@ -171,7 +171,7 @@ async fn job_context(
     use aruna_core::structs::storage::blob::object_permission_path;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
-    
+
     let test = setup_driver_context().await;
     let driver = test.driver_context;
     let targets: Vec<&str> = prefixes.iter().map(|(_, target)| *target).collect();
@@ -298,7 +298,9 @@ fn split_of(keys: &[&str], source_path: &str, parts: usize) -> Vec<String> {
     let mut plan = SplitPlan::new(source_path, parts);
     let mut lower = plan.begin();
     while let Some(at) = lower {
-        let first = keys.iter().find(|key| **key >= at.as_str() && key.starts_with(source_path));
+        let first = keys
+            .iter()
+            .find(|key| **key >= at.as_str() && key.starts_with(source_path));
         lower = plan.answer(first.map(|key| key.to_string()));
     }
     plan.splits()
@@ -336,7 +338,7 @@ fn splits_sample_space() {
 
 // A single key gives no split, and the plan stops once its probes run out.
 #[test]
-fn plan_ends_without_forks() {
+fn plan_needs_forks() {
     assert!(split_of(&["p/only"], "p/", 4).is_empty());
     assert!(split_of(&[], "p/", 4).is_empty());
     assert!(SplitPlan::new("p/", 1).begin().is_none());
@@ -371,7 +373,10 @@ fn walking_lane() -> OpenLane {
 fn lane_page_reports() {
     let mut page = LanePageOperation::new(test_run(), 4, walking_lane());
     assert_eq!(page.first(), Ok(Next::Call(job_call(JobEffect::Stops))));
-    assert!(matches!(page.next(stops(false)), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        page.next(stops(false)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let mut checkpoint = walking_lane().checkpoint;
     checkpoint.items_current = 3;
     let walked = WalkedPage {
@@ -406,7 +411,10 @@ fn opened_window(run: StagingRun) -> LanesOperation {
         rows: Vec::new(),
         next: None,
     };
-    assert!(matches!(lanes.next(page), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        lanes.next(page),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     lanes
 }
 
@@ -508,7 +516,10 @@ fn opener_writes_lanes() {
     };
     let mut open = OpenPrefixOperation::new(run, initial_checkpoint(&spec), 2);
     assert_eq!(open.first(), Ok(Next::Call(job_call(JobEffect::Stops))));
-    assert!(matches!(open.next(stops(false)), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        open.next(stops(false)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let listed = |path: Option<&str>, open: &mut OpenPrefixOperation| {
         let page = crate::staging::list_source::ListStagingResult {
             entries: path.into_iter().map(entry).collect(),
@@ -520,7 +531,10 @@ fn opener_writes_lanes() {
     };
     assert!(matches!(listed(Some("p/a1"), &mut open), Ok(Next::Call(_))));
     assert!(matches!(listed(Some("p/b1"), &mut open), Ok(Next::Call(_))));
-    assert!(matches!(listed(None, &mut open), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        listed(None, &mut open),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let OpenStep::Commit(lanes) = &open.step else {
         panic!("expected the write of the lanes");
     };
@@ -545,4 +559,3 @@ fn entry(path: &str) -> aruna_core::structs::execution::source_access::SourceEnt
         stat: None,
     }
 }
-

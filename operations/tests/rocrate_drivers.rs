@@ -1338,10 +1338,13 @@ async fn cancel_mid_write() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(hidden_count(&fixture, upload_id).await?, 0);
     assert!(
-        aruna_operations::driver::drive(aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id), &fixture.context)
-            .await
-            .map_err(|error| error.0)?
-            .is_none()
+        aruna_operations::driver::drive(
+            aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+            &fixture.context
+        )
+        .await
+        .map_err(|error| error.0)?
+        .is_none()
     );
 
     fixture.stop().await;

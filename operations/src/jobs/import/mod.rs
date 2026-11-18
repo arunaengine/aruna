@@ -408,7 +408,18 @@ async fn acquire_source(
             })
         }
         ImportRoCrateSource::Upload { upload_id } => {
-            let record = crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(*upload_id, spec.auth_context.user_id, ctx.job_id, aruna_core::time::unix_timestamp_millis()), &ctx.driver, &*upload_id.to_bytes())
+            let record = crate::driver::drive_retry(
+                || {
+                    crate::jobs::import::upload::ClaimUploadOperation::new(
+                        *upload_id,
+                        spec.auth_context.user_id,
+                        ctx.job_id,
+                        aruna_core::time::unix_timestamp_millis(),
+                    )
+                },
+                &ctx.driver,
+                &*upload_id.to_bytes(),
+            )
             .await
             .map_err(|error| match error {
                 UploadClaimError::Storage(message) => ImportFailure::Retryable(message),
@@ -1305,10 +1316,15 @@ async fn cleanup_source(
             .await
             .map_err(ImportFailure::Retryable)?;
         if let Some(upload_id) = input.upload_id {
-            crate::driver::drive(crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, ctx.job_id), &ctx.driver)
-                .await
-                .map_err(|error| error.0)
-                .map_err(ImportFailure::Retryable)?;
+            crate::driver::drive(
+                crate::jobs::import::upload_store::DeleteUploadOperation::new(
+                    upload_id, ctx.job_id,
+                ),
+                &ctx.driver,
+            )
+            .await
+            .map_err(|error| error.0)
+            .map_err(ImportFailure::Retryable)?;
         }
     }
     checkpoint.refs.hidden_locations.clear();

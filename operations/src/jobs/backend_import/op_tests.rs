@@ -22,8 +22,8 @@ use super::job::{BackendImportOperation, ImportRunError};
 use super::object::ImportObjectOperation;
 use super::prepare::{PrepareRunOperation, RunEnd};
 use super::reads::{
-    PageReadsOperation, PrefixRowsOperation, StoredIntentsOperation, TakenPathsOperation,
-    exact_of, head_of, read_call,
+    PageReadsOperation, PrefixRowsOperation, StoredIntentsOperation, TakenPathsOperation, exact_of,
+    head_of, read_call,
 };
 use super::*;
 use crate::jobs::page_intents::IntentReadError;
@@ -192,7 +192,10 @@ fn prefix_rows_gathered() {
         rows: vec![row.clone()],
         next: Some(row.0.clone()),
     };
-    assert!(matches!(rows.next(page), Ok(Next::Call(IoCall::Page { .. }))));
+    assert!(matches!(
+        rows.next(page),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
     let last = IoResult::Page {
         rows: Vec::new(),
         next: None,
@@ -237,7 +240,7 @@ fn exact_states() {
 
 // A page with no rows asks for no heads; a missing row stays absent.
 #[test]
-fn page_reads_empty_rows() {
+fn page_reads_empty() {
     let mut reads = PageReadsOperation::new(rule(), vec![object("raw/a")]);
     assert!(matches!(reads.first(), Ok(Next::Call(IoCall::Read(_)))));
     let rows = IoResult::Values(vec![None]);
@@ -300,7 +303,10 @@ fn started() -> BackendImportOperation {
     let mut import = BackendImportOperation::new(job());
     assert!(matches!(import.first(), Ok(Next::Call(IoCall::Child(_)))));
     let stored = answer(Ok::<_, StateReadError>(None::<BackendImportCheckpoint>));
-    assert!(matches!(import.next(stored), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        import.next(stored),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     import
 }
 
@@ -325,7 +331,9 @@ fn listed(import: &mut BackendImportOperation, objects: Vec<ExternalObject>, nex
 fn page_read(import: &mut BackendImportOperation) -> Result<Next<JobRunOutcome>, ImportRunError> {
     let intents = answer(Ok::<_, IntentReadError>(PathIntents::new()));
     import.next(intents).unwrap();
-    import.next(answer(Ok::<_, ItemError>(PageReads::default()))).unwrap();
+    import
+        .next(answer(Ok::<_, ItemError>(PageReads::default())))
+        .unwrap();
     import.next(answer(Ok::<_, ItemError>(HashSet::<String>::new())))
 }
 
@@ -350,7 +358,10 @@ fn empty_listing_succeeds() {
     let mut import = started();
     prepared(&mut import);
     listed(&mut import, Vec::new(), None);
-    assert!(matches!(page_read(&mut import), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        page_read(&mut import),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let report = JobReport {
         current: Some(0),
         ..JobReport::default()

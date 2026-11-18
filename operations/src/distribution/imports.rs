@@ -668,8 +668,8 @@ mod tests {
         use crate::distribution::test_record::{binding, member, realm, record, secret};
         use crate::jobs::submit::{SubmitJobError, SubmitJobOperation, SubmitJobSpec};
         use aruna_core::effects::Effect;
-        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
         use aruna_core::errors::StorageError;
+        use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
         use aruna_core::operation::{EffectOperation, Runnable};
         use aruna_core::structs::execution::job::WorkspaceMode;
         use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
@@ -774,9 +774,12 @@ mod tests {
             let mut record =
                 JobRecord::new(job_id, payload, Default::default(), node_id, 1, 1, None);
             record.state = state;
-            crate::jobs::store::query::insert_job(&crate::testing::test_context(storage.clone()), &record)
-                .await
-                .unwrap();
+            crate::jobs::store::query::insert_job(
+                &crate::testing::test_context(storage.clone()),
+                &record,
+            )
+            .await
+            .unwrap();
         }
         let context = DriverContext {
             storage_handle: storage,
@@ -804,9 +807,12 @@ mod tests {
         let job_id = JobId::from_bytes([1; 16]);
         let payload = JobPayload::Staging(spec("spire"));
         let mut record = JobRecord::new(job_id, payload, Default::default(), node_id, 1, 1, None);
-        crate::jobs::store::query::insert_job(&crate::testing::test_context(storage.clone()), &record)
-            .await
-            .unwrap();
+        crate::jobs::store::query::insert_job(
+            &crate::testing::test_context(storage.clone()),
+            &record,
+        )
+        .await
+        .unwrap();
         let context = DriverContext {
             storage_handle: storage,
             net_handle: None,

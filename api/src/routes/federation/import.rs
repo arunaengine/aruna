@@ -197,10 +197,13 @@ pub(crate) async fn pushed_upload(
     };
     // The source's push confirms its grant again; a paused import resumes with this consent.
     rebind(state, &push.intent, &push.grant, &push.key, upload_id).await?;
-    let record = aruna_operations::driver::drive(aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id), &context)
-        .await
-        .map_err(|error| error.0)
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let record = aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let owner_node_url = owner_node_url(state).await?;
     match record {
         Some(record) => upload_response(&record, owner_node_url).map(Some),
@@ -249,16 +252,22 @@ pub(crate) async fn bind_upload(
         expires_at_ms: 0,
         ..record.clone()
     };
-    aruna_operations::driver::drive(aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(losing.clone()), &context)
-        .await
-        .map_err(|error| error.0)
-        .map_err(ServerError::ServiceUnavailableReason)?;
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(losing.clone()),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(ServerError::ServiceUnavailableReason)?;
     let bound = bound.map_err(import_refused)?;
-    aruna_operations::driver::drive(aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(bound), &context)
-        .await
-        .map_err(|error| error.0)
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .ok_or(ServerError::NotFound)
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(bound),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .ok_or(ServerError::NotFound)
 }
 
 /// Replaces the intent and grant of a bound upload with a fresh consent to the same transfer.

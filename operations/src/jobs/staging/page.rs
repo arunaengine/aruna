@@ -146,8 +146,7 @@ impl ImportPageOperation {
                     };
                     self.heading = Some(file);
                     let transient: fn(&HeadSourceError) -> bool = |error| !lasting_head(error);
-                    let head =
-                        retried_call(&self.run, input, HeadSourceOperation::new, transient);
+                    let head = retried_call(&self.run, input, HeadSourceOperation::new, transient);
                     return Ok(Next::Call(head));
                 }
             }
@@ -236,7 +235,9 @@ impl ImportPageOperation {
                     source_path: entry.source_path.clone(),
                     allow_root: false,
                 };
-                Ok(Next::Call(IoCall::child(ResolveConnectorOperation::new(input))))
+                Ok(Next::Call(IoCall::child(ResolveConnectorOperation::new(
+                    input,
+                ))))
             }
         }
     }
@@ -329,8 +330,7 @@ impl Operation for ImportPageOperation {
                 self.resolve()
             }
             ImportStep::Resolve => {
-                let resolved =
-                    result.child::<ResolvedSourceConnector, SourceResolutionError>()?;
+                let resolved = result.child::<ResolvedSourceConnector, SourceResolutionError>()?;
                 match resolved {
                     Ok(resolved) => {
                         self.source = Some((resolved.connector, resolved.secret_fingerprint));
@@ -357,8 +357,7 @@ impl Operation for ImportPageOperation {
                 match page.map_err(|error| PageFailure::Retry(error.to_string()))? {
                     Ok(imported) => Ok(Next::Done(imported.checkpoint)),
                     Err(
-                        error @ (PageImportError::BucketChanged
-                        | PageImportError::TooManyBytes(_)),
+                        error @ (PageImportError::BucketChanged | PageImportError::TooManyBytes(_)),
                     ) => Err(PageFailure::Permanent(error.to_string())),
                     Err(error @ PageImportError::Storage(StorageError::TransactionConflict)) => {
                         Err(PageFailure::Conflict(error.to_string()))
@@ -580,7 +579,9 @@ impl SnapshotPageOperation {
             return Ok(Next::Call(call));
         }
         self.step = SnapshotStep::Stops;
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Job(JobEffect::Stops)))))
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Job(
+            JobEffect::Stops,
+        )))))
     }
 
     fn stage(&mut self) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
@@ -666,8 +667,7 @@ impl Operation for SnapshotPageOperation {
                 Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
                     self.step = SnapshotStep::Moved(message);
                     let file = self.current.as_ref().ok_or(lost("file"))?;
-                    let moved =
-                        ElsewhereOperation::new(self.run.clone(), file.target_key.clone());
+                    let moved = ElsewhereOperation::new(self.run.clone(), file.target_key.clone());
                     Ok(Next::Call(IoCall::child(moved)))
                 }
                 Err(ItemFailure::System(message)) => Err(PageFailure::Retry(message)),

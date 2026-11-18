@@ -612,11 +612,14 @@ async fn fast_source_check(
             crate::metadata::ensure_metadata_scope(state, auth, *group_id, Permission::READ).await
         }
         ImportRoCrateSource::Upload { upload_id } => {
-            let record = aruna_operations::driver::drive(aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(*upload_id), &state.get_ctx())
-                .await
-                .map_err(|error| error.0)
-                .map_err(|error| ServerError::InternalError(error.into()))?
-                .ok_or(ServerError::NotFound)?;
+            let record = aruna_operations::driver::drive(
+                aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(*upload_id),
+                &state.get_ctx(),
+            )
+            .await
+            .map_err(|error| error.0)
+            .map_err(|error| ServerError::InternalError(error.into()))?
+            .ok_or(ServerError::NotFound)?;
             if record.owner != auth.user_id {
                 return Err(ServerError::Forbidden);
             }

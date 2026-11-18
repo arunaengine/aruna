@@ -1030,9 +1030,12 @@ pub async fn list_staging_jobs(
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut jobs = Vec::with_capacity(records.len());
     for record in records {
-        let checkpoint = drive(ReadCheckpointOperation::new(record.job_id), &state.get_ctx())
-            .await
-            .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        let checkpoint = drive(
+            ReadCheckpointOperation::new(record.job_id),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
         jobs.push(staging_job_response(&record, checkpoint.as_ref())?);
     }
     Ok((

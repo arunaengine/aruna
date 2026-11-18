@@ -326,7 +326,7 @@ pub(crate) fn claim_upload(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-        use aruna_core::structs::execution::job::RoCrateMediaType;
+    use aruna_core::structs::execution::job::RoCrateMediaType;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;
@@ -488,19 +488,42 @@ pub(crate) mod tests {
             expires_at_ms: 10,
             claimed_by: None,
         };
-        crate::driver::drive(crate::jobs::import::upload_store::WriteUploadOperation::new(record.clone()), &context).await.map_err(|error| error.0).unwrap();
-        crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 9), &context, &upload_id.to_bytes())
-            .await
-            .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
+        crate::driver::drive_retry(
+            || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 9),
+            &context,
+            &upload_id.to_bytes(),
+        )
+        .await
+        .unwrap();
 
-        let reclaimed = crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 11), &context, &upload_id.to_bytes())
-            .await
-            .unwrap();
+        let reclaimed = crate::driver::drive_retry(
+            || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 11),
+            &context,
+            &upload_id.to_bytes(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(reclaimed.claimed_by, Some(job_id));
         assert!(matches!(
-            crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, JobId::from_bytes([6u8; 16]), 11), &context, &upload_id.to_bytes())
-                .await,
+            crate::driver::drive_retry(
+                || crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id,
+                    owner,
+                    JobId::from_bytes([6u8; 16]),
+                    11
+                ),
+                &context,
+                &upload_id.to_bytes()
+            )
+            .await,
             Err(UploadClaimError::AlreadyClaimed)
         ));
     }
@@ -543,24 +566,35 @@ pub(crate) mod tests {
         let context = crate::testing::test_context(storage.clone());
         let upload_id = Ulid::from_bytes([2u8; 16]);
         assert!(
-            crate::driver::drive(crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id), &context)
-                .await
-                .map_err(|error| error.0)
-                .unwrap()
-                .is_none()
-        );
-        let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
-        crate::driver::drive(crate::jobs::import::upload_store::WriteUploadOperation::new(upload_record(owner, upload_id, 10).clone()), &context)
+            crate::driver::drive(
+                crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+                &context
+            )
             .await
             .map_err(|error| error.0)
-            .unwrap();
+            .unwrap()
+            .is_none()
+        );
+        let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(
+                upload_record(owner, upload_id, 10).clone(),
+            ),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         assert_eq!(
-            crate::driver::drive(crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id), &context)
-                .await
-                .map_err(|error| error.0)
-                .unwrap()
-                .unwrap()
-                .owner,
+            crate::driver::drive(
+                crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+                &context
+            )
+            .await
+            .map_err(|error| error.0)
+            .unwrap()
+            .unwrap()
+            .owner,
             owner
         );
     }
@@ -575,16 +609,35 @@ pub(crate) mod tests {
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
         assert!(matches!(
-            crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 5), &context, &upload_id.to_bytes()).await,
+            crate::driver::drive_retry(
+                || crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id, owner, job_id, 5
+                ),
+                &context,
+                &upload_id.to_bytes()
+            )
+            .await,
             Err(UploadClaimError::NotFound)
         ));
-        crate::driver::drive(crate::jobs::import::upload_store::WriteUploadOperation::new(upload_record(owner, upload_id, 100).clone()), &context)
-            .await
-            .map_err(|error| error.0)
-            .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(
+                upload_record(owner, upload_id, 100).clone(),
+            ),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         let intruder = UserId::new(Ulid::from_bytes([7u8; 16]), realm_id);
         assert!(matches!(
-            crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, intruder, job_id, 5), &context, &upload_id.to_bytes()).await,
+            crate::driver::drive_retry(
+                || crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id, intruder, job_id, 5
+                ),
+                &context,
+                &upload_id.to_bytes()
+            )
+            .await,
             Err(UploadClaimError::WrongOwner)
         ));
     }
@@ -597,12 +650,24 @@ pub(crate) mod tests {
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
-        crate::driver::drive(crate::jobs::import::upload_store::WriteUploadOperation::new(upload_record(owner, upload_id, 10).clone()), &context)
-            .await
-            .map_err(|error| error.0)
-            .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(
+                upload_record(owner, upload_id, 10).clone(),
+            ),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         assert!(matches!(
-            crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 10), &context, &upload_id.to_bytes()).await,
+            crate::driver::drive_retry(
+                || crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id, owner, job_id, 10
+                ),
+                &context,
+                &upload_id.to_bytes()
+            )
+            .await,
             Err(UploadClaimError::Expired)
         ));
     }
@@ -616,34 +681,55 @@ pub(crate) mod tests {
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
-        crate::driver::drive(crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id), &context)
-            .await
-            .map_err(|error| error.0)
-            .unwrap();
-        crate::driver::drive(crate::jobs::import::upload_store::WriteUploadOperation::new(upload_record(owner, upload_id, 100).clone()), &context)
-            .await
-            .map_err(|error| error.0)
-            .unwrap();
-        crate::driver::drive_retry(|| crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 5), &context, &upload_id.to_bytes())
-            .await
-            .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(
+                upload_record(owner, upload_id, 100).clone(),
+            ),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
+        crate::driver::drive_retry(
+            || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 5),
+            &context,
+            &upload_id.to_bytes(),
+        )
+        .await
+        .unwrap();
         let intruder = JobId::from_bytes([8u8; 16]);
         assert!(
-            crate::driver::drive(crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, intruder), &context)
-                .await
-                .map_err(|error| error.0)
-                .is_err()
-        );
-        crate::driver::drive(crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id), &context)
+            crate::driver::drive(
+                crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, intruder),
+                &context
+            )
             .await
             .map_err(|error| error.0)
-            .unwrap();
+            .is_err()
+        );
+        crate::driver::drive(
+            crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         assert!(
-            crate::driver::drive(crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id), &context)
-                .await
-                .map_err(|error| error.0)
-                .unwrap()
-                .is_none()
+            crate::driver::drive(
+                crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+                &context
+            )
+            .await
+            .map_err(|error| error.0)
+            .unwrap()
+            .is_none()
         );
     }
 

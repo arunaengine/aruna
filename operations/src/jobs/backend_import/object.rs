@@ -114,13 +114,20 @@ impl ImportObjectOperation {
         let rule = &run.rule;
         // The bytes stay on the rule's backend, wherever new writes to the key are routed.
         let target = RoutingTarget::Backend(BackendRef::Group(rule.backend_id));
-        let resolved = match run.routing.catalog.resolve_target(&target, RuleSource::Tenant) {
+        let resolved = match run
+            .routing
+            .catalog
+            .resolve_target(&target, RuleSource::Tenant)
+        {
             Ok(Some(resolved)) => resolved,
             Ok(None) => return Err(item("the backend is not usable")),
             Err(error) => return Err(item(error.to_string())),
         };
         self.resolved = Some(resolved.clone());
-        let intents = run.intents.get(&self.object.key).map_or(&[][..], Vec::as_slice);
+        let intents = run
+            .intents
+            .get(&self.object.key)
+            .map_or(&[][..], Vec::as_slice);
         let names = (rule, run.earlier.as_slice());
         if !needs_lookup(names, &self.object, self.row.as_ref(), !intents.is_empty()) {
             return self.place();

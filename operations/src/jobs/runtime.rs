@@ -1875,10 +1875,13 @@ mod tests {
         upload.blake3 = blake3;
         upload.size = size;
         upload.claimed_by = Some(job_id);
-        crate::driver::drive(crate::jobs::import::upload_store::WriteUploadOperation::new(upload.clone()), &driver)
-            .await
-            .map_err(|error| error.0)
-            .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(upload.clone()),
+            &driver,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         let checkpoint_value =
             crate::jobs::import::tests::checkpoint_bytes(location, size, blake3, upload.upload_id);
         let checkpoint_key = ByteView::from(job_id.to_bytes().to_vec());
@@ -1932,10 +1935,13 @@ mod tests {
             .unwrap();
         assert!(rows.is_empty(), "panic must not write a failure report");
         assert_eq!(
-            crate::driver::drive(crate::jobs::import::upload_store::ReadUploadOperation::new(upload.upload_id), &ctx.driver)
-                .await
-                .map_err(|error| error.0)
-                .unwrap(),
+            crate::driver::drive(
+                crate::jobs::import::upload_store::ReadUploadOperation::new(upload.upload_id),
+                &ctx.driver
+            )
+            .await
+            .map_err(|error| error.0)
+            .unwrap(),
             Some(upload)
         );
         assert_eq!(std::fs::metadata(&blob_path).unwrap().len(), blob_len);

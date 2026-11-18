@@ -217,7 +217,10 @@ fn allowed_reader(offset: u64) -> ManifestChunkOperation {
 fn denied_manifest_skipped() {
     let mut chunk = allowed_reader(0);
     let denied = child_answer(Ok::<bool, AuthorizationError>(false));
-    assert!(matches!(chunk.next(denied), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        chunk.next(denied),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(chunk.step, ChunkStep::Commit);
     assert_eq!(chunk.next.items_failed, 1);
     assert_eq!(chunk.next.manifest, None);
@@ -228,10 +231,16 @@ fn denied_manifest_skipped() {
 fn failed_manifest_cleared() {
     let mut chunk = allowed_reader(4096);
     let denied = child_answer(Ok::<bool, AuthorizationError>(false));
-    assert!(matches!(chunk.next(denied), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        chunk.next(denied),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(chunk.step, ChunkStep::Clear);
     let cleared = child_answer(Ok::<(), IoError>(()));
-    assert!(matches!(chunk.next(cleared), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        chunk.next(cleared),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(chunk.step, ChunkStep::Commit);
 }
 

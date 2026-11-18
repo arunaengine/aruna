@@ -573,7 +573,9 @@ pub enum ObjectReadFailure {
 pub enum JobEvent {
     Stops(JobStops),
     Reported,
-    Paused { stopped: bool },
+    Paused {
+        stopped: bool,
+    },
     Finished(Box<Event>),
     Stopped,
     Collected(Result<Vec<u8>, String>),

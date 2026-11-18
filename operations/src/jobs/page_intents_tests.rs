@@ -45,7 +45,7 @@ fn start_of(next: Next<PathIntents>) -> IterStart {
 
 // An empty listing page has no range to read.
 #[test]
-fn empty_page_reads_nothing() {
+fn empty_page_skipped() {
     let mut intents = PageIntentsOperation::new(import_id(), &[]);
     assert_eq!(intents.first(), Ok(Next::Done(PathIntents::new())));
 }
@@ -58,7 +58,9 @@ fn range_continues() {
     let first = start_of(intents.first().unwrap());
     assert_eq!(first, IterStart::At(object_key(import_id(), "a")));
     let after = intent_key("a", 9);
-    let next = intents.next(answer(Vec::new(), Some(after.clone()))).unwrap();
+    let next = intents
+        .next(answer(Vec::new(), Some(after.clone())))
+        .unwrap();
     assert_eq!(start_of(next), IterStart::After(after));
     assert_eq!(
         intents.next(answer(Vec::new(), None)),

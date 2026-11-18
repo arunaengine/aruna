@@ -20,10 +20,10 @@ use ulid::Ulid;
 use super::*;
 use crate::driver::{drive, node_routing};
 use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_core::structs::execution::job::StagingJobSpec;
-use aruna_core::time::unix_timestamp_millis;
 use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput};
 use crate::s3::object::search_scan::search_local_objects;
+use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::time::unix_timestamp_millis;
 
 const SUMMARY: &str = include_str!("../../../../core/tests/fixtures/assembly_summary.tsv");
 const COLI: &str = "all/GCF/000/005/845/GCF_000005845.2_ASM584v2/";

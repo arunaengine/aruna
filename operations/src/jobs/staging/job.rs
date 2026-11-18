@@ -93,7 +93,10 @@ impl StagingJobOperation {
 
     fn commit(&mut self, step: Step) -> Turn {
         let checkpoint = self.checkpoint()?;
-        match self.run.commit_call(None, checkpoint, Vec::new(), Vec::new()) {
+        match self
+            .run
+            .commit_call(None, checkpoint, Vec::new(), Vec::new())
+        {
             Ok(call) => {
                 self.step = step;
                 Ok(Next::Call(call))
@@ -167,7 +170,8 @@ impl StagingJobOperation {
         }
         let checkpoint = checkpoint.clone();
         let ahead = self.ahead.take();
-        let walk = WalkPageOperation::new(self.run.clone(), WalkPlace::default(), checkpoint, ahead);
+        let walk =
+            WalkPageOperation::new(self.run.clone(), WalkPlace::default(), checkpoint, ahead);
         self.step = Step::Walk;
         Ok(Next::Call(IoCall::child(walk)))
     }
@@ -311,8 +315,7 @@ impl Operation for StagingJobOperation {
                     Ok(stored) => stored,
                     Err(error) => return self.end(retryable(error.0)),
                 };
-                let checkpoint =
-                    stored.unwrap_or_else(|| initial_checkpoint(&self.run.spec));
+                let checkpoint = stored.unwrap_or_else(|| initial_checkpoint(&self.run.spec));
                 let flat_known = checkpoint.flat.is_some();
                 self.checkpoint = Some(checkpoint);
                 if flat_known {

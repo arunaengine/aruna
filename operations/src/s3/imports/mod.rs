@@ -122,10 +122,13 @@ pub async fn last_run(
     else {
         return Ok(None);
     };
-    let checkpoint = drive(ReadStateOperation::<BackendImportCheckpoint>::new(job_id), context)
-        .await
-        .map_err(|error| ImportRuleError::Read(error.0))?
-        .unwrap_or_default();
+    let checkpoint = drive(
+        ReadStateOperation::<BackendImportCheckpoint>::new(job_id),
+        context,
+    )
+    .await
+    .map_err(|error| ImportRuleError::Read(error.0))?
+    .unwrap_or_default();
     Ok(Some(LastRun {
         job_id,
         state: record.state,

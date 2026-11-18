@@ -20,9 +20,9 @@ use super::reads::{
     head_of, listed_hash, note_call, noted, read_call, version_row,
 };
 use super::{
-    Claim, Exact, Fence, Hashed, Identity, ImportJob, ImportRun, ItemError, Outcome, choose_identity,
-    claimed, complete_call, encode, item, moved_away, observed, put_failure, put_operation,
-    rule_guard, shared_guards,
+    Claim, Exact, Fence, Hashed, Identity, ImportJob, ImportRun, ItemError, Outcome,
+    choose_identity, claimed, complete_call, encode, item, moved_away, observed, put_failure,
+    put_operation, rule_guard, shared_guards,
 };
 use crate::jobs::import_listing::ListingNote;
 use crate::s3::object::put::{PutObjectError, PutObjectResult};
@@ -122,8 +122,7 @@ impl RecoverOperation {
         else {
             return Ok(Next::Done(None));
         };
-        ensure_confined_path(Path::new(&identity.key))
-            .map_err(|error| item(error.to_string()))?;
+        ensure_confined_path(Path::new(&identity.key)).map_err(|error| item(error.to_string()))?;
         // A name alone proves no owner where several rules read the folder.
         if identity.intent.is_none()
             && self.row.is_none()
@@ -361,7 +360,9 @@ impl Operation for RecoverOperation {
     type Error = ItemError;
 
     fn first(&mut self) -> Turn {
-        let intents = (self.run.intents.get(&self.object.key)).cloned().unwrap_or_default();
+        let intents = (self.run.intents.get(&self.object.key))
+            .cloned()
+            .unwrap_or_default();
         if intents.is_empty() {
             return self.with_claims(Vec::new());
         }

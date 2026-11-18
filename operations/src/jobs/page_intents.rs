@@ -92,9 +92,7 @@ impl Operation for PageIntentsOperation {
         let last = (self.bounds.as_ref()).map_or("", |(_, last)| last.as_str());
         for (key, value) in values {
             let Some(path) = intent_path(&key) else {
-                return Err(IntentReadError(
-                    "a malformed write intent key".to_string(),
-                ));
+                return Err(IntentReadError("a malformed write intent key".to_string()));
             };
             if path > last {
                 return Ok(Next::Done(std::mem::take(&mut self.intents)));

@@ -35,10 +35,8 @@ pub trait JobHost: Send + Sync {
         &'a self,
         turns: &'a BTreeSet<(Ulid, Ulid)>,
     ) -> BoxFuture<'a, Box<dyn Any + Send>>;
-    fn read_object(
-        &self,
-        read: ObjectRead,
-    ) -> BoxFuture<'_, Result<ObjectBody, ObjectReadFailure>>;
+    fn read_object(&self, read: ObjectRead)
+    -> BoxFuture<'_, Result<ObjectBody, ObjectReadFailure>>;
 }
 
 /// Runs `future` with `host` answering the job effects of every operation it drives.
@@ -141,7 +139,10 @@ mod tests {
     // A stream is read to its end, and a transport failure comes back as text.
     #[tokio::test]
     async fn collect_reads_stream() {
-        let bytes = stream(vec![Ok(Bytes::from_static(b"ab")), Ok(Bytes::from_static(b"c"))]);
+        let bytes = stream(vec![
+            Ok(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"c")),
+        ]);
         assert_eq!(collect(bytes).await, Ok(b"abc".to_vec()));
     }
 

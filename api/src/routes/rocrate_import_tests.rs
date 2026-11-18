@@ -446,10 +446,13 @@ async fn seed_upload(
         expires_at_ms,
         claimed_by: None,
     };
-    aruna_operations::driver::drive(aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()), &state.get_ctx())
-        .await
-        .map_err(|error| error.0)
-        .unwrap();
+    aruna_operations::driver::drive(
+        aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap();
 }
 
 fn submit_request(

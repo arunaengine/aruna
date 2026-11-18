@@ -250,8 +250,9 @@ pub(super) struct TrailOperation {
 
 impl TrailOperation {
     pub(super) fn new(rule: &BackendImport, incarnation: u128, key: &str, id: Ulid) -> Self {
-        let mut ranges: Vec<Key> =
-            trail_ranges(rule.group_id, (&rule.bucket, incarnation), key).into_iter().collect();
+        let mut ranges: Vec<Key> = trail_ranges(rule.group_id, (&rule.bucket, incarnation), key)
+            .into_iter()
+            .collect();
         ranges.reverse();
         Self {
             bucket: rule.bucket.clone(),
@@ -620,7 +621,10 @@ impl PageReadsOperation {
             let parsed = parse(row.clone(), ImportedObject::from_bytes)?;
             self.page.rows.insert(object.key.clone(), row);
             let Some(parsed) = parsed else { continue };
-            let key = parsed.key.clone().or_else(|| self.rule.aruna_key(&object.key));
+            let key = parsed
+                .key
+                .clone()
+                .or_else(|| self.rule.aruna_key(&object.key));
             let Some(key) = key else { continue };
             let head = BlobHeadKey::new(&self.rule.bucket, &key).to_bytes();
             let version = VersionKey::new(&self.rule.bucket, &key, parsed.version_id).to_bytes();
@@ -657,7 +661,9 @@ impl Operation for PageReadsOperation {
                         return Err(ItemError::System("short batch read".to_string()));
                     };
                     let head = parse(head, CurrentVersionPointer::from_bytes)?;
-                    self.page.heads.insert(key, head.map(|head| head.version_id));
+                    self.page
+                        .heads
+                        .insert(key, head.map(|head| head.version_id));
                     self.page.versions.insert(path, version);
                 }
                 Ok(Next::Done(std::mem::take(&mut self.page)))
@@ -754,7 +760,9 @@ impl Operation for TakenPathsOperation {
             let rest = key.get(16..).unwrap_or_default();
             // An intent key ends in a zero byte and the 16 bytes of its version id.
             let path = match intents {
-                true => rest.get(..rest.len().saturating_sub(17)).unwrap_or_default(),
+                true => rest
+                    .get(..rest.len().saturating_sub(17))
+                    .unwrap_or_default(),
                 false => rest,
             };
             let path = std::str::from_utf8(path).unwrap_or_default();

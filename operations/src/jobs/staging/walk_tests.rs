@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::execution::source_access::ListCursor;
 use crate::jobs::staging::initial_checkpoint;
 use crate::jobs::staging::pure_tests::{child_answer, test_bucket, test_connector, test_run};
 use crate::jobs::store::JobMutationError;
 use crate::s3::bucket::get::GetBucketError;
+use aruna_core::structs::execution::source_access::ListCursor;
 
 fn walk() -> StagingWalk {
     StagingWalk {
@@ -85,7 +85,10 @@ fn refused_listing_counts() {
     let mut walk = operation(false);
     walk.first().unwrap();
     let refused = listed(Err(ItemFailure::Stage("denied".to_string())));
-    assert!(matches!(walk.next(refused), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        walk.next(refused),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(walk.next.items_failed, 1);
     assert_eq!(walk.step, WalkStep::Commit);
 }
@@ -104,11 +107,10 @@ fn repeated_cursor_fails() {
 
 // A flat page is imported while the next page is listed; both answers come back together.
 #[test]
-fn flat_page_lists_ahead() {
+fn flat_lists_ahead() {
     let mut walk = operation(true);
     walk.first().unwrap();
-    let Ok(Next::Call(IoCall::Group(group))) =
-        walk.next(listed(Ok(page(&["src/a"], Some("two")))))
+    let Ok(Next::Call(IoCall::Group(group))) = walk.next(listed(Ok(page(&["src/a"], Some("two")))))
     else {
         panic!("expected the page and the next listing");
     };
@@ -116,12 +118,18 @@ fn flat_page_lists_ahead() {
     assert_eq!(walk.step, WalkStep::Both);
     let checkpoint = walk.next.clone();
     let results = vec![
-        GroupResult::Done(Box::new(Event::Child(ChildOutcome::new(
-            Ok::<_, PageFailure>(checkpoint.clone()),
-        )))),
-        GroupResult::Done(Box::new(Event::Child(ChildOutcome::new(
-            Ok::<_, PageFailure>(Listing::Done),
-        )))),
+        GroupResult::Done(Box::new(Event::Child(ChildOutcome::new(Ok::<
+            _,
+            PageFailure,
+        >(
+            checkpoint.clone(),
+        ))))),
+        GroupResult::Done(Box::new(Event::Child(ChildOutcome::new(Ok::<
+            _,
+            PageFailure,
+        >(
+            Listing::Done
+        ))))),
     ];
     let Ok(Next::Done(walked)) = walk.next(IoResult::Group(GroupEvent::Finished { results }))
     else {
@@ -151,9 +159,15 @@ fn listing_gathers_pages() {
     let mut listing = ListingOperation::new(run, walk(), true, None);
     assert!(matches!(listing.first(), Ok(Next::Call(IoCall::Child(_)))));
     let whole = child_answer(Ok::<_, PageFailure>(Bounds::Whole));
-    assert!(matches!(listing.next(whole), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        listing.next(whole),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let first = child_answer(Ok::<_, ItemFailure>(page(&["src/a"], Some("two"))));
-    assert!(matches!(listing.next(first), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        listing.next(first),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(listing.step, ListingStep::More);
     let more = child_answer(Ok::<_, ItemFailure>(page(&["src/b"], None)));
     let Ok(Next::Done(Listing::Page(None, Ok(gathered)))) = listing.next(more) else {
@@ -165,7 +179,7 @@ fn listing_gathers_pages() {
 
 // A failed follow-up listing ends the gathered page; the walk lists on from its cursor.
 #[test]
-fn failed_more_keeps_page() {
+fn failed_more_keeps() {
     let mut listing = ListingOperation::new(test_run(), walk(), true, None);
     listing.step = ListingStep::More;
     listing.page = Some(page(&["src/a"], Some("two")));

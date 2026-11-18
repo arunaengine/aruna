@@ -451,7 +451,6 @@ impl From<ItemFailure> for PageFailure {
     }
 }
 
-
 #[cfg(test)]
 pub(crate) mod pure_tests {
     use super::walk::{directory_list_path, record_failure};
@@ -704,7 +703,10 @@ pub(crate) mod pure_tests {
     fn missing_checkpoint_none() {
         let mut read = ReadCheckpointOperation::new(JobId::from_bytes([7; 16]));
         read.first().unwrap();
-        assert_eq!(read.next(IoResult::Values(vec![None])), Ok(Next::Done(None)));
+        assert_eq!(
+            read.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
     }
 
     // The queue cleanup pages through a key space until it finds no row.
@@ -740,7 +742,10 @@ pub(crate) mod pure_tests {
         let mut clear = ClearQueueOperation::new(JobId::from_bytes([7; 16]));
         assert!(matches!(clear.first(), Ok(Next::Call(IoCall::Child(_)))));
         let failed = child_answer(Err::<(), _>(IoError::Aborted));
-        assert!(matches!(clear.next(failed), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            clear.next(failed),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         let cleared = child_answer(Ok::<(), IoError>(()));
         assert_eq!(clear.next(cleared), Ok(Next::Done(())));
     }

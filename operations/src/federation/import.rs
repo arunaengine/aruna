@@ -236,10 +236,13 @@ async fn stale_upload(
     import_key: &str,
     upload_id: Ulid,
 ) -> Result<bool, ImportError> {
-    let upload = crate::driver::drive(crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id), context)
-        .await
-        .map_err(|error| error.0)
-        .map_err(ImportError::Storage)?;
+    let upload = crate::driver::drive(
+        crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+        context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(ImportError::Storage)?;
     let now = aruna_core::time::unix_timestamp_millis();
     if upload.is_some() {
         return Ok(upload_stale(upload.as_ref(), false, now));
@@ -332,10 +335,13 @@ async fn check_bound(
     let stored = read_import(context, upload_id)
         .await?
         .ok_or_else(|| ImportError::Storage("upload binding without record".to_string()))?;
-    let upload = crate::driver::drive(crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id), context)
-        .await
-        .map_err(|error| error.0)
-        .map_err(ImportError::Storage)?;
+    let upload = crate::driver::drive(
+        crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+        context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(ImportError::Storage)?;
     if !same_transfer(&stored, upload.as_ref(), intent, grant) {
         return Err(ImportError::Conflict);
     }
@@ -346,13 +352,9 @@ pub async fn read_import(
     context: &DriverContext,
     upload_id: Ulid,
 ) -> Result<Option<ImportRecord>, ImportError> {
-    let row = read_row(
-        context,
-        FEDERATION_KEYSPACE,
-        record_key(upload_id),
-    )
-    .await
-    .map_err(ImportError::Storage)?;
+    let row = read_row(context, FEDERATION_KEYSPACE, record_key(upload_id))
+        .await
+        .map_err(ImportError::Storage)?;
     row.map(|row| postcard::from_bytes(&row).map_err(|e| ImportError::Storage(e.to_string())))
         .transpose()
 }
@@ -780,10 +782,13 @@ pub(crate) mod tests {
         let (first, second) = (Ulid::from_bytes([9; 16]), Ulid::from_bytes([10; 16]));
         let live = upload(u64::MAX);
         let storage = &context.storage_handle;
-        crate::driver::drive(crate::jobs::import::upload_store::WriteUploadOperation::new(live.clone()), &context)
-            .await
-            .map_err(|error| error.0)
-            .unwrap();
+        crate::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(live.clone()),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         let mut record = record();
         record.grant.payload.artifact_blake3 = hex::encode(live.blake3);
         write_import(&context, "key", first, &record).await.unwrap();

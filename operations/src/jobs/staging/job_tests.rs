@@ -37,8 +37,14 @@ fn stored(flat: Option<bool>) -> IoResult {
 fn started() -> StagingJobOperation {
     let mut job = StagingJobOperation::new(test_run());
     assert_eq!(job.first(), Ok(Next::Call(main_read(job.run.job_id))));
-    assert!(matches!(job.next(stored(Some(false))), Ok(Next::Call(IoCall::Child(_)))));
-    assert_eq!(job.next(written()), Ok(Next::Call(job_call(JobEffect::Stops))));
+    assert!(matches!(
+        job.next(stored(Some(false))),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(
+        job.next(written()),
+        Ok(Next::Call(job_call(JobEffect::Stops)))
+    );
     job
 }
 
@@ -70,11 +76,14 @@ fn sync_strategy_refused() {
 
 // A new job learns from its connector whether listings are flat, then records that.
 #[test]
-fn new_job_asks_connector() {
+fn job_asks_connector() {
     let mut job = StagingJobOperation::new(test_run());
     job.first().unwrap();
     let missing = IoResult::Values(vec![None]);
-    assert!(matches!(job.next(missing), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        job.next(missing),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(job.step, Step::Connector);
     let source = GetSourceResult {
         connector: test_connector(),
@@ -110,7 +119,10 @@ fn stops_end_job() {
         Ok(Next::Call(IoCall::Child(_)))
     ));
     let cleared = child_answer(Ok::<(), IoError>(()));
-    assert_eq!(cancelled.next(cleared), Ok(Next::Done(JobRunOutcome::Cancelled)));
+    assert_eq!(
+        cancelled.next(cleared),
+        Ok(Next::Done(JobRunOutcome::Cancelled))
+    );
 
     let mut interrupted = started();
     assert_eq!(
@@ -172,10 +184,16 @@ fn finished_job_succeeds() {
     job.first().unwrap();
     job.next(stored(Some(false))).unwrap();
     job.next(written()).unwrap();
-    assert!(matches!(job.next(stops(false, false)), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        job.next(stops(false, false)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(job.step, Step::Finish);
     assert_eq!(job.checkpoint().unwrap().phase, StagingJobPhase::Completed);
-    assert!(matches!(job.next(written()), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        job.next(written()),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     assert!(matches!(
         job.next(job_event(JobEvent::Reported)),
         Ok(Next::Call(IoCall::Child(_)))
@@ -199,7 +217,10 @@ fn page_failures_map() {
     let (retry, _) = failed(PageFailure::Retry("again".to_string()));
     assert!(matches!(retry, Ok(Next::Done(JobRunOutcome::Failed(_)))));
     let (conflict, _) = failed(PageFailure::Conflict("busy".to_string()));
-    assert!(matches!(conflict, Ok(Next::Done(JobRunOutcome::Deferred(_)))));
+    assert!(matches!(
+        conflict,
+        Ok(Next::Done(JobRunOutcome::Deferred(_)))
+    ));
     let (lasting, job) = failed(PageFailure::Permanent("gone".to_string()));
     assert!(matches!(lasting, Ok(Next::Call(IoCall::Child(_)))));
     assert!(matches!(job.step, Step::Clear(_)));
@@ -231,7 +252,10 @@ fn stopped_table_failure() {
         Ok(Next::Call(IoCall::Child(_)))
     ));
     let cleared = child_answer(Ok::<(), IoError>(()));
-    assert_eq!(cancelled.next(cleared), Ok(Next::Done(JobRunOutcome::Cancelled)));
+    assert_eq!(
+        cancelled.next(cleared),
+        Ok(Next::Done(JobRunOutcome::Cancelled))
+    );
     let mut running = failing();
     assert!(matches!(
         running.next(stops(false, false)),

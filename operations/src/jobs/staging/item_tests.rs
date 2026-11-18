@@ -61,7 +61,9 @@ fn replaced_bucket_lasts() {
 fn seed_failure_fails() {
     let mut stage = StageItemOperation::new(test_run(), paths(), Vec::new(), 0);
     stage.step = StageStep::Replicate(4);
-    let failed = child_answer(Err::<QueueBlobResult, _>(BlobQueueError::UnexpectedEvent("full".to_string())));
+    let failed = child_answer(Err::<QueueBlobResult, _>(BlobQueueError::UnexpectedEvent(
+        "full".to_string(),
+    )));
     assert!(matches!(stage.next(failed), Err(ItemFailure::Stage(_))));
 }
 
@@ -91,7 +93,10 @@ fn failed_item_recorded() {
     let failed = || child_answer(Err::<u64, _>(ItemFailure::Stage("no".to_string())));
     let mut run = item_run();
     run.step = RunStep::Stage;
-    assert!(matches!(run.next(failed()), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        run.next(failed()),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let Ok(Next::Done(checkpoint)) = run.next(child_answer(Ok::<_, ItemFailure>(false))) else {
         panic!("the item ends");
     };
@@ -112,7 +117,10 @@ fn item_failures_map() {
     let mut run = item_run();
     run.step = RunStep::Stage;
     let system = child_answer(Err::<u64, _>(ItemFailure::System("busy".to_string())));
-    assert_eq!(run.next(system), Err(PageFailure::Retry("busy".to_string())));
+    assert_eq!(
+        run.next(system),
+        Err(PageFailure::Retry("busy".to_string()))
+    );
     let mut run = item_run();
     run.step = RunStep::Stage;
     let lasting = child_answer(Err::<u64, _>(ItemFailure::Lasting("gone".to_string())));

@@ -289,9 +289,6 @@ mod tests {
             retried_result::<u8, IoError>(IoResult::Event(Box::new(event))),
             Ok(Ok(4))
         );
-        assert_eq!(
-            retried_result::<u8, IoError>(answer(Ok(2))),
-            Ok(Ok(2))
-        );
+        assert_eq!(retried_result::<u8, IoError>(answer(Ok(2))), Ok(Ok(2)));
     }
 }

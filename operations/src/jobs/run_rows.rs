@@ -160,10 +160,7 @@ mod tests {
     #[test]
     fn conflict_writes_again() {
         let mut rows = operation();
-        assert!(matches!(
-            rows.first(),
-            Ok(Next::Call(IoCall::Child(_)))
-        ));
+        assert!(matches!(rows.first(), Ok(Next::Call(IoCall::Child(_)))));
         let pause = rows.next(answer(Some(JobMutationError::Conflict)));
         assert_eq!(
             pause,
@@ -196,7 +193,10 @@ mod tests {
         let value = ByteView::from(postcard::to_allocvec(&7u32).unwrap());
         let found = IoResult::Values(vec![Some(value)]);
         assert_eq!(read().next(found), Ok(Next::Done(Some(7))));
-        assert_eq!(read().next(IoResult::Values(vec![None])), Ok(Next::Done(None)));
+        assert_eq!(
+            read().next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
         let broken = IoResult::Values(vec![Some(ByteView::from(Vec::new()))]);
         assert!(read().next(broken).is_err());
     }

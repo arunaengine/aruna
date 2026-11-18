@@ -220,9 +220,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             ))
             .await
         }
-        JobPayload::Staging(spec) => {
-            Box::pin(crate::jobs::host::run_staging_job(ctx, spec)).await
-        }
+        JobPayload::Staging(spec) => Box::pin(crate::jobs::host::run_staging_job(ctx, spec)).await,
         JobPayload::ExportRoCrate(spec) => {
             Box::pin(crate::jobs::export::run_export_job(ctx, spec)).await
         }

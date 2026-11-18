@@ -17,14 +17,15 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use tracing::warn;
 
 use super::mirrors::ItemMirrorsOperation;
-use super::walk::{authority_call, file_access, item_phase, local_ranges, record_failure, rules_call};
+use super::walk::{
+    authority_call, file_access, item_phase, local_ranges, record_failure, rules_call,
+};
 use super::{ItemFailure, PageFailure, StagingRun, pinned};
 use crate::auth::permission_rules::PermissionRules;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::queue::{
     BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
 };
-use aruna_core::errors::AuthorizationError;
 use crate::staging::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
     MaterializeReferenceResult,
@@ -33,6 +34,7 @@ use crate::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, MaterializeSnapshotOperation,
     MaterializeSnapshotResult,
 };
+use aruna_core::errors::AuthorizationError;
 
 /// The answer of a child that fails with anything printable, as a system failure.
 fn system<T: 'static, E: ToString + 'static>(result: IoResult) -> Result<T, ItemFailure> {

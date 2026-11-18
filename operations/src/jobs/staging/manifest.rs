@@ -97,7 +97,10 @@ impl ManifestChunkOperation {
         Ok(Next::Call(IoCall::child(clear)))
     }
 
-    fn read(&mut self, observation: SourceMetadata) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
+    fn read(
+        &mut self,
+        observation: SourceMetadata,
+    ) -> Result<Next<StagingJobCheckpoint>, PageFailure> {
         let manifest = self.manifest()?.clone();
         self.end = manifest
             .offset
@@ -311,14 +314,17 @@ pub(super) fn digest_reads(job_id: JobId, paths: &[&str]) -> IoCall {
 
 /// The answer to [`digest_reads`], one digest per path.
 pub(super) fn parse_digests(result: IoResult) -> Result<Vec<Option<ManifestDigest>>, String> {
-    (result.values().map_err(|error| error.to_string())?.into_iter())
-        .map(|value| {
-            value
-                .map(|value| postcard::from_bytes(value.as_ref()))
-                .transpose()
-                .map_err(|error| error.to_string())
-        })
-        .collect()
+    (result
+        .values()
+        .map_err(|error| error.to_string())?
+        .into_iter())
+    .map(|value| {
+        value
+            .map(|value| postcard::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(|error| error.to_string())
+    })
+    .collect()
 }
 
 fn manifest_key(job_id: JobId, source_path: &str) -> Key {

@@ -28,7 +28,12 @@ fn entry() -> PageEntry {
 fn operation(rendered: Vec<(Ulid, String)>) -> MirrorsOperation {
     let run = test_run();
     let next = initial_checkpoint(&run.spec);
-    MirrorsOperation::new(run, PermissionRules::default(), next, vec![(entry(), rendered)])
+    MirrorsOperation::new(
+        run,
+        PermissionRules::default(),
+        next,
+        vec![(entry(), rendered)],
+    )
 }
 
 // An entry without further sources is kept without reading any connector.

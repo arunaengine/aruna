@@ -258,7 +258,9 @@ impl LanesOperation {
         let (key, value) = state_row(job_id, None, &self.main)?;
         let writes = vec![(STAGING_STATE_KEYSPACE.to_string(), key, value)];
         let token = self.run.claim_token;
-        Ok(member(SettledRowsOperation::new(job_id, token, writes, deletes)))
+        Ok(member(SettledRowsOperation::new(
+            job_id, token, writes, deletes,
+        )))
     }
 
     fn fail(&mut self, failure: PageFailure) {
@@ -289,7 +291,10 @@ impl LanesOperation {
             Some(Member::Opener) => {
                 self.opening = false;
                 match member_outcome::<Opened, PageFailure>(result)? {
-                    Ok(Opened::Lanes { lanes, prefixes_done }) => {
+                    Ok(Opened::Lanes {
+                        lanes,
+                        prefixes_done,
+                    }) => {
                         self.main.prefixes_done = prefixes_done;
                         self.exhausted = lanes.is_empty();
                         // The first lane opened runs first, as lanes are taken from the end.
@@ -721,7 +726,11 @@ impl OpenPrefixOperation {
     /// Writes the lanes between the plan's split points with the job's checkpoint.
     fn open(&mut self) -> Result<Next<Opened>, PageFailure> {
         let walk = self.walk.clone().ok_or(lost_walk())?;
-        let splits = self.plan.as_ref().map(SplitPlan::splits).unwrap_or_default();
+        let splits = self
+            .plan
+            .as_ref()
+            .map(SplitPlan::splits)
+            .unwrap_or_default();
         let bounds: Vec<Option<String>> = std::iter::once(None)
             .chain(splits.iter().map(|split| target_of(&walk, split)))
             .collect();

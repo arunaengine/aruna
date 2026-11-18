@@ -1264,7 +1264,11 @@ async fn hide_alias(
     version_id: Ulid,
 ) -> Result<(), ItemError> {
     let (job, rule, literal) = (job_of(spec), rule.clone(), literal.to_string());
-    drive(HideAliasOperation::new(job, rule, literal, version_id), context).await
+    drive(
+        HideAliasOperation::new(job, rule, literal, version_id),
+        context,
+    )
+    .await
 }
 
 async fn trail_of(
@@ -1284,7 +1288,11 @@ async fn committed_md5(
     row: &ImportedObject,
     object: &ExternalObject,
 ) -> Result<Option<Option<Vec<u8>>>, ItemError> {
-    drive(CommittedMd5Operation::new(bucket, key, row, object)?, context).await
+    drive(
+        CommittedMd5Operation::new(bucket, key, row, object)?,
+        context,
+    )
+    .await
 }
 
 async fn candidates(

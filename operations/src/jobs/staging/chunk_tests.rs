@@ -7,9 +7,7 @@ use std::sync::Arc;
 use aruna_core::events::Event;
 
 use super::*;
-use crate::jobs::staging::pure_tests::{
-    child_answer, test_bucket, test_connector, test_run,
-};
+use crate::jobs::staging::pure_tests::{child_answer, test_bucket, test_connector, test_run};
 use crate::jobs::staging::{StagingRun, initial_checkpoint};
 use crate::jobs::store::JobMutationError;
 
@@ -89,13 +87,19 @@ fn denied_table_lasts() {
 fn first_chunk_observed() {
     let mut chunk = reader(TableRead::default());
     chunk.first().unwrap();
-    assert!(matches!(chunk.next(allowed()), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        chunk.next(allowed()),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     let head = finished(Ok::<_, HeadSourceError>(HeadSourceResult {
         connector: test_connector(),
         secret_fingerprint: None,
         metadata: observation(4),
     }));
-    assert!(matches!(chunk.next(head), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        chunk.next(head),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     assert!(matches!(
         chunk.next(read_answer(observation(4))),
         Ok(Next::Call(IoCall::Effect(_)))
@@ -112,7 +116,7 @@ fn first_chunk_observed() {
 
 // Reading from the end of a known table gives nothing and needs no request.
 #[test]
-fn read_at_end_empty() {
+fn end_reads_empty() {
     let read = TableRead {
         offset: 4,
         observation: Some(observation(4)),
@@ -176,7 +180,10 @@ fn broken_gzip_reopens() {
         work,
         result: Err(GzipBroken::Stream("reset".to_string())),
     });
-    assert!(matches!(chunk.next(broken), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        chunk.next(broken),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     assert_eq!(chunk.step, ChunkStep::OpenGzip { reused: false });
     assert_eq!(chunk.kept, None);
     let Ok(Next::Call(IoCall::Effect(fill))) = chunk.next(read_answer(observation(4))) else {
@@ -189,7 +196,10 @@ fn broken_gzip_reopens() {
         work,
         result: Err(GzipBroken::Stream("reset".to_string())),
     });
-    assert_eq!(chunk.next(broken), Err(ChunkFailure::Retry("reset".to_string())));
+    assert_eq!(
+        chunk.next(broken),
+        Err(ChunkFailure::Retry("reset".to_string()))
+    );
 }
 
 // Bytes a new stream delivers that are no gzip end the table; they will not get better.
@@ -230,7 +240,10 @@ fn object_version_pinned() {
     let mut chunk = object_reader();
     assert!(matches!(chunk.first(), Ok(Next::Call(IoCall::Child(_)))));
     let bucket = child_answer(Ok::<_, GetBucketError>(test_bucket(&run.spec)));
-    assert!(matches!(chunk.next(bucket), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        chunk.next(bucket),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let Ok(Next::Call(IoCall::Effect(read))) = chunk.next(allowed()) else {
         panic!("expected the object read");
     };
@@ -289,7 +302,10 @@ fn step(checkpoint: &StagingJobCheckpoint) -> TableChunkOperation {
         has_secret_config: false,
     };
     let answer = child_answer(Ok::<_, GetSourceError>(source));
-    assert!(matches!(step.next(answer), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        step.next(answer),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     step
 }
 
@@ -302,7 +318,10 @@ fn table_checkpoint() -> StagingJobCheckpoint {
 fn lasting_failure_recorded() {
     let mut chunk = step(&table_checkpoint());
     let failed = child_answer(Err::<ChunkRead, _>(ChunkFailure::Lasting("gone".into())));
-    assert!(matches!(chunk.next(failed), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        chunk.next(failed),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(chunk.next.table, None);
     assert_eq!(chunk.next.items_failed, 1);
     let written = child_answer(Ok::<(), JobMutationError>(()));
@@ -322,7 +341,10 @@ fn header_read_first() {
         kept: None,
     };
     let answer = child_answer(Ok::<_, ChunkFailure>(read));
-    assert!(matches!(chunk.next(answer), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        chunk.next(answer),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(chunk.step, TableStep::Commit);
     let table = chunk.next.table.as_ref().expect("the table goes on");
     assert_eq!(table.columns, Some(vec!["a".to_string()]));
@@ -370,6 +392,9 @@ fn equal_folder_stays() {
     let mut put = PutFolderOperation::new(run, bucket, "f/".to_string(), BTreeMap::new());
     put.first().unwrap();
     let missing = child_answer(Err::<HeadObjectResult, _>(HeadObjectError::NoSuchKey));
-    assert!(matches!(put.next(missing), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        put.next(missing),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(put.step, PutStep::Routing);
 }

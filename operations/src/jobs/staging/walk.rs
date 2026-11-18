@@ -34,7 +34,9 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use super::limiter::{retried_call, retried_result};
-use super::manifest::{ManifestDigest, digest_reads, lasting_resolution, lasting_source, parse_digests};
+use super::manifest::{
+    ManifestDigest, digest_reads, lasting_resolution, lasting_source, parse_digests,
+};
 use super::page::{ImportPageOperation, PageSource, SnapshotPageOperation};
 use super::{ItemFailure, PageFailure, StagingRun, committed, pinned, queue_key};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -263,7 +265,10 @@ impl WalkPageOperation {
 
     fn commit(&mut self) -> Result<Next<WalkedPage>, PageFailure> {
         self.step = WalkStep::Commit;
-        let (writes, deletes) = (std::mem::take(&mut self.writes), std::mem::take(&mut self.deletes));
+        let (writes, deletes) = (
+            std::mem::take(&mut self.writes),
+            std::mem::take(&mut self.deletes),
+        );
         let call = (self.run)
             .commit_call(self.place.slot, &self.next, writes, deletes)
             .map_err(PageFailure::Retry)?;
@@ -284,7 +289,12 @@ impl WalkPageOperation {
         let mut page = match listed {
             Ok(page) => Some(page),
             Err(ItemFailure::Denied(message) | ItemFailure::Stage(message)) => {
-                record_failure(&mut self.next, &walk.source_path, &walk.target_prefix, message);
+                record_failure(
+                    &mut self.next,
+                    &walk.source_path,
+                    &walk.target_prefix,
+                    message,
+                );
                 None
             }
             Err(failure) => return Err(failure.into()),
@@ -331,8 +341,10 @@ impl WalkPageOperation {
         for entry in entries {
             match map_source_entry(&walk, entry, (flat, exact)) {
                 Ok(MappedEntry::File(file)) => {
-                    self.next.bytes_discovered =
-                        self.next.bytes_discovered.saturating_add(file.size.unwrap_or(0));
+                    self.next.bytes_discovered = self
+                        .next
+                        .bytes_discovered
+                        .saturating_add(file.size.unwrap_or(0));
                     self.files.push(file);
                 }
                 Ok(MappedEntry::Directory(directory)) => {
@@ -346,9 +358,12 @@ impl WalkPageOperation {
                     ));
                     self.next.queue_tail += 1;
                 }
-                Err(message) => {
-                    record_failure(&mut self.next, &walk.source_path, &walk.target_prefix, message)
-                }
+                Err(message) => record_failure(
+                    &mut self.next,
+                    &walk.source_path,
+                    &walk.target_prefix,
+                    message,
+                ),
             }
         }
         self.page = page;
@@ -386,8 +401,8 @@ impl WalkPageOperation {
                 );
                 // The next page of a flat walk is listed while this one commits; one at most.
                 let flat = self.flat();
-                let following = (self.next.walk.clone())
-                    .filter(|walk| flat && walk.queue_row.is_none());
+                let following =
+                    (self.next.walk.clone()).filter(|walk| flat && walk.queue_row.is_none());
                 let Some(walk) = following else {
                     self.step = WalkStep::Import;
                     return Ok(Next::Call(IoCall::child(import)));
@@ -546,7 +561,12 @@ impl ListingOperation {
 
     fn list(&self, walk: StagingWalk) -> IoCall {
         let segment = self.segment.clone();
-        IoCall::child(ListPageOperation::new(self.run.clone(), walk, self.flat, segment))
+        IoCall::child(ListPageOperation::new(
+            self.run.clone(),
+            walk,
+            self.flat,
+            segment,
+        ))
     }
 
     fn list_first(&mut self) -> Next<Listing> {
@@ -1019,7 +1039,10 @@ pub(super) fn target_of(walk: &StagingWalk, source_key: &str) -> Option<String> 
 }
 
 /// Adds shipped digests to an observation; they bind every complete read.
-pub(super) fn with_manifest(mut observation: SourceMetadata, digests: Vec<ManifestDigest>) -> SourceMetadata {
+pub(super) fn with_manifest(
+    mut observation: SourceMetadata,
+    digests: Vec<ManifestDigest>,
+) -> SourceMetadata {
     for (algorithm, digest) in digests {
         let origin = DigestOrigin::Manifest;
         let scope = DigestScope::FullObject;

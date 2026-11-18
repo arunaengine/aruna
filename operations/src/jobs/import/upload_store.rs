@@ -25,7 +25,9 @@ fn upload_row(upload_id: Ulid) -> (String, aruna_core::types::Key) {
     (ROCRATE_UPLOAD_KEYSPACE.to_string(), upload_key(upload_id))
 }
 
-fn decoded(value: Option<aruna_core::types::Value>) -> Result<Option<RoCrateUploadRecord>, UploadStoreError> {
+fn decoded(
+    value: Option<aruna_core::types::Value>,
+) -> Result<Option<RoCrateUploadRecord>, UploadStoreError> {
     value
         .map(|value| postcard::from_bytes(value.as_ref()))
         .transpose()
@@ -153,7 +155,10 @@ mod tests {
             read.first(),
             Ok(Next::Call(IoCall::Read(vec![upload_row(upload())])))
         );
-        assert_eq!(read.next(IoResult::Values(vec![None])), Ok(Next::Done(None)));
+        assert_eq!(
+            read.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
         let broken = IoResult::Values(vec![Some(ByteView::from(vec![0xFF]))]);
         assert!(read.next(broken).is_err());
     }
@@ -163,6 +168,9 @@ mod tests {
     fn delete_missing_ends() {
         let mut delete = DeleteUploadOperation::new(upload(), job());
         delete.first().unwrap();
-        assert_eq!(delete.next(IoResult::Values(vec![None])), Ok(Next::Done(())));
+        assert_eq!(
+            delete.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(()))
+        );
     }
 }

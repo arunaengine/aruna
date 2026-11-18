@@ -36,10 +36,9 @@ enum Step {
 
 type Turn = Result<Next<Outcome>, ItemError>;
 
-/// An unmapped file whose key holds a version of the same content is a second copy of that
-/// version: its row names the version, so the copy cleanup can let the key keep one file. A file
-/// with other bytes than every version becomes another version: the newest one is current, an
-/// older one joins the history.
+/// An unmapped file with the bytes of a version of its key is a second copy of that version, so
+/// the copy cleanup can let the key keep one file. A file with other bytes becomes another
+/// version: the newest one is current, an older one joins the history.
 #[derive(Debug, PartialEq)]
 pub(super) struct RegisterTwinOperation {
     job: ImportJob,
@@ -93,8 +92,8 @@ impl RegisterTwinOperation {
         guards.push((BLOB_VERSIONS_KEYSPACE.to_string(), stored, Some(value)));
         // A file a release is deleting is no copy to keep.
         let deleting = version.as_deref().unwrap_or_default();
-        let claim = claim_key(&location, deleting)
-            .map_err(|error| ItemError::System(error.to_string()))?;
+        let claim =
+            claim_key(&location, deleting).map_err(|error| ItemError::System(error.to_string()))?;
         guards.push((DELETE_CLAIM_KEYSPACE.to_string(), claim, None));
         // The copy is found by its key like a renamed row, and keeps its file and version there.
         let prefix = VersionKey::object_prefix(&rule.bucket, &self.key)

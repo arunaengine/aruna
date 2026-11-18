@@ -53,7 +53,10 @@ fn denied_file_counted() {
     assert!(matches!(page.first(), Ok(Next::Call(IoCall::Child(_)))));
     page.next(bucket_answer()).unwrap();
     assert_eq!(page.step, ImportStep::Rules);
-    assert!(matches!(page.next(rules_answer()), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        page.next(rules_answer()),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(page.step, ImportStep::Mirrors);
     assert_eq!(page.next.items_failed, 1);
     let mirrored = MirroredPage {
@@ -62,7 +65,10 @@ fn denied_file_counted() {
         connectors: Vec::new(),
     };
     let answer = child_answer(Ok::<_, PageFailure>(mirrored));
-    assert!(matches!(page.next(answer), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        page.next(answer),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert_eq!(page.step, ImportStep::Prepare);
 }
 
@@ -78,7 +84,8 @@ fn empty_page_commits() {
         entries: Vec::new(),
         connectors: Vec::new(),
     };
-    page.next(child_answer(Ok::<_, PageFailure>(mirrored))).unwrap();
+    page.next(child_answer(Ok::<_, PageFailure>(mirrored)))
+        .unwrap();
     assert_eq!(page.step, ImportStep::Commit);
     let written = child_answer(Ok::<(), JobMutationError>(()));
     assert!(matches!(page.next(written), Ok(Next::Done(_))));
@@ -90,7 +97,9 @@ fn commit_errors_map() {
     let failed = |error| {
         let mut page = import(Vec::new(), None);
         page.step = ImportStep::Turns;
-        page.next(child_answer(Ok::<_, IoError>(Err::<PageImportResult, _>(error))))
+        page.next(child_answer(Ok::<_, IoError>(Err::<PageImportResult, _>(
+            error,
+        ))))
     };
     assert!(matches!(
         failed(PageImportError::BucketChanged),
@@ -250,7 +259,10 @@ fn stops(cancelled: bool) -> IoResult {
 fn stop_leaves_page() {
     let mut page = snapshot(vec![file(true)]);
     page.first().unwrap();
-    assert!(matches!(page.next(bucket_answer()), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        page.next(bucket_answer()),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     let Ok(Next::Done(checkpoint)) = page.next(stops(true)) else {
         panic!("expected the page to stop");
     };
@@ -263,7 +275,10 @@ fn copied_file_counts() {
     let mut page = snapshot(vec![file(true)]);
     page.first().unwrap();
     page.next(bucket_answer()).unwrap();
-    assert!(matches!(page.next(stops(false)), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        page.next(stops(false)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let report = JobReport {
         current: Some(1),
         ..JobReport::default()

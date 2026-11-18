@@ -166,12 +166,13 @@ impl Operation for MirrorsOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<MirroredPage>, PageFailure> {
         let connector_id = (self.asked.take())
             .ok_or_else(|| PageFailure::Retry("no connector was asked for".to_string()))?;
-        let connector = connector_result(result, connector_id).map_err(|failure| match failure {
-            ItemFailure::Lasting(message) => PageFailure::Permanent(message),
-            ItemFailure::Denied(message)
-            | ItemFailure::Stage(message)
-            | ItemFailure::System(message) => PageFailure::Retry(message),
-        })?;
+        let connector =
+            connector_result(result, connector_id).map_err(|failure| match failure {
+                ItemFailure::Lasting(message) => PageFailure::Permanent(message),
+                ItemFailure::Denied(message)
+                | ItemFailure::Stage(message)
+                | ItemFailure::System(message) => PageFailure::Retry(message),
+            })?;
         self.connectors.insert(connector_id, connector);
         Ok(self.advance())
     }

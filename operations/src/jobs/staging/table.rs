@@ -44,7 +44,9 @@ use super::walk::{
 };
 use super::{ItemFailure, PageFailure, StagingRun, committed, pinned, queue_key};
 use crate::auth::permission_rules::PermissionRules;
-use crate::connectors::get_connector::{GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult};
+use crate::connectors::get_connector::{
+    GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
+};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::gate::PolicyGateError;
@@ -135,8 +137,14 @@ pub(super) struct ChunkRead {
 /// Where the table's bytes come from.
 #[derive(Debug, PartialEq)]
 enum Origin {
-    Connector { path: String },
-    Object { bucket: String, key: String, group_id: Option<Ulid> },
+    Connector {
+        path: String,
+    },
+    Object {
+        bucket: String,
+        key: String,
+        group_id: Option<Ulid>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -212,7 +220,10 @@ impl ChunkReadOperation {
     /// Decides the table's kind, then reads its bytes.
     fn start(&mut self) -> Result<Next<ChunkRead>, ChunkFailure> {
         let format = &self.import()?.format;
-        self.gzip = self.read.gzip.unwrap_or_else(|| is_gzip(format, self.name(), &[]));
+        self.gzip = self
+            .read
+            .gzip
+            .unwrap_or_else(|| is_gzip(format, self.name(), &[]));
         self.proceed()
     }
 
@@ -255,11 +266,21 @@ impl ChunkReadOperation {
             expected: Some(self.observation()?.clone()),
         };
         let transient: fn(&ReadSourceError) -> bool = |error| !lasting_read(error);
-        Ok(retried_call(&self.run, input, ReadSourceOperation::new, transient))
+        Ok(retried_call(
+            &self.run,
+            input,
+            ReadSourceOperation::new,
+            transient,
+        ))
     }
 
     fn object_call(&self, range: Option<(u64, u64)>) -> Result<IoCall, ChunkFailure> {
-        let Origin::Object { bucket, key, group_id } = &self.origin else {
+        let Origin::Object {
+            bucket,
+            key,
+            group_id,
+        } = &self.origin
+        else {
             return Err(ChunkFailure::Retry("the table is no object".to_string()));
         };
         let group_id = group_id.ok_or_else(|| ChunkFailure::Retry("no bucket".to_string()))?;
@@ -454,18 +475,18 @@ impl Operation for ChunkReadOperation {
                     Err(error) => return Err(ChunkFailure::Retry(error.to_string())),
                 };
                 let spec = self.run.spec.clone();
-                let Origin::Object { bucket, key, group_id } = &mut self.origin else {
+                let Origin::Object {
+                    bucket,
+                    key,
+                    group_id,
+                } = &mut self.origin
+                else {
                     return Err(ChunkFailure::Retry("the table is no object".to_string()));
                 };
                 *group_id = Some(info.group_id);
                 let auth = &spec.auth_context;
-                let path = object_permission_path(
-                    auth.realm_id,
-                    info.group_id,
-                    spec.node_id,
-                    bucket,
-                    key,
-                );
+                let path =
+                    object_permission_path(auth.realm_id, info.group_id, spec.node_id, bucket, key);
                 Ok(Next::Call(read_check_call(&spec, path)))
             }
             ChunkStep::Allowed => {
@@ -532,7 +553,11 @@ impl Operation for ChunkReadOperation {
             },
             ChunkStep::Fill { reused } => {
                 let event = result.event()?;
-                let Event::Job(JobEvent::GzipFilled { work, result: filled }) = event else {
+                let Event::Job(JobEvent::GzipFilled {
+                    work,
+                    result: filled,
+                }) = event
+                else {
                     return Err(IoError::Unexpected {
                         expected: "the filled gzip chunk",
                         got: event.label(),
@@ -947,7 +972,12 @@ impl EmptyObjectsOperation {
             );
             let rules = self.rules.as_ref().ok_or(lost_rows())?;
             if !rules.allows(&target, &Permission::WRITE) {
-                record_failure(&mut self.next, "", &entry.target, "permission denied".to_string());
+                record_failure(
+                    &mut self.next,
+                    "",
+                    &entry.target,
+                    "permission denied".to_string(),
+                );
                 continue;
             }
             let turn = turn_of(&bucket, &entry.target, record.as_deref(), fence.as_deref())?;
@@ -1336,8 +1366,8 @@ impl Operation for PutFolderOperation {
         match std::mem::replace(&mut self.step, PutStep::Replicate) {
             PutStep::Head => {
                 if let Ok(head) = result.child::<HeadObjectResult, HeadObjectError>()? {
-                    let empty = (head.location.as_ref())
-                        .is_some_and(|location| location.blob_size == 0);
+                    let empty =
+                        (head.location.as_ref()).is_some_and(|location| location.blob_size == 0);
                     let metadata = &self.metadata;
                     let same = head.metadata.len() == metadata.len()
                         && (metadata.iter())
@@ -1584,5 +1614,5 @@ mod tests {
 mod adapter_tests;
 
 #[cfg(test)]
-#[path = "table_chunk_tests.rs"]
+#[path = "chunk_tests.rs"]
 mod chunk_tests;

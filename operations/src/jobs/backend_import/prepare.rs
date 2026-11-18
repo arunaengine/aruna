@@ -66,7 +66,10 @@ fn rule_extras(
         .map(|value| DiscoveryRules::from_bytes(&value))
         .transpose()
         .map_err(stop)?;
-    Ok((earlier, discovery.map_or_else(Vec::new, |rules| rules.rules)))
+    Ok((
+        earlier,
+        discovery.map_or_else(Vec::new, |rules| rules.rules),
+    ))
 }
 
 fn extras_call(rule: &BackendImport) -> IoCall {
