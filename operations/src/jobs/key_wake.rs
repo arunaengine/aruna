@@ -12,14 +12,9 @@ use crate::blob::migration::queue::resume_transitions;
 use crate::blob::promote::PromoteError;
 use crate::blob::unlocked::promote_unlocked;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::key_locks::{KeyCheckError, ParkLockedOperation, VersionWaitOperation};
 use crate::jobs::remote_key::RemoteWakesOperation;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::key_wait::wake_key_waits;
-use aruna_core::structs::execution::job::{JobError, JobRecord, KeyWait};
-use aruna_core::structs::storage::blob::VersionKey;
-use aruna_core::time::unix_timestamp_millis;
-use ulid::Ulid;
 
 #[derive(Debug, Error)]
 pub enum KeyWakeError {
@@ -64,49 +59,10 @@ pub async fn wake_unlocked(
     Ok((woken?, promoted?))
 }
 
-fn lookup<T>(result: Result<T, KeyCheckError>) -> Result<T, String> {
-    result.map_err(|error| error.0)
-}
-
-/// See [`VersionWaitOperation`].
-pub(crate) async fn version_wait(
-    context: &DriverContext,
-    place: (NodeId, Ulid),
-    version: &VersionKey,
-) -> Result<Option<KeyWait>, String> {
-    lookup(drive(VersionWaitOperation::new(place, version.clone()), context).await)
-}
-
-/// See [`ParkLockedOperation::on_error`].
-pub(crate) async fn park_on_lock(
-    context: &DriverContext,
-    record: &JobRecord,
-    token: Ulid,
-    node_id: NodeId,
-    error: &JobError,
-) -> bool {
-    let node = (node_id, context.node_and_realm());
-    let now_ms = unix_timestamp_millis();
-    let park = ParkLockedOperation::on_error(record, token, node, error, now_ms);
-    drive(park, context).await.unwrap_or(false)
-}
-
-/// See [`ParkLockedOperation`].
-pub(crate) async fn park_locked(
-    context: &DriverContext,
-    record: &JobRecord,
-    token: Ulid,
-    node_id: NodeId,
-) -> bool {
-    let node = (node_id, context.node_and_realm());
-    let park = ParkLockedOperation::new(record, token, node, unix_timestamp_millis());
-    drive(park, context).await.unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::key_locks::LockedInputsOperation;
+    use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};
     use crate::jobs::store::key_wait::park_job;
     use crate::jobs::store::query::insert_job;
     use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
@@ -116,10 +72,27 @@ mod tests {
         PATHS_INDEX_KEYSPACE,
     };
     use aruna_core::structs::execution::job::CapturedInput;
-    use aruna_core::structs::execution::job::{JobId, JobPayload, JobState};
-    use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, HashIndex};
+    use aruna_core::structs::execution::job::{
+        JobError, JobId, JobPayload, JobRecord, JobState, KeyWait,
+    };
+    use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, HashIndex, VersionKey};
     use aruna_core::structs::storage::encryption::BucketEncryption;
+    use aruna_core::time::unix_timestamp_millis;
     use byteview::ByteView;
+    use ulid::Ulid;
+
+    async fn park_on_lock(
+        context: &DriverContext,
+        record: &JobRecord,
+        token: Ulid,
+        node_id: NodeId,
+        error: &JobError,
+    ) -> bool {
+        let node = (node_id, context.node_and_realm());
+        let now_ms = unix_timestamp_millis();
+        let park = ParkLockedOperation::on_error(record, token, node, error, now_ms);
+        drive(park, context).await.unwrap_or(false)
+    }
 
     #[tokio::test]
     async fn corrupt_archive_wakes() {

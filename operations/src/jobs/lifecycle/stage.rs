@@ -14,7 +14,6 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
-use crate::driver::{DriverContext, drive};
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::workflow::workspace::LOCKED_INPUT;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
@@ -193,19 +192,6 @@ impl Operation for StageInputOperation {
             }
         }
     }
-}
-
-/// See [`StageInputOperation`].
-pub async fn stage_remote_input(
-    context: &DriverContext,
-    record: &JobRecord,
-    input: &InputSelection,
-    version: Ulid,
-    blake3: [u8; 32],
-) -> Result<StagedInput, JobError> {
-    let serving = context.node_and_realm();
-    let stage = StageInputOperation::new(record, input, version, blake3, serving);
-    drive(stage, context).await.map_err(|error| error.0)
 }
 
 /// What one holder is asked for: its own stored version, and, when it is not

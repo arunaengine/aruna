@@ -18,7 +18,7 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::jobs::lifecycle::updates::{PublishStateOperation, PublishTerminalOperation};
-use crate::jobs::output_record::store_outputs;
+use crate::jobs::output_record::StoreOutputsOperation;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
@@ -198,7 +198,14 @@ async fn publishes_terminal_success() {
         digest: None,
     }];
 
-    let output_digest = store_outputs(&ctx, &commit.record, &control, &outputs)
+    let store = StoreOutputsOperation::new(
+        &commit.record,
+        &control,
+        &outputs,
+        ctx.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    let output_digest = crate::driver::drive(store, &ctx)
         .await
         .expect("outputs stored");
     let mut terminal = record;
