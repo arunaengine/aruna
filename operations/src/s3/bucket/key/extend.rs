@@ -3,14 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, retry_effect, retry_timer};
+use crate::s3::bucket::audit_retry::{AuditError, AuditWrite, KeepAudit};
 use crate::s3::bucket::key::lock::{answers_timer, lock_timer};
-use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use crate::s3::bucket::key::rows::{SettingsError, authority_keys, parse_authority};
+use crate::s3::object::put::abe::keyed;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::events::{BlobEvent, Event};
+use aruna_core::keyspaces::BUCKET_HOLDER_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRef, HolderOrigin, KeyTicket, UnlockStatus,
@@ -20,27 +23,21 @@ use aruna_core::structs::storage::key_audit::{
     AuditAction, AuditOutcome, BucketAuditRecord, next_event_id,
 };
 use aruna_core::task::TaskEffect;
-use aruna_core::types::{Effects, GroupId, Key, Value};
+use aruna_core::types::{GroupId, Value};
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use std::time::Duration;
 use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExtendStep {
-    Init,
     ReadBucket,
     ReadGrant,
     CheckSession,
     WriteIntent,
-    SyncIntent,
     ExtendKey,
     MoveTimer,
     WriteAudit,
-    ArmRetry,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -67,6 +64,29 @@ pub enum ExtendError {
     NotFinished,
 }
 
+impl From<IoError> for ExtendError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+impl From<AuditError> for ExtendError {
+    fn from(error: AuditError) -> Self {
+        match error {
+            AuditError::Conversion(error) => Self::Conversion(error),
+            AuditError::Storage(error) => Self::Storage(error),
+            AuditError::NotAuditTimer => Self::NotFinished,
+            AuditError::Unexpected(received) => Self::InvalidStateEvent {
+                state: "WriteAudit".to_string(),
+                expected: "the audit retry timer's answer",
+                received,
+            },
+        }
+    }
+}
+
+type ExtendTurn = Result<Next<UnlockStatus>, ExtendError>;
+
 /// An extension of `session_id` in `generation`; implicit authority is read right before it.
 #[derive(Debug, PartialEq)]
 pub struct ExtendInput {
@@ -87,95 +107,96 @@ pub struct ExtendBucketOperation {
     step: ExtendStep,
     key: Option<BucketKeyRef>,
     status: Option<UnlockStatus>,
-    /// The outcome record until it is written, and the writes tried so far.
     outcome: Option<BucketAuditRecord>,
     /// Why the registry refused the extension, reported once its failed outcome is recorded.
     failure: Option<ExtendError>,
     /// The event id of the stored intent, which the outcome names.
     intent_id: Option<Ulid>,
-    attempts: u32,
-    output: Option<Result<UnlockStatus, ExtendError>>,
 }
 
 impl ExtendBucketOperation {
     pub fn new(input: ExtendInput) -> Self {
         Self {
             input,
-            step: ExtendStep::Init,
+            step: ExtendStep::ReadBucket,
             key: None,
             status: None,
             outcome: None,
             failure: None,
             intent_id: None,
-            attempts: 0,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: impl Into<ExtendError>) -> Effects {
-        self.output = Some(Err(error.into()));
-        self.step = ExtendStep::Error;
-        smallvec![]
+    fn call(&mut self, step: ExtendStep, call: IoCall) -> ExtendTurn {
+        self.step = step;
+        Ok(Next::Call(call))
     }
 
-    fn authorize(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn refused(&self, received: Event) -> ExtendTurn {
+        match received {
+            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+            other => Err(ExtendError::InvalidStateEvent {
+                state: format!("{:?}", self.step),
+                expected: "the event of the current step",
+                received: other.label(),
+            }),
+        }
+    }
+
+    fn authorize(&mut self, values: Vec<Option<Value>>) -> ExtendTurn {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-        let state = match parse_authority(values, realm_id, group_id) {
-            Ok(state) => state,
-            Err(error) => return self.fail(error),
-        };
-        let settings = state.settings;
-        let Some(bucket_id) = settings.bucket_id else {
-            return self.fail(ExtendError::NotEncrypted);
-        };
+        let state = parse_authority(keyed(&values), realm_id, group_id)?;
+        let bucket_id = state.settings.bucket_id.ok_or(ExtendError::NotEncrypted)?;
         self.key = Some(BucketKeyRef::new(bucket_id, self.input.generation));
         let caller = self.input.caller;
         if state.info.created_by == caller || state.admins.contains(&caller) {
             return self.check_session();
         }
-        self.step = ExtendStep::ReadGrant;
         let grant = [&bucket_id.to_bytes()[..], &caller.to_storage_key()].concat();
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_HOLDER_KEYSPACE.to_string(),
-            key: grant.into(),
-            txn_id: None,
-        })]
+        let read = read_row(BUCKET_HOLDER_KEYSPACE, grant);
+        self.call(ExtendStep::ReadGrant, read)
+    }
+
+    fn grant_read(&mut self, value: Option<Value>) -> ExtendTurn {
+        let grant = value
+            .map(|value| BucketHolder::from_bytes(&value))
+            .transpose()?;
+        match grant {
+            Some(grant) if grant.origin == HolderOrigin::Explicit => self.check_session(),
+            _ => Err(ExtendError::NotHolder),
+        }
     }
 
     /// Asks the registry first, so an extension it would refuse writes no intent at all.
-    fn check_session(&mut self) -> Effects {
-        let Some(key) = self.key else {
-            return self.fail(ExtendError::NotFinished);
-        };
-        self.step = ExtendStep::CheckSession;
-        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus {
-            bucket_id: key.bucket_id
-        })]
+    fn check_session(&mut self) -> ExtendTurn {
+        let key = self.key.ok_or(ExtendError::NotFinished)?;
+        let status = Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: key.bucket_id,
+        });
+        self.call(ExtendStep::CheckSession, status.into())
     }
 
-    fn session_checked(&mut self, generations: &[UnlockStatus]) -> Effects {
+    fn session_checked(&mut self, generations: &[UnlockStatus]) -> ExtendTurn {
         let (key, session_id) = (self.key, self.input.session_id);
         let current = generations.iter().find(|status| {
             Some(status.key) == key && status.session_id == session_id && status.active
         });
         let Some(current) = current else {
-            return self.fail(BlobError::BucketKey(BucketKeyError::SessionMismatch));
+            return Err(BlobError::BucketKey(BucketKeyError::SessionMismatch).into());
         };
         let past_max = matches!(
             (self.input.duration, current.max_remaining),
             (Some(asked), Some(max)) if asked > max
         );
         if past_max {
-            return self.fail(BlobError::BucketKey(BucketKeyError::InvalidDuration));
+            return Err(BlobError::BucketKey(BucketKeyError::InvalidDuration).into());
         }
         self.write_intent()
     }
 
     /// A synced intent records the extension before the registry applies it.
-    fn write_intent(&mut self) -> Effects {
-        let Some(key) = self.key else {
-            return self.fail(ExtendError::NotFinished);
-        };
+    fn write_intent(&mut self) -> ExtendTurn {
+        let key = self.key.ok_or(ExtendError::NotFinished)?;
         let now_ms = self.input.now_ms;
         let deadline = self
             .input
@@ -183,8 +204,8 @@ impl ExtendBucketOperation {
             .and_then(|left| deadline_after(now_ms, left));
         let intent = self.record(key, AuditOutcome::Intent, deadline);
         self.intent_id = Some(intent.event_id);
-        self.step = ExtendStep::WriteIntent;
-        self.write_record(&intent)
+        let write = AuditWrite::new(&intent, true)?;
+        self.call(ExtendStep::WriteIntent, IoCall::child(write))
     }
 
     fn record(
@@ -213,32 +234,18 @@ impl ExtendBucketOperation {
         }
     }
 
-    fn write_record(&mut self, record: &BucketAuditRecord) -> Effects {
-        match record.to_bytes() {
-            Ok(value) => smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
-                key: record.key().into(),
-                value: value.into(),
-                txn_id: None,
-            })],
-            Err(error) => self.fail(error),
-        }
-    }
-
     /// The registry refuses a session of another generation and any bound past the maximum.
-    fn extend(&mut self) -> Effects {
-        let Some(key) = self.key else {
-            return self.fail(ExtendError::NotFinished);
-        };
-        self.step = ExtendStep::ExtendKey;
-        smallvec![Effect::Blob(BlobEffect::ExtendKey {
+    fn extend(&mut self) -> ExtendTurn {
+        let key = self.key.ok_or(ExtendError::NotFinished)?;
+        let extend = Effect::Blob(BlobEffect::ExtendKey {
             key,
             session_id: self.input.session_id,
             duration: self.input.duration,
-        })]
+        });
+        self.call(ExtendStep::ExtendKey, extend.into())
     }
 
-    fn move_timer(&mut self, status: UnlockStatus) -> Effects {
+    fn move_timer(&mut self, status: UnlockStatus) -> ExtendTurn {
         let foreign = Some(status.key) != self.key || status.session_id != self.input.session_id;
         if foreign {
             return self.reject(BlobError::BucketKey(BucketKeyError::SessionMismatch).into());
@@ -253,97 +260,54 @@ impl ExtendBucketOperation {
         let Some(after) = remaining else {
             return self.audit();
         };
-        self.step = ExtendStep::MoveTimer;
-        smallvec![Effect::Task(TaskEffect::ShortenTimer { key, after })]
+        let shorten = Effect::Task(TaskEffect::ShortenTimer { key, after });
+        self.call(ExtendStep::MoveTimer, shorten.into())
     }
 
-    fn audit(&mut self) -> Effects {
-        let Some(status) = self.status.as_ref() else {
-            return self.fail(ExtendError::NotFinished);
-        };
+    fn audit(&mut self) -> ExtendTurn {
+        let status = self.status.as_ref().ok_or(ExtendError::NotFinished)?;
         let mut record = self.record(status.key, AuditOutcome::Applied, status.deadline_ms);
         record.sequence = Some(status.sequence);
-        self.outcome = Some(record);
-        self.retry_audit()
+        self.keep_outcome(record)
     }
 
     /// A refused extension records its failed outcome, so the synced intent never reads as
     /// applied at restart.
-    fn reject(&mut self, error: ExtendError) -> Effects {
+    fn reject(&mut self, error: ExtendError) -> ExtendTurn {
         let Some(key) = self.key else {
-            return self.fail(error);
+            return Err(error);
         };
         self.failure = Some(error);
-        self.outcome = Some(self.record(key, AuditOutcome::Failed, None));
-        self.retry_audit()
+        let record = self.record(key, AuditOutcome::Failed, None);
+        self.keep_outcome(record)
     }
 
-    fn retry_audit(&mut self) -> Effects {
-        let Some(record) = self.outcome.clone() else {
-            return self.fail(ExtendError::NotFinished);
-        };
-        self.attempts += 1;
-        self.step = ExtendStep::WriteAudit;
-        self.write_record(&record)
+    fn keep_outcome(&mut self, record: BucketAuditRecord) -> ExtendTurn {
+        self.outcome = Some(record.clone());
+        let keep = KeepAudit::new(vec![record]);
+        self.call(ExtendStep::WriteAudit, IoCall::child(keep))
     }
 
     /// The new deadline already applies; a lost audit write does not undo it.
-    fn finish(&mut self) -> Effects {
-        self.output = match self.failure.take() {
-            Some(error) => Some(Err(error)),
-            None => self.status.take().map(Ok),
-        };
-        self.step = ExtendStep::Finish;
-        smallvec![]
-    }
-}
-
-impl EffectOperation for ExtendBucketOperation {
-    type Output = UnlockStatus;
-    type Error = ExtendError;
-
-    fn start(&mut self) -> Effects {
-        self.step = ExtendStep::ReadBucket;
-        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-        smallvec![authority_read(&self.input.bucket, realm_id, group_id, None)]
+    fn finish(&mut self, kept: Result<bool, AuditError>) -> ExtendTurn {
+        kept?;
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        let status = self.status.take().ok_or(ExtendError::NotFinished)?;
+        Ok(Next::Done(status))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn event_answered(&mut self, event: Event) -> ExtendTurn {
         match (self.step, event) {
-            (ExtendStep::WriteAudit, Event::Storage(StorageEvent::Error { .. }))
-                if self.attempts < AUDIT_ATTEMPTS =>
-            {
-                self.retry_audit()
-            }
-            (ExtendStep::WriteAudit, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.finish()
-            }
-            // A lasting outage hands the outcome to its own retry timer.
-            (ExtendStep::WriteAudit, Event::Storage(StorageEvent::Error { .. })) => {
-                let Some(record) = self.outcome.as_ref() else {
-                    return self.fail(ExtendError::NotFinished);
-                };
-                self.step = ExtendStep::ArmRetry;
-                smallvec![retry_effect(record)]
-            }
-            (ExtendStep::ArmRetry, Event::Task(event))
-                if self
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|record| answers_timer(&event, &retry_timer(record))) =>
-            {
-                self.finish()
-            }
             (ExtendStep::CheckSession, Event::Blob(BlobEvent::KeyStatus { generations })) => {
                 self.session_checked(&generations)
             }
-            (ExtendStep::WriteIntent, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.step = ExtendStep::SyncIntent;
-                smallvec![Effect::Storage(StorageEffect::SyncAll)]
+            (ExtendStep::ExtendKey, Event::Blob(BlobEvent::KeyExtended { status })) => {
+                self.move_timer(status)
             }
-            // The intent must survive a crash before the registry moves the deadline.
-            (ExtendStep::SyncIntent, Event::Storage(StorageEvent::SyncAllFinished)) => {
-                self.extend()
+            (ExtendStep::ExtendKey, Event::Blob(BlobEvent::Error(error))) => {
+                self.reject(error.into())
             }
             // A timer that did not move only records the lock late; admission ends on time.
             (ExtendStep::MoveTimer, Event::Task(event))
@@ -357,58 +321,48 @@ impl EffectOperation for ExtendBucketOperation {
             {
                 self.audit()
             }
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error),
-            (ExtendStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.authorize(values)
-            }
-            (ExtendStep::ReadGrant, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let grant = value
-                    .map(|value| BucketHolder::from_bytes(&value))
-                    .transpose();
-                match grant {
-                    Ok(Some(grant)) if grant.origin == HolderOrigin::Explicit => {
-                        self.check_session()
-                    }
-                    Ok(_) => self.fail(ExtendError::NotHolder),
-                    Err(error) => self.fail(error),
-                }
-            }
-            (ExtendStep::ExtendKey, Event::Blob(BlobEvent::KeyExtended { status })) => {
-                self.move_timer(status)
-            }
-            (ExtendStep::ExtendKey, Event::Blob(BlobEvent::Error(error))) => {
-                self.reject(error.into())
-            }
-            (ExtendStep::Finish | ExtendStep::Error, _) => smallvec![],
-            (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
-            (state, received) => self.fail(ExtendError::InvalidStateEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current step",
-                received: received.label(),
-            }),
+            (_, received) => self.refused(received),
         }
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(self.step, ExtendStep::Finish | ExtendStep::Error)
+impl Operation for ExtendBucketOperation {
+    type Output = UnlockStatus;
+    type Error = ExtendError;
+
+    fn first(&mut self) -> ExtendTurn {
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let reads = authority_keys(&self.input.bucket, realm_id, group_id);
+        self.call(ExtendStep::ReadBucket, IoCall::Read(reads))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(ExtendError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> ExtendTurn {
+        match self.step {
+            ExtendStep::ReadBucket => self.authorize(result.values()?),
+            ExtendStep::ReadGrant => self.grant_read(result.value()?),
+            // The intent must survive a crash before the registry moves the deadline.
+            ExtendStep::WriteIntent => {
+                result.child::<(), StorageError>()??;
+                self.extend()
+            }
+            ExtendStep::WriteAudit => self.finish(result.child::<bool, AuditError>()?),
+            _ => self.event_answered(result.event()?),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3::bucket::key::lock::LockBucketOperation;
     use crate::s3::bucket::key::rows::authority_rows;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::handle::Handle;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::task::TaskEvent;
     use std::time::SystemTime;
 
     const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
@@ -418,7 +372,42 @@ mod tests {
         UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([1; 32]))
     }
 
-    fn read(caller: UserId) -> (ExtendBucketOperation, Effects) {
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn blob(blob: BlobEvent) -> IoResult {
+        event(Event::Blob(blob))
+    }
+
+    fn intent_done(result: Result<(), StorageError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn kept(stored: bool) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, AuditError>(stored)))
+    }
+
+    fn asked(turn: &ExtendTurn) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
+            other => panic!("expected an effect call, got {other:?}"),
+        }
+    }
+
+    /// The record the audit write child of `turn` stores.
+    fn intent_of(turn: ExtendTurn) -> BucketAuditRecord {
+        let Ok(Next::Call(IoCall::Child(mut child))) = turn else {
+            panic!("expected the intent, got {turn:?}");
+        };
+        let effects = child.start();
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected the intent, got {effects:?}");
+        };
+        BucketAuditRecord::from_bytes(&writes[0].2).unwrap()
+    }
+
+    fn read(caller: UserId) -> (ExtendBucketOperation, ExtendTurn) {
         let mut operation = ExtendBucketOperation::new(ExtendInput {
             bucket: "bucket".to_string(),
             group_id: Ulid::from_bytes([3; 16]),
@@ -430,7 +419,7 @@ mod tests {
             realm_id: RealmId::from_bytes([1; 32]),
             now_ms: 1_000,
         });
-        operation.start();
+        operation.first().unwrap();
         let info = BucketInfo {
             group_id: Ulid::from_bytes([3; 16]),
             created_at: SystemTime::UNIX_EPOCH,
@@ -448,40 +437,30 @@ mod tests {
             key_generation: 3,
             ..Default::default()
         };
-        let values = authority_rows(&info, Some(&settings), &[]);
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        (operation, effects)
+        let rows = authority_rows(&info, Some(&settings), &[]);
+        let values = rows.into_iter().map(|(_, value)| value).collect();
+        let turn = operation.next(IoResult::Values(values));
+        (operation, turn)
+    }
+
+    /// Answers the registry check before the intent with the running session.
+    fn checked(operation: &mut ExtendBucketOperation, turn: &ExtendTurn) -> ExtendTurn {
+        let check = BlobEffect::ReadKeyStatus {
+            bucket_id: BUCKET_ID,
+        };
+        assert_eq!(asked(turn), &Effect::Blob(check));
+        let generations = vec![status(Some(Duration::from_secs(60)))];
+        operation.next(blob(BlobEvent::KeyStatus { generations }))
     }
 
     /// Answers the synced intent of an authorized extension.
-    fn synced(operation: &mut ExtendBucketOperation, effects: &Effects) -> Effects {
-        let effects = checked(operation, effects);
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected the intent, got {effects:?}");
-        };
-        let intent = BucketAuditRecord::from_bytes(value).unwrap();
+    fn synced(operation: &mut ExtendBucketOperation, turn: &ExtendTurn) -> ExtendTurn {
+        let intent = intent_of(checked(operation, turn));
         assert_eq!(
             (intent.action, intent.outcome, intent.deadline_ms),
             (AuditAction::Extend, AuditOutcome::Intent, Some(31_000))
         );
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(Vec::new()),
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::SyncAll)]
-        );
-        operation.step(Event::Storage(StorageEvent::SyncAllFinished))
-    }
-
-    /// Answers the registry check before the intent with the running session.
-    fn checked(operation: &mut ExtendBucketOperation, effects: &Effects) -> Effects {
-        let check = BlobEffect::ReadKeyStatus {
-            bucket_id: BUCKET_ID,
-        };
-        assert_eq!(effects.as_slice(), [Effect::Blob(check)]);
-        let generations = vec![status(Some(Duration::from_secs(60)))];
-        operation.step(Event::Blob(BlobEvent::KeyStatus { generations }))
+        operation.next(intent_done(Ok(())))
     }
 
     fn status(remaining: Option<Duration>) -> UnlockStatus {
@@ -497,37 +476,52 @@ mod tests {
         }
     }
 
+    fn session_ticket() -> KeyTicket {
+        KeyTicket {
+            key: BucketKeyRef::new(BUCKET_ID, 2),
+            session_id: SESSION,
+        }
+    }
+
+    /// An extension whose intent is synced, waiting for the registry.
+    fn extending(seconds: u64) -> ExtendBucketOperation {
+        let (mut operation, turn) = read(user(1));
+        operation.input.duration = Some(Duration::from_secs(seconds));
+        checked(&mut operation, &turn).unwrap();
+        operation.next(intent_done(Ok(()))).unwrap();
+        operation
+    }
+
+    async fn on_scheduler<T: std::fmt::Debug, E: std::fmt::Debug>(
+        scheduler: &aruna_tasks::TaskHandle,
+        turn: Result<Next<T>, E>,
+    ) -> IoResult {
+        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+            panic!("expected a timer effect, got {turn:?}");
+        };
+        IoResult::Event(Box::new(scheduler.send_effect(*effect).await))
+    }
+
     #[test]
     fn delayed_extension_recorded() {
-        let (mut operation, effects) = read(user(1));
+        let (mut operation, turn) = read(user(1));
         operation.input.duration = Some(Duration::from_secs(60));
-        let effects = checked(&mut operation, &effects);
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("intent missing")
-        };
-        let intent = BucketAuditRecord::from_bytes(value).unwrap();
+        let intent = intent_of(checked(&mut operation, &turn));
         assert_eq!(intent.deadline_ms, Some(61_000));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
-        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
+        operation.next(intent_done(Ok(()))).unwrap();
         let mut current = status(Some(Duration::from_secs(60)));
         current.deadline_ms = Some(91_000);
-        operation.step(Event::Blob(BlobEvent::KeyExtended {
-            status: current.clone(),
-        }));
-        let ticket = KeyTicket {
-            key: current.key,
-            session_id: current.session_id,
-        };
-        let effects = operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
-            key: lock_timer(&ticket),
+        operation
+            .next(blob(BlobEvent::KeyExtended {
+                status: current.clone(),
+            }))
+            .unwrap();
+        let armed = TaskEvent::TimerScheduled {
+            key: lock_timer(&session_ticket()),
             after: Duration::from_secs(60),
-        }));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("outcome missing")
         };
-        let record = BucketAuditRecord::from_bytes(value).unwrap();
+        operation.next(event(Event::Task(armed))).unwrap();
+        let record = operation.outcome.clone().unwrap();
         assert_eq!(
             (record.deadline_ms, record.sequence),
             (Some(91_000), Some(current.sequence))
