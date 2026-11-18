@@ -1177,15 +1177,15 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::api::links::links_local(
-                            context.as_ref(),
-                            *net_handle.realm_id(),
-                            auth.as_ref(),
-                            *request,
-                        )
-                        .await
-                        .map(Box::new)
-                        .map_err(crate::forward::transport::read_error),
+                        Some(net_handle) => {
+                            use crate::metadata::api::links::local::LinksLocalOperation;
+                            let realm_id = *net_handle.realm_id();
+                            let links = LinksLocalOperation::new(realm_id, auth, *request);
+                            drive(links, context.as_ref())
+                                .await
+                                .map(Box::new)
+                                .map_err(crate::forward::transport::read_error)
+                        }
                         None => Err(MetadataReadError::Unavailable),
                     },
                     Err(error) => Err(error),
@@ -1218,17 +1218,15 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::api::links::set_preview_local(
-                            context.as_ref(),
-                            *net_handle.realm_id(),
-                            auth.as_ref(),
-                            set_id,
-                            None,
-                            limit,
-                        )
-                        .await
-                        .map(Box::new)
-                        .map_err(crate::forward::transport::read_error),
+                        Some(net_handle) => {
+                            use crate::metadata::api::links::local::SetPreviewOperation;
+                            let scope = (*net_handle.realm_id(), auth);
+                            let preview = SetPreviewOperation::new(scope, set_id, None, limit);
+                            drive(preview, context.as_ref())
+                                .await
+                                .map(Box::new)
+                                .map_err(crate::forward::transport::read_error)
+                        }
                         None => Err(MetadataReadError::Unavailable),
                     },
                     Err(error) => Err(error),
