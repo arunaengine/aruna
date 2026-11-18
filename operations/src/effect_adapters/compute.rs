@@ -17,6 +17,7 @@ use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{BackendError, FenceContext, OutputChunks, TaskOutput};
 use aruna_core::stream::{BackendStream, StreamError};
 use futures_util::StreamExt;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::job::{JobHost, current_host};
@@ -62,6 +63,26 @@ async fn unless_stopped<T>(until_stop: bool, work: impl Future<Output = T>) -> O
     }
 }
 
+/// Ends the task that watches a job's stop once the stream that needs it is gone.
+struct StopWatch(JoinHandle<()>);
+
+impl Drop for StopWatch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A token cancelled when the job stops, for the stream the returned watch stays with.
+fn stop_token(host: Arc<dyn JobHost>) -> (CancellationToken, StopWatch) {
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let watch = tokio::spawn(async move {
+        host.stopped().await;
+        cancel.cancel();
+    });
+    (token, StopWatch(watch))
+}
+
 /// The output bytes until the job stops, which ends them with an error the reading put fails
 /// on, so a put in flight cleans up after itself.
 fn stoppable_chunks(
@@ -69,18 +90,20 @@ fn stoppable_chunks(
     host: Option<Arc<dyn JobHost>>,
     failure: OutputFailure,
 ) -> BackendStream<Result<bytes::Bytes, StreamError>> {
-    let body = futures_util::stream::unfold(Some((chunks, host)), |state| async move {
-        let (mut chunks, host) = state?;
-        let next = match &host {
-            Some(host) => tokio::select! {
-                biased;
-                () = host.stopped() => Some(Err(BackendError::Cancelled)),
-                chunk = chunks.next() => chunk,
-            },
-            None => chunks.next().await,
+    let (stop, watch) = match host.map(stop_token) {
+        Some((token, watch)) => (token, Some(watch)),
+        None => (CancellationToken::new(), None),
+    };
+    let start = Some((chunks, stop, watch));
+    let body = futures_util::stream::unfold(start, |state| async move {
+        let (mut chunks, stop, watch) = state?;
+        let next = tokio::select! {
+            biased;
+            () = stop.cancelled() => Some(Err(BackendError::Cancelled)),
+            chunk = chunks.next() => chunk,
         };
-        let stop = matches!(next, Some(Err(BackendError::Cancelled)));
-        let state = (!stop).then_some((chunks, host));
+        let ended = matches!(next, Some(Err(BackendError::Cancelled)));
+        let state = (!ended).then_some((chunks, stop, watch));
         next.map(|chunk| (chunk, state))
     });
     BackendStream(Box::pin(body.map(move |chunk| {
