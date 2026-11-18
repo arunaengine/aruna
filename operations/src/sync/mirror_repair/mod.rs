@@ -3,19 +3,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod drain;
+mod ensure;
 mod kick;
 mod record;
+mod remove;
 mod scan;
 mod settle;
 mod status;
 #[cfg(test)]
 mod tests;
 
-pub use drain::{
-    delete_sync_mirror, process_mirror_repairs, request_mirror_create, restore_mirror_timer,
-};
+pub use drain::{DrainRepairsOperation, RestoreTimerOperation};
 pub use kick::KickRepairOperation;
 pub use record::MirrorRecordOperation;
+pub use remove::RemoveMirrorOperation;
 pub use status::StoreStatusOperation;
 
 use std::time::Duration;

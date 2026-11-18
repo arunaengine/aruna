@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
@@ -390,6 +390,157 @@ impl Operation for ReplayPage {
                 Ok(Next::Done(outcome))
             }
         }
+    }
+}
+
+/// What one install's coverage needs now.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReplayPlan {
+    Nothing,
+    /// A replay of the grown part starts; the node's clock is `by`'s unless it is this one.
+    Start {
+        target: Box<Target>,
+        next: Box<CoverageRow>,
+        old: Coverage,
+        boundary: u64,
+        by: Option<NodeId>,
+    },
+}
+
+/// Decides from the coverage row whether the install's coverage grew here; a record that moved on
+/// without growth only updates the row.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PlanReplay {
+    install: PluginInstall,
+    target: Option<Target>,
+    writing: bool,
+}
+
+impl PlanReplay {
+    pub(crate) fn new(install: PluginInstall, target: Target) -> Self {
+        Self {
+            install,
+            target: Some(target),
+            writing: false,
+        }
+    }
+}
+
+impl Operation for PlanReplay {
+    type Output = ReplayPlan;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<ReplayPlan>, StoreError> {
+        Ok(Next::Call(IoCall::child(replay_rows(
+            self.install.install_id,
+        ))))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<ReplayPlan>, StoreError> {
+        if self.writing {
+            done(answer)?;
+            return Ok(Next::Done(ReplayPlan::Nothing));
+        }
+        let rows = answer.child::<(Option<CoverageRow>, Option<ReplayRow>), StoreError>()??;
+        let (row, task) = rows;
+        let target = self.target.take().ok_or(IoError::Unfinished)?;
+        let next = CoverageRow {
+            revision: self.install.revision,
+            active_since_ms: self.install.active_since_ms,
+            coverage: target.coverage.clone(),
+            note: None,
+        };
+        if task.is_some_and(|task| task.next.revision == next.revision) {
+            return Ok(Next::Done(ReplayPlan::Nothing));
+        }
+        let Some((old, boundary, by)) = growth(&self.install, row.as_ref(), &target.coverage)
+        else {
+            if !row.is_some_and(|row| row.revision != next.revision) {
+                return Ok(Next::Done(ReplayPlan::Nothing));
+            }
+            self.writing = true;
+            let key = row_key(COVERAGE_ROW, self.install.install_id);
+            let coverage = row_of(PLUGIN_REPLAYS_KEYSPACE, key, encode(&next)?);
+            return Ok(Next::Call(IoCall::Write(vec![coverage])));
+        };
+        Ok(Next::Done(ReplayPlan::Start {
+            target: Box::new(target),
+            next: Box::new(next),
+            old,
+            boundary,
+            by,
+        }))
+    }
+}
+
+/// Continues every replay, at most `pages` pages of `page` rows each, a page per transaction;
+/// answers the rows read.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RunReplays {
+    now_ms: u64,
+    page: usize,
+    pages: usize,
+    scan: Option<Scan>,
+    keys: VecDeque<Vec<u8>>,
+    current: Option<(Vec<u8>, usize)>,
+    read: usize,
+}
+
+impl RunReplays {
+    pub(crate) fn new(now_ms: u64, (page, pages): (usize, usize)) -> Self {
+        Self {
+            now_ms,
+            page,
+            pages,
+            scan: Some(replay_scan()),
+            keys: VecDeque::new(),
+            current: None,
+            read: 0,
+        }
+    }
+
+    fn page_of(&self, key: Vec<u8>) -> IoCall {
+        IoCall::child(replay_page(key, self.now_ms, self.page))
+    }
+
+    /// The next page of the next replay, or the end.
+    fn next_replay(&mut self) -> Next<usize> {
+        while let Some(key) = self.keys.pop_front() {
+            if self.pages > 0 {
+                self.current = Some((key.clone(), 1));
+                return Next::Call(self.page_of(key));
+            }
+        }
+        Next::Done(self.read)
+    }
+}
+
+impl Operation for RunReplays {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        let scan = self.scan.as_ref().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(scan.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
+        if let Some(scan) = self.scan.as_mut() {
+            let Some(rows) = scan.take(answer)? else {
+                return Ok(Next::Call(scan.ask()));
+            };
+            self.scan = None;
+            self.keys = rows.into_iter().map(|(key, _)| key).collect();
+            return Ok(self.next_replay());
+        }
+        let (rows, ended) = answer.child::<(usize, bool), StoreError>()??;
+        self.read += rows;
+        let (key, done_pages) = self.current.take().ok_or(IoError::Unfinished)?;
+        if ended || done_pages >= self.pages {
+            return Ok(self.next_replay());
+        }
+        self.current = Some((key.clone(), done_pages + 1));
+        Ok(Next::Call(self.page_of(key)))
     }
 }
 

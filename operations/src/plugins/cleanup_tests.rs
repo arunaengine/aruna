@@ -10,12 +10,12 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
+use crate::plugin_host::worker::tests::{created, installed, worker};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::rows::encode;
-use crate::plugins::rows::page_result;
+use crate::plugins::rows::tests::page_result;
 use crate::plugins::store::Txn;
-use crate::plugins::worker::tests::{created, installed, worker};
 use aruna_core::calls::IoCall;
 
 async fn count(fixture: &Fixture, space: &str) -> usize {

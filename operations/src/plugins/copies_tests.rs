@@ -6,13 +6,19 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::*;
+use crate::driver::{DriverContext, drive};
+use crate::plugins::artifacts::ArtifactError;
+use crate::plugins::calls::*;
+use crate::plugins::copy_rows::tests::stale_progress;
+use crate::plugins::copy_rows::{CHUNK, GRACE, MAX_UNSETTLED, chunk_count, chunk_of};
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::plugins::PublishedPlugin;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
+use aruna_core::plugins::{ArtifactBytes, MAX_ARTIFACT, PublishedPlugin};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use aruna_storage::{FjallStorage, StorageHandle};
 use futures_util::TryStreamExt;
 use tempfile::{TempDir, tempdir};
@@ -328,10 +334,9 @@ async fn interrupted_completion() {
 
     // A stale progress row next to a published done row only removes itself.
     let published = config(&[FIXTURE]);
-    let progress = Progress::new(FIXTURE.len() as u64, T0).encode();
-    write_rows(&ctx, vec![(progress_key(&digest(FIXTURE)), progress)])
-        .await
-        .unwrap();
+    let progress = stale_progress(&digest(FIXTURE), FIXTURE.len() as u64, T0);
+    let write = crate::plugins::rows::write_rows(vec![progress]);
+    drive(write, &ctx).await.unwrap();
     assert_eq!(
         sweep_copies(&ctx, &published, after_grace(T0))
             .await

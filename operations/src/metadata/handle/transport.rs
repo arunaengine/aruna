@@ -8,7 +8,6 @@ use std::time::{Duration, Instant, SystemTime};
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::metadata::{MetadataError, MetadataQueryResults, MetadataSearchHit};
-use aruna_core::structs::SyncRelationship;
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
@@ -21,7 +20,7 @@ use ulid::Ulid;
 use super::effects::record_query_counts;
 use super::{
     METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
-    MetadataInner, MetadataRequestError, PAGE_ANSWER_TIMEOUT, SYNC_MIRROR_TIMEOUT,
+    MetadataInner, MetadataRequestError, PAGE_ANSWER_TIMEOUT,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::metadata::frames::{
@@ -402,6 +401,13 @@ impl MetadataHandle {
             .map_err(|error| MetadataError::InvalidInput(error.to_string()))
             .map_err(MetadataRequestError::definitely_not_sent)?;
         let answer = self.request_forwarded_write(node_id, message).await?;
+        #[cfg(feature = "test-hooks")]
+        if matches!(answer, MetadataTransportMessage::SyncMirrorCreated) && self.take_dropped_ack()
+        {
+            return Err(MetadataRequestError::possibly_sent(MetadataError::Backend(
+                "sync mirror request timed out".to_string(),
+            )));
+        }
         encode_message(&answer)
             .map_err(MetadataError::Backend)
             .map_err(MetadataRequestError::possibly_sent)
@@ -772,82 +778,6 @@ impl MetadataHandle {
         }
     }
 
-    /// One chunk of a published plugin artifact from the management node `node_id`, unchecked.
-    pub(crate) async fn request_artifact(
-        &self,
-        node_id: NodeId,
-        digest: String,
-        index: u32,
-    ) -> Result<aruna_core::plugins::Chunk, MetadataReadError> {
-        let request = MetadataTransportMessage::FetchArtifact { digest, index };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::FetchedArtifact { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    /// The clock of the infrastructure node `node_id`, in Unix milliseconds.
-    pub(crate) async fn request_clock(&self, node_id: NodeId) -> Result<u64, MetadataReadError> {
-        let request = MetadataTransportMessage::ProbeClock;
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::ClockProbed { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    /// Hands matched plugin events to the install's receiver `node_id` and returns its decisions.
-    pub(crate) async fn request_forward(
-        &self,
-        node_id: NodeId,
-        batch: aruna_core::plugin_runs::EventBatch,
-    ) -> Result<aruna_core::plugin_runs::Decisions, MetadataReadError> {
-        let request = MetadataTransportMessage::ForwardEvents { batch };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::EventsDecided { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
-    /// Whether the node `node_id` holds the node secret `name` with `kind`, and the header the
-    /// secret checks.
-    pub(crate) async fn request_node_check(
-        &self,
-        node_id: NodeId,
-        name: aruna_core::secrets::SecretName,
-        kind: aruna_core::secrets::SecretKind,
-    ) -> Result<Option<String>, aruna_core::plugins::NodeCheckError> {
-        use aruna_core::plugins::NodeCheckError;
-        let request = MetadataTransportMessage::CheckNodeSecret { name, kind };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
-            Ok(MetadataTransportMessage::NodeSecretChecked { result }) => result,
-            _ => Err(NodeCheckError::Unavailable),
-        }
-    }
-
-    /// The secret bound to a plugin install's slot, released by the management node `node_id`.
-    pub(crate) async fn request_release(
-        &self,
-        node_id: NodeId,
-        request: aruna_core::plugins::ReleaseRequest,
-    ) -> Result<aruna_core::plugins::Released, aruna_core::plugins::ReleaseError> {
-        use aruna_core::plugins::ReleaseError;
-        let request = MetadataTransportMessage::ReleaseSecret { request };
-        let unavailable = || ReleaseError::Unavailable(format!("node {node_id} did not answer"));
-        match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
-            Ok(MetadataTransportMessage::SecretReleased { result }) => result,
-            _ => Err(unavailable()),
-        }
-    }
-
     /// Sends a reference page to a member; an error leaves its outcome unknown.
     pub(crate) async fn request_reference_page(
         &self,
@@ -1035,70 +965,6 @@ impl MetadataHandle {
         result
     }
 
-    pub(crate) async fn request_sync_create(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        source_group_id: GroupId,
-        relationship: SyncRelationship,
-        extras: PolicyRequestExtras,
-    ) -> Result<(), MetadataError> {
-        match with_sync_timeout(send_remote_request(
-            &self.inner,
-            &Span::current(),
-            node_id,
-            MetadataTransportMessage::CreateSyncMirror {
-                auth_token,
-                source_group_id,
-                relationship: Box::new(relationship),
-                extras,
-            },
-        ))
-        .await?
-        {
-            #[cfg(feature = "test-hooks")]
-            MetadataTransportMessage::SyncMirrorCreated if self.take_dropped_ack() => Err(
-                MetadataError::Backend("sync mirror request timed out".to_string()),
-            ),
-            MetadataTransportMessage::SyncMirrorCreated => Ok(()),
-            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
-            other => Err(MetadataError::Backend(format!(
-                "unexpected sync mirror response: {}",
-                transport_message_kind(&other)
-            ))),
-        }
-    }
-
-    pub(crate) async fn request_sync_delete(
-        &self,
-        node_id: NodeId,
-        auth_token: Option<AuthToken>,
-        relationship: SyncRelationship,
-        extras: PolicyRequestExtras,
-        rollback: bool,
-    ) -> Result<(), MetadataError> {
-        match with_sync_timeout(send_remote_request(
-            &self.inner,
-            &Span::current(),
-            node_id,
-            MetadataTransportMessage::DeleteSyncMirror {
-                auth_token,
-                relationship: Box::new(relationship),
-                extras,
-                rollback,
-            },
-        ))
-        .await?
-        {
-            MetadataTransportMessage::SyncMirrorDeleted => Ok(()),
-            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
-            other => Err(MetadataError::Backend(format!(
-                "unexpected sync mirror response: {}",
-                transport_message_kind(&other)
-            ))),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn search_remote_filtered(
         &self,
@@ -1196,13 +1062,4 @@ impl MetadataHandle {
             _ => Err(MetadataReadError::Unavailable),
         }
     }
-}
-
-pub(super) async fn with_sync_timeout<T>(
-    request: impl std::future::Future<Output = Result<T, MetadataRequestError>>,
-) -> Result<T, MetadataError> {
-    timeout(SYNC_MIRROR_TIMEOUT, request)
-        .await
-        .map_err(|_| MetadataError::Backend("sync mirror request timed out".to_string()))?
-        .map_err(MetadataRequestError::into_metadata_error)
 }

@@ -6,19 +6,23 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::errors::StorageError;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
-use aruna_operations::plugins::account::plugin_account;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::plugin_host::read_config;
+use aruna_operations::plugins::account::PluginAccount;
 use aruna_operations::plugins::grants::GrantError;
 use aruna_operations::plugins::install::{
-    InstallError, InstallRequest, Summary, install_plugin, installed_summary, pick_version,
-    prepare_install, prepared_summary, read_config, read_manifest,
+    InstallCaller, InstallError, InstallPrepared, InstallRequest, PrepareInstall, Summary,
+    installed_summary, pick_version, prepared_summary, read_manifest,
 };
-use aruna_operations::plugins::lifecycle::remove_install;
+use aruna_operations::plugins::lifecycle::RemoveInstall;
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
@@ -297,16 +301,15 @@ pub async fn install(
         let digest = chosen.map(|plugin| plugin.digest);
         secret_session(&state, &auth, (request.install_id, digest.as_deref())).await?;
     }
+    let place = (state.get_realm_id(), local_node(&ctx));
+    let prepare = PrepareInstall::new(&auth, place, &request);
+    let prepared = drive(prepare, &ctx).await.map_err(map_error)?;
     if preview {
-        let prepared = prepare_install(&ctx, &auth, state.get_realm_id(), &request)
-            .await
-            .map_err(map_error)?;
         let summary = InstallSummary::from(prepared_summary(&prepared));
         return Ok(Json(summary).into_response());
     }
-    let installed = install_plugin(&ctx, &actor(&state, &auth), &auth, &request)
-        .await
-        .map_err(map_error)?;
+    let install = InstallPrepared::new(caller(&state, &auth), prepared);
+    let installed = drive(install, &ctx).await.map_err(map_error)?;
     let view = view(&state, installed).await?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
 }
@@ -433,10 +436,19 @@ pub async fn remove(
 ) -> ServerResult<StatusCode> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
     secret_session(&state, &auth, (Some(install_id), None)).await?;
-    remove_install(&state.get_ctx(), &actor(&state, &auth), &auth, install_id)
-        .await
-        .map_err(map_error)?;
+    let remove = RemoveInstall::new(caller(&state, &auth), install_id);
+    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The caller of an install change made now.
+pub(crate) fn caller(state: &ServerState, auth: &AuthContext) -> InstallCaller {
+    InstallCaller::new(&actor(state, auth), auth, unix_timestamp_millis())
+}
+
+/// This node as a secret binding check sees it.
+pub(crate) fn local_node(ctx: &DriverContext) -> Option<NodeId> {
+    ctx.net_handle.as_ref().map(|net| net.node_id())
 }
 
 pub(crate) fn parse_id(id: &str) -> ServerResult<Ulid> {
@@ -566,12 +578,12 @@ pub(crate) async fn refuse_plugin_account(
     state: &ServerState,
     user_id: UserId,
 ) -> ServerResult<()> {
-    match plugin_account(&state.get_ctx(), user_id).await {
+    match drive(PluginAccount(user_id), &state.get_ctx()).await {
         Ok(false) => Ok(()),
         Ok(true) => Err(ServerError::Conflict(
             "the account acts for a plugin install; change the install instead".into(),
         )),
-        Err(error) => Err(ServerError::InternalError(error.into())),
+        Err(error) => Err(ServerError::InternalError(error.0.into())),
     }
 }
 

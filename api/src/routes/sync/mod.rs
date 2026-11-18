@@ -22,6 +22,7 @@ use aruna_core::structs::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{drive, drive_retry};
+use aruna_operations::metadata::mirror_request::MirrorRequestOperation;
 use aruna_operations::replication::parking::AwaitingJobsOperation;
 use aruna_operations::replication::plaintext::{
     ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
@@ -30,8 +31,8 @@ use aruna_operations::replication::plaintext::{
 use aruna_operations::replication::queue::JobStatsOperation;
 use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::sync::mirror_repair::{
-    KickRepairOperation, MirrorRecordOperation, StoreStatusOperation, SyncMirrorIntent,
-    delete_sync_mirror, request_mirror_create,
+    KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation, StoreStatusOperation,
+    SyncMirrorIntent,
 };
 use aruna_operations::sync::sync_relationship::{
     CreateRelationshipOperation, DeleteRelationshipOperation, GetRelationshipOperation,
@@ -1140,16 +1141,16 @@ async fn create_mirror(
 
     let auth_token = AuthToken::bearer(bearer.as_str().to_string())
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    request_mirror_create(
-        &state.get_ctx(),
+    let request = MirrorRequestOperation::create(
         relationship.target.node_id,
         auth_token,
         source_group_id,
-        relationship,
+        relationship.clone(),
         PolicyRequestExtras::operation("s3.PutBucketReplication"),
-    )
-    .await
-    .map_err(map_mirror_error)
+    );
+    drive(request, &state.get_ctx())
+        .await
+        .map_err(map_mirror_error)
 }
 
 /// Stores the outgoing record, or removes the mirror again when that fails. A create that repair
@@ -1186,9 +1187,8 @@ async fn activate_sync(state: &ServerState, relationship: &SyncRelationship) -> 
 }
 
 async fn remove_mirror(state: &ServerState, relationship: &SyncRelationship) -> bool {
-    if let Err(error) =
-        delete_sync_mirror(&state.get_ctx(), state.get_node_id(), relationship).await
-    {
+    let remove = RemoveMirrorOperation::new(state.get_node_id(), relationship.clone());
+    if let Err(error) = drive(remove, &state.get_ctx()).await {
         warn!(%error, relationship_id = %relationship.id, "Failed to remove remote sync mirror");
         return false;
     }

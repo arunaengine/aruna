@@ -151,10 +151,6 @@ pub enum SubOperationEvent {
     KeyRequestsOpened {
         request_ids: Vec<Ulid>,
     },
-    /// Epoch due markers were written in the caller's transaction.
-    EpochsMarked {
-        result: Result<(), StorageError>,
-    },
     /// A key request run failed and may succeed on retry.
     KeyRequestsFailed,
     /// One version of a re-key page ended.
@@ -546,7 +542,7 @@ impl From<crate::calls::IoError> for PeerAuthRefusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRequestError {
     /// The request failed before an answer arrived.
-    Failed(String),
+    Failed(crate::metadata::MetadataError),
     /// No answer arrived within the request's timeout.
     TimedOut,
 }
@@ -979,7 +975,6 @@ impl Event {
                     UserUpdated,
                     VaultHeld,
                     KeyRequestsOpened,
-                    EpochsMarked,
                     KeyRequestsFailed,
                     VersionRekeyed,
                     AuditStored,
@@ -1029,7 +1024,8 @@ impl Event {
                 OutboundEvent {
                     Posted,
                     MailSent,
-                    Backoff
+                    Backoff,
+                    Answered
                 }
             ),
         }

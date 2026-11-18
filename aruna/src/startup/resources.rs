@@ -18,10 +18,10 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
-use aruna_operations::node::recovery::RecoveryStatus;
-use aruna_operations::node::usage_publish::publish_refresh_snapshots;
+use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
-use aruna_operations::plugins::plugin_work::PluginWorkHandler;
+use aruna_operations::plugin_host::plugin_work::PluginWorkHandler;
+use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_storage::FjallPersistPolicy;
@@ -116,7 +116,10 @@ impl Acquired {
     pub(crate) async fn cleanup(self, grace: Duration) -> ShutdownOutcome {
         info!("Startup stopped early; releasing the acquired resources");
         let ops = self.ops_handle;
-        let driver_ctx = self.driver_ctx;
+        // Startup may stop before the context exists; leases are then handed back over storage.
+        let driver_ctx = self
+            .driver_ctx
+            .unwrap_or_else(|| Arc::new(DriverContext::storage_only(self.storage_handle.clone())));
         let outcome = NodeShutdown {
             shutdown: self.shutdown,
             readiness: self.readiness,
@@ -128,6 +131,7 @@ impl Acquired {
             monitoring: self.monitoring,
             task_handle: self.task_handle,
             jobs_runtime: self.jobs_runtime,
+            driver_ctx: driver_ctx.clone(),
             net_handle: self.net_handle,
             graph_handle: self.graph_handle,
             blob_handle: self.blob_handle,
@@ -678,7 +682,8 @@ fn spawn_usage_rebuild(
             }
         }
         info!("Usage counters rebuilt");
-        if let Err(error) = publish_refresh_snapshots(&context, node_id, realm_id, true).await {
+        let publish = PublishUsageOperation::new(&context, (node_id, realm_id), true, true);
+        if let Err(error) = drive(publish, context.as_ref()).await {
             warn!(error = %error, "Usage snapshots were not published after the rebuild");
         }
     });

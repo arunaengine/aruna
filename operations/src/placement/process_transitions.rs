@@ -361,7 +361,7 @@ async fn completion_step(
         let event = net_handle
             .sync_document_topics(vec![topic], sources.clone())
             .await;
-        crate::node::startup::apply_restored_reconcile(context, local_node_id, event).await;
+        crate::shard::restore::apply_restored_reconcile(context, local_node_id, event).await;
     }
 
     let mut required = irokle::ActorClock::default();

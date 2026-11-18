@@ -1,177 +1,31 @@
-//! Selects the secret a plugin install binds to a slot in this node's own view, and opens it
-//! through the storage backend, which holds the realm keys on a management node.
+//! Checks the secrets a plugin install binds to its slots, each where it lives: group secrets in
+//! this node's view, realm secrets in the config and node secrets on the receiver.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::compute::SecretBytes;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::NODE_SECRETS_KEYSPACE;
-use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
-use aruna_core::plugins::{NodeCheckError, Refusal, ReleaseError};
-use aruna_core::realm_vault::{RealmSealed, RealmSecretRef, RealmVaultRecord};
+use aruna_core::operation::Operation;
+use aruna_core::plugin_installs::{BoundScope, SecretBinding};
+use aruna_core::plugins::NodeCheckError;
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
-use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings, UseRule};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_plugins::manifest::Manifest;
 use aruna_plugins::trigger::TriggerKind;
-use ulid::Ulid;
 
-use super::entry::ReadEntry;
-use super::install::{pick_version, read_manifest};
-use super::rows::read_rows;
-use crate::driver::{DriverContext, drive};
+use super::artifacts::ServingNode;
+use super::entry::{EntryError, ReadEntry};
+use super::peer::{ask_peer, peer_answer};
+use super::rows::{read_call, values};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::mutate_placement::node_kind;
-use crate::secrets::node::{record_key, value_entry};
-use crate::secrets::owner::sealed_value;
-
-/// The current entry of a bound secret in the serving node's view.
-pub struct Selected {
-    pub kind: SecretKind,
-    pub settings: SecretSettings,
-    pub rules: Vec<UseRule>,
-    pub incarnation: Option<Ulid>,
-    pub value_id: Ulid,
-    pub sealed: Sealed,
-}
-
-pub enum Sealed {
-    Owner(Box<SecretEntry>),
-    Realm(RealmVaultRecord),
-    /// The node vault entry of a node secret, by its value id.
-    Node(Ulid),
-}
-
-/// The kind the install's manifest declares for `slot`.
-pub(crate) fn slot_kind(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    slot: &str,
-) -> Result<SecretKind, ReleaseError> {
-    let unavailable = |error: String| ReleaseError::Unavailable(error);
-    let plugin = pick_version(config, &install.plugin, Some(&install.digest));
-    let manifest = read_manifest(&plugin.map_err(|error| unavailable(error.to_string()))?);
-    let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
-    let declared = manifest.secrets.get(slot).map(|slot| slot.kind);
-    let name = serde_json::to_value(declared).ok();
-    let name = name
-        .as_ref()
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    SecretKind::parse(name).map_err(|_| ReleaseError::Refused(Refusal::Entry))
-}
-
-/// The current entry of a group or realm secret, or `None` when it is absent or incomplete.
-pub async fn select(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    binding: &SecretBinding,
-) -> Result<Option<Selected>, ReleaseError> {
-    if binding.scope == BoundScope::Node {
-        let key = record_key(&binding.name);
-        let row = drive(read_rows(vec![(NODE_SECRETS_KEYSPACE, key)]), ctx).await;
-        let row = row.map_err(|error| ReleaseError::Unavailable(error.to_string()))?;
-        let row = row.into_iter().next().flatten();
-        let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
-        return Ok(record.map(|record| Selected {
-            kind: record.kind,
-            settings: record.settings,
-            rules: record.uses,
-            incarnation: None,
-            value_id: record.value_id,
-            sealed: Sealed::Node(record.value_id),
-        }));
-    }
-    if binding.scope == BoundScope::Realm {
-        let Some(record) = config
-            .secrets
-            .iter()
-            .find(|record| record.name == binding.name)
-        else {
-            return Ok(None);
-        };
-        let entry = RealmSecretRef::named(record.value_id).entry;
-        let sealed = config.vault.iter().find(|held| held.entry == entry);
-        return Ok(sealed.map(|sealed| Selected {
-            kind: record.kind.clone(),
-            settings: record.settings.clone(),
-            rules: record.uses.clone(),
-            incarnation: None,
-            value_id: record.value_id,
-            sealed: Sealed::Realm(sealed.clone()),
-        }));
-    }
-    let owner = SecretOwner::Group(install.group_id);
-    let Some(entry) = read_entry(ctx, config.realm_id, &owner, &binding.name).await? else {
-        return Ok(None);
-    };
-    let (Some(info), Some(value), Some(kind)) = (&entry.info, &entry.value, entry.kind()) else {
-        return Ok(None);
-    };
-    let SecretBody::Info(info) = &info.body else {
-        return Ok(None);
-    };
-    Ok(Some(Selected {
-        kind: kind.clone(),
-        settings: info.settings.clone(),
-        rules: info.uses.clone(),
-        incarnation: Some(entry.lifecycle.stamp.write_id),
-        value_id: value.stamp.write_id,
-        sealed: Sealed::Owner(Box::new(entry.clone())),
-    }))
-}
-
-/// Drives the register reader of one name on the node's own storage.
-pub(crate) async fn read_entry(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    owner: &SecretOwner,
-    name: &SecretName,
-) -> Result<Option<SecretEntry>, ReleaseError> {
-    let read = drive(ReadEntry::new(realm_id, owner, name), ctx).await;
-    read.map_err(|error| ReleaseError::Unavailable(error.to_string()))
-}
-
-pub async fn open(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    sealed: &Sealed,
-) -> Result<SecretBytes, ReleaseError> {
-    let failed = |error: String| ReleaseError::Unavailable(error);
-    let sealed = match sealed {
-        Sealed::Owner(entry) => {
-            sealed_value(realm_id, entry).map_err(|error| failed(error.to_string()))?
-        }
-        Sealed::Realm(record) => RealmSealed::Record {
-            realm_id,
-            record: record.clone(),
-        },
-        Sealed::Node(value_id) => {
-            let entry = value_entry(*value_id);
-            let read = StorageEffect::VaultRead {
-                entry,
-                txn_id: None,
-            };
-            return match ctx.storage_handle.send_storage_effect(read).await {
-                Event::Storage(StorageEvent::VaultResult {
-                    secret: Some(secret),
-                    ..
-                }) => Ok(secret),
-                other => Err(failed(format!("the node vault answered {}", other.label()))),
-            };
-        }
-    };
-    let open = StorageEffect::RealmOpen(Box::new(sealed));
-    match ctx.storage_handle.send_storage_effect(open).await {
-        Event::Storage(StorageEvent::RealmOpened { result }) => {
-            result.map_err(|error| failed(error.to_string()))
-        }
-        other => Err(failed(format!("the realm keys answered {}", other.label()))),
-    }
-}
+use crate::secrets::node::record_key;
 
 /// The vault kind a manifest slot kind names.
 pub fn vault_kind(kind: aruna_plugins::manifest::SecretKind) -> Option<SecretKind> {
@@ -180,96 +34,11 @@ pub fn vault_kind(kind: aruna_plugins::manifest::SecretKind) -> Option<SecretKin
 }
 
 /// Who installs into which group, on which management node, for which receiver.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BindPlace {
     pub group_id: aruna_core::types::GroupId,
     pub local: Option<NodeId>,
     pub receiver: Option<NodeId>,
-}
-
-/// The bindings of every slot the manifest declares, from `requested` (slot to `scope:name`)
-/// or the same name in the group, each checked where it lives; and the warnings for slots whose
-/// use rule a realm admin must add.
-pub(crate) async fn bind_slots(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    place: BindPlace,
-    manifest: &aruna_plugins::manifest::Manifest,
-    requested: &BTreeMap<String, String>,
-) -> Result<(BTreeMap<String, SecretBinding>, Vec<String>), BindError> {
-    if let Some(slot) = requested
-        .keys()
-        .find(|slot| !manifest.secrets.contains_key(*slot))
-    {
-        return Err(BindError::Invalid(format!(
-            "the manifest has no secret slot `{slot}`"
-        )));
-    }
-    let (mut bindings, mut warnings) = (BTreeMap::new(), Vec::new());
-    for (slot, declared) in &manifest.secrets {
-        let text = requested
-            .get(slot)
-            .cloned()
-            .unwrap_or_else(|| format!("group:{slot}"));
-        let invalid = || BindError::Invalid(format!("`{text}` is not a secret of slot `{slot}`"));
-        let binding = SecretBinding::parse(&text).ok_or_else(invalid)?;
-        let kind = vault_kind(declared.kind).ok_or_else(invalid)?;
-        let shown = kind.as_str();
-        let missing = || BindError::Invalid(format!("no {shown} secret `{binding}` for `{slot}`"));
-        // A node secret's settings live on the receiver, which checks them on every delivery.
-        let settings = match binding.scope {
-            BoundScope::Group => {
-                let owner = SecretOwner::Group(place.group_id);
-                let entry = read_entry(ctx, config.realm_id, &owner, &binding.name).await;
-                let entry = entry.map_err(|error| BindError::Unavailable(error.to_string()))?;
-                let entry = entry.filter(|entry| entry.kind() == Some(&kind));
-                match entry.as_ref().and_then(|entry| entry.info.as_ref()) {
-                    Some(info) => match &info.body {
-                        SecretBody::Info(info) => Some(info.settings.clone()),
-                        _ => None,
-                    },
-                    None => return Err(missing()),
-                }
-            }
-            BoundScope::Realm => {
-                let record = config
-                    .secrets
-                    .iter()
-                    .find(|record| record.name == binding.name);
-                let record = record.filter(|record| record.kind == kind);
-                let record = record.ok_or_else(missing)?;
-                warnings.push(format!(
-                    "a realm admin adds the use rule of `{binding}` for `{slot}`"
-                ));
-                Some(record.settings.clone())
-            }
-            BoundScope::Node => {
-                let (Some(local), Some(receiver)) = (place.local, place.receiver) else {
-                    return Err(BindError::Unavailable(
-                        "the receiver is not known yet".into(),
-                    ));
-                };
-                match check_node_binding(ctx, (local, receiver), &binding.name, &kind).await {
-                    Ok(_) => {}
-                    Err(NodeCheckError::Unavailable) => {
-                        return Err(BindError::Unavailable("the receiver did not answer".into()));
-                    }
-                    Err(_) => return Err(missing()),
-                }
-                warnings.push(format!(
-                    "a realm admin adds the use rule of `{binding}` for `{slot}`"
-                ));
-                None
-            }
-        };
-        if settings.is_some_and(|settings| delivery_clash(manifest, slot, &settings)) {
-            return Err(BindError::Invalid(format!(
-                "the webhook's delivery id is the header `{binding}` checks"
-            )));
-        }
-        bindings.insert(slot.clone(), binding);
-    }
-    Ok((bindings, warnings))
 }
 
 /// Whether the webhook that `slot` verifies reads its delivery id from the header the secret
@@ -294,70 +63,352 @@ pub enum BindError {
     Unavailable(String),
 }
 
+impl From<IoError> for BindError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+/// A node binding check that did not answer yes.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?}")]
+pub struct NodeCheckFailure(pub NodeCheckError);
+
+impl From<IoError> for NodeCheckFailure {
+    fn from(_: IoError) -> Self {
+        Self(NodeCheckError::Unavailable)
+    }
+}
+
+/// The slot a binding check is waiting for.
+#[derive(Debug, PartialEq)]
+struct PendingSlot {
+    slot: String,
+    binding: SecretBinding,
+    kind: SecretKind,
+}
+
+/// The bindings of every slot the manifest declares, from `requested` (slot to `scope:name`) or
+/// the same name in the group, each checked where it lives; and the warnings for slots whose use
+/// rule a realm admin must add.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BindSlots {
+    config: Arc<RealmConfigDocument>,
+    place: BindPlace,
+    manifest: Manifest,
+    requested: BTreeMap<String, String>,
+    slots: VecDeque<String>,
+    pending: Option<PendingSlot>,
+    bindings: BTreeMap<String, SecretBinding>,
+    warnings: Vec<String>,
+}
+
+/// The slots bound and what the admin should know about them.
+pub(crate) type BoundSlots = (BTreeMap<String, SecretBinding>, Vec<String>);
+
+impl BindSlots {
+    pub(crate) fn new(
+        config: Arc<RealmConfigDocument>,
+        place: BindPlace,
+        manifest: &Manifest,
+        requested: &BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            config,
+            place,
+            manifest: manifest.clone(),
+            requested: requested.clone(),
+            slots: manifest.secrets.keys().cloned().collect(),
+            pending: None,
+            bindings: BTreeMap::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn missing(pending: &PendingSlot) -> BindError {
+        let shown = pending.kind.as_str();
+        let (binding, slot) = (&pending.binding, &pending.slot);
+        BindError::Invalid(format!("no {shown} secret `{binding}` for `{slot}`"))
+    }
+
+    fn warn_rule(&mut self, pending: &PendingSlot) {
+        let (binding, slot) = (&pending.binding, &pending.slot);
+        self.warnings.push(format!(
+            "a realm admin adds the use rule of `{binding}` for `{slot}`"
+        ));
+    }
+
+    /// Records a checked slot; settings that clash with the webhook refuse it.
+    fn bound(
+        &mut self,
+        pending: PendingSlot,
+        settings: Option<SecretSettings>,
+    ) -> Result<(), BindError> {
+        let clash = |settings| delivery_clash(&self.manifest, &pending.slot, settings);
+        if settings.as_ref().is_some_and(clash) {
+            return Err(BindError::Invalid(format!(
+                "the webhook's delivery id is the header `{}` checks",
+                pending.binding
+            )));
+        }
+        self.bindings.insert(pending.slot, pending.binding);
+        Ok(())
+    }
+
+    fn advance(&mut self) -> Result<Next<BoundSlots>, BindError> {
+        while let Some(slot) = self.slots.pop_front() {
+            let text =
+                (self.requested.get(&slot).cloned()).unwrap_or_else(|| format!("group:{slot}"));
+            let invalid =
+                || BindError::Invalid(format!("`{text}` is not a secret of slot `{slot}`"));
+            let declared = self.manifest.secrets.get(&slot).ok_or_else(invalid)?;
+            let binding = SecretBinding::parse(&text).ok_or_else(invalid)?;
+            let kind = vault_kind(declared.kind).ok_or_else(invalid)?;
+            let pending = PendingSlot {
+                slot,
+                binding,
+                kind,
+            };
+            let name = pending.binding.name.clone();
+            // A node secret's settings live on the receiver, which checks them on every delivery.
+            let call = match pending.binding.scope {
+                BoundScope::Group => {
+                    let owner = SecretOwner::Group(self.place.group_id);
+                    IoCall::child(ReadEntry::new(self.config.realm_id, &owner, &name))
+                }
+                BoundScope::Node => {
+                    let (Some(local), Some(receiver)) = (self.place.local, self.place.receiver)
+                    else {
+                        let unknown = "the receiver is not known yet".to_string();
+                        return Err(BindError::Unavailable(unknown));
+                    };
+                    let check = CheckNodeBinding::new((local, receiver), &name, &pending.kind);
+                    IoCall::child(check)
+                }
+                BoundScope::Realm => {
+                    let record = (self.config.secrets.iter())
+                        .find(|record| record.name == name)
+                        .filter(|record| record.kind == pending.kind)
+                        .ok_or_else(|| Self::missing(&pending))?;
+                    let settings = record.settings.clone();
+                    self.warn_rule(&pending);
+                    self.bound(pending, Some(settings))?;
+                    continue;
+                }
+            };
+            self.pending = Some(pending);
+            return Ok(Next::Call(call));
+        }
+        let bindings = std::mem::take(&mut self.bindings);
+        Ok(Next::Done((bindings, std::mem::take(&mut self.warnings))))
+    }
+}
+
+fn entry_settings(entry: &SecretEntry) -> Option<SecretSettings> {
+    match &entry.info.as_ref()?.body {
+        SecretBody::Info(info) => Some(info.settings.clone()),
+        _ => None,
+    }
+}
+
+impl Operation for BindSlots {
+    type Output = BoundSlots;
+    type Error = BindError;
+
+    fn first(&mut self) -> Result<Next<BoundSlots>, BindError> {
+        let unknown =
+            (self.requested.keys()).find(|slot| !self.manifest.secrets.contains_key(*slot));
+        if let Some(slot) = unknown {
+            return Err(BindError::Invalid(format!(
+                "the manifest has no secret slot `{slot}`"
+            )));
+        }
+        self.advance()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<BoundSlots>, BindError> {
+        let pending = self.pending.take().ok_or(IoError::Unfinished)?;
+        let settings = match pending.binding.scope {
+            BoundScope::Node => {
+                match result.child::<Option<String>, NodeCheckFailure>()? {
+                    Ok(_) => {}
+                    Err(NodeCheckFailure(NodeCheckError::Unavailable)) => {
+                        let silent = "the receiver did not answer".to_string();
+                        return Err(BindError::Unavailable(silent));
+                    }
+                    Err(_) => return Err(Self::missing(&pending)),
+                }
+                self.warn_rule(&pending);
+                None
+            }
+            _ => {
+                let entry = result.child::<Option<SecretEntry>, EntryError>()?;
+                let entry = entry.map_err(|error| BindError::Unavailable(error.to_string()))?;
+                let entry = entry.filter(|entry| entry.kind() == Some(&pending.kind));
+                if entry.as_ref().is_none_or(|entry| entry.info.is_none()) {
+                    return Err(Self::missing(&pending));
+                }
+                entry.as_ref().and_then(entry_settings)
+            }
+        };
+        self.bound(pending, settings)?;
+        self.advance()
+    }
+}
+
 /// Whether this node holds the node secret `name` with `kind`; answers the header its `header`
 /// setting names, in lowercase. Never the value.
-pub(crate) async fn node_secret_fits(
-    ctx: &DriverContext,
-    name: &SecretName,
-    kind: &SecretKind,
-) -> Result<Option<String>, NodeCheckError> {
-    let read = vec![(NODE_SECRETS_KEYSPACE, record_key(name))];
-    let row = drive(read_rows(read), ctx).await;
-    let row = row.map_err(|_| NodeCheckError::Unavailable)?;
-    let row = row.into_iter().next().flatten();
-    let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
-    match record {
-        None => Err(NodeCheckError::Missing),
-        Some(record) if record.kind != *kind => Err(NodeCheckError::OtherKind),
-        Some(record) => Ok(record
-            .settings
-            .get("header")
-            .map(|h| h.to_ascii_lowercase())),
+#[derive(Debug, PartialEq)]
+pub(crate) struct NodeSecretFits {
+    name: SecretName,
+    kind: SecretKind,
+}
+
+impl NodeSecretFits {
+    pub(crate) fn new(name: &SecretName, kind: &SecretKind) -> Self {
+        Self {
+            name: name.clone(),
+            kind: kind.clone(),
+        }
+    }
+}
+
+impl Operation for NodeSecretFits {
+    type Output = Option<String>;
+    type Error = NodeCheckFailure;
+
+    fn first(&mut self) -> Result<Next<Option<String>>, NodeCheckFailure> {
+        let row = (NODE_SECRETS_KEYSPACE, record_key(&self.name));
+        Ok(Next::Call(read_call(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, NodeCheckFailure> {
+        let unavailable = NodeCheckFailure(NodeCheckError::Unavailable);
+        let [row] = values::<1>(result).map_err(|_| unavailable)?;
+        let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
+        match record {
+            None => Err(NodeCheckFailure(NodeCheckError::Missing)),
+            Some(record) if record.kind != self.kind => {
+                Err(NodeCheckFailure(NodeCheckError::OtherKind))
+            }
+            Some(record) => Ok(Next::Done(
+                record
+                    .settings
+                    .get("header")
+                    .map(|h| h.to_ascii_lowercase()),
+            )),
+        }
     }
 }
 
 /// Checks a node binding where it lives: on `receiver`, here or over the metadata transport;
-/// answers the secret's checked header as [`node_secret_fits`] does.
-pub(crate) async fn check_node_binding(
-    ctx: &DriverContext,
-    (local, receiver): (NodeId, NodeId),
-    name: &SecretName,
-    kind: &SecretKind,
-) -> Result<Option<String>, NodeCheckError> {
-    if receiver == local {
-        return node_secret_fits(ctx, name, kind).await;
+/// answers the secret's checked header as [`NodeSecretFits`] does.
+#[derive(Debug, PartialEq)]
+pub(crate) struct CheckNodeBinding {
+    local: NodeId,
+    receiver: NodeId,
+    name: SecretName,
+    kind: SecretKind,
+}
+
+impl CheckNodeBinding {
+    pub(crate) fn new(
+        (local, receiver): (NodeId, NodeId),
+        name: &SecretName,
+        kind: &SecretKind,
+    ) -> Self {
+        Self {
+            local,
+            receiver,
+            name: name.clone(),
+            kind: kind.clone(),
+        }
     }
-    let metadata = ctx.metadata_handle.as_ref();
-    let metadata = metadata.ok_or(NodeCheckError::Unavailable)?;
-    let asked = metadata.request_node_check(receiver, name.clone(), kind.clone());
-    asked.await
+}
+
+impl Operation for CheckNodeBinding {
+    type Output = Option<String>;
+    type Error = NodeCheckFailure;
+
+    fn first(&mut self) -> Result<Next<Option<String>>, NodeCheckFailure> {
+        if self.receiver == self.local {
+            let fits = NodeSecretFits::new(&self.name, &self.kind);
+            return Ok(Next::Call(IoCall::child(fits)));
+        }
+        let message = MetadataTransportMessage::CheckNodeSecret {
+            name: self.name.clone(),
+            kind: self.kind.clone(),
+        };
+        let call = ask_peer(self.receiver, &message);
+        Ok(Next::Call(
+            call.ok_or(NodeCheckFailure(NodeCheckError::Unavailable))?,
+        ))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, NodeCheckFailure> {
+        if self.receiver == self.local {
+            return Ok(Next::Done(
+                result.child::<Option<String>, NodeCheckFailure>()??,
+            ));
+        }
+        match peer_answer(self.receiver, result)? {
+            Some(MetadataTransportMessage::NodeSecretChecked { result }) => {
+                Ok(Next::Done(result.map_err(NodeCheckFailure)?))
+            }
+            _ => Err(NodeCheckFailure(NodeCheckError::Unavailable)),
+        }
+    }
 }
 
 /// The receiver side of a node binding check, for a management node that installs or a server
 /// node that relays a webhook.
-pub(crate) async fn serve_node_check(
-    ctx: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub(crate) struct ServeNodeCheck {
+    node: ServingNode,
     peer: NodeId,
     name: SecretName,
     kind: SecretKind,
-) -> Result<Option<String>, NodeCheckError> {
-    let local = super::artifacts::local_config(ctx).await;
-    let (config, _) = local.map_err(|_| NodeCheckError::Unavailable)?;
-    node_check_for(ctx, (&config, peer), &name, &kind).await
+    checked: bool,
 }
 
-async fn node_check_for(
-    ctx: &DriverContext,
-    (config, peer): (&RealmConfigDocument, NodeId),
-    name: &SecretName,
-    kind: &SecretKind,
-) -> Result<Option<String>, NodeCheckError> {
-    let server =
-        node_kind(config, peer).is_some_and(|kind| !matches!(kind, RealmNodeKind::User { .. }));
-    if !server {
-        return Err(NodeCheckError::Forbidden);
+impl ServeNodeCheck {
+    pub(crate) fn new(node: ServingNode, peer: NodeId, name: SecretName, kind: SecretKind) -> Self {
+        Self {
+            node,
+            peer,
+            name,
+            kind,
+            checked: false,
+        }
     }
-    node_secret_fits(ctx, name, kind).await
+}
+
+impl Operation for ServeNodeCheck {
+    type Output = Option<String>;
+    type Error = NodeCheckFailure;
+
+    fn first(&mut self) -> Result<Next<Option<String>>, NodeCheckFailure> {
+        let read = GetConfigOperation::new(self.node.0);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, NodeCheckFailure> {
+        if self.checked {
+            return Ok(Next::Done(
+                result.child::<Option<String>, NodeCheckFailure>()??,
+            ));
+        }
+        let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+        let config = config.map_err(|_| NodeCheckFailure(NodeCheckError::Unavailable))?;
+        let server = node_kind(&config, self.peer)
+            .is_some_and(|kind| !matches!(kind, RealmNodeKind::User { .. }));
+        if !server {
+            return Err(NodeCheckFailure(NodeCheckError::Forbidden));
+        }
+        self.checked = true;
+        let fits = NodeSecretFits::new(&self.name, &self.kind);
+        Ok(Next::Call(IoCall::child(fits)))
+    }
 }
 
 #[cfg(test)]

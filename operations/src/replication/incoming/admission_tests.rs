@@ -4,10 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::pure_tests::{
-    bucket_read, load_routing, make_bucket_info, make_manifest, test_realm_id,
+    asked, bucket_read, event_result, load_routing, make_bucket_info, make_manifest, test_realm_id,
 };
 use super::*;
 use crate::distribution::test_record::{authority_rows, binding, member, replicated, secret};
+use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
 use aruna_core::structs::storage::distribution::Publication;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
@@ -62,15 +63,18 @@ fn admit_fenced(
     record: Vec<u8>,
     fence: Option<Vec<u8>>,
 ) -> IncomingVersionOperation {
-    operation.start();
-    operation.step(bucket_read(Some(bucket.to_bytes().unwrap().into())));
+    operation.first().unwrap();
+    operation
+        .next(bucket_read(Some(bucket.to_bytes().unwrap().into())))
+        .unwrap();
     let effects = load_routing(&mut operation, GroupRoutingInputs::default());
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: None })]
+        asked(&effects),
+        Effect::Storage(StorageEffect::BatchRead { reads, txn_id: None })
             if reads[0].0 == DISTRIBUTION_KEYSPACE
     ));
-    operation.step(authority_rows(Some(record), fence));
+    let answer = event_result(authority_rows(Some(record), fence));
+    operation.next(answer).unwrap();
     operation
 }
 
@@ -122,8 +126,10 @@ fn refuses_unbound_destination() {
     let (manifest, _, mut bucket) = published();
     bucket.distribution = None;
     let mut operation = receiver(manifest, 1);
-    operation.start();
-    operation.step(bucket_read(Some(bucket.to_bytes().unwrap().into())));
+    operation.first().unwrap();
+    operation
+        .next(bucket_read(Some(bucket.to_bytes().unwrap().into())))
+        .unwrap();
     assert!(rejected(&operation));
 }
 
@@ -134,8 +140,10 @@ fn refuses_foreign_input() {
     manifest.distribution = None;
     manifest.writer_auth_context = Some(manifest.auth_context.clone());
     let mut operation = receiver(manifest, 1);
-    operation.start();
-    operation.step(bucket_read(Some(bucket.to_bytes().unwrap().into())));
+    operation.first().unwrap();
+    operation
+        .next(bucket_read(Some(bucket.to_bytes().unwrap().into())))
+        .unwrap();
     assert!(rejected(&operation));
 }
 
@@ -143,8 +151,8 @@ fn refuses_foreign_input() {
 fn never_creates_member() {
     let (manifest, _, _) = published();
     let mut operation = receiver(manifest, 1);
-    operation.start();
-    operation.step(bucket_read(None));
+    operation.first().unwrap();
+    operation.next(bucket_read(None)).unwrap();
     assert!(
         rejected(&operation),
         "a missing member bucket is not created by a publication"

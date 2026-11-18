@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
+use crate::plugins::calls::*;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{EventBatch, RECEIVER_GAP, RunState, RunTrigger, SourceEvent};
@@ -11,16 +12,17 @@ use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
+use crate::plugin_host::worker::decide_batch;
+use crate::plugin_host::worker::prune_runs;
+use crate::plugin_host::worker::tests::{created, installed, scoped, worker};
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, journal};
-use crate::plugins::rows::{page_result, values_result};
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, save_run, unfinished};
 use crate::plugins::store::Txn;
-use crate::plugins::worker::decide_batch;
-use crate::plugins::worker::prune_runs;
-use crate::plugins::worker::tests::{created, installed, scoped, worker};
+use aruna_plugins::broker::HostError;
 
 /// A created dataset journaled now, and its forward row for `install`.
 fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, ForwardRow) {
@@ -456,4 +458,144 @@ fn late_event_counted() {
     };
     assert_eq!(rows.len(), 1);
     assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(()));
+}
+
+fn empty_config() -> Arc<RealmConfigDocument> {
+    let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+    Arc::new(RealmConfigDocument::new(realm, Vec::new(), 3))
+}
+
+fn local_node() -> NodeId {
+    iroh::SecretKey::from_bytes(&[3u8; 32]).public()
+}
+
+fn with_install() -> Arc<RealmConfigDocument> {
+    let mut config = (*empty_config()).clone();
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    config.installs.push(install);
+    Arc::new(config)
+}
+
+fn is_child<T>(next: Next<T>) -> bool {
+    matches!(next, Next::Call(IoCall::Child(_)))
+}
+
+#[test]
+fn judge_needs_record() {
+    let row = plain_row("s1");
+    let mut absent = Judge::new(empty_config(), local_node(), row.clone(), 9);
+    assert_eq!(absent.first(), Ok(Next::Done(Verdict::Unready)));
+    let mut stale_row = row.clone();
+    stale_row.revision = 9;
+    let mut stale = Judge::new(with_install(), local_node(), stale_row, 9);
+    assert_eq!(stale.first(), Ok(Next::Done(Verdict::Unready)));
+    let mut waiting = Judge::new(with_install(), local_node(), row, 9);
+    assert!(is_child(waiting.first().unwrap()));
+    let missing = child_result(Ok::<bool, AccountError>(false));
+    assert_eq!(waiting.next(missing), Ok(Next::Done(Verdict::Unready)));
+}
+
+#[test]
+fn judge_maps_check() {
+    let run = queued(Ulid::from_parts(1, 1), 1);
+    let judged = |outcome: Result<PluginInstall, CallError>| {
+        let mut judge = Judge::new(with_install(), local_node(), plain_row("s1"), 9);
+        judge.phase = JudgePhase::Checking(Box::new(run.clone()));
+        judge.next(child_result(outcome)).unwrap()
+    };
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    assert_eq!(
+        judged(Ok(install)),
+        Next::Done(Verdict::Run(Box::new(run.clone())))
+    );
+    let busy = CallError(crate::plugins::unavailable("later"));
+    assert_eq!(judged(Err(busy)), Next::Done(Verdict::Unavailable));
+    let denied = HostError::new(ErrorKind::Denied, "no");
+    assert_eq!(
+        judged(Err(CallError(denied))),
+        Next::Done(Verdict::Denied("no".into()))
+    );
+}
+
+#[test]
+fn row_reuses_outcome() {
+    let mut decide = DecideRow::new(empty_config(), local_node(), plain_row("s1"), 9);
+    assert!(is_child(decide.first().unwrap()));
+    let seen = child_result(Ok::<_, StoreError>(Some(Outcome::Expired)));
+    assert_eq!(decide.next(seen), Ok(Next::Done(Outcome::Expired)));
+}
+
+#[test]
+fn late_row_expires() {
+    let now = DEDUP_RETENTION_MS + 100;
+    let mut decide = DecideRow::new(empty_config(), local_node(), plain_row("s1"), now);
+    let unseen = child_result(Ok::<Option<Outcome>, StoreError>(None));
+    assert!(is_child(decide.next(unseen).unwrap()));
+    assert_eq!(decide.phase, RowPhase::Late);
+    let counted = child_result(Ok::<(), StoreError>(()));
+    assert_eq!(decide.next(counted), Ok(Next::Done(Outcome::Expired)));
+}
+
+#[test]
+fn row_judged_first() {
+    let mut decide = DecideRow::new(empty_config(), local_node(), plain_row("s1"), 9);
+    let unseen = child_result(Ok::<Option<Outcome>, StoreError>(None));
+    assert!(is_child(decide.next(unseen).unwrap()));
+    let verdict = child_result(Ok::<_, StoreError>(Verdict::Denied("no".into())));
+    assert!(is_child(decide.next(verdict).unwrap()));
+    let outcome = child_result(Ok::<_, StoreError>(Outcome::Expired));
+    assert_eq!(decide.next(outcome), Ok(Next::Done(Outcome::Expired)));
+}
+
+#[test]
+fn batch_collects_decisions() {
+    let batch = EventBatch {
+        events: vec![plain_row("s1")],
+        gaps: Vec::new(),
+    };
+    let nodes = (local_node(), local_node());
+    let mut decide = DecideBatch::new(empty_config(), nodes, batch, 9);
+    assert!(is_child(decide.first().unwrap()), "the event");
+    let outcome = child_result(Ok::<_, StoreError>(Outcome::Expired));
+    assert!(is_child(decide.next(outcome).unwrap()), "the gap reports");
+    let kept = Vec::<(Ulid, SourceKind, GapReason, u64)>::new();
+    let Next::Done(decisions) = decide
+        .next(child_result(Ok::<_, StoreError>(kept)))
+        .unwrap()
+    else {
+        panic!("the reports end the batch");
+    };
+    let install = Ulid::from_parts(1, 1);
+    let expected = vec![(install, "s1".to_string(), Outcome::Expired)];
+    assert_eq!(decisions.events, expected);
+}
+
+mod operations {
+    use super::*;
+    use crate::plugins::fixtures::{self, config_result, is_child, node};
+
+    fn serve(peer: u8) -> ServeEvents {
+        let place = (fixtures::realm(), node(1));
+        ServeEvents::new(place, node(peer), EventBatch::default(), 5)
+    }
+
+    #[test]
+    fn serve_decides_batch() {
+        let mut events = serve(3);
+        assert_eq!(events.hold_scope(), Some(HoldScope::PluginAdmissions));
+        assert!(is_child(&events.first()));
+        assert!(is_child(
+            &events.next(config_result(fixtures::realm_nodes()))
+        ));
+        let decided = child_result(Ok::<_, StoreError>(Decisions::default()));
+        assert_eq!(events.next(decided), Ok(Next::Done(Decisions::default())));
+    }
+
+    #[test]
+    fn serve_refuses_device() {
+        let mut events = serve(4);
+        events.first().unwrap();
+        let refused = events.next(config_result(fixtures::realm_nodes()));
+        assert_eq!(refused, Err(MetadataReadError::Forbidden));
+    }
 }

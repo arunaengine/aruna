@@ -4,25 +4,104 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{PolicyEvaluator, enforce_policies};
-use crate::auth::error::{AuthorizeError, check_error};
+use crate::auth::enforcement::{PolicyEvaluator, PolicyLoadOperation};
+use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
 use crate::auth::permission_rules::{
     GroupPermissionRules, PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
+use crate::auth::policy_load::enforce_policies;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::operation::Operation;
 use aruna_core::permission_path::readable_roots;
+use aruna_core::request_policy::PolicyRequest;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::types::GroupId;
 use std::collections::{BTreeSet, HashMap};
 
-/// Authorizes one action: ordinary RBAC and public visibility first, then the
-/// realm and group deny/require policies. Neither layer may grant what the
-/// other denied.
+/// Authorizes one action: ordinary RBAC and public visibility first, then the realm and group
+/// deny/require policies. Neither layer may grant what the other denied.
+#[derive(Debug, PartialEq)]
+pub struct AuthorizeOperation {
+    realm_id: RealmId,
+    auth: AuthContext,
+    path: String,
+    permission: Permission,
+    extras: PolicyRequestExtras,
+    /// Set once the role check passed and the policies are loading.
+    checked: bool,
+}
+
+impl AuthorizeOperation {
+    pub fn new(
+        realm_id: RealmId,
+        auth: AuthContext,
+        path: String,
+        permission: Permission,
+        extras: PolicyRequestExtras,
+    ) -> Self {
+        Self {
+            realm_id,
+            auth,
+            path,
+            permission,
+            extras,
+            checked: false,
+        }
+    }
+
+    fn request(&self) -> PolicyRequest {
+        let extras = self.extras.clone();
+        policy_request_with(&self.path, &self.permission, Some(&self.auth), extras)
+    }
+}
+
+impl Operation for AuthorizeOperation {
+    type Output = ();
+    type Error = AuthorizeError;
+
+    fn first(&mut self) -> Result<Next<()>, AuthorizeError> {
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.auth.clone(),
+            path: self.path.clone(),
+            required_permission: self.permission.clone(),
+        });
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, AuthorizeError> {
+        if self.checked {
+            result
+                .child::<PolicyEvaluator, PolicyEnforcementError>()??
+                .evaluate(&self.request())?;
+            return Ok(Next::Done(()));
+        }
+        let allowed = result
+            .child::<bool, AuthorizationError>()?
+            .map_err(check_error)?;
+        if !allowed {
+            return Err(AuthorizeError::PermissionDenied);
+        }
+        self.checked = true;
+        let load = PolicyLoadOperation::for_request(self.realm_id, &self.request());
+        Ok(Next::Call(IoCall::child(load)))
+    }
+
+    fn expected_error(error: &AuthorizeError) -> bool {
+        matches!(
+            error,
+            AuthorizeError::PermissionDenied
+                | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })
+        )
+    }
+}
+
+/// Runs [`AuthorizeOperation`] for one request.
 pub async fn authorize(
     context: &DriverContext,
     realm_id: RealmId,
@@ -31,26 +110,14 @@ pub async fn authorize(
     permission: &Permission,
     extras: PolicyRequestExtras,
 ) -> Result<(), AuthorizeError> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path: path.to_string(),
-            required_permission: permission.clone(),
-        }),
-        context,
-    )
-    .await
-    .map_err(check_error)?;
-    if !allowed {
-        return Err(AuthorizeError::PermissionDenied);
-    }
-    enforce_policies(
-        context,
+    let operation = AuthorizeOperation::new(
         realm_id,
-        &policy_request_with(path, permission, Some(auth), extras),
-    )
-    .await?;
-    Ok(())
+        auth.clone(),
+        path.to_string(),
+        permission.clone(),
+        extras,
+    );
+    drive(operation, context).await
 }
 
 /// Authorizes `permission` by RBAC on `path` or else on `alternative`, then always enforces the

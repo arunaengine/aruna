@@ -5,9 +5,10 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::plugins::broker::call_intent;
-use crate::plugins::rows::{page_result, values_result};
-use crate::plugins::worker::prune_runs;
+use crate::plugin_host::worker::prune_runs;
+use crate::plugins::host_calls::call_intent;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::{page_result, values_result};
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};
@@ -479,4 +480,21 @@ fn expired_runs_listed() {
     ));
     let done = plan.next(page_result(Vec::new(), None)).unwrap();
     assert_eq!(done, Next::Done(vec![(install, ended.run_id)]));
+}
+
+#[test]
+fn prunes_each_expired() {
+    let ids = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+    let mut prune = PruneRuns::new(9);
+    assert!(matches!(prune.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let listed = child_result(Ok::<_, RunError>(vec![ids]));
+    assert!(matches!(
+        prune.next(listed),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let dropped = child_result(Ok::<(), StoreError>(()));
+    assert_eq!(prune.next(dropped), Ok(Next::Done(1)));
+    let mut empty = PruneRuns::new(9);
+    let none = child_result(Ok::<Vec<(Ulid, Ulid)>, RunError>(Vec::new()));
+    assert_eq!(empty.next(none), Ok(Next::Done(0)));
 }

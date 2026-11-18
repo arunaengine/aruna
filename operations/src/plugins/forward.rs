@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
@@ -11,26 +12,33 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 
 use aruna_core::NodeId;
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
     PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE,
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataBatch,
-    MetadataEventPayload, MetadataEventRecord,
+    MetadataEffect, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
 };
+use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
-    Decisions, EventBatch, ForwardRow, GapReason, GapRow, Outcome, SEND_EXPIRY_MS, gap_key,
+    Decisions, EventBatch, ForwardRow, GapReason, GapRow, Outcome, SEND_EXPIRY_MS, SENDER_GAP,
+    SourceKind, gap_key,
 };
 use aruna_core::storage_entries::{event_log_key, graph_lifecycle_key, materialization_status_key};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
 use super::matcher::Outbox;
+use super::peer::{ask_peer, peer_answer};
 use super::rows::{
-    Rows, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of, read_call,
-    row as row_of, values,
+    Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
+    read_call, row as row_of, values,
 };
+use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 /// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;
@@ -65,7 +73,7 @@ impl Backoff {
 pub(crate) type Pending = (EventBatch, BTreeMap<(Ulid, String), Vec<u8>>);
 
 /// One receiver's requests, each with the encoded row bytes it holds.
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct Requests {
     bound: usize,
     pub(crate) open: Vec<(Pending, usize)>,
@@ -412,6 +420,320 @@ impl Operation for Apply {
                 done(answer)?;
                 Ok(Next::Done((self.count, self.busy)))
             }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadablePhase {
+    Facts,
+    Dot { deleted: bool },
+}
+
+/// Whether a dataset event is not readable here yet: its own change is not materialized and the
+/// document is not deleted. A parked job keeps the row until its send expiry counts a gap.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Unreadable {
+    kind: SourceKind,
+    ids: Option<(Ulid, Ulid)>,
+    /// Whether this node has a metadata store that can be asked about a change.
+    metadata: bool,
+    phase: ReadablePhase,
+}
+
+impl Unreadable {
+    pub(crate) fn new(row: &ForwardRow, metadata: bool) -> Self {
+        let event = &row.event;
+        let ids = (event.resource.parse().ok()).zip(event.revision.parse().ok());
+        Self {
+            kind: event.kind,
+            ids,
+            metadata,
+            phase: ReadablePhase::Facts,
+        }
+    }
+}
+
+impl Operation for Unreadable {
+    type Output = bool;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<bool>, StoreError> {
+        let Some((document, event_id)) = self.ids else {
+            return Ok(Next::Done(false));
+        };
+        let updated = match self.kind {
+            SourceKind::DataUploaded
+            | SourceKind::SyncCompleted
+            | SourceKind::SyncFailed
+            | SourceKind::JobFinished => return Ok(Next::Done(false)),
+            SourceKind::DatasetCreated => false,
+            SourceKind::DatasetUpdated => true,
+        };
+        let facts = dataset_facts(document, event_id, updated);
+        Ok(Next::Call(IoCall::child(facts)))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
+        if let ReadablePhase::Dot { deleted } = self.phase {
+            let applied = match answer.event()? {
+                Event::Metadata(MetadataEvent::ContainsDotResult { contains, .. }) => contains,
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    return Err(StoreError(error.to_string()));
+                }
+                other => return Err(StoreError(format!("unexpected {}", other.label()))),
+            };
+            return Ok(Next::Done(!applied && !deleted));
+        }
+        let mut facts = answer.child::<Facts, StoreError>()??;
+        let event_id = self.ids.map(|(_, event_id)| event_id).unwrap_or_default();
+        let applied = match (self.kind, facts.batch.take()) {
+            (SourceKind::DatasetCreated, _) => facts.materialized(|id| id >= event_id),
+            (_, Some((graph_iri, batch))) => {
+                if !self.metadata {
+                    return Ok(Next::Done(false));
+                }
+                self.phase = ReadablePhase::Dot {
+                    deleted: facts.deleted,
+                };
+                let dot = MetadataEffect::ContainsDot {
+                    graph_iri,
+                    actor: batch.actor,
+                    counter: batch.counter,
+                };
+                return Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(dot)))));
+            }
+            (_, None) => facts.logged && facts.materialized(|id| id == event_id),
+        };
+        Ok(Next::Done(!applied && !facts.deleted))
+    }
+}
+
+/// What the outbox pass is waiting for.
+#[derive(Debug, PartialEq)]
+enum CollectPhase {
+    NextInstall,
+    Dropping,
+    Expiring {
+        install_id: Ulid,
+        receiver: Option<NodeId>,
+    },
+    Reading {
+        install_id: Ulid,
+        receiver: NodeId,
+        rows: VecDeque<(Vec<u8>, Vec<u8>)>,
+        current: Box<(Vec<u8>, ForwardRow, usize)>,
+    },
+    ScanningGaps(Scan),
+    DroppingGap(VecDeque<(Vec<u8>, Vec<u8>)>),
+}
+
+/// The requests of one outbox pass by receiver. Rows of removed installs are dropped, rows past
+/// their send expiry become gaps, rows and unacknowledged gaps of `open` receivers join a request
+/// unless their dataset is not readable here yet.
+#[derive(Debug, PartialEq)]
+pub(crate) struct CollectOutbox {
+    config: Arc<RealmConfigDocument>,
+    open: BTreeSet<NodeId>,
+    now_ms: u64,
+    bound: usize,
+    metadata: bool,
+    after: Option<Ulid>,
+    batches: BTreeMap<NodeId, Requests>,
+    phase: CollectPhase,
+}
+
+impl CollectOutbox {
+    pub(crate) fn new(
+        config: Arc<RealmConfigDocument>,
+        open: BTreeSet<NodeId>,
+        (now_ms, bound): (u64, usize),
+        metadata: bool,
+    ) -> Self {
+        Self {
+            config,
+            open,
+            now_ms,
+            bound,
+            metadata,
+            after: None,
+            batches: BTreeMap::new(),
+            phase: CollectPhase::NextInstall,
+        }
+    }
+
+    /// The install of `install_id` while it is not being removed.
+    fn kept(&self, install_id: Ulid) -> Option<NodeId> {
+        (self.config.installs.iter())
+            .find(|install| install.install_id == install_id)
+            .filter(|install| install.state != InstallState::Removing)
+            .map(|install| install.receiver)
+    }
+
+    fn next_install(&mut self) -> IoCall {
+        self.phase = CollectPhase::NextInstall;
+        IoCall::child(next_install(self.after))
+    }
+
+    fn scan_gaps(&mut self) -> IoCall {
+        let scan = Scan::new(PLUGIN_GAPS_KEYSPACE, vec![SENDER_GAP]);
+        let call = scan.ask();
+        self.phase = CollectPhase::ScanningGaps(scan);
+        call
+    }
+
+    /// The readability check of the next row, or the next install.
+    fn next_row(
+        &mut self,
+        install_id: Ulid,
+        receiver: NodeId,
+        mut rows: VecDeque<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<IoCall, StoreError> {
+        let Some((key, value)) = rows.pop_front() else {
+            return Ok(self.next_install());
+        };
+        let row: ForwardRow = decode(&value)?;
+        let check = Unreadable::new(&row, self.metadata);
+        self.phase = CollectPhase::Reading {
+            install_id,
+            receiver,
+            rows,
+            current: Box::new((key, row, value.len())),
+        };
+        Ok(IoCall::child(check))
+    }
+
+    /// Adds the gaps of `rows`; stops at a gap of a removed install, which is dropped first.
+    fn take_gaps(
+        &mut self,
+        mut rows: VecDeque<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Next<BTreeMap<NodeId, Requests>>, StoreError> {
+        while let Some((key, value)) = rows.pop_front() {
+            let install_id = Ulid::from_bytes(key[1..17].try_into().unwrap_or_default());
+            let Some(receiver) = self.kept(install_id) else {
+                self.phase = CollectPhase::DroppingGap(rows);
+                return Ok(Next::Call(IoCall::child(drop_rows(
+                    PLUGIN_GAPS_KEYSPACE,
+                    key,
+                ))));
+            };
+            let row: GapRow = decode(&value)?;
+            if row.sequence > row.acked && self.open.contains(&receiver) {
+                let requests = receiver_requests(&mut self.batches, receiver, self.bound);
+                let (batch, _) = requests.room(value.len() + 16);
+                batch.gaps.push((install_id, row));
+            }
+        }
+        Ok(Next::Done(std::mem::take(&mut self.batches)))
+    }
+}
+
+impl Operation for CollectOutbox {
+    type Output = BTreeMap<NodeId, Requests>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(self.next_install()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
+        match std::mem::replace(&mut self.phase, CollectPhase::Dropping) {
+            CollectPhase::NextInstall => {
+                let Some(install_id) = answer.child::<Option<Ulid>, StoreError>()?? else {
+                    return Ok(Next::Call(self.scan_gaps()));
+                };
+                self.after = Some(install_id);
+                let Some(receiver) = self.kept(install_id) else {
+                    let prefix = install_id.to_bytes().to_vec();
+                    let drop = drop_rows(PLUGIN_OUTBOX_KEYSPACE, prefix);
+                    return Ok(Next::Call(IoCall::child(drop)));
+                };
+                let receiver = self.open.contains(&receiver).then_some(receiver);
+                if let Some(receiver) = receiver {
+                    receiver_requests(&mut self.batches, receiver, self.bound);
+                }
+                self.phase = CollectPhase::Expiring {
+                    install_id,
+                    receiver,
+                };
+                Ok(Next::Call(IoCall::child(expire_rows(
+                    install_id,
+                    self.now_ms,
+                ))))
+            }
+            CollectPhase::Dropping => {
+                answer.child::<(), StoreError>()??;
+                Ok(Next::Call(self.next_install()))
+            }
+            CollectPhase::Expiring {
+                install_id,
+                receiver,
+            } => {
+                let kept = answer.child::<Rows, StoreError>()??;
+                Ok(Next::Call(match receiver {
+                    Some(receiver) => self.next_row(install_id, receiver, kept.into())?,
+                    None => self.next_install(),
+                }))
+            }
+            CollectPhase::Reading {
+                install_id,
+                receiver,
+                rows,
+                current,
+            } => {
+                let (key, row, size) = *current;
+                if !answer.child::<bool, StoreError>()?? {
+                    let requests = receiver_requests(&mut self.batches, receiver, self.bound);
+                    let (batch, keys) = requests.room(size);
+                    keys.insert((install_id, row.event.source.clone()), key);
+                    batch.events.push(row);
+                }
+                Ok(Next::Call(self.next_row(install_id, receiver, rows)?))
+            }
+            CollectPhase::ScanningGaps(mut scan) => match scan.take(answer)? {
+                Some(rows) => self.take_gaps(rows.into()),
+                None => {
+                    let call = scan.ask();
+                    self.phase = CollectPhase::ScanningGaps(scan);
+                    Ok(Next::Call(call))
+                }
+            },
+            CollectPhase::DroppingGap(rows) => {
+                answer.child::<(), StoreError>()??;
+                self.take_gaps(rows)
+            }
+        }
+    }
+}
+
+/// Hands a batch of events to its receiver over the metadata transport.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SendEvents {
+    node: NodeId,
+    batch: EventBatch,
+}
+
+impl SendEvents {
+    pub(crate) fn new(node: NodeId, batch: EventBatch) -> Self {
+        Self { node, batch }
+    }
+}
+
+impl Operation for SendEvents {
+    type Output = Decisions;
+    type Error = MetadataReadError;
+
+    fn first(&mut self) -> Result<Next<Decisions>, MetadataReadError> {
+        let batch = std::mem::take(&mut self.batch);
+        let forward = MetadataTransportMessage::ForwardEvents { batch };
+        let ask = ask_peer(self.node, &forward).ok_or(MetadataReadError::Unavailable)?;
+        Ok(Next::Call(ask))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Decisions>, MetadataReadError> {
+        match peer_answer(self.node, result)? {
+            Some(MetadataTransportMessage::EventsDecided { result }) => Ok(Next::Done(result?)),
+            _ => Err(MetadataReadError::Unavailable),
         }
     }
 }

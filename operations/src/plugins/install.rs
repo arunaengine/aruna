@@ -3,19 +3,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, LazyLock};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
-use aruna_core::keyspaces::AUTH_KEYSPACE;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugin_installs::{
-    BoundScope, InstallGuard, InstallState, PluginInstall, Prerequisite, SecretBinding,
+    BoundScope, InstallState, PluginInstall, Prerequisite, SecretBinding,
 };
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission as Access};
+use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
+use aruna_core::structs::identity::user::User;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_plugins::artifact::ArtifactDigest;
@@ -23,15 +24,14 @@ use aruna_plugins::manifest::Manifest;
 use aruna_plugins::permission::{Grant, Permission};
 use serde_json::{Map, Value};
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::account::{
-    Identity, account_name, check_ready, ensure_account, ensure_role, guard_of, read_auth,
-    read_row, read_user, teardown,
+    AccountChange, AccountError, CheckReady, Identity, MakeReady, ReadGroupAuth, StepError,
+    Teardown,
 };
-use super::bound::{BindError, BindPlace, bind_slots, vault_kind};
+use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, vault_kind};
 use super::grants::covers;
 use super::grants::{
     GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
@@ -39,19 +39,17 @@ use super::grants::{
 };
 use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
-use super::rules::{ensure_rules, retire_rules};
+use super::rules::{EnsureRules, RetireRules, RulesFailure};
 use super::settings::{SettingError, check_settings};
-use super::sweep::{ORPHAN_GRACE_MS, plugin_accounts};
-use crate::auth::enforcement::enforce_policies;
-use crate::auth::request_authorization::permission_rules;
+use crate::auth::enforcement::{group_from_path, policy_reads, read_policies};
+use crate::auth::permission_rules::{PermissionRules, read_rules, rule_reads};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
-use crate::realm::mutate_placement::is_management;
-use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
-use crate::users::service_account::check::{ServiceCheckConfig, ServiceCheckOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::users::service_account::check::{
+    ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation,
+};
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum InstallError {
     #[error("caller may not administer this group's plugins")]
     Unauthorized,
@@ -79,6 +77,33 @@ pub enum InstallError {
     Unavailable(String),
     #[error("{0}")]
     Binding(String),
+}
+
+impl From<IoError> for InstallError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+impl From<GetConfigError> for InstallError {
+    fn from(error: GetConfigError) -> Self {
+        Self::Unavailable(format!("realm config: {error:?}"))
+    }
+}
+
+impl From<BindError> for InstallError {
+    fn from(error: BindError) -> Self {
+        match error {
+            BindError::Invalid(why) => Self::Binding(why),
+            BindError::Unavailable(why) => Self::Unavailable(why),
+        }
+    }
+}
+
+impl From<StepError> for InstallError {
+    fn from(StepError { step, error }: StepError) -> Self {
+        Self::Step { step, error }
+    }
 }
 
 /// What a group admin asks to install.
@@ -113,110 +138,705 @@ pub struct Prepared {
     pub request: String,
 }
 
-/// Checks a request as a group admin and writes nothing; a preview answers with this. Without
-/// a version, a retry of an existing install keeps its digest and a new install takes the newest.
-pub async fn prepare_install(
-    ctx: &DriverContext,
-    auth: &AuthContext,
-    realm_id: RealmId,
-    request: &InstallRequest,
-) -> Result<Prepared, InstallError> {
-    check_admin(ctx, auth, request.group_id).await?;
-    let config = read_config(ctx, realm_id).await?;
-    let existing = (request.install_id).and_then(|id| {
-        config
-            .installs
-            .iter()
-            .find(|install| install.install_id == id)
-    });
-    let version = (request.version.as_deref()).or(existing.map(|install| install.digest.as_str()));
-    let plugin = pick_version(&config, &request.plugin, version)?;
-    let manifest = read_manifest(&plugin)?;
-    check_supported(&manifest)?;
-    let settings = check_settings(&manifest, &request.settings)?;
-    let scope = InstallScope {
-        realm_id,
-        group_id: request.group_id,
-        install_id: request.install_id.unwrap_or_else(Ulid::generate),
-    };
-    let grants = narrow_grants(&manifest, &scope, &request.grants)?;
-    check_holder(ctx, auth, &scope, &grants).await?;
-    // Node secrets are checked on the receiver, so it is chosen first.
-    let receiver = (existing.map(|install| install.receiver))
-        .or_else(|| pick_receiver(&config, realm_id, request.group_id));
-    let place = BindPlace {
-        group_id: request.group_id,
-        local: ctx.net_handle.as_ref().map(|net| net.node_id()),
-        receiver,
-    };
-    let bound = bind_slots(ctx, &config, place, &manifest, &request.secrets).await;
-    let (secrets, warnings) = bound.map_err(|error| match error {
-        BindError::Invalid(why) => InstallError::Binding(why),
-        BindError::Unavailable(why) => InstallError::Unavailable(why),
-    })?;
-    let request = request_digest(&plugin.digest, &scope, &settings, (&grants, &secrets));
-    Ok(Prepared {
-        scope,
-        plugin,
-        manifest,
-        settings,
-        grants,
-        secrets,
-        warnings,
-        request,
-    })
+/// Who changes an install, and when the change was asked for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstallCaller {
+    pub actor: Actor,
+    pub auth: AuthContext,
+    pub now_ms: u64,
 }
 
-/// Installs, or resumes the install with the request's id. Answers once it is settled; an
-/// existing settled install is checked again before it is answered.
-pub async fn install_plugin(
-    ctx: &DriverContext,
-    actor: &Actor,
-    auth: &AuthContext,
-    request: &InstallRequest,
-) -> Result<PluginInstall, InstallError> {
-    let prepared = prepare_install(ctx, auth, actor.realm_id, request).await?;
-    let id = prepared.scope.install_id;
-    let _lock = lock_install(id).await;
-    let config = read_config(ctx, actor.realm_id).await?;
-    let record = match config
-        .installs
-        .iter()
-        .find(|install| install.install_id == id)
-    {
-        Some(existing) if existing.request != prepared.request => {
-            return Err(InstallError::Changed);
+impl InstallCaller {
+    pub fn new(actor: &Actor, auth: &AuthContext, now_ms: u64) -> Self {
+        Self {
+            actor: actor.clone(),
+            auth: auth.clone(),
+            now_ms,
         }
-        Some(existing) if existing.state == InstallState::Removing => {
-            return Err(InstallError::State("being removed"));
+    }
+
+    /// The change of `install`'s account and role by this caller.
+    pub(crate) fn change(&self, install: &PluginInstall) -> AccountChange {
+        let who = (&self.actor, &self.auth);
+        AccountChange::of(who, install, self.now_ms / 1000)
+    }
+
+    /// Writes the record as the caller, expecting the revision it read.
+    pub(crate) fn write(
+        &self,
+        expected: Option<u64>,
+        install: &PluginInstall,
+        audit: Option<AdminAuditRecord>,
+    ) -> IoCall {
+        IoCall::child(InstallEntryOperation::new(InstallEntryConfig {
+            actor: self.actor.clone(),
+            auth_context: self.auth.clone(),
+            install_id: install.install_id,
+            group_id: install.group_id,
+            expected,
+            install: Some(install.clone()),
+            audit,
+        }))
+    }
+
+    /// The audit row of `action` on `install` by this caller.
+    pub(crate) fn audit(
+        &self,
+        action: AdminAuditAction,
+        install: &PluginInstall,
+    ) -> AdminAuditRecord {
+        AdminAuditRecord::for_install(action, self.actor.user_id, install)
+    }
+
+    /// Removes the rules of a removing or abandoned install from its group secrets.
+    pub(crate) fn retire(&self, install: &PluginInstall) -> IoCall {
+        IoCall::child(RetireRules::new(&self.actor, install, self.now_ms))
+    }
+}
+
+/// The answer of a [`InstallCaller::write`] call.
+pub(crate) fn written(result: IoResult) -> Result<(), InstallError> {
+    result.child::<Option<PluginInstall>, RecordError>()??;
+    Ok(())
+}
+
+pub(crate) fn config_call(realm_id: RealmId) -> IoCall {
+    IoCall::child(GetConfigOperation::new(realm_id))
+}
+
+pub(crate) fn config_answer(result: IoResult) -> Result<RealmConfigDocument, InstallError> {
+    Ok(result.child::<RealmConfigDocument, GetConfigError>()??)
+}
+
+/// Asks whether the caller is an admin of the group.
+pub(crate) fn admin_call(auth: &AuthContext, group_id: GroupId) -> IoCall {
+    IoCall::child(ServiceCheckOperation::new(ServiceCheckConfig {
+        auth_context: auth.clone(),
+        group_id,
+        target: None,
+    }))
+}
+
+/// Refuses a caller who is not an admin of the group.
+pub(crate) fn admin_answer(result: IoResult) -> Result<(), InstallError> {
+    (result.child::<Option<User>, ServiceCheckError>()?)
+        .map(drop)
+        .map_err(|_| InstallError::Unauthorized)
+}
+
+fn find_install(config: &RealmConfigDocument, id: Ulid) -> Option<&PluginInstall> {
+    (config.installs.iter()).find(|install| install.install_id == id)
+}
+
+/// A request whose version, settings and grants passed, before its secrets are bound.
+#[derive(Debug, PartialEq)]
+struct CheckedRequest {
+    config: Arc<RealmConfigDocument>,
+    plugin: PublishedPlugin,
+    manifest: Manifest,
+    settings: String,
+    scope: InstallScope,
+    grants: Grants,
+}
+
+#[derive(Debug, PartialEq)]
+enum PreparePhase {
+    Admin,
+    Config,
+    Holder(Box<CheckedRequest>),
+    Binding(Box<CheckedRequest>),
+}
+
+/// Checks a request as a group admin and writes nothing; a preview answers with this. Without
+/// a version, a retry of an existing install keeps its digest and a new install takes the newest.
+#[derive(Debug, PartialEq)]
+pub struct PrepareInstall {
+    auth: AuthContext,
+    realm_id: RealmId,
+    local: Option<NodeId>,
+    request: InstallRequest,
+    phase: PreparePhase,
+}
+
+impl PrepareInstall {
+    pub fn new(
+        auth: &AuthContext,
+        (realm_id, local): (RealmId, Option<NodeId>),
+        request: &InstallRequest,
+    ) -> Self {
+        Self {
+            auth: auth.clone(),
+            realm_id,
+            local,
+            request: request.clone(),
+            phase: PreparePhase::Admin,
         }
-        Some(existing) if existing.state != InstallState::Preparing => {
-            let paths = role_paths(&parse_grants(&existing.grants));
-            let identity = Identity::of(existing);
-            check_ready(ctx, &prepared.scope, identity, &paths)
-                .await
-                .map_err(|error| InstallError::Step {
-                    step: "check",
-                    error,
+    }
+
+    fn existing<'a>(&self, config: &'a RealmConfigDocument) -> Option<&'a PluginInstall> {
+        (self.request.install_id).and_then(|id| find_install(config, id))
+    }
+
+    fn checked(&self, config: RealmConfigDocument) -> Result<CheckedRequest, InstallError> {
+        let request = &self.request;
+        let existing = self.existing(&config);
+        let pinned = existing.map(|install| install.digest.as_str());
+        let plugin = pick_version(
+            &config,
+            &request.plugin,
+            request.version.as_deref().or(pinned),
+        )?;
+        let manifest = read_manifest(&plugin)?;
+        check_supported(&manifest)?;
+        let settings = check_settings(&manifest, &request.settings)?;
+        let scope = InstallScope {
+            realm_id: self.realm_id,
+            group_id: request.group_id,
+            install_id: request.install_id.unwrap_or_else(Ulid::generate),
+        };
+        let grants = narrow_grants(&manifest, &scope, &request.grants)?;
+        Ok(CheckedRequest {
+            config: Arc::new(config),
+            plugin,
+            manifest,
+            settings,
+            scope,
+            grants,
+        })
+    }
+
+    /// Binds the slots; node secrets are checked on the receiver, so it is chosen first.
+    fn bind(&self, checked: &CheckedRequest) -> IoCall {
+        let config = &checked.config;
+        let group_id = self.request.group_id;
+        let receiver = (self.existing(config).map(|install| install.receiver))
+            .or_else(|| pick_receiver(config, self.realm_id, group_id));
+        let place = BindPlace {
+            group_id,
+            local: self.local,
+            receiver,
+        };
+        let requested = &self.request.secrets;
+        let bind = BindSlots::new(config.clone(), place, &checked.manifest, requested);
+        IoCall::child(bind)
+    }
+
+    fn prepared(&self, checked: CheckedRequest, bound: BoundSlots) -> Prepared {
+        let CheckedRequest {
+            plugin,
+            manifest,
+            settings,
+            scope,
+            grants,
+            ..
+        } = checked;
+        let (secrets, warnings) = bound;
+        let request = request_digest(&plugin.digest, &scope, &settings, (&grants, &secrets));
+        Prepared {
+            scope,
+            plugin,
+            manifest,
+            settings,
+            grants,
+            secrets,
+            warnings,
+            request,
+        }
+    }
+}
+
+impl Operation for PrepareInstall {
+    type Output = Prepared;
+    type Error = InstallError;
+
+    fn first(&mut self) -> Result<Next<Prepared>, InstallError> {
+        Ok(Next::Call(admin_call(&self.auth, self.request.group_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Prepared>, InstallError> {
+        match std::mem::replace(&mut self.phase, PreparePhase::Config) {
+            PreparePhase::Admin => {
+                admin_answer(result)?;
+                Ok(Next::Call(config_call(self.realm_id)))
+            }
+            PreparePhase::Config => {
+                let checked = self.checked(config_answer(result)?)?;
+                let what = (&checked.scope, &checked.grants);
+                let holder = CheckHolder::new(&self.auth, what, &checked.config);
+                self.phase = PreparePhase::Holder(Box::new(checked));
+                Ok(Next::Call(IoCall::child(holder)))
+            }
+            PreparePhase::Holder(checked) => {
+                result.child::<(), InstallError>()??;
+                let bind = self.bind(&checked);
+                self.phase = PreparePhase::Binding(checked);
+                Ok(Next::Call(bind))
+            }
+            PreparePhase::Binding(checked) => {
+                let bound = result.child::<BoundSlots, BindError>()??;
+                Ok(Next::Done(self.prepared(*checked, bound)))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum InstallPhase {
+    Config,
+    Ready(Box<PluginInstall>),
+    Written(Box<PluginInstall>),
+    Settling,
+}
+
+/// Installs a checked request, or resumes the install with its id. Answers once it is settled;
+/// an existing settled install is checked again before it is answered.
+#[derive(Debug, PartialEq)]
+pub struct InstallPrepared {
+    caller: InstallCaller,
+    prepared: Box<Prepared>,
+    phase: InstallPhase,
+}
+
+impl InstallPrepared {
+    pub fn new(caller: InstallCaller, prepared: Prepared) -> Self {
+        Self {
+            caller,
+            prepared: Box::new(prepared),
+            phase: InstallPhase::Config,
+        }
+    }
+
+    fn settle(&mut self, record: PluginInstall) -> Next<PluginInstall> {
+        let audit = Some(AdminAuditAction::PluginInstalled);
+        let settle = SettleInstall::new(self.caller.clone(), record, audit);
+        self.phase = InstallPhase::Settling;
+        Next::Call(IoCall::child(settle))
+    }
+
+    fn start(&mut self, config: RealmConfigDocument) -> Result<Next<PluginInstall>, InstallError> {
+        let scope = self.prepared.scope;
+        match find_install(&config, scope.install_id) {
+            Some(existing) if existing.request != self.prepared.request => {
+                Err(InstallError::Changed)
+            }
+            Some(existing) if existing.state == InstallState::Removing => {
+                Err(InstallError::State("being removed"))
+            }
+            Some(existing) if existing.state != InstallState::Preparing => {
+                let paths = role_paths(&parse_grants(&existing.grants));
+                let check = CheckReady::new(scope, Identity::of(existing), paths);
+                self.phase = InstallPhase::Ready(Box::new(existing.clone()));
+                Ok(Next::Call(IoCall::child(check)))
+            }
+            Some(existing) => Ok(self.settle(existing.clone())),
+            None => {
+                let receiver = pick_receiver(&config, scope.realm_id, scope.group_id);
+                let receiver = receiver.ok_or_else(|| {
+                    let why = "no eligible server or management node holds the group's metadata";
+                    InstallError::Unavailable(why.into())
                 })?;
-            return Ok(existing.clone());
+                let record = new_record(&self.caller.actor, &self.prepared, receiver);
+                let write = self.caller.write(None, &record, None);
+                self.phase = InstallPhase::Written(Box::new(record));
+                Ok(Next::Call(write))
+            }
         }
-        Some(existing) => existing.clone(),
-        None => {
-            let group_id = prepared.scope.group_id;
-            let receiver = pick_receiver(&config, actor.realm_id, group_id).ok_or_else(|| {
-                InstallError::Unavailable(
-                    "no eligible server or management node holds the group's metadata".into(),
-                )
-            })?;
-            let record = new_record(actor, &prepared, receiver);
-            write_record(ctx, actor, auth, None, record, None).await?
+    }
+}
+
+impl Operation for InstallPrepared {
+    type Output = PluginInstall;
+    type Error = InstallError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginInstall(self.prepared.scope.install_id))
+    }
+
+    fn first(&mut self) -> Result<Next<PluginInstall>, InstallError> {
+        Ok(Next::Call(config_call(self.caller.actor.realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PluginInstall>, InstallError> {
+        match std::mem::replace(&mut self.phase, InstallPhase::Settling) {
+            InstallPhase::Config => self.start(config_answer(result)?),
+            InstallPhase::Ready(existing) => {
+                let ready = result.child::<Vec<Prerequisite>, AccountError>()?;
+                ready.map_err(|error| InstallError::Step {
+                    step: "check",
+                    error: error.0,
+                })?;
+                Ok(Next::Done(*existing))
+            }
+            InstallPhase::Written(record) => {
+                written(result)?;
+                Ok(self.settle(*record))
+            }
+            InstallPhase::Settling => {
+                let settled = result.child::<PluginInstall, InstallError>()??;
+                let (id, plugin) = (settled.install_id, &settled.plugin);
+                info!(%id, %plugin, version = %settled.version, "Installed a plugin");
+                Ok(Next::Done(settled))
+            }
         }
-    };
-    let audit = Some(AdminAuditAction::PluginInstalled);
-    let settled = settle(ctx, actor, auth, record, audit).await?;
-    info!(%id, plugin = %settled.plugin, version = %settled.version, "Installed a plugin");
-    Ok(settled)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SettlePhase {
+    Config,
+    Account(Box<Manifest>),
+    Rules(Box<Manifest>, Vec<Prerequisite>),
+    Write(Box<PluginInstall>),
+    Abandon(Box<InstallError>),
+}
+
+/// Makes a `preparing` record's account and role match it, then writes its settled state:
+/// blocked while something required is not granted, else paused or active. A failure undoes
+/// the account and role, but only while the record is still the revision this call wrote.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SettleInstall {
+    caller: InstallCaller,
+    record: PluginInstall,
+    audit: Option<AdminAuditAction>,
+    phase: SettlePhase,
+}
+
+impl SettleInstall {
+    pub(crate) fn new(
+        caller: InstallCaller,
+        record: PluginInstall,
+        audit: Option<AdminAuditAction>,
+    ) -> Self {
+        Self {
+            caller,
+            record,
+            audit,
+            phase: SettlePhase::Config,
+        }
+    }
+
+    fn abandon(&mut self, step: &'static str, error: String) -> Next<PluginInstall> {
+        let failed = InstallError::Step { step, error };
+        self.phase = SettlePhase::Abandon(Box::new(failed));
+        let abandon = AbandonInstall::new(self.caller.clone(), &self.record, step);
+        Next::Call(IoCall::child(abandon))
+    }
+
+    fn settled(&self, manifest: &Manifest, prerequisites: Vec<Prerequisite>) -> PluginInstall {
+        let record = &self.record;
+        let scope = scope_of(self.caller.actor.realm_id, record);
+        let (_, missing) = carry_grants(&parse_grants(&record.grants), manifest, &scope);
+        let mut next = record.clone();
+        next.state = match (missing.is_empty(), record.paused) {
+            (false, _) => InstallState::Blocked,
+            (true, true) => InstallState::Paused,
+            (true, false) => InstallState::Active,
+        };
+        if next.state == InstallState::Active && next.active_since_ms.is_none() {
+            next.active_since_ms = Some(self.caller.now_ms);
+            next.activated_by = Some(self.caller.actor.node_id);
+        }
+        next.failed = None;
+        next.prerequisites = prerequisites;
+        next.revision += 1;
+        next
+    }
+}
+
+impl Operation for SettleInstall {
+    type Output = PluginInstall;
+    type Error = InstallError;
+
+    fn first(&mut self) -> Result<Next<PluginInstall>, InstallError> {
+        Ok(Next::Call(config_call(self.caller.actor.realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PluginInstall>, InstallError> {
+        match std::mem::replace(&mut self.phase, SettlePhase::Config) {
+            SettlePhase::Config => {
+                let config = config_answer(result)?;
+                let record = &self.record;
+                let plugin = pick_version(&config, &record.plugin, Some(&record.digest))?;
+                let manifest = read_manifest(&plugin)?;
+                let ready = MakeReady::new(self.caller.change(record), record);
+                self.phase = SettlePhase::Account(Box::new(manifest));
+                Ok(Next::Call(IoCall::child(ready)))
+            }
+            SettlePhase::Account(manifest) => {
+                match result.child::<Vec<Prerequisite>, StepError>()? {
+                    Err(StepError { step, error }) => Ok(self.abandon(step, error)),
+                    Ok(prerequisites) => {
+                        let (actor, now_ms) = (&self.caller.actor, self.caller.now_ms);
+                        match EnsureRules::new(actor, &self.record, &manifest, now_ms) {
+                            Err(error) => Ok(self.abandon("rules", error)),
+                            Ok(rules) => {
+                                self.phase = SettlePhase::Rules(manifest, prerequisites);
+                                Ok(Next::Call(IoCall::child(rules)))
+                            }
+                        }
+                    }
+                }
+            }
+            SettlePhase::Rules(manifest, prerequisites) => {
+                if let Err(error) = result.child::<(), RulesFailure>()? {
+                    return Ok(self.abandon("rules", error.0));
+                }
+                let next = self.settled(&manifest, prerequisites);
+                let audit = self.audit.map(|action| self.caller.audit(action, &next));
+                let write = self.caller.write(Some(self.record.revision), &next, audit);
+                self.phase = SettlePhase::Write(Box::new(next));
+                Ok(Next::Call(write))
+            }
+            SettlePhase::Write(next) => {
+                written(result)?;
+                Ok(Next::Done(*next))
+            }
+            SettlePhase::Abandon(failed) => Err(*failed),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum AbandonPhase {
+    Config,
+    Teardown,
+    Rules,
+    Record,
+}
+
+/// Undoes a failed preparation and records the failed step, unless another change of the
+/// install moved on meanwhile; the undo writes themselves refuse a record that moved on.
+#[derive(Debug, PartialEq)]
+struct AbandonInstall {
+    caller: InstallCaller,
+    record: PluginInstall,
+    step: &'static str,
+    phase: AbandonPhase,
+}
+
+impl AbandonInstall {
+    fn new(caller: InstallCaller, record: &PluginInstall, step: &'static str) -> Self {
+        Self {
+            caller,
+            record: record.clone(),
+            step,
+            phase: AbandonPhase::Config,
+        }
+    }
+}
+
+impl Operation for AbandonInstall {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(config_call(self.caller.actor.realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        let id = self.record.install_id;
+        match std::mem::replace(&mut self.phase, AbandonPhase::Record) {
+            AbandonPhase::Config => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                let config = config.ok();
+                let current = config.as_ref().and_then(|config| find_install(config, id));
+                if current != Some(&self.record) {
+                    let step = self.step;
+                    warn!(%id, step, "A plugin install changed meanwhile; leaving it as it is");
+                    return Ok(Next::Done(()));
+                }
+                self.phase = AbandonPhase::Teardown;
+                let teardown = Teardown::new(self.caller.change(&self.record));
+                Ok(Next::Call(IoCall::child(teardown)))
+            }
+            AbandonPhase::Teardown => {
+                if let Err(error) = result.child::<(), AccountError>()? {
+                    warn!(%id, %error, "Could not undo a failed plugin install step");
+                }
+                // Only an install that never became active loses its rules here.
+                self.phase = AbandonPhase::Rules;
+                Ok(Next::Call(self.caller.retire(&self.record)))
+            }
+            AbandonPhase::Rules => {
+                if let Err(error) = result.child::<(), RulesFailure>()? {
+                    warn!(%error, "Could not remove a plugin install's use rules");
+                }
+                let mut failed = self.record.clone();
+                failed.failed = Some(self.step.to_string());
+                failed.revision += 1;
+                self.phase = AbandonPhase::Record;
+                let expected = Some(self.record.revision);
+                Ok(Next::Call(self.caller.write(expected, &failed, None)))
+            }
+            AbandonPhase::Record => {
+                if let Err(error) = written(result) {
+                    warn!(%id, %error, "Could not record the failed plugin install step");
+                }
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum HolderPhase {
+    Rules,
+    Group,
+    Policy,
+}
+
+/// The pattern under check, with the access the pending policy read decides.
+#[derive(Debug, PartialEq)]
+struct HeldPattern {
+    permission: Permission,
+    pattern: String,
+    accesses: VecDeque<Access>,
+    asked: Option<Access>,
+}
+
+/// Refuses grants the caller does not hold now: each action they allow, with its own access and
+/// operation `plugin.<permission>`, against roles, denies below a subtree, restrictions and
+/// policies. Any policy reading the path refuses every subtree, even one guarded off for plugins.
+#[derive(Debug, PartialEq)]
+pub(crate) struct CheckHolder {
+    auth: AuthContext,
+    scope: InstallScope,
+    patterns: VecDeque<(Permission, String)>,
+    path_policies: bool,
+    rules: Option<PermissionRules>,
+    current: Option<HeldPattern>,
+    phase: HolderPhase,
+}
+
+impl CheckHolder {
+    pub(crate) fn new(
+        auth: &AuthContext,
+        (scope, grants): (&InstallScope, &Grants),
+        config: &RealmConfigDocument,
+    ) -> Self {
+        let patterns = (Permission::ALL.into_iter())
+            .flat_map(|permission| {
+                let patterns = patterns_for(grants, permission);
+                patterns
+                    .into_iter()
+                    .map(move |pattern| (permission, pattern))
+            })
+            .collect();
+        Self {
+            auth: auth.clone(),
+            scope: *scope,
+            patterns,
+            path_policies: config
+                .request_policies
+                .iter()
+                .any(|policy| policy.reads_path()),
+            rules: None,
+            current: None,
+            phase: HolderPhase::Rules,
+        }
+    }
+
+    /// Takes up the next pattern, refusing a subtree any policy could decide by path.
+    fn next_pattern(&mut self) -> Result<bool, InstallError> {
+        let Some((permission, pattern)) = self.patterns.pop_front() else {
+            return Ok(false);
+        };
+        if pattern.ends_with("**") && self.path_policies {
+            let why = "a request policy reads the path, so grant exact paths";
+            let what = format!("{permission} on {pattern} ({why})");
+            return Err(InstallError::NotHeld(what));
+        }
+        self.current = Some(HeldPattern {
+            permission,
+            pattern,
+            accesses: accesses(permission).to_vec().into(),
+            asked: None,
+        });
+        Ok(true)
+    }
+
+    /// Decides the next access by role and reads the policies that decide it too.
+    fn advance(&mut self) -> Result<Next<()>, InstallError> {
+        loop {
+            let rules = self.rules.as_ref().ok_or(IoError::Unfinished)?;
+            let pending = self
+                .current
+                .as_mut()
+                .filter(|held| !held.accesses.is_empty());
+            let Some(held) = pending else {
+                if !self.next_pattern()? {
+                    return Ok(Next::Done(()));
+                }
+                continue;
+            };
+            let access = held.accesses.pop_front().ok_or(IoError::Unfinished)?;
+            let holds = match held.pattern.strip_suffix("**") {
+                Some(base) => rules.holds_below(base, &access),
+                None => rules.allows(&held.pattern, &access),
+            };
+            if !holds {
+                return Err(InstallError::NotHeld(what_held(held, &access)));
+            }
+            let group = group_from_path(&held.pattern);
+            held.asked = Some(access);
+            self.phase = HolderPhase::Policy;
+            let reads = policy_reads(self.scope.realm_id, group);
+            return Ok(Next::Call(IoCall::Read(reads)));
+        }
+    }
+
+    fn policy_answer(&mut self, result: IoResult) -> Result<(), InstallError> {
+        let held = self.current.as_mut().ok_or(IoError::Unfinished)?;
+        let access = held.asked.take().ok_or(IoError::Unfinished)?;
+        let extras = PolicyRequestExtras::operation(format!("plugin.{}", held.permission));
+        let request = policy_request_with(&held.pattern, &access, Some(&self.auth), extras);
+        let group = group_from_path(&held.pattern);
+        (read_policies(self.scope.realm_id, group, result.values()?))
+            .and_then(|policies| policies.evaluate(&request))
+            .map_err(|error| {
+                InstallError::NotHeld(format!("{} ({error})", what_held(held, &access)))
+            })
+    }
+}
+
+fn what_held(held: &HeldPattern, access: &Access) -> String {
+    format!("{} ({access}) on {}", held.permission, held.pattern)
+}
+
+impl Operation for CheckHolder {
+    type Output = ();
+    type Error = InstallError;
+
+    fn first(&mut self) -> Result<Next<()>, InstallError> {
+        let reads = rule_reads(&self.scope.group());
+        let reads = reads.map_err(|error| InstallError::Unavailable(error.to_string()))?;
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, InstallError> {
+        match self.phase {
+            HolderPhase::Rules => {
+                let rules = read_rules(&self.auth, result.values()?);
+                let rules = rules.map_err(|error| InstallError::Unavailable(error.to_string()))?;
+                self.rules = Some(rules);
+                self.phase = HolderPhase::Group;
+                Ok(Next::Call(IoCall::child(ReadGroupAuth(
+                    self.scope.group_id,
+                ))))
+            }
+            HolderPhase::Group => {
+                let group = result.child::<Option<GroupAuthorizationDocument>, AccountError>()?;
+                let group = group.map_err(|error| InstallError::Unavailable(error.0))?;
+                let mut policies = group.iter().flat_map(|auth| auth.policies.iter());
+                self.path_policies |= policies.any(|policy| policy.reads_path());
+                self.advance()
+            }
+            HolderPhase::Policy => {
+                self.policy_answer(result)?;
+                self.advance()
+            }
+        }
+    }
 }
 
 /// The record of a new install. The account and role ids are fresh, never taken from the
@@ -248,297 +868,12 @@ fn new_record(actor: &Actor, prepared: &Prepared, receiver: NodeId) -> PluginIns
     }
 }
 
-/// Makes a `preparing` record's account and role match it, then writes its settled state:
-/// blocked while something required is not granted, else paused or active. A failure undoes
-/// the account and role, but only while the record is still the revision this call wrote.
-pub(crate) async fn settle(
-    ctx: &DriverContext,
-    actor: &Actor,
-    auth: &AuthContext,
-    record: PluginInstall,
-    audit: Option<AdminAuditAction>,
-) -> Result<PluginInstall, InstallError> {
-    let config = read_config(ctx, actor.realm_id).await?;
-    let manifest = read_manifest(&pick_version(
-        &config,
-        &record.plugin,
-        Some(&record.digest),
-    )?)?;
-    let scope = scope_of(actor.realm_id, &record);
-    let grants = parse_grants(&record.grants);
-    let prerequisites = match make_ready(ctx, actor, auth, &scope, &record).await {
-        Ok(prerequisites) => prerequisites,
-        Err((step, error)) => {
-            abandon(ctx, actor, auth, &record, step).await;
-            return Err(InstallError::Step { step, error });
-        }
-    };
-    if let Err(error) = ensure_rules(ctx, actor, &record, &manifest).await {
-        abandon(ctx, actor, auth, &record, "rules").await;
-        return Err(InstallError::Step {
-            step: "rules",
-            error,
-        });
-    }
-    let mut next = record.clone();
-    let (_, missing) = carry_grants(&grants, &manifest, &scope);
-    next.state = match (missing.is_empty(), record.paused) {
-        (false, _) => InstallState::Blocked,
-        (true, true) => InstallState::Paused,
-        (true, false) => InstallState::Active,
-    };
-    if next.state == InstallState::Active && next.active_since_ms.is_none() {
-        next.active_since_ms = Some(unix_timestamp_millis());
-        next.activated_by = Some(actor.node_id);
-    }
-    next.failed = None;
-    next.prerequisites = prerequisites;
-    next.revision += 1;
-    let audit = audit.map(|action| AdminAuditRecord::for_install(action, actor.user_id, &next));
-    write_record(ctx, actor, auth, Some(record.revision), next, audit).await
-}
-
-/// Undoes a failed preparation and records the failed step, unless another change of the
-/// install moved on meanwhile; the undo writes themselves refuse a record that moved on.
-async fn abandon(
-    ctx: &DriverContext,
-    actor: &Actor,
-    auth: &AuthContext,
-    record: &PluginInstall,
-    step: &'static str,
-) {
-    let id = record.install_id;
-    let current = read_config(ctx, actor.realm_id)
-        .await
-        .ok()
-        .and_then(|config| {
-            config
-                .installs
-                .into_iter()
-                .find(|install| install.install_id == id)
-        });
-    if current.as_ref() != Some(record) {
-        warn!(%id, step, "A plugin install changed meanwhile; leaving it as it is");
-        return;
-    }
-    let scope = scope_of(actor.realm_id, record);
-    let undo = teardown(
-        ctx,
-        actor,
-        auth,
-        &scope,
-        Identity::of(record),
-        guard_of(record),
-    );
-    if let Err(error) = undo.await {
-        warn!(%id, %error, "Could not undo a failed plugin install step");
-    }
-    // Only an install that never became active loses its rules here.
-    retire_rules(ctx, actor, record).await;
-    let mut failed = record.clone();
-    failed.failed = Some(step.to_string());
-    failed.revision += 1;
-    if let Err(error) = write_record(ctx, actor, auth, Some(record.revision), failed, None).await {
-        warn!(%id, %error, "Could not record the failed plugin install step");
-    }
-}
-
-/// Steps 2 to 5 for `record`: the account, its role, then a check of both against current
-/// state, each write refused once the record moved on. Secret use rules join as step 4 later.
-async fn make_ready(
-    ctx: &DriverContext,
-    actor: &Actor,
-    auth: &AuthContext,
-    scope: &InstallScope,
-    record: &PluginInstall,
-) -> Result<Vec<Prerequisite>, (&'static str, String)> {
-    let (identity, guard) = (Identity::of(record), guard_of(record));
-    let name = account_name(ctx, &record.plugin, scope.group_id).await;
-    ensure_account(ctx, actor, auth, scope, identity, name, guard)
-        .await
-        .map_err(|error| ("account", error))?;
-    let paths = role_paths(&parse_grants(&record.grants));
-    ensure_role(ctx, actor, auth, scope, identity, &paths, guard)
-        .await
-        .map_err(|error| ("role", error))?;
-    check_ready(ctx, scope, identity, &paths)
-        .await
-        .map_err(|error| ("check", error))
-}
-
-/// Repairs the account and role of every settled install from its current record on a
-/// management node, as the approving admin, then sweeps accounts no record names any more.
-pub(crate) async fn reconcile_installs(ctx: &DriverContext) -> Result<usize, InstallError> {
-    let Some(net) = ctx.net_handle.as_ref() else {
-        return Ok(0);
-    };
-    let (node_id, realm_id) = (net.node_id(), *net.realm_id());
-    let config = read_config(ctx, realm_id).await?;
-    if !is_management(&config, node_id) {
-        return Ok(0);
-    }
-    let repaired = repair_settled(ctx, node_id, realm_id, &config.installs).await;
-    let swept = sweep_orphans(ctx, node_id, &config, unix_timestamp_millis()).await;
-    Ok(repaired
-        + swept.unwrap_or_else(|error| {
-            warn!(%error, "Could not sweep unnamed plugin accounts");
-            0
-        }))
-}
-
-/// Repairs each settled install; one that fails is logged and the others are still repaired.
-pub(crate) async fn repair_settled(
-    ctx: &DriverContext,
-    node_id: aruna_core::NodeId,
-    realm_id: RealmId,
-    installs: &[PluginInstall],
-) -> usize {
-    let mut repaired = 0;
-    for install in installs {
-        if matches!(
-            install.state,
-            InstallState::Preparing | InstallState::Removing
-        ) {
-            continue;
-        }
-        match repair_install(ctx, node_id, realm_id, install).await {
-            Ok(changed) => repaired += usize::from(changed),
-            Err(error) => {
-                warn!(install = %install.install_id, %error, "Could not repair a plugin install");
-            }
-        }
-    }
-    repaired
-}
-
-/// Makes one settled install's account and role match its record again; `true` if it changed.
-pub(crate) async fn repair_install(
-    ctx: &DriverContext,
-    node_id: aruna_core::NodeId,
-    realm_id: RealmId,
-    install: &PluginInstall,
-) -> Result<bool, InstallError> {
-    let (scope, identity) = (scope_of(realm_id, install), Identity::of(install));
-    let paths = role_paths(&parse_grants(&install.grants));
-    if check_ready(ctx, &scope, identity, &paths).await.is_ok() {
-        return Ok(false);
-    }
-    let step = |step| move |error| InstallError::Step { step, error };
-    // An administrator's deactivation stands; repair restores only what the install stopped.
-    let user = read_user(ctx, identity.account)
-        .await
-        .map_err(step("account"))?;
-    if user.is_some_and(|user| user.is_deactivated() && !user.stopped_by_install()) {
-        return Ok(false);
-    }
-    let actor = Actor {
-        node_id,
-        user_id: install.granted_by,
-        realm_id,
-    };
-    let auth = AuthContext {
-        user_id: install.granted_by,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    let guard = guard_of(install);
-    let name = account_name(ctx, &install.plugin, scope.group_id).await;
-    ensure_account(ctx, &actor, &auth, &scope, identity, name, guard)
-        .await
-        .map_err(step("account"))?;
-    ensure_role(ctx, &actor, &auth, &scope, identity, &paths, guard)
-        .await
-        .map_err(step("role"))?;
-    info!(install = %install.install_id, "Repaired a plugin install's account and role");
-    Ok(true)
-}
-
 pub(crate) fn scope_of(realm_id: RealmId, install: &PluginInstall) -> InstallScope {
     InstallScope {
         realm_id,
         group_id: install.group_id,
         install_id: install.install_id,
     }
-}
-
-/// Holds the lock of one install on this node, so its changes never overlap here.
-pub(crate) async fn lock_install(install_id: Ulid) -> OwnedMutexGuard<()> {
-    static LOCKS: LazyLock<std::sync::Mutex<HashMap<Ulid, Arc<Mutex<()>>>>> =
-        LazyLock::new(Default::default);
-    let lock = {
-        let mut locks = LOCKS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        locks.entry(install_id).or_default().clone()
-    };
-    lock.lock_owned().await
-}
-
-/// Refuses a caller who is not an admin of the group.
-pub(crate) async fn check_admin(
-    ctx: &DriverContext,
-    auth: &AuthContext,
-    group_id: GroupId,
-) -> Result<(), InstallError> {
-    let check = ServiceCheckOperation::new(ServiceCheckConfig {
-        auth_context: auth.clone(),
-        group_id,
-        target: None,
-    });
-    drive(check, ctx)
-        .await
-        .map(drop)
-        .map_err(|_| InstallError::Unauthorized)
-}
-
-/// Refuses grants the caller does not hold now: each action they allow, with its own access and
-/// operation `plugin.<permission>`, against roles, denies below a subtree, restrictions and
-/// policies. Any policy reading the path refuses every subtree, even one guarded off for plugins.
-pub(crate) async fn check_holder(
-    ctx: &DriverContext,
-    auth: &AuthContext,
-    scope: &InstallScope,
-    grants: &Grants,
-) -> Result<(), InstallError> {
-    let root = format!("/{}/g/{}", scope.realm_id, scope.group_id);
-    let rules = permission_rules(ctx, auth, &root)
-        .await
-        .map_err(|error| InstallError::Unavailable(error.to_string()))?;
-    let config = read_config(ctx, scope.realm_id).await?;
-    let group = read_auth(ctx, scope.group_id)
-        .await
-        .map_err(InstallError::Unavailable)?;
-    let group_policies = group.iter().flat_map(|auth_doc| auth_doc.policies.iter());
-    let path_policies =
-        (config.request_policies.iter().chain(group_policies)).any(|policy| policy.reads_path());
-    for permission in Permission::ALL {
-        for pattern in &patterns_for(grants, permission) {
-            let subtree = pattern.strip_suffix("**");
-            if subtree.is_some() && path_policies {
-                let why = "a request policy reads the path, so grant exact paths";
-                return Err(InstallError::NotHeld(format!(
-                    "{permission} on {pattern} ({why})"
-                )));
-            }
-            for access in accesses(permission) {
-                let what = || format!("{permission} ({access}) on {pattern}");
-                let held = match subtree {
-                    Some(base) => rules.holds_below(base, access),
-                    None => rules.allows(pattern, access),
-                };
-                if !held {
-                    return Err(InstallError::NotHeld(what()));
-                }
-                let extras = PolicyRequestExtras::operation(format!("plugin.{permission}"));
-                let request = policy_request_with(pattern, access, Some(auth), extras);
-                if let Err(error) = enforce_policies(ctx, scope.realm_id, &request).await {
-                    return Err(InstallError::NotHeld(format!("{} ({error})", what())));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// The published version with `digest`, or the newest one of `name`.
@@ -576,37 +911,6 @@ fn request_digest(
         parts.push(serde_json::json!(bound));
     }
     ArtifactDigest::of(request.to_string().as_bytes()).to_string()
-}
-
-pub async fn read_config(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-) -> Result<RealmConfigDocument, InstallError> {
-    drive(GetConfigOperation::new(realm_id), ctx)
-        .await
-        .map_err(|error| InstallError::Unavailable(format!("realm config: {error:?}")))
-}
-
-/// Writes the record as the caller, expecting the revision it read.
-pub(crate) async fn write_record(
-    ctx: &DriverContext,
-    actor: &Actor,
-    auth: &AuthContext,
-    expected: Option<u64>,
-    install: PluginInstall,
-    audit: Option<AdminAuditRecord>,
-) -> Result<PluginInstall, InstallError> {
-    let write = InstallEntryConfig {
-        actor: actor.clone(),
-        auth_context: auth.clone(),
-        install_id: install.install_id,
-        group_id: install.group_id,
-        expected,
-        install: Some(install.clone()),
-        audit,
-    };
-    drive(InstallEntryOperation::new(write), ctx).await?;
-    Ok(install)
 }
 
 /// One grant line: `read`, or `write` when the plugin writes, and its granted patterns.
@@ -783,94 +1087,6 @@ fn bare_summary(install: &PluginInstall) -> Summary {
         secrets: Vec::new(),
         warnings: Vec::new(),
     }
-}
-
-/// When this node first saw each unnamed account; a restart starts the grace again.
-static SEEN: LazyLock<std::sync::Mutex<HashMap<UserId, u64>>> = LazyLock::new(Default::default);
-
-/// Deactivates the active plugin accounts the canonical records have not named for the grace
-/// period, as a realm administrator. Returns how many it deactivated.
-pub(crate) async fn sweep_orphans(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    config: &RealmConfigDocument,
-    now_ms: u64,
-) -> Result<usize, String> {
-    let accounts = drive(plugin_accounts(), ctx)
-        .await
-        .map_err(|error| error.0)?;
-    let mut due = Vec::new();
-    {
-        let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (install_id, user) in accounts {
-            let named = (config.installs.iter())
-                .any(|install| install.install_id == install_id && install.account == user.user_id);
-            if named {
-                seen.remove(&user.user_id);
-                continue;
-            }
-            let first = *seen.entry(user.user_id).or_insert(now_ms);
-            if now_ms.saturating_sub(first) >= ORPHAN_GRACE_MS {
-                due.push((install_id, user.user_id));
-            }
-        }
-    }
-    if due.is_empty() {
-        return Ok(0);
-    }
-    let Some(admin) = realm_admin(ctx, config).await? else {
-        warn!("No realm administrator to deactivate unnamed plugin accounts with");
-        return Ok(0);
-    };
-    let realm_id = config.realm_id;
-    let mut swept = 0;
-    for (install_id, account) in due {
-        let status = AccountStatusOperation::new(AccountStatusConfig {
-            actor: Actor {
-                node_id,
-                user_id: admin,
-                realm_id,
-            },
-            auth_context: AuthContext {
-                user_id: admin,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            target: account,
-            active: false,
-            now: unix_timestamp_secs(),
-        })
-        .guarded(InstallGuard::Unnamed {
-            install_id,
-            account,
-        })
-        .by_install();
-        match drive(status, ctx).await {
-            Ok(()) => {
-                info!(%account, %install_id, "Deactivated a plugin account its install no longer names");
-                swept += 1;
-            }
-            Err(error) => warn!(%account, %error, "Could not deactivate an unnamed plugin account"),
-        }
-    }
-    Ok(swept)
-}
-
-/// The realm administrator with the smallest id, so every node acts as the same one.
-async fn realm_admin(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-) -> Result<Option<UserId>, String> {
-    let key = config.realm_id.as_bytes().to_vec();
-    let realm = read_row(ctx, AUTH_KEYSPACE, key).await?;
-    let realm = (realm.map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes)))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let admins = (realm.iter().flat_map(|realm| realm.roles.values()))
-        .filter(|role| role.name == REALM_ADMIN_ROLE)
-        .flat_map(|role| role.assigned_users.iter().copied());
-    Ok(admins.min())
 }
 
 #[cfg(test)]

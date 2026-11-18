@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::share::{ShareAction, ShareMode, ShareTarget, ShareUses};
 use aruna_storage::storage::FjallStorage;
@@ -137,8 +139,11 @@ async fn concurrent_logs_count() {
         bytes: None,
         client: None,
     };
+    let seeds: Vec<_> = (1..=8u8).map(|entry| [entry; 8]).collect();
     let log = |entry: u64| LogShareOperation::new(share, Ulid::from_parts(entry, 0), event.clone());
-    let runs: Vec<_> = (1..=8).map(|entry| drive(log(entry), &context)).collect();
+    let runs: Vec<_> = (seeds.iter().zip(1..))
+        .map(|(seed, entry)| drive_retry(move || log(entry), &context, seed))
+        .collect();
     for result in futures_util::future::join_all(runs).await {
         result.unwrap();
     }
@@ -146,4 +151,61 @@ async fn concurrent_logs_count() {
         .await
         .unwrap();
     assert_eq!(uses[0].uploads, 8);
+}
+
+fn log_event() -> ShareEvent {
+    ShareEvent {
+        at: 5,
+        action: ShareAction::Download,
+        key: None,
+        bytes: Some(3),
+        client: None,
+    }
+}
+
+#[test]
+fn log_counts_use() {
+    // The stored counters grow by the entry, and the entry lands in the same write.
+    let (share, entry) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
+    let mut stored = ShareUses::default();
+    stored.record(&log_event());
+    let mut operation = LogShareOperation::new(share, entry, log_event());
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    let row = (
+        SHARE_USE_KEYSPACE.to_string(),
+        share.to_bytes().to_vec().into(),
+    );
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+    let answer = IoResult::Values(vec![Some(stored.to_bytes().unwrap().into())]);
+    let Ok(Next::Call(IoCall::Write(writes))) = operation.next(answer) else {
+        panic!("expected the entry and the counters");
+    };
+    assert_eq!(writes[0].0, SHARE_EVENT_KEYSPACE);
+    assert_eq!(writes[0].1, Key::from(event_key(share, entry)));
+    assert_eq!(writes[1].0, SHARE_USE_KEYSPACE);
+    assert_eq!(ShareUses::from_bytes(&writes[1].2).unwrap().downloads, 2);
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+}
+
+#[test]
+fn log_retries_conflicts() {
+    // However often it loses, the entry is tried again: a visit never drops its count.
+    let id = Ulid::from_bytes([1; 16]);
+    let mut operation = LogShareOperation::new(id, id, log_event());
+    assert_eq!(operation.on_conflict(u32::MAX), AfterConflict::Rerun);
+    let lost = ShareStoreError::from(IoError::Conflict);
+    assert!(LogShareOperation::is_conflict(&lost));
+}
+
+#[test]
+fn log_refuses_garbage() {
+    // An unreadable counter row fails the entry instead of restarting the count at zero.
+    let id = Ulid::from_bytes([1; 16]);
+    let mut operation = LogShareOperation::new(id, id, log_event());
+    operation.first().unwrap();
+    let answer = IoResult::Values(vec![Some(vec![0xff; 3].into())]);
+    assert!(matches!(
+        operation.next(answer),
+        Err(ShareStoreError::Conversion(_))
+    ));
 }

@@ -506,6 +506,9 @@ fn shutdown_sequence(
         monitoring: None,
         task_handle: aruna_tasks::TaskHandle::new(),
         jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
+        driver_ctx: Arc::new(aruna_operations::driver::DriverContext::storage_only(
+            storage_handle.clone(),
+        )),
         net_handle: None,
         graph_handle: None,
         blob_handle: None,

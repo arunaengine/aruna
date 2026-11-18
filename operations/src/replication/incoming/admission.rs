@@ -8,17 +8,15 @@
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::{AdmissionError, DistributionView};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 
 use crate::distribution::guard::{authority_read, authority_rows};
 
-use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState};
+use super::{IncomingVersionError, IncomingVersionOperation, IncomingVersionState, Turn};
 
 impl IncomingVersionOperation {
     /// Reads this node's record and fence row of the destination's set; `recheck` reads them
     /// in the apply transaction, so a member fence set meanwhile conflicts the apply.
-    pub(super) fn read_publication_record(&mut self, recheck: bool) -> Effects {
+    pub(super) fn read_publication_record(&mut self, recheck: bool) -> Turn {
         let Some(binding) = self.destination_binding.as_ref() else {
             return match recheck {
                 true => self.fail(IncomingVersionError::ForeignPublication),
@@ -26,15 +24,11 @@ impl IncomingVersionOperation {
             };
         };
         let set_id = binding.set_id;
-        let txn_id = match recheck {
-            true => self.txn_id,
-            false => None,
-        };
-        self.state = match recheck {
+        let state = match recheck {
             true => IncomingVersionState::RecheckPublication,
             false => IncomingVersionState::ReadPublicationRecord,
         };
-        smallvec![authority_read(set_id, txn_id)]
+        self.call(state, authority_read(set_id, None).into())
     }
 
     /// Whether the record admits this publication from the authenticated peer.
@@ -78,14 +72,14 @@ impl IncomingVersionOperation {
         Ok(())
     }
 
-    pub(super) fn accept_publication_record(&mut self, event: Event) -> Effects {
+    pub(super) fn accept_publication_record(&mut self, event: Event) -> Turn {
         match self.admission(event) {
             Ok(()) => self.read_existing_version(),
             Err(error) => self.reject_negotiation(error),
         }
     }
 
-    pub(super) fn accept_publication_recheck(&mut self, event: Event) -> Effects {
+    pub(super) fn accept_publication_recheck(&mut self, event: Event) -> Turn {
         match self.admission(event) {
             Ok(()) => self.verify_replaced(),
             Err(error) => self.fail(error),

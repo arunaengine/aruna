@@ -16,6 +16,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::NodeId;
+use aruna_core::node_state::NodeUrlsOperation;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::delegation::{
@@ -29,7 +30,7 @@ use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::routing::{route_read, route_upload, route_write};
 use aruna_operations::distribution::routing::{upload_route, upload_tag, upload_tags};
 use aruna_operations::distribution::status::node_reach;
-use aruna_operations::node::node_info::node_urls;
+use aruna_operations::driver::drive;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use bytes::Bytes;
 use http::{HeaderMap, Method};
@@ -486,7 +487,10 @@ impl ArunaS3Service {
         forward: &Forward,
         request: ForwardRequest,
     ) -> S3Result<reqwest::Response> {
-        let urls = node_urls(self.state.as_ref(), forward.node_id).await;
+        let urls = drive(NodeUrlsOperation::new(forward.node_id), self.state.as_ref())
+            .await
+            .ok()
+            .flatten();
         let Some(base) = urls.and_then(|urls| urls.s3) else {
             return Err(unreachable_error(
                 forward,

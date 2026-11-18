@@ -8,7 +8,9 @@ mod mail;
 use std::sync::Arc;
 
 use aruna_core::egress::EgressPolicy;
-use aruna_core::outbound::{HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent};
+use aruna_core::outbound::{
+    HttpMethod, HttpPost, HttpRequest, MailRequest, OutboundEffect, OutboundError, OutboundEvent,
+};
 
 use backoff::Backoffs;
 pub use mail::{MailBuilder, MailSender, SmtpMailer, valid_address};
@@ -58,6 +60,9 @@ impl OutboundHandle {
             OutboundEffect::Backoff(request) => OutboundEvent::Backoff {
                 stored: self.inner.backoffs.apply(request),
             },
+            OutboundEffect::Request(request) => OutboundEvent::Answered {
+                result: self.request(*request).await,
+            },
         }
     }
 
@@ -67,18 +72,35 @@ impl OutboundHandle {
     }
 
     async fn post(&self, post: HttpPost) -> Result<u16, OutboundError> {
-        let url = reqwest::Url::parse(&post.url)
+        self.request(HttpRequest {
+            method: HttpMethod::Post,
+            url: post.url,
+            headers: post.headers,
+            body: post.body,
+            deadline: post.deadline,
+        })
+        .await
+    }
+
+    async fn request(&self, call: HttpRequest) -> Result<u16, OutboundError> {
+        let url = reqwest::Url::parse(&call.url)
             .map_err(|error| OutboundError::Permanent(error.to_string()))?;
         let host = url
             .host_str()
             .ok_or_else(|| OutboundError::Permanent("the URL has no host".to_string()))?;
         (self.inner.policy.check_host(host))
             .map_err(|error| OutboundError::Permanent(format!("egress screen: {error}")))?;
-        let mut request = self.inner.http.post(url).body(post.body);
-        for (name, value) in post.headers {
+        let method = match call.method {
+            HttpMethod::Head => reqwest::Method::HEAD,
+            HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Put => reqwest::Method::PUT,
+            HttpMethod::Delete => reqwest::Method::DELETE,
+        };
+        let mut request = self.inner.http.request(method, url).body(call.body);
+        for (name, value) in call.headers {
             request = request.header(name, value);
         }
-        let response = tokio::time::timeout(post.deadline, request.send())
+        let response = tokio::time::timeout(call.deadline, request.send())
             .await
             .map_err(|_| OutboundError::Retryable("the receiver did not answer in time".into()))?
             .map_err(|error| OutboundError::Retryable(format!("request: {error}")))?;

@@ -21,7 +21,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use async_trait::async_trait;
@@ -268,12 +268,9 @@ pub(crate) async fn make_net_handle(
 ) -> NetHandle {
     NetHandle::new(
         NetConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
             secret_key: Some(iroh::SecretKey::from_bytes(&secret)),
             realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
+            ..crate::testing::local_net()
         },
         storage.clone(),
     )

@@ -3,32 +3,35 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
+
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     ATTENTION_ROW, MAX_ATTEMPTS, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState,
-    RunTrigger, WAITING_ROW, parse_queue_key, queue_key, run_key, run_prefix, timer_key,
+    RunTrigger, SourceEvent, WAITING_ROW, parse_queue_key, queue_key, run_key, run_prefix,
+    timer_key,
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_plugins::trigger::{Trigger, TriggerKind};
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
 use aruna_plugins::{FailureKind, InvokeError};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
+use super::install::{pick_version, read_manifest};
 use super::intents::{first_open, intent_keys, intent_scan, resolved_rows};
+use super::matcher::event_trigger;
 use super::rows::{
     Row, Rows, Scan, StoreError, Writes, decode, delete_call, done, encode, page_call, page_of,
     read_call, row, unexpected, values, writes,
 };
 use super::work::{WorkRow, work_scan};
-
-/// Serializes admissions on this node, so no install passes its queue bound.
-pub static ADMISSIONS: Mutex<()> = Mutex::const_new(());
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RunError {
@@ -53,7 +56,6 @@ impl From<IoError> for RunError {
 }
 
 /// A sub-plan that admits a run, a new one or one queued again, within its install's bound.
-/// The caller holds `ADMISSIONS` while the transaction runs.
 #[derive(Debug, PartialEq)]
 pub struct Admission {
     run: Box<PluginRun>,
@@ -97,8 +99,7 @@ impl Admission {
     }
 }
 
-/// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones. The
-/// caller holds `ADMISSIONS`.
+/// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones.
 pub fn admit(run: PluginRun) -> Admit {
     Admit {
         admission: Admission::new(run),
@@ -115,6 +116,10 @@ pub struct Admit {
 impl Operation for Admit {
     type Output = ();
     type Error = RunError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -658,8 +663,7 @@ pub(crate) fn new_run(
     }
 }
 
-/// Queues the due occurrence of an install's timer, or counts it as skipped over the queue bound;
-/// the caller holds `ADMISSIONS`.
+/// Queues the due occurrence of an install's timer, or counts it as skipped over the queue bound.
 pub(crate) fn enqueue_timer(
     install: &PluginInstall,
     handler: String,
@@ -696,6 +700,10 @@ enum TimerPhase {
 impl Operation for EnqueueTimer {
     type Output = bool;
     type Error = StoreError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
@@ -763,6 +771,77 @@ impl Operation for EnqueueTimer {
             }
         }
     }
+}
+
+/// Removes the runs that ended longer than the retention ago, each with its intents in one
+/// transaction; answers how many went.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PruneRuns {
+    now_ms: u64,
+    expired: Option<VecDeque<(Ulid, Ulid)>>,
+    count: usize,
+}
+
+impl PruneRuns {
+    pub(crate) fn new(now_ms: u64) -> Self {
+        Self {
+            now_ms,
+            expired: None,
+            count: 0,
+        }
+    }
+
+    fn drop_next(&mut self) -> Next<usize> {
+        match self.expired.as_mut().and_then(VecDeque::pop_front) {
+            Some(ids) => Next::Call(IoCall::child(drop_run(ids))),
+            None => Next::Done(self.count),
+        }
+    }
+}
+
+impl Operation for PruneRuns {
+    type Output = usize;
+    type Error = RunError;
+
+    fn first(&mut self) -> Result<Next<usize>, RunError> {
+        Ok(Next::Call(IoCall::child(expired_runs(self.now_ms))))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, RunError> {
+        match self.expired {
+            None => {
+                let expired = answer.child::<Vec<(Ulid, Ulid)>, RunError>()??;
+                self.count = expired.len();
+                self.expired = Some(expired.into());
+            }
+            Some(_) => answer.child::<(), StoreError>()??,
+        }
+        Ok(self.drop_next())
+    }
+}
+
+/// The trigger of `kind` the install's pinned version declares.
+pub(crate) fn declared_trigger(
+    config: &RealmConfigDocument,
+    install: &PluginInstall,
+    kind: TriggerKind,
+) -> Option<Trigger> {
+    let plugin = pick_version(config, &install.plugin, Some(&install.digest)).ok()?;
+    read_manifest(&plugin).ok()?.triggers.remove(&kind)
+}
+
+/// A run of the install's handler for the event's kind, due at `now_ms`, or `None` when the
+/// manifest has no trigger of that kind.
+pub(crate) fn event_run(
+    config: &RealmConfigDocument,
+    install: &PluginInstall,
+    event: &SourceEvent,
+    now_ms: u64,
+) -> Option<PluginRun> {
+    let kind = event_trigger(event.kind);
+    declared_trigger(config, install, kind)?;
+    let trigger = RunTrigger::Event(event.clone());
+    Some(new_run(install, kind.as_str().to_string(), trigger, now_ms))
 }
 
 #[cfg(test)]

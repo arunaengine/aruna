@@ -43,7 +43,7 @@ use aruna_operations::device::publish_queue::{
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::forward::token::forward_token_revoke;
+use aruna_operations::forward::entry::forward_token_revoke;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
@@ -1170,7 +1170,7 @@ async fn install_realm_config(
 
     for _ in 0..5 {
         for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
+            aruna_operations::shard::restore::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 realm_id,

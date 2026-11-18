@@ -172,7 +172,10 @@ impl Operation for AdmitTransferOperation {
         {
             return Err(TransferAdmitError::CutOff);
         }
-        Ok(Next::Done(import_key(&grant.payload, &payload.destination)?))
+        Ok(Next::Done(import_key(
+            &grant.payload,
+            &payload.destination,
+        )?))
     }
 }
 

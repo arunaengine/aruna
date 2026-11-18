@@ -91,7 +91,7 @@ async fn setup() -> Harness {
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let config = NetConfig {
         realm_id,
-        ..NetConfig::default()
+        ..aruna_operations::testing::local_net()
     };
     let net_handle = NetHandle::new(config, storage_handle.clone())
         .await

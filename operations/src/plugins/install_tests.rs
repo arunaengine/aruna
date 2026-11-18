@@ -4,15 +4,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use crate::plugins::account::read_user;
+use crate::plugins::account::{EnsureAccount, EnsureRole};
+use crate::plugins::calls::*;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
+use crate::plugins::rows::read_rows;
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
+use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::storage_entries::reducer_state_key;
@@ -267,11 +270,14 @@ impl Fixture {
     }
 
     pub(crate) async fn account(&self, install: &PluginInstall) -> Option<User> {
-        read_user(&self.ctx, install.account).await.unwrap()
+        let row = (USER_KEYSPACE, install.account.to_bytes().to_vec());
+        let rows = drive(read_rows(vec![row]), &self.ctx).await.unwrap();
+        let row = rows.into_iter().next().flatten();
+        row.map(|bytes| User::from_bytes(&bytes).unwrap())
     }
 
     pub(crate) async fn roles(&self) -> HashMap<Ulid, Role> {
-        read_auth(&self.ctx, self.group_id)
+        drive(ReadGroupAuth(self.group_id), &self.ctx)
             .await
             .unwrap()
             .unwrap()
@@ -371,38 +377,19 @@ async fn resumes_after_steps() {
         let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
         let id = Ulid::from_parts(9, stop);
         let record = fixture.prepared_only(id).await;
-        let (scope, identity) = (scope_of(actor.realm_id, &record), Identity::of(&record));
+        let change = AccountChange::of((actor, &auth), &record, 1);
         if stop >= 2 {
-            ensure_account(
-                ctx,
-                actor,
-                &auth,
-                &scope,
-                identity,
-                "x".into(),
-                guard_of(&record),
-            )
-            .await
-            .unwrap();
+            let ensure = EnsureAccount::new(change.clone(), "x".into());
+            drive(ensure, ctx).await.unwrap();
         }
         if stop >= 3 {
             let paths = role_paths(&parse_grants(&record.grants));
-            ensure_role(
-                ctx,
-                actor,
-                &auth,
-                &scope,
-                identity,
-                &paths,
-                guard_of(&record),
-            )
-            .await
-            .unwrap();
-        }
-        if stop == 4 {
-            teardown(ctx, actor, &auth, &scope, identity, guard_of(&record))
+            drive(EnsureRole::new(change.clone(), paths), ctx)
                 .await
                 .unwrap();
+        }
+        if stop == 4 {
+            drive(Teardown::new(change), ctx).await.unwrap();
             assert!(fixture.account(&record).await.unwrap().is_deactivated());
             assert!(fixture.role(&record).await.is_none());
         }
@@ -830,4 +817,259 @@ fn summary_stored_answers() {
     let download = serde_json::json!(["transfers.download"]);
     assert_eq!(stored(download), [true, false]);
     assert_eq!(stored(serde_json::json!([])), [false, false]);
+}
+
+mod operations {
+    use serde_json::json;
+
+    use super::*;
+    use crate::plugins::fixtures::{self, config_result, is_child};
+    use crate::plugins::rows::tests::{child_result, values_result};
+
+    fn open_manifest() -> Value {
+        json!({ "permissions": { "required": [] } })
+    }
+
+    fn request(install: &PluginInstall) -> InstallRequest {
+        InstallRequest {
+            plugin: install.plugin.clone(),
+            group_id: install.group_id,
+            version: None,
+            settings: Map::new(),
+            grants: BTreeMap::new(),
+            install_id: Some(install.install_id),
+            secrets: BTreeMap::new(),
+        }
+    }
+
+    fn prepared(install: &PluginInstall) -> Prepared {
+        let plugin = fixtures::plugin(open_manifest());
+        Prepared {
+            scope: scope_of(fixtures::realm(), install),
+            manifest: read_manifest(&plugin).unwrap(),
+            plugin,
+            settings: "{}".into(),
+            grants: Grants::new(),
+            secrets: BTreeMap::new(),
+            warnings: Vec::new(),
+            request: install.request.clone(),
+        }
+    }
+
+    fn write_done() -> IoResult {
+        child_result(Ok::<Option<PluginInstall>, RecordError>(None))
+    }
+
+    fn admin_ok() -> IoResult {
+        child_result(Ok::<Option<User>, ServiceCheckError>(None))
+    }
+
+    #[test]
+    fn prepare_runs_steps() {
+        let install = fixtures::install();
+        let config = fixtures::config(&install, json!({}));
+        let place = (fixtures::realm(), Some(fixtures::node(3)));
+        let auth = fixtures::caller().auth;
+        let mut prepare = PrepareInstall::new(&auth, place, &request(&install));
+        assert!(is_child(&prepare.first()));
+        assert!(is_child(&prepare.next(admin_ok())));
+        assert!(is_child(&prepare.next(config_result(config))));
+        let held = child_result(Ok::<(), InstallError>(()));
+        assert!(is_child(&prepare.next(held)));
+        let bound = (
+            BTreeMap::<String, SecretBinding>::new(),
+            vec!["note".to_string()],
+        );
+        let Ok(Next::Done(done)) = prepare.next(child_result(Ok::<_, BindError>(bound))) else {
+            panic!("the bound slots end the preparation");
+        };
+        assert_eq!(done.scope.install_id, install.install_id);
+        assert_eq!(done.warnings, ["note"]);
+    }
+
+    #[test]
+    fn prepare_refuses_strangers() {
+        let install = fixtures::install();
+        let place = (fixtures::realm(), None);
+        let auth = fixtures::caller().auth;
+        let mut prepare = PrepareInstall::new(&auth, place, &request(&install));
+        prepare.first().unwrap();
+        let refused = child_result(Err::<Option<User>, _>(ServiceCheckError::Refused));
+        assert_eq!(prepare.next(refused), Err(InstallError::Unauthorized));
+        let mut prepare = PrepareInstall::new(&auth, place, &request(&install));
+        prepare.first().unwrap();
+        prepare.next(admin_ok()).unwrap();
+        let mut empty = fixtures::config(&install, json!({}));
+        empty.plugins.clear();
+        let answer = prepare.next(config_result(empty));
+        assert_eq!(answer, Err(InstallError::NotPublished));
+    }
+
+    fn started(
+        install: &PluginInstall,
+        stored: &PluginInstall,
+    ) -> Result<Next<PluginInstall>, InstallError> {
+        let mut run = InstallPrepared::new(fixtures::caller(), prepared(install));
+        assert_eq!(
+            run.hold_scope(),
+            Some(HoldScope::PluginInstall(install.install_id))
+        );
+        assert!(is_child(&run.first()));
+        run.next(config_result(fixtures::config(stored, json!({}))))
+    }
+
+    #[test]
+    fn install_checks_existing() {
+        let install = fixtures::install();
+        let mut other = install.clone();
+        other.request = "another".into();
+        assert_eq!(started(&install, &other), Err(InstallError::Changed));
+        let mut removing = install.clone();
+        removing.state = InstallState::Removing;
+        let refused = InstallError::State("being removed");
+        assert_eq!(started(&install, &removing), Err(refused));
+
+        let mut run = InstallPrepared::new(fixtures::caller(), prepared(&install));
+        run.first().unwrap();
+        let config = fixtures::config(&install, json!({}));
+        assert!(is_child(&run.next(config_result(config))));
+        let ready = child_result(Ok::<_, AccountError>(Vec::<Prerequisite>::new()));
+        assert_eq!(run.next(ready), Ok(Next::Done(install)));
+    }
+
+    #[test]
+    fn install_settles_preparing() {
+        let mut install = fixtures::install();
+        install.state = InstallState::Preparing;
+        let mut run = InstallPrepared::new(fixtures::caller(), prepared(&install));
+        run.first().unwrap();
+        let config = fixtures::config(&install, json!({}));
+        assert!(is_child(&run.next(config_result(config))));
+        let settled = child_result(Ok::<_, InstallError>(install.clone()));
+        assert_eq!(run.next(settled), Ok(Next::Done(install)));
+    }
+
+    #[test]
+    fn install_needs_receiver() {
+        let install = fixtures::install();
+        let mut run = InstallPrepared::new(fixtures::caller(), prepared(&install));
+        run.first().unwrap();
+        let empty = RealmConfigDocument::new(fixtures::realm(), Vec::new(), 3);
+        let answer = run.next(config_result(empty));
+        assert!(matches!(answer, Err(InstallError::Unavailable(_))));
+    }
+
+    #[test]
+    fn settle_writes_state() {
+        let mut record = fixtures::install();
+        record.state = InstallState::Preparing;
+        record.active_since_ms = None;
+        let mut settle = SettleInstall::new(fixtures::caller(), record.clone(), None);
+        assert!(is_child(&settle.first()));
+        let config = fixtures::config(&record, open_manifest());
+        assert!(is_child(&settle.next(config_result(config))));
+        let ready = child_result(Ok::<_, StepError>(Vec::<Prerequisite>::new()));
+        assert!(is_child(&settle.next(ready)));
+        let rules = child_result(Ok::<(), RulesFailure>(()));
+        assert!(is_child(&settle.next(rules)));
+        let Ok(Next::Done(next)) = settle.next(write_done()) else {
+            panic!("the write ends the settling");
+        };
+        assert_eq!(next.state, InstallState::Active);
+        assert_eq!(next.revision, record.revision + 1);
+        assert_eq!(next.active_since_ms, Some(5_000));
+        assert_eq!(next.activated_by, Some(fixtures::node(3)));
+    }
+
+    #[test]
+    fn settle_abandons_failure() {
+        let record = fixtures::install();
+        let mut settle = SettleInstall::new(fixtures::caller(), record.clone(), None);
+        settle.first().unwrap();
+        settle
+            .next(config_result(fixtures::config(&record, json!({}))))
+            .unwrap();
+        let failed = StepError {
+            step: "role",
+            error: "no".into(),
+        };
+        let failed = child_result(Err::<Vec<Prerequisite>, _>(failed));
+        assert!(is_child(&settle.next(failed)));
+        let answer = settle.next(child_result(Ok::<(), IoError>(())));
+        let step = InstallError::Step {
+            step: "role",
+            error: "no".into(),
+        };
+        assert_eq!(answer, Err(step));
+    }
+
+    #[test]
+    fn abandon_undoes_record() {
+        let record = fixtures::install();
+        let mut abandon = AbandonInstall::new(fixtures::caller(), &record, "role");
+        assert!(is_child(&abandon.first()));
+        let config = fixtures::config(&record, json!({}));
+        assert!(is_child(&abandon.next(config_result(config))));
+        let torn = child_result(Err::<(), _>(AccountError("no".into())));
+        assert!(is_child(&abandon.next(torn)));
+        assert!(is_child(
+            &abandon.next(child_result(Ok::<(), RulesFailure>(())))
+        ));
+        assert_eq!(abandon.next(write_done()), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn abandon_leaves_moved() {
+        let record = fixtures::install();
+        let mut moved = record.clone();
+        moved.revision += 1;
+        let mut abandon = AbandonInstall::new(fixtures::caller(), &record, "role");
+        abandon.first().unwrap();
+        let config = fixtures::config(&moved, json!({}));
+        assert_eq!(abandon.next(config_result(config)), Ok(Next::Done(())));
+    }
+
+    fn holder(pattern: &str) -> CheckHolder {
+        let install = fixtures::install();
+        let scope = scope_of(fixtures::realm(), &install);
+        let pattern = format!("{}/meta/{pattern}", scope.group());
+        let grants = Grants::from([(Grant::Read, [pattern].into())]);
+        let config = fixtures::config(&install, json!({}));
+        CheckHolder::new(&fixtures::caller().auth, (&scope, &grants), &config)
+    }
+
+    #[test]
+    fn holder_reads_rules() {
+        let mut check = holder("a");
+        assert!(matches!(check.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let missing = check.next(values_result(vec![None, None]));
+        assert!(matches!(missing, Err(InstallError::Unavailable(_))));
+        let mut check = holder("a");
+        check.phase = HolderPhase::Group;
+        let failed = child_result(Err::<Option<GroupAuthorizationDocument>, _>(AccountError(
+            "no".into(),
+        )));
+        assert_eq!(
+            check.next(failed),
+            Err(InstallError::Unavailable("no".into()))
+        );
+    }
+
+    #[test]
+    fn holder_refuses_unheld() {
+        let mut check = holder("a");
+        check.rules = Some(PermissionRules::default());
+        assert!(matches!(check.advance(), Err(InstallError::NotHeld(_))));
+        let mut subtree = holder("**");
+        subtree.rules = Some(PermissionRules::default());
+        subtree.path_policies = true;
+        let Err(InstallError::NotHeld(what)) = subtree.advance() else {
+            panic!("a policy reading the path refuses a subtree");
+        };
+        assert!(what.contains("reads the path"));
+        let mut none = holder("a");
+        none.patterns.clear();
+        none.rules = Some(PermissionRules::default());
+        assert_eq!(none.advance(), Ok(Next::Done(())));
+    }
 }

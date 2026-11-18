@@ -4,12 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::drive;
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::lifecycle::pause_install;
 use crate::plugins::runs::tests::queued;
 
-fn kind(result: Result<PluginInstall, HostError>) -> Option<ErrorKind> {
-    result.err().map(|error| error.kind)
+fn kind(result: Result<PluginInstall, CallError>) -> Option<ErrorKind> {
+    result.err().map(|error| error.0.kind)
 }
 
 #[test]
@@ -38,10 +39,10 @@ async fn checks_each_step() {
     let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
     let read = (Permission::MetadataRead, format!("{meta}/x"));
     let call = |scope: RunScope, target: (Permission, String)| async move {
-        check_call(ctx, &scope, Some((target.0, &target.1))).await
+        drive(CheckCall::new(&scope, Some((target.0, &target.1))), ctx).await
     };
     assert!(call(scope.clone(), read.clone()).await.is_ok());
-    assert!(check_call(ctx, &scope, None).await.is_ok());
+    assert!(drive(CheckCall::new(&scope, None), ctx).await.is_ok());
 
     let write = (Permission::MetadataWrite, format!("{meta}/x"));
     assert_eq!(
@@ -81,7 +82,7 @@ async fn checks_each_step() {
         .await
         .unwrap();
     assert_eq!(
-        kind(check_call(ctx, &scope, None).await),
+        kind(drive(CheckCall::new(&scope, None), ctx).await),
         Some(ErrorKind::Denied)
     );
 }

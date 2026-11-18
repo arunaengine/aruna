@@ -19,11 +19,13 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_core::transfer::{
     ExportGrant, GrantError, ImportIntent, TransferError, check_remote, intent_digest,
 };
-use aruna_operations::federation::export::{
-    GrantRequest, admit_grant, authorize_export, check_holder, issue_grant, read_record,
-    revoke_grant,
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::federation::grant::{
+    AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
+    RevokeGrantOperation, export_access,
 };
 use aruna_operations::federation::import::header_value;
+use aruna_operations::jobs::export::{crate_jsonld, unheld_bucket};
 use aruna_operations::jobs::service::{read_artifact_routed, read_owned_job, submit_export_job};
 use axum::Json;
 use axum::extract::{Path, State};
@@ -192,9 +194,15 @@ pub async fn create_export(
     let with_files = !request.files.is_empty();
     let path = &record.permission_path;
     let context = state.get_ctx();
-    authorize_export(&context, &auth, path, audience, with_files)
-        .await
-        .map_err(grant_refused)?;
+    match drive(
+        export_access(&auth, path, audience, with_files),
+        context.as_ref(),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Err(grant_refused(GrantError::Denied)),
+    }
     let digest = intent_digest(&request.intent)
         .map_err(|error| transfer_refused(TransferError::Signature(error)))?;
     let key = format!("federation-{digest}");
@@ -303,17 +311,19 @@ pub async fn create_grant(
         .artifact_url
         .parse()
         .map_err(|_| ServerError::InternalError("artifact URL is invalid".to_string().into()))?;
-    let request = GrantRequest {
-        auth: &auth,
+    let config = IssueGrantConfig {
+        realm_id: auth.realm_id,
+        principal: auth.user_id,
         job_id,
         document_id: spec.document_id,
         document_path: record.permission_path,
-        selection,
+        selection: selection.clone(),
         artifact_url,
-        capabilities: state.node_capabilities(),
+        capabilities: state.node_capabilities().clone(),
         now: unix_timestamp_secs(),
     };
-    let grant = issue_grant(&state.get_ctx(), request)
+    let issue = IssueExportOperation::new(auth.clone(), config);
+    let grant = drive(issue, state.get_ctx().as_ref())
         .await
         .map_err(grant_refused)?;
     Ok(Json(grant))
@@ -346,10 +356,28 @@ pub async fn delete_grant(
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let (job_id, _) = owned_export(&state, &auth, &job_id).await?;
-    match revoke_grant(&state.get_ctx(), job_id).await {
+    match drive(RevokeGrantOperation::new(job_id), state.get_ctx().as_ref()).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(ServerError::NotFound),
         Err(error) => Err(grant_refused(error)),
+    }
+}
+
+/// Refuses a file export at consent when a selected file has copies on this node and each needs
+/// a bucket key the caller does not hold now. The export job applies the same rule.
+async fn check_holder(
+    context: &Arc<DriverContext>,
+    spec: &ExportRoCrateSpec,
+    node_id: aruna_core::NodeId,
+) -> Result<(), GrantError> {
+    let (auth, limit) = (&spec.auth_context, spec.limits.metadata_bytes);
+    let (jsonld, _) = crate_jsonld(context, auth, spec.document_id, limit)
+        .await
+        .map_err(|error| GrantError::Storage(error.to_string()))?;
+    match unheld_bucket(context, spec, node_id, &jsonld).await {
+        Ok(None) => Ok(()),
+        Ok(Some(bucket)) => Err(GrantError::NotHolder(bucket)),
+        Err(error) => Err(GrantError::Storage(error)),
     }
 }
 
@@ -401,12 +429,13 @@ pub async fn push_export(
     let (local, now) = (state.get_realm_id(), unix_timestamp_secs());
     let context = state.get_ctx();
     check_remote(&request.intent, &request.descriptor, &local, now).map_err(transfer_refused)?;
-    let grant = read_record(&context, job_id)
+    let grant = drive(ReadGrantOperation::new(job_id), context.as_ref())
         .await
         .map_err(grant_refused)?
         .ok_or(ServerError::NotFound)?
         .grant;
-    admit_grant(&context, local, job_id, &grant, now)
+    let admit = AdmitGrantOperation::new(local, job_id, grant.clone(), now);
+    drive(admit, context.as_ref())
         .await
         .map_err(grant_refused)?;
     let digest = intent_digest(&request.intent)

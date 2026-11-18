@@ -105,7 +105,7 @@ mod tests {
     use ulid::Ulid;
 
     use crate::driver::{DriverContext, drive};
-    use crate::metadata::repository::write_graph_lifecycle;
+    use aruna_core::storage_entries::graph_lifecycle_entry;
 
     fn write_registry_effect(
         record: &MetadataRegistryRecord,
@@ -209,15 +209,8 @@ mod tests {
             deleted_id,
             1,
         );
-        let event = storage_handle
-            .send_effect(write_graph_lifecycle(&lifecycle, None).unwrap())
-            .await;
-        assert!(matches!(
-            event,
-            aruna_core::events::Event::Storage(
-                aruna_core::events::StorageEvent::WriteResult { .. }
-            )
-        ));
+        let row = graph_lifecycle_entry(&lifecycle).unwrap();
+        crate::testing::write_entries(&storage_handle, vec![row]).await;
 
         let context = DriverContext {
             storage_handle,

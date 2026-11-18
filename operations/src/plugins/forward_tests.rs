@@ -10,13 +10,15 @@ use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
+use crate::driver::drive;
+use crate::plugin_host::worker::match_journal;
+use crate::plugin_host::worker::tests::{created, installed};
+use crate::plugin_host::worker::{send_bounded, send_outbox};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
-use crate::plugins::rows::{page_result, values_result};
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::store::Txn;
-use crate::plugins::worker::match_journal;
-use crate::plugins::worker::tests::{created, installed};
-use crate::plugins::worker::{send_bounded, send_outbox, unreadable};
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 
 /// The batches a fake receiver got; it answers each event with `decide` and acknowledges gaps
@@ -304,7 +306,8 @@ async fn update_waits() {
         event,
         queued_ms: 1,
     };
-    let waits = async || unreadable(&fixture.ctx, &row).await;
+    let metadata = fixture.ctx.metadata_handle.is_some();
+    let waits = async || drive(Unreadable::new(&row, metadata), &fixture.ctx).await;
     let newer = (document, Ulid::from_parts(20, 1));
     materialization(&fixture, newer, State::Materialized).await;
     assert_eq!(waits().await, Ok(true));
@@ -489,4 +492,137 @@ fn drops_every_page() {
     assert!(matches!(again, Next::Call(IoCall::Page { .. })));
     let last = plan.next(page_result(Vec::new(), None)).unwrap();
     assert_eq!(last, Next::Done(()));
+}
+
+fn forward_row(kind: SourceKind, resource: String, revision: String) -> ForwardRow {
+    ForwardRow {
+        install_id: Ulid::from_parts(1, 1),
+        revision: 1,
+        event: SourceEvent {
+            kind,
+            group_id: Ulid::from_parts(1, 9),
+            path: "/r/g/x/meta/a@d".into(),
+            resource,
+            revision,
+            source: "s".into(),
+            actor: None,
+            anchor_ms: 5,
+            journaled_ms: 5,
+        },
+        queued_ms: 5,
+    }
+}
+
+fn dataset_row(kind: SourceKind) -> ForwardRow {
+    let (document, event) = (Ulid::from_parts(5, 5), Ulid::from_parts(6, 6));
+    forward_row(kind, document.to_string(), event.to_string())
+}
+
+#[test]
+fn other_events_readable() {
+    let upload = dataset_row(SourceKind::DataUploaded);
+    assert_eq!(
+        Unreadable::new(&upload, true).first(),
+        Ok(Next::Done(false))
+    );
+    let named = forward_row(SourceKind::DatasetCreated, "d".into(), "e".into());
+    assert_eq!(Unreadable::new(&named, true).first(), Ok(Next::Done(false)));
+}
+
+#[test]
+fn unmaterialized_update_unreadable() {
+    let row = dataset_row(SourceKind::DatasetUpdated);
+    let mut check = Unreadable::new(&row, true);
+    assert!(matches!(check.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let facts = child_result(Ok::<_, StoreError>(Facts::default()));
+    assert_eq!(check.next(facts), Ok(Next::Done(true)));
+    let mut deleted = Unreadable::new(&row, true);
+    let gone = Facts {
+        deleted: true,
+        ..Facts::default()
+    };
+    let answer = deleted.next(child_result(Ok::<_, StoreError>(gone)));
+    assert_eq!(answer, Ok(Next::Done(false)));
+}
+
+fn collecting(config: RealmConfigDocument) -> CollectOutbox {
+    let open = BTreeSet::from([iroh::SecretKey::from_bytes(&[3u8; 32]).public()]);
+    CollectOutbox::new(Arc::new(config), open, (9, 1 << 20), true)
+}
+
+fn bare_config() -> RealmConfigDocument {
+    let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+    RealmConfigDocument::new(realm, Vec::new(), 3)
+}
+
+#[test]
+fn collects_nothing_empty() {
+    let mut collect = collecting(bare_config());
+    assert!(matches!(collect.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let none = child_result(Ok::<Option<Ulid>, StoreError>(None));
+    let scan = collect.next(none);
+    assert!(matches!(scan, Ok(Next::Call(IoCall::Page { .. }))));
+    assert_eq!(
+        collect.next(page_result(Vec::new(), None)),
+        Ok(Next::Done(BTreeMap::new()))
+    );
+}
+
+#[test]
+fn drops_removed_install() {
+    let mut collect = collecting(bare_config());
+    let found = child_result(Ok::<_, StoreError>(Some(Ulid::from_parts(7, 7))));
+    assert!(matches!(
+        collect.next(found),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(collect.phase, CollectPhase::Dropping);
+    let dropped = child_result(Ok::<(), StoreError>(()));
+    assert!(matches!(
+        collect.next(dropped),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(collect.phase, CollectPhase::NextInstall);
+}
+
+#[test]
+fn readable_row_joins() {
+    let mut config = bare_config();
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let receiver = install.receiver;
+    config.installs.push(install.clone());
+    let mut collect = collecting(config);
+    let found = child_result(Ok::<_, StoreError>(Some(install.install_id)));
+    assert!(matches!(
+        collect.next(found),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let row = forward_row(SourceKind::DataUploaded, "d".into(), "e".into());
+    let kept: Rows = vec![(b"k".to_vec(), encode(&row).unwrap())];
+    let check = collect.next(child_result(Ok::<_, StoreError>(kept)));
+    assert!(matches!(check, Ok(Next::Call(IoCall::Child(_)))));
+    let next = collect.next(child_result(Ok::<bool, StoreError>(false)));
+    assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+    let none = child_result(Ok::<Option<Ulid>, StoreError>(None));
+    collect.next(none).unwrap();
+    let Next::Done(batches) = collect.next(page_result(Vec::new(), None)).unwrap() else {
+        panic!("the gap scan ends the pass");
+    };
+    assert_eq!(batches[&receiver].open[0].0.0.events, [row]);
+}
+
+mod operations {
+    use super::*;
+    use crate::plugins::fixtures::{is_effect, node, peer_says, peer_silent};
+
+    #[test]
+    fn events_reach_receiver() {
+        let mut send = SendEvents::new(node(1), EventBatch::default());
+        assert!(is_effect(&send.first()));
+        let result = Ok(Decisions::default());
+        let said = peer_says(node(1), &MetadataTransportMessage::EventsDecided { result });
+        assert_eq!(send.next(said), Ok(Next::Done(Decisions::default())));
+        let silent = send.next(peer_silent(node(1)));
+        assert_eq!(silent, Err(MetadataReadError::Unavailable));
+    }
 }

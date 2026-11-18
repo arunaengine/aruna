@@ -96,7 +96,7 @@ pub(crate) fn record_craqle_result<T>(
     operation: &'static str,
     graph_iri: Option<&str>,
     started: Instant,
-    result: &Result<T, CraqleError>,
+    result: &Result<T, Box<CraqleError>>,
 ) {
     let duration = started.elapsed();
     record_duration_ms(span, "elapsed_ms", duration);
@@ -115,7 +115,7 @@ pub(crate) fn record_metadata_result(
     operation: &'static str,
     graph_iri: Option<&str>,
     started: Instant,
-    result: &Result<MetadataEvent, CraqleError>,
+    result: &Result<MetadataEvent, Box<CraqleError>>,
 ) {
     record_craqle_result(span, operation, graph_iri, started, result);
 }
@@ -131,7 +131,7 @@ fn validate_effect(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     effect: MetadataEffect,
-) -> Result<MetadataEvent, CraqleError> {
+) -> Result<MetadataEvent, Box<CraqleError>> {
     match effect {
         MetadataEffect::ValidateCreateCrate { request } => {
             let graph_iri = request.graph_iri.clone();
@@ -147,7 +147,10 @@ fn validate_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.validate_create_crate(auth, craqle_create_request(request)))
+                .in_scope(|| {
+                    node.validate_create_crate(auth, craqle_create_request(request))
+                        .map_err(Box::new)
+                })
                 .map(|_| MetadataEvent::ValidationResult {
                     graph_iri: graph_iri.clone(),
                 });
@@ -182,6 +185,7 @@ fn validate_effect(
                         &jsonld,
                         craqle_graph_policy(policy),
                     )
+                    .map_err(Box::new)
                 })
                 .map(|_| MetadataEvent::ValidationResult {
                     graph_iri: graph_iri.clone(),
@@ -203,7 +207,7 @@ fn crate_effect(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     effect: MetadataEffect,
-) -> Result<MetadataEvent, CraqleError> {
+) -> Result<MetadataEvent, Box<CraqleError>> {
     match effect {
         MetadataEffect::CreateCrate { request } => {
             let call_span = debug_span!(
@@ -228,6 +232,7 @@ fn crate_effect(
                     craqle_request_durability(durability),
                     actor,
                 )
+                .map_err(Box::new)
             });
             record_craqle_result(
                 &call_span,
@@ -271,6 +276,7 @@ fn crate_effect(
                     craqle_request_durability(durability),
                     actor,
                 )
+                .map_err(Box::new)
             });
             record_craqle_result(
                 &call_span,
@@ -295,7 +301,7 @@ fn entity_effect(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     effect: MetadataEffect,
-) -> Result<MetadataEvent, CraqleError> {
+) -> Result<MetadataEvent, Box<CraqleError>> {
     match effect {
         MetadataEffect::UpsertDataEntity { request } => {
             let graph_iri = request.graph_iri.clone();
@@ -365,7 +371,7 @@ fn policy_effect(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     effect: MetadataEffect,
-) -> Result<MetadataEvent, CraqleError> {
+) -> Result<MetadataEvent, Box<CraqleError>> {
     match effect {
         MetadataEffect::SetGraphPolicy { graph_iri, policy } => {
             let call_span = debug_span!(
@@ -380,14 +386,12 @@ fn policy_effect(
             let result = call_span
                 .in_scope(|| {
                     // Every holder applies the policy; publishing it would mint a rival topic genesis.
-                    node.set_policy_with(
-                        auth,
-                        PolicyWrite {
-                            graph: &GraphId::new(&graph_iri),
-                            policy: craqle_graph_policy(policy),
-                            durability: CraqleRequestDurability::WalAlreadyDurable,
-                        },
-                    )
+                    let write = PolicyWrite {
+                        graph: &GraphId::new(&graph_iri),
+                        policy: craqle_graph_policy(policy),
+                        durability: CraqleRequestDurability::WalAlreadyDurable,
+                    };
+                    node.set_policy_with(auth, write).map_err(Box::new)
                 })
                 .map(|_| MetadataEvent::GraphPolicySet {
                     graph_iri: graph_iri.clone(),
@@ -413,6 +417,7 @@ fn policy_effect(
             let result = call_span
                 .in_scope(|| {
                     node.add_irokle_peer(&GraphId::new(&graph_iri), irokle_peer_id(node_id))
+                        .map_err(Box::new)
                 })
                 .map(|_| MetadataEvent::GraphPeerAdded {
                     graph_iri: graph_iri.clone(),
@@ -436,7 +441,10 @@ fn policy_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.graph_policy(&GraphId::new(&graph_iri)))
+                .in_scope(|| {
+                    node.graph_policy(&GraphId::new(&graph_iri))
+                        .map_err(Box::new)
+                })
                 .map(|policy| MetadataEvent::GraphPolicyResult {
                     graph_iri: graph_iri.clone(),
                     policy: policy_from_craqle(policy),
@@ -458,7 +466,7 @@ fn export_effect(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     effect: MetadataEffect,
-) -> Result<MetadataEvent, CraqleError> {
+) -> Result<MetadataEvent, Box<CraqleError>> {
     match effect {
         MetadataEffect::ExportRoCrate { graph_iri } => {
             let call_span = debug_span!(
@@ -470,7 +478,10 @@ fn export_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.export_rocrate(auth, &GraphId::new(&graph_iri)))
+                .in_scope(|| {
+                    node.export_rocrate(auth, &GraphId::new(&graph_iri))
+                        .map_err(Box::new)
+                })
                 .map(|jsonld| {
                     call_span.record("jsonld_len", jsonld.len() as u64);
                     MetadataEvent::RoCrateExportResult {
@@ -501,8 +512,8 @@ fn export_effect(
                     });
                 }
             }
-            Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
-                "metadata graph `{graph_iri}` kept changing while exporting"
+            Err(Box::new(CraqleError::RoCrate(RoCrateError::InvalidGraph(
+                format!("metadata graph `{graph_iri}` kept changing while exporting"),
             ))))
         }
         MetadataEffect::ExportRoCrateSummary { graph_iri } => {
@@ -515,7 +526,10 @@ fn export_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.export_rocrate_summary(auth, &GraphId::new(&graph_iri)))
+                .in_scope(|| {
+                    node.export_rocrate_summary(auth, &GraphId::new(&graph_iri))
+                        .map_err(Box::new)
+                })
                 .map(|jsonld| {
                     call_span.record("jsonld_len", jsonld.len() as u64);
                     MetadataEvent::RoCrateSummaryResult {
@@ -552,11 +566,11 @@ fn export_effect(
             let started = Instant::now();
             let graph = GraphId::new(&graph_iri);
             let page = call_span.in_scope(|| {
-                if let Some(after) = after.as_deref() {
-                    node.export_rocrate_page_after(auth, &graph, Some(after), limit)
-                } else {
-                    node.export_rocrate_page(auth, &graph, offset.unwrap_or(0), limit)
-                }
+                let page = match after.as_deref() {
+                    Some(after) => node.export_rocrate_page_after(auth, &graph, Some(after), limit),
+                    None => node.export_rocrate_page(auth, &graph, offset.unwrap_or(0), limit),
+                };
+                page.map_err(Box::new)
             });
             let result = page.map(|page| {
                 call_span.record("returned_data_entities", page.returned_data_entities as u64);
@@ -583,7 +597,7 @@ fn graph_effect(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     effect: MetadataEffect,
-) -> Result<MetadataEvent, CraqleError> {
+) -> Result<MetadataEvent, Box<CraqleError>> {
     match effect {
         MetadataEffect::DeleteGraph { graph_iri } => {
             let call_span = debug_span!(
@@ -594,7 +608,10 @@ fn graph_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.delete_graph(auth, &GraphId::new(&graph_iri)))
+                .in_scope(|| {
+                    node.delete_graph(auth, &GraphId::new(&graph_iri))
+                        .map_err(Box::new)
+                })
                 .map(|_| MetadataEvent::GraphDeleted {
                     graph_iri: graph_iri.clone(),
                 });
@@ -615,15 +632,17 @@ fn graph_effect(
                 graph_count = field::Empty,
             );
             let started = Instant::now();
-            let result = call_span.in_scope(|| node.graphs()).map(|graphs| {
-                call_span.record("graph_count", graphs.len() as u64);
-                MetadataEvent::GraphListResult {
-                    graph_iris: graphs
-                        .into_iter()
-                        .map(|graph| graph.as_str().to_string())
-                        .collect(),
-                }
-            });
+            let result = call_span
+                .in_scope(|| node.graphs().map_err(Box::new))
+                .map(|graphs| {
+                    call_span.record("graph_count", graphs.len() as u64);
+                    MetadataEvent::GraphListResult {
+                        graph_iris: graphs
+                            .into_iter()
+                            .map(|graph| graph.as_str().to_string())
+                            .collect(),
+                    }
+                });
             record_metadata_result(&call_span, "list_graphs", None, started, &result);
             result
         }
@@ -637,7 +656,10 @@ fn graph_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.contains_graph(&GraphId::new(&graph_iri)))
+                .in_scope(|| {
+                    node.contains_graph(&GraphId::new(&graph_iri))
+                        .map_err(Box::new)
+                })
                 .map(|exists| {
                     call_span.record("exists", exists);
                     MetadataEvent::ContainsGraphResult {
@@ -668,10 +690,12 @@ fn graph_effect(
                 Ok(true) => node.vector_clock(&graph).map(|clock| clock.contains(&dot)),
                 other => other,
             };
-            contains.map(|contains| MetadataEvent::ContainsDotResult {
-                graph_iri: graph_iri.clone(),
-                contains,
-            })
+            contains
+                .map_err(Box::new)
+                .map(|contains| MetadataEvent::ContainsDotResult {
+                    graph_iri: graph_iri.clone(),
+                    contains,
+                })
         }
         _ => unreachable!("effect family routed incorrectly"),
     }
@@ -681,7 +705,7 @@ fn sync_effect(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     effect: MetadataEffect,
-) -> Result<MetadataEvent, CraqleError> {
+) -> Result<MetadataEvent, Box<CraqleError>> {
     match effect {
         // Device replicas
         MetadataEffect::GraphSnapshot { graph_iri } => {
@@ -694,7 +718,10 @@ fn sync_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.graph_snapshot(&GraphId::new(&graph_iri)))
+                .in_scope(|| {
+                    node.graph_snapshot(&GraphId::new(&graph_iri))
+                        .map_err(Box::new)
+                })
                 .map(|snapshot| {
                     call_span.record("quad_count", snapshot.quads.len() as u64);
                     MetadataEvent::GraphSnapshotResult {
@@ -725,7 +752,7 @@ fn sync_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| node.install_graph_snapshot(&snapshot))
+                .in_scope(|| node.install_graph_snapshot(&snapshot).map_err(Box::new))
                 .map(|merged| {
                     call_span.record("applied", merged.applied);
                     MetadataEvent::SnapshotInstalled {
@@ -781,7 +808,10 @@ fn sync_effect(
             );
             let started = Instant::now();
             let result = call_span
-                .in_scope(|| to_craqle_batch(&batch).and_then(|batch| node.merge_batch(&batch)))
+                .in_scope(|| {
+                    to_craqle_batch(&batch)
+                        .and_then(|batch| node.merge_batch(&batch).map_err(Box::new))
+                })
                 .map(|merged| {
                     call_span.record("applied", merged.applied);
                     MetadataEvent::BatchMerged {
@@ -875,7 +905,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
             {
                 MetadataError::GraphNotFound
             } else {
-                error_from_craqle(error)
+                error_from_craqle(*error)
             };
             MetadataEvent::Error { graph_iri, error }
         }

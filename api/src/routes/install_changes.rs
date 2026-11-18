@@ -5,9 +5,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_operations::plugins::lifecycle::{
-    pause_install, resume_install, set_grants, update_install,
-};
+use aruna_operations::driver::drive;
+use aruna_operations::plugins::lifecycle::{SetGrants, SetPaused, UpdateInstall};
 use axum::Json;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
@@ -17,11 +16,10 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::plugin_installs::{
-    InstallView, admin_call, map_error, secret_session, view, view_example,
+    InstallView, admin_call, caller, local_node, map_error, secret_session, view, view_example,
 };
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerResult};
-use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -91,15 +89,8 @@ pub async fn put_grants(
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
     secret_session(&state, &auth, (Some(install_id), None)).await?;
-    let changed = set_grants(
-        &state.get_ctx(),
-        &actor(&state, &auth),
-        &auth,
-        install_id,
-        &body.grants,
-    )
-    .await
-    .map_err(map_error)?;
+    let change = SetGrants::new(caller(&state, &auth), install_id, &body.grants);
+    let changed = drive(change, &state.get_ctx()).await.map_err(map_error)?;
     Ok(Json(view(&state, changed).await?))
 }
 
@@ -138,18 +129,11 @@ pub async fn put_version(
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
     let target = (Some(install_id), Some(body.version.as_str()));
     secret_session(&state, &auth, target).await?;
-    let actor = actor(&state, &auth);
+    let ctx = state.get_ctx();
+    let who = (caller(&state, &auth), local_node(&ctx));
     let settings = body.settings.as_ref();
-    let (updated, missing) = update_install(
-        &state.get_ctx(),
-        &actor,
-        &auth,
-        install_id,
-        &body.version,
-        settings,
-    )
-    .await
-    .map_err(map_error)?;
+    let update = UpdateInstall::new(who, install_id, &body.version, settings);
+    let (updated, missing) = drive(update, &ctx).await.map_err(map_error)?;
     let install = view(&state, updated).await?;
     Ok(Json(UpdateView { install, missing }))
 }
@@ -181,9 +165,8 @@ pub async fn pause(
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
-    let paused = pause_install(&state.get_ctx(), &actor(&state, &auth), &auth, install_id)
-        .await
-        .map_err(map_error)?;
+    let pause = SetPaused::new(caller(&state, &auth), install_id, true);
+    let paused = drive(pause, &state.get_ctx()).await.map_err(map_error)?;
     Ok(Json(view(&state, paused).await?))
 }
 
@@ -214,8 +197,7 @@ pub async fn resume(
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
-    let resumed = resume_install(&state.get_ctx(), &actor(&state, &auth), &auth, install_id)
-        .await
-        .map_err(map_error)?;
+    let resume = SetPaused::new(caller(&state, &auth), install_id, false);
+    let resumed = drive(resume, &state.get_ctx()).await.map_err(map_error)?;
     Ok(Json(view(&state, resumed).await?))
 }

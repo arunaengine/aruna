@@ -4,18 +4,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::plugins::clock::ClockReading;
-use crate::plugins::journal::JOURNAL_PAGE;
-use crate::plugins::lifecycle::set_grants;
-use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
-use crate::plugins::rows::decode;
-use crate::plugins::rows::values_result;
-use crate::plugins::store::Txn;
-use crate::plugins::worker::match_journal;
-use crate::plugins::worker::tests::{
+use crate::plugin_host::worker::match_journal;
+use crate::plugin_host::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced,
 };
-use crate::plugins::worker::{plan_replays, run_replays};
+use crate::plugin_host::worker::{plan_replays, run_replays};
+use crate::plugins::calls::*;
+use crate::plugins::clock::ClockReading;
+use crate::plugins::journal::JOURNAL_PAGE;
+use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
+use crate::plugins::rows::decode;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::values_result;
+use crate::plugins::store::Txn;
 use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
 use aruna_core::plugin_installs::Widening;
 use aruna_core::plugin_runs::{GapRow, gap_key};
@@ -301,4 +302,76 @@ fn replay_rows_read() {
     let answer = plan.next(values_result(vec![None, None])).unwrap();
     assert_eq!(answer, Next::Done((None, None)));
     assert!(plan.next(values_result(vec![None])).is_err());
+}
+
+fn replay_target(install: &PluginInstall) -> Target {
+    Target {
+        install_id: install.install_id,
+        group_id: install.group_id,
+        revision: install.revision,
+        coverage: BTreeMap::new(),
+        account: install.account,
+    }
+}
+
+type ReplayAnswer = (Option<CoverageRow>, Option<ReplayRow>);
+
+#[test]
+fn first_coverage_starts() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let mut plan = PlanReplay::new(install.clone(), replay_target(&install));
+    assert!(matches!(plan.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let rows: ReplayAnswer = (None, None);
+    let answer = plan.next(child_result(Ok::<_, StoreError>(rows))).unwrap();
+    let Next::Done(ReplayPlan::Start { boundary, by, .. }) = answer else {
+        panic!("a first activation replays");
+    };
+    assert_eq!((boundary, by), (5, install.activated_by));
+}
+
+#[test]
+fn moved_record_updates() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let mut newer = install.clone();
+    newer.revision = 2;
+    let row = CoverageRow {
+        revision: 1,
+        active_since_ms: newer.active_since_ms,
+        coverage: BTreeMap::new(),
+        note: None,
+    };
+    let mut plan = PlanReplay::new(newer.clone(), replay_target(&newer));
+    let rows: ReplayAnswer = (Some(row), None);
+    let answer = plan.next(child_result(Ok::<_, StoreError>(rows)));
+    assert!(matches!(answer, Ok(Next::Call(IoCall::Write(_)))));
+    assert_eq!(
+        plan.next(IoResult::Done),
+        Ok(Next::Done(ReplayPlan::Nothing))
+    );
+}
+
+#[test]
+fn replays_pages_bounded() {
+    let key = (b"r1".to_vec(), Vec::new());
+    let page = crate::plugins::rows::tests::page_result(vec![key], None);
+    let mut replays = RunReplays::new(9, (10, 2));
+    assert!(matches!(
+        replays.first(),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    assert!(matches!(
+        replays.next(page),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let more = child_result(Ok::<_, StoreError>((4usize, false)));
+    assert!(matches!(
+        replays.next(more),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let last = child_result(Ok::<_, StoreError>((1usize, false)));
+    assert_eq!(
+        replays.next(last),
+        Ok(Next::Done(5)),
+        "the page bound ends it"
+    );
 }
