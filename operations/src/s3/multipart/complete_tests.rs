@@ -321,7 +321,7 @@ fn finalize_waiting(record: MultipartUpload, composed: BackendLocation) -> Compl
 }
 
 #[test]
-fn refused_finalize_rolls_back() {
+fn refused_rolls_back() {
     // A refused finalize proves no version names the composed object, so it is queued for
     // deletion and the record reopened.
     let input = finalize_input();

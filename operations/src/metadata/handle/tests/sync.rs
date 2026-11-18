@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::transport::with_sync_timeout;
 use super::auth::{node_id_seed, realm_fixture};
 use super::*;
 use crate::metadata::handle::transport::read_budget;
@@ -135,18 +134,6 @@ async fn sync_creates_bucket() {
 
     assert_eq!(bucket.group_id, group_id);
     assert_eq!(bucket.created_by, user_id);
-}
-#[tokio::test(start_paused = true)]
-async fn sync_timeout_fires() {
-    assert!(SYNC_MIRROR_TIMEOUT < RECONCILE_GRACE);
-    let result =
-        with_sync_timeout(std::future::pending::<Result<(), MetadataRequestError>>()).await;
-
-    assert!(matches!(
-        result,
-        Err(MetadataError::Backend(message))
-            if message == "sync mirror request timed out"
-    ));
 }
 async fn assert_timeout(frame: &[u8], held: bool) {
     let (mut writer, reader) = tokio::io::duplex(16);

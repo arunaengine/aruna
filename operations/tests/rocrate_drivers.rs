@@ -1517,10 +1517,13 @@ fn storage_proxy(
 }
 
 fn bucket_read(effect: &StorageEffect) -> bool {
-    matches!(
-        effect,
-        StorageEffect::Read { key_space, .. } if key_space == S3_BUCKET_KEYSPACE
-    )
+    match effect {
+        StorageEffect::Read { key_space, .. } => key_space == S3_BUCKET_KEYSPACE,
+        StorageEffect::BatchRead { reads, .. } => reads
+            .iter()
+            .any(|(key_space, _)| key_space == S3_BUCKET_KEYSPACE),
+        _ => false,
+    }
 }
 
 fn fenced_release(effect: &StorageEffect) -> bool {

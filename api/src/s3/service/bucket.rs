@@ -17,11 +17,11 @@ use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
+use aruna_operations::metadata::mirror_request::MirrorRequestOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::sync::mirror_repair::{
-    KickRepairOperation, MirrorRecordOperation, SyncMirrorIntent, delete_sync_mirror,
-    request_mirror_create,
+    KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation, SyncMirrorIntent,
 };
 use aruna_operations::sync::sync_relationship::{
     DeleteRelationshipOperation, ListRelationshipsOperation, StoreRelationshipOperation,
@@ -340,31 +340,34 @@ impl ArunaS3Service {
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         });
-        request_mirror_create(
-            &self.state,
+        let request = MirrorRequestOperation::create(
             relationship.target.node_id,
             auth_token,
             user_access.group_id,
             relationship.clone(),
             extras.clone(),
-        )
-        .await
-        .map_err(|error| match error {
-            aruna_core::metadata::MetadataError::HandleMissing => {
-                s3_error!(InternalError, "Replication target is unreachable")
-            }
-            aruna_core::metadata::MetadataError::Backend(message) if message == "access_denied" => {
-                s3_error!(AccessDenied, "Permission denied")
-            }
-            aruna_core::metadata::MetadataError::Backend(message) if message == "not_found" => {
-                s3_error!(NoSuchBucket, "Replication target bucket does not exist")
-            }
-            error => s3_error!(InternalError, "Replication target error: {}", error),
-        })
+        );
+        drive(request, &self.state)
+            .await
+            .map_err(|error| match error {
+                aruna_core::metadata::MetadataError::HandleMissing => {
+                    s3_error!(InternalError, "Replication target is unreachable")
+                }
+                aruna_core::metadata::MetadataError::Backend(message)
+                    if message == "access_denied" =>
+                {
+                    s3_error!(AccessDenied, "Permission denied")
+                }
+                aruna_core::metadata::MetadataError::Backend(message) if message == "not_found" => {
+                    s3_error!(NoSuchBucket, "Replication target bucket does not exist")
+                }
+                error => s3_error!(InternalError, "Replication target error: {}", error),
+            })
     }
 
     pub(super) async fn remove_sync_mirror(&self, relationship: &SyncRelationship) -> bool {
-        if let Err(error) = delete_sync_mirror(&self.state, self.node_id, relationship).await {
+        let remove = RemoveMirrorOperation::new(self.node_id, relationship.clone());
+        if let Err(error) = drive(remove, &self.state).await {
             warn!(relationship_id = %relationship.id, %error, "Failed to remove remote sync mirror");
             return false;
         }

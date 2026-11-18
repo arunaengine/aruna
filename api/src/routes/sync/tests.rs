@@ -26,7 +26,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_operations::sync::mirror_repair::{SyncMirrorRecord, process_mirror_repairs};
+use aruna_operations::sync::mirror_repair::{DrainRepairsOperation, SyncMirrorRecord};
 use aruna_operations::testing::test_context;
 use tempfile::TempDir;
 
@@ -788,7 +788,7 @@ async fn claimed_create(state: &ServerState) -> SyncRelationship {
         postcard::to_allocvec(&record).unwrap().into(),
     )
     .await;
-    process_mirror_repairs(&context, state.get_node_id())
+    drive(DrainRepairsOperation::new(state.get_node_id()), &context)
         .await
         .unwrap();
     assert!(
@@ -856,7 +856,7 @@ async fn rollback_before_cleanup() {
     // Repair finished the rollback before the route saw its refused activation.
     let (_storage_dir, state, auth, _) = test_state().await;
     let relationship = claimed_create(&state).await;
-    process_mirror_repairs(&state.get_ctx(), state.get_node_id())
+    drive(DrainRepairsOperation::new(state.get_node_id()), &state.get_ctx())
         .await
         .unwrap();
     assert!(repair_record(&state, &relationship).await.is_none());
@@ -885,7 +885,7 @@ async fn claim_during_cleanup() {
             .await
             .is_some_and(|record| record.rollback)
     );
-    process_mirror_repairs(&state.get_ctx(), state.get_node_id())
+    drive(DrainRepairsOperation::new(state.get_node_id()), &state.get_ctx())
         .await
         .unwrap();
     assert!(repair_record(&state, &relationship).await.is_none());

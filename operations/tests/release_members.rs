@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::effects::StorageEffect;
-use aruna_core::jobs::InputResolveRequest;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -28,6 +27,7 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::jobs::lifecycle::remote_inputs::{RemoteInputsOperation, ResolveCaller};
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::metadata::PutMetadataOperation;
@@ -272,16 +272,18 @@ async fn releases_pin_versions() -> TestResult<()> {
         Some(metadata.clone()),
     );
     drive(set_metadata, context).await?;
-    let request = InputResolveRequest {
+    let asker = realm.node(1).context.as_ref();
+    let inputs = vec![input];
+    let caller = ResolveCaller {
         created_by: realm.user_id,
         submission_id: SubmissionId([7; 32]),
         expires_at: u64::MAX,
-        inputs: vec![input],
     };
-    let resolved = handle
-        .request_input_resolve(holder.node_id(), realm.bearer_token(), request)
-        .await?
-        .map_err(|refusal| format!("{refusal:?}"))?;
+    let resolved = drive(
+        RemoteInputsOperation::new(holder.node_id(), inputs, caller, Some(realm.bearer_token())),
+        asker,
+    )
+    .await?;
     let captured = &resolved[0].1;
     // The bucket links no dataset here, so the captured description stays empty.
     let database = aruna_core::structs::storage::bucket_metadata::CapturedDatabase::new(
@@ -316,16 +318,18 @@ async fn releases_pin_versions() -> TestResult<()> {
         txn_id: None,
     };
     context.storage_handle.send_storage_effect(write).await;
-    let request = InputResolveRequest {
+    let inputs = resolved.iter().map(|(input, _)| input.clone()).collect();
+    let caller = ResolveCaller {
         created_by: one_key,
         submission_id: SubmissionId([8; 32]),
         expires_at: u64::MAX,
-        inputs: resolved.iter().map(|(input, _)| input.clone()).collect(),
     };
-    let resolved = handle
-        .request_input_resolve(holder.node_id(), realm.bearer_for(one_key), request)
-        .await?
-        .map_err(|refusal| format!("{refusal:?}"))?;
+    let token = Some(realm.bearer_for(one_key));
+    let resolved = drive(
+        RemoteInputsOperation::new(holder.node_id(), inputs, caller, token),
+        asker,
+    )
+    .await?;
     assert_eq!(resolved[0].1.database, None, "no bucket READ, no metadata");
 
     // The holder reads a tagged crate version for the caller; an untagged version is none.

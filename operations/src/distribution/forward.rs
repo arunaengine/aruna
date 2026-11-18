@@ -35,10 +35,11 @@ use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
-use crate::s3::bucket::dataset::{DescriptionError, dataset_description};
+use crate::s3::bucket::dataset::DatasetSummaryOperation;
 use crate::s3::bucket::delete::DeleteBucketOperation;
 use crate::s3::bucket::get::GetBucketOperation;
 use aruna_core::metadata::AuthToken;
+use aruna_core::structs::storage::dataset_description::DescriptionError;
 
 /// Why the publisher refused or could not take a request.
 #[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
@@ -172,7 +173,8 @@ async fn readable_link(
         return Ok(());
     };
     let caller = (Some(auth), Some(token));
-    match dataset_description(context, auth.realm_id, dataset, caller).await {
+    let read = DatasetSummaryOperation::new(auth.realm_id, dataset, caller);
+    match drive(read, context).await {
         Ok(_) => Ok(()),
         Err(DescriptionError::Unreadable) => Err(PublishRefusal::Rejected(format!(
             "dataset {dataset} does not exist or you may not read it"

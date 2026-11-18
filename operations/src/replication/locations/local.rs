@@ -5,7 +5,6 @@
 use super::LocationSummaryError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::records::blob_location_read;
 use crate::realm::peer_trust::ensure_realm_peer;
 use crate::replication::protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
@@ -13,17 +12,17 @@ use crate::replication::protocol::{
 };
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::managed_copy::{
-    CopyRequest, read_effect, registration_for, serve_reads, split_reads,
-};
-use aruna_core::operation::EffectOperation;
+use aruna_core::managed_copy::{CopyRequest, read_effect, registration_for, serve_reads};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
+use aruna_core::rows::read_row;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -36,17 +35,18 @@ use aruna_core::structs::storage::blob::{
     object_permission_path,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use std::time::SystemTime;
 use ulid::Ulid;
+
+type Turn = Result<Next<LocalSummary>, LocationSummaryError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SummaryState {
     Init,
     ReadRealm,
     ReadBucket,
-    StartPolicy,
+    Snapshot,
     ReadPolicy,
     ReadHead,
     ReadVersion,
@@ -54,13 +54,9 @@ enum SummaryState {
     ReadCopyOrigin,
     CheckManagedCopy,
     ReadBackend,
-    CommitTransaction,
-    AbortTransaction,
     SendSummary,
     SendDenial,
     Close,
-    Finish,
-    Error,
 }
 
 /// A local answer, plus the content hash that never goes on the wire and the
@@ -76,20 +72,20 @@ pub struct LocalSummary {
     pub delete_marker: bool,
 }
 
-/// Answers "which copy does THIS node hold" for one version. One state machine
-/// serves the local read and, with a reply stream, an inbound peer request; the
-/// peer path additionally proves realm membership and READ access.
+/// Answers "which copy does THIS node hold" for one version, locally or on a peer's stream; the
+/// peer path also proves realm membership. The READ check and the answer's rows are read by a
+/// child of this type in one read snapshot.
 #[derive(Debug, PartialEq)]
 pub struct LocationSummaryOperation {
     request: LocationSummaryRequest,
     peer: Option<NodeId>,
     local_node: Option<NodeId>,
     stream_id: Option<Ulid>,
+    snapshot: bool,
     bucket: Option<BucketInfo>,
     /// Identity of the bucket record the READ check was evaluated against.
     authorized: Option<(Ulid, SystemTime, UserId)>,
     permission_path: Option<String>,
-    txn_id: Option<Ulid>,
     policy_allowed: bool,
     policy_current: bool,
     state: SummaryState,
@@ -101,7 +97,8 @@ pub struct LocationSummaryOperation {
     /// the summary may claim the copy is held.
     version_refs: Vec<PlacementPolicyRef>,
     pending_copy: Option<(ManagedCopyKey, BackendLocation)>,
-    output: Option<Result<LocalSummary, LocationSummaryError>>,
+    /// The answer sent on the stream, returned once the stream is closed.
+    answer: Option<LocalSummary>,
 }
 
 impl LocationSummaryOperation {
@@ -132,10 +129,10 @@ impl LocationSummaryOperation {
             peer,
             local_node,
             stream_id,
+            snapshot: false,
             bucket: None,
             authorized: None,
             permission_path: None,
-            txn_id: None,
             policy_allowed: false,
             policy_current: false,
             state: SummaryState::Init,
@@ -145,78 +142,8 @@ impl LocationSummaryOperation {
             summary: LocationSummary::absent(),
             version_refs: Vec::new(),
             pending_copy: None,
-            output: None,
+            answer: None,
         }
-    }
-
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            SummaryState::Init => "init",
-            SummaryState::ReadRealm => "read_realm",
-            SummaryState::ReadBucket => "read_bucket",
-            SummaryState::StartPolicy => "start_policy",
-            SummaryState::ReadPolicy => "read_policy",
-            SummaryState::ReadHead => "read_head",
-            SummaryState::ReadVersion => "read_version",
-            SummaryState::ReadLocation => "read_location",
-            SummaryState::ReadCopyOrigin => "read_copy_origin",
-            SummaryState::CheckManagedCopy => "check_managed_copy",
-            SummaryState::ReadBackend => "read_backend",
-            SummaryState::CommitTransaction => "commit_transaction",
-            SummaryState::AbortTransaction => "abort_transaction",
-            SummaryState::SendSummary => "send_summary",
-            SummaryState::SendDenial => "send_denial",
-            SummaryState::Close => "close",
-            SummaryState::Finish => "finish",
-            SummaryState::Error => "error",
-        }
-    }
-
-    fn fail(&mut self, error: LocationSummaryError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = SummaryState::Error;
-        let mut effects = smallvec![];
-        if let Some(txn_id) = self.txn_id.take() {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        if let Some(stream_id) = self.stream_id {
-            effects.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }));
-        }
-        effects
-    }
-
-    fn unexpected(&mut self, event: Event) -> Effects {
-        let state = self.state_name();
-        self.fail(LocationSummaryError::Unexpected {
-            state,
-            event: event.label().to_string(),
-        })
-    }
-
-    fn local_answer(&self) -> LocalSummary {
-        LocalSummary {
-            summary: self.summary.clone(),
-            blake3: self.blake3,
-            bucket: self.bucket.clone(),
-            delete_marker: self.delete_marker,
-        }
-    }
-
-    fn read_realm(&mut self) -> Effects {
-        self.state = SummaryState::ReadRealm;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: self.request.realm_id.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
-    }
-
-    fn bucket_read(&self) -> Effect {
-        Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.request.bucket.as_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        })
     }
 
     pub fn with_policy(mut self, allowed: bool) -> Self {
@@ -224,21 +151,65 @@ impl LocationSummaryOperation {
         self
     }
 
-    fn read_bucket(&mut self) -> Effects {
-        self.state = SummaryState::ReadBucket;
-        smallvec![self.bucket_read()]
+    fn state_name(&self) -> &'static str {
+        match self.state {
+            SummaryState::Init => "init",
+            SummaryState::ReadRealm => "read_realm",
+            SummaryState::ReadBucket => "read_bucket",
+            SummaryState::Snapshot => "snapshot",
+            SummaryState::ReadPolicy => "read_policy",
+            SummaryState::ReadHead => "read_head",
+            SummaryState::ReadVersion => "read_version",
+            SummaryState::ReadLocation => "read_location",
+            SummaryState::ReadCopyOrigin => "read_copy_origin",
+            SummaryState::CheckManagedCopy => "check_managed_copy",
+            SummaryState::ReadBackend => "read_backend",
+            SummaryState::SendSummary => "send_summary",
+            SummaryState::SendDenial => "send_denial",
+            SummaryState::Close => "close",
+        }
     }
 
-    fn start_policy(&mut self) -> Effects {
-        self.state = SummaryState::StartPolicy;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
+    fn unexpected(&self, event: Event) -> Turn {
+        Err(LocationSummaryError::Unexpected {
+            state: self.state_name(),
+            event: event.label().to_string(),
+        })
     }
 
-    fn read_policy(&mut self) -> Effects {
+    fn call(&mut self, state: SummaryState, call: IoCall) -> Turn {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn read(&mut self, state: SummaryState, space: &str, key: Vec<u8>) -> Turn {
+        self.call(state, read_row(space, key))
+    }
+
+    fn read_realm(&mut self) -> Turn {
+        let key = self.request.realm_id.as_bytes().to_vec();
+        self.read(SummaryState::ReadRealm, REALM_CONFIG_KEYSPACE, key)
+    }
+
+    fn read_bucket(&mut self) -> Turn {
+        let key = self.request.bucket.as_bytes().to_vec();
+        self.read(SummaryState::ReadBucket, S3_BUCKET_KEYSPACE, key)
+    }
+
+    fn snapshot_child(&self) -> Self {
+        Self {
+            snapshot: true,
+            bucket: self.bucket.clone(),
+            authorized: self.authorized,
+            permission_path: self.permission_path.clone(),
+            policy_allowed: self.policy_allowed,
+            ..Self::build(self.request.clone(), self.peer, self.local_node, None)
+        }
+    }
+
+    fn read_policy(&mut self) -> Turn {
         let Some(bucket) = self.bucket.as_ref() else {
-            return self.fail(LocationSummaryError::BucketNotFound);
+            return Err(LocationSummaryError::BucketNotFound);
         };
         let mut reads = vec![
             (
@@ -251,17 +222,13 @@ impl LocationSummaryOperation {
             ),
             (AUTH_KEYSPACE.to_string(), bucket.group_id.to_bytes().into()),
         ];
-        // The caller's roles are read in this transaction, after the three policy rows.
+        // The caller's roles are read in this snapshot, after the three policy rows.
         let roles = self.read_check().map(|check| check.reads());
         let Some(Ok(roles)) = roles else {
-            return self.deny();
+            return Err(LocationSummaryError::Denied);
         };
         reads.extend(roles);
-        self.state = SummaryState::ReadPolicy;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(SummaryState::ReadPolicy, IoCall::Read(reads))
     }
 
     fn read_check(&self) -> Option<CheckPermissionsConfig> {
@@ -272,108 +239,116 @@ impl LocationSummaryOperation {
         })
     }
 
-    fn read_head(&mut self) -> Effects {
-        let key = match BlobHeadKey::new(&self.request.bucket, &self.request.key).to_bytes() {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = SummaryState::ReadHead;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: self.txn_id,
-        })]
+    fn read_head(&mut self) -> Turn {
+        let key = BlobHeadKey::new(&self.request.bucket, &self.request.key).to_bytes()?;
+        self.read(SummaryState::ReadHead, BLOB_HEAD_KEYSPACE, key)
     }
 
-    fn read_version(&mut self) -> Effects {
+    fn read_version(&mut self) -> Turn {
         let Some(version_id) = self.version_id else {
-            return self.answer();
+            return self.finish_snapshot();
         };
-        let key =
-            match VersionKey::new(&self.request.bucket, &self.request.key, version_id).to_bytes() {
-                Ok(key) => key,
-                Err(error) => return self.fail(error.into()),
-            };
-        self.state = SummaryState::ReadVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: self.txn_id,
-        })]
+        let key = VersionKey::new(&self.request.bucket, &self.request.key, version_id);
+        let key = key.to_bytes()?;
+        self.read(SummaryState::ReadVersion, BLOB_VERSIONS_KEYSPACE, key)
     }
 
-    fn read_location(&mut self, key: BlobLocationKey) -> Effects {
-        self.state = SummaryState::ReadLocation;
-        smallvec![blob_location_read(&key, self.txn_id)]
+    fn read_location(&mut self, key: BlobLocationKey) -> Turn {
+        let key = key.to_bytes();
+        self.read(SummaryState::ReadLocation, BLOB_LOCATIONS_KEYSPACE, key)
     }
 
-    fn read_backend(&mut self, backend_id: Ulid) -> Effects {
-        self.state = SummaryState::ReadBackend;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-            key: backend_id.to_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        })]
+    fn read_backend(&mut self, backend_id: Ulid) -> Turn {
+        let key = backend_id.to_bytes().to_vec();
+        self.read(SummaryState::ReadBackend, STORAGE_BACKEND_KEYSPACE, key)
     }
 
-    fn answer(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id.take() else {
-            return self.fail(LocationSummaryError::Unexpected {
-                state: "answer",
-                event: "missing read transaction".to_string(),
-            });
-        };
-        self.state = SummaryState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn send_answer(&mut self) -> Effects {
+    /// The snapshot's outcome; the runner closes the snapshot with it.
+    fn finish_snapshot(&mut self) -> Turn {
         self.summary.version_id = self.version_id;
         self.summary.group_id = self.bucket.as_ref().map(|bucket| bucket.group_id);
-        let summary = self.summary.clone();
-        let Some(stream_id) = self.stream_id else {
-            self.state = SummaryState::Finish;
-            self.output = Some(Ok(self.local_answer()));
-            return smallvec![];
-        };
-        let payload = match VersionReplicationMessage::LocationSummaryResponse(summary).to_bytes() {
-            Ok(payload) => payload,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = SummaryState::SendSummary;
-        smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
+        Ok(Next::Done(LocalSummary {
+            summary: self.summary.clone(),
+            blake3: self.blake3,
+            bucket: self.bucket.clone(),
+            delete_marker: self.delete_marker,
+        }))
     }
 
-    fn handle_realm(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+    fn send(&mut self, state: SummaryState, stream_id: Ulid, payload: Vec<u8>) -> Turn {
+        let send = BlobEffect::SendMessage { stream_id, payload };
+        self.call(state, Effect::Blob(send).into())
+    }
+
+    fn close(&mut self, stream_id: Ulid) -> Turn {
+        let close = BlobEffect::CloseConnection { stream_id };
+        self.call(SummaryState::Close, Effect::Blob(close).into())
+    }
+
+    fn accept_snapshot(&mut self, outcome: Result<LocalSummary, LocationSummaryError>) -> Turn {
+        let local = match outcome {
+            Ok(local) => local,
+            Err(LocationSummaryError::Denied) => return self.deny(),
+            Err(error) => return Err(error),
+        };
+        let Some(stream_id) = self.stream_id else {
+            return Ok(Next::Done(local));
+        };
+        let summary = local.summary.clone();
+        let payload = VersionReplicationMessage::LocationSummaryResponse(summary).to_bytes()?;
+        self.answer = Some(local);
+        self.send(SummaryState::SendSummary, stream_id, payload)
+    }
+
+    /// A refusal is answered rather than dropped: a caller must be able to tell
+    /// a node that will not answer from one that cannot.
+    fn deny(&mut self) -> Turn {
+        let Some(stream_id) = self.stream_id else {
+            return Err(LocationSummaryError::Denied);
+        };
+        let payload = VersionReplicationMessage::LocationSummaryDenied.to_bytes()?;
+        self.send(SummaryState::SendDenial, stream_id, payload)
+    }
+
+    fn accept_sent(&mut self, event: Event) -> Turn {
+        let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
             return self.unexpected(event);
         };
+        self.close(stream_id)
+    }
+
+    fn accept_closed(&mut self, event: Event) -> Turn {
+        let Event::Blob(BlobEvent::ConnectionClosed { stream_id }) = event else {
+            return self.unexpected(event);
+        };
+        if Some(stream_id) != self.stream_id {
+            return self.unexpected(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+        }
+        self.stream_id = None;
+        match self.answer.take() {
+            Some(local) => Ok(Next::Done(local)),
+            None => Err(LocationSummaryError::Denied),
+        }
+    }
+
+    fn accept_realm(&mut self, value: Option<Value>) -> Turn {
         let (Some(value), Some(peer)) = (value, self.peer) else {
-            return self.fail(LocationSummaryError::PeerDenied);
+            return Err(LocationSummaryError::PeerDenied);
         };
-        let document = match RealmConfigDocument::from_bytes(&value) {
-            Ok(document) => document,
-            Err(error) => return self.fail(error.into()),
-        };
+        let document = RealmConfigDocument::from_bytes(&value)?;
         if ensure_realm_peer(&document, peer, self.request.realm_id, true).is_err() {
-            return self.fail(LocationSummaryError::PeerDenied);
+            return Err(LocationSummaryError::PeerDenied);
         }
         self.read_bucket()
     }
 
-    fn handle_bucket(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn accept_bucket(&mut self, value: Option<Value>) -> Turn {
         let Some(value) = value else {
-            return self.fail(LocationSummaryError::BucketNotFound);
+            return Err(LocationSummaryError::BucketNotFound);
         };
-        let bucket = match BucketInfo::from_bytes(&value) {
-            Ok(bucket) => bucket,
-            Err(error) => return self.fail(error.into()),
-        };
+        let bucket = BucketInfo::from_bytes(&value)?;
         let Some(local_node) = self.local_node else {
-            return self.fail(LocationSummaryError::PeerDenied);
+            return Err(LocationSummaryError::PeerDenied);
         };
         let group_id = bucket.group_id;
         self.authorized = Some(bucket.identity());
@@ -395,54 +370,40 @@ impl LocationSummaryOperation {
             )
         };
         self.permission_path = Some(path);
-        self.start_policy()
+        let child = IoCall::child(self.snapshot_child());
+        self.call(SummaryState::Snapshot, child)
     }
 
-    fn handle_start_policy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected(event);
+    fn accept_policy(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let denied = || Err(LocationSummaryError::Denied);
+        let Some(Some(bucket_value)) = values.first() else {
+            return denied();
         };
-        self.txn_id = Some(txn_id);
-        self.read_policy()
-    }
-
-    fn handle_policy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
-        let Some((_, Some(bucket_value))) = values.first() else {
-            return self.deny();
-        };
-        let current = match BucketInfo::from_bytes(bucket_value) {
-            Ok(bucket) => bucket,
-            Err(error) => return self.fail(error.into()),
-        };
+        let current = BucketInfo::from_bytes(bucket_value)?;
         if Some(current.identity()) != self.authorized {
-            return self.deny();
+            return denied();
         }
-        let Some((_, Some(realm_value))) = values.get(1) else {
-            return self.deny();
+        let Some(Some(realm_value)) = values.get(1) else {
+            return denied();
         };
-        let realm = match RealmConfigDocument::from_bytes(realm_value) {
-            Ok(realm) if realm.realm_id == self.request.realm_id => realm,
-            Ok(_) => return self.deny(),
-            Err(error) => return self.fail(error.into()),
-        };
+        let realm = RealmConfigDocument::from_bytes(realm_value)?;
+        if realm.realm_id != self.request.realm_id {
+            return denied();
+        }
         if let Some(peer) = self.peer
             && ensure_realm_peer(&realm, peer, self.request.realm_id, true).is_err()
         {
-            return self.deny();
+            return denied();
         }
-        let Some((_, Some(group_value))) = values.get(2) else {
-            return self.deny();
+        let Some(Some(group_value)) = values.get(2) else {
+            return denied();
         };
-        let group = match GroupAuthorizationDocument::from_bytes(group_value) {
-            Ok(group) if group.group_id == current.group_id => group,
-            Ok(_) => return self.deny(),
-            Err(error) => return self.fail(error.into()),
-        };
+        let group = GroupAuthorizationDocument::from_bytes(group_value)?;
+        if group.group_id != current.group_id {
+            return denied();
+        }
         let Some(path) = self.permission_path.as_deref() else {
-            return self.deny();
+            return denied();
         };
         let request = policy_request_with(
             path,
@@ -450,103 +411,46 @@ impl LocationSummaryOperation {
             Some(&self.request.auth_context),
             PolicyRequestExtras::operation("s3.GetObject"),
         );
-        let realm_set = match CompiledPolicySet::compile(&realm.request_policies) {
-            Ok(set) => set,
-            Err(_) => return self.deny(),
+        let Ok(realm_set) = CompiledPolicySet::compile(&realm.request_policies) else {
+            return denied();
         };
-        let group_set = match CompiledPolicySet::compile(&group.policies) {
-            Ok(set) => set,
-            Err(_) => return self.deny(),
+        let Ok(group_set) = CompiledPolicySet::compile(&group.policies) else {
+            return denied();
         };
         self.policy_current = self.policy_allowed
             && matches!(realm_set.evaluate(&request), PolicyDecision::Allowed)
             && matches!(group_set.evaluate(&request), PolicyDecision::Allowed);
-        let roles = values.iter().skip(3).map(|(_, value)| value.clone());
-        let allowed = self
-            .read_check()
-            .map(|check| check.allowed(roles.collect()));
+        let roles = values.iter().skip(3).cloned().collect();
+        let allowed = self.read_check().map(|check| check.allowed(roles));
         match allowed {
             Some(Ok(true)) if self.policy_current => self.resolve_version(),
-            _ => self.deny(),
+            _ => denied(),
         }
     }
 
-    fn handle_commit(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected(event);
-        };
-        self.send_answer()
-    }
-
-    fn handle_abort(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
-            return self.unexpected(event);
-        };
-        self.send_denial()
-    }
-
-    /// A refusal is answered rather than dropped: a caller must be able to tell
-    /// a node that will not answer from one that cannot.
-    fn deny(&mut self) -> Effects {
-        if let Some(txn_id) = self.txn_id.take() {
-            self.output = Some(Err(LocationSummaryError::Denied));
-            self.state = SummaryState::AbortTransaction;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        self.send_denial()
-    }
-
-    fn send_denial(&mut self) -> Effects {
-        let Some(stream_id) = self.stream_id else {
-            self.output = Some(Err(LocationSummaryError::Denied));
-            self.state = SummaryState::Error;
-            return smallvec![];
-        };
-        let payload = match VersionReplicationMessage::LocationSummaryDenied.to_bytes() {
-            Ok(payload) => payload,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.output = Some(Err(LocationSummaryError::Denied));
-        self.state = SummaryState::SendDenial;
-        smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
-    }
-
-    fn resolve_version(&mut self) -> Effects {
+    fn resolve_version(&mut self) -> Turn {
         match self.version_id {
             Some(_) => self.read_version(),
             None => self.read_head(),
         }
     }
 
-    fn handle_head(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn accept_head(&mut self, value: Option<Value>) -> Turn {
         let Some(value) = value else {
-            return self.answer();
+            return self.finish_snapshot();
         };
-        match CurrentVersionPointer::from_bytes(&value) {
-            Ok(pointer) => {
-                self.version_id = Some(pointer.version_id);
-                self.read_version()
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        let pointer = CurrentVersionPointer::from_bytes(&value)?;
+        self.version_id = Some(pointer.version_id);
+        self.read_version()
     }
 
-    fn handle_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn accept_version(&mut self, value: Option<Value>) -> Turn {
         // An unknown version is the caller's "not found": no copy, no id.
         let Some(value) = value else {
             self.version_id = None;
-            return self.answer();
+            return self.finish_snapshot();
         };
-        let version = match BlobVersion::from_bytes(&value) {
-            Ok(version) => version,
-            Err(error) => return self.fail(error.into()),
-        };
+        let version = BlobVersion::from_bytes(&value)?;
         self.delete_marker = version.is_deleted();
         self.version_refs = version.placement_policies.clone();
         self.summary.origin_device = version.metadata.get(ORIGIN_DEVICE_TAG).cloned();
@@ -556,25 +460,19 @@ impl LocationSummaryOperation {
                 self.summary.materialized = true;
                 self.read_location(key)
             }
-            None => self.answer(),
+            None => self.finish_snapshot(),
         }
     }
 
-    fn handle_location(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn accept_location(&mut self, value: Option<Value>) -> Turn {
         let Some(value) = value else {
-            return self.answer();
+            return self.finish_snapshot();
         };
-        let location = match BackendLocation::from_bytes(&value) {
-            Ok(location) => location,
-            Err(error) => return self.fail(error.into()),
-        };
+        let location = BackendLocation::from_bytes(&value)?;
         self.summary.blob_size = Some(location.blob_size);
         self.summary.hashes = location.hashes.clone().into_iter().collect();
         let Some(version_id) = self.version_id else {
-            return self.answer();
+            return self.finish_snapshot();
         };
         let key = ManagedCopyKey::new(
             VersionKey::new(
@@ -587,19 +485,21 @@ impl LocationSummaryOperation {
         // An ungoverned copy is advertised from its location record alone, as
         // before; its registration is read only to learn where it came from.
         let (effect, state) = match self.version_refs.is_empty() {
-            true => (read_effect(&key, self.txn_id), SummaryState::ReadCopyOrigin),
-            false => (
-                serve_reads(&key, self.txn_id),
-                SummaryState::CheckManagedCopy,
-            ),
+            true => (read_effect(&key, None)?, SummaryState::ReadCopyOrigin),
+            false => (serve_reads(&key, None)?, SummaryState::CheckManagedCopy),
         };
-        let effect = match effect {
-            Ok(effect) => effect,
-            Err(error) => return self.fail(error.into()),
+        let reads = match effect {
+            Effect::Storage(StorageEffect::Read { key_space, key, .. }) => vec![(key_space, key)],
+            Effect::Storage(StorageEffect::BatchRead { reads, .. }) => reads,
+            _ => {
+                return Err(LocationSummaryError::Unexpected {
+                    state: self.state_name(),
+                    event: "a copy read of another form".to_string(),
+                });
+            }
         };
         self.pending_copy = Some((key, location));
-        self.state = state;
-        smallvec![effect]
+        self.call(state, IoCall::Read(reads))
     }
 
     /// The registration matching exactly this copy, whatever its state.
@@ -613,12 +513,9 @@ impl LocationSummaryOperation {
         }
     }
 
-    fn handle_copy_origin(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn accept_copy_origin(&mut self, value: Option<Value>) -> Turn {
         let Some((key, location)) = self.pending_copy.take() else {
-            return self.answer();
+            return self.finish_snapshot();
         };
         if let Ok(record) = registration_for(value.as_deref(), &self.copy_request(&key)) {
             self.summary.origin = record.origin;
@@ -630,18 +527,15 @@ impl LocationSummaryOperation {
 
     /// A governed copy the node is not serving is listed with its verdict rather
     /// than hidden: the caller already holds READ, and no rule is disclosed.
-    fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
+    fn accept_managed_copy(&mut self, values: Vec<Option<Value>>) -> Turn {
         let Some((key, location)) = self.pending_copy.take() else {
-            return self.answer();
+            return self.finish_snapshot();
         };
-        let Ok((copy, subject)) = split_reads(values) else {
-            return self.answer();
+        let Ok([copy, subject]) = <[Option<Value>; 2]>::try_from(values) else {
+            return self.finish_snapshot();
         };
         let Ok(record) = registration_for(copy.as_deref(), &self.copy_request(&key)) else {
-            return self.answer();
+            return self.finish_snapshot();
         };
         self.summary.origin = record.origin;
         // A subject row that is missing or unreadable leaves the copy held but
@@ -660,14 +554,14 @@ impl LocationSummaryOperation {
         self.describe(location)
     }
 
-    fn describe(&mut self, location: BackendLocation) -> Effects {
+    fn describe(&mut self, location: BackendLocation) -> Turn {
         self.summary.held = true;
         match location.backend {
             BackendRef::Node(_) => {
                 self.summary.storage = Some(LocationCopyStorage::NodeManaged {
                     storage_class: location.storage_class,
                 });
-                self.answer()
+                self.finish_snapshot()
             }
             BackendRef::Group(backend_id) => {
                 self.summary.storage = Some(LocationCopyStorage::GroupBackend {
@@ -679,10 +573,7 @@ impl LocationSummaryOperation {
         }
     }
 
-    fn handle_backend(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    fn accept_backend(&mut self, value: Option<Value>) -> Turn {
         if let Some(value) = value
             && let Ok(record) = GroupStorage::from_bytes(&value)
             && let Some(LocationCopyStorage::GroupBackend { name, .. }) =
@@ -690,15 +581,18 @@ impl LocationSummaryOperation {
         {
             *name = Some(record.name);
         }
-        self.answer()
+        self.finish_snapshot()
     }
 }
 
-impl EffectOperation for LocationSummaryOperation {
+impl Operation for LocationSummaryOperation {
     type Output = LocalSummary;
     type Error = LocationSummaryError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Turn {
+        if self.snapshot {
+            return self.read_policy();
+        }
         let user_id = self.request.auth_context.user_id;
         if self.request.auth_context.realm_id != self.request.realm_id
             || (user_id.is_nil() && user_id.realm_id != self.request.realm_id)
@@ -711,83 +605,54 @@ impl EffectOperation for LocationSummaryOperation {
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Turn {
         match self.state {
-            SummaryState::Init => self.start(),
-            SummaryState::ReadRealm => self.handle_realm(event),
-            SummaryState::ReadBucket => self.handle_bucket(event),
-            SummaryState::StartPolicy => self.handle_start_policy(event),
-            SummaryState::ReadPolicy => self.handle_policy(event),
-            SummaryState::ReadHead => self.handle_head(event),
-            SummaryState::ReadVersion => self.handle_version(event),
-            SummaryState::ReadLocation => self.handle_location(event),
-            SummaryState::ReadCopyOrigin => self.handle_copy_origin(event),
-            SummaryState::CheckManagedCopy => self.handle_managed_copy(event),
-            SummaryState::ReadBackend => self.handle_backend(event),
-            SummaryState::CommitTransaction => self.handle_commit(event),
-            SummaryState::AbortTransaction => self.handle_abort(event),
-            SummaryState::SendSummary => {
-                let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
-                    return self.unexpected(event);
-                };
-                self.output = Some(Ok(self.local_answer()));
-                self.state = SummaryState::Close;
-                smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
+            SummaryState::Init => self.first(),
+            SummaryState::ReadRealm => self.accept_realm(result.value()?),
+            SummaryState::ReadBucket => self.accept_bucket(result.value()?),
+            SummaryState::Snapshot => {
+                self.accept_snapshot(result.child::<LocalSummary, LocationSummaryError>()?)
             }
-            SummaryState::SendDenial => {
-                let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
-                    return self.unexpected(event);
-                };
-                self.state = SummaryState::Close;
-                smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
+            SummaryState::ReadPolicy => self.accept_policy(result.values()?),
+            SummaryState::ReadHead => self.accept_head(result.value()?),
+            SummaryState::ReadVersion => self.accept_version(result.value()?),
+            SummaryState::ReadLocation => self.accept_location(result.value()?),
+            SummaryState::ReadCopyOrigin => self.accept_copy_origin(result.value()?),
+            SummaryState::CheckManagedCopy => self.accept_managed_copy(result.values()?),
+            SummaryState::ReadBackend => self.accept_backend(result.value()?),
+            SummaryState::SendSummary | SummaryState::SendDenial => {
+                self.accept_sent(result.event()?)
             }
-            SummaryState::Close => {
-                let Event::Blob(BlobEvent::ConnectionClosed { stream_id }) = event else {
-                    return self.unexpected(event);
-                };
-                if Some(stream_id) != self.stream_id {
-                    return self.unexpected(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
-                }
-                self.state = SummaryState::Finish;
-                smallvec![]
-            }
-            SummaryState::Finish | SummaryState::Error => smallvec![],
+            SummaryState::Close => self.accept_closed(result.event()?),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SummaryState::Finish | SummaryState::Error)
+    fn transaction(&self) -> TransactionMode {
+        match self.snapshot {
+            true => TransactionMode::ReadSnapshot,
+            false => TransactionMode::None,
+        }
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(LocationSummaryError::Unexpected {
-            state: "finalize",
-            event: "summary ended without an answer".to_string(),
-        }))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.state = SummaryState::Error;
-        let mut effects = smallvec![];
-        if let Some(txn_id) = self.txn_id.take() {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        if let Some(stream_id) = self.stream_id {
-            effects.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }));
-        }
-        effects
+    /// A failed run closes the stream it still holds.
+    fn abort(&mut self) -> Vec<IoCall> {
+        let close = |stream_id| Effect::Blob(BlobEffect::CloseConnection { stream_id }).into();
+        self.stream_id.take().map(close).into_iter().collect()
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{LocationSummaryError, LocationSummaryOperation};
-    use crate::replication::protocol::{CopyCompliance, LocationCopyStorage};
+    use super::{LocalSummary, LocationSummaryError, LocationSummaryOperation, SummaryState, Turn};
+    use crate::replication::protocol::{
+        CopyCompliance, LocationCopyStorage, VersionReplicationMessage,
+    };
     use crate::tests::locations::{node_id, realm_id, request};
     use aruna_core::UserId;
-    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+    use aruna_core::effects::{BlobEffect, Effect};
+    use aruna_core::events::{BlobEvent, Event};
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -801,6 +666,7 @@ mod pure_tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::types::Value;
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -839,18 +705,68 @@ mod pure_tests {
 
     /// Answers the bucket read and the READ check every local answer starts with.
     fn authorized(version_id: Option<Ulid>) -> LocationSummaryOperation {
-        let mut operation =
-            LocationSummaryOperation::new_local(node_id(5), request(version_id)).with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        operation.step(policy_batch());
-        operation
+        let (_, mut child) = reading(true, version_id);
+        child.next(policy_batch()).unwrap();
+        child
     }
 
-    fn policy_batch() -> Event {
+    /// A local run at its snapshot, with the child that reads it, on its first read.
+    fn reading(
+        allowed: bool,
+        version_id: Option<Ulid>,
+    ) -> (LocationSummaryOperation, LocationSummaryOperation) {
+        let mut parent = LocationSummaryOperation::new_local(node_id(5), request(version_id))
+            .with_policy(allowed);
+        parent.first().unwrap();
+        let child = enter_snapshot(&mut parent, bucket_info().to_bytes().unwrap());
+        (parent, child)
+    }
+
+    /// Answers the bucket read and starts the snapshot child.
+    fn enter_snapshot(
+        parent: &mut LocationSummaryOperation,
+        bucket: Vec<u8>,
+    ) -> LocationSummaryOperation {
+        let turn = parent.next(read_result(Some(bucket)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(parent.state, SummaryState::Snapshot);
+        let mut child = parent.snapshot_child();
+        assert_eq!(child.transaction(), TransactionMode::ReadSnapshot);
+        child.first().unwrap();
+        child
+    }
+
+    fn done(turn: Turn) -> LocalSummary {
+        match turn {
+            Ok(Next::Done(local)) => local,
+            other => panic!("expected the answer, got {other:?}"),
+        }
+    }
+
+    fn denied(turn: Turn) {
+        assert!(
+            matches!(turn, Err(LocationSummaryError::Denied)),
+            "{turn:?}"
+        );
+    }
+
+    fn snapshot_denied() -> IoResult {
+        let outcome = Err::<LocalSummary, _>(LocationSummaryError::Denied);
+        IoResult::Child(ChildOutcome::new(outcome))
+    }
+
+    fn event(event: BlobEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(event)))
+    }
+
+    fn asked(turn: &Turn) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
+            other => panic!("expected an effect call, got {other:?}"),
+        }
+    }
+
+    fn policy_batch() -> IoResult {
         let realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
         let group = GroupAuthorizationDocument::default_group_doc(
             UserId::nil(realm_id()),
@@ -883,53 +799,31 @@ mod pure_tests {
             user_id: UserId::nil(realm_id()),
             realm_id: realm_id(),
         };
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    b"bucket".to_vec().into(),
-                    Some(bucket_info().to_bytes().unwrap().into()),
-                ),
-                (
-                    b"realm".to_vec().into(),
-                    Some(postcard::to_allocvec(&realm).unwrap().into()),
-                ),
-                (
-                    b"group".to_vec().into(),
-                    Some(group.to_bytes(&actor).unwrap().into()),
-                ),
-                (
-                    b"realm roles".to_vec().into(),
-                    Some(realm_roles.to_bytes(&actor).unwrap().into()),
-                ),
-                (
-                    b"group roles".to_vec().into(),
-                    Some(group_roles.to_bytes(&actor).unwrap().into()),
-                ),
-            ],
-        })
+        IoResult::Values(vec![
+            Some(bucket_info().to_bytes().unwrap().into()),
+            Some(postcard::to_allocvec(&realm).unwrap().into()),
+            Some(group.to_bytes(&actor).unwrap().into()),
+            Some(realm_roles.to_bytes(&actor).unwrap().into()),
+            Some(group_roles.to_bytes(&actor).unwrap().into()),
+        ])
     }
 
     /// The policy rows of a caller whose group role row is gone, so the check refuses it.
-    fn refused_batch() -> Event {
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+    fn refused_batch() -> IoResult {
+        with_row(4, None)
+    }
+
+    /// The policy rows with one of them replaced.
+    fn with_row(index: usize, value: Option<Value>) -> IoResult {
+        let IoResult::Values(mut values) = policy_batch() else {
             unreachable!();
         };
-        values[4].1 = None;
-        batch
+        values[index] = value;
+        IoResult::Values(values)
     }
 
-    fn verify(operation: &mut LocationSummaryOperation) {
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from(11u128),
-        }));
-    }
-
-    fn read_result(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: b"k".to_vec().into(),
-            value: value.map(Into::into),
-        })
+    fn read_result(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Into::into)])
     }
 
     fn materialized() -> BlobVersion {
@@ -947,16 +841,17 @@ mod pure_tests {
     fn reports_copy_class() {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let mut operation = authorized(Some(version_id));
-        operation.step(read_result(Some(materialized().to_bytes().unwrap())));
-        operation.step(read_result(Some(
-            location(BackendRef::node_default(), Some("cold".to_string()))
-                .to_bytes()
-                .unwrap(),
-        )));
-        operation.step(read_result(None));
-        verify(&mut operation);
-
-        let local = operation.finalize().unwrap();
+        operation
+            .next(read_result(Some(materialized().to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(
+                location(BackendRef::node_default(), Some("cold".to_string()))
+                    .to_bytes()
+                    .unwrap(),
+            )))
+            .unwrap();
+        let local = done(operation.next(read_result(None)));
         assert_eq!(local.blake3, Some([7u8; 32]));
         let summary = local.summary;
         assert!(summary.held);
@@ -979,16 +874,17 @@ mod pure_tests {
             "device-ada".to_string(),
         );
         let mut operation = authorized(Some(version_id));
-        operation.step(read_result(Some(version.to_bytes().unwrap())));
-        operation.step(read_result(Some(
-            location(BackendRef::node_default(), None)
-                .to_bytes()
-                .unwrap(),
-        )));
-        operation.step(read_result(None));
-        verify(&mut operation);
-
-        let summary = operation.finalize().unwrap().summary;
+        operation
+            .next(read_result(Some(version.to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(
+                location(BackendRef::node_default(), None)
+                    .to_bytes()
+                    .unwrap(),
+            )))
+            .unwrap();
+        let summary = done(operation.next(read_result(None))).summary;
         assert_eq!(summary.origin_device.as_deref(), Some("device-ada"));
     }
 
@@ -1038,7 +934,7 @@ mod pure_tests {
     fn serve_batch(
         record: &aruna_core::structs::storage::blob::ManagedCopyRecord,
         blocked: bool,
-    ) -> Event {
+    ) -> IoResult {
         let mut subject = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
             aruna_core::structs::placement::policy::PlacementSubject {
                 node_id: node_id(5),
@@ -1051,18 +947,10 @@ mod pure_tests {
         )
         .expect("subject is valid");
         subject.serving_blocked = blocked;
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    b"copy".to_vec().into(),
-                    Some(record.to_bytes().unwrap().into()),
-                ),
-                (
-                    b"subject".to_vec().into(),
-                    Some(subject.to_bytes().unwrap().into()),
-                ),
-            ],
-        })
+        IoResult::Values(vec![
+            Some(record.to_bytes().unwrap().into()),
+            Some(subject.to_bytes().unwrap().into()),
+        ])
     }
 
     #[test]
@@ -1071,21 +959,25 @@ mod pure_tests {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let relationship_id = Ulid::from_bytes([6u8; 16]);
         let mut operation = authorized(Some(version_id));
-        operation.step(read_result(Some(materialized().to_bytes().unwrap())));
-        operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
-        operation.step(read_result(Some(
-            copy_record(
-                version_id,
-                aruna_core::structs::storage::blob::ManagedCopyState::Registered,
-                CopyOrigin::Sync { relationship_id },
-                false,
-            )
-            .to_bytes()
-            .unwrap(),
-        )));
-        verify(&mut operation);
-
-        let summary = operation.finalize().unwrap().summary;
+        operation
+            .next(read_result(Some(materialized().to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(hashed_location().to_bytes().unwrap())))
+            .unwrap();
+        let summary = done(
+            operation.next(read_result(Some(
+                copy_record(
+                    version_id,
+                    aruna_core::structs::storage::blob::ManagedCopyState::Registered,
+                    CopyOrigin::Sync { relationship_id },
+                    false,
+                )
+                .to_bytes()
+                .unwrap(),
+            ))),
+        )
+        .summary;
         assert!(summary.held);
         assert_eq!(summary.origin, CopyOrigin::Sync { relationship_id });
         assert_eq!(summary.compliance, CopyCompliance::Allowed);
@@ -1103,9 +995,13 @@ mod pure_tests {
         // hidden, and it names no rule.
         let version_id = Ulid::from_bytes([3u8; 16]);
         let mut operation = authorized(Some(version_id));
-        operation.step(read_result(Some(governed_version().to_bytes().unwrap())));
-        operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
-        operation.step(serve_batch(
+        operation
+            .next(read_result(Some(governed_version().to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(hashed_location().to_bytes().unwrap())))
+            .unwrap();
+        let summary = done(operation.next(serve_batch(
             &copy_record(
                 version_id,
                 aruna_core::structs::storage::blob::ManagedCopyState::Quarantined(
@@ -1115,10 +1011,8 @@ mod pure_tests {
                 true,
             ),
             false,
-        ));
-        verify(&mut operation);
-
-        let summary = operation.finalize().unwrap().summary;
+        )))
+        .summary;
         assert!(summary.held);
         assert_eq!(summary.origin, CopyOrigin::Replicate);
         assert_eq!(summary.compliance, CopyCompliance::Quarantined);
@@ -1130,9 +1024,13 @@ mod pure_tests {
         // its origin rather than dropped from the answer.
         let version_id = Ulid::from_bytes([3u8; 16]);
         let mut operation = authorized(Some(version_id));
-        operation.step(read_result(Some(governed_version().to_bytes().unwrap())));
-        operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
-        operation.step(serve_batch(
+        operation
+            .next(read_result(Some(governed_version().to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(hashed_location().to_bytes().unwrap())))
+            .unwrap();
+        let summary = done(operation.next(serve_batch(
             &copy_record(
                 version_id,
                 aruna_core::structs::storage::blob::ManagedCopyState::Registered,
@@ -1140,10 +1038,8 @@ mod pure_tests {
                 true,
             ),
             true,
-        ));
-        verify(&mut operation);
-
-        let summary = operation.finalize().unwrap().summary;
+        )))
+        .summary;
         assert!(summary.held);
         assert_eq!(summary.origin, CopyOrigin::Replicate);
         assert_eq!(summary.compliance, CopyCompliance::Quarantined);
@@ -1153,9 +1049,13 @@ mod pure_tests {
     fn allows_served_copy() {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let mut operation = authorized(Some(version_id));
-        operation.step(read_result(Some(governed_version().to_bytes().unwrap())));
-        operation.step(read_result(Some(hashed_location().to_bytes().unwrap())));
-        operation.step(serve_batch(
+        operation
+            .next(read_result(Some(governed_version().to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(hashed_location().to_bytes().unwrap())))
+            .unwrap();
+        let summary = done(operation.next(serve_batch(
             &copy_record(
                 version_id,
                 aruna_core::structs::storage::blob::ManagedCopyState::Registered,
@@ -1163,10 +1063,8 @@ mod pure_tests {
                 true,
             ),
             false,
-        ));
-        verify(&mut operation);
-
-        let summary = operation.finalize().unwrap().summary;
+        )))
+        .summary;
         assert!(summary.held);
         assert_eq!(summary.origin, CopyOrigin::Write);
         assert_eq!(summary.compliance, CopyCompliance::Allowed);
@@ -1177,17 +1075,18 @@ mod pure_tests {
         // Tenant-owned storage is the durability signal, so id and name ship.
         let backend_id = Ulid::from_bytes([9u8; 16]);
         let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
-        operation.step(read_result(Some(materialized().to_bytes().unwrap())));
-        operation.step(read_result(Some(
-            location(BackendRef::Group(backend_id), None)
-                .to_bytes()
-                .unwrap(),
-        )));
-        operation.step(read_result(None));
-        operation.step(read_result(None));
-        verify(&mut operation);
-
-        let summary = operation.finalize().unwrap().summary;
+        operation
+            .next(read_result(Some(materialized().to_bytes().unwrap())))
+            .unwrap();
+        operation
+            .next(read_result(Some(
+                location(BackendRef::Group(backend_id), None)
+                    .to_bytes()
+                    .unwrap(),
+            )))
+            .unwrap();
+        operation.next(read_result(None)).unwrap();
+        let summary = done(operation.next(read_result(None))).summary;
         assert_eq!(
             summary.storage,
             Some(LocationCopyStorage::GroupBackend {
@@ -1201,10 +1100,7 @@ mod pure_tests {
     fn unknown_version_empty() {
         // An unknown version is no copy anywhere, not a copy in an unknown state.
         let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
-        operation.step(read_result(None));
-        verify(&mut operation);
-
-        let local = operation.finalize().unwrap();
+        let local = done(operation.next(read_result(None)));
         assert!(local.blake3.is_none());
         assert!(!local.summary.held);
         assert_eq!(local.summary.version_id, None);
@@ -1214,10 +1110,9 @@ mod pure_tests {
     fn carries_bucket_record() {
         // The caller must fan out from the record the answer was authorized on.
         let mut operation = authorized(Some(Ulid::from_bytes([3u8; 16])));
-        operation.step(read_result(None));
-        verify(&mut operation);
+        let local = done(operation.next(read_result(None)));
 
-        assert_eq!(operation.finalize().unwrap().bucket, Some(bucket_info()));
+        assert_eq!(local.bucket, Some(bucket_info()));
     }
 
     #[test]
@@ -1234,12 +1129,11 @@ mod pure_tests {
             request.auth_context.user_id = user_id;
             request.auth_context.realm_id = serving_realm;
             let mut operation = LocationSummaryOperation::new_local(node_id(5), request);
-            let effects = operation.start();
-            assert_eq!(operation.is_complete(), !accepted);
+            let turn = operation.first();
             if accepted {
-                assert!(!effects.is_empty());
+                assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
             } else {
-                assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+                denied(turn);
             }
         }
     }
@@ -1248,116 +1142,40 @@ mod pure_tests {
     fn replaced_bucket_denied() {
         // A bucket deleted and recreated under another group must not answer to
         // a caller authorized against the generation the read started on.
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        )
-        .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
+        let (_, mut child) = reading(true, Some(Ulid::from_bytes([3u8; 16])));
         let replaced = BucketInfo {
             group_id: Ulid::from_bytes([9u8; 16]),
             created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
             ..bucket_info()
         };
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
-            unreachable!();
-        };
-        values[0].1 = Some(replaced.to_bytes().unwrap().into());
-        operation.step(batch);
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        denied(child.next(with_row(0, Some(replaced.to_bytes().unwrap().into()))));
     }
 
     #[test]
     fn deleted_bucket_fails() {
         // A bucket that vanished mid-read has no answer to give.
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        )
-        .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
-            unreachable!();
-        };
-        values[0].1 = None;
-        operation.step(batch);
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let (_, mut child) = reading(true, Some(Ulid::from_bytes([3u8; 16])));
+        denied(child.next(with_row(0, None)));
     }
 
     #[test]
     fn local_refuses_denied() {
         // Without a stream there is no one to answer, so the read just fails.
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        );
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        operation.step(refused_batch());
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let (mut parent, mut child) = reading(true, Some(Ulid::from_bytes([3u8; 16])));
+        denied(child.next(refused_batch()));
+        denied(parent.next(snapshot_denied()));
+        assert!(parent.abort().is_empty());
     }
 
     #[test]
     fn policy_refuses_denied() {
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        )
-        .with_policy(false);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        operation.step(policy_batch());
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let (_, mut child) = reading(false, Some(Ulid::from_bytes([3u8; 16])));
+        denied(child.next(policy_batch()));
     }
 
     #[test]
     fn policy_snapshot_denies() {
-        let mut operation = LocationSummaryOperation::new_local(
-            node_id(5),
-            request(Some(Ulid::from_bytes([3u8; 16]))),
-        )
-        .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(11u128),
-        }));
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
-            unreachable!();
-        };
+        let (_, mut child) = reading(true, Some(Ulid::from_bytes([3u8; 16])));
         let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
         realm.request_policies.push(RequestPolicy {
             policy_id: Ulid::from(12u128),
@@ -1367,31 +1185,61 @@ mod pure_tests {
             expression: "true".to_string(),
             enabled: true,
         });
-        values[1].1 = Some(postcard::to_allocvec(&realm).unwrap().into());
-        operation.step(batch);
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(11u128),
-        }));
-
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let realm = postcard::to_allocvec(&realm).unwrap();
+        denied(child.next(with_row(1, Some(realm.into()))));
     }
 
     #[test]
     fn answers_on_stream() {
         // The peer path must never reply before the permission check passed.
         let stream_id = Ulid::from_bytes([5u8; 16]);
+        let peer = node_id(4);
         let mut operation = LocationSummaryOperation::new_incoming(
-            node_id(4),
+            peer,
             node_id(5),
             stream_id,
             request(Some(Ulid::from_bytes([3u8; 16]))),
-        );
-        let effects = operation.start();
-
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected a realm read first, got {effects:?}")
+        )
+        .with_policy(true);
+        let turn = operation.first();
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected a realm read first, got {turn:?}")
         };
-        assert_eq!(key_space, aruna_core::keyspaces::REALM_CONFIG_KEYSPACE);
+        assert_eq!(reads[0].0, aruna_core::keyspaces::REALM_CONFIG_KEYSPACE);
+
+        // The answer goes out after the snapshot, and the run ends once the stream is closed.
+        operation.next(read_result(Some(peer_realm(peer)))).unwrap();
+        let mut child = enter_snapshot(&mut operation, bucket_info().to_bytes().unwrap());
+        let mut batch = policy_batch();
+        let IoResult::Values(values) = &mut batch else {
+            unreachable!();
+        };
+        values[1] = Some(peer_realm(peer).into());
+        child.next(batch).unwrap();
+        let local = done(child.next(read_result(None)));
+        let outcome = ChildOutcome::new(Ok::<_, LocationSummaryError>(local.clone()));
+        let turn = operation.next(IoResult::Child(outcome));
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+            panic!("expected the summary, got {turn:?}")
+        };
+        assert_eq!(
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::LocationSummaryResponse(local.summary.clone())
+        );
+        let turn = operation.next(event(BlobEvent::MessageSent { stream_id }));
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::CloseConnection { .. })
+        ));
+        let closed = operation.next(event(BlobEvent::ConnectionClosed { stream_id }));
+        assert_eq!(done(closed), local);
+        assert!(operation.abort().is_empty());
+    }
+
+    fn peer_realm(peer: aruna_core::NodeId) -> Vec<u8> {
+        let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
+        realm.ensure_node(peer, RealmNodeKind::Server);
+        postcard::to_allocvec(&realm).unwrap()
     }
 
     #[test]
@@ -1399,8 +1247,6 @@ mod pure_tests {
         // A peer removed in the fenced realm snapshot must not disclose data.
         let peer = node_id(4);
         let stream_id = Ulid::from(13u128);
-        let mut initial = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
-        initial.ensure_node(peer, RealmNodeKind::Server);
         let mut operation = LocationSummaryOperation::new_incoming(
             peer,
             node_id(5),
@@ -1408,38 +1254,23 @@ mod pure_tests {
             request(Some(Ulid::from_bytes([3u8; 16]))),
         )
         .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(postcard::to_allocvec(&initial).unwrap())));
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(14u128),
-        }));
-        let mut batch = policy_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
-            unreachable!();
-        };
+        operation.first().unwrap();
+        operation.next(read_result(Some(peer_realm(peer)))).unwrap();
+        let mut child = enter_snapshot(&mut operation, bucket_info().to_bytes().unwrap());
         let current = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
-        values[1].1 = Some(postcard::to_allocvec(&current).unwrap().into());
-        let effects = operation.step(batch);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from(14u128),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::SendMessage { .. })]
-        ));
-        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
-            stream_id,
-        }));
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::ConnectionClosed { stream_id },
-        ));
+        let current = postcard::to_allocvec(&current).unwrap();
+        denied(child.next(with_row(1, Some(current.into()))));
 
-        assert_eq!(operation.finalize(), Err(LocationSummaryError::Denied));
+        let turn = operation.next(snapshot_denied());
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::SendMessage { .. })
+        ));
+        operation
+            .next(event(BlobEvent::MessageSent { stream_id }))
+            .unwrap();
+        denied(operation.next(event(BlobEvent::ConnectionClosed { stream_id })));
+        assert!(operation.abort().is_empty());
     }
 
     #[test]
@@ -1447,9 +1278,7 @@ mod pure_tests {
         // A refused peer must say so, so the caller does not read it as offline.
         let stream_id = Ulid::from_bytes([5u8; 16]);
         let peer = node_id(4);
-        let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
-        realm.ensure_node(peer, RealmNodeKind::Server);
-        let realm = postcard::to_allocvec(&realm).unwrap();
+        let realm = peer_realm(peer);
         let mut operation = LocationSummaryOperation::new_incoming(
             peer,
             node_id(5),
@@ -1457,39 +1286,31 @@ mod pure_tests {
             request(Some(Ulid::from_bytes([3u8; 16]))),
         )
         .with_policy(true);
-        operation.start();
-        operation.step(read_result(Some(realm.clone())));
-        operation.step(read_result(Some(bucket_info().to_bytes().unwrap())));
-        let txn_id = Ulid::from(14u128);
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        // The caller's roles are read with the policy rows, in the same transaction.
-        let [
-            Effect::Storage(StorageEffect::BatchRead {
-                reads,
-                txn_id: read_txn,
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the policy read, got {effects:?}")
+        operation.first().unwrap();
+        operation.next(read_result(Some(realm.clone()))).unwrap();
+        operation
+            .next(read_result(Some(bucket_info().to_bytes().unwrap())))
+            .unwrap();
+        // The caller's roles are read with the policy rows, in the same snapshot.
+        let mut child = operation.snapshot_child();
+        let turn = child.first();
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the policy read, got {turn:?}")
         };
-        assert_eq!((reads.len(), *read_txn), (5, Some(txn_id)));
-        let mut batch = refused_batch();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = &mut batch else {
+        assert_eq!(reads.len(), 5);
+        let IoResult::Values(mut values) = refused_batch() else {
             unreachable!();
         };
-        values[1].1 = Some(realm.into());
-        operation.step(batch);
+        values[1] = Some(realm.into());
+        denied(child.next(IoResult::Values(values)));
 
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-
-        let [Effect::Blob(aruna_core::effects::BlobEffect::SendMessage { payload, .. })] =
-            effects.as_slice()
-        else {
-            panic!("expected an explicit denial, got {effects:?}")
+        let turn = operation.next(snapshot_denied());
+        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+            panic!("expected an explicit denial, got {turn:?}")
         };
         assert_eq!(
-            crate::replication::protocol::VersionReplicationMessage::from_bytes(payload).unwrap(),
-            crate::replication::protocol::VersionReplicationMessage::LocationSummaryDenied
+            VersionReplicationMessage::from_bytes(payload).unwrap(),
+            VersionReplicationMessage::LocationSummaryDenied
         );
     }
 
@@ -1503,14 +1324,14 @@ mod pure_tests {
             stream_id,
             request(None),
         );
-        operation.state = super::SummaryState::Close;
+        operation.state = SummaryState::Close;
 
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::ConnectionClosed {
-                stream_id: Ulid::from_bytes([6u8; 16]),
-            },
-        ));
+        let turn = operation.next(event(BlobEvent::ConnectionClosed {
+            stream_id: Ulid::from_bytes([6u8; 16]),
+        }));
 
-        assert_eq!(operation.state, super::SummaryState::Error);
+        assert!(matches!(turn, Err(LocationSummaryError::Unexpected { .. })));
+        assert_eq!(operation.abort().len(), 1);
+        assert!(operation.abort().is_empty());
     }
 }

@@ -6,7 +6,6 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_core::UserId;
-use aruna_core::operation_check::{rejects_events, sample_events};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::storage;
@@ -14,15 +13,104 @@ use aruna_tasks::TaskHandle;
 use tempfile::tempdir;
 use ulid::Ulid;
 
-#[test]
-fn incomplete_finalize_errors() {
-    // A deadline can finalize an operation that never reached a terminal
-    // state; that must report an error instead of panicking.
-    let mut operation = GetConfigOperation::new(RealmId::from_bytes([7; 32]));
-    operation.start();
+fn actor(realm_id: RealmId) -> Actor {
+    Actor {
+        user_id: UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+        realm_id,
+        node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+    }
+}
 
-    assert!(!operation.is_complete());
-    assert_eq!(operation.finalize(), Err(GetConfigError::NotFinished));
+#[test]
+fn reads_realm_config() {
+    let realm_id = RealmId::from_bytes([7; 32]);
+    let config = RealmConfigDocument::new(realm_id, Vec::new(), 2);
+    let mut operation = GetConfigOperation::new(realm_id);
+    let row = read_row(&DocumentTarget::RealmConfig { realm_id });
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+    let bytes = config.to_bytes(&actor(realm_id)).unwrap();
+    let answer = IoResult::Values(vec![Some(bytes.into())]);
+    assert_eq!(operation.next(answer), Ok(Next::Done(config)));
+}
+
+#[test]
+fn config_read_fails() {
+    // A missing row, unreadable bytes and a storage fault stay three distinct errors.
+    let mut operation = GetConfigOperation::new(RealmId::from_bytes([7; 32]));
+    assert_eq!(
+        operation.next(IoResult::Values(vec![None])),
+        Err(GetConfigError::DocumentNotFound)
+    );
+    let garbage = IoResult::Values(vec![Some(vec![0xff; 3].into())]);
+    assert!(matches!(
+        operation.next(garbage),
+        Err(GetConfigError::ConversionError(_))
+    ));
+    assert_eq!(
+        GetConfigError::from(IoError::Storage(StorageError::Timeout)),
+        GetConfigError::StorageError(StorageError::Timeout)
+    );
+}
+
+/// A stored group with its authorization document, encoded.
+fn group_rows() -> (Group, GroupAuthorizationDocument, Vec<u8>, Vec<u8>) {
+    let realm_id = RealmId::from_bytes([7; 32]);
+    let actor = actor(realm_id);
+    let group_id = Ulid::from_bytes([1; 16]);
+    let group = Group {
+        display_name: "Group".to_string(),
+        group_id,
+        realm_id,
+        roles: Default::default(),
+        owner: actor.user_id,
+    };
+    let auth = GroupAuthorizationDocument::default_group_doc(actor.user_id, realm_id, group_id);
+    let (group_bytes, auth_bytes) = (
+        group.to_bytes(&actor).unwrap(),
+        auth.to_bytes(&actor).unwrap(),
+    );
+    (group, auth, group_bytes, auth_bytes)
+}
+
+fn group_read() -> GetGroupOperation {
+    GetGroupOperation::new(GetGroupConfig {
+        group_id: Ulid::from_bytes([1; 16]),
+    })
+}
+
+#[test]
+fn reads_group_snapshot() {
+    let (group, auth, group_bytes, auth_bytes) = group_rows();
+    let mut operation = group_read();
+    assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+    let key: Key = group.group_id.to_bytes().into();
+    let reads = vec![
+        (GROUP_KEYSPACE.to_string(), key.clone()),
+        (AUTH_KEYSPACE.to_string(), key),
+    ];
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(reads))));
+    let answer = IoResult::Values(vec![Some(group_bytes.into()), Some(auth_bytes.into())]);
+    assert_eq!(operation.next(answer), Ok(Next::Done((group, auth))));
+}
+
+#[test]
+fn group_read_fails() {
+    // The group row is judged first, so a missing group never reports a missing document.
+    let (_, _, group_bytes, auth_bytes) = group_rows();
+    let cases = [
+        (None, Some(auth_bytes), GetGroupError::GroupNotFound),
+        (None, None, GetGroupError::GroupNotFound),
+        (Some(group_bytes), None, GetGroupError::DocNotFound),
+    ];
+    for (group, auth, expected) in cases {
+        let answer = IoResult::Values(vec![group.map(Into::into), auth.map(Into::into)]);
+        assert_eq!(group_read().next(answer), Err(expected));
+    }
+    let garbage = IoResult::Values(vec![Some(vec![0xff; 3].into()), None]);
+    assert!(matches!(
+        group_read().next(garbage),
+        Err(GetGroupError::ConversionError(_))
+    ));
 }
 
 #[tokio::test]
@@ -79,24 +167,4 @@ pub async fn test_get_group() {
     assert_eq!(create_result.0, get_result.0);
 
     net_handle.shutdown().await;
-}
-
-// A state that expects no event must reject one instead of ignoring it.
-#[test]
-fn terminal_rejects_event() {
-    let make = || {
-        GetGroupOperation::new(GetGroupConfig {
-            group_id: Ulid::from_bytes([1u8; 16]),
-        })
-    };
-    for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
-        assert!(effects.is_empty());
-        assert!(
-            matches!(
-                error,
-                GetGroupError::UnexpectedEvent { .. } | GetGroupError::StorageError(_)
-            ),
-            "{error:?}"
-        );
-    }
 }

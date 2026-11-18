@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::events::PeerAuthRefusal;
 use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobPayload};
@@ -32,7 +33,7 @@ use super::service::{
 use super::staging::read_staging_checkpoint;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
-use crate::metadata::WritePeerError;
+use crate::metadata::write_peer::WritePeerOperation;
 
 use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange};
 
@@ -168,21 +169,13 @@ async fn prepare_response(
     peer: NodeId,
     request: JobRequest,
 ) -> PreparedResponse {
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
-        return PreparedResponse::new(JobResponse::Unavailable(
-            "metadata auth handle unavailable".to_string(),
-        ));
-    };
-    let auth = match metadata_handle
-        .authorize_write_peer(peer, Some(request.auth_token()))
-        .await
-    {
+    let auth = match drive(WritePeerOperation::new(peer, request.auth_token()), context).await {
         Ok(auth) => auth,
-        Err(WritePeerError::Unauthorized) => {
+        Err(PeerAuthRefusal::Unauthorized) => {
             return PreparedResponse::new(JobResponse::Unauthorized);
         }
-        Err(WritePeerError::Unavailable(error)) => {
-            return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+        Err(PeerAuthRefusal::Unavailable(reason)) => {
+            return PreparedResponse::new(JobResponse::Unavailable(reason));
         }
     };
     let Some(local_realm_id) = context.net_handle.as_ref().map(|net| *net.realm_id()) else {

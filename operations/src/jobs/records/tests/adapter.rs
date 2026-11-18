@@ -191,9 +191,13 @@ async fn holds_bound_pages() {
     };
     let missing = serve_job_record(&context, crate::tests::records::node(2), publish()).await;
     assert_eq!(missing, MetadataTransportMessage::ForwardedWriteUnavailable);
-    crate::jobs::records::pages::store_pages(&context, &spec.submission_id, &pages)
-        .await
-        .expect("pages stored");
+    let writes =
+        crate::jobs::records::pages::page_rows(&spec.submission_id, &pages).expect("page rows");
+    let store = aruna_core::effects::StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(store).await;
     let kept = serve_job_record(&context, crate::tests::records::node(2), publish()).await;
     assert_eq!(
         kept,

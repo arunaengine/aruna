@@ -6,14 +6,10 @@
 // The claim only steers naming; the create-only write is what keeps a file from being replaced.
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARE_NAME_KEYSPACE;
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::{AfterConflict, Operation, TransactionMode};
 use aruna_core::rows;
-use aruna_core::types::{Effects, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 
 use crate::shares::lifecycle::ShareError;
 
@@ -21,141 +17,63 @@ fn name_key(bucket: &str, key: &str) -> Key {
     [bucket.as_bytes(), &[0], key.as_bytes()].concat().into()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClaimState {
-    Init,
-    Begin,
-    Read(TxnId),
-    Write(TxnId),
-    Commit,
-    Abort,
-    Done(bool),
-    Failed,
-}
-
-/// Claims `bucket`/`key` until `until` (Unix seconds); `false` when a live claim holds it.
+/// Claims `bucket`/`key` until `until` (Unix seconds); `false` when a live claim holds it. Run it
+/// with a conflict retry: a lost conflict means a concurrent claim won, so it answers `false`.
 #[derive(Debug, PartialEq)]
 pub struct ClaimNameOperation {
-    bucket: String,
-    key: String,
+    row: Key,
     now: u64,
     until: u64,
-    state: ClaimState,
-    error: Option<ShareError>,
+    writing: bool,
 }
 
 impl ClaimNameOperation {
     pub fn new(bucket: &str, key: &str, now: u64, until: u64) -> Self {
         Self {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            row: name_key(bucket, key),
             now,
             until,
-            state: ClaimState::Init,
-            error: None,
+            writing: false,
         }
-    }
-
-    fn fail(&mut self, error: ShareError) -> Effects {
-        self.state = ClaimState::Failed;
-        self.error = Some(error);
-        smallvec![]
-    }
-
-    fn row(&self) -> Key {
-        name_key(&self.bucket, &self.key)
     }
 }
 
-impl EffectOperation for ClaimNameOperation {
+impl Operation for ClaimNameOperation {
     type Output = bool;
     type Error = ShareError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ClaimState::Begin;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (ClaimState::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.state = ClaimState::Read(txn_id);
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: SHARE_NAME_KEYSPACE.to_string(),
-                    key: self.row(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (ClaimState::Read(txn_id), Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let held = value
-                    .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok())
-                    .is_some_and(|until| u64::from_be_bytes(until) > self.now);
-                if held {
-                    self.state = ClaimState::Abort;
-                    return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-                }
-                self.state = ClaimState::Write(txn_id);
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: SHARE_NAME_KEYSPACE.to_string(),
-                    key: self.row(),
-                    value: self.until.to_be_bytes().to_vec().into(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (ClaimState::Write(txn_id), Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.state = ClaimState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (ClaimState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.state = ClaimState::Done(true);
-                smallvec![]
-            }
-            // A concurrent claim of the same name won the commit.
-            (
-                ClaimState::Commit,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            )
-            | (ClaimState::Abort, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
-                self.state = ClaimState::Done(false);
-                smallvec![]
-            }
-            (ClaimState::Read(txn_id) | ClaimState::Write(txn_id), event) => {
-                let error = match event {
-                    Event::Storage(StorageEvent::Error { error }) => error.into(),
-                    _ => ShareError::UnexpectedEvent("claim"),
-                };
-                self.state = ClaimState::Failed;
-                self.error = Some(error);
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error.into()),
-            _ => self.fail(ShareError::UnexpectedEvent("claim")),
+    fn first(&mut self) -> Result<Next<bool>, ShareError> {
+        Ok(Next::Call(rows::read_row(
+            SHARE_NAME_KEYSPACE,
+            self.row.clone(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, ShareError> {
+        if self.writing {
+            rows::done(result)?;
+            return Ok(Next::Done(true));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ClaimState::Done(_) | ClaimState::Failed)
-    }
-
-    fn finalize(self) -> Result<bool, ShareError> {
-        match (self.state, self.error) {
-            (ClaimState::Done(claimed), _) => Ok(claimed),
-            (_, Some(error)) => Err(error),
-            _ => Err(ShareError::NotFinished),
+        let held = rows::value(result)?
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok())
+            .is_some_and(|until| u64::from_be_bytes(until) > self.now);
+        if held {
+            return Ok(Next::Done(false));
         }
+        self.writing = true;
+        Ok(Next::Call(IoCall::Write(vec![(
+            SHARE_NAME_KEYSPACE.to_string(),
+            self.row.clone(),
+            self.until.to_be_bytes().to_vec().into(),
+        )])))
     }
 
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            ClaimState::Read(txn_id) | ClaimState::Write(txn_id) => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
-        }
+    fn on_conflict(&mut self, _attempt: u32) -> AfterConflict<bool> {
+        AfterConflict::Finish(false)
     }
 }
 
@@ -191,13 +109,11 @@ impl Operation for ReleaseNameOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{DriverContext, drive, drive_retry};
     use aruna_storage::storage::FjallStorage;
 
-    #[tokio::test]
-    async fn claims_until_released() {
-        let dir = tempfile::tempdir().unwrap();
-        let context = DriverContext {
+    fn context(dir: &tempfile::TempDir) -> DriverContext {
+        DriverContext {
             storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
             net_handle: None,
             blob_handle: None,
@@ -206,7 +122,68 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
-        };
+        }
+    }
+
+    /// Reads the name row and answers it with `stored`.
+    fn answered(stored: Option<u64>) -> (ClaimNameOperation, Result<Next<bool>, ShareError>) {
+        let mut operation = ClaimNameOperation::new("data", "in/a.txt", 100, 200);
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        let row = (
+            SHARE_NAME_KEYSPACE.to_string(),
+            name_key("data", "in/a.txt"),
+        );
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+        let value = stored.map(|until| until.to_be_bytes().to_vec().into());
+        let turn = operation.next(IoResult::Values(vec![value]));
+        (operation, turn)
+    }
+
+    #[test]
+    fn free_name_written() {
+        // A free or expired name is claimed until the given time.
+        for stored in [None, Some(100), Some(50)] {
+            let (mut operation, turn) = answered(stored);
+            let row = (
+                SHARE_NAME_KEYSPACE.to_string(),
+                name_key("data", "in/a.txt"),
+                200u64.to_be_bytes().to_vec().into(),
+            );
+            assert_eq!(turn, Ok(Next::Call(IoCall::Write(vec![row]))));
+            assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
+        }
+    }
+
+    #[test]
+    fn live_claim_refuses() {
+        let (_, turn) = answered(Some(101));
+        assert_eq!(turn, Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn lost_conflict_refuses() {
+        // The concurrent claim that won the commit holds the name; nothing is retried.
+        let mut operation = ClaimNameOperation::new("data", "in/a.txt", 100, 200);
+        assert_eq!(operation.on_conflict(1), AfterConflict::Finish(false));
+        let lost = ShareError::from(aruna_core::calls::IoError::Conflict);
+        assert!(ClaimNameOperation::is_conflict(&lost));
+    }
+
+    #[test]
+    fn release_deletes_row() {
+        let mut operation = ReleaseNameOperation::new("data", "in/a.txt");
+        let row = (
+            SHARE_NAME_KEYSPACE.to_string(),
+            name_key("data", "in/a.txt"),
+        );
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Delete(vec![row]))));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    #[tokio::test]
+    async fn claims_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = context(&dir);
         let claim = |now| ClaimNameOperation::new("data", "in/a.txt", now, 200);
         assert!(drive(claim(100), &context).await.unwrap());
         assert!(!drive(claim(150), &context).await.unwrap());
@@ -218,5 +195,19 @@ mod tests {
         assert!(drive(claim(150), &context).await.unwrap());
         let other = ClaimNameOperation::new("data", "in/b.txt", 100, 200);
         assert!(drive(other, &context).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn one_claim_wins() {
+        // Concurrent claims of one name leave exactly one winner and no error.
+        let dir = tempfile::tempdir().unwrap();
+        let context = context(&dir);
+        let build = || ClaimNameOperation::new("data", "in/a.txt", 100, 200);
+        let runs: Vec<_> = (0..8)
+            .map(|_| drive_retry(build, &context, b"claim"))
+            .collect();
+        let claimed = futures_util::future::join_all(runs).await;
+        let won = claimed.into_iter().filter(|run| *run == Ok(true)).count();
+        assert_eq!(won, 1);
     }
 }

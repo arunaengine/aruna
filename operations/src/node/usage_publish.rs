@@ -330,10 +330,21 @@ fn retry_markers(
     if published.global {
         keys.push(DIRTY_GLOBAL_KEY.to_vec());
     }
-    keys.extend(published.groups.iter().map(|group_id| dirty_group_key(*group_id)));
+    keys.extend(
+        published
+            .groups
+            .iter()
+            .map(|group_id| dirty_group_key(*group_id)),
+    );
     (keys.into_iter())
         .filter(|key| !observed_keys.contains(key.as_slice()))
-        .map(|key| (NODE_STATS_KEYSPACE.to_string(), Key::from(key), generation.clone()))
+        .map(|key| {
+            (
+                NODE_STATS_KEYSPACE.to_string(),
+                Key::from(key),
+                generation.clone(),
+            )
+        })
         .collect()
 }
 
@@ -355,7 +366,9 @@ impl RetrySignalOperation {
 
     fn schedule(&mut self) -> Result<Next<()>, IoError> {
         self.scheduling = true;
-        Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))))
+        Ok(Next::Call(IoCall::Effect(Box::new(
+            schedule_snapshot_publish(),
+        ))))
     }
 }
 
@@ -535,7 +548,10 @@ mod tests {
     fn clears_unchanged_markers() {
         // Only markers still at their observed generation are deleted, in one transaction.
         let mut operation = ClearMarkersOperation::new(vec![marker(1), marker(2)]);
-        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let reads = vec![
             (NODE_STATS_KEYSPACE.to_string(), marker(1).0),
             (NODE_STATS_KEYSPACE.to_string(), marker(2).0),
@@ -551,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_marks_then_schedules() {
+    fn retry_marks_schedules() {
         // Scopes a concurrent write marked already keep their marker; then the timer moves up.
         let group = GroupId::from_bytes([3; 16]);
         let published = PublishedUsage {
@@ -570,7 +586,9 @@ mod tests {
         let mut operation = RetrySignalOperation::new(markers);
         let write = Ok(Next::Call(IoCall::Write(vec![marker])));
         assert_eq!(operation.first(), write);
-        let timer = Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))));
+        let timer = Ok(Next::Call(IoCall::Effect(Box::new(
+            schedule_snapshot_publish(),
+        ))));
         assert_eq!(operation.next(IoResult::Done), timer);
         let refused = Event::Task(TaskEvent::Error {
             key: None,
