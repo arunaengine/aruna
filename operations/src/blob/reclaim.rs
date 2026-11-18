@@ -926,9 +926,15 @@ mod tests {
             UsageCounters::from_bytes(&counters).unwrap(),
             UsageCounters::default()
         );
-        let outcome = crate::blob::cleanup::process_cleanup_batch(&after)
-            .await
-            .unwrap();
+        let outcome = crate::driver::drive(
+            crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
+                routing: crate::driver::node_routing(&after),
+                has_blob: (&after).blob_handle.is_some(),
+            }),
+            &after,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.failed, 1);
         let (queued, _) = iter_prefix_page(
             &after.storage_handle,

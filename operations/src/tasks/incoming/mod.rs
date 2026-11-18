@@ -45,7 +45,8 @@ impl Drop for OutboxBarrier {
 }
 
 use crate::blob::cleanup::{
-    BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, process_cleanup_batch, sweep_stale_uploads,
+    BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, CleanupNode, ProcessCleanupOperation,
+    SweepUploadsOperation,
 };
 use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,

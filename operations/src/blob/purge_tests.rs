@@ -248,9 +248,15 @@ async fn plans_until_ended() {
     crate::jobs::store::query::insert_job(&context, &record)
         .await
         .unwrap();
-    crate::blob::cleanup::process_cleanup_batch(&context)
-        .await
-        .unwrap();
+    crate::driver::drive(
+        crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
+            routing: crate::driver::node_routing(&context),
+            has_blob: (&context).blob_handle.is_some(),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(works().await.len(), 1);
     let claim = aruna_core::structs::storage::backend_import::claim_key(&versioned, "p1").unwrap();
     let claimed = |context: &DriverContext| {
@@ -281,9 +287,15 @@ async fn plans_until_ended() {
         txn_id: None,
     };
     context.storage_handle.send_storage_effect(delete).await;
-    crate::blob::cleanup::process_cleanup_batch(&context)
-        .await
-        .unwrap();
+    crate::driver::drive(
+        crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
+            routing: crate::driver::node_routing(&context),
+            has_blob: (&context).blob_handle.is_some(),
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
     // The release ran once the job was gone; the version still reads the file, so it stays
     // and its claim went again.
     assert!(works().await.is_empty());

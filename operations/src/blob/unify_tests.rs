@@ -4,7 +4,7 @@
 use super::*;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::BucketAccessOperation;
-use crate::blob::release::release_renamed;
+use crate::blob::release::{ReleaseFile, ReleaseRenamedOperation};
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::s3::bucket::rename::tests::{BUCKET, access, group, put, realm, rule, setup, store_job};
 use crate::storage_read::iter_prefix_page;
@@ -335,15 +335,14 @@ async fn keeps_shared_copies() {
     job_page(&context, (BUCKET, ""), &access, &unifying(&context).await)
         .await
         .unwrap();
-    let kept = release_renamed(
-        &context,
-        old.clone(),
-        rule().import_id,
-        Ulid::from_parts(10, 1),
-        "p1".to_string(),
-    )
-    .await;
-    assert!(kept);
+    let release = ReleaseRenamedOperation::new(ReleaseFile {
+        location: old.clone(),
+        import_id: rule().import_id,
+        version_id: Ulid::from_parts(10, 1),
+        version: "p1".to_string(),
+        has_blob: context.blob_handle.is_some(),
+    });
+    assert!(drive(release, &context).await.unwrap());
     let row = read(
         &context,
         BLOB_LOCATIONS_KEYSPACE,
