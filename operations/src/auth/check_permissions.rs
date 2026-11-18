@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::AuthorizationError;
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::types::{Effects, Key, KeySpace, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace};
 
 use crate::auth::permission_rules::{read_rules, rule_reads};
 
@@ -53,15 +51,6 @@ impl CheckPermissionsOperation {
     pub fn new(config: CheckPermissionsConfig) -> Self {
         CheckPermissionsOperation { config }
     }
-
-    /// The same check with its reads in `txn_id`, for a raw parent that holds that transaction.
-    pub fn new_with_txn(config: CheckPermissionsConfig, txn_id: TxnId) -> TransactionCheck {
-        TransactionCheck {
-            config,
-            txn_id,
-            output: None,
-        }
-    }
 }
 
 impl Operation for CheckPermissionsOperation {
@@ -81,62 +70,6 @@ impl Operation for CheckPermissionsOperation {
             });
         };
         self.config.allowed(values).map(Next::Done)
-    }
-}
-
-/// A permission check whose reads join the transaction of a parent that is not converted yet.
-#[derive(Debug, PartialEq)]
-pub struct TransactionCheck {
-    config: CheckPermissionsConfig,
-    txn_id: TxnId,
-    output: Option<Result<bool, AuthorizationError>>,
-}
-
-impl EffectOperation for TransactionCheck {
-    type Output = bool;
-    type Error = AuthorizationError;
-
-    fn start(&mut self) -> Effects {
-        match self.config.reads() {
-            Ok(reads) => smallvec![Effect::Storage(StorageEffect::BatchRead {
-                reads,
-                txn_id: Some(self.txn_id),
-            })],
-            Err(error) => {
-                self.output = Some(Err(error));
-                smallvec![]
-            }
-        }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if self.output.is_some() {
-            return smallvec![];
-        }
-        self.output = Some(match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => self
-                .config
-                .allowed(values.into_iter().map(|(_, value)| value).collect()),
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(AuthorizationError::UnexpectedEvent {
-                state: "TransactionCheck".to_string(),
-                expected: "storage batch read result",
-                got: other.label().to_string(),
-            }),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<bool, AuthorizationError> {
-        self.output.unwrap_or(Err(AuthorizationError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 

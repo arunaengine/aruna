@@ -57,12 +57,8 @@ async fn durable_rearm_loop(
         restore_notification_prune(&context, &task_handle).await;
         restore_drain_timer(&context, &task_handle).await;
         restore_prune_timer(&context, &task_handle).await;
-        restore_mirror_timer(&context, &task_handle).await;
-        crate::jobs::repository::link_queue::restore_link_timer(
-            &context,
-            &task_handle,
-        )
-        .await;
+        restore_mirror_timer(&context).await;
+        crate::jobs::repository::link_queue::restore_link_timer(&context, &task_handle).await;
     }
 }
 
@@ -333,7 +329,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_mirror_timer(&context, &task_handle).await;
+        restore_mirror_timer(&context).await;
         if stopped() {
             return;
         }
@@ -587,7 +583,8 @@ impl OperationsTaskHandler {
                 .await;
             return;
         };
-        match process_mirror_repairs(&self.context, net_handle.node_id()).await {
+        let drain = DrainRepairsOperation::new(net_handle.node_id());
+        match drive(drain, self.context.as_ref()).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainMirrorRepair, Duration::ZERO)
                     .await;
@@ -747,13 +744,8 @@ impl OperationsTaskHandler {
                     warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
                     continue;
                 };
-                if let Err(error) = release_job(
-                    &self.context,
-                    record.job_id,
-                    token,
-                    unix_timestamp_millis(),
-                )
-                .await
+                if let Err(error) =
+                    release_job(&self.context, record.job_id, token, unix_timestamp_millis()).await
                 {
                     warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
                 }
@@ -983,5 +975,12 @@ mod stop_tests {
             "the later restore unit must not run after the stop"
         );
         drop(temp);
+    }
+}
+
+/// Re-arms the sync mirror repair timer; a failure waits for the next rearm tick.
+async fn restore_mirror_timer(context: &DriverContext) {
+    if let Err(error) = drive(RestoreTimerOperation::new(), context).await {
+        warn!(%error, "Failed to restore sync mirror repair timer");
     }
 }

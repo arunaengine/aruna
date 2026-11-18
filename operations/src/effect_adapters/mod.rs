@@ -100,6 +100,14 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::MetadataRequest(request)) => {
             Box::pin(metadata::dispatch_request(*request, context)).await
         }
+        // Token validation state lives in the metadata handle the runner holds.
+        Effect::Net(NetEffect::WritePeerAuth(request)) => {
+            Box::pin(metadata::dispatch_peer_auth(*request, context)).await
+        }
+        // The routed export reads through the handles the runner holds.
+        Effect::Net(NetEffect::DatasetSummary(request)) => {
+            metadata::dispatch_summary(*request, context).await
+        }
         // Notification frames and inbox wakes need the net handle the runner holds.
         Effect::Net(NetEffect::Notification(request)) => {
             Event::Net(NetEvent::Notification(match context.net_handle.as_ref() {

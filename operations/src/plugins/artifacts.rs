@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::IoError;
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::realm_vault::FetchScope;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -18,9 +19,10 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::copies::{
-    Assembled, chunk_count, chunk_fits, has_local, read_chunk, read_local, reserve, store_chunk,
-    store_local, sweep_copies,
+    Assembled, has_local, read_chunk, read_local, reserve, store_chunk, store_local, sweep_copies,
 };
+use super::copy_rows::{chunk_count, chunk_fits};
+use super::rows::StoreError;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
@@ -31,7 +33,7 @@ use aruna_core::plugins::{ArtifactBytes, Chunk};
 /// accounts and roles of its installs.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(600);
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum ArtifactError {
     #[error("no published plugin version has this digest")]
     NotPublished,
@@ -43,6 +45,18 @@ pub enum ArtifactError {
     Storage(String),
     #[error("this node holds too many unsettled copies or uses its artifact memory; retry later")]
     Busy,
+}
+
+impl From<IoError> for ArtifactError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+impl From<StoreError> for ArtifactError {
+    fn from(error: StoreError) -> Self {
+        Self::Storage(error.0)
+    }
 }
 
 /// Whether `bytes` are exactly the artifact `plugin` publishes: digest, size and manifest.

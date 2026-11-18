@@ -4,14 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE};
-use aruna_core::operation::{EffectOperation, Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::abe_access::{due_rows, indexed_buckets};
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
@@ -125,120 +121,6 @@ impl Operation for EpochDueOperation {
             None => Next::Done(self.marks.managed()),
         })
     }
-}
-
-/// Runs [`DueMarks`] in the transaction of a parent that is not converted yet.
-#[derive(Debug, PartialEq)]
-struct JoinedMarks {
-    marks: DueMarks,
-    txn_id: TxnId,
-    output: Option<Result<(), EpochDueError>>,
-}
-
-impl JoinedMarks {
-    fn effect(&self, call: IoCall) -> Result<Effect, EpochDueError> {
-        let txn_id = Some(self.txn_id);
-        Ok(Effect::Storage(match call {
-            IoCall::Page {
-                space,
-                prefix,
-                after,
-                limit,
-            } => StorageEffect::Iter {
-                key_space: space,
-                prefix: Some(prefix),
-                start: after.map(IterStart::After),
-                limit,
-                txn_id,
-            },
-            IoCall::Read(reads) => StorageEffect::BatchRead { reads, txn_id },
-            IoCall::Write(writes) => StorageEffect::BatchWrite { writes, txn_id },
-            _ => return Err(EpochDueError::Storage),
-        }))
-    }
-
-    /// The effect of the next call, or the outcome when there is none.
-    fn answer(&mut self, next: Result<Option<IoCall>, EpochDueError>) -> Effects {
-        match next.and_then(|call| call.map(|call| self.effect(call)).transpose()) {
-            Ok(Some(effect)) => smallvec![effect],
-            Ok(None) => {
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
-            Err(error) => {
-                self.output = Some(Err(error));
-                smallvec![]
-            }
-        }
-    }
-
-    fn result(event: Event) -> Option<IoResult> {
-        match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => Some(IoResult::Page {
-                rows: values,
-                next: next_start_after,
-            }),
-            Event::Storage(StorageEvent::BatchReadResult { values }) => Some(IoResult::Values(
-                values.into_iter().map(|(_, value)| value).collect(),
-            )),
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => Some(IoResult::Done),
-            _ => None,
-        }
-    }
-}
-
-impl EffectOperation for JoinedMarks {
-    type Output = ();
-    type Error = EpochDueError;
-
-    fn start(&mut self) -> Effects {
-        self.answer(Ok(Some(self.marks.first())))
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let next = Self::result(event)
-            .ok_or(EpochDueError::Storage)
-            .and_then(|result| self.marks.next(result, true));
-        self.answer(next)
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<(), EpochDueError> {
-        self.output.unwrap_or(Err(EpochDueError::Storage))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-/// Marks a raise due for a lost READ scope inside the caller's transaction `txn_id`.
-pub fn mark_due(group_id: Option<GroupId>, txn_id: TxnId) -> Effect {
-    let now = aruna_core::time::unix_timestamp_millis();
-    let operation = JoinedMarks {
-        marks: DueMarks::new(group_id, now),
-        txn_id,
-        output: None,
-    };
-    Effect::SubOperation(boxed_suboperation(operation, |result| {
-        let result = result.map_err(|error| StorageError::WriteError(error.to_string()));
-        Event::SubOperation(SubOperationEvent::EpochsMarked { result })
-    }))
-}
-
-/// Commits `txn_id` after `mark_due` succeeded, or returns the marking error.
-pub fn marked(event: &Event, txn_id: TxnId) -> Option<Result<Effects, StorageError>> {
-    let Event::SubOperation(SubOperationEvent::EpochsMarked { result }) = event else {
-        return None;
-    };
-    let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
-    Some(result.clone().map(|()| smallvec![commit]))
 }
 
 #[cfg(test)]

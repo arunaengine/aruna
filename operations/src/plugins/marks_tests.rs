@@ -12,7 +12,8 @@ use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::jobs::retire_work;
 use crate::plugins::plugin_work::tests::ready_copy;
-use crate::plugins::rows::values_result;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::values_result;
 use crate::plugins::rows::write_rows;
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::worker::sweep_marks;
@@ -126,4 +127,57 @@ fn mark_work_ended() {
         check.next(values_result(vec![None])).unwrap(),
         Next::Done(true)
     );
+}
+
+fn mark_row_of(version: Ulid) -> (Vec<u8>, Vec<u8>) {
+    let mark = Mark {
+        install_id: Ulid::from_parts(1, 1),
+        work_id: Ulid::from_parts(2, 2),
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let key = mark_key(("b", "k", version)).unwrap();
+    (key, encode(&mark).unwrap())
+}
+
+fn marks_page(rows: Vec<(Vec<u8>, Vec<u8>)>) -> IoResult {
+    crate::plugins::rows::tests::page_result(rows, None)
+}
+
+fn is_child(next: Next<usize>) -> bool {
+    matches!(next, Next::Call(IoCall::Child(_)))
+}
+
+#[test]
+fn sweep_drops_ended_absent() {
+    let mut sweep = SweepMarks::new();
+    assert!(matches!(sweep.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let page = marks_page(vec![mark_row_of(Ulid::from_parts(3, 3))]);
+    assert!(is_child(sweep.next(page).unwrap()), "the work is asked");
+    let ended = child_result(Ok::<bool, StoreError>(true));
+    assert!(is_child(sweep.next(ended).unwrap()), "the version is asked");
+    let gone = child_result(Ok::<bool, ()>(true));
+    assert!(is_child(sweep.next(gone).unwrap()), "the mark goes");
+    let dropped = child_result(Ok::<bool, StoreError>(true));
+    assert_eq!(sweep.next(dropped), Ok(Next::Done(1)));
+}
+
+#[test]
+fn sweep_keeps_live_marks() {
+    let mut running = SweepMarks::new();
+    running
+        .next(marks_page(vec![mark_row_of(Ulid::from_parts(3, 3))]))
+        .unwrap();
+    let busy = child_result(Ok::<bool, StoreError>(false));
+    assert_eq!(running.next(busy), Ok(Next::Done(0)));
+    let mut present = SweepMarks::new();
+    present
+        .next(marks_page(vec![mark_row_of(Ulid::from_parts(3, 3))]))
+        .unwrap();
+    present
+        .next(child_result(Ok::<bool, StoreError>(true)))
+        .unwrap();
+    let there = child_result(Ok::<bool, ()>(false));
+    assert_eq!(present.next(there), Ok(Next::Done(0)));
 }

@@ -3,23 +3,31 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{PluginRun, RunState, SourceEvent, SourceKind, run_key};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
 use super::intents::{intent_scan, undone_keys};
-use super::rows::{Row, Scan, decode, delete_call, done, encode, read_call, row, values};
-use super::runs::{Admission, RunError, audit_rows};
-use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_state};
+use super::rows::{
+    Row, Scan, StoreError, decode, delete_call, done, encode, mapped_child, read_call, row, values,
+};
+use super::runs::{Admission, RunError, audit_rows, event_run, read_run};
+use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_scan, work_state};
 
 /// Marks a settled work notified, with the `job_finished` run it starts admitted in the same
 /// transaction; `false` when the work is gone or notified already. The caller holds `ADMISSIONS`.
 #[derive(Debug, PartialEq)]
 pub struct NotifyWork {
+    work_id: Ulid,
     lookup: WorkLookup,
     admission: Option<Admission>,
     phase: NotifyPhase,
@@ -35,10 +43,18 @@ enum NotifyPhase {
 impl NotifyWork {
     pub fn new(install_id: Ulid, work_id: Ulid, run: Option<PluginRun>) -> Self {
         Self {
+            work_id,
             lookup: WorkLookup::new(install_id, work_id),
             admission: run.map(Admission::new),
             phase: NotifyPhase::Looking,
         }
+    }
+}
+
+impl NotifyWork {
+    /// The work this delivery settles.
+    pub(crate) fn work_id(&self) -> Ulid {
+        self.work_id
     }
 }
 
@@ -275,6 +291,106 @@ pub(crate) fn finished_event(install: &PluginInstall, row: &WorkRow, now_ms: u64
         anchor_ms: now_ms,
         journaled_ms: now_ms,
         actor: None,
+    }
+}
+
+/// The completion waiting for one work's run to be read.
+#[derive(Debug, PartialEq)]
+struct Candidate {
+    install: PluginInstall,
+    row: WorkRow,
+}
+
+/// The `job_finished` deliveries due now: one per settled work whose starting run succeeded or is
+/// gone, for the installs this node receives. A manifest without the trigger delivers no run.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DueCompletions {
+    config: Arc<RealmConfigDocument>,
+    local: NodeId,
+    now_ms: u64,
+    scan: Scan,
+    rows: VecDeque<(Vec<u8>, Vec<u8>)>,
+    current: Option<Box<Candidate>>,
+    due: Vec<NotifyWork>,
+}
+
+impl DueCompletions {
+    pub(crate) fn new(config: Arc<RealmConfigDocument>, local: NodeId, now_ms: u64) -> Self {
+        Self {
+            config,
+            local,
+            now_ms,
+            scan: work_scan(),
+            rows: VecDeque::new(),
+            current: None,
+            due: Vec::new(),
+        }
+    }
+
+    fn candidate(&self, key: &[u8], row: WorkRow) -> Option<Candidate> {
+        if row.state != WorkState::Settled || row.notified {
+            return None;
+        }
+        let install = (self.config.installs.iter()).find(|install| {
+            key.get(1..17) == Some(&install.install_id.to_bytes()[..])
+                && install.account == row.account
+                && install.receiver == self.local
+                && install.state != InstallState::Removing
+        })?;
+        Some(Candidate {
+            install: install.clone(),
+            row,
+        })
+    }
+
+    fn advance(&mut self) -> Result<Next<Vec<NotifyWork>>, StoreError> {
+        while let Some((key, value)) = self.rows.pop_front() {
+            let row: WorkRow = decode(&value)?;
+            let Some(candidate) = self.candidate(&key, row) else {
+                continue;
+            };
+            let read = read_run(candidate.install.install_id, candidate.row.run_id);
+            self.current = Some(Box::new(candidate));
+            // Runs stay while a completion waits; one that is gone anyway cannot be retried.
+            return Ok(Next::Call(mapped_child(read, |run| match run {
+                Ok(run) => Ok(Some(run.state)),
+                Err(RunError::NotFound) => Ok(None),
+                Err(error) => Err(error.to_string()),
+            })));
+        }
+        Ok(Next::Done(std::mem::take(&mut self.due)))
+    }
+}
+
+impl Operation for DueCompletions {
+    type Output = Vec<NotifyWork>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(self.scan.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
+        let Some(candidate) = self.current.take() else {
+            return match self.scan.take(answer)? {
+                Some(rows) => {
+                    self.rows = rows.into();
+                    self.advance()
+                }
+                None => Ok(Next::Call(self.scan.ask())),
+            };
+        };
+        let state = answer
+            .child::<Option<RunState>, String>()?
+            .map_err(StoreError)?;
+        if state.is_none_or(|state| state == RunState::Succeeded) {
+            let Candidate { install, row } = *candidate;
+            let event = finished_event(&install, &row, self.now_ms);
+            let run = event_run(&self.config, &install, &event, self.now_ms);
+            self.due
+                .push(NotifyWork::new(install.install_id, row.work_id, run));
+        }
+        self.advance()
     }
 }
 

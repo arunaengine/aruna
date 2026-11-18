@@ -10,6 +10,7 @@ pub(crate) mod locations;
 pub(crate) mod metadata;
 pub(crate) mod metadata_api;
 pub(crate) mod notifications;
+pub(crate) mod peers;
 pub(crate) mod policy;
 pub(crate) mod records;
 pub(crate) mod s3;

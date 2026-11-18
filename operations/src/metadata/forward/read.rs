@@ -40,6 +40,7 @@ use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::dataset_description::{DatasetSummaryRequest, DescriptionError};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use futures_util::future::BoxFuture;
 use std::sync::Arc;
@@ -527,6 +528,36 @@ pub(super) fn keep_status(
         .is_some_and(|status| status.dataset_revision == expected_revision);
     if current.is_none() || incoming_exact && !current_exact {
         *current = Some(incoming);
+    }
+}
+
+/// Bytes the summary of a dataset may have; only its root entity is read.
+const SUMMARY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The JSON-LD summary of a dataset, read from its holders with the caller's own access.
+pub(crate) async fn dataset_summary(
+    context: &DriverContext,
+    request: DatasetSummaryRequest,
+) -> Result<String, DescriptionError> {
+    let export = ExportMetadataRequest {
+        document_id: request.dataset,
+        auth: request.auth,
+        view: RoCrateExportView::Summary,
+        limit: None,
+        offset: None,
+        after: None,
+    };
+    let context = Arc::new(context.clone());
+    let (realm_id, token) = (request.realm_id, request.token);
+    match export_rocrate_routed(&context, realm_id, export, token, SUMMARY_BYTES).await {
+        Ok(ExportMetadataResult::Summary { jsonld, .. }) => Ok(jsonld),
+        Err(
+            MetadataApiError::NotFound
+            | MetadataApiError::Forbidden
+            | MetadataApiError::Unauthorized
+            | MetadataApiError::BadRequest,
+        ) => Err(DescriptionError::Unreadable),
+        Ok(_) | Err(_) => Err(DescriptionError::Unavailable),
     }
 }
 

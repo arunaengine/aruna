@@ -26,6 +26,7 @@ pub mod nonce;
 pub mod publish;
 pub mod pull;
 pub mod purge;
+pub mod read_route;
 pub mod rebuild;
 pub mod refill;
 mod refresh;

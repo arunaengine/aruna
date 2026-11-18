@@ -19,7 +19,7 @@ pub(crate) fn upsert_data_entity(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     request: UpsertEntityRequest,
-) -> Result<MetadataBatch, CraqleError> {
+) -> Result<MetadataBatch, Box<CraqleError>> {
     let graph = GraphId::new(&request.graph_iri);
     let actor = request.deterministic_actor.map(ActorId::from_bytes);
     // An event materializes under its own actor, so a dot of it here means it is applied; a
@@ -45,13 +45,14 @@ pub(crate) fn upsert_data_entity(
         actor,
     )
     .map(batch_from_craqle)
+    .map_err(Box::new)
 }
 
 pub(crate) fn upsert_contextual_entity(
     node: &CraqleNode,
     auth: &AllowAllAuthorizer,
     request: UpsertEntityRequest,
-) -> Result<MetadataBatch, CraqleError> {
+) -> Result<MetadataBatch, Box<CraqleError>> {
     let graph = GraphId::new(&request.graph_iri);
     let actor = request.deterministic_actor.map(ActorId::from_bytes);
     let entity_request = craqle_patch_request(&graph, &request.jsonld)?;
@@ -62,6 +63,7 @@ pub(crate) fn upsert_contextual_entity(
         actor,
     )
     .map(batch_from_craqle)
+    .map_err(Box::new)
 }
 
 pub(crate) fn error_from_craqle(error: CraqleError) -> MetadataError {
@@ -206,7 +208,7 @@ pub(crate) fn batch_from_craqle(batch: Batch) -> MetadataBatch {
     }
 }
 
-pub(crate) fn to_craqle_batch(batch: &MetadataBatch) -> Result<Batch, CraqleError> {
+pub(crate) fn to_craqle_batch(batch: &MetadataBatch) -> Result<Batch, Box<CraqleError>> {
     let timestamp =
         chrono::DateTime::from_timestamp_millis(batch.timestamp_millis).ok_or_else(|| {
             CraqleError::RoCrate(RoCrateError::InvalidBatch(
@@ -261,47 +263,50 @@ pub(crate) fn plan_batch(
     graph_iri: &str,
     dot: ([u8; 32], u64),
     source: &MetadataBatchSource,
-) -> Result<MetadataBatch, CraqleError> {
+) -> Result<MetadataBatch, Box<CraqleError>> {
     let (actor, counter) = dot;
     let graph = GraphId::new(graph_iri);
     // Planning against a graph this node has not materialized yet would omit
     // the removals the change set needs, so the caller must retry instead.
     if !node.contains_graph(&graph)? {
-        return Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
-            "metadata graph `{graph_iri}` is not materialized yet"
+        return Err(Box::new(CraqleError::RoCrate(RoCrateError::InvalidGraph(
+            format!("metadata graph `{graph_iri}` is not materialized yet"),
         ))));
     }
-    let plan = || match source {
-        MetadataBatchSource::ReplaceRoCrate { jsonld } => {
-            node.plan_rocrate_document_checked(auth, &graph, jsonld)
-        }
-        MetadataBatchSource::UpsertDataEntity { jsonld } => {
-            node.plan_patch_data(auth, &craqle_patch_request(&graph, jsonld)?)
-        }
-        MetadataBatchSource::UpsertContextualEntity { jsonld } => {
-            node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)
-        }
-        MetadataBatchSource::RemoveDataEntity { id } => {
-            let request = RemoveEntityRequest {
-                graph: graph.clone(),
-                entity_id: id.clone(),
-            };
-            node.plan_remove_data(auth, &request)
-        }
-        MetadataBatchSource::ReplaceDataEntity { jsonld } => {
-            // Every stored predicate of the subject is replaced, so the ones the entity omits go.
-            let mut request = craqle_patch_request(&graph, jsonld)?;
-            let subject = DescribeRequest {
-                graph: &graph,
-                subject_id: &request.entity.entity_id,
-            };
-            let stored = node.describe_subject(auth, subject)?;
-            let stored = stored
-                .iter()
-                .filter_map(|(predicate, _)| predicate.to_named_node());
-            request.replaced_predicates.extend(stored);
-            node.plan_patch_data(auth, &request)
-        }
+    let plan = || -> Result<_, Box<CraqleError>> {
+        let changes = match source {
+            MetadataBatchSource::ReplaceRoCrate { jsonld } => {
+                node.plan_rocrate_document_checked(auth, &graph, jsonld)
+            }
+            MetadataBatchSource::UpsertDataEntity { jsonld } => {
+                node.plan_patch_data(auth, &craqle_patch_request(&graph, jsonld)?)
+            }
+            MetadataBatchSource::UpsertContextualEntity { jsonld } => {
+                node.plan_patch_contextual(auth, &craqle_patch_request(&graph, jsonld)?)
+            }
+            MetadataBatchSource::RemoveDataEntity { id } => {
+                let request = RemoveEntityRequest {
+                    graph: graph.clone(),
+                    entity_id: id.clone(),
+                };
+                node.plan_remove_data(auth, &request)
+            }
+            MetadataBatchSource::ReplaceDataEntity { jsonld } => {
+                // Every stored predicate of the subject is replaced, so the ones the entity omits go.
+                let mut request = craqle_patch_request(&graph, jsonld)?;
+                let subject = DescribeRequest {
+                    graph: &graph,
+                    subject_id: &request.entity.entity_id,
+                };
+                let stored = node.describe_subject(auth, subject)?;
+                let stored = stored
+                    .iter()
+                    .filter_map(|(predicate, _)| predicate.to_named_node());
+                request.replaced_predicates.extend(stored);
+                node.plan_patch_data(auth, &request)
+            }
+        };
+        Ok(changes?)
     };
     // A merge landing mid-plan would let the batch witness dots the plan never saw, so
     // the plan only counts when the graph clock stayed the same around it.
@@ -318,8 +323,8 @@ pub(crate) fn plan_batch(
             Err(error) => return Err(error),
             Ok(_) if attempt < 8 => {}
             Ok(_) => {
-                return Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
-                    "metadata graph `{graph_iri}` kept changing while planning"
+                return Err(Box::new(CraqleError::RoCrate(RoCrateError::InvalidGraph(
+                    format!("metadata graph `{graph_iri}` kept changing while planning"),
                 ))));
             }
         }

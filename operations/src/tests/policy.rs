@@ -9,6 +9,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE};
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
@@ -45,7 +46,7 @@ pub(crate) fn fetch_requests(effects: Effects) -> (Vec<NodeId>, MetadataTranspor
             MetadataAnswer {
                 peer: request.peer,
                 elapsed: std::time::Duration::ZERO,
-                result: Err(PeerRequestError::Failed("test".to_string())),
+                result: Err(PeerRequestError::Failed(MetadataError::Backend("test".to_string()))),
             },
         ))));
     }

@@ -365,18 +365,6 @@ pub async fn change_metadata(
     send(context, (local, &snapshot), caller, request).await
 }
 
-/// The bucket metadata of a set this node holds the record of.
-pub async fn set_metadata(
-    context: &DriverContext,
-    set_id: Ulid,
-) -> Result<Option<BucketMetadata>, String> {
-    let view = read_view(context, set_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let metadata = view.and_then(|view| view.snapshot().config.settings.metadata.clone());
-    Ok(metadata.map(|metadata| *metadata))
-}
-
 /// Prepares the deletion of the set with every admitted member as its identity. It commits
 /// once every coordinator fenced its ranges; then every member purges its bucket.
 pub async fn delete_set(

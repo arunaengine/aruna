@@ -22,6 +22,7 @@ use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use crate::jobs::records::family::LoadFamilyOperation;
+use crate::jobs::records::pages::SpecInputsOperation;
 use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
@@ -357,7 +358,8 @@ pub async fn family_report(
         return Some(Err(JobRouteError::NotFound));
     }
     // A paged spec reports its inputs as if they were inline.
-    let spec = match crate::jobs::records::pages::with_inputs(context, &spec).await {
+    let fill = SpecInputsOperation::new(&spec, context.node_and_realm());
+    let spec = match drive(fill, context).await {
         Ok(spec) => spec,
         Err(error) => return Some(Err(JobRouteError::Unavailable(error.to_string()))),
     };

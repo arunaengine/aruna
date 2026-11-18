@@ -6,6 +6,7 @@ use std::array::TryFromSliceError;
 
 use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
+use aruna_core::calls::IoError;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
@@ -22,7 +23,7 @@ pub enum PolicyEnforcementError {
     Unavailable(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum AuthorizeError {
     #[error("permission denied")]
     PermissionDenied,
@@ -34,6 +35,17 @@ pub enum AuthorizeError {
     Storage(StorageError),
     #[error("authorization check failed: {0}")]
     CheckFailed(String),
+}
+
+impl From<IoError> for AuthorizeError {
+    /// A storage fault stays one; any other runner failure ends the check without a verdict.
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::CheckFailed(other.to_string()),
+        }
+    }
 }
 
 /// A missing or malformed target is an authorization failure, not an internal error, matching
