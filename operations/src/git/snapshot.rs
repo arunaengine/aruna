@@ -299,7 +299,7 @@ async fn located(
         && let Ok(bucket) = drive(GetBucketOperation::new(location.bucket.clone()), context).await
         && let Ok(Some(object)) = drive(
             objects::described(
-                context,
+                context.node_id(),
                 (&location.bucket, bucket.group_id),
                 &location.key,
                 None,
@@ -614,7 +614,13 @@ async fn generate(
         _ => None,
     };
     let publishing = drive(
-        publish::publish_with(context, document, user, change, (pack, Vec::new())),
+        publish::publish_with(
+            context.node_id(),
+            document,
+            user,
+            change,
+            (pack, Vec::new()),
+        ),
         context,
     );
     time_stage("git_publish", publishing).await?;
@@ -662,9 +668,12 @@ async fn checkpoint(
         revision: state.revision,
         covered: state.coverable(),
     }));
-    drive(publish::publish(context, document, owner, change), context)
-        .await
-        .map(|_| ())
+    drive(
+        publish::publish(context.node_id(), document, owner, change),
+        context,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Projects the records, then publishes a missing snapshot or a due checkpoint. The first
@@ -904,7 +913,7 @@ pub async fn status(
 > {
     let store = super::store(context)?;
     let (document, _) = drive(
-        super::repository(context, auth, id, Permission::READ),
+        super::repository(context.node_id(), auth, id, Permission::READ),
         context,
     )
     .await?;

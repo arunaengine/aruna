@@ -377,7 +377,7 @@ impl McpServer {
         let jsonld = rocrate_json(&input.rocrate.0)?;
         let ctx = self.state.get_ctx();
         let resolved = drive(
-            aruna_operations::git::location::resolve(&ctx, &auth, group_id, None),
+            aruna_operations::git::location::resolve(ctx.node_id(), &auth, group_id, None),
             &ctx,
         )
         .await
@@ -404,7 +404,7 @@ impl McpServer {
             error => write_error(error),
         })?;
         drive(
-            aruna_operations::git::location::establish(&ctx, &auth, &record, resolved),
+            aruna_operations::git::location::establish(ctx.node_id(), &auth, &record, resolved),
             &ctx,
         )
         .await

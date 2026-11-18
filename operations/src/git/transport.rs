@@ -24,7 +24,12 @@ pub async fn transport(
         };
     let write = permission == Permission::WRITE;
     let (document, repository) = drive(
-        repository(context, auth, request.repository.document_id, permission),
+        repository(
+            context.node_id(),
+            auth,
+            request.repository.document_id,
+            permission,
+        ),
         context,
     )
     .await?;

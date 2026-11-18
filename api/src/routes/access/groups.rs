@@ -975,7 +975,7 @@ pub async fn set_group_location(
     ensure_group_admin(&state, &auth, group_id).await?;
     if let Some(location) = &location {
         drive(
-            check_default(&state.get_ctx(), &auth, group_id, location),
+            check_default(state.get_ctx().node_id(), &auth, group_id, location),
             &state.get_ctx(),
         )
         .await

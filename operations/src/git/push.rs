@@ -19,12 +19,10 @@ use bytes::Bytes;
 use ulid::Ulid;
 
 use super::access::{Repository, RepositoryOperation};
-use super::calls::node_of;
 use super::objects::MarkImportedOperation;
 use super::publish::PublishRecordOperation;
 use super::state::{Ancestry, GitState, reduce};
 use super::{GitError, objects, records};
-use crate::driver::DriverContext;
 
 type Document = MetadataRegistryRecord;
 
@@ -95,13 +93,12 @@ enum AcceptStep {
 /// Runs inside the receive hook of a push that already holds the repository, so it must not
 /// project. Locked paths of other users and unknown LFS objects refuse the push.
 pub fn accept(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     (id, key): (Ulid, &str),
     request: PushRequest,
     pack: Bytes,
 ) -> AcceptPushOperation {
-    let node = node_of(context);
     AcceptPushOperation {
         node,
         auth: auth.clone(),
@@ -306,14 +303,13 @@ pub(super) fn record_publish(
 /// Like [`record_publish`] for a pack this node made itself, outside a Git transfer: its cache
 /// holds the objects already. A push must not use it, since the transfer holds the repository.
 pub(super) fn record_made(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     document: &Document,
     refs: Vec<RefUpdate>,
     written: (Bytes, Vec<StoredObject>),
     made: (Vec<String>, Option<PendingMerge>),
 ) -> RecordMadeOperation {
-    let node = node_of(context);
     RecordMadeOperation {
         publish: Some(record_publish(node, auth, document, refs, written, made)),
         actor: auth.user_id,

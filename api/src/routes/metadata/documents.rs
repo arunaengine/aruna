@@ -181,7 +181,12 @@ pub async fn create_metadata_document(
         ),
     };
     let resolved = drive(
-        aruna_operations::git::location::resolve(&state.get_ctx(), &auth, group_id, chosen),
+        aruna_operations::git::location::resolve(
+            state.get_ctx().node_id(),
+            &auth,
+            group_id,
+            chosen,
+        ),
         &state.get_ctx(),
     )
     .await
@@ -199,7 +204,12 @@ pub async fn create_metadata_document(
     )
     .await?;
     drive(
-        aruna_operations::git::location::establish(&state.get_ctx(), &auth, &result, resolved),
+        aruna_operations::git::location::establish(
+            state.get_ctx().node_id(),
+            &auth,
+            &result,
+            resolved,
+        ),
         &state.get_ctx(),
     )
     .await

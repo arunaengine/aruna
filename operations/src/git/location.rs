@@ -22,7 +22,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::access::{Repository, RepositoryOperation};
-use super::calls::node_of;
 use super::objects::EnsureBucketOperation;
 use super::publish::PublishRecordOperation;
 use super::state::{Ancestry, reduce};
@@ -30,7 +29,6 @@ use super::{GitError, records};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::DriverContext;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 type Document = MetadataRegistryRecord;
@@ -76,14 +74,9 @@ impl Operation for EffectiveOperation {
 }
 
 /// The location of a dataset the caller may read.
-pub fn get(context: &DriverContext, auth: &AuthContext, id: Ulid) -> GetLocationOperation {
+pub fn get(node: Option<NodeId>, auth: &AuthContext, id: Ulid) -> GetLocationOperation {
     GetLocationOperation {
-        open: Some(RepositoryOperation::new(
-            node_of(context),
-            auth,
-            id,
-            Permission::READ,
-        )),
+        open: Some(RepositoryOperation::new(node, auth, id, Permission::READ)),
         reading: false,
     }
 }
@@ -115,12 +108,11 @@ impl Operation for GetLocationOperation {
 
 /// Records `location` as the dataset's choice after WRITE on the dataset and on the location.
 pub fn set(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     id: Ulid,
     location: DatasetLocation,
 ) -> SetLocationOperation {
-    let node = node_of(context);
     SetLocationOperation {
         node,
         auth: auth.clone(),
@@ -163,12 +155,12 @@ impl Operation for SetLocationOperation {
 /// Records `location` for a document whose WRITE the caller already proved, as the create
 /// that returned the document did. A location moves no ref, so it needs no repository hold.
 pub fn record(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     document: &Document,
     location: DatasetLocation,
 ) -> RecordLocationOperation {
-    RecordLocationOperation::new(node_of(context), auth, document, location)
+    RecordLocationOperation::new(node, auth, document, location)
 }
 
 #[derive(Debug, PartialEq)]
@@ -268,12 +260,12 @@ fn permit_answer(result: IoResult) -> Result<(), GitError> {
 /// This node's bucket of a location when `auth` may write under its prefix. The default bucket
 /// is created on first use; any other bucket must already exist here.
 pub fn writable(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     document: &Document,
     location: &DatasetLocation,
 ) -> WritableOperation {
-    WritableOperation::new(node_of(context), auth, document, location)
+    WritableOperation::new(node, auth, document, location)
 }
 
 #[derive(Debug, PartialEq)]
@@ -420,24 +412,22 @@ impl Operation for CheckLocationOperation {
 /// Checks a location chosen for a dataset that does not exist yet: a bucket other than the
 /// group's default one must exist here and allow `auth` to write under the prefix.
 pub fn precheck(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     group_id: GroupId,
     location: &DatasetLocation,
 ) -> CheckLocationOperation {
-    let node = node_of(context);
     CheckLocationOperation::new(node, auth, group_id, location, CheckKind::Chosen)
 }
 
 /// Checks a group default here: its bucket exists on this node, belongs to the group and
 /// allows `auth` to write under the prefix.
 pub fn check_default(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     group_id: GroupId,
     location: &DatasetLocation,
 ) -> CheckLocationOperation {
-    let node = node_of(context);
     CheckLocationOperation::new(node, auth, group_id, location, CheckKind::Default)
 }
 
@@ -488,13 +478,13 @@ enum ResolveStep {
 /// Where a new dataset stores its files: the explicit choice, else the group default, which
 /// gets `<document id>/` appended to its prefix at create (`true`).
 pub fn resolve(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     group_id: GroupId,
     chosen: Option<DatasetLocation>,
 ) -> ResolveLocationOperation {
     ResolveLocationOperation {
-        node: node_of(context),
+        node,
         auth: auth.clone(),
         group_id,
         location: chosen,
@@ -559,7 +549,7 @@ impl Operation for ResolveLocationOperation {
 /// Records the resolved location of a just-created dataset, so later group default changes
 /// never move it. A location not recorded here can be set with PUT later.
 pub fn establish(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     document: &Document,
     (location, shared): Chosen,
@@ -572,7 +562,7 @@ pub fn establish(
         document_id: document.document_id,
         // A dataset without a record already uses exactly this location, so none is written.
         record: (location != DatasetLocation::default_for(document.group_id, document.document_id))
-            .then(|| RecordLocationOperation::new(node_of(context), auth, document, location)),
+            .then(|| RecordLocationOperation::new(node, auth, document, location)),
     }
 }
 

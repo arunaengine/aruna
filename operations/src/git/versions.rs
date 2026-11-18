@@ -88,7 +88,11 @@ pub(super) async fn open(
     id: Ulid,
     permission: Permission,
 ) -> Result<(MetadataRegistryRecord, Projection, Guard), GitError> {
-    let (document, _) = drive(super::repository(context, auth, id, permission), context).await?;
+    let (document, _) = drive(
+        super::repository(context.node_id(), auth, id, permission),
+        context,
+    )
+    .await?;
     let guard = store.lock(id).await;
     let projection = refresh(context, store, &document).await?;
     Ok((document, projection, guard))
@@ -103,7 +107,7 @@ async fn read(
     id: Ulid,
 ) -> Result<Projection, GitError> {
     let (document, _) = drive(
-        super::repository(context, auth, id, Permission::READ),
+        super::repository(context.node_id(), auth, id, Permission::READ),
         context,
     )
     .await?;
@@ -546,7 +550,7 @@ pub async fn change_ref(
     let nothing = (Bytes::new(), Vec::new());
     drive(
         record_made(
-            context,
+            context.node_id(),
             auth,
             &document,
             vec![update],

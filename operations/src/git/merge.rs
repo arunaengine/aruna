@@ -102,7 +102,7 @@ pub async fn edit(
         let made = vec![new.clone()];
         drive(
             record_made(
-                context,
+                context.node_id(),
                 auth,
                 &document,
                 vec![update],
@@ -261,7 +261,7 @@ async fn merge_into(
     if !updates.is_empty() {
         drive(
             record_made(
-                context,
+                context.node_id(),
                 auth,
                 document,
                 updates,

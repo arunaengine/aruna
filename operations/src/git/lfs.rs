@@ -14,14 +14,12 @@ use aruna_core::structs::storage::routing::NodeRouting;
 use ulid::Ulid;
 
 use super::access::{Repository, RepositoryOperation};
-use super::calls::node_of;
 use super::objects::{self, Blob, StoreObjectOperation};
 use super::state::{Ancestry, reduce};
 use super::{GitError, records};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, node_routing};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
@@ -162,12 +160,12 @@ impl Operation for PermitObjectOperation {
 
 /// Whether the node holding the object still serves that exact version to `auth`.
 pub(super) fn readable(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     object: &StoredObject,
 ) -> ReadableOperation {
     ReadableOperation {
-        node: node_of(context),
+        node,
         auth: auth.clone(),
         object: object.clone(),
     }
@@ -193,7 +191,7 @@ impl Operation for ReadableOperation {
     fn first(&mut self) -> Result<Next<bool>, IoError> {
         let object = &self.object;
         Ok(match (self.local(), object.group_id) {
-            (true, Some(group_id)) => Next::Call(IoCall::child(objects::describe_call(
+            (true, Some(group_id)) => Next::Call(IoCall::child(objects::described(
                 self.node,
                 (&object.bucket, group_id),
                 &object.key,
@@ -214,7 +212,7 @@ impl Operation for ReadableOperation {
 
 /// The stored location of an LFS object the caller may reach with `permission`.
 pub fn inspect(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     id: Ulid,
     object: &LfsObject,
@@ -222,12 +220,7 @@ pub fn inspect(
 ) -> InspectObjectOperation {
     InspectObjectOperation {
         object: object.clone(),
-        open: Some(RepositoryOperation::new(
-            node_of(context),
-            auth,
-            id,
-            permission,
-        )),
+        open: Some(RepositoryOperation::new(node, auth, id, permission)),
         locating: false,
     }
 }
@@ -277,16 +270,15 @@ enum UploadStep {
 
 /// Stores LFS content the caller may write, unless this node already has it.
 pub fn upload(
-    context: &DriverContext,
+    (node, routing): (Option<NodeId>, NodeRouting),
     auth: &AuthContext,
     id: Ulid,
     object: LfsObject,
     body: Blob,
 ) -> UploadObjectOperation {
-    let node = node_of(context);
     UploadObjectOperation {
         node,
-        routing: node_routing(context),
+        routing,
         auth: auth.clone(),
         id,
         object,

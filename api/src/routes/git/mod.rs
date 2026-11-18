@@ -147,7 +147,7 @@ pub async fn push(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     drive(
-        git::push::accept(&state.get_ctx(), &auth, (id, key), request, pack),
+        git::push::accept(state.get_ctx().node_id(), &auth, (id, key), request, pack),
         &state.get_ctx(),
     )
     .await

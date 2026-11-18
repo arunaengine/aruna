@@ -67,9 +67,12 @@ pub async fn get_location(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<StorageLocation>> {
-    let effective = drive(location::get(&state.get_ctx(), &auth, id), &state.get_ctx())
-        .await
-        .map_err(map_error)?;
+    let effective = drive(
+        location::get(state.get_ctx().node_id(), &auth, id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(StorageLocation::new(effective)))
 }
 
@@ -92,7 +95,7 @@ pub async fn put_location(
 ) -> ServerResult<Json<StorageLocation>> {
     let chosen = request.location()?;
     let chosen = drive(
-        location::set(&state.get_ctx(), &auth, id, chosen),
+        location::set(state.get_ctx().node_id(), &auth, id, chosen),
         &state.get_ctx(),
     )
     .await

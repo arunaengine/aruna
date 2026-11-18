@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult};
 use aruna_core::effects::Effect;
@@ -11,12 +10,6 @@ use aruna_core::git::{GitAnswer, GitCall, GitEffect, GitEvent};
 use ulid::Ulid;
 
 use super::GitError;
-use crate::driver::DriverContext;
-
-/// This node, which repository operations take from their caller's context.
-pub(super) fn node_of(context: &DriverContext) -> Option<NodeId> {
-    context.net_handle.as_ref().map(|net| net.node_id())
-}
 
 fn store_call(call: GitCall) -> IoCall {
     IoCall::from(Effect::Git(Box::new(call)))

@@ -18,11 +18,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
-use super::calls::node_of;
 use super::records::Writes;
 use super::{GitError, records};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::driver::DriverContext;
 use crate::realm::load_config::config_unavailable;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 
@@ -56,8 +54,8 @@ fn holders_in(
 }
 
 /// The document's current holders when this node is one of them.
-pub fn holders(context: &DriverContext, document: &Document) -> HoldersOperation {
-    HoldersOperation::new(node_of(context), document)
+pub fn holders(node: Option<NodeId>, document: &Document) -> HoldersOperation {
+    HoldersOperation::new(node, document)
 }
 
 #[derive(Debug, PartialEq)]
@@ -116,12 +114,12 @@ enum PackStep {
 
 /// Stores and replicates the bytes of a pack whose record is already stored.
 pub fn publish_pack(
-    context: &DriverContext,
+    node: Option<NodeId>,
     document: &Document,
     pack: GitPackRecord,
 ) -> PublishPackOperation {
     PublishPackOperation {
-        node: node_of(context),
+        node,
         document: document.clone(),
         pack,
         step: PackStep::Stored,
@@ -228,24 +226,24 @@ pub fn uncovered(records: &[GitRecord]) -> Vec<&GitRecord> {
 
 /// Writes the record, its sync revision, shard manifest row and outbox publish atomically.
 pub fn publish(
-    context: &DriverContext,
+    node: Option<NodeId>,
     document: &Document,
     user_id: UserId,
     change: GitChange,
 ) -> PublishRecordOperation {
-    publish_with(context, document, user_id, change, (None, Vec::new()))
+    publish_with(node, document, user_id, change, (None, Vec::new()))
 }
 
 /// Like [`publish`], also storing the bytes of the pack the change names and writing `extra`
 /// local rows, all in the same transaction.
 pub fn publish_with(
-    context: &DriverContext,
+    node: Option<NodeId>,
     document: &Document,
     user_id: UserId,
     change: GitChange,
     extras: (Option<bytes::Bytes>, Vec<Row>),
 ) -> PublishRecordOperation {
-    PublishRecordOperation::new(node_of(context), document, user_id, change, extras)
+    PublishRecordOperation::new(node, document, user_id, change, extras)
 }
 
 /// What the pending call of publishing a record answers.

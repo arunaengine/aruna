@@ -59,7 +59,7 @@ pub async fn create(
     let id = repository_id(&repository)?;
     Ok(
         match drive(
-            git::locks::create(&state.get_ctx(), &auth, id, request.path),
+            git::locks::create(state.get_ctx().node_id(), &auth, id, request.path),
             &state.get_ctx(),
         )
         .await
@@ -97,7 +97,11 @@ pub async fn list(
     Query(filter): Query<LockFilter>,
 ) -> ServerResult<Response> {
     let locks = drive(
-        git::locks::list(&state.get_ctx(), &auth, repository_id(&repository)?),
+        git::locks::list(
+            state.get_ctx().node_id(),
+            &auth,
+            repository_id(&repository)?,
+        ),
         &state.get_ctx(),
     )
     .await
@@ -136,7 +140,7 @@ pub async fn verify(
     let id = repository_id(&repository)?;
     drive(
         git::repository(
-            &state.get_ctx(),
+            state.get_ctx().node_id(),
             &auth,
             id,
             aruna_core::structs::identity::auth::Permission::WRITE,
@@ -146,7 +150,7 @@ pub async fn verify(
     .await
     .map_err(map_error)?;
     let locks = drive(
-        git::locks::list(&state.get_ctx(), &auth, id),
+        git::locks::list(state.get_ctx().node_id(), &auth, id),
         &state.get_ctx(),
     )
     .await
@@ -187,7 +191,7 @@ pub async fn unlock(
     let force = body.is_some_and(|Json(body)| body.force);
     let released = drive(
         git::locks::unlock(
-            &state.get_ctx(),
+            state.get_ctx().node_id(),
             &auth,
             repository_id(&repository)?,
             lock,

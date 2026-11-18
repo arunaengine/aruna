@@ -12,12 +12,10 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
 use super::GitError;
-use super::calls::node_of;
 use super::publish::HoldersOperation;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::DriverContext;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
 use crate::storage_read::StorageReadError;
@@ -102,12 +100,12 @@ impl Operation for DocumentAccessOperation {
 
 /// The document's repository on this holder; new LFS content goes to the node's dataset bucket.
 pub fn repository(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     id: Ulid,
     permission: Permission,
 ) -> RepositoryOperation {
-    RepositoryOperation::new(node_of(context), auth, id, permission)
+    RepositoryOperation::new(node, auth, id, permission)
 }
 
 #[derive(Debug, PartialEq)]

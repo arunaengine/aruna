@@ -8,7 +8,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::LfsObject;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::git::{self, GitError};
 use axum::Json;
 use axum::body::Body;
@@ -54,7 +54,7 @@ pub async fn batch(
         return Err(ServerError::BadRequest);
     }
     drive(
-        git::repository(&state.get_ctx(), &auth, id, permission.clone()),
+        git::repository(state.get_ctx().node_id(), &auth, id, permission.clone()),
         &state.get_ctx(),
     )
     .await
@@ -72,7 +72,13 @@ pub async fn batch(
         }
         let mut item = json!({"oid": object.oid, "size": object.size});
         match drive(
-            git::lfs::inspect(&state.get_ctx(), &auth, id, &object, permission.clone()),
+            git::lfs::inspect(
+                state.get_ctx().node_id(),
+                &auth,
+                id,
+                &object,
+                permission.clone(),
+            ),
             &state.get_ctx(),
         )
         .await
@@ -129,7 +135,7 @@ pub async fn upload(
     }
     drive(
         git::lfs::upload(
-            &state.get_ctx(),
+            (state.get_ctx().node_id(), node_routing(&state.get_ctx())),
             &auth,
             repository_id(&repository)?,
             LfsObject { oid, size },

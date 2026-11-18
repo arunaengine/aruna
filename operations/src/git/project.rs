@@ -85,7 +85,7 @@ pub async fn recent(
     if !store.configured(document.document_id).await {
         return Ok(None);
     }
-    let holders = drive(publish::holders(context, document), context).await?;
+    let holders = drive(publish::holders(context.node_id(), document), context).await?;
     let unchanged = record_writes(document.document_id) == projection.writes;
     Ok((holders == projection.holders && unchanged).then_some(projection))
 }
@@ -166,7 +166,7 @@ pub async fn project(
     store: &GitStore,
     document: &MetadataRegistryRecord,
 ) -> Result<Projection, GitError> {
-    let holders = drive(publish::holders(context, document), context).await?;
+    let holders = drive(publish::holders(context.node_id(), document), context).await?;
     let id = document.document_id;
     let actor = UserId::nil(document.realm_id);
     execute(store, GitEffect::Initialize(id), actor).await?;

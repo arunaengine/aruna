@@ -14,7 +14,6 @@ use futures_util::StreamExt;
 use tokio::time::Instant;
 use ulid::Ulid;
 
-use super::calls::node_of;
 use super::lfs::{PermitObjectOperation, locate};
 use super::objects::{self, Blob};
 use super::{GitError, publish, records, repository};
@@ -62,7 +61,7 @@ pub(super) async fn pack_bytes(
     }
     let record = super::publish::pack_record(owner, bytes.clone());
     drive(
-        super::publish::publish_pack(context, document, record),
+        super::publish::publish_pack(context.node_id(), document, record),
         context,
     )
     .await?;
@@ -77,7 +76,7 @@ pub(super) async fn open(
     object: &StoredObject,
     holders: &[NodeId],
 ) -> Result<Blob, GitError> {
-    let node = node_of(context).ok_or(GitError::Unavailable)?;
+    let node = context.node_id().ok_or(GitError::Unavailable)?;
     let own = drive(objects::copy(document, &object.sha256), context).await?;
     if let Some(own) = own.as_ref().or((object.node_id == node).then_some(object)) {
         let input = GetObjectInput {
@@ -151,18 +150,23 @@ pub async fn download(
     id: Ulid,
     oid: &str,
 ) -> Result<(Blob, u64), GitError> {
-    let (document, _) = drive(repository(context, auth, id, Permission::READ), context).await?;
+    let (document, _) = drive(
+        repository(context.node_id(), auth, id, Permission::READ),
+        context,
+    )
+    .await?;
     let original = drive(locate(&document, oid), context)
         .await?
         .ok_or(GitError::NotFound)?;
     let permit = PermitObjectOperation::new(auth, &original, Permission::READ);
     drive(permit, context).await?;
-    let node = node_of(context).ok_or(GitError::Unavailable)?;
+    let node = context.node_id().ok_or(GitError::Unavailable)?;
     let local = match drive(objects::copy(&document, oid), context).await? {
         Some(copy) => copy,
         None if original.node_id == node => original,
         None => {
-            let mut holders = drive(publish::holders(context, &document), context).await?;
+            let mut holders =
+                drive(publish::holders(context.node_id(), &document), context).await?;
             holders.extend(set_holders(context, &original).await);
             let blob = open(context, auth, &document, &original, &holders).await?;
             return Ok((blob, original.size));

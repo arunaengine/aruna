@@ -154,7 +154,7 @@ async fn original(
         .map_or(UserId::nil(document.realm_id), |record| record.user_id);
     let auth = super::project::author(pusher);
     Ok(
-        match drive(lfs::readable(context, &auth, &original), context).await {
+        match drive(lfs::readable(context.node_id(), &auth, &original), context).await {
             true => Ok(()),
             false => Err("the original is unreadable, so this copy may be the last one"),
         },
@@ -168,7 +168,12 @@ async fn stored(context: &DriverContext, object: &StoredObject) -> bool {
     };
     let found = (object.bucket.as_str(), group_id);
     drive(
-        objects::described(context, found, &object.key, Some(object.version_id)),
+        objects::described(
+            context.node_id(),
+            found,
+            &object.key,
+            Some(object.version_id),
+        ),
         context,
     )
     .await

@@ -22,11 +22,10 @@ use bytes::Bytes;
 use tracing::debug;
 use ulid::Ulid;
 
-use super::calls::{git_call, git_event, node_of};
+use super::calls::{git_call, git_event};
 use super::records::{InsertRowOperation, LoadRowOperation, SyncedOperation};
 use super::{GitError, records};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::driver::{DriverContext, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
@@ -153,17 +152,6 @@ enum StoreStep {
 }
 
 /// Stores content under `key` in this node's dataset bucket after checking its SHA-256.
-pub fn store(
-    context: &DriverContext,
-    auth: &AuthContext,
-    document: &Document,
-    (key, size, sha256): (String, u64, &str),
-    body: Blob,
-) -> StoreObjectOperation {
-    let scope = (node_of(context), node_routing(context));
-    StoreObjectOperation::new(scope, auth, document, (key, size, sha256), body)
-}
-
 #[derive(Debug, PartialEq)]
 pub struct StoreObjectOperation {
     node: Option<NodeId>,
@@ -259,14 +247,14 @@ enum PutStep {
 /// Writes content to `key` in a bucket of this node through the ordinary put with its quota,
 /// gate and routing guards, after checking its SHA-256.
 pub fn put(
-    context: &DriverContext,
+    scope: (Option<NodeId>, &NodeRouting),
     auth: &AuthContext,
     (name, bucket): (&str, BucketInfo),
     (key, size, sha256): (String, u64, &str),
     body: Blob,
 ) -> PutBlobOperation {
     PutBlobOperation::new(
-        (node_of(context), &node_routing(context)),
+        scope,
         auth,
         (name.to_string(), bucket),
         (key, size, sha256.to_string()),
@@ -419,16 +407,6 @@ impl Operation for PutBlobOperation {
 /// The size and digests of an object version of this node, or of its current version with
 /// `None`; `None` when there is no such object. Callers authorize the read.
 pub fn described(
-    context: &DriverContext,
-    (name, group_id): (&str, GroupId),
-    key: &str,
-    version: Option<Ulid>,
-) -> DescribeObjectOperation {
-    describe_call(node_of(context), (name, group_id), key, version)
-}
-
-/// [`described`] for a run that already knows this node.
-pub(super) fn describe_call(
     node: Option<NodeId>,
     (name, group_id): (&str, GroupId),
     key: &str,

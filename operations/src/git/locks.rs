@@ -11,11 +11,9 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
 use super::access::{Repository, RepositoryOperation};
-use super::calls::node_of;
 use super::publish::PublishRecordOperation;
 use super::state::{Ancestry, reduce};
 use super::{GitError, records};
-use crate::driver::DriverContext;
 
 type Document = MetadataRegistryRecord;
 
@@ -62,12 +60,11 @@ enum CreateStep {
 
 /// Claims a path. A concurrent claim from another holder may still win once it replicates.
 pub fn create(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     id: Ulid,
     path: String,
 ) -> CreateLockOperation {
-    let node = node_of(context);
     CreateLockOperation {
         node,
         auth: auth.clone(),
@@ -155,8 +152,8 @@ impl Operation for CreateLockOperation {
 }
 
 /// The locks of a repository the caller may read.
-pub fn list(context: &DriverContext, auth: &AuthContext, id: Ulid) -> ListLocksOperation {
-    let open = RepositoryOperation::new(node_of(context), auth, id, Permission::READ);
+pub fn list(node: Option<NodeId>, auth: &AuthContext, id: Ulid) -> ListLocksOperation {
+    let open = RepositoryOperation::new(node, auth, id, Permission::READ);
     ListLocksOperation {
         id,
         open: Some(open),
@@ -199,13 +196,12 @@ enum UnlockStep {
 
 /// Releases the caller's lock; WRITE on the document with `force` releases anyone's.
 pub fn unlock(
-    context: &DriverContext,
+    node: Option<NodeId>,
     auth: &AuthContext,
     id: Ulid,
     lock_id: Ulid,
     force: bool,
 ) -> UnlockOperation {
-    let node = node_of(context);
     UnlockOperation {
         node,
         auth: auth.clone(),

@@ -9,7 +9,7 @@ use super::{GitError, download, lfs, location, publish};
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, node_routing};
 use crate::s3::object::copy::{CopyObjectInput, CopyReferences, CopySourceConditions, copy_object};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{FileChangeKind, GitEffect, GitEvent, LfsObject, PendingMerge, StoredObject};
@@ -57,7 +57,7 @@ pub(super) async fn target(
         ..author(merge.user_id)
     };
     let bucket = match drive(
-        location::writable(context, &auth, document, &location),
+        location::writable(context.node_id(), &auth, document, &location),
         context,
     )
     .await
@@ -176,7 +176,7 @@ impl PushTarget {
         };
         let sha256 = content.sha256();
         let existing = drive(
-            objects::described(context, (name, bucket.group_id), &key, None),
+            objects::described(context.node_id(), (name, bucket.group_id), &key, None),
             context,
         )
         .await?;
@@ -241,13 +241,19 @@ impl Content {
                 {
                     return copied(context, auth, (&local, group_id), (name, bucket, key)).await;
                 }
-                let holders = drive(publish::holders(context, document), context).await?;
+                let holders = drive(publish::holders(context.node_id(), document), context).await?;
                 let blob = download::open(context, auth, document, &source, &holders).await?;
                 (source.size, blob)
             }
         };
         drive(
-            objects::put(context, auth, (name, bucket), (key, size, &sha256), body),
+            objects::put(
+                (context.node_id(), &node_routing(context)),
+                auth,
+                (name, bucket),
+                (key, size, &sha256),
+                body,
+            ),
             context,
         )
         .await
@@ -304,7 +310,7 @@ async fn copied(
         .map_err(|_| GitError::Unavailable)?;
     drive(
         objects::described(
-            context,
+            context.node_id(),
             (name, bucket.group_id),
             &key,
             Some(result.version_id),
