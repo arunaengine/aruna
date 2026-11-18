@@ -1,4 +1,4 @@
-//! Groups the user operations for lookup, search, updates, subject index and the vault.
+//! Groups the user operations for lookup, search, updates and the vault.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -14,7 +14,6 @@ pub mod resolve_users;
 pub mod revoke_all;
 pub mod search_users;
 pub mod service_account;
-pub mod subject_index;
 pub mod update_user;
 mod vault;
 

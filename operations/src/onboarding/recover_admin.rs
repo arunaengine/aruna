@@ -2,18 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{PrefixPages, done};
+use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::onboarding::create_secret::secret_record_key;
+use crate::onboarding::create_secret::{secret_pages, secret_record_key};
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,35 +20,23 @@ pub struct RecoverInitialInput {
     pub record: OnboardingSecretRecord,
 }
 
+/// What the recovery transaction waits for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stage {
+    Records,
+    States,
+    Delete,
+    Write,
+}
+
+/// Drops the unclaimed initial administrator secrets and writes the replacement in one write
+/// transaction.
 #[derive(Debug, PartialEq)]
 pub struct RecoverInitialOperation {
     input: RecoverInitialInput,
-    state: RecoverInitialState,
-    output: Option<Result<OnboardingSecretRecord, RecoverInitialError>>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum RecoverInitialState {
-    Init,
-    StartTransaction,
-    ReadRecords {
-        txn_id: TxnId,
-    },
-    ReadStates {
-        txn_id: TxnId,
-        records: Vec<OnboardingSecretRecord>,
-    },
-    DeleteRecords {
-        txn_id: TxnId,
-    },
-    WriteReplacement {
-        txn_id: TxnId,
-    },
-    CommitTransaction {
-        txn_id: TxnId,
-    },
-    Finish,
-    Error,
+    stage: Stage,
+    pages: PrefixPages,
+    records: Vec<OnboardingSecretRecord>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -68,12 +55,30 @@ pub enum RecoverInitialError {
     },
 }
 
+impl From<IoError> for RecoverInitialError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "RecoverInitial".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type RecoverTurn = Result<Next<OnboardingSecretRecord>, RecoverInitialError>;
+
 impl RecoverInitialOperation {
     pub fn new(input: RecoverInitialInput) -> Self {
         Self {
             input,
-            state: RecoverInitialState::Init,
-            output: None,
+            stage: Stage::Records,
+            pages: secret_pages(),
+            records: Vec::new(),
         }
     }
 
@@ -93,199 +98,98 @@ impl RecoverInitialOperation {
         ])
     }
 
-    fn write_replacement(&mut self, txn_id: TxnId) -> Effects {
-        let writes = match self.replacement_writes() {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error),
-        };
-        self.state = RecoverInitialState::WriteReplacement { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+    fn write_replacement(&mut self) -> RecoverTurn {
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(self.replacement_writes()?)))
     }
 
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.fail(RecoverInitialError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: event.label(),
-        })
+    /// Collects every stored secret, then reads their states.
+    fn handle_page(&mut self, result: IoResult) -> RecoverTurn {
+        for (_, value) in self.pages.take(result)? {
+            let record = postcard::from_bytes::<OnboardingSecretRecord>(&value)
+                .map_err(ConversionError::from)?;
+            self.records.push(record);
+        }
+        if !self.pages.done() {
+            return Ok(Next::Call(self.pages.call()));
+        }
+        if self.records.is_empty() {
+            return self.write_replacement();
+        }
+        let reads = (self.records.iter())
+            .map(|record| {
+                (
+                    ONBOARDING_KEYSPACE.to_string(),
+                    secret_state_key(record.enrollment_id),
+                )
+            })
+            .collect();
+        self.stage = Stage::States;
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn fail(&mut self, error: RecoverInitialError) -> Effects {
-        let cleanup = self.abort();
-        self.state = RecoverInitialState::Error;
-        self.output = Some(Err(error));
-        cleanup
+    fn handle_states(&mut self, values: Vec<Option<Value>>) -> RecoverTurn {
+        if values.len() != self.records.len() {
+            return Err(RecoverInitialError::UnexpectedEvent {
+                state: "States".to_string(),
+                expected: "one state per onboarding secret",
+                got: "a different number of states",
+            });
+        }
+        let mut deletes: Vec<(KeySpace, Key)> = Vec::new();
+        for (record, state_value) in std::mem::take(&mut self.records).into_iter().zip(values) {
+            let state = resolve_secret_state(&record, state_value.as_ref())?;
+            if record.purpose == OnboardingPurpose::InitialAdministrator
+                && state.claimed_node_id().is_none()
+            {
+                deletes.push((
+                    ONBOARDING_KEYSPACE.to_string(),
+                    secret_record_key(record.enrollment_id),
+                ));
+                deletes.push((
+                    ONBOARDING_KEYSPACE.to_string(),
+                    secret_state_key(record.enrollment_id),
+                ));
+            }
+        }
+        if deletes.is_empty() {
+            return self.write_replacement();
+        }
+        self.stage = Stage::Delete;
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 }
 
-impl EffectOperation for RecoverInitialOperation {
+impl Operation for RecoverInitialOperation {
     type Output = OnboardingSecretRecord;
     type Error = RecoverInitialError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RecoverInitialState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
+    fn first(&mut self) -> RecoverTurn {
+        Ok(Next::Call(self.pages.call()))
+    }
 
-        match &self.state {
-            RecoverInitialState::StartTransaction => {
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.unexpected("transaction started", event);
+    fn next(&mut self, result: IoResult) -> RecoverTurn {
+        match self.stage {
+            Stage::Records => self.handle_page(result),
+            Stage::States => {
+                let IoResult::Values(values) = result else {
+                    return Err(RecoverInitialError::NotFinished);
                 };
-                self.state = RecoverInitialState::ReadRecords { txn_id };
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: ONBOARDING_KEYSPACE.to_string(),
-                    prefix: Some(ByteView::from(b"secret:".as_slice())),
-                    start: None,
-                    limit: usize::MAX,
-                    txn_id: Some(txn_id),
-                })]
+                self.handle_states(values)
             }
-            RecoverInitialState::ReadRecords { txn_id } => {
-                let txn_id = txn_id.clone();
-                let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-                    return self.unexpected("onboarding secret iteration result", event);
-                };
-                let records = values
-                    .into_iter()
-                    .map(|(_, value)| postcard::from_bytes::<OnboardingSecretRecord>(&value))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(ConversionError::from);
-                let records = match records {
-                    Ok(records) => records,
-                    Err(error) => return self.fail(error.into()),
-                };
-                if records.is_empty() {
-                    return self.write_replacement(txn_id);
-                }
-
-                let reads = records
-                    .iter()
-                    .map(|record| {
-                        (
-                            ONBOARDING_KEYSPACE.to_string(),
-                            secret_state_key(record.enrollment_id),
-                        )
-                    })
-                    .collect();
-                self.state = RecoverInitialState::ReadStates { txn_id, records };
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: Some(txn_id),
-                })]
+            Stage::Delete => {
+                done(result)?;
+                self.write_replacement()
             }
-            RecoverInitialState::ReadStates { txn_id, records } => {
-                let txn_id = txn_id.clone();
-                let records = records.clone();
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    return self.unexpected("onboarding secret states", event);
-                };
-                if values.len() != records.len() {
-                    return self.fail(RecoverInitialError::UnexpectedEvent {
-                        state: format!("{:?}", self.state),
-                        expected: "one state per onboarding secret",
-                        got: "a different number of states",
-                    });
-                }
-
-                let mut deletes = Vec::new();
-                for (record, (_, state_value)) in records.into_iter().zip(values) {
-                    let state = match resolve_secret_state(&record, state_value.as_ref()) {
-                        Ok(state) => state,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                    if record.purpose == OnboardingPurpose::InitialAdministrator
-                        && state.claimed_node_id().is_none()
-                    {
-                        deletes.push((
-                            ONBOARDING_KEYSPACE.to_string(),
-                            secret_record_key(record.enrollment_id),
-                        ));
-                        deletes.push((
-                            ONBOARDING_KEYSPACE.to_string(),
-                            secret_state_key(record.enrollment_id),
-                        ));
-                    }
-                }
-
-                if deletes.is_empty() {
-                    return self.write_replacement(txn_id);
-                }
-                self.state = RecoverInitialState::DeleteRecords { txn_id };
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            RecoverInitialState::DeleteRecords { txn_id } => {
-                let txn_id = txn_id.clone();
-                if !matches!(
-                    event,
-                    Event::Storage(StorageEvent::BatchDeleteResult { .. })
-                ) {
-                    return self.unexpected("onboarding secret deletion result", event);
-                }
-                self.write_replacement(txn_id)
-            }
-            RecoverInitialState::WriteReplacement { txn_id } => {
-                let txn_id = txn_id.clone();
-                if !matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
-                    return self.unexpected("replacement secret write result", event);
-                }
-                self.state = RecoverInitialState::CommitTransaction { txn_id };
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            RecoverInitialState::CommitTransaction { .. } => {
-                if !matches!(
-                    event,
-                    Event::Storage(StorageEvent::TransactionCommitted { .. })
-                ) {
-                    return self.unexpected("transaction committed", event);
-                }
-                self.state = RecoverInitialState::Finish;
-                self.output = Some(Ok(self.input.record.clone()));
-                smallvec![]
-            }
-            RecoverInitialState::Init => self.unexpected("operation start", event),
-            RecoverInitialState::Finish | RecoverInitialState::Error => {
-                self.unexpected("no event after completion", event)
+            Stage::Write => {
+                done(result)?;
+                Ok(Next::Done(self.input.record.clone()))
             }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RecoverInitialState::Finish | RecoverInitialState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(RecoverInitialError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        let txn_id = match &self.state {
-            RecoverInitialState::ReadRecords { txn_id }
-            | RecoverInitialState::ReadStates { txn_id, .. }
-            | RecoverInitialState::DeleteRecords { txn_id }
-            | RecoverInitialState::WriteReplacement { txn_id }
-            | RecoverInitialState::CommitTransaction { txn_id } => Some(*txn_id),
-            _ => None,
-        };
-        txn_id
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
     }
 }
 

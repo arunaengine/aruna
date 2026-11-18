@@ -6,26 +6,28 @@
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::realm_vault::{
     FetchScope, RealmSealed, RealmSecretRef, RealmVaultError, RealmVaultRecord,
 };
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::execution::setting::{SettingChannel, validate_setting};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::debug;
 use ulid::Ulid;
 
-use crate::document_repository::read_effect;
-use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
+use crate::forward::fetch::{
+    Answer, Budget, FetchError, Fetched, HolderFetchOperation, HolderRecord,
+};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
 use crate::realm::mutate_placement::{is_management, node_kind};
@@ -48,6 +50,19 @@ pub enum RealmSecretError {
     Cache(String),
 }
 
+impl From<IoError> for RealmSecretError {
+    fn from(error: IoError) -> Self {
+        Self::Cache(error.to_string())
+    }
+}
+
+/// An effect call of this operation.
+fn effect_call<T>(effect: Effect) -> Next<T> {
+    Next::Call(IoCall::Effect(Box::new(effect)))
+}
+
+type SecretTurn = Result<Next<SecretBytes>, RealmSecretError>;
+
 /// Reads the secret `reference` names, when it is the current revision in the config: opened with
 /// the realm keys this node holds, else from the node vault cache, else fetched from the
 /// management nodes in config order and cached.
@@ -57,17 +72,14 @@ pub struct ReadSecretOperation {
     sealed: Option<RealmSealed>,
     managers: Vec<NodeId>,
     state: ReadState,
-    output: Option<Result<SecretBytes, RealmSecretError>>,
 }
 
 #[derive(Debug, PartialEq)]
 enum ReadState {
-    Init,
     Open,
     Cache,
-    Fetch(Box<HolderFetchOperation<SecretBytes>>),
+    Fetch,
     Write(SecretBytes),
-    Done,
 }
 
 impl ReadSecretOperation {
@@ -77,56 +89,49 @@ impl ReadSecretOperation {
             reference,
             sealed,
             managers: managers(config),
-            state: ReadState::Init,
-            output: None,
+            state: ReadState::Open,
         }
     }
 
-    fn finish(&mut self, result: Result<SecretBytes, RealmSecretError>) -> Effects {
-        self.state = ReadState::Done;
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn opened(&mut self, result: Result<SecretBytes, RealmVaultError>) -> Effects {
+    fn opened(&mut self, event: Event) -> SecretTurn {
+        let Event::Storage(StorageEvent::RealmOpened { result }) = event else {
+            return Err(RealmSecretError::Cache(event.label().to_string()));
+        };
         match result {
             Err(RealmVaultError::NoKey) => {
                 self.state = ReadState::Cache;
-                smallvec![read_secret(cache_entry(self.reference), None)]
+                Ok(effect_call(read_secret(cache_entry(self.reference), None)))
             }
-            opened => self.finish(opened.map_err(RealmSecretError::from)),
+            opened => Ok(Next::Done(opened?)),
         }
     }
 
-    fn cached(&mut self, event: Event) -> Effects {
+    fn cached(&mut self, event: Event) -> SecretTurn {
         let entry = cache_entry(self.reference);
         let reference = self.reference;
         match parse_secret(event, entry, |bytes| Ok(cached_secret(bytes, reference))) {
-            Ok(Some(Some(secret))) => self.finish(Ok(secret)),
+            Ok(Some(Some(secret))) => Ok(Next::Done(secret)),
             Ok(_) => {
                 let request = MetadataTransportMessage::RealmSecret {
                     entry: reference.entry,
                     revision: reference.revision,
                 };
-                let mut fetch = HolderFetchOperation::new(
+                let fetch = HolderFetchOperation::<SecretBytes>::new(
                     &self.managers,
                     &request,
                     FETCH_DEADLINE,
                     Budget::Split,
                 );
-                let effects = fetch.start();
-                self.fetching(fetch, effects)
+                self.state = ReadState::Fetch;
+                Ok(Next::Call(IoCall::child(fetch)))
             }
-            Err(error) => self.finish(Err(RealmSecretError::Cache(error.to_string()))),
+            Err(error) => Err(RealmSecretError::Cache(error.to_string())),
         }
     }
 
-    fn fetching(&mut self, fetch: HolderFetchOperation<SecretBytes>, effects: Effects) -> Effects {
-        if !fetch.is_complete() {
-            self.state = ReadState::Fetch(Box::new(fetch));
-            return effects;
-        }
-        match fetch.finalize() {
+    fn fetched(&mut self, result: Result<Fetched<SecretBytes>, FetchError>) -> SecretTurn {
+        let unavailable = |reason: String| Err(RealmSecretError::Unavailable(reason));
+        match result {
             Ok(Fetched::Found { value, .. }) => {
                 let row = [
                     &[self.reference.entry.purpose.tag()][..],
@@ -136,60 +141,41 @@ impl ReadSecretOperation {
                 let entry = cache_entry(self.reference);
                 let write = write_secret(entry, SecretBytes::new(row.concat()), None);
                 self.state = ReadState::Write(value);
-                smallvec![write]
+                Ok(effect_call(write))
             }
-            Ok(Fetched::Unavailable(reason)) => {
-                self.finish(Err(RealmSecretError::Unavailable(reason)))
+            Ok(Fetched::Unavailable(reason)) => unavailable(reason),
+            Ok(Fetched::NotFound | Fetched::Denied) => {
+                unavailable("no management node handed it out".to_string())
             }
-            Ok(Fetched::NotFound | Fetched::Denied) => self.finish(Err(
-                RealmSecretError::Unavailable("no management node handed it out".to_string()),
-            )),
-            Err(error) => self.finish(Err(RealmSecretError::Unavailable(error.to_string()))),
+            Err(error) => unavailable(error.to_string()),
         }
     }
 }
 
-impl EffectOperation for ReadSecretOperation {
+impl Operation for ReadSecretOperation {
     type Output = SecretBytes;
     type Error = RealmSecretError;
 
-    fn start(&mut self) -> Effects {
-        let Some(sealed) = self.sealed.take() else {
-            return self.finish(Err(RealmSecretError::NotReplicated));
-        };
-        self.state = ReadState::Open;
-        smallvec![Effect::Storage(StorageEffect::RealmOpen(Box::new(sealed)))]
+    fn first(&mut self) -> SecretTurn {
+        let sealed = self.sealed.take().ok_or(RealmSecretError::NotReplicated)?;
+        Ok(effect_call(Effect::Storage(StorageEffect::RealmOpen(
+            Box::new(sealed),
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::replace(&mut self.state, ReadState::Done), event) {
-            (ReadState::Open, Event::Storage(StorageEvent::RealmOpened { result })) => {
-                self.opened(result)
+    fn next(&mut self, result: IoResult) -> SecretTurn {
+        match std::mem::replace(&mut self.state, ReadState::Open) {
+            ReadState::Open => self.opened(result.event()?),
+            ReadState::Cache => self.cached(result.event()?),
+            ReadState::Fetch => {
+                let fetched = result.child::<Fetched<SecretBytes>, FetchError>()?;
+                self.fetched(fetched)
             }
-            (ReadState::Cache, event) => self.cached(event),
-            (ReadState::Fetch(mut fetch), event) => {
-                let effects = fetch.step(event);
-                self.fetching(*fetch, effects)
-            }
-            (ReadState::Write(secret), Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.finish(Ok(secret))
-            }
-            (_, event) => self.finish(Err(RealmSecretError::Cache(event.label().to_string()))),
+            ReadState::Write(secret) => match result.event()? {
+                Event::Storage(StorageEvent::WriteResult { .. }) => Ok(Next::Done(secret)),
+                event => Err(RealmSecretError::Cache(event.label().to_string())),
+            },
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<SecretBytes, RealmSecretError> {
-        self.output.unwrap_or(Err(RealmSecretError::Unavailable(
-            "the read did not finish".to_string(),
-        )))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -311,10 +297,8 @@ pub enum ServeRequest {
 
 #[derive(Debug, PartialEq)]
 enum ServeState {
-    Init,
     Config,
     Open,
-    Done,
 }
 
 /// The management side of a secret request. Only a node that holds the realm keys answers, and
@@ -326,11 +310,12 @@ pub struct ServeSecretOperation {
     peer: NodeId,
     request: ServeRequest,
     state: ServeState,
-    output: Option<Result<SecretAnswer, MetadataReadError>>,
 }
 
 /// The secret a peer gets, or why it is refused.
 pub type SecretAnswer = Result<SecretBytes, MetadataReadError>;
+
+type ServeTurn = Result<Next<SecretAnswer>, MetadataReadError>;
 
 impl ServeSecretOperation {
     pub fn new(realm_id: RealmId, local: NodeId, peer: NodeId, request: ServeRequest) -> Self {
@@ -339,21 +324,14 @@ impl ServeSecretOperation {
             local,
             peer,
             request,
-            state: ServeState::Init,
-            output: None,
+            state: ServeState::Config,
         }
     }
 
-    fn answer(&mut self, answer: SecretAnswer) -> Effects {
-        self.state = ServeState::Done;
-        self.output = Some(Ok(answer));
-        smallvec![]
-    }
-
-    fn config(&mut self, value: Option<Value>) -> Effects {
+    fn config(&mut self, value: Option<Value>) -> ServeTurn {
         let config = value.and_then(|value| RealmConfigDocument::from_bytes(&value).ok());
         let Some(config) = config else {
-            return self.answer(Err(MetadataReadError::Unavailable));
+            return Ok(Next::Done(Err(MetadataReadError::Unavailable)));
         };
         let sealed = match &self.request {
             ServeRequest::Secret(request) => check_fetch(&config, self.local, self.peer, *request)
@@ -366,14 +344,16 @@ impl ServeSecretOperation {
         match sealed {
             Ok(sealed) => {
                 self.state = ServeState::Open;
-                smallvec![Effect::Storage(StorageEffect::RealmOpen(Box::new(sealed)))]
+                Ok(effect_call(Effect::Storage(StorageEffect::RealmOpen(
+                    Box::new(sealed),
+                ))))
             }
-            Err(error) => self.answer(Err(error)),
+            Err(error) => Ok(Next::Done(Err(error))),
         }
     }
 
-    fn opened(&mut self, result: Result<SecretBytes, RealmVaultError>) -> Effects {
-        let answer = match &self.request {
+    fn opened(&mut self, result: Result<SecretBytes, RealmVaultError>) -> SecretAnswer {
+        match &self.request {
             ServeRequest::Secret(request) => {
                 if result.is_ok() {
                     debug!(peer = %self.peer, entry = ?request.entry, revision = %request.revision, "Served a realm vault entry");
@@ -381,51 +361,38 @@ impl ServeSecretOperation {
                 result.map_err(|_| MetadataReadError::Unavailable)
             }
             ServeRequest::Setting { .. } => result.map_err(setting_error),
-        };
-        self.answer(answer)
+        }
     }
 }
 
-impl EffectOperation for ServeSecretOperation {
+impl Operation for ServeSecretOperation {
     type Output = SecretAnswer;
     type Error = MetadataReadError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ServeState::Config;
+    fn first(&mut self) -> ServeTurn {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
-        smallvec![read_effect(&config, None)]
+        Ok(Next::Call(IoCall::Read(vec![(
+            config.storage_keyspace().to_string(),
+            config.storage_key(),
+        )])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::replace(&mut self.state, ServeState::Done), event) {
-            (ServeState::Config, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.config(value)
-            }
-            (ServeState::Config, Event::Storage(StorageEvent::Error { .. })) => {
-                self.answer(Err(MetadataReadError::Unavailable))
-            }
-            (ServeState::Open, Event::Storage(StorageEvent::RealmOpened { result })) => {
-                self.opened(result)
-            }
-            _ => {
-                self.output = Some(Err(MetadataReadError::Unavailable));
-                smallvec![]
-            }
+    fn next(&mut self, result: IoResult) -> ServeTurn {
+        match self.state {
+            // An unreadable config is an answer too: this node cannot serve right now.
+            ServeState::Config => match values::<1>(result) {
+                Ok([value]) => self.config(value),
+                Err(_) => Ok(Next::Done(Err(MetadataReadError::Unavailable))),
+            },
+            ServeState::Open => match result.event()? {
+                Event::Storage(StorageEvent::RealmOpened { result }) => {
+                    Ok(Next::Done(self.opened(result)))
+                }
+                _ => Err(MetadataReadError::Unavailable),
+            },
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<SecretAnswer, MetadataReadError> {
-        self.output.unwrap_or(Err(MetadataReadError::Unavailable))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -445,21 +412,20 @@ fn infrastructure_peer(
 #[derive(Debug, PartialEq)]
 pub struct PruneCacheOperation {
     current: Vec<RealmSecretRef>,
+    pages: PrefixPages,
     keys: Vec<Key>,
-    next: Option<Key>,
     state: PruneState,
     pruned: usize,
-    output: Option<Result<usize, RealmSecretError>>,
 }
 
 #[derive(Debug, PartialEq)]
 enum PruneState {
-    Init,
     Page,
     Read(VaultEntry),
     Delete,
-    Done,
 }
+
+type PruneTurn = Result<Next<usize>, RealmSecretError>;
 
 impl PruneCacheOperation {
     pub fn new(config: &RealmConfigDocument) -> Self {
@@ -471,47 +437,31 @@ impl PruneCacheOperation {
                 revision: record.revision,
             })
             .collect();
+        let prefix = Key::from(vec![VaultPurpose::RealmSecret.tag()]);
         Self {
             current,
+            pages: PrefixPages::new(NODE_VAULT_KEYSPACE, prefix, PRUNE_PAGE),
             keys: Vec::new(),
-            next: None,
-            state: PruneState::Init,
+            state: PruneState::Page,
             pruned: 0,
-            output: None,
         }
     }
 
-    fn page(&mut self, start: Option<Key>) -> Effects {
-        self.state = PruneState::Page;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: NODE_VAULT_KEYSPACE.to_string(),
-            prefix: Some(vec![VaultPurpose::RealmSecret.tag()].into()),
-            start: start.map(IterStart::After),
-            limit: PRUNE_PAGE,
-            txn_id: None,
-        })]
-    }
-
     /// Reads the next cache row of the page, or turns the page.
-    fn next_row(&mut self) -> Effects {
+    fn next_row(&mut self) -> PruneTurn {
         while let Some(key) = self.keys.pop() {
             let Some(id) = key.get(1..).and_then(|id| <[u8; 16]>::try_from(id).ok()) else {
                 continue;
             };
             let entry = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_bytes(id));
             self.state = PruneState::Read(entry);
-            return smallvec![read_secret(entry, None)];
+            return Ok(effect_call(read_secret(entry, None)));
         }
-        match self.next.take() {
-            Some(start) => self.page(Some(start)),
-            None => self.finish(Ok(self.pruned)),
+        if self.pages.done() {
+            return Ok(Next::Done(self.pruned));
         }
-    }
-
-    fn finish(&mut self, result: Result<usize, RealmSecretError>) -> Effects {
-        self.state = PruneState::Done;
-        self.output = Some(result);
-        smallvec![]
+        self.state = PruneState::Page;
+        Ok(Next::Call(self.pages.call()))
     }
 
     fn is_current(&self, entry: VaultEntry, bytes: &[u8]) -> bool {
@@ -521,62 +471,46 @@ impl PruneCacheOperation {
     }
 }
 
-impl EffectOperation for PruneCacheOperation {
+impl Operation for PruneCacheOperation {
     type Output = usize;
     type Error = RealmSecretError;
 
-    fn start(&mut self) -> Effects {
-        self.page(None)
+    fn first(&mut self) -> PruneTurn {
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> PruneTurn {
         let cache = |text: String| RealmSecretError::Cache(text);
-        match (std::mem::replace(&mut self.state, PruneState::Done), event) {
-            (
-                PruneState::Page,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
+        match std::mem::replace(&mut self.state, PruneState::Page) {
+            PruneState::Page => {
                 // Rows are visited last first; the order does not change what is deleted.
-                self.keys = values.into_iter().map(|(key, _)| key).collect();
-                self.next = next_start_after;
+                self.keys = self
+                    .pages
+                    .take(result)?
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect();
                 self.next_row()
             }
-            (PruneState::Read(entry), event) => {
+            PruneState::Read(entry) => {
+                let event = result.event()?;
                 match parse_secret(event, entry, |bytes| Ok(self.is_current(entry, bytes))) {
                     Ok(Some(true)) => self.next_row(),
                     Ok(_) => {
                         self.state = PruneState::Delete;
-                        smallvec![delete_secret(entry, None)]
+                        Ok(effect_call(delete_secret(entry, None)))
                     }
-                    Err(error) => self.finish(Err(cache(error.to_string()))),
+                    Err(error) => Err(cache(error.to_string())),
                 }
             }
-            (PruneState::Delete, Event::Storage(StorageEvent::DeleteResult { .. })) => {
-                self.pruned += 1;
-                self.next_row()
-            }
-            (_, event) => self.finish(Err(cache(format!("node vault answered {}", event.label())))),
+            PruneState::Delete => match result.event()? {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    self.pruned += 1;
+                    self.next_row()
+                }
+                event => Err(cache(format!("node vault answered {}", event.label()))),
+            },
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<usize, RealmSecretError> {
-        let unfinished = || {
-            Err(RealmSecretError::Cache(
-                "the prune did not finish".to_string(),
-            ))
-        };
-        self.output.unwrap_or_else(unfinished)
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
