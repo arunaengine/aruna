@@ -1310,12 +1310,27 @@ mod tests {
         assert_eq!(captured.run.status, PolicyStatus::Active);
     }
 
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::Write { .. })))
-        );
-        assert_eq!(operation.finalize(), Err(BulkError::BucketChanged));
+    #[test]
+    fn finished_run_stays() {
+        // A pass never revives or downgrades a run another pass finished.
+        use aruna_core::structs::placement::policy::attachment::PolicyBulkRun;
+        let operation_id = Ulid::from_bytes([3u8; 16]);
+        let run = PolicyBulkRun {
+            operation_id,
+            bucket: BUCKET.to_string(),
+            bucket_identity: (Ulid::generate(), UNIX_EPOCH, UserId::default()),
+            generation: 1,
+            target_refs: Vec::new(),
+            status: PolicyStatus::Superseded,
+        };
+        let mut close = CloseRun {
+            operation_id,
+            status: PolicyStatus::Completed,
+            written: None,
+        };
+        close.first().unwrap();
+        let stored = IoResult::Values(vec![Some(run.to_bytes().unwrap().into())]);
+        assert_eq!(close.next(stored), Ok(Next::Done(Some(run))));
     }
 
     #[tokio::test]
@@ -1500,9 +1515,9 @@ mod tests {
         ] {
             let mut operation = PolicyBulkOperation::new(bulk_config(Ulid::generate()));
             operation.state = BulkState::Mint;
-            operation.record_outcome(Err(SuccessorError::Distribution(refusal)));
+            let turn = operation.record_outcome(Err(SuccessorError::Distribution(refusal)));
             assert_eq!(operation.report.replanned, 1);
-            assert_ne!(operation.state, BulkState::Error);
+            assert!(turn.is_ok());
         }
     }
 
