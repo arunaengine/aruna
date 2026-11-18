@@ -17,6 +17,7 @@ use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::PlacementReconcileOutcome;
 use crate::placement::process_placements::ReconcilePlacementsOperation;
 use crate::replication::catch_up::wake_bootstrap;
+use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::sync::reconcile::ReconcileTopicsOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
@@ -589,12 +590,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     .await
                 }
                 Alpn::Shard => {
-                    Box::pin(crate::effect_adapters::shard::serve_stream(
-                        self.context.as_ref(),
-                        stream,
-                        node_id,
-                    ))
-                    .await
+                    Box::pin(serve_shard_stream(self.context.as_ref(), stream, node_id)).await
                 }
                 Alpn::Heartbeat => {
                     Box::pin(receive_heartbeat(self.context.as_ref(), stream, node_id)).await
@@ -736,6 +732,44 @@ async fn heartbeat_frame(stream: &mut BiStream) -> Result<Vec<u8>, String> {
         .await
         .map_err(|error| error.to_string())?;
     Ok(bytes)
+}
+
+/// Answers one inbound shard manifest request on `stream`.
+#[tracing::instrument(
+    name = "shard.incoming.stream",
+    level = "debug",
+    skip(context, stream),
+    fields(peer = %peer)
+)]
+async fn serve_shard_stream(
+    context: &DriverContext,
+    mut stream: aruna_net::streams::BiStream,
+    peer: NodeId,
+) {
+    use aruna_net::shard_manifest::{
+        close_shard_stream, read_manifest_request, write_manifest, write_rejection,
+    };
+    let Some(local) = context.node_and_realm() else {
+        warn!(peer = %peer, "Dropping inbound shard stream without net handle");
+        return;
+    };
+    let message = match read_manifest_request(&mut stream).await {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(peer = %peer, error = %error, "Failed to read shard manifest request");
+            return;
+        }
+    };
+    let serve = ServeManifestOperation::new(local, peer, message);
+    let written = match drive(serve, context).await {
+        Ok(ManifestAnswer::Manifest(manifest)) => write_manifest(&mut stream, &manifest).await,
+        Ok(ManifestAnswer::Reject(reason)) => write_rejection(&mut stream, reason).await,
+        Err(error) => write_rejection(&mut stream, error.to_string()).await,
+    };
+    if let Err(error) = written {
+        warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
+    }
+    close_shard_stream(&mut stream).await;
 }
 
 #[cfg(test)]
