@@ -22,6 +22,7 @@ use crate::metadata::create_document::CreateDocumentOperation;
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::create_document::CreateDocumentResult;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::create_document::{mint_forward_document, mint_local_document};
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::profile::validation::{RevalidateOperation, ValidationStatusOperation};

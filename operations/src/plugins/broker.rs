@@ -74,9 +74,8 @@ use crate::metadata::api::list::ListVisibleOperation;
 use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
 use crate::metadata::forward::read::get_metadata_routed;
-use crate::metadata::forward::write::{
-    CreateAuthorizedError, PinnedCreate, create_with_id, route_metadata_update,
-};
+use crate::metadata::forward::pinned::PinnedCreate;
+use crate::metadata::forward::write::{CreateAuthorizedError, create_with_id, route_metadata_update};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
