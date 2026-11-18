@@ -443,14 +443,49 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
 
-    use super::super::credential::{RunIdentity, WorkspaceAccessOperation, WorkspaceCredential};
-    use super::super::inventory::CollectOutputsOperation;
-    use super::super::prepare::{input_mint, workspace_mint};
-    use super::*;
-    use crate::s3::access::get::GetAccessOperation;
+    use std::collections::BTreeSet;
+    use std::time::{Duration, SystemTime};
+
     use aruna_core::calls::Next;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::storage::blob::bucket_permission_path;
+    use aruna_core::structs::execution::job::{CapturedInput, ExecutionSpec};
+    use aruna_core::structs::identity::auth::Permission;
+    use aruna_core::structs::placement::policy::PlacementPolicyRef;
+    use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
+    use aruna_core::structs::storage::distribution::source_root::RootEntry;
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::origin::SourcePin;
+
+    use super::super::credential::{
+        MintCredentialOperation, RunIdentity, WorkspaceAccessOperation, WorkspaceCredential,
+    };
+    use super::super::inputs::{keep_served, serving_pin};
+    use super::super::inventory::CollectOutputsOperation;
+    use super::super::outputs::{input_refs, uncaptured_input};
+    use super::*;
+    use crate::driver::{DriverContext, drive};
+    use crate::s3::access::get::GetAccessOperation;
+    use crate::s3::bucket::create::CreateBucketOperation;
+
+    fn run_of(
+        context: &DriverContext,
+        spec: &ExecutionSpec,
+        record: &JobRecord,
+        node_id: NodeId,
+    ) -> RunIdentity {
+        let realm_id = context.serving_realm(record.created_by.realm_id);
+        RunIdentity::new(spec, record, realm_id, node_id)
+    }
+
+    fn secret_inputs(
+        context: &DriverContext,
+    ) -> (
+        Option<aruna_core::credential_encryption::CredentialEncryptionKey>,
+        SystemTime,
+    ) {
+        let key = (context.net_handle.as_ref()).map(|net| net.credential_encryption_key());
+        (key, SystemTime::now())
+    }
 
     async fn mint_workspace(
         context: &DriverContext,
@@ -459,11 +494,10 @@ mod tests {
         node_id: NodeId,
         scope: (&str, Option<&str>),
     ) -> Result<WorkspaceCredential, JobError> {
-        drive(
-            workspace_mint(context, spec, record, node_id, scope),
-            context,
-        )
-        .await
+        let run = run_of(context, spec, record, node_id);
+        let secret = secret_inputs(context);
+        let mint = MintCredentialOperation::workspace((spec, record), run, scope, secret);
+        drive(mint, context).await
     }
 
     async fn mint_inputs(
@@ -473,7 +507,10 @@ mod tests {
         node_id: NodeId,
         buckets: &BTreeSet<String>,
     ) -> Result<WorkspaceCredential, JobError> {
-        drive(input_mint(context, spec, record, node_id, buckets), context).await
+        let run = run_of(context, spec, record, node_id);
+        let secret = secret_inputs(context);
+        let mint = MintCredentialOperation::inputs((spec, record), run, buckets, secret);
+        drive(mint, context).await
     }
 
     async fn group_write(
@@ -482,8 +519,7 @@ mod tests {
         record: &JobRecord,
         node_id: NodeId,
     ) -> Result<(), JobError> {
-        let realm_id = context.serving_realm(record.created_by.realm_id);
-        let run = RunIdentity::new(spec, record, realm_id, node_id);
+        let run = run_of(context, spec, record, node_id);
         drive(WorkspaceAccessOperation::group(run), context).await
     }
 
@@ -519,31 +555,6 @@ mod tests {
             size: 0,
             digest: None,
         }
-    }
-
-    // A cancel ends a stalled output stream with an error the reading put fails on, instead
-    // of the put being dropped halfway; without a cancel every byte passes.
-    #[tokio::test]
-    async fn cancel_fails_stream() {
-        let stalled = futures_util::stream::iter([Ok(bytes::Bytes::from_static(b"ab"))])
-            .chain(futures_util::stream::pending());
-        let cancel = CancellationToken::new();
-        let mut chunks = Box::pin(cancellable_chunks(Box::pin(stalled), cancel.clone()));
-        assert_eq!(chunks.next().await.unwrap().unwrap().as_ref(), b"ab");
-        cancel.cancel();
-        assert!(matches!(
-            chunks.next().await,
-            Some(Err(BackendError::Cancelled))
-        ));
-        assert!(chunks.next().await.is_none());
-
-        let whole = futures_util::stream::iter([
-            Ok(bytes::Bytes::from_static(b"ab")),
-            Ok(bytes::Bytes::from_static(b"cd")),
-        ]);
-        let chunks = cancellable_chunks(whole, CancellationToken::new());
-        let read: Vec<_> = chunks.map(Result::unwrap).collect().await;
-        assert_eq!(read.concat(), b"abcd");
     }
 
     #[test]
@@ -1070,12 +1081,10 @@ mod tests {
 
     // A served source stored by its root's digest is named by its public URL once the root's
     // settings are back.
-    #[tokio::test]
-    async fn compact_pins_hydrated() {
+    #[test]
+    fn compact_pins_hydrated() {
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
         use aruna_core::structs::execution::staging::{PortableSourceDescriptor, StagingStrategy};
-        let test_context = crate::tests::staging::setup_driver_context().await;
-        let context = &test_context.driver_context;
         let full = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
             descriptor: PortableSourceDescriptor {
@@ -1098,15 +1107,7 @@ mod tests {
             mirrors: Vec::new(),
         };
         let (compact, root) = RootEntry::compact(&full).unwrap().unwrap();
-        let (key_space, key, value) = crate::connectors::root_record::root_write(&root).unwrap();
-        let write = aruna_core::effects::StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
-        };
-        context.storage_handle.send_storage_effect(write).await;
-        let pin = serving_pin(context, compact).await;
+        let pin = serving_pin(&compact, Some(&root));
         let url = "https://s3.example.org/refseq/genomes/a.fna";
         assert_eq!(pin.url.as_deref(), Some(url));
     }
@@ -1155,7 +1156,7 @@ mod tests {
             claim_token: Ulid::from_bytes([8; 16]),
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::query::insert_job(&context, &record)
+        crate::jobs::store::test_calls::insert_job(context, &record)
             .await
             .unwrap();
         let pin = SourcePin {
@@ -1165,11 +1166,13 @@ mod tests {
         };
         let stored = || async {
             let read =
-                crate::jobs::store::state::read_job_record(&context, record.job_id, None).await;
+                crate::jobs::store::test_calls::read_job_record(context, record.job_id, None).await;
             read.unwrap().unwrap().captured_inputs[0].served_by.clone()
         };
+        let token = Ulid::from_bytes([8; 16]);
+        let stale_token = Ulid::from_bytes([9; 16]);
         let served = BTreeMap::from([("inputs/in.txt".to_string(), pin.clone())]);
-        record_served(context, &record, served.clone())
+        drive(keep_served(record.job_id, token, served.clone()), context)
             .await
             .unwrap();
         assert_eq!(stored().await, Some(pin.clone()));
@@ -1179,13 +1182,16 @@ mod tests {
             claim.claim_token = Ulid::from_bytes([9; 16]);
         }
         assert!(
-            record_served(context, &stale, BTreeMap::new())
-                .await
-                .is_err()
+            drive(
+                keep_served(stale.job_id, stale_token, BTreeMap::new()),
+                context
+            )
+            .await
+            .is_err()
         );
         assert_eq!(stored().await, Some(pin));
         // A later preparation that served nothing clears the earlier pin.
-        record_served(context, &record, BTreeMap::new())
+        drive(keep_served(record.job_id, token, BTreeMap::new()), context)
             .await
             .unwrap();
         assert_eq!(stored().await, None);
@@ -1245,8 +1251,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inherits_effective_refs() {
+    #[test]
+    fn inherits_effective_refs() {
         // A node that holds no copy of the input must still inherit its refs,
         // so they come from the captured inputs and a missing one fails closed.
         let version = Ulid::from_bytes([7; 16]);
@@ -1266,17 +1272,6 @@ mod tests {
         });
         let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let realm_id = RealmId([1; 32]);
-        let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
         let mut record = JobRecord::new(
             JobId::from_bytes([4; 16]),
             JobPayload::Execution(spec.clone()),
@@ -1287,8 +1282,7 @@ mod tests {
             None,
         );
 
-        let error = input_policies(&context, &spec, &record).await.unwrap_err();
-        assert_eq!(error.kind, JobErrorKind::Permanent);
+        assert_eq!(uncaptured_input(&spec, &record), Some("in/data.csv"));
 
         let policy = PlacementPolicyRef {
             policy_id: Ulid::from_bytes([5; 16]),
@@ -1312,10 +1306,8 @@ mod tests {
             served_by: None,
         });
 
-        assert_eq!(
-            input_policies(&context, &spec, &record).await.unwrap(),
-            vec![policy]
-        );
+        assert_eq!(uncaptured_input(&spec, &record), None);
+        assert_eq!(input_refs(&spec, &record).unwrap(), vec![policy]);
     }
 
     #[test]

@@ -278,3 +278,72 @@ pub(super) async fn dispatch_compute(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+    use std::collections::BTreeSet;
+
+    use aruna_core::jobs::{JobReport, JobStops, ObjectBody, ObjectRead, ObjectReadFailure};
+    use futures_util::future::BoxFuture;
+    use ulid::Ulid;
+
+    struct TokenHost(CancellationToken);
+
+    impl JobHost for TokenHost {
+        fn stops(&self) -> JobStops {
+            JobStops::default()
+        }
+
+        fn report(&self, _report: JobReport) {}
+
+        fn stopped(&self) -> BoxFuture<'_, ()> {
+            Box::pin(self.0.cancelled())
+        }
+
+        fn take_turns<'a>(
+            &'a self,
+            _turns: &'a BTreeSet<(Ulid, Ulid)>,
+        ) -> BoxFuture<'a, Box<dyn Any + Send>> {
+            Box::pin(std::future::ready(Box::new(()) as Box<dyn Any + Send>))
+        }
+
+        fn read_object(
+            &self,
+            _read: ObjectRead,
+        ) -> BoxFuture<'_, Result<ObjectBody, ObjectReadFailure>> {
+            let failure = ObjectReadFailure::Failed("no objects".to_string());
+            Box::pin(std::future::ready(Err(failure)))
+        }
+    }
+
+    // A stop ends a stalled output stream with an error the reading put fails on, instead of
+    // the put being dropped halfway, and the failure stays readable.
+    #[tokio::test]
+    async fn stop_fails_stream() {
+        let stalled = futures_util::stream::iter([Ok(bytes::Bytes::from_static(b"ab"))])
+            .chain(futures_util::stream::pending());
+        let cancel = CancellationToken::new();
+        let host: Arc<dyn JobHost> = Arc::new(TokenHost(cancel.clone()));
+        let failure = OutputFailure::default();
+        let mut chunks = stoppable_chunks(Box::pin(stalled), Some(host), failure.clone());
+        assert_eq!(chunks.0.next().await.unwrap().unwrap().as_ref(), b"ab");
+        cancel.cancel();
+        assert!(chunks.0.next().await.unwrap().is_err());
+        assert!(chunks.0.next().await.is_none());
+        assert_eq!(failure.take(), Some(BackendError::Cancelled));
+    }
+
+    // Without a host every byte passes.
+    #[tokio::test]
+    async fn hostless_stream_passes() {
+        let whole = futures_util::stream::iter([
+            Ok(bytes::Bytes::from_static(b"ab")),
+            Ok(bytes::Bytes::from_static(b"cd")),
+        ]);
+        let chunks = stoppable_chunks(Box::pin(whole), None, OutputFailure::default());
+        let read: Vec<_> = chunks.0.map(Result::unwrap).collect().await;
+        assert_eq!(read.concat(), b"abcd");
+    }
+}
