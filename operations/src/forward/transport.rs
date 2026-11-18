@@ -139,3 +139,61 @@ pub(crate) fn forwarded_unavailable(
         _ => reject("unexpected forwarded metadata message"),
     }
 }
+
+/// Upper bound of one request; the transport's own step limits end it earlier.
+const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The call that sends `message` to `peer`, or why it does not encode.
+pub(crate) fn peer_call(
+    peer: aruna_core::NodeId,
+    message: &MetadataTransportMessage,
+) -> Result<aruna_core::calls::IoCall, String> {
+    peer_call_within(peer, message, PEER_DEADLINE)
+}
+
+/// [`peer_call`] with an answer due within `timeout`.
+pub(crate) fn peer_call_within(
+    peer: aruna_core::NodeId,
+    message: &MetadataTransportMessage,
+    timeout: std::time::Duration,
+) -> Result<aruna_core::calls::IoCall, String> {
+    let frame = crate::metadata::protocol::encode_message(message).map_err(|error| error.to_string())?;
+    let request = aruna_core::effects::MetadataRequestEffect {
+        peer,
+        frame,
+        timeout,
+    };
+    let effect = aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(Box::new(request)));
+    Ok(aruna_core::calls::IoCall::from(effect))
+}
+
+/// The peer's decoded answer, or why there is none.
+pub(crate) fn peer_answer(
+    result: aruna_core::calls::IoResult,
+) -> Result<Result<MetadataTransportMessage, String>, aruna_core::calls::IoError> {
+    Ok(timed_answer(result)?.0)
+}
+
+/// The peer's decoded answer and how long the request took.
+pub(crate) fn timed_answer(
+    result: aruna_core::calls::IoResult,
+) -> Result<(Result<MetadataTransportMessage, String>, std::time::Duration), aruna_core::calls::IoError> {
+    let answer = match result.event()? {
+        aruna_core::events::Event::Net(aruna_core::events::NetEvent::MetadataAnswer(answer)) => answer,
+        other => {
+            return Err(aruna_core::calls::IoError::Unexpected {
+                expected: "Event::Net(NetEvent::MetadataAnswer)",
+                got: other.label(),
+            });
+        }
+    };
+    let decoded = match answer.result {
+        Ok(bytes) => crate::metadata::protocol::decode_message(&bytes).map_err(|error| error.to_string()),
+        Err(error) => Err(format!("{error:?}")),
+    };
+    Ok((decoded, answer.elapsed))
+}
+
+#[cfg(test)]
+#[path = "peer_call_tests.rs"]
+mod peer_call_tests;

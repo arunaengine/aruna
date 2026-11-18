@@ -154,6 +154,8 @@ pub enum HeartbeatEffect {
         peer: NodeId,
         heartbeat: Box<NodeHeartbeat>,
     },
+    /// Skips `holder` in holder choices for a while after it failed to serve.
+    Avoid { holder: NodeId, now_ms: u64 },
     /// Answers this node, its realm, and the held heartbeats and avoided state of `holders`.
     Holders { holders: Vec<NodeId>, now_ms: u64 },
 }
@@ -176,6 +178,7 @@ pub enum HeartbeatEvent {
     Pushed,
     PushFailed(String),
     Stored(bool),
+    Avoided,
     Holders(Box<HolderFacts>),
 }
 

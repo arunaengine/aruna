@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
@@ -27,12 +28,11 @@ use super::replica::{
 };
 use super::replica_store::list_replicas;
 use super::scan_rows::{ScanRowsError, ScanRowsOperation};
-use super::sync::folder_reads::{folder_bases, list_folders, list_transfers};
 use super::sync::folders::FolderError;
+use super::sync::folders::reads::{folder_bases, list_folders, list_transfers};
 use super::sync::outbox::RequeueUploadsOperation;
 use super::sync::repository::SyncUpload;
 use super::sync_note::{DeviceSyncState, sync_state_key};
-use crate::distribution::inventory::{StagedCall, outside_answer};
 
 /// One selected document in the Sync view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,7 +193,7 @@ pub fn pending_total(documents: &[DocumentRow], datasets: &[DatasetRow]) -> usiz
 /// The sync state row; an absent or unreadable one reads as nothing known yet.
 fn state_read() -> IoCall {
     let read = read_row(SYNC_STATE_KEYSPACE, sync_state_key().to_vec());
-    StagedCall::Outside(read).into_call()
+    outside_call(read)
 }
 
 fn state_of(result: IoResult) -> DeviceSyncState {
@@ -468,8 +468,7 @@ impl SyncRunOperation {
             sync_state_key(),
             ByteView::from(bytes),
         );
-        let write = StagedCall::Outside(IoCall::Write(vec![row]));
-        Ok(Next::Call(write.into_call()))
+        Ok(Next::Call(outside_call(IoCall::Write(vec![row]))))
     }
 
     fn next_timer(&mut self) -> Result<Next<bool>, IoError> {

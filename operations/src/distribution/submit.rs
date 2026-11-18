@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
@@ -19,9 +20,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::forward::PublishRefusal;
-use super::here::NodeRealm;
-use super::inventory::{StagedCall, outside_answer};
-use super::peer_call::{peer_answer, peer_call};
+use aruna_core::structs::identity::realm::NodeRealm;
+use crate::forward::transport::{peer_answer, peer_call};
 use super::publish::{PublishConfig, PublishError, PublishOperation};
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::transport_message_kind;
@@ -41,7 +41,7 @@ fn waiting_read() -> IoCall {
         after: None,
         limit: 1,
     };
-    StagedCall::Outside(page).into_call()
+    outside_call(page)
 }
 
 /// Accepts one request on this node, the set's publisher, retrying storage conflicts, and

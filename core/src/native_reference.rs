@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::calls::IoError;
 use crate::errors::StagingSourceError;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use crate::structs::execution::source_connector::SourceConnectorKind;
-use crate::structs::storage::distribution::delegation::SignedDelegation;
+use crate::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
 use crate::structs::storage::read_grant::{GrantedRequest, SignedRequest};
 use crate::types::GroupId;
 
@@ -55,6 +56,24 @@ pub struct GrantedReadEffect {
     pub version_id: Ulid,
     pub head: bool,
     pub range: Option<NativeRange>,
+}
+
+/// One version read from the node a delegation targets. The adapter signs the delegation with
+/// this node's key, so it must name this node as issuer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedReadEffect {
+    pub delegation: Delegation,
+    pub version_id: Ulid,
+    pub head: bool,
+    pub range: Option<NativeRange>,
+}
+
+/// What a holder answered a delegated read; the group is named for a caller read.
+#[derive(Debug, PartialEq)]
+pub struct DelegatedBody {
+    pub metadata: SourceMetadata,
+    pub group_id: Option<GroupId>,
+    pub blob: BackendStream<Result<Bytes, StreamError>>,
 }
 
 /// What a holder answered a granted read: the version's metadata and its bytes.
@@ -104,6 +123,12 @@ pub enum NativeReferenceReject {
     AccessDenied,
     NotFound,
     Unavailable(String),
+}
+
+impl From<IoError> for NativeReferenceReject {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
 }
 
 impl From<NativeReferenceReject> for StagingSourceError {

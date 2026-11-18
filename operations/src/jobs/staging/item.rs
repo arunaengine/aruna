@@ -31,8 +31,8 @@ use crate::staging::reference::{
     MaterializeReferenceResult,
 };
 use crate::staging::snapshot::{
-    MaterializeSnapshotError, MaterializeSnapshotInput, MaterializeSnapshotOperation,
-    MaterializeSnapshotResult,
+    MaterializeSnapshotError, MaterializeSnapshotInput, MaterializeSnapshotResult,
+    StageSnapshotOperation,
 };
 use aruna_core::errors::AuthorizationError;
 
@@ -142,7 +142,7 @@ impl StageItemOperation {
         let spec = self.run.spec.clone();
         let expected_bucket = self.bucket()?;
         self.step = StageStep::Write;
-        let snapshot = MaterializeSnapshotOperation::new(
+        let snapshot = StageSnapshotOperation::routed(
             MaterializeSnapshotInput {
                 job_id: Some(self.run.job_id.as_ulid()),
                 group_id: spec.group_id,
@@ -159,7 +159,7 @@ impl StageItemOperation {
                 restrictions: spec.auth_context.path_restrictions.clone(),
                 expected_checksums: std::mem::take(&mut self.expected),
             },
-            self.run.routing.clone(),
+            &self.run.routing,
         );
         Ok(Next::Call(IoCall::child(snapshot)))
     }

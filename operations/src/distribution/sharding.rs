@@ -5,6 +5,7 @@
 
 // Every pass is bounded and resumes.
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
@@ -29,9 +30,8 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::balance::{BalanceInputs, BalanceOperation, COOL_DOWN, balance_inputs};
-use super::here::NodeRealm;
+use aruna_core::structs::identity::realm::NodeRealm;
 use super::imports::{ContinueImportsOperation, ImportError, KeptStart};
-use super::inventory::{StagedCall, outside_answer};
 use super::lifecycle::{LifecycleCursors, LifecyclePass, TendLifecycleOperation};
 pub use super::rebuild::BeginRebuildsError;
 use super::rebuild::{
@@ -180,7 +180,7 @@ impl MaintainRangesOperation {
             limit: ACCOUNT_PAGE,
         };
         self.step = MaintainStep::Accounts;
-        Ok(Next::Call(StagedCall::Outside(page).into_call()))
+        Ok(Next::Call(outside_call(page)))
     }
 
     fn accounts_read(&mut self, result: IoResult) -> Maintaining {
@@ -214,7 +214,7 @@ impl MaintainRangesOperation {
             if !self.records.contains_key(&set_id) {
                 let read = read_row(DISTRIBUTION_KEYSPACE, set_id.to_bytes().to_vec());
                 self.step = MaintainStep::Record;
-                return Ok(Next::Call(StagedCall::Outside(read).into_call()));
+                return Ok(Next::Call(outside_call(read)));
             }
             if let Some(tend) = self.tend_current()? {
                 return Ok(tend);
@@ -493,7 +493,7 @@ impl TendRangeOperation {
         let row = generation_key(self.set_id(), range.range_id, generation);
         let read = read_row(RANGE_COUNTER_KEYSPACE, row);
         self.step = TendStep::Counters;
-        Ok(Next::Call(StagedCall::Outside(read).into_call()))
+        Ok(Next::Call(outside_call(read)))
     }
 
     /// Goes on to the key sample once the counters pass a threshold.
@@ -661,7 +661,7 @@ impl Operation for RangeSampleOperation {
             after: None,
             limit: usize::from(SAMPLE_SIZE) * 2,
         };
-        Ok(Next::Call(StagedCall::Outside(page).into_call()))
+        Ok(Next::Call(outside_call(page)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<Vec<String>>>, IoError> {

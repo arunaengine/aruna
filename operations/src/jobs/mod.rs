@@ -12,6 +12,7 @@ pub mod demand;
 pub mod drain;
 pub mod executor;
 pub mod export;
+pub(crate) mod handed_imports;
 pub mod harvest;
 pub mod host;
 pub mod import;

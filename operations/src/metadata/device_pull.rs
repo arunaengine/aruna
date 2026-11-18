@@ -1183,11 +1183,12 @@ mod tests {
     // being unbound after its offer is gone. The cleanup on this node still deletes the bucket.
     #[tokio::test]
     async fn guards_folder_pull() {
-        use crate::device::sync::folders::{finish_unbind, store_folder};
+        use crate::device::sync::folders::finish_unbind;
         use crate::device::sync::repository::folder_bucket;
         use crate::staging::offered_directory::{
             OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
         };
+        use crate::tests::device::store_folder;
         use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 
         let fixture = crate::tests::staging::setup_driver_context().await;
@@ -1207,7 +1208,9 @@ mod tests {
             node_id,
             user_id,
         };
-        offer_directory(&context, offer.clone()).await.unwrap();
+        drive(offer_directory(offer.clone()), &context)
+            .await
+            .unwrap();
         assert_eq!(
             guard_target(&context, &bucket).await,
             Err(SyncRefusal::Forbidden)
@@ -1241,13 +1244,16 @@ mod tests {
             node_id,
             user_id,
         };
-        assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
+        assert_eq!(drive(withdraw_offer(withdrawal), &context).await, Ok(1));
         assert_eq!(
             guard_target(&context, &bucket).await,
             Err(SyncRefusal::Forbidden)
         );
 
-        assert_eq!(finish_unbind(&context, folder_id, node_id).await, Ok(()));
+        assert_eq!(
+            drive(finish_unbind(&context, folder_id, node_id), &context).await,
+            Ok(())
+        );
         assert!(matches!(
             read_bucket(&context, &bucket).await,
             Err(SyncRefusal::NotFound)

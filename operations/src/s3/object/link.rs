@@ -29,7 +29,6 @@ use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequ
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::staging::native_source::delegated_read;
 use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
-use aruna_blob::native::body_stream;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -93,7 +92,9 @@ pub async fn head_target(
     if arn.node_id == local {
         return Ok(());
     }
-    delegated_read(context, delegation(caller, arn.node_id), arn, None, true)
+    let ids = context.node_and_realm();
+    let read = delegated_read(ids, delegation(caller, arn.node_id), arn, None, true);
+    drive(read, context)
         .await
         .map(|_| ())
         .map_err(staging_error)
@@ -170,11 +171,10 @@ pub async fn read_target(
         .map_err(|error| LinkError::Unavailable(error.to_string()))?;
         return Ok(get.blob);
     }
-    let (_, _, stream) =
-        delegated_read(context, delegation(caller, arn.node_id), arn, range, false)
-            .await
-            .map_err(staging_error)?;
-    Ok(body_stream(stream))
+    let ids = context.node_and_realm();
+    let read = delegated_read(ids, delegation(caller, arn.node_id), arn, range, false);
+    let body = drive(read, context).await.map_err(staging_error)?;
+    Ok(body.blob)
 }
 
 /// The verified caller a delegation carries; the read fills in what it binds. A signed-out

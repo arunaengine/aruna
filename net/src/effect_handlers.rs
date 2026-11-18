@@ -292,6 +292,11 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
                 "granted reads must be dispatched by the operations runner".to_string(),
             )))
         }
+        NetEffect::DelegatedRead(_) => {
+            NetEvent::DelegatedRead(Err(aruna_core::errors::StagingSourceError::ReadError(
+                "delegated reads must be dispatched by the operations runner".to_string(),
+            )))
+        }
         // Notification requests and inbox wakes need the net handle, which the runner holds.
         NetEffect::Shard(_) => NetEvent::Shard(Box::new(ShardNetEvent::NoNetwork)),
         NetEffect::EnsureTopics { .. } | NetEffect::AllowTopicPeers { .. } => {
@@ -657,6 +662,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::MetadataRequest(_) => "metadata_request",
         NetEffect::RefreshDocumentPeers(_) => "refresh_document_peers",
         NetEffect::GrantedRead(_) => "granted_read",
+        NetEffect::DelegatedRead(_) => "delegated_read",
         NetEffect::DatasetSummary(_) => "dataset_summary",
         NetEffect::HarvestWrite(_) => "harvest_write",
         NetEffect::WritePeerAuth(_) => "write_peer_auth",

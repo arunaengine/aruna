@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
@@ -33,7 +34,7 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::inventory::{StagedCall, open_ranges, outside_answer};
+use super::inventory::open_ranges;
 
 /// Reservation rows read per page; a node holds one per member and one per held range.
 const RESERVATION_PAGE: usize = 256;
@@ -278,7 +279,7 @@ impl AdmitOperation {
             let key = Key::from(usage_bucket_key(bucket));
             (USAGE_STATS_KEYSPACE.to_string(), key)
         }));
-        let usage = StagedCall::Outside(IoCall::Read(reads)).into_call();
+        let usage = outside_call(IoCall::Read(reads));
         self.call(AdmitState::Usage, usage)
     }
 

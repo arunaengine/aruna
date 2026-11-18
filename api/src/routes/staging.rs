@@ -1533,10 +1533,9 @@ async fn snapshot_blob(
 
     let quota_ceiling = resolve_quota_ceiling(&state, group_id).await?;
 
-    let context = state.get_ctx();
-    let routing = aruna_operations::driver::node_routing(&context);
     let result = drive(
-        MaterializeSnapshotOperation::new(
+        stage_snapshot_blob(
+            &state.get_ctx(),
             MaterializeSnapshotInput {
                 job_id: None,
                 group_id,
@@ -1553,9 +1552,8 @@ async fn snapshot_blob(
                 restrictions: auth.path_restrictions.clone(),
                 expected_checksums: Vec::new(),
             },
-            routing,
         ),
-        &context,
+        &state.get_ctx(),
     )
     .await
     .map_err(map_snapshot_error)?;

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::NodeId;
@@ -26,7 +27,6 @@ use ulid::Ulid;
 
 use super::here::Heard;
 use crate::distribution::feed_walks::{FeedError, IndexProgress, RangeProgressOperation};
-use crate::distribution::inventory::{StagedCall, outside_answer};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::replication::bootstrap::{BootstrapError, ReadCursorOperation};
 use crate::replication::members::{CopyLag, CopyLagOperation, LagMap, RecordError};
@@ -388,7 +388,7 @@ impl ReadStatusOperation {
         self.status = Some(summarize(self.realm_id, &view, reach, eligible));
         let key = LocalFence::key(self.set_id);
         let read = read_row(DISTRIBUTION_FENCE_KEYSPACE, key);
-        Some(StagedCall::Outside(read).into_call())
+        Some(outside_call(read))
     }
 }
 
@@ -614,5 +614,5 @@ impl Operation for AddProgressOperation {
 }
 
 #[cfg(test)]
-#[path = "status_tests.rs"]
+#[path = "view_tests.rs"]
 mod tests;

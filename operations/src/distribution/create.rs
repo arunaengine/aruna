@@ -28,11 +28,10 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::forward::{
-    AdmitMemberOperation, MemberRefusal, PublishRefusal, config_of, realm_config,
-};
+use super::forward::{AdmitMemberOperation, PublishRefusal};
+use crate::document_repository::{config_of, realm_config};
 use super::here::{Here, here};
-use super::peer_call::{peer_answer, peer_call};
+use crate::forward::transport::{peer_answer, peer_call};
 use super::status_view::{ReadViewOperation, StatusError};
 use super::submit::{PublishLocalOperation, SendAdminOperation, SubmitOperation};
 use crate::driver::DriverContext;
@@ -446,8 +445,8 @@ impl AdmitPendingOperation {
         result: IoResult,
     ) -> Result<Result<SignedStatement, SyncRefusal>, IoError> {
         let Some(node_id) = self.asked.take() else {
-            let admitted = result.child::<SignedStatement, MemberRefusal>()?;
-            return Ok(admitted.map_err(|refused| refused.0));
+            let admitted = result.child::<SignedStatement, SyncRefusal>()?;
+            return Ok(admitted);
         };
         Ok(match peer_answer(result)? {
             Ok(MetadataTransportMessage::AdmittedMember { result }) => result.map(|signed| *signed),

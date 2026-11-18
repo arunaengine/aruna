@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::str::FromStr;
 use std::time::Duration;
@@ -36,10 +37,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::distribution::forward::{config_of, realm_config};
-use crate::distribution::here::NodeRealm;
-use crate::distribution::inventory::{StagedCall, outside_answer};
-use crate::distribution::peer_call::{peer_call_within, timed_answer};
+use crate::document_repository::{config_of, realm_config};
+use aruna_core::structs::identity::realm::NodeRealm;
+use crate::forward::transport::{peer_call_within, timed_answer};
 use crate::driver::DriverContext;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
@@ -164,7 +164,7 @@ fn rebase_after(behind: u32) -> (bool, u32) {
 }
 
 fn outside_read(key_space: &str, key: Vec<u8>) -> IoCall {
-    StagedCall::Outside(read_row(key_space, key)).into_call()
+    outside_call(read_row(key_space, key))
 }
 
 /// The row an outside read found; an absent, unreadable row is none.
@@ -725,7 +725,7 @@ impl InstallDocumentsOperation {
             realm_row(NODE_NAME_KEYSPACE, realm_id),
             realm_row(NODE_PLACE_KEYSPACE, realm_id),
         ];
-        StagedCall::Outside(IoCall::Read(reads)).into_call()
+        outside_call(IoCall::Read(reads))
     }
 
     fn keep_stored(&mut self, result: IoResult) {
@@ -962,7 +962,7 @@ impl Operation for InstalledGroupsOperation {
             after: None,
             limit: GROUP_SCAN_LIMIT,
         };
-        Ok(Next::Call(StagedCall::Outside(page).into_call()))
+        Ok(Next::Call(outside_call(page)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
@@ -996,7 +996,7 @@ impl Operation for InstalledGroupsOperation {
             })
             .collect();
         Ok(Next::Call(
-            StagedCall::Outside(IoCall::Read(reads)).into_call(),
+            outside_call(IoCall::Read(reads)),
         ))
     }
 }
@@ -1188,7 +1188,7 @@ impl Operation for InstalledDisplaysOperation {
             realm_row(NODE_PLACE_KEYSPACE, self.realm_id),
         ];
         Ok(Next::Call(
-            StagedCall::Outside(IoCall::Read(reads)).into_call(),
+            outside_call(IoCall::Read(reads)),
         ))
     }
 

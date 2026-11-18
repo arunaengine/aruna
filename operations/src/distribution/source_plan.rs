@@ -47,7 +47,7 @@ pub struct SourceKeep {
 
 /// What a keeping member keeps of one reference version.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Plan {
+pub struct Plan {
     pub(super) kind: KeptKind,
     pub(super) pull: PullPlan,
     pub(super) set_id: Ulid,
@@ -58,7 +58,7 @@ pub(super) struct Plan {
 
 #[derive(Debug, Error, PartialEq)]
 #[error("the keep plan could not be read: {0}")]
-pub(super) struct PlanError(String);
+pub struct PlanError(String);
 
 impl From<IoError> for PlanError {
     fn from(error: IoError) -> Self {
@@ -143,7 +143,8 @@ impl KeepPlanOperation {
                 self.read(PlanState::Encryption, BUCKET_ENCRYPTION_KEYSPACE, bucket)
             }
             PlanState::Encryption => {
-                let encryption = BucketEncryption::from_row(value.as_deref()).map_err(plan_fault)?;
+                let encryption =
+                    BucketEncryption::from_row(value.as_deref()).map_err(plan_fault)?;
                 let binding = self.binding.as_ref();
                 let set_id = binding.ok_or(plan_fault("no binding was read"))?.set_id;
                 if encryption.active_key().is_some() {
@@ -157,10 +158,18 @@ impl KeepPlanOperation {
                     return nothing;
                 };
                 let view = DistributionView::from_bytes(&value).map_err(plan_fault)?;
-                let binding = self.binding.take().ok_or(plan_fault("no binding was read"))?;
-                let version = self.version.take().ok_or(plan_fault("no version was read"))?;
+                let binding = self
+                    .binding
+                    .take()
+                    .ok_or(plan_fault("no binding was read"))?;
+                let version = self
+                    .version
+                    .take()
+                    .ok_or(plan_fault("no version was read"))?;
                 let (version, identity) = version;
-                Ok(Next::Done(plan(&self.keep, &view, &binding, version, identity)))
+                Ok(Next::Done(plan(
+                    &self.keep, &view, &binding, version, identity,
+                )))
             }
         }
     }

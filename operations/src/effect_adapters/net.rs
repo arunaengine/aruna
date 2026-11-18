@@ -15,9 +15,10 @@ use aruna_core::events::{
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
 use aruna_core::native_reference::{
-    GrantedBody, GrantedReadEffect, NativeAuthority, NativeReferenceRequest,
-    NativeReferenceResponse,
+    DelegatedBody, DelegatedReadEffect, GrantedBody, GrantedReadEffect, NativeAuthority,
+    NativeReferenceRequest, NativeReferenceResponse,
 };
+use aruna_core::structs::storage::distribution::delegation::SignedDelegation;
 use aruna_core::structs::storage::read_grant::SignedRequest;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use aruna_net::NetHandle;
@@ -50,6 +51,10 @@ pub(super) async fn dispatch_heartbeat(effect: HeartbeatEffect, context: &Driver
         }
         HeartbeatEffect::Store { peer, heartbeat } => {
             HeartbeatEvent::Stored(net_handle.record_heartbeat(peer, *heartbeat))
+        }
+        HeartbeatEffect::Avoid { holder, now_ms } => {
+            net_handle.avoided_holders().avoid(holder, now_ms);
+            HeartbeatEvent::Avoided
         }
         HeartbeatEffect::Holders { holders, now_ms } => {
             let avoid_list = net_handle.avoided_holders();
@@ -194,6 +199,45 @@ async fn granted_read(
     }
 }
 
+/// Signs a delegation with this node's key, sends it and opens the holder's answer.
+async fn delegated_read(
+    read: DelegatedReadEffect,
+    context: &DriverContext,
+) -> Result<Box<DelegatedBody>, StagingSourceError> {
+    let net = (context.net_handle.as_ref()).ok_or(StagingSourceError::HandleMissing)?;
+    let delegation = read.delegation;
+    if delegation.issuer != net.node_id() {
+        return Err(StagingSourceError::AccessDenied);
+    }
+    let bytes = (delegation.signing_bytes())
+        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
+    let holder = delegation.target;
+    let (bucket, key) = (delegation.bucket.clone(), delegation.key.clone());
+    let signed = SignedDelegation {
+        signature: net.sign(&bytes),
+        delegation,
+    };
+    let request = NativeReferenceRequest {
+        authority: NativeAuthority::Delegated(Box::new(signed)),
+        bucket,
+        key,
+        version_id: read.version_id,
+        head: read.head,
+        range: read.range,
+    };
+    let (response, stream) = send_request(net, holder, request).await?;
+    let (metadata, group_id) = match response {
+        NativeReferenceResponse::Content(metadata) => (metadata, None),
+        NativeReferenceResponse::Described { metadata, group_id } => (metadata, Some(group_id)),
+        NativeReferenceResponse::Rejected(reject) => return Err(reject.into()),
+    };
+    Ok(Box::new(DelegatedBody {
+        metadata,
+        group_id,
+        blob: body_stream(stream),
+    }))
+}
+
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
     let effect = match record_watch(effect, context.net_handle.as_ref()) {
         Ok(recorded) => return recorded,
@@ -205,6 +249,10 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     };
     if let NetEffect::GrantedRead(read) = effect {
         return Event::Net(NetEvent::GrantedRead(granted_read(*read, context).await));
+    }
+    if let NetEffect::DelegatedRead(read) = effect {
+        let answer = delegated_read(*read, context).await;
+        return Event::Net(NetEvent::DelegatedRead(answer));
     }
     if let NetEffect::DocumentSync(DocumentEffect::ReloadRealmPeers) = effect {
         return Event::Net(NetEvent::DocumentSync(reload_peers(context).await));

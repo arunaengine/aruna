@@ -59,7 +59,7 @@ use crate::device::drain::{
 };
 use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
-    UPLOAD_DEFER_AFTER, restore_sync_timers,
+    UPLOAD_DEFER_AFTER,
 };
 use crate::device::sync_note::{NoteSyncOperation, SyncNote};
 use crate::document_repository::GetConfigOperation;
@@ -166,8 +166,10 @@ use crate::tasks::task_persistence::{
 use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
+use folder_pass::restore_sync_timers;
 
 mod drained;
+pub mod folder_pass;
 mod outbox;
 pub(crate) use drained::remove_drained_backends;
 mod restore;
@@ -1036,8 +1038,7 @@ impl OperationsTaskHandler {
                     Ok(pass) => {
                         let (after, imports) = pass.finish();
                         for start in imports {
-                            let started =
-                                crate::distribution::import_start::start_kept(context, start);
+                            let started = crate::jobs::handed_imports::start_kept(context, start);
                             if let Err(error) = started.await {
                                 warn!(%error, "Handed over imports could not start");
                             }
@@ -1088,7 +1089,7 @@ impl OperationsTaskHandler {
                 self.drain_link_queue().await;
             }),
             TaskKey::ReconcileSyncedFolders => Box::pin(async move {
-                let after = match crate::device::sync::reconcile_folders(&self.context).await {
+                let after = match folder_pass::reconcile_folders(&self.context).await {
                     DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
                     DrainOutcome::Recheck => RECONCILE_CONTINUE_AFTER,
                     DrainOutcome::Idle => RECONCILE_IDLE_AFTER,

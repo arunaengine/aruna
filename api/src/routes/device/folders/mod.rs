@@ -28,10 +28,11 @@ use aruna_core::types::Key;
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
+use aruna_operations::device::sync::folder_gate;
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, FolderError, bind_folder, folder_counters, list_actions, list_entries,
-    list_folders, read_bound, read_entry, request_sync, set_folder_state, set_propagate_deletes,
-    unbind_folder,
+    BindFolderInput, FolderError, bind_folder, finish_binding, folder_counters, list_actions,
+    list_entries, list_folders, read_bound, read_entry, request_sync, set_folder_state,
+    set_propagate_deletes, unbind_folder,
 };
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 
@@ -360,27 +361,35 @@ async fn bind_synced_folder(
         Some(super::dto::FolderModeName::DownloadOnly) => FolderMode::DownloadOnly,
         _ => FolderMode::TwoWay,
     };
-    let folder = bind_folder(
-        &state.get_ctx(),
-        BindFolderInput {
-            folder_id,
-            root: request.root,
-            group_id,
-            remote: RemoteBinding {
-                node_id,
-                bucket: request.remote_bucket,
-                prefix: request.remote_prefix,
-            },
-            create_bucket: request.create_bucket,
-            mode,
-            // A download-only folder never publishes, so it propagates no deletion either.
-            propagate_deletes: mode != FolderMode::DownloadOnly
-                && request.propagate_deletes.unwrap_or(true),
-            realm_id: state.get_realm_id(),
-            user_id: auth.user_id,
+    let context = state.get_ctx();
+    let bind = bind_folder(BindFolderInput {
+        folder_id,
+        root: request.root,
+        group_id,
+        remote: RemoteBinding {
+            node_id,
+            bucket: request.remote_bucket,
+            prefix: request.remote_prefix,
         },
-    )
+        create_bucket: request.create_bucket,
+        mode,
+        // A download-only folder never publishes, so it propagates no deletion either.
+        propagate_deletes: mode != FolderMode::DownloadOnly
+            && request.propagate_deletes.unwrap_or(true),
+        realm_id: state.get_realm_id(),
+        user_id: auth.user_id,
+    });
+    let folder_id = drive(bind, &context)
+        .await
+        .map_err(map_folder_error)?
+        .folder_id;
+    // Detached, so a dropped request still records the outcome; a crash leaves it to the next pass.
+    let folder = tokio::spawn(async move {
+        let _pass = folder_gate(folder_id).lock().await;
+        drive(finish_binding(folder_id), &context).await
+    })
     .await
+    .map_err(|_| map_folder_error(FolderError::Unavailable))?
     .map_err(map_folder_error)?;
     Ok((
         StatusCode::CREATED,
@@ -566,9 +575,12 @@ async fn update_synced_folder(
     Json(request): Json<UpdateFolderRequest>,
 ) -> ServerResult<Json<SyncedFolderView>> {
     let folder_id = parse_folder_id(&folder_id)?;
-    let folder = set_propagate_deletes(&state.get_ctx(), folder_id, request.propagate_deletes)
-        .await
-        .map_err(map_folder_error)?;
+    let folder = drive(
+        set_propagate_deletes(folder_id, request.propagate_deletes),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_folder_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -607,7 +619,7 @@ async fn unbind_synced_folder(
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<UnboundFolder>> {
     let folder_id = parse_folder_id(&folder_id)?;
-    unbind_folder(&state.get_ctx(), folder_id)
+    drive(unbind_folder(folder_id), &state.get_ctx())
         .await
         .map_err(map_folder_error)?;
     Ok(Json(UnboundFolder {
@@ -669,9 +681,12 @@ async fn pause_folder(
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
     let folder_id = parse_folder_id(&folder_id)?;
-    let folder = set_folder_state(&state.get_ctx(), folder_id, FolderState::Paused)
-        .await
-        .map_err(map_folder_error)?;
+    let folder = drive(
+        set_folder_state(folder_id, FolderState::Paused),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_folder_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -726,9 +741,12 @@ async fn resume_folder(
     Path(folder_id): Path<String>,
 ) -> ServerResult<Json<SyncedFolderView>> {
     let folder_id = parse_folder_id(&folder_id)?;
-    let folder = set_folder_state(&state.get_ctx(), folder_id, FolderState::Active)
-        .await
-        .map_err(map_folder_error)?;
+    let folder = drive(
+        set_folder_state(folder_id, FolderState::Active),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_folder_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -799,7 +817,7 @@ async fn sync_folder(
             "the folder is not active".to_string(),
         ));
     }
-    request_sync(&context, &folder)
+    drive(request_sync(&folder), &context)
         .await
         .map_err(map_folder_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
@@ -858,9 +876,12 @@ async fn list_folder_entries(
 ) -> ServerResult<Json<FolderEntryPage>> {
     let folder_id = parse_folder_id(&folder_id)?;
     let cursor = decode_cursor(query.cursor)?;
-    let (entries, next) = drive(list_entries(folder_id, query.state.as_deref(), cursor), &state.get_ctx())
-        .await
-        .map_err(map_folder_error)?;
+    let (entries, next) = drive(
+        list_entries(folder_id, query.state.as_deref(), cursor),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_folder_error)?;
     Ok(Json(FolderEntryPage {
         entries: entries
             .into_iter()
@@ -965,7 +986,7 @@ async fn act_on_entry(
         ));
     }
     let context = state.get_ctx();
-    let record = apply_action(
+    let action = apply_action(
         &context,
         ApplyActionInput {
             folder_id,
@@ -976,9 +997,8 @@ async fn act_on_entry(
             expected,
             actor: auth.user_id,
         },
-    )
-    .await
-    .map_err(map_action_error)?;
+    );
+    let record = drive(action, &context).await.map_err(map_action_error)?;
     if record.outcome == ActionOutcome::Stale {
         return Err(ServerError::PreconditionFailed(
             "the file changed since the owner saw it".to_string(),
@@ -1080,7 +1100,7 @@ async fn act_on_folder(
             "the confirmation must name this folder".to_string(),
         ));
     }
-    apply_action(
+    let action = apply_action(
         &context,
         ApplyActionInput {
             folder_id,
@@ -1089,9 +1109,8 @@ async fn act_on_folder(
             expected: None,
             actor: auth.user_id,
         },
-    )
-    .await
-    .map_err(map_action_error)?;
+    );
+    drive(action, &context).await.map_err(map_action_error)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 

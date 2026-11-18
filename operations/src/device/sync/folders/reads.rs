@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -16,11 +17,10 @@ use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::folders::{FolderCounters, FolderError};
-use super::repository::{
+use super::super::repository::{
     MAX_SYNCED_FOLDERS, SYNC_PAGE_SIZE, SyncUpload, base_key, folder_key, folder_prefix, key_path,
 };
-use crate::distribution::inventory::{StagedCall, outside_answer};
+use super::{FolderCounters, FolderError};
 
 /// A synced folder row as its reader wants it.
 pub trait FolderRow: Sized + Send + Debug + PartialEq + 'static {
@@ -129,7 +129,7 @@ impl<T: FolderRow> Operation for FolderRowOperation<T> {
 
     fn first(&mut self) -> Result<Next<T>, FolderError> {
         let read = read_row(self.space, self.key.to_vec());
-        Ok(Next::Call(StagedCall::Outside(read).into_call()))
+        Ok(Next::Call(outside_call(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<T>, FolderError> {

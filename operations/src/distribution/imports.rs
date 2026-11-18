@@ -23,7 +23,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::peer_call::{peer_answer, peer_call};
+use crate::forward::transport::{peer_answer, peer_call};
 use crate::connectors::create_connector::{
     SourceConnectorError, SourceConnectorInput, SourceConnectorOperation, SourceConnectorResult,
 };
@@ -81,10 +81,10 @@ struct FencedJob {
 /// What a new coordinator keeps of a range's imports: jobs still to fetch from the former
 /// coordinator, and jobs ready to run here with their connector and position.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct Kept {
+pub(crate) struct Kept {
     from: NodeId,
     pending: Vec<JobId>,
-    pub(super) ready: Vec<(StagingJobSpec, Option<StagingJobCheckpoint>)>,
+    pub(crate) ready: Vec<(StagingJobSpec, Option<StagingJobCheckpoint>)>,
 }
 
 fn resume_key(transfer_id: Ulid, job_id: JobId) -> Vec<u8> {
@@ -669,9 +669,9 @@ impl Operation for FetchImportsOperation {
 /// Kept imports of a range this node now coordinates, ready to run as its own jobs.
 #[derive(Debug, PartialEq)]
 pub(crate) struct KeptStart {
-    pub(super) key: Vec<u8>,
-    pub(super) kept: Kept,
-    pub(super) bucket: BucketInfo,
+    pub(crate) key: Vec<u8>,
+    pub(crate) kept: Kept,
+    pub(crate) bucket: BucketInfo,
 }
 
 /// What the pending call of looking at handed imports answers.

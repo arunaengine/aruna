@@ -5,13 +5,10 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::NodeRealm;
 
 use super::status_view::{Reach, heartbeat_reach};
 use crate::driver::{DriverContext, node_routing};
-
-/// This node's id and realm, while it has a realm transport.
-pub type NodeRealm = Option<(NodeId, RealmId)>;
 
 /// Who this node hears from: itself, and each node's heartbeat age and wall receive time.
 #[derive(Clone, Debug, Eq, PartialEq)]

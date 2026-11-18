@@ -31,7 +31,7 @@ impl From<IoError> for SnapshotReuseError {
 }
 
 /// The stored copy and version id a retried staging may answer with.
-pub(crate) type Reusable = Option<(BackendLocation, Ulid)>;
+pub type Reusable = Option<(BackendLocation, Ulid)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReuseStep {

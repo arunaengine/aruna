@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::rows::{outside_answer, outside_call};
 use std::fmt::Debug;
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
@@ -13,7 +14,6 @@ use tracing::warn;
 
 use super::drain::DrainOutcome;
 use super::retry::RetryView;
-use crate::distribution::inventory::{StagedCall, outside_answer};
 
 /// What forwarding one due queue entry asks of the drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,7 +96,7 @@ impl<Q: DrainQueue> DrainOperation<Q> {
             limit,
         };
         self.forwarding = false;
-        Ok(Next::Call(StagedCall::Outside(page).into_call()))
+        Ok(Next::Call(outside_call(page)))
     }
 
     fn page_done(&mut self) -> Draining {

@@ -26,7 +26,8 @@ use aruna_core::structs::storage::distribution::{
 use ulid::Ulid;
 
 use super::create::{AdmitPendingOperation, CreateError, CreationReport};
-use super::forward::{PublishRefusal, config_of, realm_config};
+use super::forward::PublishRefusal;
+use crate::document_repository::{config_of, realm_config};
 use super::here::{Heard, Here, here};
 use super::sharding::{RangeSampleOperation, split_point};
 use super::status_view::{Reach, ReadViewOperation, StatusError};

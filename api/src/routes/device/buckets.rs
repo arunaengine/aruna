@@ -20,6 +20,7 @@ use crate::server::state::ServerState;
 use aruna_core::id::NodeId;
 use aruna_core::structs::storage::group_backend::valid_bucket;
 use aruna_operations::device::sync::folders::{RealmBucketInput, create_realm_bucket};
+use aruna_operations::driver::drive;
 
 use super::folders::map_folder_error;
 
@@ -103,15 +104,15 @@ pub(super) async fn create_device_bucket(
                 .to_string(),
         ));
     }
-    create_realm_bucket(
-        &state.get_ctx(),
-        RealmBucketInput {
+    drive(
+        create_realm_bucket(RealmBucketInput {
             bucket: request.name.clone(),
             group_id,
             node_id,
             realm_id: state.get_realm_id(),
             user_id: auth.user_id,
-        },
+        }),
+        &state.get_ctx(),
     )
     .await
     .map_err(map_folder_error)?;

@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub(crate) use aruna_core::rows::outside_answer;
+use aruna_core::rows::outside_call;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -77,7 +79,7 @@ impl StagedCall {
     pub fn into_call(self) -> IoCall {
         match self {
             Self::InTransaction(call) => call,
-            Self::Outside(call) => IoCall::child(OutsideRead { call: Some(call) }),
+            Self::Outside(call) => outside_call(call),
         }
     }
 
@@ -141,34 +143,6 @@ impl StagedCall {
             }
         };
         Ok(Effect::Storage(storage))
-    }
-}
-
-/// The answer of an outside read: a child outcome when a host ran it with [`StagedCall::into_call`],
-/// or the plain answer when a driver ran it itself.
-pub(crate) fn outside_answer(result: IoResult) -> Result<IoResult, IoError> {
-    match result {
-        IoResult::Child(_) => result.child::<IoResult, IoError>()?,
-        other => Ok(other),
-    }
-}
-
-/// One read outside any transaction, run as a child of a host in a transaction.
-#[derive(Debug, PartialEq)]
-struct OutsideRead {
-    call: Option<IoCall>,
-}
-
-impl Operation for OutsideRead {
-    type Output = IoResult;
-    type Error = IoError;
-
-    fn first(&mut self) -> Result<Next<IoResult>, IoError> {
-        self.call.take().map(Next::Call).ok_or(IoError::Unfinished)
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<IoResult>, IoError> {
-        Ok(Next::Done(result))
     }
 }
 
