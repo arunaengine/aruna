@@ -286,7 +286,7 @@ fn authorized(result: IoResult) -> Result<(), CallError> {
 /// The patterns a copy reads `source` and writes `target` under: read on the source and write
 /// on the target, each authorized with the operation `plugin.objects.copy`.
 #[derive(Debug, PartialEq)]
-pub struct CopyGrants {
+pub(crate) struct CopyGrants {
     install: PluginInstall,
     target: String,
     read: BTreeSet<String>,
@@ -295,7 +295,7 @@ pub struct CopyGrants {
 }
 
 impl CopyGrants {
-    pub fn new(install: &PluginInstall, (source, target): (&str, &str)) -> Self {
+    pub(crate) fn new(install: &PluginInstall, (source, target): (&str, &str)) -> Self {
         Self {
             install: install.clone(),
             target: target.to_string(),
