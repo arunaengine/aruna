@@ -11,7 +11,7 @@ use aruna_core::structs::execution::job::{JobError, JobPayload, JobResultPayload
 use aruna_core::time::unix_timestamp_millis;
 
 use super::job_context::JobContext;
-use super::job_host::{run_backend_import, run_hosted, run_staging_job};
+use super::job_host::{run_backend_import, run_hosted, run_staging_job, run_storage_purge};
 use crate::driver::drive;
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::persistent_id::{MintPidOperation, RegisterIdentifiersOperation};
@@ -43,10 +43,9 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             .await
         }
         JobPayload::WriteRunCrate { for_job } => {
-            let write = crate::jobs::workflow::run_crate::WriteCrateOperation::new(
-                *for_job,
-                ctx.driver.node_and_realm(),
-            );
+            let serving = ctx.driver.node_and_realm();
+            let write =
+                crate::jobs::workflow::run_crate::WriteCrateOperation::new(*for_job, serving);
             let result = Box::pin(crate::driver::drive(write, &ctx.driver)).await;
             crate::jobs::workflow::run_crate::crate_outcome(result)
         }
@@ -89,12 +88,8 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             let job = MintPidOperation::new(spec, node, ctx.final_attempt, now_ms);
             Box::pin(run_hosted(ctx, job)).await
         }
-        JobPayload::StoragePurge(spec) => {
-            Box::pin(super::job_host::run_storage_purge(ctx, spec, false)).await
-        }
-        JobPayload::StoragePurgeFiles(spec) => {
-            Box::pin(super::job_host::run_storage_purge(ctx, spec, true)).await
-        }
+        JobPayload::StoragePurge(spec) => Box::pin(run_storage_purge(ctx, spec, false)).await,
+        JobPayload::StoragePurgeFiles(spec) => Box::pin(run_storage_purge(ctx, spec, true)).await,
         JobPayload::CopyObject(spec) => Box::pin(crate::jobs::copy::run_copy_job(ctx, spec)).await,
         JobPayload::BackendImport(spec) => Box::pin(run_backend_import(ctx, spec)).await,
         JobPayload::RegisterIdentifiers(spec) => {
