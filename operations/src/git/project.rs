@@ -4,7 +4,7 @@
 
 use super::state::{Ancestry, GitState, reduce};
 use super::{GitError, objects, publish, records};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use aruna_blob::git::GitStore;
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -172,7 +172,7 @@ pub async fn project(
     execute(store, GitEffect::Initialize(id), actor).await?;
     // Read first, so a record stored during this projection makes the next one run again.
     let writes = record_writes(id);
-    let records = time_stage("git_records", records::scan(context, id)).await?;
+    let records = time_stage("git_records", drive(records::scan(id), context)).await?;
     let (mut state, mut needs) = reduce(&records, &Ancestry::new());
     let GitEvent::Imported(known) = execute(store, GitEffect::Imported(id), actor).await? else {
         return Err(GitError::Unavailable);

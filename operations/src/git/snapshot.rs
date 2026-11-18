@@ -94,10 +94,12 @@ pub(super) async fn current(
     if let Some(raw) = raw {
         return Ok(Some((raw.winning_event_id, raw.jsonld)));
     }
-    let projected: Option<MaterializationStatusRecord> = records::load(
+    let projected: Option<MaterializationStatusRecord> = drive(
+        records::load(
+            MATERIALIZATION_STATUS_KEYSPACE,
+            materialization_status_key(document.document_id).to_vec(),
+        ),
         context,
-        MATERIALIZATION_STATUS_KEYSPACE,
-        materialization_status_key(document.document_id).to_vec(),
     )
     .await?;
     if !projected.is_some_and(|status| {
@@ -499,20 +501,24 @@ async fn generate(
     digest: Option<[u8; 32]>,
 ) -> Result<(), GitError> {
     let (event_id, jsonld) = source;
-    let event: Option<MetadataEventRecord> = records::load(
+    let event: Option<MetadataEventRecord> = drive(
+        records::load(
+            EVENT_LOG_KEYSPACE,
+            event_log_key(document.document_id, event_id).to_vec(),
+        ),
         context,
-        EVENT_LOG_KEYSPACE,
-        event_log_key(document.document_id, event_id).to_vec(),
     )
     .await?;
     let user = event
         .as_ref()
         .map_or(UserId::nil(document.realm_id), |event| event.user_id);
     let occurred_at_ms = event.map_or(document.updated_at_ms, |event| event.occurred_at_ms);
-    let message: Option<String> = records::load(
+    let message: Option<String> = drive(
+        records::load(
+            COMMIT_MESSAGE_KEYSPACE,
+            event_log_key(document.document_id, event_id).to_vec(),
+        ),
         context,
-        COMMIT_MESSAGE_KEYSPACE,
-        event_log_key(document.document_id, event_id).to_vec(),
     )
     .await?;
     // Trailer lines stay reserved for Aruna, so an author cannot forge a trusted one.
@@ -558,7 +564,7 @@ async fn generate(
                 commit: refs.get("refs/heads/aruna").cloned(),
                 error: Some(error),
             };
-            return records::save(context, STATUS, status_key, &status).await;
+            return drive(records::save(STATUS, status_key, &status), context).await;
         }
         _ => return Err(GitError::Unavailable),
     };
@@ -616,7 +622,7 @@ async fn generate(
     };
     time_stage(
         "git_status",
-        records::save(context, STATUS, status_key, &status),
+        drive(records::save(STATUS, status_key, &status), context),
     )
     .await
 }
@@ -665,7 +671,7 @@ pub async fn refresh(
     let projection = update(context, store, document, None, false).await?;
     // Pushed metadata that still waits must be retried by the next refresh.
     let prefix = document.document_id.to_bytes().to_vec();
-    if records::prefixed::<PendingMerge>(context, PENDING, prefix)
+    if drive(records::prefixed::<PendingMerge>(PENDING, prefix), context)
         .await
         .is_ok_and(|rows| rows.is_empty())
     {
@@ -693,7 +699,7 @@ pub async fn view(
     }
     let projection = project(context, store, document).await?;
     let prefix = document.document_id.to_bytes().to_vec();
-    let waiting = !records::prefixed::<PendingMerge>(context, PENDING, prefix)
+    let waiting = !drive(records::prefixed::<PendingMerge>(PENDING, prefix), context)
         .await?
         .is_empty();
     let pending = waiting
@@ -907,7 +913,7 @@ pub async fn status(
             ),
         },
     };
-    let status = records::load(context, STATUS, id.to_bytes().to_vec()).await?;
+    let status = drive(records::load(STATUS, id.to_bytes().to_vec()), context).await?;
     let layout = match projection.state.refs.get("refs/heads/main") {
         Some(main) => {
             let effect = GitEffect::Layout {

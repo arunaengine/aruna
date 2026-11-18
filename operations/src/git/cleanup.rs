@@ -24,7 +24,12 @@ pub async fn remove_objects(context: &DriverContext) {
     let Some(realm_id) = context.net_handle.as_ref().map(|net| *net.realm_id()) else {
         return;
     };
-    let rows = match records::prefixed::<StoredObject>(context, LOCAL_OBJECTS, Vec::new()).await {
+    let rows = match drive(
+        records::prefixed::<StoredObject>(LOCAL_OBJECTS, Vec::new()),
+        context,
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(error) => return warn!(%error, "Local Git objects unreadable"),
     };
@@ -68,7 +73,7 @@ async fn settled(
     document: &MetadataRegistryRecord,
     object: &StoredObject,
 ) -> Result<Result<(), &'static str>, GitError> {
-    let history = records::scan(context, document.document_id).await?;
+    let history = drive(records::scan(document.document_id), context).await?;
     let pack = GitPack {
         sha256: object.sha256.clone(),
         size: object.size,
@@ -104,9 +109,12 @@ async fn moved(
 ) -> Result<Result<(), &'static str>, GitError> {
     let digest = pack.digest().ok_or(GitError::Invalid)?;
     let key = git_pack_key(document.document_id, &digest).to_vec();
-    if records::load::<GitPackRecord>(context, GIT_PACK_KEYSPACE, key)
-        .await?
-        .is_some()
+    if drive(
+        records::load::<GitPackRecord>(GIT_PACK_KEYSPACE, key),
+        context,
+    )
+    .await?
+    .is_some()
     {
         return Ok(Ok(()));
     }
@@ -187,5 +195,5 @@ async fn delete(
         .await
         .map_err(|_| GitError::Unavailable)?;
     }
-    records::remove(context, LOCAL_OBJECTS, key).await
+    drive(records::remove(LOCAL_OBJECTS, key), context).await
 }

@@ -95,7 +95,11 @@ pub async fn copy(
     document: &MetadataRegistryRecord,
     sha256: &str,
 ) -> Result<Option<StoredObject>, GitError> {
-    records::load(context, LOCAL_OBJECTS, index_key(document, sha256)).await
+    drive(
+        records::load(LOCAL_OBJECTS, index_key(document, sha256)),
+        context,
+    )
+    .await
 }
 
 /// Stores content under `key` in this node's dataset bucket after checking its SHA-256.
@@ -113,7 +117,11 @@ pub async fn store(
     let bucket = bucket(context, document, auth).await?;
     let name = default_bucket(document.group_id);
     let stored = put(context, auth, (&name, bucket), (key, size, sha256), body).await?;
-    records::insert(context, LOCAL_OBJECTS, index_key(document, sha256), &stored).await
+    drive(
+        records::insert(LOCAL_OBJECTS, index_key(document, sha256), &stored),
+        context,
+    )
+    .await
 }
 
 /// Writes content to `key` in a bucket of this node through the ordinary put with its
@@ -258,7 +266,12 @@ pub async fn pack_bytes(
 ) -> Result<Bytes, GitError> {
     let digest = pack.digest().ok_or(GitError::Invalid)?;
     let key = git_pack_key(document.document_id, &digest).to_vec();
-    if let Some(stored) = records::load::<GitPackRecord>(context, GIT_PACK_KEYSPACE, key).await? {
+    if let Some(stored) = drive(
+        records::load::<GitPackRecord>(GIT_PACK_KEYSPACE, key),
+        context,
+    )
+    .await?
+    {
         return Ok(stored.bytes);
     }
     let Some(object) = copy(context, document, &pack.sha256).await? else {

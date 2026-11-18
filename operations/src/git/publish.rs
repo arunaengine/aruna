@@ -77,7 +77,7 @@ pub async fn publish_pack(
     let mut fence = aruna_core::placement::fence::WriteFence::default();
     fence.add(document.realm_id, &config, [pack.placement]);
     let writes = pack_writes(&pack, document.realm_id, peers, &fence)?;
-    records::commit(context, writes, &fence).await?;
+    drive(records::commit(writes, &fence), context).await?;
     aruna_core::git::record_written(document.document_id);
     Ok(())
 }
@@ -96,11 +96,12 @@ pub fn pack_record(record: &GitRecord, bytes: bytes::Bytes) -> GitPackRecord {
 
 async fn stored(context: &DriverContext, pack: &GitPackRecord) -> Result<bool, GitError> {
     let key = pack.target().storage_key().to_vec();
-    Ok(
-        records::load::<GitPackRecord>(context, GIT_PACK_KEYSPACE, key)
-            .await?
-            .is_some(),
+    Ok(drive(
+        records::load::<GitPackRecord>(GIT_PACK_KEYSPACE, key),
+        context,
     )
+    .await?
+    .is_some())
 }
 
 /// The pack row, its sync revision, shard manifest row and outbox publish.
@@ -176,7 +177,7 @@ pub async fn publish_with(
         .map(|net| net.node_id())
         .ok_or(GitError::Unavailable)?;
     let peers = holders_in(&config, node_id, document)?;
-    let existing = records::scan(context, document.document_id).await?;
+    let existing = drive(records::scan(document.document_id), context).await?;
     if !matches!(change, GitChange::Checkpoint(_)) && uncovered(&existing).len() >= MAX_RECORDS {
         return Err(GitError::Full);
     }
@@ -232,7 +233,7 @@ pub async fn publish_with(
         }
     }
     writes.extend(extra);
-    records::commit(context, writes, &fence).await?;
+    drive(records::commit(writes, &fence), context).await?;
     aruna_core::git::record_written(record.document_id);
     super::project::forget(record.document_id);
     if let Some(tasks) = context.task_handle.as_ref() {

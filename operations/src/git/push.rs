@@ -4,7 +4,7 @@
 
 use super::state::{Ancestry, GitState, reduce};
 use super::{GitError, objects, publish, records};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use aruna_core::git::{
     GitChange, GitRecord, LfsObject, PendingMerge, RefUpdate, StoredObject, ZERO_OID, valid_path,
     valid_ref,
@@ -76,7 +76,7 @@ pub async fn accept(
     {
         return Err(GitError::Invalid);
     }
-    let (mut state, _) = reduce(&records::scan(context, id).await?, &Ancestry::new());
+    let (mut state, _) = reduce(&drive(records::scan(id), context).await?, &Ancestry::new());
     // The refs this node served the pushing client; a replay without ancestry answers can
     // disagree with them about fast-forwarded branches.
     if let Some(served) = super::project::served(id) {

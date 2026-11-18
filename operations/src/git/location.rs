@@ -30,7 +30,7 @@ pub async fn effective(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
 ) -> Result<(DatasetLocation, bool), GitError> {
-    let records = records::scan(context, document.document_id).await?;
+    let records = drive(records::scan(document.document_id), context).await?;
     Ok(chosen(
         document,
         reduce(&records, &Ancestry::new()).0.location,

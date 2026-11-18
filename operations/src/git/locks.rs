@@ -4,7 +4,7 @@
 
 use super::state::{Ancestry, reduce};
 use super::{GitError, publish, records};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use aruna_core::git::{GitChange, LfsLock, valid_path};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -16,7 +16,7 @@ pub enum LockOutcome {
 }
 
 async fn current(context: &DriverContext, id: Ulid) -> Result<Vec<LfsLock>, GitError> {
-    let (state, _) = reduce(&records::scan(context, id).await?, &Ancestry::new());
+    let (state, _) = reduce(&drive(records::scan(id), context).await?, &Ancestry::new());
     Ok(state.locks.into_values().collect())
 }
 

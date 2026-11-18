@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod calls;
 pub mod changes;
 pub mod cleanup;
 mod dataset;
@@ -38,7 +39,7 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum GitError {
     #[error("repository not found")]
     NotFound,
@@ -68,6 +69,12 @@ pub enum GitError {
     NotHook,
     #[error("the branch does not exist")]
     BranchMissing,
+}
+
+impl From<aruna_core::calls::IoError> for GitError {
+    fn from(_: aruna_core::calls::IoError) -> Self {
+        Self::Unavailable
+    }
 }
 
 /// Why a merge could not be completed; nothing was changed.
