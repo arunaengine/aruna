@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use aruna_core::effects::Effect;
-use aruna_core::git::{GitAnswer, GitCall, GitEffect, record_writes};
+use aruna_core::git::{GitAnswer, GitCall, GitEffect, record_writes, record_written};
 use aruna_core::telemetry::{RequestStages, record_stage};
 use futures_util::StreamExt;
 
@@ -33,6 +33,17 @@ pub(super) async fn dispatch_git(
         }
         GitCall::RecordWrites(document_id) => {
             return GitAnswer::RecordWrites(record_writes(document_id));
+        }
+        GitCall::RecordStored {
+            document_id,
+            forget,
+        } => {
+            record_written(document_id);
+            let store = context.blob_handle.as_ref().and_then(|handle| handle.git());
+            if let Some(store) = store.filter(|_| forget) {
+                store.caches().forget(document_id);
+            }
+            return GitAnswer::Noted;
         }
         GitCall::Timed(child) => {
             let stages = RequestStages::default();
@@ -123,6 +134,7 @@ pub(super) async fn dispatch_git(
         GitCall::Stages(_)
         | GitCall::Canonicalize(_)
         | GitCall::RecordWrites(_)
+        | GitCall::RecordStored { .. }
         | GitCall::Timed(_) => GitAnswer::Failed("the call was already answered".to_string()),
     }
 }

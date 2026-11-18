@@ -8,6 +8,7 @@ use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::git::{CommitInfo, GitAnswer, GitChange, GitEvent, GitRecord, StoredObject};
+use aruna_core::git_state::{GitState, Projection};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -16,8 +17,6 @@ use std::fmt::Debug;
 use ulid::Ulid;
 
 use super::GitNode;
-use super::project::Projection;
-use super::state::GitState;
 
 pub(super) fn realm() -> RealmId {
     RealmId::from_bytes([7; 32])
@@ -91,6 +90,15 @@ pub(super) fn ran(event: GitEvent) -> IoResult {
 
 pub(super) fn asks_child<T, E>(turn: &Result<Next<T>, E>) -> bool {
     matches!(turn, Ok(Next::Call(IoCall::Child(_))))
+}
+
+/// The output of a finished turn and how many calls follow it.
+pub(super) fn finished<T, E: Debug>(turn: Result<Next<T>, E>) -> (T, usize) {
+    match turn.expect("a finished operation") {
+        Next::Done(output) => (output, 0),
+        Next::Then { output, calls } => (output, calls.len()),
+        _ => panic!("the operation asks for more"),
+    }
 }
 
 pub(super) fn asks_store<T, E>(turn: &Result<Next<T>, E>) -> bool {

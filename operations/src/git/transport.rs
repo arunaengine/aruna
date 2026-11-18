@@ -4,15 +4,14 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::{GitEffect, GitEvent, GitRequest};
+use aruna_core::git_state::Projection;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use tracing::warn;
 
 use super::access::Repository;
-use super::calls::{git_call, git_event};
-use super::project::Projection;
-use super::push::PushKey;
+use super::calls::{git_call, git_event, push_call};
 use super::{GitError, GitNode, pending, repository, snapshot};
 
 /// What the pending call of serving a request answers.
@@ -35,7 +34,6 @@ pub fn transport(node: &GitNode, auth: &AuthContext, request: GitRequest) -> Tra
         request: Some(request),
         step: ServeStep::Repository,
         document: None,
-        key: None,
         served: None,
     }
 }
@@ -48,7 +46,6 @@ pub struct TransportOperation {
     request: Option<GitRequest>,
     step: ServeStep,
     document: Option<MetadataRegistryRecord>,
-    key: Option<PushKey>,
     served: Option<GitEvent>,
 }
 
@@ -60,16 +57,13 @@ impl TransportOperation {
     }
 
     fn serve(&mut self) -> ServeTurn {
-        let mut request = self.request.take().ok_or(IoError::Unfinished)?;
-        if self.write {
-            let document = self.document.as_ref().ok_or(IoError::Unfinished)?;
-            let key = PushKey::open(document.document_id);
-            request.push_key = key.value.clone();
-            self.key = Some(key);
-        }
+        let request = self.request.take().ok_or(IoError::Unfinished)?;
+        let actor = self.auth.user_id;
         self.step = ServeStep::Serve;
-        let effect = GitEffect::Http(Box::new(request));
-        Ok(Next::Call(git_call(effect, self.auth.user_id)))
+        Ok(Next::Call(match self.write {
+            true => push_call(request, actor),
+            false => git_call(GitEffect::Http(Box::new(request)), actor),
+        }))
     }
 
     fn finish(&mut self) -> ServeTurn {

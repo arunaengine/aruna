@@ -20,12 +20,13 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::objects::DescribeObjectOperation;
-use super::state::{Ancestry, reduce};
+use super::state::reduce;
 use super::{GitError, download, lfs, objects, records};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
+use aruna_core::git_state::Ancestry;
 
 type Document = MetadataRegistryRecord;
 type ObjectRows = Vec<(Vec<u8>, StoredObject)>;

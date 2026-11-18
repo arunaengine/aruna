@@ -434,6 +434,8 @@ pub enum GitCall {
     ServedRefs(Ulid),
     /// How often this process stored a Git record of the document.
     RecordWrites(Ulid),
+    /// Notes a durably stored record or pack; `forget` also drops the remembered projection.
+    RecordStored { document_id: Ulid, forget: bool },
     /// The next id in the order pending merges are accepted.
     NextSequence,
     /// Starts `child` beside the caller unless a refresh of the document already runs.

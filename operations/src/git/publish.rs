@@ -18,6 +18,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
+use super::calls::{noted, written_call};
 use super::records::Writes;
 use super::{GitError, records};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -110,6 +111,7 @@ enum PackStep {
     Stored,
     Config,
     Commit,
+    Noted,
 }
 
 /// Stores and replicates the bytes of a pack whose record is already stored.
@@ -164,7 +166,12 @@ impl Operation for PublishPackOperation {
             }
             PackStep::Commit => {
                 result.child::<(), GitError>()??;
-                aruna_core::git::record_written(self.document.document_id);
+                self.step = PackStep::Noted;
+                let document_id = self.document.document_id;
+                Ok(Next::Call(written_call(document_id, false)))
+            }
+            PackStep::Noted => {
+                noted(result)?;
                 Ok(Next::Done(()))
             }
         }
@@ -253,6 +260,7 @@ enum PublishStep {
     Scan,
     PackStored,
     Commit,
+    Stored,
     Wake,
 }
 
@@ -415,9 +423,11 @@ impl Operation for PublishRecordOperation {
             }
             PublishStep::Commit => {
                 result.child::<(), GitError>()??;
-                let document_id = self.document.document_id;
-                aruna_core::git::record_written(document_id);
-                super::project::forget(document_id);
+                self.step = PublishStep::Stored;
+                Ok(Next::Call(written_call(self.document.document_id, true)))
+            }
+            PublishStep::Stored => {
+                noted(result)?;
                 // The record is durable; a missed wake-up only delays replication.
                 self.step = PublishStep::Wake;
                 Ok(Next::Call(IoCall::from(schedule_drain_effect())))

@@ -7,6 +7,7 @@ use aruna_core::git::{
     CommitInfo, FileChange, GitEffect, GitEvent, GitRecord, GitSnapshot, LinkedObject,
     MergeOutcome, PendingMerge, RefUpdate, StoredObject, ZERO_OID,
 };
+use aruna_core::git_state::Projection;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -18,7 +19,6 @@ use ulid::Ulid;
 use super::calls::{git_call, git_event, store_read};
 use super::changes::property_conflicts;
 use super::linked::linked;
-use super::project::Projection;
 use super::push::{record_made, unlocked};
 use super::versions::{
     Named, Version, WriteOptions, branch_ref, diff, expect, log, open, parse_conflict, peeled_tags,

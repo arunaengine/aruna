@@ -24,12 +24,13 @@ use ulid::Ulid;
 use super::access::{Repository, RepositoryOperation};
 use super::objects::EnsureBucketOperation;
 use super::publish::PublishRecordOperation;
-use super::state::{Ancestry, reduce};
+use super::state::reduce;
 use super::{GitError, records};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::git_state::Ancestry;
 
 type Document = MetadataRegistryRecord;
 type Chosen = (DatasetLocation, bool);

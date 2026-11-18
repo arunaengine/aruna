@@ -21,7 +21,6 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::{LazyLock, Mutex};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -31,20 +30,13 @@ type PendingRows = Vec<(Vec<u8>, PendingMerge)>;
 /// How often a merge is planned again after the graph moved under it.
 const MERGE_ATTEMPTS: usize = 8;
 
-/// Orders pending merges as they are accepted; later ones build on earlier ones.
-static SEQUENCE: LazyLock<Mutex<ulid::Generator>> = LazyLock::new(Default::default);
-
 /// The local row of a pending merge, written with the push record that brings it. Keys
-/// sort by acceptance, so merges apply in the order their pushes moved `main`.
+/// sort by `sequence`, so merges apply in the order their pushes moved `main`.
 pub fn entry(
     document_id: Ulid,
+    sequence: Ulid,
     merge: &PendingMerge,
 ) -> Result<(String, byteview::ByteView, byteview::ByteView), GitError> {
-    let sequence = SEQUENCE
-        .lock()
-        .map_err(|_| GitError::Unavailable)?
-        .generate()
-        .map_err(|_| GitError::Unavailable)?;
     let mut key = document_id.to_bytes().to_vec();
     key.extend_from_slice(&sequence.to_bytes());
     let value = postcard::to_allocvec(merge).map_err(|_| GitError::Invalid)?;
@@ -389,6 +381,7 @@ mod tests {
     use aruna_core::git::GitAnswer;
     use aruna_core::structs::identity::realm::RealmId;
 
+    // Rows sort by the order the store handed out, whatever the commit ids are.
     #[test]
     fn rows_keep_order() {
         let merge = |new: char| PendingMerge {
@@ -397,10 +390,13 @@ mod tests {
             new: new.to_string().repeat(40),
         };
         let document = Ulid::from(9);
-        // Commit ids sort the other way; the rows must still follow acceptance.
         let keys: Vec<_> = ['f', 'a', 'c']
             .into_iter()
-            .map(|new| entry(document, &merge(new)).expect("row").1.to_vec())
+            .enumerate()
+            .map(|(sequence, new)| {
+                let row = entry(document, Ulid::from(sequence as u128), &merge(new));
+                row.expect("row").1.to_vec()
+            })
             .collect();
         let mut sorted = keys.clone();
         sorted.sort();
@@ -428,7 +424,7 @@ mod tests {
         };
         // More rows than one storage page, as a backlog of blocked documents would leave.
         let rows: Vec<_> = (0..1100u128)
-            .map(|id| entry(Ulid::from(id), &merge).expect("row"))
+            .map(|id| entry(Ulid::from(id), Ulid::from(id), &merge).expect("row"))
             .collect();
         let keys: Vec<_> = rows.iter().map(|row| row.1.to_vec()).collect();
         drive(records::commit(rows, &Default::default()), &context)

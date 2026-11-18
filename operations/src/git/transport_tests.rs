@@ -86,7 +86,7 @@ fn read_served_directly() {
     assert_eq!(serve.next(ran(served())), Ok(Next::Done(served())));
 }
 
-// A push carries its key and applies pushed metadata; a failure there does not fail it.
+// A push runs under a key and applies pushed metadata; a failure there does not fail it.
 #[test]
 fn push_applies_metadata() {
     let document = dataset_of(63);
@@ -101,14 +101,7 @@ fn push_applies_metadata() {
     let Effect::Git(call) = *effect else {
         panic!("expected a Git call");
     };
-    let GitCall::Run {
-        effect: GitEffect::Http(sent),
-        ..
-    } = *call
-    else {
-        panic!("expected the HTTP effect");
-    };
-    assert!(!sent.push_key.is_empty());
+    assert!(matches!(*call, GitCall::Push { .. }));
     assert!(asks_child(&serve.next(ran(served()))));
     let waits = child(Err::<(), _>(GitError::Unavailable));
     assert_eq!(serve.next(waits), Ok(Next::Done(served())));

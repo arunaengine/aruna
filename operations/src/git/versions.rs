@@ -9,6 +9,7 @@ use aruna_core::git::{
     CommitInfo, FileChange, GitEffect, GitEvent, GitRecord, RefUpdate, ZERO_OID, refs_clash,
     valid_ref,
 };
+use aruna_core::git_state::{GitState, Projection};
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::repo_layout::{ARUNA_FILE, entity_path, git_copy, is_file};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -20,10 +21,8 @@ use ulid::Ulid;
 use super::access::Repository;
 use super::calls::{StoreReadOperation, git_call, git_event, store_read};
 use super::changes::{EntityChange, entity_changes};
-use super::project::Projection;
 use super::push::record_made;
 use super::snapshot::{read_view, refresh};
-use super::state::GitState;
 use super::{GitError, GitNode, repository};
 
 type Document = MetadataRegistryRecord;
