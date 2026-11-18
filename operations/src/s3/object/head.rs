@@ -165,252 +165,63 @@ impl HeadObjectOperation {
     }
 
     fn access_resolved(&mut self, event: Event) -> HeadTurn {
-            let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
-            return self.emit_error(error);
-        }
-        self.state = HeadObjectState::GetBlobLocation;
-        smallvec![pending_location_read(&archive, self.txn_id)]
-    }
-
-    fn commit_reference(&mut self, source: VersionSourceBinding) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(HeadObjectError::NoTransactionFound);
-        };
-        self.reference_source = Some(source);
-        self.state = HeadObjectState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
-        self.state = HeadObjectState::GetBlobLocation;
-        smallvec![blob_location_read(&key, self.txn_id)]
-    }
-
-    /// A governed version is only serveable from a registered local copy, so an
-    /// unregistered or quarantined copy fails closed before any metadata is served.
-    fn check_managed_copy(&mut self, version_id: Ulid, location_key: BlobLocationKey) -> Effects {
-        let check = match begin_copy_check(
-            &self.input.bucket,
-            &self.input.key,
-            version_id,
-            location_key,
-            self.txn_id,
-        ) {
-            Ok(check) => check,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.pending_copy = Some(check.copy_key);
-        self.pending_location = Some(check.location_key);
-        self.state = HeadObjectState::CheckManagedCopy;
-        smallvec![check.effect]
-    }
-
-    fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let key = match finish_copy_check(
-            event,
-            &mut self.pending_copy,
-            &mut self.pending_location,
-            &self.source_policies,
-            ExpectedNode::Subject,
-        ) {
-            Ok(key) => key,
-            Err(err) => {
-                let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
-                return self.emit_error(error);
-            }
-        };
-        self.read_blob_location(key)
-    }
-
-    fn location_read(&mut self, event: Event) -> Effects {
-        let location = match location_from_read(event) {
-            Ok(location) => location,
-            Err(err) => {
-                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
-                return self.emit_error(error);
-            }
-        };
-
-        self.read_multipart_summary(location, self.resolved_version_id)
-    }
-
-    fn read_multipart_summary(
-        &mut self,
-        location: Option<BackendLocation>,
-        resolved_version_id: Option<Ulid>,
-    ) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(HeadObjectError::NoTransactionFound);
-        };
-
-        self.location = location;
-        self.resolved_version_id = resolved_version_id;
-
-        let Some(version_id) = resolved_version_id else {
-            return self.finish_lookup();
-        };
-
-        let effect = match multipart_summary_read(version_id, Some(txn_id)) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
-        };
-
-        self.state = HeadObjectState::ReadMultipartSummary;
-        smallvec![effect]
-    }
-
-    fn summary_read(&mut self, event: Event) -> Effects {
-        let summary = match summary_from_read(event) {
-            Ok(summary) => summary,
-            Err(err) => {
-                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
-                return self.emit_error(error);
-            }
-        };
-
-        if let Some(summary) = summary {
-            self.checksum_type = summary.checksum_type;
-            self.composite_hashes = summary.composite_hashes;
-            self.part_count = Some(summary.part_count);
-        }
-
-        self.finish_lookup()
-    }
-
-    fn finish_lookup(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(HeadObjectError::NoTransactionFound);
-        };
-        self.state = HeadObjectState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
-            self.txn_id = None;
-            if let Some(source) = self.reference_source.take() {
-                self.state = HeadObjectState::ResolveReferenceAccess;
-                return smallvec![resolve_binding_effect(ResolveBindingInput {
-                    source,
-                    group_id: None,
-                },)];
-            }
-            self.state = HeadObjectState::Finish;
-            self.output = Some(Ok(HeadObjectResult {
-                location: self.location.clone(),
-                metadata: self.metadata.clone(),
-                source_metadata: self.source_metadata.clone(),
-                last_refresh: self.last_refresh,
-                version_created_at: self.version_created_at,
-                version_id: self.resolved_version_id.or(self.input.version_id),
-                resolved_version_id: self.resolved_version_id,
-                checksum_type: self.checksum_type,
-                composite_hashes: self.composite_hashes.clone(),
-                part_count: self.part_count,
-                source_policies: self.source_policies.clone(),
-                source_binding: self.source_binding.clone(),
-            }));
-            smallvec![]
-        } else {
-            self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: (event).label(),
-            })
-        }
-    }
-
-    fn handle_reference_access(&mut self, event: Event) -> Effects {
         match event {
             Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Ok(access),
             }) => {
                 self.state = HeadObjectState::HeadReferenceSource;
-                smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+                let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+                Ok(Next::Call(head.into()))
             }
             Event::SubOperation(SubOperationEvent::VersionAccessResolved {
                 result: Err(error),
-            }) => self.emit_error(error.into()),
-            other => self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
-                received: (other).label(),
-            }),
+            }) => Err(error.into()),
+            other => self.invalid(
+                "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
+                other,
+            ),
         }
     }
 
-    fn handle_reference_head(&mut self, event: Event) -> Effects {
+    fn source_answered(&mut self, event: Event) -> HeadTurn {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
-                self.source_metadata = Some(metadata);
-                self.last_refresh = Some(SystemTime::now());
-                self.state = HeadObjectState::Finish;
-                self.output = Some(Ok(HeadObjectResult {
-                    location: None,
-                    metadata: self.metadata.clone(),
-                    source_metadata: self.source_metadata.clone(),
-                    last_refresh: self.last_refresh,
-                    version_created_at: None,
-                    version_id: self.resolved_version_id.or(self.input.version_id),
-                    resolved_version_id: self.resolved_version_id,
-                    checksum_type: self.checksum_type,
-                    composite_hashes: self.composite_hashes.clone(),
-                    part_count: self.part_count,
-                    source_policies: self.source_policies.clone(),
-                    source_binding: self.source_binding.clone(),
-                }));
-                smallvec![]
+                let mut found = self.found.take().ok_or(IoError::Unfinished)?;
+                found.source_metadata = Some(metadata);
+                found.last_refresh = Some(SystemTime::now());
+                found.location = None;
+                found.created_at = None;
+                Ok(Next::Done(self.result(found)))
             }
-            Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                self.emit_error(error.into())
-            }
-            other => self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::StagingSource(StagingSourceEvent::HeadResult)",
-                received: (other).label(),
-            }),
+            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
+            other => self.invalid(
+                "Event::StagingSource(StagingSourceEvent::HeadResult)",
+                other,
+            ),
         }
     }
 }
 
-impl EffectOperation for HeadObjectOperation {
+impl Operation for HeadObjectOperation {
     type Output = HeadObjectResult;
     type Error = HeadObjectError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> HeadTurn {
+        Ok(Next::Call(IoCall::child(VersionLookup::new(
+            self.input.bucket.clone(),
+            self.input.key.clone(),
+            self.input.version_id,
+            false,
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(HeadObjectError::StorageError(error));
-        }
-
+    fn next(&mut self, result: IoResult) -> HeadTurn {
         match self.state {
-            HeadObjectState::Init => self.handle_init(),
-            HeadObjectState::StartTransaction => self.handle_transaction_started(event),
-            HeadObjectState::GetVersion => self.handle_received_version(event),
-            HeadObjectState::CheckManagedCopy => self.handle_managed_copy(event),
-            HeadObjectState::CheckPendingCopy => self.handle_pending_copy(event),
-            HeadObjectState::GetBlobLocation => self.location_read(event),
-            HeadObjectState::GetCurrentVersion => self.current_version_received(event),
-            HeadObjectState::ReadMultipartSummary => self.summary_read(event),
-            HeadObjectState::CommitTransaction => self.handle_transaction_committed(event),
-            HeadObjectState::ResolveReferenceAccess => self.handle_reference_access(event),
-            HeadObjectState::HeadReferenceSource => self.handle_reference_head(event),
-            HeadObjectState::Finish | HeadObjectState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, HeadObjectState::Finish | HeadObjectState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(HeadObjectError::NotFinished),
+            HeadObjectState::Lookup => {
+                self.looked_up(result.child::<FoundVersion, VersionLookupError>()?)
+            }
+            HeadObjectState::ResolveReferenceAccess => self.access_resolved(result.event()?),
+            HeadObjectState::HeadReferenceSource => self.source_answered(result.event()?),
         }
     }
 
@@ -423,13 +234,6 @@ impl EffectOperation for HeadObjectOperation {
                 | HeadObjectError::DeleteMarker
         )
     }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
 }
 
 #[cfg(test)]
@@ -437,8 +241,9 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     };
@@ -451,10 +256,12 @@ mod tests {
     use aruna_core::structs::storage::blob::BackendConfig;
     use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::structs::storage::blob::{
-        Backend, BackendRef, BlobHeadKey, BlobVersion, CurrentVersionPointer, VersionKey,
+        Backend, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
+        VersionKey,
     };
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::multipart::MultipartObjectSummary;
     use aruna_net::{NetConfig, NetHandle};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -481,131 +288,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pending_reads_location() {
-        use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
-        use aruna_core::structs::placement::policy::PlacementPolicyRef;
-        use aruna_core::structs::storage::blob::ArchiveKey;
-        use aruna_core::structs::storage::encryption::BucketKeyRef;
-        use aruna_core::structs::storage::format::PithosLayout;
-
-        let mut location = location_with_hash();
-        location.hashes.remove(HASH_BLAKE3);
-        let layout = PithosLayout {
-            stored_size: 70,
-            metadata_digest: [3; 32],
-            storage_generation: 0,
-        };
-        location.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
-        let archive = ArchiveKey::of(&location);
-        let version_id = Ulid::generate();
-        let version = BlobVersion::pending(
-            archive.clone(),
-            location.created_at,
-            location.created_by,
-            None,
-        );
-        let input = || HeadObjectInput {
-            bucket: "mybucket".to_string(),
-            key: "hello.txt".to_string(),
+    fn found(version_id: Ulid) -> FoundVersion {
+        FoundVersion {
+            location: Some(location_with_hash()),
             version_id: Some(version_id),
-        };
-
-        let mut operation = HeadObjectOperation::new(input());
-        operation.txn_id = Some(Ulid::generate());
-        let effects = operation.read_version(version_id, version.clone(), true);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, key, .. })]
-                if key_space == PENDING_LOCATION_KEYSPACE && key.as_ref() == archive.to_bytes()
-        ));
-        let read = |value: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::ReadResult {
-                key: Vec::<u8>::new().into(),
-                value: value.map(Into::into),
-            })
-        };
-        operation.step(read(Some(location.to_bytes().unwrap())));
-        operation.step(read(None));
-        let txn_id = operation.txn_id.unwrap();
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        let found = matches!(&operation.output, Some(Ok(output)) if output.location == Some(location.clone()));
-        assert!(found);
-
-        // A governed archive is described only through the registration of exactly it.
-        let refs = vec![PlacementPolicyRef {
-            policy_id: Ulid::generate(),
-            digest: [1; 32],
-        }];
-        let governed = version.with_policies(refs.clone()).unwrap();
-        let version_key = VersionKey::new("mybucket", "hello.txt", version_id);
-        let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
-        let subject = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
-            crate::tests::policy::subject(node_id, "eu"),
-        )
-        .unwrap();
-        let registered = |location: &BackendLocation| {
-            use aruna_core::structs::storage::blob::{ManagedCopyRecord, ManagedCopyState};
-            let record = ManagedCopyRecord::new(
-                version_key.clone(),
-                subject.subject.node_id,
-                location.clone(),
-                refs.clone(),
-                0,
-                ManagedCopyState::Registered,
-            )
-            .unwrap()
-            .stored_under(subject.subject.generation);
-            Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![
-                    (
-                        Vec::<u8>::new().into(),
-                        Some(record.to_bytes().unwrap().into()),
-                    ),
-                    (
-                        Vec::<u8>::new().into(),
-                        Some(subject.to_bytes().unwrap().into()),
-                    ),
-                ],
-            })
-        };
-        let mut operation = HeadObjectOperation::new(input());
-        operation.txn_id = Some(Ulid::generate());
-        let effects = operation.read_version(version_id, governed.clone(), true);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { .. })]
-        ));
-        let effects = operation.step(registered(&location));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == PENDING_LOCATION_KEYSPACE
-        ));
-
-        // A registration of another archive answers for nothing.
-        let mut other = location.clone();
-        other.ulid = Ulid::generate();
-        let mut operation = HeadObjectOperation::new(input());
-        operation.txn_id = Some(Ulid::generate());
-        operation.read_version(version_id, governed, true);
-        operation.step(registered(&other));
-        assert!(matches!(
-            operation.output,
-            Some(Err(HeadObjectError::ManagedCopyError(
-                ManagedCopyError::Mismatched
-            )))
-        ));
+            summary: Some(MultipartObjectSummary {
+                checksum_type: MultipartChecksumType::Composite,
+                part_count: 3,
+                composite_hashes: HashMap::from([("md5".to_string(), vec![1])]),
+            }),
+            ..FoundVersion::default()
+        }
     }
 
-    // A result exists only once the read transaction committed, so an aborted head never succeeds.
+    fn looked_up(outcome: Result<FoundVersion, VersionLookupError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(outcome))
+    }
+
+    fn head_operation(version_id: Option<Ulid>) -> HeadObjectOperation {
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: "mybucket".to_string(),
+            key: "hello.txt".to_string(),
+            version_id,
+        })
+    }
+
     #[test]
-    fn output_after_commit() {
-        use aruna_core::structs::storage::blob::ArchiveKey;
-        use aruna_core::structs::storage::encryption::BucketKeyRef;
-        use aruna_core::structs::storage::format::PithosLayout;
+    fn lookup_answers_head() {
+        // The snapshot runs in a child; its finding is the answer.
+        let version_id = Ulid::from_parts(4, 4);
+        let mut operation = head_operation(None);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let Ok(Next::Done(result)) = operation.next(looked_up(Ok(found(version_id)))) else {
+            panic!("a plain version needs nothing after its lookup");
+        };
+        assert_eq!(result.version_id, Some(version_id));
+        assert_eq!(result.resolved_version_id, Some(version_id));
+        assert_eq!(result.checksum_type, MultipartChecksumType::Composite);
+        assert_eq!(result.part_count, Some(3));
+        assert_eq!(result.composite_hashes.get("md5"), Some(&vec![1]));
+        assert_eq!(result.location, found(version_id).location);
+    }
 
         let mut location = location_with_hash();
         location.hashes.remove(HASH_BLAKE3);
