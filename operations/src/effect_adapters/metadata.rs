@@ -23,7 +23,8 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::read::dataset_summary;
 use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::write::{route_metadata_delete, route_metadata_update};
+use crate::metadata::forward::routed_write::RouteDeleteOperation;
+use crate::metadata::forward::write::route_metadata_update;
 use crate::metadata::handle::{MetadataRequestDelivery, WritePeerError};
 use crate::metadata::update_document::UpdateDocumentMutation;
 
@@ -119,14 +120,10 @@ async fn routed_write(
             document_id,
         } => {
             let token = Some(AuthToken::internal(owner));
-            Box::pin(route_metadata_delete(
-                &context,
-                actor,
-                record.as_deref(),
-                document_id,
-                token,
-            ))
-            .await?;
+            let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+            let record = record.map(|record| *record);
+            let delete = RouteDeleteOperation::new((actor, local_node), record, document_id, token);
+            Box::pin(crate::driver::drive(delete, &context)).await?;
         }
     }
     Ok(())

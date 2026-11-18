@@ -10,6 +10,7 @@ pub mod read;
 pub mod route_create;
 pub mod routed_export;
 pub mod routed_read;
+pub mod routed_write;
 pub mod write;
 
 #[cfg(test)]

@@ -31,8 +31,6 @@ use crate::metadata::update_entry::UpdateEntryOperation;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
-use aruna_core::metadata::MetadataBatch;
-use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataError;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::SyncRefusal;
@@ -56,15 +54,12 @@ use crate::forward::replay::HeldRecordOperation;
 use crate::forward::replay::routed_record_matches;
 use crate::forward::replay::{CreateRowsOperation, replay_answer};
 use crate::forward::routing::ForwardHoldersOperation;
-use crate::forward::routing::distinct_holders;
 use crate::forward::routing::holder_intersection;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::MetadataWriteError;
-use crate::forward::transport::RetryDisposition;
 use crate::forward::transport::forwarded_unavailable;
 use crate::forward::transport::read_error;
 use crate::forward::transport::reject;
-use crate::forward::transport::retry_disposition;
 use crate::forward::transport::unexpected_response;
 use crate::metadata::persistent_id::forward::pid_authority_node;
 use crate::realm::load_config::config_unavailable;
@@ -246,69 +241,6 @@ pub async fn route_metadata_update(
     }
 }
 
-/// Forwards one edit a device made on its replica to a holder.
-/// The batch is idempotent by its dot, but an ambiguous delivery stops the
-/// attempt: replaying would append a second event for a merge that changes nothing.
-pub async fn apply_batch_routed(
-    context: &Arc<DriverContext>,
-    realm_id: RealmId,
-    document_id: Ulid,
-    batch: Box<MetadataBatch>,
-    authored: MetadataBatchSource,
-    auth_token: AuthToken,
-) -> Result<MetadataRegistryRecord, MetadataWriteError> {
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or_else(|| {
-            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
-        })?;
-    let config_digest = config
-        .digest()
-        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    let placement = resolve_metadata_id(&config, realm_id, None, document_id)
-        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    let metadata = context.metadata_handle.as_ref().ok_or_else(|| {
-        MetadataWriteError::Undeliverable("no metadata handle to forward with".to_string())
-    })?;
-    let message = MetadataTransportMessage::ForwardApplyBatch {
-        auth_token,
-        config_digest,
-        document_id,
-        batch,
-        authored,
-    };
-    let mut detail = String::from("the document's bucket has no reachable holder");
-    for holder in distinct_holders(&resolve_shard_holders(&config, &placement)) {
-        match metadata
-            .request_forwarded_write(holder, message.clone())
-            .await
-        {
-            Ok(MetadataTransportMessage::ForwardedApplyBatch { result: Ok(record) }) => {
-                return Ok(*record);
-            }
-            Ok(MetadataTransportMessage::ForwardedApplyBatch {
-                result: Err(SyncRefusal::Unavailable),
-            }) => detail = format!("{holder}: holder could not apply the device edit"),
-            Ok(MetadataTransportMessage::ForwardedApplyBatch {
-                result: Err(refusal),
-            }) => return Err(batch_refusal(refusal)),
-            Ok(other) => return Err(unexpected_response(other)),
-            Err(error) => {
-                warn!(holder = %holder, error = %error, "Failed to forward a device edit to holder");
-                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
-                    return Err(MetadataWriteError::Undeliverable(format!(
-                        "forward to holder `{holder}` may have applied the device edit before failing; refusing to replay it: {error}"
-                    )));
-                }
-                detail = format!("{holder}: {error}");
-            }
-        }
-    }
-    Err(MetadataWriteError::Undeliverable(detail))
-}
-
 /// An offline edit's verdict, as the metadata routes report it.
 pub(super) fn device_edit_error(error: DeviceEditError) -> MetadataWriteError {
     match error {
@@ -335,87 +267,6 @@ pub(super) fn batch_refusal(refusal: SyncRefusal) -> MetadataWriteError {
         SyncRefusal::Coordinator(node) => {
             MetadataWriteError::Undeliverable(format!("node {node} coordinates this key"))
         }
-    }
-}
-
-pub async fn route_metadata_delete(
-    context: &Arc<DriverContext>,
-    actor: Actor,
-    record: Option<&MetadataRegistryRecord>,
-    document_id: Ulid,
-    auth_token: Option<AuthToken>,
-) -> Result<(), MetadataWriteError> {
-    let config = drive(GetConfigOperation::new(actor.realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or_else(|| {
-            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
-        })?;
-    let placement = resolve_metadata_id(
-        &config,
-        actor.realm_id,
-        record.map(|record| record.group_id),
-        document_id,
-    )
-    .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    let config_digest = config
-        .digest()
-        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    if record.is_some_and(|record| {
-        !routed_record_matches(&config, actor.realm_id, document_id, &placement, record)
-    }) {
-        return Err(MetadataWriteError::Undeliverable(
-            "local metadata registry record does not match the routed document".to_string(),
-        ));
-    }
-    let local_node_id = actor.node_id;
-    let current_holders = resolve_shard_holders(&config, &placement);
-    let holders = record.map_or_else(
-        || current_holders.clone(),
-        |record| holder_intersection(&current_holders, &record.holder_node_ids),
-    );
-    if record.is_some() && holders.is_empty() {
-        return Err(MetadataWriteError::Undeliverable(
-            "metadata document has no active frozen holder with history capacity".to_string(),
-        ));
-    }
-    let authority = pid_authority_node(&config, actor.realm_id, document_id).ok_or_else(|| {
-        MetadataWriteError::Undeliverable("persistent id authority is unavailable".to_string())
-    })?;
-    let local_holds = holders.contains(&local_node_id);
-    if local_node_id == authority
-        && local_holds
-        && let Some(record) = record
-    {
-        delete_metadata_document(
-            DeleteDocumentOperation::new(actor, record.group_id, document_id),
-            context.as_ref(),
-            document_id,
-        )
-        .await
-        .map_err(MetadataWriteError::from)?;
-        return Ok(());
-    }
-    let response = drive(
-        ForwardHoldersOperation::new(
-            context.node_and_realm().map(|(node_id, _)| node_id),
-            &holders,
-            &MetadataTransportMessage::ForwardDeleteDocument {
-                auth_token,
-                config_digest,
-                document_id,
-            },
-            (local_holds && record.is_none()).then_some(local_node_id),
-            false,
-        ),
-        context,
-    )
-    .await
-    .map_err(MetadataWriteError::from)?;
-    match response {
-        MetadataTransportMessage::ForwardedDelete => Ok(()),
-        other => Err(unexpected_response(other)),
     }
 }
 

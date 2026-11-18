@@ -27,7 +27,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_forward_document,
 };
-use crate::metadata::forward::write::apply_batch_routed;
+use crate::metadata::forward::routed_write::ApplyBatchOperation;
 use crate::metadata::update_document::UpdateDocumentError;
 
 use super::edit::{refused_edit, reject_edit};
@@ -366,16 +366,12 @@ async fn publish_edit(
             document_id: Some(*document_id),
         };
     }
-    match apply_batch_routed(
-        context,
-        realm_id,
-        *document_id,
-        batch.clone(),
-        authored.clone(),
+    let apply = ApplyBatchOperation::new(
+        (realm_id, *document_id),
+        (batch.clone(), authored.clone()),
         token,
-    )
-    .await
-    {
+    );
+    match drive(apply, context).await {
         Ok(_) => {
             info!(draft_id = %entry.draft_id, document_id = %document_id, "Published an offline edit");
             settle_edit(context, *document_id).await;
