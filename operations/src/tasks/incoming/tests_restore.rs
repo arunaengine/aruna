@@ -373,11 +373,8 @@ async fn drain_reconcile_wakes() {
     let realm_id = RealmId::from_bytes([44u8; 32]);
     let net = NetHandle::new(
         NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
             realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
+            ..crate::testing::local_net()
         },
         storage.clone(),
     )
@@ -428,7 +425,7 @@ async fn drain_reconcile_summary() {
     use aruna_core::structs::storage::usage::{
         NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, UsageCounters, global_shard_key, usage_global_key,
     };
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::{NetConfig, NetHandle};
 
     async fn write_stat(
         storage: &aruna_storage::StorageHandle,
@@ -456,11 +453,8 @@ async fn drain_reconcile_summary() {
     let realm_id = RealmId::from_bytes([44u8; 32]);
     let net = NetHandle::new(
         NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
             realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
+            ..crate::testing::local_net()
         },
         storage.clone(),
     )
@@ -560,7 +554,7 @@ async fn drain_reconcile_summary() {
 async fn drain_reconcile_config() {
     use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{SUMMARY_GLOBAL_KEY, UsageCounters};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::{NetConfig, NetHandle};
 
     let temp_dir = tempdir().expect("temp dir");
     let storage =
@@ -568,11 +562,8 @@ async fn drain_reconcile_config() {
     let realm_id = RealmId::from_bytes([45u8; 32]);
     let net = NetHandle::new(
         NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
             realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
+            ..crate::testing::local_net()
         },
         storage.clone(),
     )

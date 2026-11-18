@@ -32,7 +32,7 @@ use aruna_core::structs::storage::usage::{
     BucketCounters, NodeUsageSnapshot, USAGE_BUCKET_PREFIX, USAGE_COMPLETE_KEY, UsageCounters,
     dirty_group_key, global_shard_keys, usage_bucket_key, usage_group_key, usage_snapshot_key,
 };
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_operations::blob::records::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::realm_usage::{RealmUsageOperation, RealmUsageScope};
@@ -83,9 +83,12 @@ async fn setup_on(temp_dir: TempDir, storage_handle: StorageHandle) -> Harness {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
-        .await
-        .unwrap();
+    let net_handle = NetHandle::new(
+        aruna_operations::testing::local_net(),
+        storage_handle.clone(),
+    )
+    .await
+    .unwrap();
     let blob_handle = BlobHandler::new(
         BackendConfig {
             backend_type: Backend::FileSystem,
