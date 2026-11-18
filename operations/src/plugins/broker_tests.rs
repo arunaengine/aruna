@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::metadata::MetadataHandle;
-use crate::metadata::api::read::query_metadata_document;
+use crate::metadata::api::document_query::DocumentQueryOperation;
 use crate::metadata::api::read_types::DocumentQueryRequest;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
@@ -441,9 +441,12 @@ async fn patch_keeps_entities() {
         allow_partial: false,
     };
     let (realm, node) = (fixture.actor.realm_id, fixture.actor.node_id);
-    let names = query_metadata_document(&broker.ctx, realm, node, request)
-        .await
-        .unwrap();
+    let names = drive(
+        DocumentQueryOperation::new(realm, node, request),
+        &broker.ctx,
+    )
+    .await
+    .unwrap();
     let names = format!("{:?}", names.results);
     for kept in ["nested file", "unreferenced lab", "two"] {
         assert!(names.contains(kept), "{kept} is gone: {names}");

@@ -12,10 +12,9 @@ use crate::lookup::actor;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::drive;
+use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
-use aruna_operations::metadata::api::read::{
-    query_metadata, query_metadata_document, references_metadata,
-};
+use aruna_operations::metadata::api::read::{query_metadata, references_metadata};
 use aruna_operations::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
 };
@@ -473,18 +472,20 @@ impl McpServer {
             authorize_document(self, &auth, document, extras)
                 .await
                 .map_err(server_error)?;
-            query_metadata_document(
+            drive(
+                DocumentQueryOperation::new(
+                    self.state.get_realm_id(),
+                    self.state.get_node_id(),
+                    DocumentQueryRequest {
+                        document_id,
+                        auth: Some(auth.clone()),
+                        bearer_token: bearer,
+                        query: input.query,
+                        mode: None,
+                        allow_partial: true,
+                    },
+                ),
                 self.state.get_ctx().as_ref(),
-                self.state.get_realm_id(),
-                self.state.get_node_id(),
-                DocumentQueryRequest {
-                    document_id,
-                    auth: Some(auth.clone()),
-                    bearer_token: bearer,
-                    query: input.query,
-                    mode: None,
-                    allow_partial: true,
-                },
             )
             .await
         } else {

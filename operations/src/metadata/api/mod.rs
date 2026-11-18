@@ -92,6 +92,7 @@ use aruna_core::placement::{
 mod bucket_page;
 mod distributed;
 pub mod distributed_types;
+pub mod document_query;
 pub mod export;
 pub mod export_types;
 pub mod fanout;

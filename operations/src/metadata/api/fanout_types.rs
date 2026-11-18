@@ -31,7 +31,7 @@ impl MetadataFanoutOperation {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MetadataFanoutStats {
     pub nodes_queried: usize,
     pub nodes_failed: usize,
