@@ -14,9 +14,10 @@ use aruna_core::structs::storage::distribution::{
 use ulid::Ulid;
 
 use crate::distribution::guard::{
-    GuardError, authority_reads, authority_rows, read_target, target_for,
+    GuardError, authority_reads, authority_rows, bound_member, read_target, target_for,
 };
-use crate::driver::DriverContext;
+use crate::distribution::read_route::ReadCoordinatorOperation;
+use crate::driver::{DriverContext, drive};
 
 /// Where a read of a bound bucket is answered, from this node's record.
 pub async fn route_read(
@@ -110,16 +111,7 @@ pub async fn bound_view(
             )));
         }
     };
-    let member = view
-        .snapshot()
-        .member(binding.member_id)
-        .ok_or(RouteError::NotMember(set_id))?;
-    if member
-        .incarnation
-        .is_some_and(|admitted| admitted != binding.incarnation)
-    {
-        return Err(GuardError::Unbound(set_id));
-    }
+    bound_member(&view, binding)?;
     Ok(view)
 }
 
@@ -151,19 +143,8 @@ pub async fn read_coordinator(
     binding: &DistributionBinding,
     key: &str,
 ) -> Result<Option<(Ulid, NodeId)>, GuardError> {
-    let view = bound_view(context, binding).await?;
-    let snapshot = view.snapshot();
-    let set_id = binding.set_id;
-    let range = snapshot.range_for(key).ok_or(RouteError::NoRange(set_id))?;
-    if range.coordinator == binding.member_id {
-        let fence = local_fence(context, set_id).await?;
-        fence.check_read(snapshot, range)?;
-        return Ok(None);
-    }
-    let coordinator = snapshot
-        .member(range.coordinator)
-        .ok_or(RouteError::NoRange(set_id))?;
-    Ok(Some((range.range_id, coordinator.node_id)))
+    let operation = ReadCoordinatorOperation::new(binding.clone(), key.to_string());
+    drive(operation, context).await
 }
 
 /// Names a new upload of `key` by the range and epoch this member coordinates it under.

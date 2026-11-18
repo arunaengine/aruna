@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub(crate) mod after_sync;
 pub mod api;
 pub mod audit;
 pub mod audit_entry;
@@ -27,6 +28,7 @@ mod iri_index;
 pub mod list_documents;
 pub(crate) mod live_records;
 pub mod materialization_queue;
+pub mod mirror_request;
 pub(crate) mod object_version;
 pub mod persistent_id;
 pub(crate) mod pid_transition;
@@ -54,6 +56,7 @@ pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
 pub mod warmup;
+pub mod write_peer;
 
 /// The phase-time and identity samples a metadata operation stamps records
 /// with. Production keeps the defaults and samples per phase; tests replace the
@@ -108,7 +111,7 @@ pub use handle::{
     warm_caches,
 };
 pub(crate) use handle::{
-    WritePeerError, export_summary_jsonld, list_group_records, prune_if_deleted,
+    export_summary_jsonld, list_group_records, prune_if_deleted,
     search_local_filtered, transport_message_kind,
 };
 pub use protocol::{MetadataPathWinner, MetadataReadError, PersistentIdResolution};

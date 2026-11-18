@@ -39,7 +39,8 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::node::node_info::seed_info_document;
+use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
@@ -859,17 +860,19 @@ async fn spawn_seed_at(
             .await
             .map_err(std::io::Error::other)?;
     }
-    seed_info_document(
-        context.as_ref(),
-        net.node_id(),
+    let seed = SeedInfoOperation::new(
         realm_id,
+        net.node_id(),
         NodeUrls {
             api: None,
             s3: None,
         },
-    )
-    .await
-    .map_err(std::io::Error::other)?;
+        NodeFacts::gather(context.as_ref()),
+        false,
+    );
+    drive(seed, context.as_ref())
+        .await
+        .map_err(std::io::Error::other)?;
     let documents =
         prepare_core_documents(context.as_ref(), net.node_id(), realm_id, true, true).await?;
     publish_core_documents(context.as_ref(), net.node_id(), realm_id, true, documents).await?;
@@ -999,17 +1002,19 @@ async fn spawn_joiner_mode(
         OnboardingPhase::CoreDocumentsFetched,
     )
     .await?;
-    seed_info_document(
-        joiner_context.as_ref(),
-        config.node_id,
+    let seed = SeedInfoOperation::new(
         config.realm_id,
+        config.node_id,
         NodeUrls {
             api: config.api_public_url.clone(),
             s3: config.s3_public_url.clone(),
         },
-    )
-    .await
-    .map_err(std::io::Error::other)?;
+        NodeFacts::gather(joiner_context.as_ref()),
+        false,
+    );
+    drive(seed, joiner_context.as_ref())
+        .await
+        .map_err(std::io::Error::other)?;
     let documents = prepare_core_documents(
         joiner_context.as_ref(),
         config.node_id,
@@ -1029,7 +1034,7 @@ async fn spawn_joiner_mode(
     mark_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
     // Join co-holder shard topics before creating rank-zero geneses.
     // This ordering adopts geneses already created by the seed.
-    aruna_operations::node::startup::restore_shard_subscriptions(
+    aruna_operations::shard::restore::restore_shard_subscriptions(
         &joiner_context,
         config.node_id,
         config.realm_id,

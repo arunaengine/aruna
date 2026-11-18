@@ -617,7 +617,7 @@ async fn export_identity(
 }
 
 /// The crate JSON-LD a repository export of the dataset would start from, with its revision.
-pub(crate) async fn crate_jsonld(
+pub async fn crate_jsonld(
     context: &std::sync::Arc<DriverContext>,
     auth: &AuthContext,
     document_id: Ulid,
@@ -636,7 +636,7 @@ pub(crate) async fn crate_jsonld(
 
 /// The bucket that refuses a selected file of crate `jsonld` at consent: the job's resolution
 /// finds copies of it on this node, and the holder rule refuses each of them.
-pub(crate) async fn unheld_bucket(
+pub async fn unheld_bucket(
     driver: &std::sync::Arc<DriverContext>,
     spec: &ExportRoCrateSpec,
     node_id: NodeId,

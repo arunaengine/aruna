@@ -6,25 +6,32 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use aruna_core::keyspaces::{
     PLUGIN_GAPS_KEYSPACE, PLUGIN_QUEUE_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE, PLUGIN_SEEN_KEYSPACE,
     PLUGIN_WAITING_KEYSPACE,
 };
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
-    DEDUP_RETENTION_MS, ForwardRow, GapReason, GapRow, PluginRun, RECEIVER_GAP, RUNS_QUEUED,
-    SourceKind, WAITING_ROW, queue_key, reported_key,
+    DEDUP_RETENTION_MS, Decisions, EventBatch, ForwardRow, GapReason, GapRow, PluginRun,
+    RECEIVER_GAP, RUNS_QUEUED, SourceKind, WAITING_ROW, queue_key, reported_key,
 };
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_plugins::broker::ErrorKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::account::{AccountError, PrerequisitesHeld};
+use super::check::{CallError, CheckCall, RunScope};
+use super::matcher::event_trigger;
 use super::replay::{COVERAGE_ROW, CoverageRow, row_key};
 use super::rows::{
     Row, Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, unexpected, values,
 };
-use super::runs::{Admission, RunError};
+use super::runs::{Admission, RunError, event_run};
 use aruna_core::plugin_runs::Outcome;
 
 /// The decision a resend of an event gets, with its anchor for the dedup retention.
@@ -555,6 +562,236 @@ fn gap_totals(install_id: Ulid, rows: Rows) -> Result<Vec<GapRow>, StoreError> {
         total.latest_ms = total.latest_ms.max(row.latest_ms);
     }
     Ok(totals.into_values().collect())
+}
+
+#[derive(Debug, PartialEq)]
+enum JudgePhase {
+    Prerequisites,
+    Checking(Box<PluginRun>),
+}
+
+/// Whether the local install record and its prerequisite writes are here, then steps 0 to 4 for
+/// the event's path as a new run of the install would pass them.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Judge {
+    config: Arc<RealmConfigDocument>,
+    local: NodeId,
+    row: ForwardRow,
+    now_ms: u64,
+    phase: JudgePhase,
+}
+
+impl Judge {
+    pub(crate) fn new(
+        config: Arc<RealmConfigDocument>,
+        local: NodeId,
+        row: ForwardRow,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            config,
+            local,
+            row,
+            now_ms,
+            phase: JudgePhase::Prerequisites,
+        }
+    }
+
+    fn install(&self) -> Option<&PluginInstall> {
+        let found = (self.config.installs.iter()).find(|i| i.install_id == self.row.install_id);
+        found.filter(|install| install.revision >= self.row.revision)
+    }
+
+    fn check(&mut self) -> Result<Next<Verdict>, StoreError> {
+        let Some(install) = self.install() else {
+            return Ok(Next::Done(Verdict::Unready));
+        };
+        let event = &self.row.event;
+        let Some(run) = event_run(&self.config, install, event, self.now_ms) else {
+            let refused = "the install has no trigger of this kind".to_string();
+            return Ok(Next::Done(Verdict::Denied(refused)));
+        };
+        let scope = RunScope {
+            realm_id: self.config.realm_id,
+            local: self.local,
+            run: run.clone(),
+        };
+        let needs = event_trigger(event.kind).needs();
+        let target = needs.map(|permission| (permission, event.path.as_str()));
+        let check = IoCall::child(CheckCall::new(&scope, target));
+        self.phase = JudgePhase::Checking(Box::new(run));
+        Ok(Next::Call(check))
+    }
+}
+
+impl Operation for Judge {
+    type Output = Verdict;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<Verdict>, StoreError> {
+        Ok(match self.install() {
+            Some(install) => Next::Call(IoCall::child(PrerequisitesHeld::new(install))),
+            None => Next::Done(Verdict::Unready),
+        })
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Verdict>, StoreError> {
+        match std::mem::replace(&mut self.phase, JudgePhase::Prerequisites) {
+            JudgePhase::Prerequisites => {
+                let held = answer.child::<bool, AccountError>()?;
+                match held.map_err(|error| StoreError(error.0))? {
+                    true => self.check(),
+                    false => Ok(Next::Done(Verdict::Unready)),
+                }
+            }
+            JudgePhase::Checking(run) => {
+                let checked = answer.child::<PluginInstall, CallError>()?;
+                Ok(Next::Done(match checked {
+                    Ok(_) => Verdict::Run(run),
+                    Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
+                        Verdict::Unavailable
+                    }
+                    Err(CallError(error)) => Verdict::Denied(error.message),
+                }))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum RowPhase {
+    Seen,
+    Late,
+    Judging,
+    Deciding,
+}
+
+/// One event's outcome. Busy writes nothing, so the sender keeps the row and sends it again.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DecideRow {
+    config: Arc<RealmConfigDocument>,
+    local: NodeId,
+    row: ForwardRow,
+    now_ms: u64,
+    phase: RowPhase,
+}
+
+impl DecideRow {
+    fn new(config: Arc<RealmConfigDocument>, local: NodeId, row: ForwardRow, now_ms: u64) -> Self {
+        Self {
+            config,
+            local,
+            row,
+            now_ms,
+            phase: RowPhase::Seen,
+        }
+    }
+}
+
+impl Operation for DecideRow {
+    type Output = Outcome;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<Outcome>, StoreError> {
+        Ok(Next::Call(IoCall::child(seen_outcome(&self.row))))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Outcome>, StoreError> {
+        match self.phase {
+            RowPhase::Seen => {
+                if let Some(outcome) = answer.child::<Option<Outcome>, StoreError>()?? {
+                    return Ok(Next::Done(outcome));
+                }
+                // Its dedup record would be gone, so a run now could repeat one already made.
+                let kept_until = self.row.event.anchor_ms.saturating_add(DEDUP_RETENTION_MS);
+                if self.now_ms > kept_until {
+                    self.phase = RowPhase::Late;
+                    let late = GapCount::new(self.local, &self.row, GapReason::Late);
+                    return Ok(Next::Call(IoCall::child(LateEvent(late))));
+                }
+                self.phase = RowPhase::Judging;
+                let config = self.config.clone();
+                let judge = Judge::new(config, self.local, self.row.clone(), self.now_ms);
+                Ok(Next::Call(IoCall::child(judge)))
+            }
+            RowPhase::Late => {
+                answer.child::<(), StoreError>()??;
+                Ok(Next::Done(Outcome::Expired))
+            }
+            RowPhase::Judging => {
+                let verdict = answer.child::<Verdict, StoreError>()??;
+                self.phase = RowPhase::Deciding;
+                let decide = decide_event(verdict, &self.row, self.now_ms)?;
+                Ok(Next::Call(IoCall::child(decide)))
+            }
+            RowPhase::Deciding => Ok(Next::Done(answer.child::<Outcome, StoreError>()??)),
+        }
+    }
+}
+
+/// Decides each event of a batch from `sender` and keeps its newest gap reports. The caller holds
+/// `ADMISSIONS` while it runs.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DecideBatch {
+    config: Arc<RealmConfigDocument>,
+    local: NodeId,
+    sender: NodeId,
+    now_ms: u64,
+    events: VecDeque<ForwardRow>,
+    gaps: Vec<(Ulid, GapRow)>,
+    current: Option<(Ulid, String)>,
+    decisions: Decisions,
+}
+
+impl DecideBatch {
+    pub(crate) fn new(
+        config: Arc<RealmConfigDocument>,
+        (local, sender): (NodeId, NodeId),
+        batch: EventBatch,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            config,
+            local,
+            sender,
+            now_ms,
+            events: batch.events.into(),
+            gaps: batch.gaps,
+            current: None,
+            decisions: Decisions::default(),
+        }
+    }
+
+    fn advance(&mut self) -> IoCall {
+        let Some(row) = self.events.pop_front() else {
+            self.current = None;
+            let gaps = std::mem::take(&mut self.gaps);
+            return IoCall::child(keep_reports(self.sender, gaps));
+        };
+        self.current = Some((row.install_id, row.event.source.clone()));
+        let config = self.config.clone();
+        IoCall::child(DecideRow::new(config, self.local, row, self.now_ms))
+    }
+}
+
+impl Operation for DecideBatch {
+    type Output = Decisions;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<Decisions>, StoreError> {
+        Ok(Next::Call(self.advance()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Decisions>, StoreError> {
+        let Some((install_id, source)) = self.current.take() else {
+            let kept = answer.child::<Vec<(Ulid, SourceKind, GapReason, u64)>, StoreError>()??;
+            self.decisions.gaps = kept;
+            return Ok(Next::Done(std::mem::take(&mut self.decisions)));
+        };
+        let outcome = answer.child::<Outcome, StoreError>()??;
+        self.decisions.events.push((install_id, source, outcome));
+        Ok(Next::Call(self.advance()))
+    }
 }
 
 #[cfg(test)]

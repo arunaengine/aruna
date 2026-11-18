@@ -668,7 +668,6 @@ mod tests {
     use super::*;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
-    use aruna_net::NetConfig;
     use aruna_storage::storage::FjallStorage;
 
     // The relaying peer must learn that a pinned observation is gone (NotFound)
@@ -765,7 +764,9 @@ mod tests {
     async fn preserve_allows_native() {
         let tempdir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let net = NetHandle::new(NetConfig::default(), storage).await.unwrap();
+        let net = NetHandle::new(crate::testing::local_net(), storage)
+            .await
+            .unwrap();
         let peer = iroh::SecretKey::generate().public();
         let realm_id = *net.realm_id();
         let mut relationship = SyncRelationship {

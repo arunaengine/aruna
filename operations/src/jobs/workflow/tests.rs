@@ -831,11 +831,8 @@ async fn finalize_renews_lease() {
 async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::NetHandle) {
     let net = aruna_net::NetHandle::new(
         aruna_net::NetConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
             realm_id: aruna_core::structs::identity::realm::RealmId([1; 32]),
-            discovery_method: aruna_net::DiscoveryMethod::None,
-            relay_method: aruna_net::RelayMethod::None,
-            ..aruna_net::NetConfig::default()
+            ..crate::testing::local_net()
         },
         storage.clone(),
     )

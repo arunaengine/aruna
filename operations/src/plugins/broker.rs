@@ -4,17 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::metadata::forward::routed_export::RoutedExportOperation;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aruna_core::NodeId;
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::{
-    CallIntent, LogLine, PluginRun, StateRefusal, StateRemoval, StateWrite,
-};
+use aruna_core::plugin_runs::{LogLine, PluginRun, StateRemoval, StateWrite};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
 use aruna_core::structs::execution::job::UploadForm;
@@ -37,7 +33,7 @@ use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::check::{RunScope, authorize_call, check_call, matching};
+use super::check::{Authorize, CallError, CheckCall, RunScope, matching};
 use super::creates::{
     Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
 };
@@ -47,20 +43,22 @@ use super::dataset::{
 };
 use super::grants::{install_scope, object_path, parse_grants, patterns_for, restricted_account};
 use super::held::{HeldSecrets, ask_release};
+use super::host_calls::{
+    CallEnd, CallFailure, ObjectInfoCall, ObjectListCall, RecordCall, StateCall, StateChange,
+    begun_reply, call_intent, version_id,
+};
 use super::install::{pick_version, read_config, read_manifest};
-use super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row, written};
-use super::jobs::{cancel_job, job_outputs, job_row, job_status};
-use super::marks::{MARKED, is_marked};
+use super::intents::{begin, unknown_row, written};
+use super::jobs::{cancel_job, job_outputs, job_row, job_status, start_work};
+use super::objects::{LocalObject, Unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
 use super::outgoing::{
     declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
 };
 use super::rate::take_call;
-use super::rows::{delete_rows, write_rows};
-use super::state::{MAX_STATE_KEY, PutError, put_state, read_state, remove_state};
-use super::submit::{
-    CopyRequest, DownloadRequest, UploadRequest, start_copy, start_download, start_upload,
-};
+use super::rows::write_rows;
+use super::state::{MAX_STATE_KEY, read_state};
+use super::submit::{CopyRequest, DownloadRequest, UploadRequest, WorkRequest};
 use super::unavailable;
 use super::work::RequestContext;
 use crate::auth::error::AuthorizeError;
@@ -79,10 +77,8 @@ use crate::metadata::forward::write::{
     CreateAuthorizedError, PinnedCreate, create_with_id, route_metadata_update,
 };
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
-use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::entity_patch::craqle_patch_request;
 use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
 
@@ -140,7 +136,8 @@ impl RunBroker {
         &self,
         target: Option<(Permission, &str)>,
     ) -> Result<PluginInstall, HostError> {
-        let install = check_call(&self.ctx, &self.scope, target).await?;
+        let check = CheckCall::new(&self.scope, target);
+        let install = drive(check, &self.ctx).await?;
         match take_call(install.install_id, std::time::Instant::now()) {
             true => Ok(install),
             false => Err(HostError::new(
@@ -299,9 +296,9 @@ impl RunBroker {
         (actor, auth): (Actor, &AuthContext),
         (install, key): (&PluginInstall, &str),
         minted: PinnedCreate,
-    ) -> Result<String, Outcome> {
+    ) -> Result<String, CallEnd> {
         let stored = drive(claim_key((install, key), minted), &self.ctx).await;
-        let (pinned, claim) = stored.map_err(|error| Outcome::None(unavailable(error.0)))?;
+        let (pinned, claim) = stored.map_err(|error| CallEnd::None(unavailable(error.0)))?;
         let mut lookup = None;
         loop {
             match next_step(claim, lookup) {
@@ -313,8 +310,8 @@ impl RunBroker {
                     // later call correct them. An unknown one keeps them fixed.
                     let rejected = match &outcome {
                         Ok(_) => Some(false),
-                        Err(Outcome::None(error)) => Some(error.kind == ErrorKind::Invalid),
-                        Err(Outcome::Maybe(_)) => None,
+                        Err(CallEnd::None(error)) => Some(error.kind == ErrorKind::Invalid),
+                        Err(CallEnd::Maybe(_)) => None,
                     };
                     if let Some(rejected) = rejected {
                         self.settle((install, key), rejected).await;
@@ -332,7 +329,7 @@ impl RunBroker {
                 }
                 Step::Unknown => {
                     let reason = "the document of an earlier create with this key is not reachable";
-                    return Err(Outcome::Maybe(reason.to_string()));
+                    return Err(CallEnd::Maybe(reason.to_string()));
                 }
             }
         }
@@ -465,44 +462,25 @@ impl RunBroker {
         }
     }
 
-    /// Runs a fresh effect's outcome into its intent: a reply settles it, a refusal that had
-    /// no effect clears it, and an error that may have committed leaves it unknown.
+    /// Records a fresh effect's outcome in its intent.
     async fn record(
         &self,
         intent: &Intent,
-        outcome: Result<String, Outcome>,
+        outcome: Result<String, CallEnd>,
     ) -> Result<String, HostError> {
         let run_id = self.scope.run.run_id;
-        match outcome {
-            Ok(reply) => {
-                let settled = settled_row(run_id, &call_intent(intent), reply.clone());
-                let written = match settled {
-                    Ok(row) => drive(write_rows(vec![row]), &self.ctx).await,
-                    Err(error) => Err(error),
-                };
-                match written {
-                    Ok(()) => Ok(reply),
-                    Err(error) => Err(self.unknown(intent, &error.0).await),
-                }
-            }
-            Err(Outcome::None(error)) => {
-                self.clear(intent).await?;
-                Err(error)
-            }
-            Err(Outcome::Maybe(reason)) => Err(self.unknown(intent, &reason).await),
+        let record = RecordCall::new(run_id, call_intent(intent), outcome);
+        drive(record, &self.ctx)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// The error of a failed call; one that differs from an earlier attempt marks the run.
+    fn failed(&self, failure: CallFailure) -> HostError {
+        if failure.changed {
+            self.changed.store(true, Ordering::Relaxed);
         }
-    }
-
-    /// Removes the intent of a call that ended without an effect, so it may be made again.
-    async fn clear(&self, intent: &Intent) -> Result<(), HostError> {
-        let call = call_intent(intent);
-        let clear = delete_rows(vec![intent_row_key(self.scope.run.run_id, &call)]);
-        (drive(clear, &self.ctx).await).map_err(|error| unavailable(error.0))
-    }
-
-    async fn unknown(&self, intent: &Intent, reason: &str) -> HostError {
-        self.mark_unknown(intent, reason).await;
-        HostError::new(ErrorKind::UnknownOutcome, reason)
+        failure.error
     }
 
     /// Marks a call whose effect may have happened without a recorded reply; a failure leaves the
@@ -516,18 +494,8 @@ impl RunBroker {
     /// The intent's earlier outcome, or `None` when the effect may be dispatched now.
     async fn begun(&self, intent: &Intent) -> Result<Option<String>, HostError> {
         let begun = drive(begin(self.scope.run.run_id, call_intent(intent)), &self.ctx).await;
-        match begun.map_err(|error| unavailable(error.0))? {
-            Begun::Fresh => Ok(None),
-            Begun::Settled(reply) => Ok(Some(reply)),
-            Begun::Changed => {
-                self.changed.store(true, Ordering::Relaxed);
-                Err(HostError::new(
-                    ErrorKind::Conflict,
-                    "the call differs from an earlier attempt",
-                ))
-            }
-            Begun::Unknown(reason) => Err(HostError::new(ErrorKind::UnknownOutcome, reason)),
-        }
+        let begun = begun.map_err(|error| unavailable(error.0))?;
+        begun_reply(begun).map_err(|failure| self.failed(failure))
     }
 
     /// Starts native work through the run's call history: other arguments at a known ordinal are
@@ -547,7 +515,7 @@ impl RunBroker {
         // A refused start leaves no job, or one its work row finds again, so the call may be made
         // again; its intent goes.
         let outcome = start.await.map(|work_id| work_id.to_string());
-        self.record(intent, outcome.map_err(Outcome::None)).await
+        self.record(intent, outcome.map_err(CallEnd::None)).await
     }
 
     /// The full permission path of an object path the plugin gave; see [`object_path`].
@@ -563,7 +531,7 @@ impl RunBroker {
         path: &str,
     ) -> Result<(String, String), HostError> {
         let place = (self.scope.realm_id, self.scope.local);
-        local_object(&self.ctx, place, install, path).await
+        Ok(drive(LocalObject::new(place, install, path), &self.ctx).await?)
     }
 }
 
@@ -579,67 +547,12 @@ impl RunBroker {
         let Ok(patterns) = matching(install, permission, target) else {
             return Ok(false);
         };
-        match authorize_call(&self.ctx, install, permission, target, &patterns).await {
+        let check = Authorize::call(install, permission, target, &patterns);
+        match drive(check, &self.ctx).await {
             Ok(()) => Ok(true),
-            Err(error) if error.kind == ErrorKind::Unavailable => Err(error),
+            Err(CallError(error)) if error.kind == ErrorKind::Unavailable => Err(error),
             Err(_) => Ok(false),
         }
-    }
-
-    /// Whether a job with a secret wrote this version of `bucket/key`.
-    async fn marked(&self, bucket: &str, key: &str, version: &str) -> Result<bool, HostError> {
-        let Ok(version_id) = Ulid::from_string(version) else {
-            return Ok(false);
-        };
-        let marked = match is_marked((bucket, key, version_id)) {
-            Ok(marked) => drive(marked, &self.ctx).await,
-            Err(error) => Err(error),
-        };
-        marked.map_err(|error| unavailable(error.0))
-    }
-
-    /// The listed objects of a local bucket the account may read, each named by the permission
-    /// path of its own bucket and key, never by the text of the listing prefix.
-    async fn visible(
-        &self,
-        install: &PluginInstall,
-        bucket: &str,
-        objects: Vec<(String, u64, String)>,
-    ) -> Result<Vec<ObjectInfo>, HostError> {
-        let (realm, group, node) = (self.scope.realm_id, install.group_id, self.scope.local);
-        let mut visible = Vec::new();
-        for (key, size, version) in objects {
-            let path = object_permission_path(realm, group, node, bucket, &key);
-            if self
-                .authorized(install, Permission::ObjectsRead, &path)
-                .await?
-            {
-                let marked = self.marked(bucket, &key, &version).await?;
-                visible.push(ObjectInfo {
-                    path: format!("{bucket}/{key}"),
-                    size,
-                    version,
-                    marked,
-                });
-            }
-        }
-        Ok(visible)
-    }
-}
-
-/// The core intent of a guest call.
-pub(crate) fn call_intent(intent: &Intent) -> CallIntent {
-    CallIntent {
-        ordinal: intent.ordinal,
-        digest: intent.digest,
-    }
-}
-
-/// The guest error kind of a refused state write.
-fn refused_kind(refusal: StateRefusal) -> ErrorKind {
-    match refusal {
-        StateRefusal::Limit => ErrorKind::Limit,
-        StateRefusal::Conflict => ErrorKind::Conflict,
     }
 }
 
@@ -654,59 +567,12 @@ fn check_key(key: &str) -> Result<(), HostError> {
     }
 }
 
-/// The version id a plugin gave as text.
-fn version_id(text: &str) -> Result<Ulid, HostError> {
-    let invalid = || HostError::new(ErrorKind::Invalid, format!("`{text}` is not a version id"));
-    Ulid::from_string(text).map_err(|_| invalid())
-}
-
 /// A byte bound as people read it: `1 MiB` rather than `1048576 bytes`.
 fn byte_size(bytes: usize) -> String {
     match bytes % (1 << 20) {
         0 => format!("{} MiB", bytes >> 20),
         _ => format!("{bytes} bytes"),
     }
-}
-
-/// The bucket and key on `local` of an object path below the install's group data; a bucket of
-/// another node or another group is refused.
-pub(crate) async fn local_object(
-    ctx: &DriverContext,
-    (realm_id, local): (aruna_core::structs::identity::realm::RealmId, NodeId),
-    install: &PluginInstall,
-    path: &str,
-) -> Result<(String, String), HostError> {
-    let invalid = || HostError::new(ErrorKind::Invalid, format!("{path} is not an object path"));
-    let root = format!("/{realm_id}/g/{}/data/", install.group_id);
-    let rest = path.strip_prefix(&root).ok_or_else(invalid)?;
-    let mut parts = rest.splitn(3, '/');
-    let (node, bucket) = (
-        parts.next().unwrap_or_default(),
-        parts.next().ok_or_else(invalid)?,
-    );
-    let key = parts.next().unwrap_or_default().to_string();
-    let node = NodeId::from_str(node).map_err(|_| invalid())?;
-    if node != local {
-        return Err(unavailable(
-            "objects of another node are not reachable from plugins yet",
-        ));
-    }
-    let info = drive(GetBucketOperation::new(bucket.to_string()), ctx).await;
-    match info {
-        Ok(info) if info.group_id == install.group_id => Ok((bucket.to_string(), key)),
-        _ => Err(HostError::new(
-            ErrorKind::NotFound,
-            format!("no bucket at {path}"),
-        )),
-    }
-}
-
-/// How a mutating call ended without a reply.
-enum Outcome {
-    /// It had no effect.
-    None(HostError),
-    /// It may have had its effect.
-    Maybe(String),
 }
 
 #[async_trait]
@@ -903,7 +769,7 @@ impl Broker for RunBroker {
                 let key = (&install, create.key.as_str());
                 self.keyed_create((actor, &auth), key, minted).await
             }
-            Err(error) => Err(Outcome::None(unavailable(error.to_string()))),
+            Err(error) => Err(CallEnd::None(unavailable(error.to_string()))),
         };
         let reply = self.record(&create.intent, outcome).await?;
         stored_created(&reply)
@@ -943,24 +809,10 @@ impl Broker for RunBroker {
     ) -> Result<ObjectInfo, HostError> {
         let path = self.expand(text)?;
         let (install, _) = self.checked(Permission::ObjectsRead, &path).await?;
-        let (bucket, key) = self.object_at(&install, &path).await?;
-        let short = format!("{bucket}/{key}");
-        // A given version is checked as the current one: the same grant, and its own mark.
-        let input = HeadObjectInput {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id: (version.as_deref()).map(version_id).transpose()?,
-        };
-        let head = drive(HeadObjectOperation::new(input), &self.ctx).await;
-        let head =
-            head.map_err(|_| HostError::new(ErrorKind::NotFound, format!("no object at {path}")))?;
-        let version = (head.resolved_version_id.map(|id| id.to_string())).unwrap_or_default();
-        Ok(ObjectInfo {
-            path: short,
-            size: head.location.map_or(0, |location| location.blob_size),
-            marked: self.marked(&bucket, &key, &version).await?,
-            version,
-        })
+        let place = (self.scope.realm_id, self.scope.local);
+        let info = ObjectInfoCall::new(place, &install, &path, version.as_deref())?;
+        let info = drive(info, &self.ctx).await;
+        info.map_err(|failure| self.failed(failure))
     }
 
     async fn objects_list(
@@ -970,42 +822,11 @@ impl Broker for RunBroker {
         cursor: Option<String>,
     ) -> Result<ObjectPage, HostError> {
         let (install, _) = self.listing(Permission::ObjectsRead).await?;
-        let (bucket, key) = self.object_at(&install, &self.expand(prefix)?).await?;
-        let invalid = || HostError::new(ErrorKind::Invalid, "bad cursor");
-        let token = match cursor {
-            Some(cursor) => Some(
-                ListContinuationToken::from_bytes(&hex::decode(cursor).map_err(|_| invalid())?)
-                    .map_err(|_| invalid())?,
-            ),
-            None => None,
-        };
-        let input = ListBucketInput {
-            bucket: bucket.clone(),
-            group_id: install.group_id,
-            continuation_token: token,
-            max_keys: Some(PAGE),
-            prefix: (!key.is_empty()).then_some(key),
-            delimiter: None,
-            start_after: None,
-        };
-        let listed = drive(ListBucketOperation::new(input), &self.ctx).await;
-        let listed = listed.map_err(|error| unavailable(error.to_string()))?;
-        let listed_objects = (listed.objects.into_iter())
-            .map(|object| {
-                let size = object.location.map_or(0, |location| location.blob_size);
-                (object.head.key, size, object.version_id.to_string())
-            })
-            .collect();
-        let objects = self.visible(&install, &bucket, listed_objects).await?;
-        let cursor = match listed.continuation_token {
-            Some(token) => Some(hex::encode(
-                token
-                    .to_bytes()
-                    .map_err(|error| unavailable(error.to_string()))?,
-            )),
-            None => None,
-        };
-        Ok(ObjectPage { objects, cursor })
+        let prefix = self.expand(prefix)?;
+        let place = (self.scope.realm_id, self.scope.local);
+        let list = ObjectListCall::new(place, &install, &prefix, cursor.as_deref())?;
+        let page = drive(list, &self.ctx).await;
+        page.map_err(|failure| self.failed(failure))
     }
 
     async fn objects_read(
@@ -1019,7 +840,7 @@ impl Broker for RunBroker {
         let (bucket, key) = self.object_at(&install, &path).await?;
         let version = (version.as_deref()).map(version_id).transpose()?;
         let missing = || HostError::new(ErrorKind::NotFound, format!("no object at {path}"));
-        let version = unmarked(&self.ctx, (&bucket, &key), version).await?;
+        let version = drive(Unmarked::new((&bucket, &key), version), &self.ctx).await?;
         let input = GetObjectInput {
             bucket,
             key,
@@ -1073,7 +894,9 @@ impl Broker for RunBroker {
             target: self.expand(&copy.target)?,
             ordinal: copy.intent.ordinal,
         };
-        let started = self.native(&copy.intent, start_copy(&self.ctx, &self.scope, request));
+        let request = WorkRequest::Copy(request);
+        let start = start_work(&self.ctx, &self.scope, request);
+        let started = self.native(&copy.intent, start);
         match started.await {
             Err(error) if error.kind == ErrorKind::Conflict => {
                 self.changed.store(true, Ordering::Relaxed);
@@ -1113,7 +936,8 @@ impl Broker for RunBroker {
             secret: ready.secret,
             ordinal: download.intent.ordinal,
         };
-        let started = start_download(&self.ctx, &self.scope, request);
+        let request = WorkRequest::Download(request);
+        let started = start_work(&self.ctx, &self.scope, request);
         match self.native(&download.intent, started).await {
             Err(error) if error.kind == ErrorKind::Conflict => {
                 self.changed.store(true, Ordering::Relaxed);
@@ -1157,7 +981,8 @@ impl Broker for RunBroker {
             form,
             ordinal: upload.intent.ordinal,
         };
-        let started = start_upload(&self.ctx, &self.scope, request);
+        let request = WorkRequest::Upload(request);
+        let started = start_work(&self.ctx, &self.scope, request);
         match self.native(&upload.intent, started).await {
             Err(error) if error.kind == ErrorKind::Conflict => {
                 self.changed.store(true, Ordering::Relaxed);
@@ -1220,50 +1045,28 @@ impl Broker for RunBroker {
     async fn state_put(&self, _cx: &CallContext, put: StatePut) -> Result<u64, HostError> {
         check_key(&put.key)?;
         let install = self.admitted(None).await?;
-        if let Some(reply) = self.begun(&put.intent).await? {
-            return reply
-                .parse()
-                .map_err(|_| unavailable("a stored reply is not a version"));
-        }
-        let run_id = self.scope.run.run_id;
-        let intent = put.intent.clone();
-        let write = StateWrite {
+        let change = StateChange::Put(StateWrite {
+            intent: call_intent(&put.intent),
             key: put.key,
             value: put.value,
             expected: put.expected,
-            intent: call_intent(&intent),
-        };
-        match drive(put_state(run_id, install.install_id, write), &self.ctx).await {
-            Ok(version) => Ok(version),
-            Err(PutError::Refused(message, refusal)) => {
-                self.clear(&intent).await?;
-                Err(HostError::new(refused_kind(refusal), message))
-            }
-            Err(PutError::Store(error)) => Err(self.unknown(&intent, &error.0).await),
-        }
+        });
+        let ids = (self.scope.run.run_id, install.install_id);
+        let put = drive(StateCall::new(ids, change), &self.ctx).await;
+        put.map_err(|failure| self.failed(failure))
     }
 
     async fn state_remove(&self, _cx: &CallContext, remove: StateRemove) -> Result<(), HostError> {
         check_key(&remove.key)?;
         let install = self.admitted(None).await?;
-        if self.begun(&remove.intent).await?.is_some() {
-            return Ok(());
-        }
-        let run_id = self.scope.run.run_id;
-        let intent = remove.intent.clone();
-        let removal = StateRemoval {
+        let change = StateChange::Remove(StateRemoval {
+            intent: call_intent(&remove.intent),
             key: remove.key,
             expected: remove.expected,
-            intent: call_intent(&intent),
-        };
-        match drive(remove_state(run_id, install.install_id, removal), &self.ctx).await {
-            Ok(()) => Ok(()),
-            Err(PutError::Refused(message, refusal)) => {
-                self.clear(&intent).await?;
-                Err(HostError::new(refused_kind(refusal), message))
-            }
-            Err(PutError::Store(error)) => Err(self.unknown(&intent, &error.0).await),
-        }
+        });
+        let ids = (self.scope.run.run_id, install.install_id);
+        let removed = drive(StateCall::new(ids, change), &self.ctx).await;
+        removed.map(drop).map_err(|failure| self.failed(failure))
     }
 
     async fn secret_value(&self, _cx: &CallContext, slot: &str) -> Result<Vec<Field>, HostError> {
@@ -1307,41 +1110,6 @@ impl Broker for RunBroker {
     }
 }
 
-/// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
-/// when it is marked; `None` when there is no such object, so nothing is read either.
-pub(crate) async fn unmarked(
-    ctx: &DriverContext,
-    (bucket, key): (&str, &str),
-    version: Option<Ulid>,
-) -> Result<Option<Ulid>, HostError> {
-    let head = HeadObjectInput {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        version_id: version,
-    };
-    let resolved = match drive(HeadObjectOperation::new(head), ctx).await {
-        Ok(head) => head.resolved_version_id.or(version),
-        Err(error) if absent(&error) => return Ok(None),
-        Err(error) => return Err(unavailable(error.to_string())),
-    };
-    let Some(resolved) = resolved else {
-        return Ok(None);
-    };
-    let marked = is_marked((bucket, key, resolved)).map_err(|error| unavailable(error.0))?;
-    match drive(marked, ctx).await {
-        Ok(false) => Ok(Some(resolved)),
-        Ok(true) => Err(HostError::new(ErrorKind::Denied, MARKED)),
-        Err(error) => Err(unavailable(error.0)),
-    }
-}
-
-pub(crate) fn absent(error: &HeadObjectError) -> bool {
-    matches!(
-        error,
-        HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion | HeadObjectError::DeleteMarker
-    )
-}
-
 /// File entities one page asks for; a page over the byte bound comes back smaller.
 const FILE_PAGE: usize = 100;
 
@@ -1349,8 +1117,8 @@ const FILE_PAGE: usize = 100;
 const MAX_KEY: usize = 256;
 
 /// Whether a failed create had no effect, or may have had one.
-fn create_outcome(error: CreateAuthorizedError) -> Outcome {
-    let none = |kind, message: String| Outcome::None(HostError::new(kind, message));
+fn create_outcome(error: CreateAuthorizedError) -> CallEnd {
+    let none = |kind, message: String| CallEnd::None(HostError::new(kind, message));
     match error {
         CreateAuthorizedError::EmptyPath => none(ErrorKind::Invalid, error.to_string()),
         CreateAuthorizedError::Forbidden
@@ -1358,7 +1126,7 @@ fn create_outcome(error: CreateAuthorizedError) -> Outcome {
             AuthorizeError::PermissionDenied | AuthorizeError::Policy(_),
         ) => none(ErrorKind::Denied, error.to_string()),
         CreateAuthorizedError::Authorize(_) | CreateAuthorizedError::Api(_) => {
-            Outcome::None(unavailable(error.to_string()))
+            CallEnd::None(unavailable(error.to_string()))
         }
         CreateAuthorizedError::Create(CreateDocumentError::MetadataError(
             MetadataError::ProfileValidation(_)
@@ -1366,9 +1134,9 @@ fn create_outcome(error: CreateAuthorizedError) -> Outcome {
             | MetadataError::InvalidInput(_),
         )) => none(ErrorKind::Invalid, error.to_string()),
         CreateAuthorizedError::Create(CreateDocumentError::HoldsNoBucket) => {
-            Outcome::None(unavailable(error.to_string()))
+            CallEnd::None(unavailable(error.to_string()))
         }
-        CreateAuthorizedError::Create(_) => Outcome::Maybe(error.to_string()),
+        CreateAuthorizedError::Create(_) => CallEnd::Maybe(error.to_string()),
         CreateAuthorizedError::Write(error) => write_outcome(error),
     }
 }
@@ -1395,8 +1163,8 @@ fn api_error(error: MetadataApiError) -> HostError {
 }
 
 /// Whether a failed write had no effect, or may have had one.
-fn write_outcome(error: MetadataWriteError) -> Outcome {
-    let none = |kind, message: String| Outcome::None(HostError::new(kind, message));
+fn write_outcome(error: MetadataWriteError) -> CallEnd {
+    let none = |kind, message: String| CallEnd::None(HostError::new(kind, message));
     match error {
         MetadataWriteError::Unauthorized | MetadataWriteError::Forbidden => {
             none(ErrorKind::Denied, error.to_string())
@@ -1406,10 +1174,10 @@ fn write_outcome(error: MetadataWriteError) -> Outcome {
             none(ErrorKind::Conflict, error.to_string())
         }
         MetadataWriteError::Update(UpdateDocumentError::GraphPending { .. }) => {
-            Outcome::None(unavailable(error.to_string()))
+            CallEnd::None(unavailable(error.to_string()))
         }
         MetadataWriteError::Update(UpdateDocumentError::StorageError(_))
-        | MetadataWriteError::Undeliverable(_) => Outcome::Maybe(error.to_string()),
+        | MetadataWriteError::Undeliverable(_) => CallEnd::Maybe(error.to_string()),
         other => none(ErrorKind::Invalid, other.to_string()),
     }
 }
@@ -1455,8 +1223,8 @@ impl RunBroker {
                 })
             }
             Err(SendError::TooLarge { status }) => Ok(too_large(status)),
-            Err(SendError::NotSent(why)) => Err(Outcome::None(unavailable(why))),
-            Err(SendError::Unknown(why)) => Err(Outcome::Maybe(why)),
+            Err(SendError::NotSent(why)) => Err(CallEnd::None(unavailable(why))),
+            Err(SendError::Unknown(why)) => Err(CallEnd::Maybe(why)),
         };
         stored_whole(&self.record(&intent, outcome).await?)
     }

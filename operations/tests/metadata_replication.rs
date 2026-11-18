@@ -1296,7 +1296,7 @@ async fn install_realm_config(
     // Run startup reconciliation until no missing genesis schedules another pass.
     for _ in 0..3 {
         for node in nodes {
-            aruna_operations::node::startup::restore_shard_subscriptions(
+            aruna_operations::shard::restore::restore_shard_subscriptions(
                 &node.context,
                 node.net.node_id(),
                 *realm_id,

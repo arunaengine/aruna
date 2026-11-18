@@ -398,7 +398,7 @@ pub(crate) async fn ensure_record_readable(
             Some(txn_id) => policies_in(context, realm_id, record.group_id, txn_id)
                 .await
                 .and_then(|evaluator| evaluator.evaluate(&request)),
-            None => crate::auth::enforcement::enforce_policies(context, realm_id, &request).await,
+            None => crate::auth::policy_load::enforce_policies(context, realm_id, &request).await,
         };
         return result.map_err(|_| MetadataApiError::NotFound);
     }
@@ -432,7 +432,7 @@ pub(crate) async fn can_read_record(
     record: &MetadataRegistryRecord,
 ) -> Result<bool, MetadataApiError> {
     if record.public {
-        let allowed = crate::auth::enforcement::enforce_policies(
+        let allowed = crate::auth::policy_load::enforce_policies(
             context,
             realm_id,
             &crate::auth::request_policy::policy_request_with(
@@ -522,7 +522,7 @@ pub(super) async fn ensure_permission(
             .await
             .and_then(|evaluator| evaluator.evaluate(&request))
             .map_err(|_| MetadataApiError::Forbidden)?,
-        None => crate::auth::enforcement::enforce_policies(context, realm_id, &request)
+        None => crate::auth::policy_load::enforce_policies(context, realm_id, &request)
             .await
             .map_err(|_| MetadataApiError::Forbidden)?,
     }

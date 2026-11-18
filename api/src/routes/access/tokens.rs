@@ -15,7 +15,8 @@ use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::forward::token::forward_token_revoke;
+use aruna_operations::forward::entry::forward_token_revoke;
+use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -121,6 +122,7 @@ pub async fn revoke_token(
             request.token.clone(),
         )
         .await
+        .map_err(MetadataApiError::from)
         .map_err(map_api_error)?;
         return Ok(StatusCode::NO_CONTENT);
     }

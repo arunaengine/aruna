@@ -3,18 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
 
+use super::access::{LoadAccessOperation, MembersCheckOperation};
 use super::view::{FilePage, ReleaseView, ReleaseViewOperation, ViewConfig, ViewError};
-use super::{
-    Access, BucketScope, MembersConfig, MembersOutput, MembershipCaller, MembershipQuery,
-    ReleaseError, ReleaseMembersOperation,
-};
-use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::BucketAccess;
+use super::{Access, BucketScope, MembersOutput, MembershipCaller, MembershipQuery, ReleaseError};
 use crate::driver::{DriverContext, drive};
 
 /// Loads the caller's access once, then runs the membership check.
@@ -24,20 +18,7 @@ pub async fn release_members(
     caller: MembershipCaller<'_>,
     queries: &[MembershipQuery],
 ) -> Result<MembersOutput, ReleaseError> {
-    let access = load_access(context, scope, caller.auth).await?;
-    let config = MembersConfig {
-        realm_id: scope.realm_id,
-        node_id: scope.node_id,
-        bucket: scope.bucket.to_string(),
-        info: scope.info.clone(),
-        auth: caller.auth.clone(),
-        access,
-        bearer: caller.bearer.map(str::to_string),
-        queries: queries.to_vec(),
-        ranges: None,
-        retention: false,
-    };
-    drive(ReleaseMembersOperation::new(config), context).await
+    drive(MembersCheckOperation::new(scope, caller, queries), context).await
 }
 
 /// The caller's rules and policies for the bucket, read once for every key they decide.
@@ -46,12 +27,7 @@ pub async fn load_access(
     scope: BucketScope<'_>,
     auth: &AuthContext,
 ) -> Result<Access, ReleaseError> {
-    let place = (scope.realm_id, scope.info.group_id, scope.node_id);
-    match BucketAccess::load(context, auth, place, scope.bucket).await {
-        Ok(access) => Ok(Access(Arc::new(access))),
-        Err(AuthorizeError::Storage(error)) => Err(ReleaseError::Unavailable(error.to_string())),
-        Err(error) => Err(ReleaseError::Unavailable(error.to_string())),
-    }
+    drive(LoadAccessOperation::new(scope, auth), context).await
 }
 
 /// Lists one page of a release's files after checking the caller may read its crate.

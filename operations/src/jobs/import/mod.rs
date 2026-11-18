@@ -1519,9 +1519,10 @@ async fn ensure_targets(
 /// An import of another realm's artifact starts or resumes only after its source confirms the
 /// grant: a refusal fails the job, an unreachable source waits for the next pull or push.
 async fn ensure_source(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
-    use crate::federation::import::{ImportError, confirm_source};
+    use crate::federation::import::{ConfirmSourceOperation, ImportError};
     ensure_federated(ctx, spec).await?;
-    confirm_source(&ctx.driver, spec, SOURCE_TIMEOUT)
+    let confirm = ConfirmSourceOperation::new(spec, SOURCE_TIMEOUT);
+    crate::driver::drive(confirm, ctx.driver.as_ref())
         .await
         .map_err(|error| match error {
             ImportError::Storage(error) => ImportFailure::Retryable(error),
@@ -1532,9 +1533,10 @@ async fn ensure_source(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(),
 
 /// An import of another realm's artifact keeps its intent binding and import policies.
 async fn ensure_federated(ctx: &JobContext, spec: &ImportRoCrateSpec) -> Result<(), ImportFailure> {
-    use crate::federation::import::{ImportError, recheck_import};
+    use crate::federation::import::{ImportError, RecheckImportOperation};
     let now = aruna_core::time::unix_timestamp_secs();
-    recheck_import(&ctx.driver, spec, ctx.owner_node_id, now)
+    let recheck = RecheckImportOperation::new(spec.clone(), ctx.owner_node_id, now);
+    crate::driver::drive(recheck, ctx.driver.as_ref())
         .await
         .map_err(|error| match error {
             ImportError::Storage(error) => ImportFailure::Retryable(error),

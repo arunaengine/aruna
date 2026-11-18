@@ -32,7 +32,7 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId};
 use aruna_core::{NodeId, StructuredId, UserId};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::{
@@ -700,7 +700,7 @@ async fn spawn_single() -> Result<Node, BoxError> {
     let storage = FjallStorage::open(dir.path().to_str().ok_or("invalid storage path")?)?;
     let blob_root = dir.path().join("blobstore");
     std::fs::create_dir_all(&blob_root)?;
-    let net = NetHandle::new(NetConfig::default(), storage.clone()).await?;
+    let net = NetHandle::new(aruna_operations::testing::local_net(), storage.clone()).await?;
     let backend = BackendConfig {
         backend_type: Backend::FileSystem,
         root: blob_root.to_string_lossy().to_string(),

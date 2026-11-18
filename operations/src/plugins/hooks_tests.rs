@@ -16,7 +16,7 @@ use crate::plugins::dispatch::{admit_hook, checks_authorization};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::outbound::tests::leaks;
-use crate::plugins::rows::{page_result, values_result};
+use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::list_runs;
 
 /// An install moved to a version whose webhook the `header` slot `hook_key` verifies, bound to

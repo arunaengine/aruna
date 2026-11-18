@@ -4,16 +4,10 @@
 
 pub mod api_state;
 pub mod counter_check;
-pub(crate) mod document_sync;
 pub mod heartbeat;
-mod info_publish;
-mod info_write;
-pub mod node_info;
+pub mod info;
 pub mod realm_usage;
 mod rebuild_counts;
-pub mod recovery;
-pub mod restore_plan;
-pub mod startup;
 pub mod summary_refresh;
 pub mod usage_publish;
 pub mod usage_rebuild;

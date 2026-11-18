@@ -164,7 +164,7 @@ pub(crate) async fn pending_events(ctx: &crate::driver::DriverContext) -> Vec<So
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::plugins::rows::page_result;
+    use crate::plugins::rows::tests::page_result;
     use crate::plugins::rows::{scan_rows, write_rows};
     use crate::plugins::runs::tests::opened;
     use aruna_core::plugin_runs::{SourceKind, journal_entries};

@@ -151,10 +151,6 @@ pub enum SubOperationEvent {
     KeyRequestsOpened {
         request_ids: Vec<Ulid>,
     },
-    /// Epoch due markers were written in the caller's transaction.
-    EpochsMarked {
-        result: Result<(), StorageError>,
-    },
     /// A key request run failed and may succeed on retry.
     KeyRequestsFailed,
     /// One version of a re-key page ended.
@@ -508,6 +504,12 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// The signed read grant, or `None` when this node cannot sign it.
+    GrantSign(Option<Box<crate::structs::storage::read_grant::SignedGrant>>),
+    /// The caller a forwarded token stands for, or why it is not accepted from that peer.
+    WritePeerAuth(Result<Box<crate::structs::identity::auth::AuthContext>, PeerAuthRefusal>),
+    /// The JSON-LD summary of a dataset, or why it could not be read.
+    DatasetSummary(Result<String, crate::structs::storage::dataset_description::DescriptionError>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
 }
@@ -521,13 +523,28 @@ pub struct MetadataAnswer {
     pub result: Result<Vec<u8>, PeerRequestError>,
 }
 
+/// Why a forwarded token gives a peer no caller.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PeerAuthRefusal {
+    #[error("the forwarded token is not accepted")]
+    Unauthorized,
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl From<crate::calls::IoError> for PeerAuthRefusal {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
 /// Why a peer request has no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRequestError {
     /// The request failed before an answer arrived; the peer may have acted on it.
-    Failed(String),
+    Failed(crate::metadata::MetadataError),
     /// The request never left this node, so asking again or elsewhere replays nothing.
-    NotSent(String),
+    NotSent(crate::metadata::MetadataError),
     /// No answer arrived within the request's timeout.
     TimedOut,
 }
@@ -930,6 +947,9 @@ impl Event {
                     Error,
                     ArtifactStored,
                     MetadataAnswer,
+                    DatasetSummary,
+                    WritePeerAuth,
+                    GrantSign,
                     Notification,
                     InboxWoken,
                     Heartbeat,
@@ -960,7 +980,6 @@ impl Event {
                     UserUpdated,
                     VaultHeld,
                     KeyRequestsOpened,
-                    EpochsMarked,
                     KeyRequestsFailed,
                     VersionRekeyed,
                     AuditStored,
@@ -1010,7 +1029,8 @@ impl Event {
                 OutboundEvent {
                     Posted,
                     MailSent,
-                    Backoff
+                    Backoff,
+                    Answered
                 }
             ),
         }

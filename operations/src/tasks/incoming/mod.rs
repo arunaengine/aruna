@@ -105,8 +105,8 @@ async fn replay_event_log(
 use crate::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
 };
-use crate::node::node_info::observe_placement;
-use crate::node::usage_publish::restore_usage_timer;
+use crate::node::info::facts::NodeFacts;
+use crate::node::info::flows::ObservePlacementOperation;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::digest::InterestOperation;
@@ -121,7 +121,7 @@ use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{read_outbox_records, read_outbox_tails, restore_outbox_timers};
 use crate::sync::mirror_repair::{
-    REPAIR_RETRY_AFTER, process_mirror_repairs, restore_mirror_timer,
+    DrainRepairsOperation, REPAIR_RETRY_AFTER, RestoreTimerOperation,
 };
 use crate::sync::outbox_record::OUTBOX_DRAIN_SIZE;
 use crate::sync::shard_placement::{
@@ -135,6 +135,7 @@ use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 
 mod outbox;
+mod registration;
 mod restore;
 
 pub use outbox::drive_sync_drain;
@@ -525,7 +526,7 @@ impl OperationsTaskHandler {
         if holders.is_empty() {
             return false;
         }
-        match crate::forward::realm::relay_admin_event(
+        match crate::forward::entry::relay_admin_event(
             &self.context,
             &holders,
             record.target.clone(),
@@ -807,10 +808,13 @@ impl OperationsTaskHandler {
                 let key = TaskKey::SyncPlacements { realm_id, node_id };
                 // The same observation that reconciles shards reconciles this node's placement subject: a moved,
                 // draining or removed node stops admitting governed data and revalidates its inventory.
-                if let Err(error) =
-                    observe_placement(&self.context, realm_id, node_id, unix_timestamp_millis())
-                        .await
-                {
+                let observe = ObservePlacementOperation::new(
+                    realm_id,
+                    node_id,
+                    unix_timestamp_millis(),
+                    NodeFacts::gather(&self.context),
+                );
+                if let Err(error) = drive(observe, &self.context).await {
                     warn!(error = %error, "Placement subject reconcile failed");
                 }
                 let outcome = process_shard_placements(&self.context, realm_id, node_id).await;

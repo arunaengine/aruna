@@ -11,6 +11,7 @@ use aruna_api::monitoring::{MonitoringState, Readiness};
 use aruna_blob::blob::BlobHandle;
 use aruna_graph::GraphHandle;
 use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle, NetShutdownOutcome};
+use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::StorageHandle;
@@ -117,6 +118,8 @@ pub struct NodeShutdown {
     pub monitoring: Option<Arc<MonitoringState>>,
     pub task_handle: TaskHandle,
     pub jobs_runtime: Arc<JobsRuntime>,
+    /// The node's context; job leases are handed back through it.
+    pub driver_ctx: Arc<DriverContext>,
     pub net_handle: Option<NetHandle>,
     pub graph_handle: Option<GraphHandle>,
     pub blob_handle: Option<BlobHandle>,
@@ -294,7 +297,7 @@ impl NodeShutdown {
         phase("jobs", job_budget, async {
             job_report = Some(
                 self.jobs_runtime
-                    .shutdown(&self.storage_handle, job_grace)
+                    .shutdown(&self.driver_ctx, job_grace)
                     .await,
             );
         })
@@ -609,6 +612,7 @@ mod tests {
             monitoring: None,
             task_handle: TaskHandle::new(),
             jobs_runtime: JobsRuntime::new(),
+            driver_ctx: Arc::new(DriverContext::storage_only(storage_handle.clone())),
             net_handle: None,
             graph_handle: None,
             blob_handle: None,

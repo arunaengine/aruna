@@ -26,7 +26,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
@@ -980,7 +980,11 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     let metadata_dir = tempfile::tempdir()?;
     let storage_handle =
         FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone()).await?;
+    let net_handle = NetHandle::new(
+        aruna_operations::testing::local_net(),
+        storage_handle.clone(),
+    )
+    .await?;
     let node_id = net_handle.node_id();
     let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),

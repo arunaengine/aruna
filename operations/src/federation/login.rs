@@ -113,7 +113,10 @@ impl Operation for IssueHandoffOperation {
         let user = DocumentTarget::User {
             user_id: auth.user_id,
         };
-        Ok(Next::Call(read_row(user.storage_keyspace(), user.storage_key())))
+        Ok(Next::Call(read_row(
+            user.storage_keyspace(),
+            user.storage_key(),
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IssueHandoffError> {
@@ -305,7 +308,8 @@ impl Operation for FederatedLoginOperation {
             LoginPhase::Config => {
                 let [value] = values::<1>(result)?;
                 let bytes = value.ok_or(GetConfigError::DocumentNotFound)?;
-                let realm = RealmConfigDocument::from_bytes(&bytes).map_err(GetConfigError::from)?;
+                let realm =
+                    RealmConfigDocument::from_bytes(&bytes).map_err(GetConfigError::from)?;
                 self.admit(realm)?;
                 self.phase = LoginPhase::Claims;
                 let key = alias_claims_key(&self.config.handoff.payload.user);
@@ -324,8 +328,8 @@ impl Operation for FederatedLoginOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::calls::ChildOutcome;
     use aruna_core::UserId;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::auth::{Actor, SessionRef};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::user::User;
@@ -447,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn unlinked_login_opens_session() {
+    fn unlinked_login_session() {
         // Without one owning account the foreign login gets its own session.
         let mut operation = login();
         operation.phase = LoginPhase::Claims;

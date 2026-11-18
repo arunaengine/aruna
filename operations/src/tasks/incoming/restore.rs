@@ -44,7 +44,7 @@ async fn durable_rearm_loop(
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest(&context, &task_handle).await;
-        crate::node::node_info::restore_info_timer(&task_handle).await;
+        restore_info_timer(&task_handle).await;
         restore_notification_outbox(&context, &task_handle, None).await;
         if let Err(error) = drive(ProjectionTimerOperation::new(), &context).await {
             warn!(%error, "Failed to scan metadata pending projection markers");
@@ -59,7 +59,7 @@ async fn durable_rearm_loop(
         restore_notification_prune(&context, &task_handle).await;
         restore_drain_timer(&context, &task_handle).await;
         restore_prune_timer(&context, &task_handle).await;
-        restore_mirror_timer(&context, &task_handle).await;
+        restore_mirror_timer(&context).await;
         crate::jobs::repository::link_queue::restore_link_timer(&context, &task_handle).await;
     }
 }
@@ -285,11 +285,11 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::node::node_info::restore_info_timer(&task_handle).await;
+        restore_info_timer(&task_handle).await;
         if stopped() {
             return;
         }
-        crate::federation::registry::restore_publish_timer(&context.storage_handle, &task_handle)
+        super::registration::restore_registration_timer(&context.storage_handle, &task_handle)
             .await;
         if stopped() {
             return;
@@ -333,7 +333,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_mirror_timer(&context, &task_handle).await;
+        restore_mirror_timer(&context).await;
         if stopped() {
             return;
         }
@@ -377,14 +377,13 @@ impl OperationsTaskHandler {
         };
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
-        match crate::node::usage_publish::publish_refresh_snapshots(
+        let publish = crate::node::usage_publish::PublishUsageOperation::new(
             &self.context,
-            node_id,
-            realm_id,
+            (node_id, realm_id),
             false,
-        )
-        .await
-        {
+            true,
+        );
+        match drive(publish, &self.context).await {
             Ok(_) => {}
             Err(error) => {
                 warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
@@ -405,15 +404,14 @@ impl OperationsTaskHandler {
                 .heartbeat_sequence
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
-            if let Err(error) = crate::node::node_info::refresh_info_heartbeat(
-                &self.context,
-                node_id,
+            let refresh = crate::node::info::flows::RefreshInfoOperation::new(
                 realm_id,
+                node_id,
                 sequence,
                 Some(self.jobs_runtime.running_jobs()),
-            )
-            .await
-            {
+                crate::node::info::facts::NodeFacts::gather(&self.context),
+            );
+            if let Err(error) = drive(refresh, &self.context).await {
                 warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
             }
         } else {
@@ -432,7 +430,7 @@ impl OperationsTaskHandler {
         let key = TaskKey::PublishRegistration;
         match (self.context.net_handle.as_ref(), &self.node_capabilities) {
             (Some(net_handle), Some(capabilities)) => {
-                if let Err(error) = crate::federation::registry::publish_registration(
+                if let Err(error) = super::registration::publish_registration(
                     &self.context,
                     *net_handle.realm_id(),
                     net_handle.node_id(),
@@ -589,7 +587,8 @@ impl OperationsTaskHandler {
                 .await;
             return;
         };
-        match process_mirror_repairs(&self.context, net_handle.node_id()).await {
+        let drain = DrainRepairsOperation::new(net_handle.node_id());
+        match drive(drain, self.context.as_ref()).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainMirrorRepair, Duration::ZERO)
                     .await;
@@ -980,5 +979,60 @@ mod stop_tests {
             "the later restore unit must not run after the stop"
         );
         drop(temp);
+    }
+}
+
+/// Re-arms the sync mirror repair timer; a failure waits for the next rearm tick.
+async fn restore_mirror_timer(context: &DriverContext) {
+    if let Err(error) = drive(RestoreTimerOperation::new(), context).await {
+        warn!(%error, "Failed to restore sync mirror repair timer");
+    }
+}
+
+/// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never `ResetTimer`) so the
+/// durable-queue re-arm loop cannot push the deadline forward past the handler's own re-arm.
+async fn restore_info_timer(task_handle: &TaskHandle) {
+    let effect = Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::PublishNodeInfo,
+        after: aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
+    });
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await {
+        warn!(message = %message, "Failed to arm node info heartbeat timer");
+    }
+}
+
+/// Re-arms the debounced publish task when dirty markers survived a restart.
+async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle: &TaskHandle) {
+    let has_markers = match storage
+        .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
+            key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
+            prefix: Some(Key::from(
+                aruna_core::structs::storage::usage::DIRTY_PREFIX.to_vec(),
+            )),
+            start: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(error = %error, "Failed to scan node usage dirty markers");
+            return;
+        }
+        other => {
+            warn!(
+                event = other.label(),
+                "Unexpected event while scanning node usage dirty markers"
+            );
+            return;
+        }
+    };
+    if has_markers
+        && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+            .send_effect(crate::s3::usage::schedule_snapshot_publish())
+            .await
+    {
+        warn!(message = %message, "Failed to restore node usage publish timer");
     }
 }

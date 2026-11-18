@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
+use crate::metadata::after_sync::{apply_metadata, run_maintenance};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::node::document_sync::{apply_metadata, run_maintenance};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
@@ -235,7 +235,9 @@ async fn peer_request(
             Ok(MetadataTransportMessage::ResolvedJobInputs { result })
         }
         MetadataTransportMessage::JobInputPage { submission, digest } => {
-            let page = crate::jobs::records::pages::serve_page(context, peer, submission, digest);
+            let page = crate::jobs::records::transport::serve_input_page(
+                context, peer, submission, digest,
+            );
             let page = Box::pin(page).await;
             Ok(MetadataTransportMessage::InputPageResult { page })
         }

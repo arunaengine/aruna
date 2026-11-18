@@ -1,372 +1,473 @@
-//! Runs due mirror repairs; creating and deleting the remote mirror still needs async peer calls.
+//! Runs the due mirror repairs of one pass and re-arms the repair timer from the stored records.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::handle::Handle;
-use aruna_core::metadata::MetadataError;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::structs::{SyncRelationship, SyncState};
+use aruna_core::operation::Operation;
+use aruna_core::rows::event;
+use aruna_core::structs::SyncState;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_tasks::TaskHandle;
-use tracing::warn;
-use ulid::Ulid;
 
+use super::ensure::EnsureMirrorOperation;
 use super::record::MirrorRecordOperation;
-use super::scan::ScanRepairsOperation;
+use super::remove::{RemoveLocalOperation, RemoveMirrorOperation};
+use super::scan::{RepairScan, ScanRepairsOperation};
 use super::settle::{RollbackClaim, SettleReconcileOperation};
-use super::{
-    MirrorPeer, SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, SyncMirrorResult, create_peer,
-    delete_peer,
-};
-use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::authorize;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::sync::sync_relationship::{
-    DeleteRelationshipOperation, RemoveOutgoingOperation, StoreRelationshipOperation,
-    SyncRelationshipDirection,
-};
-use aruna_core::metadata::AuthToken;
+use super::{SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, SyncMirrorResult};
 
-/// Forwards a user-authorized sync mirror creation request to the target
-/// node so routes never orchestrate metadata effects directly.
-pub async fn request_mirror_create(
-    context: &DriverContext,
-    target_node: NodeId,
-    auth_token: AuthToken,
-    source_group_id: Ulid,
-    relationship: SyncRelationship,
-    extras: PolicyRequestExtras,
-) -> Result<(), MetadataError> {
-    let metadata_handle = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataError::HandleMissing)?;
-    metadata_handle
-        .request_sync_create(
-            target_node,
-            Some(auth_token),
-            source_group_id,
-            relationship,
-            extras,
-        )
-        .await
+#[derive(Debug, PartialEq)]
+enum RepairPhase {
+    Settling,
+    RemovingLocal,
+    Finishing,
 }
 
-pub async fn delete_sync_mirror(
-    context: &DriverContext,
+/// Carries out one due record; the output tells whether it claimed a rollback that is due now.
+#[derive(Debug, PartialEq)]
+struct RepairRecordOperation {
     local_node: NodeId,
-    relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorError> {
-    send_mirror_delete(context, local_node, relationship, false).await
+    record: SyncMirrorRecord,
+    phase: RepairPhase,
 }
 
-pub async fn process_mirror_repairs(
-    context: &DriverContext,
-    local_node: NodeId,
-) -> Result<SyncMirrorResult, SyncMirrorError> {
-    let now_ms = unix_timestamp_millis();
-    let scan = drive(ScanRepairsOperation::new(), context).await?;
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-    let mut claimed = false;
+impl RepairRecordOperation {
+    fn new(local_node: NodeId, record: SyncMirrorRecord) -> Self {
+        Self {
+            local_node,
+            record,
+            phase: RepairPhase::Finishing,
+        }
+    }
 
-    for record in &scan.records {
-        match process_repair_record(context, local_node, record).await {
-            Ok(rollback) => {
-                claimed |= rollback;
-                drive(
-                    MirrorRecordOperation::clear_scanned(record.clone()),
-                    context,
-                )
-                .await?;
-                succeeded = succeeded.saturating_add(1);
+    fn remove_mirror(&mut self) -> Next<bool> {
+        self.phase = RepairPhase::Finishing;
+        let relationship = self.record.relationship.clone();
+        let remove = RemoveMirrorOperation::new(self.local_node, relationship);
+        Next::Call(IoCall::child(remove))
+    }
+
+    fn settled(&mut self, claim: RollbackClaim) -> Next<bool> {
+        match claim {
+            RollbackClaim::Stale => Next::Done(false),
+            RollbackClaim::Claimed => Next::Done(true),
+            // Detached stubs only serve retained reference reads; never resurrect the target
+            // mirror for them.
+            RollbackClaim::Active(relationship) if relationship.state == SyncState::Detached => {
+                self.remove_mirror()
             }
-            Err(error) => {
-                let reschedule =
-                    MirrorRecordOperation::reschedule(record.clone(), error.to_string());
-                drive(reschedule, context).await?;
-                failed = failed.saturating_add(1);
+            RollbackClaim::Active(relationship) => {
+                self.phase = RepairPhase::Finishing;
+                let ensure = EnsureMirrorOperation::new(self.local_node, relationship);
+                Next::Call(IoCall::child(ensure))
+            }
+        }
+    }
+}
+
+impl Operation for RepairRecordOperation {
+    type Output = bool;
+    type Error = SyncMirrorError;
+
+    fn first(&mut self) -> Result<Next<bool>, SyncMirrorError> {
+        let relationship = self.record.relationship.clone();
+        let call = match self.record.intent {
+            SyncMirrorIntent::Reconcile => {
+                self.phase = RepairPhase::Settling;
+                IoCall::child(SettleReconcileOperation::new(self.record.clone()))
+            }
+            // The claim found no outgoing record, so no local cleanup may leave a stub.
+            SyncMirrorIntent::Delete if self.record.rollback => IoCall::child(
+                RemoveMirrorOperation::rollback(self.local_node, relationship),
+            ),
+            SyncMirrorIntent::Delete => {
+                self.phase = RepairPhase::RemovingLocal;
+                IoCall::child(RemoveLocalOperation::new(self.local_node, relationship))
+            }
+        };
+        Ok(Next::Call(call))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, SyncMirrorError> {
+        match self.phase {
+            RepairPhase::Settling => {
+                let claim = result.child::<RollbackClaim, SyncMirrorError>()??;
+                Ok(self.settled(claim))
+            }
+            RepairPhase::RemovingLocal => {
+                result.child::<(), SyncMirrorError>()??;
+                Ok(self.remove_mirror())
+            }
+            RepairPhase::Finishing => {
+                result.child::<(), SyncMirrorError>()??;
+                Ok(Next::Done(false))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DrainPhase {
+    Scanning,
+    Repairing,
+    Clearing,
+    Rescheduling,
+}
+
+/// One pass over the due repair records. A failed record moves behind its retry delay and keeps
+/// the error; only a failure to change the record itself ends the pass.
+#[derive(Debug, PartialEq)]
+pub struct DrainRepairsOperation {
+    local_node: NodeId,
+    /// The time of the pass, from the runner's first stamp.
+    now_ms: Option<u64>,
+    scan: RepairScan,
+    position: usize,
+    succeeded: usize,
+    failed: usize,
+    claimed: bool,
+    phase: DrainPhase,
+}
+
+impl DrainRepairsOperation {
+    pub fn new(local_node: NodeId) -> Self {
+        Self {
+            local_node,
+            now_ms: None,
+            scan: RepairScan::default(),
+            position: 0,
+            succeeded: 0,
+            failed: 0,
+            claimed: false,
+            phase: DrainPhase::Scanning,
+        }
+    }
+
+    fn current(&self) -> Result<SyncMirrorRecord, SyncMirrorError> {
+        self.scan
+            .records
+            .get(self.position)
+            .cloned()
+            .ok_or_else(|| SyncMirrorError::Mirror("no repair record is running".to_string()))
+    }
+
+    fn advance(&mut self) -> Next<SyncMirrorResult> {
+        let Some(record) = self.scan.records.get(self.position).cloned() else {
+            return Next::Done(self.outcome());
+        };
+        self.phase = DrainPhase::Repairing;
+        let repair = RepairRecordOperation::new(self.local_node, record);
+        Next::Call(IoCall::child(repair))
+    }
+
+    fn outcome(&self) -> SyncMirrorResult {
+        // A claimed rollback is due now, so the next pass runs at once.
+        let has_more_due = self.scan.has_more_due || self.claimed;
+        SyncMirrorResult {
+            processed: self.scan.records.len(),
+            succeeded: self.succeeded,
+            failed: self.failed,
+            has_more_due,
+            next_due_after: if has_more_due {
+                None
+            } else {
+                self.scan
+                    .next_due_ms
+                    .map(|due_at| due_after(due_at, self.now_ms.unwrap_or_default()))
+            },
+        }
+    }
+}
+
+impl Operation for DrainRepairsOperation {
+    type Output = SyncMirrorResult;
+    type Error = SyncMirrorError;
+
+    fn first(&mut self) -> Result<Next<SyncMirrorResult>, SyncMirrorError> {
+        Ok(Next::Call(IoCall::child(ScanRepairsOperation::new())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<SyncMirrorResult>, SyncMirrorError> {
+        match self.phase {
+            DrainPhase::Scanning => {
+                self.scan = result.child::<RepairScan, SyncMirrorError>()??;
+                Ok(self.advance())
+            }
+            DrainPhase::Repairing => {
+                let record = self.current()?;
+                let change = match result.child::<bool, SyncMirrorError>()? {
+                    Ok(rollback) => {
+                        self.claimed |= rollback;
+                        self.phase = DrainPhase::Clearing;
+                        MirrorRecordOperation::clear_scanned(record)
+                    }
+                    Err(error) => {
+                        self.phase = DrainPhase::Rescheduling;
+                        MirrorRecordOperation::reschedule(record, error.to_string())
+                    }
+                };
+                Ok(Next::Call(IoCall::child(change)))
+            }
+            DrainPhase::Clearing => {
+                result.child::<(), SyncMirrorError>()??;
+                self.succeeded = self.succeeded.saturating_add(1);
+                self.position += 1;
+                Ok(self.advance())
+            }
+            DrainPhase::Rescheduling => {
+                result.child::<(), SyncMirrorError>()??;
+                self.failed = self.failed.saturating_add(1);
+                self.position += 1;
+                Ok(self.advance())
             }
         }
     }
 
-    // A claimed rollback is due now, so the next pass runs at once.
-    let has_more_due = scan.has_more_due || claimed;
-    Ok(SyncMirrorResult {
-        processed: scan.records.len(),
-        succeeded,
-        failed,
-        has_more_due,
-        next_due_after: if has_more_due {
-            None
-        } else {
-            scan.next_due_ms
-                .map(|due_at| Duration::from_millis(due_at.saturating_sub(now_ms)))
-        },
-    })
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms.get_or_insert(now_ms);
+    }
 }
 
-/// Re-arms the repair timer at startup from the stored records.
-pub async fn restore_mirror_timer(context: &DriverContext, task_handle: &TaskHandle) {
-    let now_ms = unix_timestamp_millis();
-    let after = match drive(ScanRepairsOperation::new(), context).await {
-        Ok(scan) if !scan.records.is_empty() || scan.has_more_due => Duration::ZERO,
-        Ok(scan) => match scan.next_due_ms {
-            Some(due_at) => Duration::from_millis(due_at.saturating_sub(now_ms)),
-            None => return,
-        },
-        Err(error) => {
-            warn!(%error, "Failed to scan sync mirror repairs");
-            return;
+/// Re-arms the repair timer from the stored records: at once for due work, otherwise at the
+/// earliest due time. No record leaves the timer alone.
+#[derive(Debug, Default, PartialEq)]
+pub struct RestoreTimerOperation {
+    now_ms: Option<u64>,
+    arming: bool,
+}
+
+impl RestoreTimerOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn after(&self, scan: &RepairScan) -> Option<Duration> {
+        if !scan.records.is_empty() || scan.has_more_due {
+            return Some(Duration::ZERO);
         }
-    };
-    let event = task_handle
-        .send_effect(Effect::Task(TaskEffect::ResetTimer {
+        let now_ms = self.now_ms.unwrap_or_default();
+        scan.next_due_ms.map(|due_at| due_after(due_at, now_ms))
+    }
+}
+
+impl Operation for RestoreTimerOperation {
+    type Output = ();
+    type Error = SyncMirrorError;
+
+    fn first(&mut self) -> Result<Next<()>, SyncMirrorError> {
+        Ok(Next::Call(IoCall::child(ScanRepairsOperation::new())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncMirrorError> {
+        if self.arming {
+            return match event(result)? {
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    Err(SyncMirrorError::Mirror(message))
+                }
+                _ => Ok(Next::Done(())),
+            };
+        }
+        let scan = result.child::<RepairScan, SyncMirrorError>()??;
+        let Some(after) = self.after(&scan) else {
+            return Ok(Next::Done(()));
+        };
+        self.arming = true;
+        let reset = Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::DrainMirrorRepair,
             after,
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(reset))))
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms.get_or_insert(now_ms);
+    }
+}
+
+fn due_after(due_at_ms: u64, now_ms: u64) -> Duration {
+    Duration::from_millis(due_at_ms.saturating_sub(now_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::relationship;
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::SyncRelationship;
+
+    fn node() -> NodeId {
+        relationship().source.node_id
+    }
+
+    fn record(intent: SyncMirrorIntent) -> SyncMirrorRecord {
+        SyncMirrorRecord::new(relationship(), intent, 1)
+    }
+
+    fn answer<T>(result: Result<T, SyncMirrorError>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn is_child<T>(next: Result<Next<T>, SyncMirrorError>) -> bool {
+        matches!(next, Ok(Next::Call(IoCall::Child(_))))
+    }
+
+    fn settling() -> RepairRecordOperation {
+        let mut operation = RepairRecordOperation::new(node(), record(SyncMirrorIntent::Reconcile));
+        assert!(is_child(operation.first()));
+        assert_eq!(operation.phase, RepairPhase::Settling);
+        operation
+    }
+
+    #[test]
+    fn settles_reconcile_claims() {
+        assert_eq!(
+            settling().next(answer(Ok(RollbackClaim::Stale))),
+            Ok(Next::Done(false))
+        );
+        assert_eq!(
+            settling().next(answer(Ok(RollbackClaim::Claimed))),
+            Ok(Next::Done(true))
+        );
+        let mut active = settling();
+        let claim = RollbackClaim::Active(relationship());
+        assert!(is_child(active.next(answer(Ok(claim)))));
+        assert_eq!(active.next(answer(Ok(()))), Ok(Next::Done(false)));
+        let detached = SyncRelationship {
+            state: SyncState::Detached,
+            ..relationship()
+        };
+        let mut stub = settling();
+        let claim = RollbackClaim::Active(detached);
+        assert!(is_child(stub.next(answer(Ok(claim)))));
+        assert_eq!(stub.phase, RepairPhase::Finishing);
+    }
+
+    #[test]
+    fn removes_local_first() {
+        let mut operation = RepairRecordOperation::new(node(), record(SyncMirrorIntent::Delete));
+        assert!(is_child(operation.first()));
+        assert_eq!(operation.phase, RepairPhase::RemovingLocal);
+        assert!(is_child(operation.next(answer(Ok(())))));
+        assert_eq!(operation.phase, RepairPhase::Finishing);
+        assert_eq!(operation.next(answer(Ok(()))), Ok(Next::Done(false)));
+    }
+
+    #[test]
+    fn rollback_skips_local() {
+        let mut rollback = record(SyncMirrorIntent::Delete);
+        rollback.rollback = true;
+        let mut operation = RepairRecordOperation::new(node(), rollback);
+        assert!(is_child(operation.first()));
+        assert_eq!(operation.phase, RepairPhase::Finishing);
+    }
+
+    fn scanned(records: Vec<SyncMirrorRecord>, next_due_ms: Option<u64>) -> IoResult {
+        answer(Ok(RepairScan {
+            records,
+            has_more_due: false,
+            next_due_ms,
         }))
-        .await;
-    if let Event::Task(TaskEvent::Error { message, .. }) = event {
-        warn!(%message, "Failed to restore sync mirror repair timer");
     }
-}
 
-/// Returns true when the pass claimed a rollback that is due now.
-async fn process_repair_record(
-    context: &DriverContext,
-    local_node: NodeId,
-    record: &SyncMirrorRecord,
-) -> Result<bool, SyncMirrorError> {
-    match record.intent {
-        SyncMirrorIntent::Reconcile => {
-            match drive(SettleReconcileOperation::new(record.clone()), context).await? {
-                RollbackClaim::Stale => Ok(false),
-                RollbackClaim::Claimed => Ok(true),
-                // Detached stubs only serve retained reference reads; never
-                // resurrect the target mirror for them.
-                RollbackClaim::Active(relationship)
-                    if relationship.state == SyncState::Detached =>
-                {
-                    delete_sync_mirror(context, local_node, &record.relationship).await?;
-                    Ok(false)
-                }
-                RollbackClaim::Active(relationship) => {
-                    ensure_sync_mirror(context, local_node, &relationship).await?;
-                    Ok(false)
-                }
-            }
-        }
-        // The claim found no outgoing record, so no local cleanup may leave a stub.
-        SyncMirrorIntent::Delete if record.rollback => {
-            send_mirror_delete(context, local_node, &record.relationship, true).await?;
-            Ok(false)
-        }
-        SyncMirrorIntent::Delete => {
-            delete_local_relationships(context, local_node, &record.relationship).await?;
-            delete_sync_mirror(context, local_node, &record.relationship).await?;
-            Ok(false)
-        }
-    }
-}
-
-async fn ensure_sync_mirror(
-    context: &DriverContext,
-    local_node: NodeId,
-    relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorError> {
-    relationship.validate()?;
-    let peer = create_peer(relationship, local_node)?;
-    let source_bucket = relationship
-        .source
-        .bucket()
-        .ok_or_else(|| SyncMirrorError::Mirror("invalid source ARN".to_string()))?;
-    let source_group_id = bucket_group(context, source_bucket, "source").await?;
-    authorize_repair(
-        context,
-        relationship,
-        relationship.source.realm_id,
-        &bucket_permission_path(
-            relationship.source.realm_id,
-            source_group_id,
-            relationship.source.node_id,
-            source_bucket,
-        ),
-        &Permission::READ,
-        "s3.GetObject",
-    )
-    .await?;
-    let MirrorPeer::Remote(target) = peer else {
-        ensure_target_write(context, relationship).await?;
-        let store = StoreRelationshipOperation::new(
-            relationship.clone(),
-            SyncRelationshipDirection::Incoming,
+    #[test]
+    fn counts_each_record() {
+        let mut operation = DrainRepairsOperation::new(node());
+        operation.stamp(100);
+        operation.stamp(500);
+        assert!(is_child(operation.first()));
+        let due = vec![
+            record(SyncMirrorIntent::Delete),
+            record(SyncMirrorIntent::Reconcile),
+        ];
+        assert!(is_child(operation.next(scanned(due, Some(160)))));
+        assert!(is_child(operation.next(answer(Ok(false)))));
+        assert!(is_child(operation.next(answer(Ok(())))));
+        let failed = Err::<bool, _>(SyncMirrorError::Mirror("down".to_string()));
+        assert!(is_child(operation.next(answer(failed))));
+        assert_eq!(operation.phase, DrainPhase::Rescheduling);
+        assert_eq!(
+            operation.next(answer(Ok(()))),
+            Ok(Next::Done(SyncMirrorResult {
+                processed: 2,
+                succeeded: 1,
+                failed: 1,
+                has_more_due: false,
+                next_due_after: Some(Duration::from_millis(60)),
+            }))
         );
-        return drive(store, context).await.map(|_| ()).map_err(Into::into);
-    };
-
-    let metadata_handle = context
-        .metadata_handle
-        .as_ref()
-        .ok_or_else(|| SyncMirrorError::Mirror("target unreachable".to_string()))?;
-    metadata_handle
-        .request_sync_create(
-            target,
-            Some(creator_token(relationship)),
-            source_group_id,
-            relationship.clone(),
-            PolicyRequestExtras::operation("s3.PutBucketReplication"),
-        )
-        .await
-        .map_err(|error| SyncMirrorError::Mirror(error.to_string()))
-}
-
-/// Deletes the remote or local mirror. A rollback removes only the target mirror of a create
-/// that never activated, without the creator's WRITE.
-async fn send_mirror_delete(
-    context: &DriverContext,
-    local_node: NodeId,
-    relationship: &SyncRelationship,
-    rollback: bool,
-) -> Result<(), SyncMirrorError> {
-    relationship.validate()?;
-    let MirrorPeer::Remote(remote_node) = delete_peer(relationship, local_node, rollback)? else {
-        if rollback {
-            let delete = DeleteRelationshipOperation::new(
-                relationship.clone(),
-                SyncRelationshipDirection::Incoming,
-            );
-            drive(delete, context).await?;
-        } else {
-            delete_local_relationships(context, local_node, relationship).await?;
-        }
-        return Ok(());
-    };
-    let metadata_handle = context
-        .metadata_handle
-        .as_ref()
-        .ok_or_else(|| SyncMirrorError::Mirror("target unreachable".to_string()))?;
-    match metadata_handle
-        .request_sync_delete(
-            remote_node,
-            Some(creator_token(relationship)),
-            relationship.clone(),
-            PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
-            rollback,
-        )
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(MetadataError::Backend(message)) if message == "not_found" => Ok(()),
-        Err(error) => Err(SyncMirrorError::Mirror(error.to_string())),
     }
-}
 
-pub(super) async fn ensure_target_write(
-    context: &DriverContext,
-    relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorError> {
-    let target_bucket = relationship
-        .target
-        .bucket()
-        .ok_or_else(|| SyncMirrorError::Mirror("invalid target ARN".to_string()))?;
-    let group_id = bucket_group(context, target_bucket, "target").await?;
-    authorize_repair(
-        context,
-        relationship,
-        relationship.target.realm_id,
-        &bucket_permission_path(
-            relationship.target.realm_id,
-            group_id,
-            relationship.target.node_id,
-            target_bucket,
-        ),
-        &Permission::WRITE,
-        "s3.PutBucketReplication",
-    )
-    .await
-}
-
-/// The owning group of a local endpoint bucket; `side` names the endpoint in the error.
-async fn bucket_group(
-    context: &DriverContext,
-    bucket: &str,
-    side: &str,
-) -> Result<Ulid, SyncMirrorError> {
-    match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(bucket_info) => Ok(bucket_info.group_id),
-        Err(GetBucketError::NotFound) => {
-            Err(SyncMirrorError::Mirror(format!("{side} bucket not found")))
-        }
-        Err(error) => Err(SyncMirrorError::Mirror(error.to_string())),
+    #[test]
+    fn claimed_rollback_repeats() {
+        let mut operation = DrainRepairsOperation::new(node());
+        operation.first().unwrap();
+        let due = vec![record(SyncMirrorIntent::Reconcile)];
+        operation.next(scanned(due, Some(9))).unwrap();
+        operation.next(answer(Ok(true))).unwrap();
+        let Ok(Next::Done(result)) = operation.next(answer(Ok(()))) else {
+            panic!("the pass ends");
+        };
+        assert!(result.has_more_due);
+        assert_eq!(result.next_due_after, None);
     }
-}
 
-fn creator_token(relationship: &SyncRelationship) -> AuthToken {
-    AuthToken::internal(AuthContext {
-        user_id: relationship.created_by,
-        realm_id: relationship.source.realm_id,
-        path_restrictions: None,
-        session: None,
-    })
-}
-
-async fn authorize_repair(
-    context: &DriverContext,
-    relationship: &SyncRelationship,
-    realm_id: RealmId,
-    path: &str,
-    permission: &Permission,
-    operation: &'static str,
-) -> Result<(), SyncMirrorError> {
-    let auth = AuthContext {
-        user_id: relationship.created_by,
-        realm_id: relationship.created_by.realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    match authorize(
-        context,
-        realm_id,
-        &auth,
-        path,
-        permission,
-        PolicyRequestExtras::operation(operation),
-    )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(AuthorizeError::PermissionDenied | AuthorizeError::Policy(_)) => {
-            Err(SyncMirrorError::Mirror("access_denied".to_string()))
-        }
-        Err(AuthorizeError::CheckFailed(error)) => Err(SyncMirrorError::Mirror(error)),
-        Err(AuthorizeError::Storage(error)) => Err(SyncMirrorError::Mirror(error.to_string())),
-    }
-}
-
-async fn delete_local_relationships(
-    context: &DriverContext,
-    local_node: NodeId,
-    relationship: &SyncRelationship,
-) -> Result<(), SyncMirrorError> {
-    if relationship.source.node_id == local_node {
-        drive(RemoveOutgoingOperation::new(relationship.clone()), context).await?;
-    }
-    if relationship.target.node_id == local_node {
-        let delete = DeleteRelationshipOperation::new(
-            relationship.clone(),
-            SyncRelationshipDirection::Incoming,
+    #[test]
+    fn change_failure_ends() {
+        let mut operation = DrainRepairsOperation::new(node());
+        operation.first().unwrap();
+        let due = vec![record(SyncMirrorIntent::Delete)];
+        operation.next(scanned(due, None)).unwrap();
+        operation.next(answer(Ok(false))).unwrap();
+        let failed = SyncMirrorError::Mirror("stuck".to_string());
+        assert_eq!(
+            operation.next(answer::<()>(Err(SyncMirrorError::Mirror(
+                "stuck".to_string()
+            )))),
+            Err(failed)
         );
-        drive(delete, context).await?;
     }
-    Ok(())
+
+    fn timer(after: Duration) -> Next<()> {
+        Next::Call(IoCall::Effect(Box::new(Effect::Task(
+            TaskEffect::ResetTimer {
+                key: TaskKey::DrainMirrorRepair,
+                after,
+            },
+        ))))
+    }
+
+    #[test]
+    fn restores_from_scan() {
+        let mut later = RestoreTimerOperation::new();
+        later.stamp(100);
+        later.first().unwrap();
+        assert_eq!(
+            later.next(scanned(Vec::new(), Some(150))),
+            Ok(timer(Duration::from_millis(50)))
+        );
+        let armed = Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainMirrorRepair,
+            after: Duration::ZERO,
+        });
+        assert_eq!(
+            later.next(IoResult::Event(Box::new(armed))),
+            Ok(Next::Done(()))
+        );
+        let due = vec![record(SyncMirrorIntent::Delete)];
+        assert_eq!(
+            RestoreTimerOperation::new().next(scanned(due, None)),
+            Ok(timer(Duration::ZERO))
+        );
+        assert_eq!(
+            RestoreTimerOperation::new().next(scanned(Vec::new(), None)),
+            Ok(Next::Done(()))
+        );
+    }
 }

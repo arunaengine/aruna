@@ -11,6 +11,7 @@ use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::api::export_types::GetVisibleRequest;
+use crate::metadata::api::export_types::RoCrateExportView;
 use crate::metadata::api::read::ensure_record_readable;
 use crate::metadata::api::read::load_live_record;
 use crate::metadata::create_document::resolve_metadata_id;
@@ -27,6 +28,7 @@ use aruna_core::metadata::ProfileValidationStatus;
 use aruna_core::placement::read_holder_sets;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::dataset_description::{DatasetSummaryRequest, DescriptionError};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use futures_util::future::BoxFuture;
 use std::sync::Arc;
@@ -37,7 +39,9 @@ use ulid::Ulid;
 
 use super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
 use super::profile_export::ProfileLocalOperation;
-use super::routed_export::{ExportWithinOperation, ensure_export_limit, owner_reads};
+use super::routed_export::{
+    ExportWithinOperation, RoutedExportOperation, ensure_export_limit, owner_reads,
+};
 use crate::forward::replay::routed_record_matches;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::read_error;
@@ -444,6 +448,37 @@ pub(super) fn keep_status(
         .is_some_and(|status| status.dataset_revision == expected_revision);
     if current.is_none() || incoming_exact && !current_exact {
         *current = Some(incoming);
+    }
+}
+
+/// Bytes the summary of a dataset may have; only its root entity is read.
+const SUMMARY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The JSON-LD summary of a dataset, read from its holders with the caller's own access.
+pub(crate) async fn dataset_summary(
+    context: &DriverContext,
+    request: DatasetSummaryRequest,
+) -> Result<String, DescriptionError> {
+    let export = ExportMetadataRequest {
+        document_id: request.dataset,
+        auth: request.auth,
+        view: RoCrateExportView::Summary,
+        limit: None,
+        offset: None,
+        after: None,
+    };
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let (realm_id, token) = (request.realm_id, request.token);
+    let routed = RoutedExportOperation::new(local_node, realm_id, export, token, SUMMARY_BYTES);
+    match drive(routed, context).await {
+        Ok(ExportMetadataResult::Summary { jsonld, .. }) => Ok(jsonld),
+        Err(
+            MetadataApiError::NotFound
+            | MetadataApiError::Forbidden
+            | MetadataApiError::Unauthorized
+            | MetadataApiError::BadRequest,
+        ) => Err(DescriptionError::Unreadable),
+        Ok(_) | Err(_) => Err(DescriptionError::Unavailable),
     }
 }
 

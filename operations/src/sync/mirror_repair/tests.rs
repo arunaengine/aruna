@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::drain::ensure_target_write;
+use super::ensure::EnsureMirrorOperation;
 use super::settle::{RollbackClaim, SettleReconcileOperation};
 use super::*;
 use crate::driver::{DriverContext, drive};
@@ -385,9 +385,12 @@ async fn rollback_skips_stub() {
         let record = staged_record(&context, &relationship).await;
         settle(&context, &record).await;
 
-        let result = process_mirror_repairs(&context, relationship.source.node_id)
-            .await
-            .unwrap();
+        let result = drive(
+            DrainRepairsOperation::new(relationship.source.node_id),
+            &context,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.failed, 1);
         assert_eq!(outgoing(&context, &relationship).await, None);
@@ -750,9 +753,12 @@ async fn repair_backs_off() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
 
-    let result = process_mirror_repairs(&context, relationship.source.node_id)
-        .await
-        .unwrap();
+    let result = drive(
+        DrainRepairsOperation::new(relationship.source.node_id),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(result.failed, 1);
 
     let Event::Storage(StorageEvent::ReadResult {
@@ -772,11 +778,20 @@ async fn repair_backs_off() {
     assert_eq!(record.last_error.as_deref(), Some("target unreachable"));
 }
 
+/// Ensures the mirror of a relationship whose two endpoints live on this node.
+async fn ensure_local(context: &DriverContext) -> Result<(), SyncMirrorError> {
+    let mut local = relationship();
+    local.target =
+        ArunaArn::s3_bucket(local.target.realm_id, local.source.node_id, "target").unwrap();
+    let node = local.source.node_id;
+    drive(EnsureMirrorOperation::new(node, local), context).await
+}
+
 #[tokio::test]
 async fn policy_denies_write() {
     let (_tempdir, context) = setup_auth(Some("operation == 's3.PutBucketReplication'")).await;
 
-    let result = ensure_target_write(&context, &relationship()).await;
+    let result = ensure_local(&context).await;
 
     assert!(matches!(
         result,
@@ -786,9 +801,9 @@ async fn policy_denies_write() {
 
 #[tokio::test]
 async fn policy_allows_write() {
-    let (_tempdir, context) = setup_auth(Some("operation == 's3.GetObject'")).await;
+    let (_tempdir, context) = setup_auth(Some("operation == 's3.DeleteObject'")).await;
 
-    assert!(ensure_target_write(&context, &relationship()).await.is_ok());
+    assert!(ensure_local(&context).await.is_ok());
 }
 
 #[tokio::test]
@@ -811,9 +826,12 @@ async fn policy_retry_survives() {
     record.due_at_ms = 0;
     store_record(&context, record).await;
 
-    let result = process_mirror_repairs(&context, relationship.source.node_id)
-        .await
-        .unwrap();
+    let result = drive(
+        DrainRepairsOperation::new(relationship.source.node_id),
+        &context,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.failed, 1);
     assert_eq!(

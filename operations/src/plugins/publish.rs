@@ -31,8 +31,9 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use super::artifacts::{ArtifactError, managers};
-use super::copies::{chunk_count, chunk_of, store_local};
+use super::copies::store_local;
 use super::copies_needed;
+use super::copy_rows::{chunk_count, chunk_of};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};

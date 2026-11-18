@@ -16,9 +16,11 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::projection::{
     MetadataProjectionError, ReplayPageOperation, max_clock_skew,
 };
-use aruna_operations::node::startup::prepare_shard_policy;
+use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
+use aruna_operations::shard::restore::prepare_shard_policy;
 use tracing::{info, warn};
 
 use crate::bootstrap::{
@@ -331,16 +333,15 @@ async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<
 }
 
 async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    aruna_operations::node::node_info::seed_info_document(
-        ctx,
-        config.node_id,
-        config.realm_id,
-        NodeUrls {
-            api: config.api_public_url.clone(),
-            s3: config.s3_public_url.clone(),
-        },
-    )
-    .await
+    let urls = NodeUrls {
+        api: config.api_public_url.clone(),
+        s3: config.s3_public_url.clone(),
+    };
+    let facts = NodeFacts::gather(ctx);
+    let seed = SeedInfoOperation::new(config.realm_id, config.node_id, urls, facts, false);
+    aruna_operations::driver::drive(seed, ctx)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

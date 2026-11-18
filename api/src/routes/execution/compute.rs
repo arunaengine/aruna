@@ -15,8 +15,8 @@ use aruna_core::structs::placement::compute_config::{
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::driver::drive;
-use aruna_operations::node::node_info::group_demand;
-use aruna_operations::node::node_info::set_operator_drain;
+use aruna_operations::node::info::facts::NodeFacts;
+use aruna_operations::node::info::flows::{GroupDemandOperation, OperatorDrainOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,
 };
@@ -641,10 +641,12 @@ pub async fn get_compute_snapshots(
 
     let group = match group_id {
         Some(group_id) => {
-            let (demand, truncated) =
-                group_demand(&context, auth.realm_id, state.get_node_id(), &group_id)
-                    .await
-                    .map_err(|error| ServerError::InternalError(error.into()))?;
+            let fresh = context.fresh_heartbeats();
+            let view =
+                GroupDemandOperation::new(auth.realm_id, state.get_node_id(), group_id, fresh);
+            let (demand, truncated) = drive(view, context.as_ref())
+                .await
+                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
             let quota = config
                 .compute
                 .effective_quota(&group_id)
@@ -721,14 +723,16 @@ pub async fn set_compute_drain(
     Json(request): Json<DrainRequest>,
 ) -> ServerResult<(StatusCode, Json<DrainResponse>)> {
     let auth = require_config_admin(&state, auth, Permission::WRITE).await?;
-    let changed = set_operator_drain(
-        &state.get_ctx(),
-        state.get_node_id(),
+    let context = state.get_ctx();
+    let drain = OperatorDrainOperation::new(
         auth.realm_id,
+        state.get_node_id(),
         request.draining,
-    )
-    .await
-    .map_err(ServerError::ServiceUnavailableReason)?;
+        NodeFacts::gather(&context),
+    );
+    let changed = drive(drain, context.as_ref())
+        .await
+        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
     Ok((
         StatusCode::OK,
         Json(DrainResponse {

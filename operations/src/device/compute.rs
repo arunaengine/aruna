@@ -1,30 +1,38 @@
-//! Accepts owner-initiated local runs on a user device and submits them as jobs.
+//! Accepts owner-initiated local runs on a user device and reads its compute plane as calls.
 //! Only the owner's work runs here; staging reads the realm-held inputs.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::{ExecutorKind, ResourceEnvelope};
 use aruna_core::id::NodeId;
+use aruna_core::node_state::{DrainState, DrainStateError, DrainStateOperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputMode, InputSource, JobPayload, JobState, WorkspaceMode,
+    ExecutionSpec, InputMode, InputSource, JobPayload, JobRecord, JobState, WorkspaceMode,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::jobs::service::{list_owned_jobs, submit_execution_job};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::driver::DriverContext;
+use crate::jobs::store::list_jobs::{ListJobsError, ListJobsOperation};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
-use crate::realm::load_config::load_realm_config;
+use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
 use crate::realm::mutate_placement::node_kind;
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_core::node_state::DrainStateOperation;
+use crate::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
 /// owner's work, not a realm's, so the count is bounded instead of paged.
 const MAX_RUN_SCAN: usize = 64;
 
 /// One owner-initiated run of the local executor.
+#[derive(Clone, Debug, PartialEq)]
 pub struct LocalExecutionConfig {
     pub spec: ExecutionSpec,
     /// The user this device is enrolled for; every local run is theirs.
@@ -37,7 +45,7 @@ pub struct LocalExecutionConfig {
 }
 
 /// Why a device refused a local run.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum LocalExecutionError {
     #[error("this node is not a user device")]
     NotADevice,
@@ -64,46 +72,195 @@ pub enum LocalExecutionError {
     Unavailable(String),
 }
 
-/// Accepts one local run on behalf of the device owner.
-///
-/// Refusals are decided before the job exists; the admitting transaction bounds concurrent submissions.
-pub async fn submit_local_execution(
-    context: &DriverContext,
-    mut config: LocalExecutionConfig,
-) -> Result<SubmitJobResult, LocalExecutionError> {
-    let realm = load_realm_config(context, config.owner.realm_id)
-        .await
-        .ok_or_else(|| LocalExecutionError::Unavailable("realm configuration".to_string()))?;
-    let owner = node_kind(&realm, config.node_id)
-        .and_then(|kind| kind.owner())
-        .ok_or(LocalExecutionError::NotADevice)?;
-    if owner != config.owner {
-        return Err(LocalExecutionError::NotOwner);
+impl From<IoError> for LocalExecutionError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
     }
-    if drive(DrainStateOperation::new(), context)
-        .await
-        .map_err(|error| LocalExecutionError::Unavailable(error.to_string()))?
-        .operator_draining
-    {
-        return Err(LocalExecutionError::Paused);
+}
+
+fn unavailable(error: impl std::fmt::Display) -> LocalExecutionError {
+    LocalExecutionError::Unavailable(error.to_string())
+}
+
+#[derive(Debug, PartialEq)]
+enum RunStep {
+    Config,
+    Drain,
+    /// The head of the input at `index`, requested at `version` when the run named one.
+    Input {
+        index: usize,
+        version: Option<Ulid>,
+    },
+    Submit,
+}
+
+type RunTurn = Result<Next<SubmitJobResult>, LocalExecutionError>;
+
+/// Accepts one local run. Refusals are decided before the job exists; the admitting transaction
+/// bounds concurrent submissions. `limits` are the ceilings of the backend the request would run
+/// on: a device without one refuses the run instead of queueing work nothing will claim.
+#[derive(Debug, PartialEq)]
+pub struct LocalRunOperation {
+    config: LocalExecutionConfig,
+    limits: Option<ResourceEnvelope>,
+    serving: Option<(NodeId, RealmId)>,
+    now_ms: u64,
+    step: RunStep,
+}
+
+impl LocalRunOperation {
+    /// A run on this node: the ceilings of the backend it would select, and the realm it serves.
+    pub fn on_node(config: LocalExecutionConfig, context: &DriverContext) -> Self {
+        let constraint = config.spec.executor_constraint.as_deref();
+        let limits = backend_limits(context, constraint);
+        Self::new(config, limits, context.node_and_realm())
     }
-    local_staging(&config.spec, config.workspace_mode)?;
-    let limits = backend_limits(context, config.spec.executor_constraint.as_deref())?;
-    resolve_inputs(context, &mut config).await?;
-    pin_outputs(&mut config.spec, config.node_id);
-    submit_execution_job(
-        context,
-        config.spec,
-        config.owner,
-        config.node_id,
-        config.idempotency_key,
-        config.workspace_mode,
-        None,
-        config.retention_ms,
-        limits.max_concurrent,
-    )
-    .await
-    .map_err(LocalExecutionError::Submit)
+
+    pub fn new(
+        config: LocalExecutionConfig,
+        limits: Option<ResourceEnvelope>,
+        serving: Option<(NodeId, RealmId)>,
+    ) -> Self {
+        Self {
+            config,
+            limits,
+            serving,
+            now_ms: 0,
+            step: RunStep::Config,
+        }
+    }
+
+    fn check_owner(&mut self, realm: &RealmConfigDocument) -> RunTurn {
+        let owner = node_kind(realm, self.config.node_id)
+            .and_then(|kind| kind.owner())
+            .ok_or(LocalExecutionError::NotADevice)?;
+        if owner != self.config.owner {
+            return Err(LocalExecutionError::NotOwner);
+        }
+        self.step = RunStep::Drain;
+        Ok(Next::Call(IoCall::child(DrainStateOperation::new())))
+    }
+
+    /// Refuses at submit time what staging could only discover mid-run: other-node inputs are
+    /// fetched by exact version, local ones must be readable and open inputs are pinned to the
+    /// version staging will read.
+    fn next_input(&mut self, start: usize) -> RunTurn {
+        let node_id = self.config.node_id;
+        for index in start..self.config.spec.inputs.len() {
+            let input = &self.config.spec.inputs[index];
+            let remote = input.source_node_id.filter(|source| *source != node_id);
+            let InputSource::S3 {
+                bucket,
+                key,
+                version_id,
+            } = &input.source;
+            if remote.is_some() {
+                remote_version(bucket, key, version_id.as_deref())?;
+                continue;
+            }
+            let version = (version_id.as_deref().map(Ulid::from_string))
+                .transpose()
+                .map_err(|_| missing_input(bucket, key))?;
+            let head = HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: version,
+            });
+            self.step = RunStep::Input { index, version };
+            return Ok(Next::Call(IoCall::child(head)));
+        }
+        self.submit()
+    }
+
+    /// Pins the input to the exact local version the run will read, from the head when the
+    /// request named none.
+    fn pin_input(&mut self, index: usize, version: Option<Ulid>, result: IoResult) -> RunTurn {
+        let head = result.child::<HeadObjectResult, HeadObjectError>()?;
+        let input = (self.config.spec.inputs.get_mut(index)).ok_or(IoError::Unfinished)?;
+        let InputSource::S3 {
+            bucket,
+            key,
+            version_id,
+        } = &mut input.source;
+        let pinned = match head {
+            Ok(head) => head.resolved_version_id.or(head.version_id).or(version),
+            Err(
+                HeadObjectError::NoSuchKey
+                | HeadObjectError::NoSuchVersion
+                | HeadObjectError::DeleteMarker,
+            ) => None,
+            Err(error) => return Err(unavailable(error)),
+        };
+        let pinned = pinned.ok_or_else(|| missing_input(bucket, key))?;
+        *version_id = Some(pinned.to_string());
+        self.next_input(index + 1)
+    }
+
+    fn submit(&mut self) -> RunTurn {
+        let limits = self
+            .limits
+            .as_ref()
+            .ok_or(LocalExecutionError::NoExecutor)?;
+        let config = &self.config;
+        let mut spec = config.spec.clone();
+        pin_outputs(&mut spec, config.node_id);
+        let submit = SubmitExecutionOperation::new(ExecutionSubmission {
+            spec,
+            created_by: config.owner,
+            owner_node_id: config.node_id,
+            idempotency_key: config.idempotency_key.clone(),
+            workspace_mode: config.workspace_mode,
+            workspace_bucket: None,
+            retention_ms: config.retention_ms,
+            active_cap: limits.max_concurrent,
+            serving: self.serving,
+            now_ms: self.now_ms,
+        });
+        self.step = RunStep::Submit;
+        Ok(Next::Call(IoCall::child(submit)))
+    }
+}
+
+impl Operation for LocalRunOperation {
+    type Output = SubmitJobResult;
+    type Error = LocalExecutionError;
+
+    fn first(&mut self) -> RunTurn {
+        let realm_id = self.config.owner.realm_id;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> RunTurn {
+        match self.step {
+            RunStep::Config => match result.child::<RealmConfigDocument, GetConfigError>()? {
+                Ok(realm) => self.check_owner(&realm),
+                Err(error) => {
+                    warn!(%error, "realm config unavailable for a local run");
+                    Err(unavailable("realm configuration"))
+                }
+            },
+            RunStep::Drain => {
+                let drain = result.child::<DrainState, DrainStateError>()?;
+                if drain.map_err(unavailable)?.operator_draining {
+                    return Err(LocalExecutionError::Paused);
+                }
+                local_staging(&self.config.spec, self.config.workspace_mode)?;
+                if self.limits.is_none() {
+                    return Err(LocalExecutionError::NoExecutor);
+                }
+                self.next_input(0)
+            }
+            RunStep::Input { index, version } => self.pin_input(index, version, result),
+            RunStep::Submit => {
+                let submitted = result.child::<SubmitJobResult, SubmitJobError>()??;
+                Ok(Next::Done(submitted))
+            }
+        }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 }
 
 /// Pins every declared output to this device, the only node that will ever
@@ -130,53 +287,86 @@ pub struct ComputeStatus {
     pub message: Option<String>,
 }
 
-/// Reports the local compute plane and the owner's runs on it.
-///
-/// Counters come from durable job records; scanning stops at [`MAX_RUN_SCAN`].
-pub async fn compute_status(
-    context: &DriverContext,
-    owner: UserId,
-) -> Result<ComputeStatus, LocalExecutionError> {
-    let backend = context
-        .compute_handle
-        .as_ref()
-        .and_then(|registry| registry.select(None).cloned());
-    let runs = count_runs(context, owner).await?;
-    let paused = drive(DrainStateOperation::new(), context)
-        .await
-        .map_err(|error| LocalExecutionError::Unavailable(error.to_string()))?
-        .operator_draining;
-    let (kind, limits, failure) = match &backend {
-        Some(backend) => (
-            Some(backend.kind().as_wire()),
-            backend.capabilities().limits,
-            backend.health().await.err().map(|error| error.to_string()),
-        ),
-        None => (
-            None,
-            ResourceEnvelope::default(),
-            Some("no compute backend is configured on this device".to_string()),
-        ),
-    };
-    Ok(ComputeStatus {
-        enabled: backend.is_some(),
-        backend: kind,
-        healthy: backend.is_some() && failure.is_none(),
-        paused,
-        limits,
-        running: runs.running,
-        queued: runs.queued,
-        message: match paused {
-            true => Some(LocalExecutionError::Paused.to_string()),
-            false => failure,
-        },
-    })
+/// What the selected backend reports about itself.
+pub struct BackendState {
+    pub kind: Option<String>,
+    pub limits: ResourceEnvelope,
+    pub failure: Option<String>,
 }
 
-/// The owner's runs this device has not finished.
-struct LocalRuns {
+pub fn status_of(plane: BackendState, runs: LocalRuns) -> ComputeStatus {
+    let enabled = plane.kind.is_some();
+    ComputeStatus {
+        enabled,
+        backend: plane.kind,
+        healthy: enabled && plane.failure.is_none(),
+        paused: runs.paused,
+        limits: plane.limits,
+        running: runs.running,
+        queued: runs.queued,
+        message: match runs.paused {
+            true => Some(LocalExecutionError::Paused.to_string()),
+            false => plane.failure,
+        },
+    }
+}
+
+/// The owner's runs this device has not finished, and whether its plane is paused.
+#[derive(Debug, PartialEq)]
+pub struct LocalRuns {
     running: u32,
     queued: u32,
+    paused: bool,
+}
+
+fn unfinished_run(record: &JobRecord) -> bool {
+    matches!(record.payload, JobPayload::Execution(_)) && !record.state.is_terminal()
+}
+
+/// Counts the owner's unfinished runs from durable job records, stopping at [`MAX_RUN_SCAN`],
+/// then reads the operator drain.
+#[derive(Debug, PartialEq)]
+pub struct LocalRunsOperation {
+    owner: UserId,
+    counted: Option<(u32, u32)>,
+}
+
+impl LocalRunsOperation {
+    pub fn new(owner: UserId) -> Self {
+        Self {
+            owner,
+            counted: None,
+        }
+    }
+}
+
+impl Operation for LocalRunsOperation {
+    type Output = LocalRuns;
+    type Error = LocalExecutionError;
+
+    fn first(&mut self) -> Result<Next<LocalRuns>, LocalExecutionError> {
+        let filter: fn(&JobRecord) -> bool = unfinished_run;
+        let list = ListJobsOperation::new(self.owner, None, MAX_RUN_SCAN, filter);
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<LocalRuns>, LocalExecutionError> {
+        let Some((running, queued)) = self.counted else {
+            let page = result.child::<(Vec<JobRecord>, Option<Vec<u8>>), ListJobsError>()?;
+            let (records, _) = page.map_err(unavailable)?;
+            let queued = (records.iter())
+                .filter(|record| record.state == JobState::Queued)
+                .count();
+            self.counted = Some(((records.len() - queued) as u32, queued as u32));
+            return Ok(Next::Call(IoCall::child(DrainStateOperation::new())));
+        };
+        let drain = result.child::<DrainState, DrainStateError>()?;
+        Ok(Next::Done(LocalRuns {
+            running,
+            queued,
+            paused: drain.map_err(unavailable)?.operator_draining,
+        }))
+    }
 }
 
 /// A device stages every input as a file and forwards no bucket name: a mount
@@ -199,66 +389,12 @@ fn local_staging(spec: &ExecutionSpec, mode: WorkspaceMode) -> Result<(), LocalE
     Ok(())
 }
 
-/// Static ceilings of the backend this request would run on. A device without
-/// one refuses the run instead of queueing work nothing will claim.
-fn backend_limits(
-    context: &DriverContext,
-    constraint: Option<&str>,
-) -> Result<ResourceEnvelope, LocalExecutionError> {
-    let registry = context
-        .compute_handle
-        .as_ref()
-        .ok_or(LocalExecutionError::NoExecutor)?;
+/// Static ceilings of the backend this request would run on.
+fn backend_limits(context: &DriverContext, constraint: Option<&str>) -> Option<ResourceEnvelope> {
+    let registry = context.compute_handle.as_ref()?;
     let constraint = constraint.map(ExecutorKind::from_wire);
-    let backend = registry
-        .select(constraint.as_ref())
-        .ok_or(LocalExecutionError::NoExecutor)?;
-    Ok(backend.capabilities().limits)
-}
-
-async fn count_runs(
-    context: &DriverContext,
-    owner: UserId,
-) -> Result<LocalRuns, LocalExecutionError> {
-    let (records, _) = list_owned_jobs(context, owner, None, MAX_RUN_SCAN, |record| {
-        matches!(record.payload, JobPayload::Execution(_)) && !record.state.is_terminal()
-    })
-    .await
-    .map_err(LocalExecutionError::Unavailable)?;
-    let queued = records
-        .iter()
-        .filter(|record| record.state == JobState::Queued)
-        .count();
-    Ok(LocalRuns {
-        running: (records.len() - queued) as u32,
-        queued: queued as u32,
-    })
-}
-
-/// Refuses at submit time what staging could only discover mid-run: other-node
-/// inputs are fetched by exact version, local ones must be readable and open
-/// inputs are pinned to the version staging will read.
-async fn resolve_inputs(
-    context: &DriverContext,
-    config: &mut LocalExecutionConfig,
-) -> Result<(), LocalExecutionError> {
-    let node_id = config.node_id;
-    for input in &mut config.spec.inputs {
-        let remote = input.source_node_id.filter(|source| *source != node_id);
-        let InputSource::S3 {
-            bucket,
-            key,
-            version_id,
-        } = &mut input.source;
-        match remote {
-            Some(_) => remote_version(bucket, key, version_id.as_deref())?,
-            None => {
-                let pinned = resolve_local(context, bucket, key, version_id.as_deref()).await?;
-                *version_id = Some(pinned.to_string());
-            }
-        }
-    }
-    Ok(())
+    let backend = registry.select(constraint.as_ref())?;
+    Some(backend.capabilities().limits)
 }
 
 /// A realm input is fetched by exact version or not at all: a device plans
@@ -280,64 +416,37 @@ fn remote_version(
     }
 }
 
-/// The exact local version the run will read, resolved from the head when the
-/// request named none.
-async fn resolve_local(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-    version_id: Option<&str>,
-) -> Result<Ulid, LocalExecutionError> {
-    let missing = || LocalExecutionError::InputNotLocal {
+fn missing_input(bucket: &str, key: &str) -> LocalExecutionError {
+    LocalExecutionError::InputNotLocal {
         bucket: bucket.to_string(),
         key: key.to_string(),
-    };
-    let version_id = version_id
-        .map(Ulid::from_string)
-        .transpose()
-        .map_err(|_| missing())?;
-    match drive(
-        HeadObjectOperation::new(HeadObjectInput {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version_id,
-        }),
-        context,
-    )
-    .await
-    {
-        Ok(head) => head
-            .resolved_version_id
-            .or(head.version_id)
-            .or(version_id)
-            .ok_or_else(missing),
-        Err(
-            HeadObjectError::NoSuchKey
-            | HeadObjectError::NoSuchVersion
-            | HeadObjectError::DeleteMarker,
-        ) => Err(missing()),
-        Err(error) => Err(LocalExecutionError::Unavailable(error.to_string())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
+    use crate::jobs::service::list_owned_jobs;
+    use crate::jobs::submit::SubmitJobError;
     use crate::tests::records::payload;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::{AttemptStatus, BackendError, FenceContext};
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::LaunchDecline;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
+    use aruna_core::structs::execution::job::InputSelection;
     use aruna_core::structs::execution::job::{
-        InputSelection, OutputDestination, OutputSelection, WorkspaceMode,
+        InputSource, JobPayload, OutputDestination, OutputSelection, WorkspaceMode,
     };
     use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
         CurrentVersionPointer, VersionKey,
@@ -349,6 +458,14 @@ mod tests {
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
+    use ulid::Ulid;
+
+    async fn submit_local_execution(
+        ctx: &DriverContext,
+        config: LocalExecutionConfig,
+    ) -> Result<SubmitJobResult, LocalExecutionError> {
+        drive(LocalRunOperation::on_node(config, ctx), ctx).await
+    }
 
     const REALM: RealmId = RealmId([3u8; 32]);
 
@@ -360,46 +477,11 @@ mod tests {
         UserId::new(Ulid::from_bytes([seed; 16]), REALM)
     }
 
-    fn test_ctx(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }
-    }
-
     fn realm_config(local: NodeId, kind: RealmNodeKind) -> RealmConfigDocument {
         let mut config = RealmConfigDocument::default_for_realm(REALM, Vec::new());
         config.seed_default_placement();
         config.ensure_node(local, kind);
         config
-    }
-
-    async fn write_config(ctx: &DriverContext, config: &RealmConfigDocument, local: NodeId) {
-        let actor = Actor {
-            node_id: local,
-            user_id: UserId::nil(REALM),
-            realm_id: REALM,
-        };
-        let target = DocumentTarget::RealmConfig { realm_id: REALM };
-        let event = ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: config.to_bytes(&actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ));
     }
 
     fn run_config(local: NodeId, caller: UserId) -> LocalExecutionConfig {
@@ -427,6 +509,244 @@ mod tests {
             name: None,
             description: None,
         }
+    }
+
+    #[test]
+    fn refuses_foreign_staging() {
+        // A device has no S3 endpoint to mount through and names no bucket.
+        let mut spec = payload();
+        assert!(matches!(
+            local_staging(&spec, WorkspaceMode::Existing),
+            Err(LocalExecutionError::Unsupported(_))
+        ));
+
+        spec.inputs.push(input("project", None, None));
+        spec.inputs[0].mode = InputMode::Mount;
+        assert!(matches!(
+            local_staging(&spec, WorkspaceMode::None),
+            Err(LocalExecutionError::Unsupported(_))
+        ));
+
+        spec.inputs[0].mode = InputMode::Snapshot;
+        assert!(local_staging(&spec, WorkspaceMode::None).is_ok());
+    }
+
+    fn local_run(config: LocalExecutionConfig) -> LocalRunOperation {
+        LocalRunOperation::new(config, Some(ResourceEnvelope::default()), None)
+    }
+
+    fn outcome<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn drain(operator_draining: bool) -> IoResult {
+        outcome::<_, DrainStateError>(Ok(DrainState {
+            operator_draining,
+            departure: None,
+        }))
+    }
+
+    fn head(version: Option<Ulid>) -> HeadObjectInput {
+        HeadObjectInput {
+            bucket: "project".to_string(),
+            key: "reads.fastq".to_string(),
+            version_id: version,
+        }
+    }
+
+    #[test]
+    fn run_checks_device() {
+        let (local, caller) = (node(1), owner(2));
+        let device = realm_config(local, RealmNodeKind::User { owner: caller });
+        let config = |result| outcome::<RealmConfigDocument, GetConfigError>(result);
+        let mut run = local_run(run_config(local, caller));
+        let read = IoCall::child(GetConfigOperation::new(REALM));
+        assert_eq!(run.first(), Ok(Next::Call(read)));
+        let drain_read = IoCall::child(DrainStateOperation::new());
+        let answer = run.next(config(Ok(device.clone())));
+        assert_eq!(answer, Ok(Next::Call(drain_read)));
+        // A server has no owner, another caller is not the owner, no config is no answer.
+        let server = realm_config(local, RealmNodeKind::Server);
+        let answer = local_run(run_config(local, caller)).next(config(Ok(server)));
+        assert_eq!(answer, Err(LocalExecutionError::NotADevice));
+        let answer = local_run(run_config(local, owner(3))).next(config(Ok(device)));
+        assert_eq!(answer, Err(LocalExecutionError::NotOwner));
+        let answer = (local_run(run_config(local, caller)))
+            .next(config(Err(GetConfigError::DocumentNotFound)));
+        let unavailable = LocalExecutionError::Unavailable("realm configuration".to_string());
+        assert_eq!(answer, Err(unavailable));
+    }
+
+    #[test]
+    fn run_stops_early() {
+        let drained = |limits| {
+            let config = run_config(node(1), owner(2));
+            let mut run = LocalRunOperation::new(config, limits, None);
+            run.step = RunStep::Drain;
+            run
+        };
+        let limits = Some(ResourceEnvelope::default());
+        let answer = drained(limits).next(drain(true));
+        assert_eq!(answer, Err(LocalExecutionError::Paused));
+        let answer = drained(None).next(drain(false));
+        assert_eq!(answer, Err(LocalExecutionError::NoExecutor));
+    }
+
+    #[test]
+    fn run_pins_inputs() {
+        let version = Ulid::from_bytes([21; 16]);
+        let mut config = run_config(node(1), owner(2));
+        config.spec.inputs.push(input("project", None, None));
+        let mut run = local_run(config);
+        run.stamp(7);
+        run.step = RunStep::Drain;
+        let call = IoCall::child(HeadObjectOperation::new(head(None)));
+        assert_eq!(run.next(drain(false)), Ok(Next::Call(call)));
+        let found = HeadObjectResult {
+            resolved_version_id: Some(version),
+            ..head_result()
+        };
+        let answer = run.next(outcome::<_, HeadObjectError>(Ok(found)));
+        assert!(matches!(answer, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(run.step, RunStep::Submit);
+        let InputSource::S3 { version_id, .. } = &run.config.spec.inputs[0].source;
+        assert_eq!(version_id.as_deref(), Some(version.to_string().as_str()));
+        let job = SubmitJobResult {
+            job_id: aruna_core::structs::execution::job::JobId::from_bytes([1; 16]),
+            created: true,
+        };
+        let answer = run.next(outcome::<_, SubmitJobError>(Ok(job.clone())));
+        assert_eq!(answer, Ok(Next::Done(job)));
+    }
+
+    fn head_result() -> HeadObjectResult {
+        HeadObjectResult {
+            location: None,
+            metadata: Default::default(),
+            source_metadata: None,
+            last_refresh: None,
+            version_created_at: None,
+            version_id: None,
+            resolved_version_id: None,
+            checksum_type:
+                aruna_core::structs::storage::multipart::MultipartChecksumType::FullObject,
+            composite_hashes: Default::default(),
+            part_count: None,
+            source_policies: Vec::new(),
+            source_binding: None,
+        }
+    }
+
+    #[test]
+    fn refuses_missing_input() {
+        let mut config = run_config(node(1), owner(2));
+        config.spec.inputs.push(input("project", None, None));
+        let mut run = local_run(config);
+        run.next_input(0).unwrap();
+        let answer = run.next(outcome::<HeadObjectResult, _>(Err(
+            HeadObjectError::NoSuchKey,
+        )));
+        assert!(matches!(
+            answer,
+            Err(LocalExecutionError::InputNotLocal { bucket, .. }) if bucket == "project"
+        ));
+    }
+
+    #[test]
+    fn refuses_floating_copy() {
+        // A realm input is copied by exact version or not at all.
+        let mut config = run_config(node(1), owner(2));
+        config
+            .spec
+            .inputs
+            .push(input("project", Some(node(4)), None));
+        let answer = local_run(config).next_input(0);
+        assert!(matches!(
+            answer,
+            Err(LocalExecutionError::InputRefused { reason, .. }) if reason.contains("exact version")
+        ));
+    }
+
+    #[test]
+    fn counts_local_runs() {
+        let mut runs = LocalRunsOperation::new(owner(2));
+        assert!(matches!(runs.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let page =
+            outcome::<(Vec<JobRecord>, Option<Vec<u8>>), ListJobsError>(Ok((Vec::new(), None)));
+        let read = IoCall::child(DrainStateOperation::new());
+        assert_eq!(runs.next(page), Ok(Next::Call(read)));
+        let expected = LocalRuns {
+            running: 0,
+            queued: 0,
+            paused: true,
+        };
+        assert_eq!(runs.next(drain(true)), Ok(Next::Done(expected)));
+    }
+
+    #[test]
+    fn pause_explains_status() {
+        let runs = |paused| LocalRuns {
+            running: 1,
+            queued: 2,
+            paused,
+        };
+        let healthy = || BackendState {
+            kind: Some("local".to_string()),
+            limits: ResourceEnvelope::default(),
+            failure: None,
+        };
+        let status = status_of(healthy(), runs(true));
+        assert!(status.enabled && status.healthy && status.paused);
+        assert_eq!(
+            status.message,
+            Some(LocalExecutionError::Paused.to_string())
+        );
+        let failing = BackendState {
+            failure: Some("down".to_string()),
+            ..healthy()
+        };
+        let status = status_of(failing, runs(false));
+        assert!(!status.healthy);
+        assert_eq!(status.message.as_deref(), Some("down"));
+    }
+
+    fn test_ctx(root: &str) -> DriverContext {
+        DriverContext {
+            storage_handle: FjallStorage::open(root).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        }
+    }
+
+    async fn write_config(ctx: &DriverContext, config: &RealmConfigDocument, local: NodeId) {
+        let actor = Actor {
+            node_id: local,
+            user_id: UserId::nil(REALM),
+            realm_id: REALM,
+        };
+        let target = DocumentTarget::RealmConfig { realm_id: REALM };
+        let event = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                value: config.to_bytes(&actor).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
     }
 
     #[tokio::test]
@@ -467,35 +787,23 @@ mod tests {
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
-        crate::node::node_info::set_operator_drain(&ctx, local, REALM, true)
-            .await
-            .unwrap();
+        crate::driver::drive(
+            crate::node::info::flows::OperatorDrainOperation::new(
+                REALM,
+                local,
+                true,
+                crate::node::info::facts::NodeFacts::gather(&ctx),
+            ),
+            &ctx,
+        )
+        .await
+        .unwrap();
 
         let error = submit_local_execution(&ctx, run_config(local, owner(2)))
             .await
             .expect_err("a paused plane accepts nothing");
 
         assert!(matches!(error, LocalExecutionError::Paused));
-    }
-
-    #[test]
-    fn refuses_foreign_staging() {
-        // A device has no S3 endpoint to mount through and names no bucket.
-        let mut spec = payload();
-        assert!(matches!(
-            local_staging(&spec, WorkspaceMode::Existing),
-            Err(LocalExecutionError::Unsupported(_))
-        ));
-
-        spec.inputs.push(input("project", None, None));
-        spec.inputs[0].mode = InputMode::Mount;
-        assert!(matches!(
-            local_staging(&spec, WorkspaceMode::None),
-            Err(LocalExecutionError::Unsupported(_))
-        ));
-
-        spec.inputs[0].mode = InputMode::Snapshot;
-        assert!(local_staging(&spec, WorkspaceMode::None).is_ok());
     }
 
     struct StubBackend;
@@ -646,17 +954,17 @@ mod tests {
         let local = node(1);
         let config = realm_config(local, RealmNodeKind::User { owner: owner(2) });
         write_config(&ctx, &config, local).await;
-        crate::node::node_info::seed_info_document(
-            &ctx,
-            local,
+        let seed = crate::node::info::flows::SeedInfoOperation::new(
             REALM,
+            local,
             NodeUrls {
                 api: None,
                 s3: None,
             },
-        )
-        .await
-        .unwrap();
+            crate::node::info::facts::NodeFacts::gather(&ctx),
+            false,
+        );
+        drive(seed, &ctx).await.unwrap();
 
         let family = Family::new([8u8; 32]);
         let spec = family.spec();
@@ -813,45 +1121,5 @@ mod tests {
         };
         let InputSource::S3 { version_id, .. } = &spec.inputs[0].source;
         assert_eq!(version_id.as_deref(), Some(version.to_string().as_str()));
-    }
-
-    #[tokio::test]
-    async fn refuses_missing_input() {
-        let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
-        let local = node(1);
-        let mut config = run_config(local, owner(2));
-        config.spec.inputs.push(input("project", None, None));
-
-        let error = resolve_inputs(&ctx, &mut config)
-            .await
-            .expect_err("an input the device does not hold is refused");
-
-        assert!(matches!(
-            error,
-            LocalExecutionError::InputNotLocal { bucket, .. } if bucket == "project"
-        ));
-    }
-
-    #[tokio::test]
-    async fn refuses_floating_copy() {
-        // A realm input is copied by exact version or not at all.
-        let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
-        let local = node(1);
-        let mut config = run_config(local, owner(2));
-        config
-            .spec
-            .inputs
-            .push(input("project", Some(node(4)), None));
-
-        let error = resolve_inputs(&ctx, &mut config)
-            .await
-            .expect_err("a realm input without a version is refused");
-
-        assert!(matches!(
-            error,
-            LocalExecutionError::InputRefused { reason, .. } if reason.contains("exact version")
-        ));
     }
 }

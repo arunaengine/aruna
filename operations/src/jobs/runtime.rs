@@ -20,7 +20,6 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use futures_util::future::FutureExt;
 use tokio::sync::{RwLock, RwLockReadGuard, watch};
@@ -417,18 +416,7 @@ impl JobsRuntime {
     /// Stop claiming, signal the jobs in flight, and give them `grace` to wind down.
     /// Whatever is still running then has its lease handed back, so a restart costs a
     /// job no attempt. Storage must outlive this call: releasing a lease writes.
-    pub async fn shutdown(&self, storage: &StorageHandle, grace: Duration) -> JobShutdownReport {
-        // Releasing a lease writes storage only, so the node's other planes stay out.
-        let context = &DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
+    pub async fn shutdown(&self, context: &DriverContext, grace: Duration) -> JobShutdownReport {
         self.close_admission();
         let waiters: Vec<_> = {
             let state = self.state();
@@ -1091,7 +1079,7 @@ mod tests {
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -1548,7 +1536,7 @@ mod tests {
         let runtime = JobsRuntime::new();
         runtime.spawn(ctx.clone(), claimed);
         wait_running(&ctx, job_id).await;
-        let report = runtime.shutdown(&storage, Duration::ZERO).await;
+        let report = runtime.shutdown(&ctx, Duration::ZERO).await;
         // The payload's own Interrupted release races the shutdown sweep; both
         // hand the lease back attempt-free, so only the sum is deterministic.
         assert_eq!(report.released + report.finished + report.skipped, 1);
@@ -1584,7 +1572,7 @@ mod tests {
         let runtime = JobsRuntime::new();
         let producer = runtime.claim_producer().await.unwrap();
 
-        let mut shutdown = Box::pin(runtime.shutdown(&storage, Duration::ZERO));
+        let mut shutdown = Box::pin(runtime.shutdown(&ctx, Duration::ZERO));
         assert!(
             shutdown.as_mut().now_or_never().is_none(),
             "shutdown must wait for the active claim producer"
@@ -1672,7 +1660,7 @@ mod tests {
             let claimed = reclaim(&ctx, job_id).await;
             runtime.spawn(ctx.clone(), claimed);
             wait_running(&ctx, job_id).await;
-            runtime.shutdown(&storage, Duration::ZERO).await;
+            runtime.shutdown(&ctx, Duration::ZERO).await;
 
             let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
             assert_eq!(record.state, JobState::Queued, "restart {restart}");
@@ -1701,7 +1689,7 @@ mod tests {
         }
         assert!(marker.exists(), "probe should create its marker");
 
-        let report = runtime.shutdown(&storage, Duration::from_secs(10)).await;
+        let report = runtime.shutdown(&ctx, Duration::from_secs(10)).await;
         assert_eq!(report.finished, 1, "the probe winds down inside the grace");
 
         let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
@@ -1730,7 +1718,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = runtime.shutdown(&storage, Duration::ZERO).await;
+        let report = runtime.shutdown(&ctx, Duration::ZERO).await;
         assert_eq!(report.released, 0);
         assert_eq!(report.skipped, 1);
 

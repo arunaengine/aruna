@@ -17,6 +17,7 @@ use crate::metadata::create_document::{
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::materialization_queue::process_materialization_batch;
 use crate::plugins::dataset::merge_into;
+use crate::plugins::host_calls::VisibleObjects;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::store::Txn;
@@ -247,6 +248,18 @@ async fn objects_broker(
     (RunBroker::new(broker.ctx.clone(), scope), installed)
 }
 
+/// The listed objects the broker's account may read in `bucket`.
+async fn visible(
+    broker: &RunBroker,
+    install: &PluginInstall,
+    bucket: &str,
+    listed: Vec<(String, u64, String)>,
+) -> Vec<aruna_plugins::broker::ObjectInfo> {
+    let place = (broker.scope.realm_id, broker.scope.local);
+    let visible = VisibleObjects::new(place, install, bucket, listed);
+    drive(visible, &broker.ctx).await.unwrap()
+}
+
 #[tokio::test]
 async fn object_paths() {
     // A key of bucket `data` never passes a grant for bucket `dataset`.
@@ -259,18 +272,9 @@ async fn object_paths() {
     let dataset = format!("/{realm}/g/{group}/data/{node}/dataset/**");
     let (objects, install) = objects_broker(&fixture, &broker, &[dataset]).await;
     let listed = vec![("set/private".to_string(), 1, "v1".to_string())];
-    assert!(
-        objects
-            .visible(&install, "data", listed)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(visible(&objects, &install, "data", listed).await.is_empty());
     let listed = vec![("private".to_string(), 1, "v1".to_string())];
-    let shown = objects
-        .visible(&install, "dataset", listed.clone())
-        .await
-        .unwrap();
+    let shown = visible(&objects, &install, "dataset", listed).await;
     // Listed objects of this node come back by their short bucket path.
     let path = "dataset/private".to_string();
     assert_eq!(
@@ -306,22 +310,13 @@ async fn listings_authorize() {
     fixture.deny(&[]).await;
     let (objects, install) = objects_broker(&fixture, &broker, &[data]).await;
     let listed = vec![("a.txt".to_string(), 1, "v1".to_string())];
-    let shown = objects
-        .visible(&install, "data", listed.clone())
-        .await
-        .unwrap();
+    let shown = visible(&objects, &install, "data", listed.clone()).await;
     assert_eq!(shown.len(), 1);
     fixture.deny(&["operation == 'plugin.objects.read'"]).await;
     let path = format!("/{realm}/g/{group}/data/{node}/data/a.txt");
     let refused = objects.objects_info(&cx(), &path, None).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Denied);
-    assert!(
-        objects
-            .visible(&install, "data", listed)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(visible(&objects, &install, "data", listed).await.is_empty());
 }
 
 #[tokio::test]
@@ -549,7 +544,7 @@ async fn invalid_patches() {
 
 #[tokio::test]
 async fn secret_values_granted() {
-    use crate::plugins::account::{Identity, ensure_role, guard_of};
+    use crate::plugins::account::{AccountChange, EnsureRole};
     use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, secret};
     use crate::plugins::grants::role_paths;
     use crate::plugins::rules::ensure_rules;
@@ -580,21 +575,12 @@ async fn secret_values_granted() {
     .await;
     let config = read_config(&fixture.ctx, fixture.actor.realm_id).await;
     let granted = config.unwrap().installs.remove(0);
-    let (scope, paths) = (
-        install_scope(&granted),
-        role_paths(&parse_grants(&granted.grants)),
-    );
-    let (identity, auth) = ((Identity::of(&granted), guard_of(&granted)), fixture.auth());
-    let role = ensure_role(
-        &fixture.ctx,
-        &fixture.actor,
-        &auth,
-        &scope,
-        identity.0,
-        &paths,
-        identity.1,
-    );
-    role.await.unwrap();
+    let paths = role_paths(&parse_grants(&granted.grants));
+    let auth = fixture.auth();
+    let change = AccountChange::of((&fixture.actor, &auth), &granted, 1);
+    drive(EnsureRole::new(change, paths), &fixture.ctx)
+        .await
+        .unwrap();
     // The secret's rules let this install inject it, not read its value.
     assert_eq!(kind(&granted).await, Err(ErrorKind::Denied));
     let config = read_config(&fixture.ctx, fixture.actor.realm_id)
