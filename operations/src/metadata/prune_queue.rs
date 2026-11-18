@@ -27,7 +27,8 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::prune_jobs::{DuePrune, DuePruneOperation, RescheduleOperation};
-use crate::jobs::repository::link_reads::QueueDeletedOperation;
+use crate::jobs::repository::NodeScope;
+use crate::jobs::repository::link_queue::QueueDeletedOperation;
 use crate::jobs::repository::links::LinkError;
 use crate::metadata::call_results::effect_event;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
@@ -474,6 +475,7 @@ enum BatchStage {
 /// copy and queues its repository link checks; a failure reschedules the graph's job.
 #[derive(Debug, PartialEq)]
 pub struct PruneBatchOperation {
+    scope: NodeScope,
     now_ms: u64,
     stage: BatchStage,
     groups: VecDeque<(String, Vec<(Vec<u8>, GraphPruneRecord)>)>,
@@ -488,8 +490,9 @@ pub struct PruneBatchOperation {
 type BatchTurn = Result<Next<GraphDrainResult>, MetadataGraphError>;
 
 impl PruneBatchOperation {
-    pub fn new() -> Self {
+    pub fn new(scope: NodeScope) -> Self {
         Self {
+            scope,
             now_ms: 0,
             stage: BatchStage::Due,
             groups: VecDeque::new(),
@@ -597,12 +600,6 @@ impl PruneBatchOperation {
     }
 }
 
-impl Default for PruneBatchOperation {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Operation for PruneBatchOperation {
     type Output = GraphDrainResult;
     type Error = MetadataGraphError;
@@ -642,7 +639,8 @@ impl Operation for PruneBatchOperation {
                     // queues again.
                     self.stage = BatchStage::Links;
                     Ok(Next::Call(IoCall::child(QueueDeletedOperation::new(
-                        &self.graph_iri(),
+                        self.scope.clone(),
+                        self.graph_iri(),
                     ))))
                 }
                 Err(MetadataError::HandleMissing) => {

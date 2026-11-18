@@ -3,7 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::driver::drive;
+use super::driven::change_link;
+use super::driven::remote_state;
+use super::driven::{current_event, start_push};
 use super::link::{
     LINK_TOKEN, attach, change, current, drain, due_now, import_dataset, linked, replace_crate,
     run_push, succeeded,
@@ -13,10 +15,8 @@ use super::*;
 use aruna_core::metadata::ProfileValidationSeverity;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
-use aruna_operations::jobs::repository::link_store::change_link;
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
-use aruna_operations::jobs::repository::remote_state;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::revision_read::RawViewOperation;
 
 async fn push_now(

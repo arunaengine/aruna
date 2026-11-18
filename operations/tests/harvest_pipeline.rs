@@ -30,13 +30,14 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig};
 use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 use aruna_core::types::GroupId;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::harvest::repository::{
     connector_writes, parse_provenance_read, parse_source_read, read_provenance_effect,
     read_source_effect, write_source_effect,
 };
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::harvest::run_harvest_job;
+use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
+use aruna_operations::jobs::repository::{JobScope, NodeScope};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::forward::write::route_metadata_delete;
@@ -488,6 +489,12 @@ async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), Box
     .await
     .map_err(|error| format!("{error:?}"))?;
     Ok(())
+}
+
+async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunOutcome {
+    let operation =
+        HarvestJobOperation::new(NodeScope::of(&ctx.driver), JobScope::of(ctx), spec.clone());
+    harvest_outcome(drive(operation, &ctx.driver).await)
 }
 
 async fn run(fixture: &Fixture, source: &HarvestSource) -> JobRunOutcome {

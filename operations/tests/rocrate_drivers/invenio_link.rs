@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::driven::drain_links;
+use super::driven::list_links;
+use super::driven::seal_link_token;
 use super::remote::{RemoteServer, remote};
 use super::*;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -12,10 +15,7 @@ use aruna_core::repository::{
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::repository::link_queue::drain_links;
-use aruna_operations::jobs::repository::link_store::list_links;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
-use aruna_operations::jobs::repository::seal_link_token;
 use aruna_operations::jobs::service::submit_export_job;
 use aruna_operations::jobs::store::state::{complete_job, fail_job};
 use aruna_operations::jobs::submit::SubmitJobError;
@@ -415,7 +415,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(_, revision)| revision)?
         .ok_or("revision missing")?
         .winning_event_id;
-    Box::pin(aruna_operations::jobs::repository::link_queue::start_push(
+    Box::pin(super::driven::start_push(
         &fixture.context,
         &second,
         event,
@@ -718,9 +718,7 @@ async fn lost_holder_fails() -> Result<(), Box<dyn std::error::Error>> {
         config.to_bytes(&fixture.actor)?,
     )
     .await?;
-    assert!(
-        !aruna_operations::jobs::repository::link_queue::owner_holds(&fixture.context, &link).await
-    );
+    assert!(!super::driven::owner_holds(&fixture.context, &link).await);
 
     drain(&fixture).await?;
     let (failed, queued) = current(&fixture, &link).await;
@@ -971,8 +969,8 @@ async fn has_row(fixture: &Fixture, key_space: &str, link: &RepositoryLink) -> b
 
 #[tokio::test]
 async fn cancelled_queue_settles() -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
-    use aruna_operations::jobs::repository::link_store::change_link;
+    use super::driven::change_link;
+    use super::driven::{current_event, start_push};
     use aruna_operations::jobs::store::attempt::{CancelRequestOutcome, set_cancel_requested};
     for paused in [false, true] {
         let fixture = build_fixture(false).await?;

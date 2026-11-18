@@ -235,9 +235,17 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::ImportRoCrate(spec) => {
             Box::pin(crate::jobs::import::run_rocrate_import(ctx, spec)).await
         }
-        JobPayload::Harvest(spec) => {
-            Box::pin(crate::jobs::harvest::run_harvest_job(ctx, spec)).await
-        }
+        JobPayload::Harvest(spec) => crate::jobs::harvest::harvest_outcome(
+            Box::pin(crate::driver::drive(
+                crate::jobs::harvest::HarvestJobOperation::new(
+                    crate::jobs::repository::NodeScope::of(&ctx.driver),
+                    crate::jobs::repository::JobScope::of(ctx),
+                    spec.clone(),
+                ),
+                &ctx.driver,
+            ))
+            .await,
+        ),
         JobPayload::MintPersistentId(spec) => {
             Box::pin(crate::jobs::persistent_id::run_mint_pid(ctx, spec)).await
         }

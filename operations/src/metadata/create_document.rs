@@ -832,7 +832,7 @@ pub fn mint_forward_document(
     mint_document_for(config, actor, group_id, document_path, true)
 }
 
-pub(super) fn mint_document_for(
+pub(crate) fn mint_document_for(
     config: &RealmConfigDocument,
     actor: &Actor,
     group_id: GroupId,

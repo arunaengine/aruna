@@ -56,6 +56,7 @@ use crate::blob::hidden::delete_hidden;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolvePathsOperation};
 use crate::driver::{DriverContext, drive};
+use crate::jobs::repository::NodeScope;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
@@ -298,7 +299,17 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
         .as_ref()
         .and_then(|target| target.link.as_ref())
     {
-        Some(link) => super::repository::push::settle(ctx, spec, link, outcome).await,
+        Some(link) => {
+            use super::repository::push::{ExportEnd, SettlePushOperation, settled_outcome};
+            let settle = SettlePushOperation::new(
+                NodeScope::of(&ctx.driver),
+                ctx.job_id,
+                spec.document_id,
+                link.clone(),
+                ExportEnd::of(&outcome),
+            );
+            settled_outcome(outcome, drive(settle, &ctx.driver).await)
+        }
         None => outcome,
     }
 }
@@ -489,8 +500,13 @@ async fn repository_export(
     destination: &aruna_core::repository::RepositoryDestination,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<(), ExportFailure> {
-    use super::repository::check::{check_content, check_crate, unmet};
-    use super::repository::{Action, TransferError, deposit, ensure_supported, repository};
+    use super::repository::check::{
+        CheckContentOperation, CrateCheck, checks_content, profile_failure, unmet,
+    };
+    use super::repository::connector::ConnectorViewOperation;
+    use super::repository::invenio::export::{ExportRun, RepositoryExportOperation};
+    use super::repository::{Action, JobScope, TransferError, ensure_supported};
+    use crate::metadata::profile::validation::check_profile;
     use aruna_core::repository::LinkFailure;
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
         return Err(ExportFailure::Permanent(
@@ -501,8 +517,9 @@ async fn repository_export(
         Ok(())
     } else {
         Box::pin(async {
-            let view =
-                repository(&ctx.driver, destination.group_id, destination.connector_id).await?;
+            let connector =
+                ConnectorViewOperation::new(destination.group_id, destination.connector_id);
+            let view = drive(connector, &ctx.driver).await?;
             let kind = view.connector.kind;
             ensure_supported(kind, Action::Publish)?;
             if destination.published_id.is_some() {
@@ -513,17 +530,48 @@ async fn repository_export(
                 let jsonld = checkpoint.raw_jsonld.as_deref().ok_or_else(|| {
                     TransferError::Permanent("source crate metadata missing".into())
                 })?;
-                let endpoint = &view.connector.endpoint;
-                let checked = check_crate(&ctx.driver, kind, endpoint, jsonld).await?;
+                let check = CrateCheck::new(kind, &view.connector.endpoint, jsonld)?;
+                let status = Box::pin(check_profile(&ctx.driver, check.profile_iri, jsonld))
+                    .await
+                    .map_err(profile_failure)?;
+                let checked = check.finish(status)?;
                 if !checked.ready {
                     return Err(unmet(checked.findings));
                 }
-                let findings = check_content(ctx, spec, kind, checkpoint).await?;
-                if !findings.is_empty() {
-                    return Err(unmet(findings));
+                if checks_content(kind)? {
+                    let artifact = export_artifact(checkpoint)?;
+                    let inspection = inspect_artifact(ctx, spec, &artifact).await?;
+                    let content = CheckContentOperation::new(
+                        kind,
+                        checkpoint,
+                        artifact,
+                        inspection,
+                        JobScope::of(ctx).stop,
+                    )?;
+                    let findings = drive(content, &ctx.driver).await?;
+                    if !findings.is_empty() {
+                        return Err(unmet(findings));
+                    }
                 }
             }
-            deposit(kind, ctx, spec, destination, checkpoint).await
+            let inspection = match export_artifact(checkpoint) {
+                Ok(artifact) => inspect_artifact(ctx, spec, &artifact).await,
+                Err(error) => Err(error),
+            };
+            let export = RepositoryExportOperation::new(
+                kind,
+                ExportRun {
+                    scope: NodeScope::of(&ctx.driver),
+                    job: JobScope::of(ctx),
+                    spec: spec.clone(),
+                    destination: destination.clone(),
+                },
+                checkpoint.clone(),
+                inspection,
+            );
+            let (stored, result) = Box::pin(drive(export, &ctx.driver)).await?;
+            *checkpoint = stored;
+            result
         })
         .await
     };
@@ -561,6 +609,48 @@ async fn repository_export(
                 .map_err(ExportFailure::Retryable)?;
             Err(ExportFailure::Permanent(message))
         }
+    }
+}
+
+fn export_artifact(
+    checkpoint: &ExportCheckpoint,
+) -> Result<ArtifactRef, super::repository::TransferError> {
+    checkpoint.artifact.clone().ok_or_else(|| {
+        super::repository::TransferError::Permanent("export artifact missing".into())
+    })
+}
+
+/// The export artifact's entries, with the limits an export archive may reach; a stop of the
+/// job ends the inspection.
+async fn inspect_artifact(
+    ctx: &JobContext,
+    spec: &ExportRoCrateSpec,
+    artifact: &ArtifactRef,
+) -> Result<crate::jobs::import::archive::ArchiveInspection, super::repository::TransferError> {
+    use super::repository::TransferError;
+    let blob = ctx
+        .driver
+        .blob_handle
+        .as_ref()
+        .ok_or_else(|| TransferError::Retryable("blob handle unavailable".into()))?;
+    let mut limits = spec.limits.clone();
+    limits.import_source_bytes = spec.limits.export_artifact_bytes;
+    limits.expanded_import_bytes = spec.limits.export_artifact_bytes;
+    limits.max_entries = limits.max_entries.saturating_add(2);
+    let inspect = crate::jobs::import::archive::inspect_reader(
+        blob.clone(),
+        artifact.location.clone(),
+        artifact.size,
+        false,
+        &limits,
+    );
+    tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => Err(TransferError::Cancelled),
+        _ = ctx.shutdown.cancelled() => Err(TransferError::Interrupted),
+        inspected = inspect => inspected
+            .map(|(inspection, _)| inspection)
+            .map_err(TransferError::Permanent),
     }
 }
 

@@ -61,7 +61,14 @@ async fn durable_rearm_loop(
         restore_drain_timer(&context, &task_handle).await;
         restore_prune_timer(&context, &task_handle).await;
         restore_mirror_timer(&context).await;
-        crate::jobs::repository::link_queue::restore_link_timer(&context, &task_handle).await;
+        if let Err(error) = drive(
+            crate::jobs::repository::link_queue::LinkTimerOperation::new(),
+            &context,
+        )
+        .await
+        {
+            warn!(%error, "Failed to arm the repository link queue");
+        }
     }
 }
 
@@ -490,7 +497,10 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.context.bulk();
-        match drive(PruneBatchOperation::new(), &bulk).await {
+        match drive(
+            PruneBatchOperation::new(crate::jobs::repository::NodeScope::of(&bulk)),
+            &bulk,
+        ).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
                     .await;
@@ -632,7 +642,10 @@ impl OperationsTaskHandler {
 impl OperationsTaskHandler {
     /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
     pub(super) async fn drain_link_queue(&self) {
-        let after = match crate::jobs::repository::link_queue::drain_links(&self.context).await {
+        let drain = crate::jobs::repository::link_queue::DrainLinksOperation::new(
+            crate::jobs::repository::NodeScope::of(&self.context),
+        );
+        let after = match drive(drain, &self.context).await {
             Ok(after) => after,
             Err(error) => {
                 warn!(task_id = ?TaskKey::DrainLinkQueue, %error, "Failed to drain repository link queue");

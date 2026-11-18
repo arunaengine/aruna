@@ -41,7 +41,6 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::repository::link_reads::LinkChecksOperation;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 
 use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
@@ -264,10 +263,11 @@ pub async fn process_materialization_batch(
         .unwrap_or(0);
     let timings = process_job_groups(context, jobs).await?;
     // Finished jobs may queue link pushes, and the link drain stops once its queue is empty.
-    if timings.processed > 0
-        && let Some(task_handle) = &context.task_handle
-    {
-        crate::jobs::repository::link_queue::restore_link_timer(context, task_handle).await;
+    if timings.processed > 0 && context.task_handle.is_some() {
+        let timer = crate::jobs::repository::link_queue::LinkTimerOperation::new();
+        if let Err(error) = drive(timer, context).await {
+            warn!(%error, "Failed to arm the repository link queue");
+        }
     }
     if job_count > 0 {
         info!(
@@ -695,8 +695,10 @@ async fn plan_finish_chunk(
     }
 
     // Linked repositories learn of the change in the same commit as the new status.
-    let checks = LinkChecksOperation::new(superseding.keys().copied(), unix_timestamp_millis());
-    match drive(checks, context).await {
+    let queue_rows = crate::jobs::repository::link_queue::QueueRowsOperation::new(
+        superseding.keys().copied().collect::<Vec<_>>(),
+    );
+    match drive(queue_rows, context).await {
         Ok(rows) => plan.writes.extend(rows),
         Err(error) => warn!(%error, "Failed to queue repository link pushes after materialization"),
     }
