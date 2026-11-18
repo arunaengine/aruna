@@ -17,7 +17,7 @@ use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, BackendImportSpec, ExternalObject, ImportedObject,
-    PathIdentity, WriteIntent, object_key, object_prefix, version_key,
+    PathIdentity, WriteIntent, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
@@ -40,7 +40,9 @@ use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 use super::executor::{JobContext, JobRunOutcome};
-use super::store::{put_state, read_state};
+use super::page_intents::{PageIntentsOperation, PathIntents, intent_path};
+use super::run_rows::ReadStateOperation;
+use super::store::put_state;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
@@ -132,7 +134,7 @@ struct ImportRun {
     quota: Option<u64>,
     gate: Option<GateContext>,
     /// The write intents of the listed page by path, read in one range.
-    intents: BTreeMap<String, Vec<(Key, WriteIntent)>>,
+    intents: PathIntents,
     /// File name rules for objects without a recorded mapping.
     discovery: Vec<DiscoveryRule>,
     /// Other rules that read an overlapping folder; they may own a listed file.
@@ -169,13 +171,9 @@ pub async fn read_checkpoint(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<BackendImportCheckpoint>, String> {
-    read_state(
-        context,
-        JOB_STATE_KEYSPACE,
-        checkpoint_key(job_id),
-        "backend import checkpoint read",
-    )
-    .await
+    drive(ReadStateOperation::new(job_id), context)
+        .await
+        .map_err(|error| error.0)
 }
 
 async fn persist(ctx: &JobContext, checkpoint: &BackendImportCheckpoint) -> Result<(), String> {
@@ -1051,63 +1049,14 @@ async fn read_claims(
     Ok(claims)
 }
 
-/// The write intents of every path from the first to the last object of a listing page, read
-/// as one range, so a page of known files costs one read however many objects it has.
 async fn page_intents(
     context: &DriverContext,
     rule: &BackendImport,
     objects: &[ExternalObject],
-) -> Result<BTreeMap<String, Vec<(Key, WriteIntent)>>, ItemError> {
-    let mut intents: BTreeMap<String, Vec<(Key, WriteIntent)>> = BTreeMap::new();
-    let paths = objects.iter().map(|object| object.key.as_str());
-    let (Some(first), Some(last)) = (paths.clone().min(), paths.max()) else {
-        return Ok(intents);
-    };
-    let mut start = IterStart::At(object_key(rule.import_id, first));
-    loop {
-        let effect = StorageEffect::Iter {
-            key_space: IMPORT_INTENT_KEYSPACE.to_string(),
-            prefix: Some(object_prefix(rule.import_id)),
-            start: Some(start),
-            limit: LIST_PAGE,
-            txn_id: None,
-        };
-        let (values, next) = match context.storage_handle.send_storage_effect(effect).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(ItemError::System(error.to_string()));
-            }
-            other => {
-                return Err(ItemError::System(format!(
-                    "unexpected answer {}",
-                    other.label()
-                )));
-            }
-        };
-        for (key, value) in values {
-            let Some(path) = intent_path(&key) else {
-                return Err(ItemError::System(
-                    "a malformed write intent key".to_string(),
-                ));
-            };
-            if path > last {
-                return Ok(intents);
-            }
-            let intent = WriteIntent::from_bytes(&value);
-            let intent = intent.map_err(|error| ItemError::System(error.to_string()))?;
-            intents
-                .entry(path.to_string())
-                .or_default()
-                .push((key, intent));
-        }
-        match next {
-            Some(next) => start = IterStart::After(next),
-            None => return Ok(intents),
-        }
-    }
+) -> Result<PathIntents, ItemError> {
+    drive(PageIntentsOperation::new(rule.import_id, objects), context)
+        .await
+        .map_err(|error| ItemError::System(error.0))
 }
 
 /// `page_intents` for a caller outside the run, such as a preview.
@@ -1115,18 +1064,10 @@ pub(crate) async fn listed_intents(
     context: &DriverContext,
     rule: &BackendImport,
     objects: &[ExternalObject],
-) -> Result<BTreeMap<String, Vec<(Key, WriteIntent)>>, String> {
+) -> Result<PathIntents, String> {
     page_intents(context, rule, objects)
         .await
         .map_err(ItemError::reason)
-}
-
-/// The path of an intent key: the import id, the path, a zero byte and the version id.
-fn intent_path(key: &[u8]) -> Option<&str> {
-    let end = key.len().checked_sub(17)?;
-    let path = key.get(16..end)?;
-    (key[end] == 0).then_some(())?;
-    std::str::from_utf8(path).ok()
 }
 
 /// Covers the literal-name head `version_id` of `literal` with a delete marker. The normal delete

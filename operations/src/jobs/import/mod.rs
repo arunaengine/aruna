@@ -43,7 +43,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use bytes::Bytes;
-use byteview::ByteView;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
@@ -59,6 +58,7 @@ use self::reader::HiddenRangeReader;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, validate_document};
 use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
+use super::run_rows::ReadStateOperation;
 use super::store::{put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
@@ -1905,13 +1905,9 @@ async fn load_reports(ctx: &JobContext) -> Result<HashMap<String, ImportReportRo
 }
 
 async fn read_checkpoint(ctx: &JobContext) -> Result<Option<ImportCheckpoint>, String> {
-    read_state(
-        &ctx.driver,
-        JOB_STATE_KEYSPACE,
-        ByteView::from(ctx.job_id.to_bytes().to_vec()),
-        "import checkpoint",
-    )
-    .await
+    drive(ReadStateOperation::new(ctx.job_id), &ctx.driver)
+        .await
+        .map_err(|error| error.0)
 }
 
 async fn read_plan(ctx: &JobContext) -> Result<Option<ImportPlan>, String> {
