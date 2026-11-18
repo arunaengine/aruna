@@ -4,23 +4,27 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::time::SystemTime;
 use ulid::Ulid;
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SharedSecret;
-use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, NetEffect};
 use aruna_core::errors::{BlobError, ConversionError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, OBJECT_METADATA_KEYSPACE};
+use aruna_core::operation::{Operation, Runnable, boxed_suboperation};
+use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
-use aruna_core::structs::storage::abe::{AbeEffect, AbeError};
+use aruna_core::structs::storage::abe::{AbeEffect, AbeError, EnvelopeArchive, ObjectEnvelope};
 use aruna_core::structs::storage::abe_access::{KeyGrant, MAX_REQUESTS};
 use aruna_core::structs::storage::blob::{ArchiveKey, BackendLocation, HiddenBlobKey};
 use aruna_core::structs::storage::distribution::on_use::{ATTACHMENT_NAMESPACE, CACHE_NAMESPACE};
@@ -28,6 +32,7 @@ use aruna_core::structs::storage::encryption::{BucketKeyError, ReadLease, TokenC
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
 };
+use aruna_core::types::{Key, Value};
 use bytes::Bytes;
 use tracing::warn;
 
@@ -35,29 +40,34 @@ use super::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectInfo, locked,
 };
 use crate::abe::envelope::EnvelopeOperation;
-use crate::blob::holders::GetHoldersOperation;
+use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
 use crate::blob::unlocked::DropReceivedOperation;
-use crate::distribution::held::PullRequest;
-use crate::distribution::pull::{PullThroughOperation, fill_slot, pinned_blob};
+use crate::distribution::held::{HeldElsewhere, PullRequest};
+use crate::distribution::pull::{PullThroughOperation, Pulled, pinned_blob};
 use crate::distribution::source_keep::{KeepFirstOperation, KeepStart};
 use crate::distribution::source_plan::SourceKeep;
-use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
 use crate::s3::object::lookup::{LookupError, summary_from_value};
 
-/// Reads an object, continuing against the realm's holders when this node holds
-/// the version record but not its bytes. Only User nodes route, since elsewhere a
-/// missing local blob is a fault; a routed range streams the whole blob and skips to it.
-pub async fn get_object_routed(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-) -> Result<GetObjectResult, GetObjectError> {
-    get_object_token(context, input, restrictions, None).await
+type Turn<T> = Result<Next<T>, GetObjectError>;
+type Read = Result<GetObjectResult, GetObjectError>;
+
+/// Starts `operation` beside the caller while a background slot is free.
+fn background<O, K>(operation: O) -> IoCall
+where
+    O: Runnable<K> + 'static,
+    K: 'static,
+    O::Output: Send + 'static,
+    O::Error: Send + 'static,
+{
+    let child = boxed_suboperation(operation, |_| Event::Delayed);
+    Effect::Background(child).into()
 }
 
 /// The token credential of one S3 request and the limits of a promotion it starts.
@@ -67,103 +77,196 @@ pub struct TokenRead {
     pub limits: RoCrateLimits,
 }
 
-/// `get_object_routed` where `token` admits a read of a locked bucket key. A pending version
-/// is promoted with the token first, then read like any other.
-pub async fn get_object_token(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+enum RoutedStep {
+    Local,
+    Keep,
+    Again,
+    Pull,
+    User(Box<RoutedRead>),
+    Holders,
+}
+
+/// Reads an object, continuing at the realm's holders when a User node has the record but not
+/// the bytes; a routed range streams the whole blob and skips to it. A token admits a read of a
+/// locked bucket key, and a pending version is promoted first.
+#[derive(Debug, PartialEq)]
+pub struct GetRoutedOperation {
     input: GetObjectInput,
     restrictions: Option<Vec<PathRestriction>>,
     token: Option<TokenRead>,
-) -> Result<GetObjectResult, GetObjectError> {
-    let range = input.range.clone();
-    let (user_id, realm_id) = (input.user_identity, input.realm_id);
-    let (bucket, key, group_id) = (input.bucket.clone(), input.key.clone(), input.group_id);
-    let again = input.clone();
-    let mut result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
-    // A member of a distributed bucket receives references without a connector id; the one it
-    // read from the source may be kept.
-    let keep = match &result {
-        Ok(read)
-            if read.source_metadata.is_some()
-                && read.location.is_none()
-                && (read.source_binding.as_ref())
-                    .is_some_and(|source| source.connector_id.is_none()) =>
-        {
-            (read.resolved_version_id.or(read.version_id)).map(|version_id| SourceKeep {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id,
-                group_id,
-                user_id,
-                ranged: range.is_some(),
-            })
+    /// The first read, while a member keeps the reference it names.
+    held: Option<Read>,
+    step: RoutedStep,
+}
+
+impl GetRoutedOperation {
+    pub fn new(
+        input: GetObjectInput,
+        restrictions: Option<Vec<PathRestriction>>,
+        token: Option<TokenRead>,
+    ) -> Self {
+        Self {
+            input,
+            restrictions,
+            token,
+            held: None,
+            step: RoutedStep::Local,
         }
-        _ => None,
-    };
-    // A member that fills first serves the range from the copy it just kept.
-    if let Some(keep) = keep
-        && keep_first(context, keep).await
-    {
-        result = read_local(context, again, restrictions.clone(), token.as_ref()).await;
     }
-    if let Ok(read) = &mut result
-        && let Some(location) = read
-            .location
-            .as_ref()
-            .filter(|location| kept_copy(location))
-    {
-        let empty = BackendStream(Box::pin(futures_util::stream::empty()));
-        read.blob = pinned_blob(location, std::mem::replace(&mut read.blob, empty));
+
+    fn read_local(&self) -> IoCall {
+        IoCall::child(ReadLocalOperation::new(
+            self.input.clone(),
+            self.restrictions.clone(),
+            self.token.clone(),
+        ))
     }
-    if let Err(GetObjectError::HeldElsewhere(held)) = result {
-        let auth = AuthContext {
-            user_id,
-            realm_id,
+
+    fn call(&mut self, step: RoutedStep, call: IoCall) -> Turn<GetObjectResult> {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    /// A member of a distributed bucket receives references without a connector id; the one
+    /// it read from the source may be kept, and a member that fills first serves from it.
+    fn first_read(&mut self, result: Read) -> Turn<GetObjectResult> {
+        let input = &self.input;
+        let keep = match &result {
+            Ok(read)
+                if read.source_metadata.is_some()
+                    && read.location.is_none()
+                    && (read.source_binding.as_ref())
+                        .is_some_and(|source| source.connector_id.is_none()) =>
+            {
+                (read.resolved_version_id.or(read.version_id)).map(|version_id| SourceKeep {
+                    bucket: input.bucket.clone(),
+                    key: input.key.clone(),
+                    version_id,
+                    group_id: input.group_id,
+                    user_id: input.user_identity,
+                    ranged: input.range.is_some(),
+                })
+            }
+            _ => None,
+        };
+        match keep {
+            Some(keep) => {
+                self.held = Some(result);
+                let keep = KeepReadOperation::new(keep);
+                self.call(RoutedStep::Keep, IoCall::child(keep))
+            }
+            None => self.finish_read(result),
+        }
+    }
+
+    fn finish_read(&mut self, result: Read) -> Turn<GetObjectResult> {
+        let mut read = match result {
+            Ok(read) => read,
+            Err(GetObjectError::HeldElsewhere(held)) => {
+                let request = pull_request(&self.input, self.restrictions.take(), *held);
+                let pull = PullReadOperation::new(request);
+                return self.call(RoutedStep::Pull, IoCall::child(pull));
+            }
+            Err(GetObjectError::BlobNotLocal {
+                blake3,
+                version_id,
+                metadata,
+                version_created_at,
+                source_policies,
+            }) => {
+                let routed = RoutedRead {
+                    user_id: self.input.user_identity,
+                    realm_id: self.input.realm_id,
+                    blake3,
+                    version_id,
+                    metadata,
+                    version_created_at,
+                    source_policies,
+                    restrictions: self.restrictions.take(),
+                };
+                let user = LocalUserOperation::new(self.input.realm_id);
+                return self.call(RoutedStep::User(Box::new(routed)), IoCall::child(user));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(location) = (read.location.as_ref()).filter(|location| kept_copy(location)) {
+            let empty = BackendStream(Box::pin(futures_util::stream::empty()));
+            read.blob = pinned_blob(location, std::mem::replace(&mut read.blob, empty));
+        }
+        Ok(Next::Done(read))
+    }
+
+    fn routed(&mut self, found: HolderRead) -> Turn<GetObjectResult> {
+        let HolderRead::Blob(result) = found else {
+            return Err(GetObjectError::GetObjectFailed);
+        };
+        let mut result = *result;
+        if let Some(range) = self.input.range.clone() {
+            let resolved = range.resolve(result.info.size)?;
+            result.blob = slice_blob(result.blob, resolved.range.clone());
+            result.resolved_range = Some(resolved);
+        }
+        Ok(Next::Done(result))
+    }
+}
+
+fn pull_request(
+    input: &GetObjectInput,
+    restrictions: Option<Vec<PathRestriction>>,
+    held: HeldElsewhere,
+) -> PullRequest {
+    PullRequest {
+        bucket: input.bucket.clone(),
+        key: input.key.clone(),
+        range: input.range.clone(),
+        auth: AuthContext {
+            user_id: input.user_identity,
+            realm_id: input.realm_id,
             path_restrictions: restrictions,
             session: None,
-        };
-        let request = PullRequest {
-            bucket,
-            key,
-            range,
-            auth,
-            held: *held,
-        };
-        return pull_through(context, request).await;
+        },
+        held,
     }
-    let Err(GetObjectError::BlobNotLocal {
-        blake3,
-        version_id,
-        metadata,
-        version_created_at,
-        source_policies,
-    }) = result
-    else {
-        return result;
-    };
-    if !drive(LocalUserOperation::new(realm_id), context)
-        .await
-        .unwrap_or(false)
-    {
-        return Err(GetObjectError::GetObjectFailed);
+}
+
+impl Operation for GetRoutedOperation {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn<GetObjectResult> {
+        Ok(Next::Call(self.read_local()))
     }
-    let read = RoutedRead {
-        user_id,
-        realm_id,
-        blake3,
-        version_id,
-        metadata,
-        version_created_at,
-        source_policies,
-        restrictions,
-    };
-    let mut result = routed_blob(context, read).await?;
-    if let Some(range) = range {
-        let resolved = range.resolve(result.info.size)?;
-        result.blob = slice_blob(result.blob, resolved.range.clone());
-        result.resolved_range = Some(resolved);
+
+    fn next(&mut self, result: IoResult) -> Turn<GetObjectResult> {
+        match std::mem::replace(&mut self.step, RoutedStep::Pull) {
+            RoutedStep::Local => self.first_read(result.child()?),
+            RoutedStep::Keep => {
+                let kept = result.child::<bool, IoError>()?.unwrap_or(false);
+                let earlier = self.held.take().ok_or(IoError::Unfinished)?;
+                if !kept {
+                    return self.finish_read(earlier);
+                }
+                let again = self.read_local();
+                self.call(RoutedStep::Again, again)
+            }
+            RoutedStep::Again => self.finish_read(result.child()?),
+            RoutedStep::Pull => Ok(Next::Done(
+                result.child::<GetObjectResult, GetObjectError>()??,
+            )),
+            RoutedStep::User(read) => {
+                if !result.child::<bool, IoError>()?.unwrap_or(false) {
+                    return Err(GetObjectError::GetObjectFailed);
+                }
+                let holders = HolderReadOperation::new(*read, false);
+                self.call(RoutedStep::Holders, IoCall::child(holders))
+            }
+            RoutedStep::Holders => {
+                let found = result.child::<HolderRead, GetObjectError>()??;
+                self.routed(found)
+            }
+        }
     }
-    Ok(result)
 }
 
 /// Whether `location` is a copy a member keeps on use, which eviction may remove.
@@ -199,51 +302,45 @@ pub(super) fn slice_blob(
     BackendStream(Box::pin(sliced))
 }
 
-/// Reads a copy source like [`read_local`]; a record-only version of a distributed bucket is
-/// read through a holder of its range under the caller's authority.
-pub(crate) async fn read_source(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    token: Option<&TokenRead>,
-) -> Result<GetObjectResult, GetObjectError> {
-    let (bucket, key, range) = (input.bucket.clone(), input.key.clone(), input.range.clone());
-    let (user_id, realm_id) = (input.user_identity, input.realm_id);
-    match read_local(context, input, restrictions.clone(), token).await {
-        Err(GetObjectError::HeldElsewhere(held)) => {
-            let auth = AuthContext {
-                user_id,
-                realm_id,
-                path_restrictions: restrictions,
-                session: None,
-            };
-            let request = PullRequest {
-                bucket,
-                key,
-                range,
-                auth,
-                held: *held,
-            };
-            pull_through(context, request).await
+/// Keeps a reference's bytes. Outputs `true` once they are kept before the read is served.
+#[derive(Debug, PartialEq)]
+struct KeepReadOperation {
+    keep: Option<SourceKeep>,
+    starting: bool,
+}
+
+impl KeepReadOperation {
+    fn new(keep: SourceKeep) -> Self {
+        Self {
+            keep: Some(keep),
+            starting: false,
         }
-        result => result,
     }
 }
 
-/// Reads through the holders and runs the fill the read asks for beside it, while a slot is free.
-async fn pull_through(
-    context: &DriverContext,
-    request: PullRequest,
-) -> Result<GetObjectResult, GetObjectError> {
-    let pulled = drive(PullThroughOperation::new(request), context).await?;
-    if let (Some(fill), Some(slot)) = (pulled.fill, fill_slot()) {
-        let context = context.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            let _ = drive(fill, &context).await;
-        });
+impl Operation for KeepReadOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let keep = self.keep.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::child(KeepFirstOperation::new(keep))))
     }
-    Ok(pulled.result)
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        if self.starting {
+            result.event()?;
+            return Ok(Next::Done(false));
+        }
+        match result.child::<KeepStart, IoError>()? {
+            Ok(KeepStart::Settled(kept)) => Ok(Next::Done(kept)),
+            Ok(KeepStart::Background(source)) => {
+                self.starting = true;
+                Ok(Next::Call(background(source)))
+            }
+            Err(_) => Ok(Next::Done(false)),
+        }
+    }
 }
 
 /// Keeps a reference's bytes; `true` once they are kept before the read is served.
