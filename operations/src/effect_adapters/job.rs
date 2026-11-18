@@ -13,7 +13,7 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::jobs::{
     ArchiveEntryRead, ArchiveRead, ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent,
-    JobReport, JobStops, ObjectBody, ObjectRead, ObjectReadFailure,
+    JobReport, JobStops,
 };
 use aruna_core::rocrate_archive::ArchiveInspection;
 use aruna_core::stream::BackendStream;
@@ -32,7 +32,7 @@ tokio::task_local! {
     static JOB_HOST: Arc<dyn JobHost>;
 }
 
-/// The runtime side of one running job: its stop signals, progress, turns and object reads.
+/// The runtime side of one running job: its stop signals, progress and turns.
 pub trait JobHost: Send + Sync {
     fn stops(&self) -> JobStops;
     fn report(&self, report: JobReport);
@@ -43,8 +43,6 @@ pub trait JobHost: Send + Sync {
         &'a self,
         turns: &'a BTreeSet<(Ulid, Ulid)>,
     ) -> BoxFuture<'a, Box<dyn Any + Send>>;
-    fn read_object(&self, read: ObjectRead)
-    -> BoxFuture<'_, Result<ObjectBody, ObjectReadFailure>>;
 }
 
 /// Runs `future` with `host` answering the job effects of every operation it drives.
@@ -104,10 +102,6 @@ pub(super) async fn dispatch_job(
             JobEvent::CollectedUpTo(collect_limited(stream, limit).await)
         }
         JobEffect::FillGzip(work) => fill_gzip(work).await,
-        JobEffect::ReadObject(read) => JobEvent::Object(match host {
-            Some(host) => host.read_object(*read).await,
-            None => Err(ObjectReadFailure::Failed("no job host".to_string())),
-        }),
         JobEffect::StoppableStream(stream) => JobEvent::Stream(match host {
             Some(host) => stoppable_stream(host, stream),
             None => stream,

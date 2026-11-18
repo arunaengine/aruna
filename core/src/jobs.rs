@@ -15,7 +15,6 @@ use ulid::Ulid;
 
 use crate::UserId;
 use crate::events::Event;
-use crate::id::NodeId;
 use crate::metadata::AuthToken;
 use crate::operation::SubOperation;
 use crate::rocrate_archive::{ArchiveCompression, ArchiveInspection};
@@ -26,8 +25,6 @@ use crate::structs::execution::job::{
     JobState, KeyWait, LogicalJobState, StagingJobCheckpoint, SubmissionId, WorkspaceMode,
 };
 use crate::structs::execution::table::GzipCursor;
-use crate::structs::identity::auth::PathRestriction;
-use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::encryption::BucketKeyRef;
 use crate::structs::storage::storage_purge::StoragePurgeScope;
@@ -485,8 +482,6 @@ pub enum JobEffect {
     CollectUpTo { stream: ByteStream, limit: u64 },
     /// Feeds `work` until its cursor holds the next chunk; answered by `JobEvent::GzipFilled`.
     FillGzip(GzipWork),
-    /// Opens an object as the job's submitter; answered by `JobEvent::Object`.
-    ReadObject(Box<ObjectRead>),
     /// Makes a stream fail once the job stops; answered by `JobEvent::Stream`.
     StoppableStream(ByteStream),
     /// Inspects a stored archive; answered by `JobEvent::ArchiveInspected`.
@@ -616,39 +611,6 @@ pub enum GzipBroken {
     Gzip(String),
 }
 
-/// One object read, as the job's submitter.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ObjectRead {
-    pub bucket: String,
-    pub key: String,
-    pub version_id: Option<Ulid>,
-    /// The first and last byte to read.
-    pub range: Option<(u64, u64)>,
-    pub group_id: GroupId,
-    pub user_id: UserId,
-    pub realm_id: RealmId,
-    pub node_id: NodeId,
-    pub restrictions: Option<Vec<PathRestriction>>,
-}
-
-/// An opened object: its bytes, the version they belong to and the object's whole size.
-#[derive(Debug, PartialEq)]
-pub struct ObjectBody {
-    pub stream: ByteStream,
-    pub version_id: Option<Ulid>,
-    pub size: u64,
-}
-
-/// Why an object could not be opened.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ObjectReadFailure {
-    /// The key, the version or the object itself is gone.
-    Gone(String),
-    /// The range starts at or after the object's end.
-    InvalidRange,
-    Failed(String),
-}
-
 /// The answer to a [`JobEffect`].
 #[derive(Debug, PartialEq)]
 pub enum JobEvent {
@@ -666,7 +628,6 @@ pub enum JobEvent {
         work: GzipWork,
         result: Result<(), GzipBroken>,
     },
-    Object(Result<ObjectBody, ObjectReadFailure>),
     Stream(ByteStream),
     ArchiveInspected(Result<(ArchiveInspection, Option<String>), String>),
     ArchiveEntry(Result<ByteStream, String>),
