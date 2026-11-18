@@ -17,7 +17,7 @@ use tracing::warn;
 
 use super::super::store::put_job_entry;
 use super::super::store::state::read_job_record;
-use super::workspace::mint_workspace_credential;
+use super::prepare::{mounted_view, workspace_mint};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::ids::session_of;
@@ -44,19 +44,15 @@ pub(super) async fn start_session(
     // The credential was minted while the task was prepared; this reads the
     // same one back, so the client sees when it really expires.
     let credential_expires_ms = match read_job_record(context, job_id, None).await {
-        Ok(Some(record)) => Box::pin(mint_workspace_credential(
-            context,
-            spec,
-            &record,
-            node_id,
-            (
-                bucket,
-                super::prepare::mounted_view(context, spec, &record).as_deref(),
-            ),
-        ))
-        .await
-        .map(|credential| credential.expires_at_ms)
-        .unwrap_or_default(),
+        Ok(Some(record)) => {
+            let view = mounted_view(context, spec, &record);
+            let scope = (bucket, view.as_deref());
+            let mint = workspace_mint(context, spec, &record, node_id, scope);
+            Box::pin(drive(mint, context))
+                .await
+                .map(|credential| credential.expires_at_ms)
+                .unwrap_or_default()
+        }
         _ => 0,
     };
     let realm_idle = realm_session_idle(context).await;

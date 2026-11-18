@@ -14,7 +14,7 @@ use crate::jobs::store::attempt::{
 };
 use crate::jobs::store::query::insert_job;
 use crate::jobs::store::state::{ClaimOutcome, claim_job, handoff_external_attempt};
-use crate::jobs::workflow::workspace::mint_workspace_credential;
+use crate::jobs::workflow::prepare::workspace_mint;
 use crate::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_compute::ExecutorRegistry;
@@ -326,15 +326,8 @@ async fn denied_write_blocks() {
         "a run never creates the bucket it names"
     );
 
-    let Err(error) = Box::pin(mint_workspace_credential(
-        &context,
-        &spec,
-        &record,
-        node_id(7),
-        (&bucket, None),
-    ))
-    .await
-    else {
+    let mint = workspace_mint(&context, &spec, &record, node_id(7), (&bucket, None));
+    let Err(error) = Box::pin(drive(mint, &context)).await else {
         panic!("workspace credential mint unexpectedly succeeded");
     };
     assert_eq!(error.kind, JobErrorKind::Permanent);

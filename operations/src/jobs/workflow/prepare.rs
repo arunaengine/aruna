@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use aruna_compute::executor::BackendCaps;
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
@@ -11,17 +11,16 @@ use aruna_core::compute::{
     AttemptRef, ExecutorKind, NetworkAccess, ResourceRequest, S3Mount, Secret, SecurityContext,
     StagingMode, TaskInput, TaskSpec, UserSpec, WorkspaceBinding,
 };
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{ExecutionSpec, JobError, JobRecord, WorkspaceMode};
 
 use super::DEFAULT_WALLTIME;
+use super::credential::{MintCredentialOperation, RunIdentity, WorkspaceAccessOperation};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::ids::session_of;
 use crate::jobs::workflow::input_view::{CachedKeysOperation, view_bucket, view_entries};
-use crate::jobs::workflow::workspace::{
-    check_workspace_bucket, ensure_group_write, load_direct_inputs, mint_input_credential,
-    mint_workspace_credential,
-};
+use crate::jobs::workflow::workspace::load_direct_inputs;
 
 pub(super) const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 
@@ -37,11 +36,52 @@ pub(super) async fn prepare_workspace(
     if record.workspace_mode != WorkspaceMode::Existing {
         return Ok(());
     }
-    Box::pin(ensure_group_write(context, spec, record, node_id)).await?;
-    Box::pin(check_workspace_bucket(
-        context, spec, record, node_id, bucket,
+    let run = run_identity(context, spec, record, node_id);
+    Box::pin(drive(
+        WorkspaceAccessOperation::existing(run, bucket),
+        context,
     ))
     .await
+}
+
+fn run_identity(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+) -> RunIdentity {
+    let realm_id = context.serving_realm(record.created_by.realm_id);
+    RunIdentity::new(spec, record, realm_id, node_id)
+}
+
+/// This node's key for sealing the credentials it issues, and the time to judge them by.
+fn credential_inputs(context: &DriverContext) -> (Option<CredentialEncryptionKey>, SystemTime) {
+    let key = (context.net_handle.as_ref()).map(|net| net.credential_encryption_key());
+    (key, SystemTime::now())
+}
+
+/// The operation that mints the run's credential for its workspace bucket.
+pub fn workspace_mint(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    scope: (&str, Option<&str>),
+) -> MintCredentialOperation {
+    let run = run_identity(context, spec, record, node_id);
+    MintCredentialOperation::workspace((spec, record), run, scope, credential_inputs(context))
+}
+
+/// The operation that mints the read-only credential of the buckets a run mounts.
+pub(super) fn input_mint(
+    context: &DriverContext,
+    spec: &ExecutionSpec,
+    record: &JobRecord,
+    node_id: NodeId,
+    buckets: &BTreeSet<String>,
+) -> MintCredentialOperation {
+    let run = run_identity(context, spec, record, node_id);
+    MintCredentialOperation::inputs((spec, record), run, buckets, credential_inputs(context))
 }
 
 pub(super) struct PreparedTask {
@@ -148,10 +188,8 @@ async fn prepare_inputs(
     // A session's one credential carries the view as well, so it is minted there instead.
     if mint {
         let buckets = BTreeSet::from([view]);
-        let credential = Box::pin(mint_input_credential(
-            context, spec, record, node_id, &buckets,
-        ))
-        .await?;
+        let mint = input_mint(context, spec, record, node_id, &buckets);
+        let credential = Box::pin(drive(mint, context)).await?;
         insert_mount_secrets(&mut secrets, credential.access_key, credential.secret);
     }
     Ok(PreparedTask {
@@ -239,14 +277,8 @@ async fn add_session_credential(
         .map(|registry| registry.workspace_endpoint().region.clone())
         .unwrap_or_default();
     let view = mounted_view(context, spec, record).filter(|_| !prepared.mounts.is_empty());
-    let credential = Box::pin(mint_workspace_credential(
-        context,
-        spec,
-        record,
-        node_id,
-        (bucket, view.as_deref()),
-    ))
-    .await?;
+    let mint = workspace_mint(context, spec, record, node_id, (bucket, view.as_deref()));
+    let credential = Box::pin(drive(mint, context)).await?;
     if view.is_some() {
         let (access_key, secret) = (credential.access_key.clone(), credential.secret.clone());
         insert_mount_secrets(&mut prepared.secrets, access_key, secret);

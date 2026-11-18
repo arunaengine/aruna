@@ -31,11 +31,12 @@ use super::super::store::state::{
     ExecutionCompleteOutcome, complete_cancelled, complete_execution, read_job_record,
 };
 use super::super::submit::schedule_drain_effect;
+use super::inventory::CollectOutputsOperation;
 use super::prepare::job_bucket;
 use super::recovery::park_attempt;
 use super::session::write_session_report;
-use super::workspace::{capture_outputs, collect_outputs, merge_outputs};
-use crate::driver::DriverContext;
+use super::workspace::{capture_outputs, merge_outputs};
+use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::publish::publish_terminal;
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, schedule_terminal_settle};
 
@@ -817,7 +818,9 @@ pub(super) async fn collect_or_park(
     bucket: &str,
     control: &AttemptControl,
 ) -> Option<Vec<OutputObject>> {
-    match Box::pin(collect_outputs(context, spec, bucket, control)).await {
+    let node_id = context.net_handle.as_ref().map(|net| net.node_id());
+    let collect = CollectOutputsOperation::new(spec, bucket, control.clone(), node_id);
+    match Box::pin(drive(collect, context)).await {
         Ok(outputs) => Some(outputs),
         Err(error)
             if error.kind == aruna_core::structs::execution::job::JobErrorKind::Permanent =>

@@ -4,8 +4,10 @@
 
 pub mod cleanup;
 pub mod compute;
+pub mod credential;
 pub mod finalize;
 pub mod input_view;
+pub mod inventory;
 pub mod prepare;
 pub mod purge;
 mod purge_audit;
