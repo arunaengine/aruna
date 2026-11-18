@@ -22,6 +22,7 @@ mod fetch;
 pub mod held;
 pub mod ids;
 pub mod ingress;
+pub(crate) mod launch_checks;
 pub mod offer;
 pub mod outbox;
 pub mod plan;
