@@ -15,22 +15,22 @@ use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::check::RunScope;
-use super::grants::short_path;
-use super::rows::{StoreError, decode, delete_rows, scan_rows};
-use super::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
-use super::unavailable;
-use super::work::{
-    SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
-    install_at, summary_of, update_work, work_scan, work_state,
-};
-use super::work_calls::{JobOutputs, JobRow};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::attempt::set_cancel_requested;
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::{SubmitJobError, SubmitJobSpec};
+use crate::plugins::check::RunScope;
+use crate::plugins::grants::short_path;
+use crate::plugins::rows::{StoreError, decode, delete_rows, scan_rows};
+use crate::plugins::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
+use crate::plugins::unavailable;
+use crate::plugins::work::{
+    SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
+    install_at, summary_of, update_work, work_scan, work_state,
+};
+use crate::plugins::work_calls::{JobOutputs, JobRow};
 
 /// The work row of job `id` of `install`.
 pub(crate) async fn job_row(

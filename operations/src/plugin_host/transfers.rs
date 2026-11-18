@@ -19,22 +19,20 @@ use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::{ErrorKind, Field, HostError, Response};
+use aruna_plugins::broker::{Field, HostError, Response};
 use futures_util::StreamExt;
 use ulid::Ulid;
 
-use super::held::release_into;
-use super::install::{pick_version, read_manifest};
-use super::objects::{LocalObject, Unmarked};
-use super::outgoing::outgoing;
-use super::outgoing::whole_text;
 use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
-use super::work::{Send, WorkChange, WorkRow, begin_send, decided, retried, update_work};
-use super::work_calls::TransferGrants;
 use crate::driver::{drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::placement::policy::GateOperation;
+use crate::plugins::held::PrepareRequest;
+use crate::plugins::objects::{LocalObject, Unmarked};
+use crate::plugins::outgoing::whole_text;
+use crate::plugins::work::{Send, WorkChange, WorkRow, begin_send, decided, retried, update_work};
+use crate::plugins::work_calls::TransferGrants;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
@@ -458,26 +456,10 @@ async fn prepared(
     ctx: &JobContext,
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
 ) -> Result<(OutgoingRequest, ResponseExposure, SecretFields), HostError> {
-    let context = row.context.as_ref();
-    let context = context.ok_or_else(|| HostError::new(ErrorKind::Invalid, "no request"))?;
-    let plugin = pick_version(config, &install.plugin, Some(&install.digest));
-    let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
-    let manifest =
-        manifest.map_err(|error| HostError::new(ErrorKind::Unavailable, error.to_string()))?;
-    let (mut request, slot) = outgoing(&manifest, context)?;
-    let Some(slot) = slot else {
-        let fields = SecretFields::new(Default::default());
-        return Ok((request, ResponseExposure::Full, fields));
-    };
-    let place = (config, ctx.owner_node_id);
-    let released = release_into(
-        &ctx.driver,
-        place,
-        (install, &slot, row.run_id),
-        &mut request,
-    );
-    let (exposure, fields) = released.await?;
-    Ok((request, exposure, fields))
+    let config = Arc::new(config.clone());
+    let prepare = PrepareRequest::new(config, ctx.owner_node_id, install, row);
+    let prepared = drive(prepare, &ctx.driver).await.map_err(|error| error.0)?;
+    Ok((prepared.outgoing, prepared.exposure, prepared.fields))
 }
 
 /// The answer's body as a put stream that counts its bytes, ends with an error past `bound`, and

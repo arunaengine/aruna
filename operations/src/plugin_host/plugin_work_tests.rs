@@ -12,6 +12,7 @@ use super::*;
 use crate::driver::DriverContext;
 use crate::jobs::executor::ProgressReporter;
 use crate::plugins::bound::tests::edit_config;
+use crate::plugins::calls::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::work::{Identity, WorkKind, WorkRow, reserve};
 use aruna_core::plugin_installs::InstallState;
@@ -123,7 +124,6 @@ async fn refuses_changed_work() {
 #[tokio::test]
 async fn paused_install_waits() {
     // A real pause holds the work and a resume lets it run; neither fails it.
-    use crate::plugins::lifecycle::{pause_install, resume_install};
     let fixture = Fixture::new().await;
     let (_root, blob, install, spec) = ready_copy(&fixture).await;
     let ctx = job_context(&blob, &fixture);
@@ -278,8 +278,8 @@ async fn marked_source_refused() {
     use aruna_plugins::broker::Broker;
 
     use crate::driver::drive;
-    use crate::plugins::broker::RunBroker;
-    use crate::plugins::jobs::start_work;
+    use crate::plugin_host::broker::RunBroker;
+    use crate::plugin_host::jobs::start_work;
     use crate::plugins::marks::{MARKED, Mark, mark_row};
     use crate::plugins::rows::write_rows;
     use crate::plugins::submit::WorkRequest;
@@ -330,7 +330,7 @@ async fn small_reads_unmarked() {
     // job wrote it.
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
 
-    use crate::plugins::broker::RunBroker;
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::marks::{MARKED, Mark, mark_row};
     use crate::plugins::rows::write_rows;
     use crate::plugins::submit::tests::scope;
@@ -390,7 +390,7 @@ async fn versioned_info() {
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind};
 
     use crate::driver::drive;
-    use crate::plugins::broker::RunBroker;
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::marks::{Mark, mark_row};
     use crate::plugins::rows::write_rows;
     use crate::plugins::submit::tests::scope;

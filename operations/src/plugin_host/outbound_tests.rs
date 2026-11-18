@@ -13,10 +13,10 @@ use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
 use super::*;
+use crate::plugin_host::worker::tests::{connected, install_artifact, worker};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, read_run};
-use crate::plugins::worker::tests::{connected, install_artifact, worker};
 
 /// Answers every request with `answer` and records what it was asked.
 pub(crate) struct Fake {
@@ -155,7 +155,7 @@ async fn oversized_answers_kept() {
 #[tokio::test]
 async fn oversized_rerun() {
     // A rerun of a send whose answer was too large answers the stored refusal and sends nothing.
-    use crate::plugins::broker::RunBroker;
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::check::RunScope;
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind, Intent, Method, SendRequest};
     let fixture = Fixture::new().await;
@@ -196,7 +196,7 @@ async fn oversized_rerun() {
 
 #[tokio::test]
 async fn undeclared_method() {
-    use crate::plugins::broker::RunBroker;
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::check::RunScope;
     use aruna_plugins::broker::{Broker, CallContext, Method, SendRequest};
     let fixture = Fixture::new().await;
@@ -232,8 +232,8 @@ async fn undeclared_method() {
 /// The secured fixture installed with its slot bound to the group secret `api-key`, whose
 /// one rule lets this install inject it toward the fixture's address.
 async fn secured_install(fixture: &Fixture) -> PluginInstall {
+    use crate::plugin_host::worker::tests::{publish_artifact, secured};
     use crate::plugins::bound::tests::{edit_config, secret_with};
-    use crate::plugins::worker::tests::{publish_artifact, secured};
     install_artifact(fixture, connected()).await;
     let digest = publish_artifact(fixture, &secured()).await;
     let binding = aruna_core::plugin_installs::SecretBinding::parse("group:api-key").unwrap();
@@ -243,7 +243,7 @@ async fn secured_install(fixture: &Fixture) -> PluginInstall {
         install.secrets = [("api".to_string(), binding)].into();
     })
     .await;
-    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = config.await.unwrap().installs.remove(0);
     secret_with(fixture, &install, ResponseExposure::Full).await;
     install
@@ -298,7 +298,7 @@ async fn injects_without_showing() {
 async fn probe_with(
     fixture: &Fixture,
     install: &PluginInstall,
-    (worker, outbound): (&Arc<crate::plugins::worker::Worker>, Arc<Fake>),
+    (worker, outbound): (&Arc<crate::plugin_host::worker::Worker>, Arc<Fake>),
     input: serde_json::Value,
 ) -> aruna_core::plugin_runs::PluginRun {
     let mut run = queued(install.install_id, 1);
@@ -362,8 +362,8 @@ async fn narrowed_rules_refuse() {
 
 #[tokio::test]
 async fn whole_answers_gated() {
+    use crate::plugin_host::broker::RunBroker;
     use crate::plugins::bound::tests::{bound, edit_config, hold_keys, secret_with};
-    use crate::plugins::broker::RunBroker;
     use crate::plugins::check::RunScope;
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind, Method, SendRequest};
     let fixture = Fixture::keyed().await;
@@ -378,7 +378,7 @@ async fn whole_answers_gated() {
         (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".to_string());
     })
     .await;
-    let config = crate::plugins::install::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = config
         .await
         .unwrap()

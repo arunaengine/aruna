@@ -14,9 +14,9 @@ use serde_json::json;
 
 use super::*;
 use crate::driver::DriverContext;
+use crate::plugin_host::plugin_work::run_plugin_work;
+use crate::plugin_host::plugin_work::tests::job_context;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::plugin_work::run_plugin_work;
-use crate::plugins::plugin_work::tests::job_context;
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{Identity, RequestContext, SendBoundary, WorkKind, read_work, reserve};
 use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};

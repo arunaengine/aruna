@@ -20,13 +20,13 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use futures_util::future::BoxFuture;
 
-use super::check::CopyGrants;
-use super::objects::{LocalObject, Unmarked};
-use super::work::holds_job;
-use super::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome, PayloadHandler};
 use crate::jobs::key_wake::version_wait;
+use crate::plugins::check::CopyGrants;
+use crate::plugins::objects::{LocalObject, Unmarked};
+use crate::plugins::work::holds_job;
+use crate::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
 
 use super::transfers::{Download, Upload, download_work, upload_work};
 use crate::s3::object::copy::{

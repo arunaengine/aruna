@@ -32,34 +32,9 @@ use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::check::{Authorize, CallError, CheckCall, RunScope, matching};
-use super::creates::{
-    Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
-};
-use super::dataset::{
-    content_urls, dataset_change, dataset_crate, dataset_of, file_entities, file_entity,
-    parse_document, same_revision,
-};
-use super::grants::{install_scope, object_path, parse_grants, patterns_for, restricted_account};
-use super::held::{HeldSecrets, ask_release};
-use super::host_calls::{
-    CallEnd, CallFailure, ObjectInfoCall, ObjectListCall, RecordCall, StateCall, StateChange,
-    begun_reply, call_intent, version_id,
-};
-use super::install::{pick_version, read_config, read_manifest};
-use super::intents::{begin, unknown_row, written};
 use super::jobs::{cancel_job, job_outputs, job_row, job_status, start_work};
-use super::objects::{LocalObject, Unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
-use super::outgoing::{
-    declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
-};
-use super::rate::take_call;
-use super::rows::write_rows;
-use super::state::{MAX_STATE_KEY, read_state};
-use super::submit::{CopyRequest, DownloadRequest, UploadRequest, WorkRequest};
-use super::unavailable;
-use super::work::RequestContext;
+use super::read_config;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
@@ -76,6 +51,34 @@ use crate::metadata::forward::write::{
     CreateAuthorizedError, PinnedCreate, create_with_id, route_metadata_update,
 };
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
+use crate::plugins::check::{Authorize, CallError, CheckCall, RunScope, matching};
+use crate::plugins::creates::{
+    Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
+};
+use crate::plugins::dataset::{
+    content_urls, dataset_change, dataset_crate, dataset_of, file_entities, file_entity,
+    parse_document, same_revision,
+};
+use crate::plugins::grants::{
+    install_scope, object_path, parse_grants, patterns_for, restricted_account,
+};
+use crate::plugins::held::{AskRelease, HeldSecrets};
+use crate::plugins::host_calls::{
+    CallEnd, CallFailure, ObjectInfoCall, ObjectListCall, RecordCall, StateCall, StateChange,
+    begun_reply, call_intent, version_id,
+};
+use crate::plugins::install::{pick_version, read_manifest};
+use crate::plugins::intents::{begin, unknown_row, written};
+use crate::plugins::objects::{LocalObject, Unmarked};
+use crate::plugins::outgoing::{
+    declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
+};
+use crate::plugins::rate::take_call;
+use crate::plugins::rows::write_rows;
+use crate::plugins::state::{MAX_STATE_KEY, read_state};
+use crate::plugins::submit::{CopyRequest, DownloadRequest, UploadRequest, WorkRequest};
+use crate::plugins::unavailable;
+use crate::plugins::work::RequestContext;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::entity_patch::craqle_patch_request;
@@ -1313,7 +1316,7 @@ impl RunBroker {
         (delivery, target): (Delivery, Option<(String, String)>),
         config: &aruna_core::structs::identity::realm::RealmConfigDocument,
     ) -> Result<(Released, SecretFields), HostError> {
-        let request = ReleaseRequest {
+        let mut request = ReleaseRequest {
             install_id: install.install_id,
             slot: slot.to_string(),
             delivery,
@@ -1321,11 +1324,12 @@ impl RunBroker {
             held: None,
             run_id: Some(self.scope.run.run_id),
         };
-        let local = self.scope.local;
-        let ask = |request| ask_release(&self.ctx, config, local, request);
         let mut held = self.held.lock().await;
-        held.obtain(request, ask)
-            .await
+        held.prepare(&mut request);
+        let ask = AskRelease::new(Arc::new(config.clone()), self.scope.local, request);
+        let released = drive(ask, &self.ctx).await.map_err(|failure| failure.0);
+        released
+            .and_then(|released| held.absorb(slot, released))
             .map_err(|error| match error {
                 ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
                 ReleaseError::Unavailable(why) => unavailable(why),
