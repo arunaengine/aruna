@@ -844,7 +844,8 @@ impl Operation for LoadCountersOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<UsageCounters>, LoadCountersError> {
         if self.is_global() {
-            return Ok(Next::Done(global_sum(result.values()?)?));
+            let total = global_sum::<LoadCountersError>(result.values()?)?;
+            return Ok(Next::Done(total));
         }
         let counters = match result.value()? {
             Some(bytes) => UsageCounters::from_bytes(&bytes)?,

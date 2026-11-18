@@ -13,12 +13,11 @@ use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
     IMPORT_INTENT_KEYSPACE, MIGRATION_AHEAD_KEYSPACE, MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE,
-    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::backend_import::{RenameRequest, WriteIntent};
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BlobCleanupWork, BlobVersion, BucketInfo, ResolvedBackend, VersionKey,
+    BackendLocation, BlobCleanupWork, BlobVersion, ResolvedBackend, VersionKey,
 };
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{

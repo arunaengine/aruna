@@ -17,7 +17,7 @@ use crate::jobs::backend_import::read_checkpoint;
 use crate::jobs::store::state::read_job_record;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::calls::{IoCall, IoError};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, IMPORT_PATTERN_KEYSPACE};
 use aruna_core::structs::execution::job::{JobError, JobId, JobState};
@@ -26,8 +26,7 @@ use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, import_key, object_prefix, read_patterns,
 };
 use aruna_core::structs::storage::blob::ensure_confined_path;
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::path::Path;
 use thiserror::Error;
 use ulid::Ulid;
@@ -196,7 +195,7 @@ impl LinkScan {
     ) -> Result<Option<IoCall>, ConversionError> {
         for (_, value) in values {
             let rule = BackendImport::from_bytes(&value)?;
-            self.linked |= rule.bucket == self.bucket && rule.mapped;
+            self.linked |= rule.bucket == self.bucket && rule.mapped_bucket().is_some();
         }
         Ok(next
             .filter(|_| !self.linked)

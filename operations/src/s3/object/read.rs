@@ -47,7 +47,7 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use crate::s3::object::lookup::{LookupError, summary_from_read};
+use crate::s3::object::lookup::{LookupError, summary_from_value};
 
 /// Reads an object, continuing against the realm's holders when this node holds
 /// the version record but not its bytes. Only User nodes route, since elsewhere a
@@ -729,9 +729,11 @@ async fn local_multipart_summary(
         .await;
     match event {
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        event => summary_from_read(event).map_err(|error| match error {
-            LookupError::Conversion(error) => GetObjectError::ConversionError(error),
-            _ => GetObjectError::GetObjectFailed,
-        }),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => summary_from_value(value)
+            .map_err(|error| match error {
+                LookupError::Conversion(error) => GetObjectError::ConversionError(error),
+                _ => GetObjectError::GetObjectFailed,
+            }),
+        _ => Err(GetObjectError::GetObjectFailed),
     }
 }

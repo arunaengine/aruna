@@ -8,7 +8,6 @@ use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::driver::drive;
 use crate::groups::backends::RecordReadError;
 use crate::groups::storage_routing::load_group_inputs;
 use crate::placement::policy::{
@@ -2915,7 +2914,7 @@ mod tests {
         ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
         target_key,
     };
-    use crate::driver::DriverContext;
+    use crate::driver::{DriverContext, drive};
     use crate::replication::protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};

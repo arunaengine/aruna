@@ -51,9 +51,7 @@ use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::replication::managed_read::LocalUserOperation;
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::replication::version_replication::{
-    ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,
-};
+use crate::replication::version_replication::{ReplicateScopeOperation, SourceAuthorizationError};
 use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
 use crate::s3::access::get::{GetAccessError, GetAccessOperation};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};

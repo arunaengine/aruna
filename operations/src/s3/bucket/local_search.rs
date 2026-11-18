@@ -15,8 +15,8 @@ use super::search::{
     SearchBucketsOutput, candidate_path,
 };
 use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
-use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_authorization::{AuthorizeError, AuthorizeOperation};
+use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::s3::object::search_scan::{open_position, seal_position};
 

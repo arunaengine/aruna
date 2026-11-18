@@ -339,6 +339,8 @@ pub enum CompleteCopiesError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Config(#[from] GetConfigError),
+    #[error(transparent)]
+    Abe(#[from] AbeError),
 }
 
 impl From<IoError> for CompleteCopiesError {

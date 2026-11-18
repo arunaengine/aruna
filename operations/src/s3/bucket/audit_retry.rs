@@ -63,7 +63,7 @@ impl AuditWrite {
     ) -> Result<Self, ConversionError> {
         let row = |record: &BucketAuditRecord| {
             let value = record.to_bytes()?.into();
-            Ok((
+            Ok::<_, ConversionError>((
                 BUCKET_AUDIT_KEYSPACE.to_string(),
                 record.key().into(),
                 value,
