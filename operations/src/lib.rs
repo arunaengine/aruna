@@ -23,6 +23,7 @@ pub mod forward;
 pub mod git;
 pub mod groups;
 pub mod harvest;
+pub mod inbound;
 pub mod jobs;
 pub mod metadata;
 pub mod node;

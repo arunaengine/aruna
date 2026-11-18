@@ -39,7 +39,7 @@ async fn durable_rearm_loop(
         if let Err(error) = drive(restore, &context).await {
             warn!(%error, "Failed to restore connector reference pruning");
         }
-        restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_outbox_timer(&context).await;
         restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
@@ -257,7 +257,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_outbox_timers(&context.storage_handle, &task_handle).await;
+        restore_outbox_timer(&context).await;
         if stopped() {
             return;
         }
@@ -872,6 +872,20 @@ pub async fn drain_notification_outbox(context: Arc<DriverContext>) {
         .await;
 }
 
+/// Re-arms the sync mirror repair timer; a failure waits for the next rearm tick.
+async fn restore_mirror_timer(context: &DriverContext) {
+    if let Err(error) = drive(RestoreTimerOperation::new(), context).await {
+        warn!(%error, "Failed to restore sync mirror repair timer");
+    }
+}
+
+/// Arms the outbox drain for waiting records; a failure waits for the next rearm tick.
+async fn restore_outbox_timer(context: &DriverContext) {
+    if let Err(error) = drive(OutboxTimerOperation::new(), context).await {
+        warn!(%error, "Failed to restore document sync outbox timer");
+    }
+}
+
 #[cfg(test)]
 mod stop_tests {
     use super::*;
@@ -975,12 +989,5 @@ mod stop_tests {
             "the later restore unit must not run after the stop"
         );
         drop(temp);
-    }
-}
-
-/// Re-arms the sync mirror repair timer; a failure waits for the next rearm tick.
-async fn restore_mirror_timer(context: &DriverContext) {
-    if let Err(error) = drive(RestoreTimerOperation::new(), context).await {
-        warn!(%error, "Failed to restore sync mirror repair timer");
     }
 }

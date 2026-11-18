@@ -17,10 +17,10 @@ use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::replication::catch_up::wake_bootstrap;
 use crate::sync::evicted::ReemitEvictedOperation;
-use crate::sync::reconcile::ReconcileTopicsOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
+use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
@@ -380,7 +380,8 @@ async fn reconcile_inbound_topics(
     };
     let run_started = Instant::now();
     let topic_count = topics.len();
-    let targets = match drive(ReconcileTopicsOperation::new(topics), context).await {
+    let reconcile = ReconcileTopicsOperation::new(*net_handle.realm_id(), topics).reloading_peers();
+    let targets = match drive(reconcile, context).await {
         Ok(targets) => targets,
         Err(err) => {
             error!(error = ?err, "Failed to reconcile inbound document sync topics");

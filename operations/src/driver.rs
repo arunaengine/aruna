@@ -1149,6 +1149,7 @@ pub(crate) fn drive_suboperation<'a>(
                 depth,
                 "Starting suboperation"
             );
+            let _hold = take_hold(context, operation.hold_scope()).await;
             let mut run = SubRun(operation.as_mut(), None);
             let mut state = drive_effects(
                 &mut run,

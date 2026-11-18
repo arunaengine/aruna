@@ -101,11 +101,14 @@ use crate::realm::announce_presence::{
 use crate::replication::drain::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
 use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
-use crate::sync::document_outbox::{read_outbox_records, read_outbox_tails, restore_outbox_timers};
+use crate::sync::document_outbox::{
+    DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
+};
 use crate::sync::mirror_repair::{
     DrainRepairsOperation, REPAIR_RETRY_AFTER, RestoreTimerOperation,
 };
 use crate::sync::outbox_record::OUTBOX_DRAIN_SIZE;
+use crate::sync::reconcile::SyncTopicsOperation;
 use crate::sync::shard_placement::{
     DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
 };
@@ -114,6 +117,7 @@ use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
 use crate::triggers::{TimerInput, timer_operation};
+use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 
 mod outbox;

@@ -30,6 +30,7 @@ use crate::node::restore_plan::{
 };
 use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
+use crate::sync::reconcile::SyncTopicsOperation;
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -682,9 +683,12 @@ async fn restore_shared(
         warn!(error = %error, "Failed to ensure shared realm topics on restart");
         outcome.fail_topics(to_ensure.iter().copied());
     }
-    let event = net_handle
-        .sync_document_topics(to_ensure.clone(), unit.peers.clone())
-        .await;
+    let sync = SyncTopicsOperation::new(
+        *net_handle.realm_id(),
+        to_ensure.clone(),
+        unit.peers.clone(),
+    );
+    let event = DocumentNetEvent::reconciled(drive(sync, context).await);
     if !apply_restored_reconcile(context, node_id, event).await {
         outcome.fail_topics(to_ensure);
     }
@@ -728,9 +732,9 @@ async fn restore_rank0(
             .filter(|topic| !present.contains(topic)),
     );
     if !present.is_empty() {
-        let event = net_handle
-            .sync_document_topics(present.clone(), unit.peers.clone())
-            .await;
+        let sync =
+            SyncTopicsOperation::new(*net_handle.realm_id(), present.clone(), unit.peers.clone());
+        let event = DocumentNetEvent::reconciled(drive(sync, context).await);
         if !apply_restored_reconcile(context, node_id, event).await {
             outcome.fail_topics(present);
         }
@@ -762,9 +766,12 @@ async fn restore_join(
         warn!(error = %error, "Failed to prepare joined shard membership on restart");
         outcome.fail_topics(unit.topics.iter().copied());
     }
-    let event = net_handle
-        .sync_document_topics(unit.topics.clone(), unit.peers.clone())
-        .await;
+    let sync = SyncTopicsOperation::new(
+        *net_handle.realm_id(),
+        unit.topics.clone(),
+        unit.peers.clone(),
+    );
+    let event = DocumentNetEvent::reconciled(drive(sync, context).await);
     if !apply_restored_reconcile(context, node_id, event).await {
         outcome.fail_topics(unit.topics.iter().copied());
     }
@@ -1196,7 +1203,7 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         });
-        crate::sync::incoming::initialize_incoming_fixture(context.clone());
+        crate::inbound::initialize_incoming_fixture(context.clone());
         RecoveryNode {
             _dir: dir,
             net,
