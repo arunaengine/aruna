@@ -2,300 +2,130 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::JobRecordFrame;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
+use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
+use aruna_core::metadata::AuthToken;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    CancelAuthority, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope,
-    JobRecordKind, LogicalJobSpec,
+    CancelAuthority, ExecutionClaim, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId,
+    JobProjection, JobRecordEnvelope, JobRecordKind, LogicalJobSpec,
 };
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_core::time::unix_timestamp_millis;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
+use super::LifecycleError;
+use super::admit_forwarded::GroupWriteOperation;
 use super::alias::AliasFamilyOperation;
-use super::family_reads::FamilyProjectionOperation;
-use super::publish::publish_terminal;
-use super::updates::{SETTLE_RETRY_AFTER, schedule_terminal_settle};
-use crate::auth::request_authorization::authorize;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
-use crate::jobs::protocol::send_job_request;
+use super::family_reads::{FamilyProjectionOperation, FamilyView};
+use super::routing::decidable;
+use super::updates::{PublishTerminalOperation, SETTLE_RETRY_AFTER, schedule_terminal_settle};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
-use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::verify::FamilyView;
-use crate::jobs::route::JobRouteError;
-use crate::jobs::service::kick_drain;
+use crate::jobs::records::append::{
+    AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
+};
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
+use crate::jobs::records::pages::ServingNode;
+use crate::jobs::records::verify::FamilyView as HolderView;
+use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
 use crate::jobs::store::JobMutationError;
-use crate::jobs::store::attempt::{CancelRequestOutcome, set_cancel_requested};
-use crate::realm::load_config::load_realm_config;
-use aruna_core::metadata::AuthToken;
+use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
+use crate::jobs::submit::schedule_drain_effect;
 
-/// Cancels one external job through its family. `None` means the alias names no
-/// family here, so the caller keeps its ordinary local cancellation.
-pub async fn cancel_family(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-    auth_token: Option<AuthToken>,
-) -> Option<Result<(), JobRouteError>> {
-    let family = match drive(AliasFamilyOperation::new(job_id), context).await {
-        Ok(Some(family)) => family,
-        Ok(None) => return None,
-        Err(error) => return Some(Err(error)),
-    };
-    let (projected, spec) = match drive(
-        FamilyProjectionOperation::new(job_id, unix_timestamp_millis()),
-        context,
-    )
-    .await
-    {
-        Ok(Some(projected)) => projected,
-        Ok(None) => return None,
-        Err(error) => return Some(Err(error)),
-    };
-    // Cancel authority is a decision: a truncated projection proves nothing.
-    if let Err(error) = super::routing::decidable(&projected) {
-        return Some(Err(error));
-    }
-    let Some(projection) = projected.projection else {
-        return Some(Err(JobRouteError::Unavailable(
-            "job family has no projection".to_string(),
-        )));
-    };
-    let authority = match cancel_authority(context, auth, &spec).await {
-        Some(authority) => authority,
-        None => return Some(Err(JobRouteError::Forbidden)),
-    };
-    if let Err(error) = publish_cancel(context, &spec, auth, authority).await {
-        return Some(Err(error));
-    }
-    cancel_local_runs(context, family).await;
-    // Every known active execution is asked to stop; a partitioned one may
-    // still finish and stays visible as a late completion.
-    if let Some(auth_token) = auth_token {
-        for execution in projection
-            .executions
-            .iter()
-            .filter(|execution| !execution.state.is_terminal())
-        {
-            stop_execution(context, execution.executor_node_id, job_id, &auth_token).await;
+fn unavailable(reason: impl std::fmt::Display) -> JobRouteError {
+    JobRouteError::Unavailable(reason.to_string())
+}
+
+fn internal(reason: impl std::fmt::Display) -> JobRouteError {
+    JobRouteError::Internal(reason.to_string())
+}
+
+fn effect_call(effect: Effect) -> IoCall {
+    IoCall::Effect(Box::new(effect))
+}
+
+#[derive(Debug, PartialEq)]
+enum FlagStep {
+    Request,
+    Publish,
+    Timer,
+}
+
+/// Requests cancellation of one local physical row and answers whether the drain must look at
+/// it. A settled or pruned row is a no-op, and a repeated request leaves the row untouched. A
+/// terminal publication that stays pending is retried by the settle timer.
+#[derive(Debug, PartialEq)]
+pub struct FlagLocalRunOperation {
+    physical: JobId,
+    serving: ServingNode,
+    now_ms: u64,
+    step: FlagStep,
+}
+
+impl FlagLocalRunOperation {
+    pub fn new(physical: JobId, serving: ServingNode, now_ms: u64) -> Self {
+        Self {
+            physical,
+            serving,
+            now_ms,
+            step: FlagStep::Request,
         }
     }
-    Some(Ok(()))
 }
 
-/// How this node may state the caller's permission against the stored spec. The
-/// submitter is checked by every holder again; a group admin's permission is
-/// checked here and the signature is that statement.
-async fn cancel_authority(
-    context: &DriverContext,
-    auth: &AuthContext,
-    spec: &LogicalJobSpec,
-) -> Option<CancelAuthority> {
-    if auth.user_id == spec.created_by {
-        return Some(CancelAuthority::Submitter);
-    }
-    let local = context.net_handle.as_ref()?.node_id();
-    authorize(
-        context,
-        spec.realm_id,
-        auth,
-        &group_permission_path(spec.realm_id, spec.group_id, local),
-        &Permission::WRITE,
-        PolicyRequestExtras::rest(),
-    )
-    .await
-    .ok()
-    .map(|()| CancelAuthority::GroupAdmin)
-}
+impl Operation for FlagLocalRunOperation {
+    type Output = bool;
+    type Error = IoError;
 
-/// Records that the submitter deleted a finished run, so every holder answers it as absent.
-/// `Ok` without a record when the job has no family here.
-pub async fn publish_deletion(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-) -> Result<(), JobRouteError> {
-    let read = FamilyProjectionOperation::new(job_id, unix_timestamp_millis());
-    let Some((_, spec)) = drive(read, context).await? else {
-        return Ok(());
-    };
-    if spec.created_by != auth.user_id {
-        return Err(JobRouteError::NotFound);
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let request = set_cancel_requested(self.physical, self.now_ms);
+        Ok(Next::Call(IoCall::child(request)))
     }
-    publish_cancel(context, &spec, auth, CancelAuthority::Deletion).await
-}
 
-/// Signs and appends the cancellation. Only a current family holder may author
-/// it, so a node that does not hold the family reports availability instead.
-async fn publish_cancel(
-    context: &DriverContext,
-    spec: &LogicalJobSpec,
-    auth: &AuthContext,
-    authority: CancelAuthority,
-) -> Result<(), JobRouteError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
-    let realm_id = *net.realm_id();
-    let local = net.node_id();
-    let config = load_realm_config(context, realm_id)
-        .await
-        .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
-    let family = aruna_core::structs::execution::job::JobFamilyId {
-        submission_id: spec.submission_id,
-        request_digest: spec.request_digest,
-    };
-    let view = FamilyView::resolve(&config, realm_id, family).ok_or_else(|| {
-        JobRouteError::Unavailable("job family holder view unavailable".to_string())
-    })?;
-    // A forwarded cancel names no deletion, so only a holder records one.
-    if !view.holds(local) && authority == CancelAuthority::Deletion {
-        return Err(JobRouteError::Unavailable(
-            "this node does not hold the job family".to_string(),
-        ));
-    }
-    if !view.holds(local) {
-        for holder in view
-            .holders()
-            .iter()
-            .copied()
-            .filter(|holder| view.holds(*holder))
-        {
-            let response = match send_job_request(
-                context,
-                holder,
-                JobRequest::Cancel {
-                    auth_token: AuthToken::internal(auth.clone()),
-                    job_id: spec.job_id,
-                },
-            )
-            .await
-            {
-                Ok(response) => response.response,
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        let physical = self.physical;
+        match self.step {
+            FlagStep::Request => match result.child::<CancelRequestOutcome, JobMutationError>()? {
+                Ok(CancelRequestOutcome::Cancelled(record)) => {
+                    self.step = FlagStep::Publish;
+                    let publish = PublishTerminalOperation::new(record, self.serving, self.now_ms);
+                    Ok(Next::Call(IoCall::child(publish)))
+                }
+                Ok(CancelRequestOutcome::Flagged(_)) => {
+                    debug!(job_id = %physical, "Local execution cancelled by its family");
+                    Ok(Next::Done(true))
+                }
+                Ok(CancelRequestOutcome::AlreadyTerminal(_)) | Err(JobMutationError::NotFound) => {
+                    Ok(Next::Done(false))
+                }
                 Err(error) => {
-                    debug!(peer = %holder, error = %error, "Family cancellation forwarding failed");
-                    continue;
+                    warn!(job_id = %physical, error = %error, "Local execution cancel flag failed");
+                    Ok(Next::Done(false))
                 }
-            };
-            match response {
-                JobResponse::Cancelled { .. } => return Ok(()),
-                JobResponse::Unauthorized => return Err(JobRouteError::Unauthorized),
-                JobResponse::Forbidden => return Err(JobRouteError::Forbidden),
-                JobResponse::NotFound => return Err(JobRouteError::NotFound),
-                JobResponse::Unavailable(error) => {
-                    debug!(peer = %holder, error, "Family cancellation holder unavailable");
+            },
+            FlagStep::Publish => {
+                let published = match result.child::<bool, LifecycleError>()? {
+                    Ok(published) => published,
+                    Err(error) => {
+                        warn!(error = %error, "Execution publication failed");
+                        false
+                    }
+                };
+                if published {
+                    return Ok(Next::Done(true));
                 }
-                response => {
-                    return Err(JobRouteError::Unavailable(format!(
-                        "unexpected family cancel response: {response:?}"
-                    )));
-                }
+                self.step = FlagStep::Timer;
+                let timer = schedule_terminal_settle(SETTLE_RETRY_AFTER);
+                Ok(Next::Call(effect_call(timer)))
             }
+            FlagStep::Timer => Ok(Next::Done(true)),
         }
-        return Err(JobRouteError::Unavailable(
-            "job family has no reachable holder".to_string(),
-        ));
-    }
-    let record = JobCancelRecord {
-        cancel_id: Ulid::generate(),
-        submission_id: spec.submission_id,
-        request_digest: spec.request_digest,
-        job_id: spec.job_id,
-        spec_digest: spec.spec_digest,
-        requested_by: auth.user_id,
-        authority,
-        requested_at_ms: unix_timestamp_millis(),
-    };
-    let envelope = JobRecordEnvelope::signed_with(
-        realm_id,
-        JobFamilyRecord::Cancel(record),
-        local,
-        |message| net.sign(message),
-    )
-    .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-    let frame = JobRecordFrame::new(envelope)
-        .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-    let outcome = drive(
-        AppendRecordOperation::new(AppendRecordConfig {
-            realm_id,
-            local_node_id: local,
-            record: frame,
-            local: None,
-            origin: RecordOrigin::Local,
-            now_ms: unix_timestamp_millis(),
-        }),
-        context,
-    )
-    .await
-    .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
-    if !matches!(
-        outcome.admission,
-        Admission::Authentic | Admission::Duplicate
-    ) {
-        return Err(JobRouteError::Unavailable(
-            "job cancellation is awaiting authentic admission".to_string(),
-        ));
-    }
-    debug!(job_id = %spec.job_id, "Job cancellation published");
-    Ok(())
-}
-
-/// Asks one executor to stop its physical execution. Delivery is best effort:
-/// an unreachable executor keeps running and converges through the record.
-async fn stop_execution(
-    context: &DriverContext,
-    executor: aruna_core::id::NodeId,
-    job_id: JobId,
-    auth_token: &AuthToken,
-) {
-    // A local execution has no network cancel: `cancel_local_runs` flagged it.
-    if context
-        .net_handle
-        .as_ref()
-        .is_some_and(|net| net.node_id() == executor)
-    {
-        return;
-    }
-    let request = JobRequest::Cancel {
-        auth_token: auth_token.clone(),
-        job_id,
-    };
-    if let Err(error) = send_job_request(context, executor, request).await {
-        warn!(peer = %executor, error = %error, "Cancel delivery to an executor failed");
-    }
-}
-
-/// Stops every physical execution of one family this node runs. The replicated
-/// record reaches no local attempt by itself, so each local row is flagged here
-/// and the drain is woken once.
-pub(crate) async fn cancel_local_runs(context: &DriverContext, family: JobFamilyId) {
-    let Some(local) = context.net_handle.as_ref().map(|net| net.node_id()) else {
-        return;
-    };
-    let receipts = match drive(
-        LoadFamilyOperation::kind(family, JobRecordKind::Receipt),
-        context,
-    )
-    .await
-    {
-        Ok(receipts) => receipts,
-        Err(error) => {
-            warn!(error = %error, "Family receipts unreadable for a local cancel");
-            return;
-        }
-    };
-    let mut flagged = false;
-    for physical in local_physical_jobs(&receipts, local) {
-        flagged |= flag_local_run(context, physical).await;
-    }
-    if flagged {
-        kick_drain(context).await;
     }
 }
 
@@ -312,37 +142,697 @@ fn local_physical_jobs(receipts: &[JobRecordEnvelope], local: NodeId) -> Vec<Job
         .collect()
 }
 
-/// Cancels one local row whose launch committed while the family was already
-/// cancelled, waking the drain so the row never starts.
-pub(crate) async fn cancel_local_run(context: &DriverContext, physical: JobId) {
-    if flag_local_run(context, physical).await {
-        kick_drain(context).await;
+/// Stops every physical execution of one family this node runs. The replicated record reaches
+/// no local attempt by itself, so each local row is flagged here and the drain is woken once.
+#[derive(Debug, PartialEq)]
+pub struct CancelLocalRunsOperation {
+    family: JobFamilyId,
+    serving: ServingNode,
+    now_ms: u64,
+    /// Rows still to flag, the next one last; `None` until the receipts are read.
+    pending: Option<Vec<JobId>>,
+    flagged: bool,
+}
+
+type LocalRunsNext = Result<Next<()>, IoError>;
+
+impl CancelLocalRunsOperation {
+    pub fn new(family: JobFamilyId, serving: ServingNode, now_ms: u64) -> Self {
+        Self {
+            family,
+            serving,
+            now_ms,
+            pending: None,
+            flagged: false,
+        }
+    }
+
+    fn flag_next(&mut self) -> LocalRunsNext {
+        match self.pending.as_mut().and_then(Vec::pop) {
+            Some(physical) => {
+                let flag = FlagLocalRunOperation::new(physical, self.serving, self.now_ms);
+                Ok(Next::Call(IoCall::child(flag)))
+            }
+            None if self.flagged => Ok(Next::Then {
+                output: (),
+                calls: vec![effect_call(schedule_drain_effect())],
+            }),
+            None => Ok(Next::Done(())),
+        }
     }
 }
 
-/// Requests cancellation of one local physical row. A settled or pruned row is
-/// a no-op, and a repeated request leaves the stored record untouched.
-async fn flag_local_run(context: &DriverContext, physical: JobId) -> bool {
-    match set_cancel_requested(context, physical, unix_timestamp_millis()).await {
-        Ok(CancelRequestOutcome::Cancelled(record)) => {
-            if !publish_terminal(context, &record).await
-                && let Some(task) = context.task_handle.as_ref()
-            {
-                use aruna_core::handle::Handle;
-                let _ = task
-                    .send_effect(schedule_terminal_settle(SETTLE_RETRY_AFTER))
-                    .await;
+impl Operation for CancelLocalRunsOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> LocalRunsNext {
+        if self.serving.is_none() {
+            return Ok(Next::Done(()));
+        }
+        let read = LoadFamilyOperation::kind(self.family, JobRecordKind::Receipt);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> LocalRunsNext {
+        if self.pending.is_some() {
+            self.flagged |= result.child::<bool, IoError>()?.unwrap_or(false);
+            return self.flag_next();
+        }
+        let receipts = match result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()? {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                warn!(error = %error, "Family receipts unreadable for a local cancel");
+                return Ok(Next::Done(()));
             }
-            true
+        };
+        let Some((local, _)) = self.serving else {
+            return Ok(Next::Done(()));
+        };
+        let mut pending = local_physical_jobs(&receipts, local);
+        pending.reverse();
+        self.pending = Some(pending);
+        self.flag_next()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PublishStep {
+    Config,
+    Forward(Vec<NodeId>),
+    Sign,
+    Append,
+}
+
+/// Signs and appends the cancellation. Only a current family holder may author it; another node
+/// forwards a cancel to the holders, and a deletion needs a holder here.
+#[derive(Debug, PartialEq)]
+pub struct PublishCancelOperation {
+    spec: LogicalJobSpec,
+    auth: AuthContext,
+    authority: CancelAuthority,
+    serving: ServingNode,
+    cancel_id: Ulid,
+    now_ms: u64,
+    step: PublishStep,
+}
+
+type PublishNext = Result<Next<()>, JobRouteError>;
+
+impl PublishCancelOperation {
+    pub fn new(
+        spec: LogicalJobSpec,
+        auth: &AuthContext,
+        authority: CancelAuthority,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            spec,
+            auth: auth.clone(),
+            authority,
+            serving,
+            cancel_id: Ulid::generate(),
+            now_ms,
+            step: PublishStep::Config,
         }
-        Ok(CancelRequestOutcome::Flagged(_)) => {
-            debug!(job_id = %physical, "Local execution cancelled by its family");
-            true
+    }
+
+    fn node(
+        &self,
+    ) -> Result<(NodeId, aruna_core::structs::identity::realm::RealmId), JobRouteError> {
+        self.serving
+            .ok_or_else(|| unavailable("network handle unavailable"))
+    }
+
+    fn configured(&mut self, config: &RealmConfigDocument) -> PublishNext {
+        let (local, realm_id) = self.node()?;
+        let family = JobFamilyId {
+            submission_id: self.spec.submission_id,
+            request_digest: self.spec.request_digest,
+        };
+        let view = HolderView::resolve(config, realm_id, family)
+            .ok_or_else(|| unavailable("job family holder view unavailable"))?;
+        if view.holds(local) {
+            return self.sign();
         }
-        Ok(CancelRequestOutcome::AlreadyTerminal(_)) | Err(JobMutationError::NotFound) => false,
-        Err(error) => {
-            warn!(job_id = %physical, error = %error, "Local execution cancel flag failed");
-            false
+        // A forwarded cancel names no deletion, so only a holder records one.
+        if self.authority == CancelAuthority::Deletion {
+            return Err(unavailable("this node does not hold the job family"));
         }
+        let mut holders: Vec<NodeId> = view
+            .holders()
+            .iter()
+            .copied()
+            .filter(|holder| view.holds(*holder))
+            .collect();
+        holders.reverse();
+        self.forward_next(holders)
+    }
+
+    fn forward_next(&mut self, mut holders: Vec<NodeId>) -> PublishNext {
+        let Some(holder) = holders.pop() else {
+            return Err(unavailable("job family has no reachable holder"));
+        };
+        let (local, realm_id) = self.node()?;
+        let request = JobRequest::Cancel {
+            auth_token: AuthToken::internal(self.auth.clone()),
+            job_id: self.spec.job_id,
+        };
+        let route = JobRouteOperation::new(realm_id, local, self.spec.job_id, Some(request))
+            .with_responder(Some(holder));
+        self.step = PublishStep::Forward(holders);
+        Ok(Next::Call(IoCall::child(route)))
+    }
+
+    fn forwarded(
+        &mut self,
+        holders: Vec<NodeId>,
+        answer: Result<JobRouteOutcome, JobRouteError>,
+    ) -> PublishNext {
+        let response = match answer {
+            Ok(JobRouteOutcome::Remote(response)) => response,
+            Ok(JobRouteOutcome::Local) => return self.forward_next(holders),
+            Err(error) => {
+                debug!(error = %error, "Family cancellation forwarding failed");
+                return self.forward_next(holders);
+            }
+        };
+        match response {
+            JobResponse::Cancelled { .. } => Ok(Next::Done(())),
+            JobResponse::Unauthorized => Err(JobRouteError::Unauthorized),
+            JobResponse::Forbidden => Err(JobRouteError::Forbidden),
+            JobResponse::NotFound => Err(JobRouteError::NotFound),
+            JobResponse::Unavailable(error) => {
+                debug!(error, "Family cancellation holder unavailable");
+                self.forward_next(holders)
+            }
+            response => Err(unavailable(format!(
+                "unexpected family cancel response: {response:?}"
+            ))),
+        }
+    }
+
+    fn sign(&mut self) -> PublishNext {
+        let (publisher, realm_id) = self.node()?;
+        let spec = &self.spec;
+        let record = JobCancelRecord {
+            cancel_id: self.cancel_id,
+            submission_id: spec.submission_id,
+            request_digest: spec.request_digest,
+            job_id: spec.job_id,
+            spec_digest: spec.spec_digest,
+            requested_by: self.auth.user_id,
+            authority: self.authority,
+            requested_at_ms: self.now_ms,
+        };
+        let claim = ExecutionClaim {
+            realm_id,
+            record: JobFamilyRecord::Cancel(record),
+            publisher,
+        };
+        self.step = PublishStep::Sign;
+        let effect = Effect::Net(NetEffect::ExecutionSign(Box::new(claim)));
+        Ok(Next::Call(effect_call(effect)))
+    }
+
+    fn signed(&mut self, result: IoResult) -> PublishNext {
+        let expected = "Event::Net(NetEvent::ExecutionSign)";
+        let IoResult::Event(event) = result else {
+            let got = result.label();
+            return Err(IoError::Unexpected { expected, got }.into());
+        };
+        let envelope = match *event {
+            Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Signed(envelope))) => *envelope,
+            Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Unavailable(error))) => {
+                return Err(internal(error));
+            }
+            _ => {
+                let got = "another event";
+                return Err(IoError::Unexpected { expected, got }.into());
+            }
+        };
+        let (local_node_id, realm_id) = self.node()?;
+        let record = JobRecordFrame::new(envelope).map_err(internal)?;
+        self.step = PublishStep::Append;
+        let append = AppendRecordOperation::new(AppendRecordConfig {
+            realm_id,
+            local_node_id,
+            record,
+            local: None,
+            origin: RecordOrigin::Local,
+            now_ms: self.now_ms,
+        });
+        Ok(Next::Call(IoCall::child(append)))
+    }
+}
+
+impl Operation for PublishCancelOperation {
+    type Output = ();
+    type Error = JobRouteError;
+
+    fn first(&mut self) -> PublishNext {
+        let (_, realm_id) = self.node()?;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishNext {
+        match std::mem::replace(&mut self.step, PublishStep::Append) {
+            PublishStep::Config => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                let config = config.map_err(|_| unavailable("realm config unavailable"))?;
+                self.configured(&config)
+            }
+            PublishStep::Forward(holders) => {
+                let answer = result.child::<JobRouteOutcome, JobRouteError>()?;
+                self.forwarded(holders, answer)
+            }
+            PublishStep::Sign => self.signed(result),
+            PublishStep::Append => {
+                let outcome = result.child::<AppendOutcome, RecordStoreError>()?;
+                let outcome = outcome.map_err(unavailable)?;
+                if !matches!(
+                    outcome.admission,
+                    Admission::Authentic | Admission::Duplicate
+                ) {
+                    return Err(unavailable(
+                        "job cancellation is awaiting authentic admission",
+                    ));
+                }
+                debug!(job_id = %self.spec.job_id, "Job cancellation published");
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+/// Records that the submitter deleted a finished run, so every holder answers it as absent. A
+/// job without a family here records nothing.
+#[derive(Debug, PartialEq)]
+pub struct PublishDeletionOperation {
+    auth: AuthContext,
+    job_id: JobId,
+    serving: ServingNode,
+    now_ms: u64,
+    publishing: bool,
+}
+
+impl PublishDeletionOperation {
+    pub fn new(auth: &AuthContext, job_id: JobId, serving: ServingNode, now_ms: u64) -> Self {
+        Self {
+            auth: auth.clone(),
+            job_id,
+            serving,
+            now_ms,
+            publishing: false,
+        }
+    }
+}
+
+impl Operation for PublishDeletionOperation {
+    type Output = ();
+    type Error = JobRouteError;
+
+    fn first(&mut self) -> PublishNext {
+        let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishNext {
+        if self.publishing {
+            result.child::<(), JobRouteError>()??;
+            return Ok(Next::Done(()));
+        }
+        let Some((_, spec)) = result.child::<Option<FamilyView>, JobRouteError>()?? else {
+            return Ok(Next::Done(()));
+        };
+        if spec.created_by != self.auth.user_id {
+            return Err(JobRouteError::NotFound);
+        }
+        self.publishing = true;
+        let publish = PublishCancelOperation::new(
+            spec,
+            &self.auth,
+            CancelAuthority::Deletion,
+            self.serving,
+            self.now_ms,
+        );
+        Ok(Next::Call(IoCall::child(publish)))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CancelStep {
+    Alias,
+    Projection(JobFamilyId),
+    Authority(Box<CancelTarget>),
+    Publish(Box<CancelTarget>),
+    Local(Box<JobProjection>),
+    Stop(Vec<NodeId>),
+}
+
+/// What a cancel of one family found.
+#[derive(Debug, PartialEq)]
+struct CancelTarget {
+    family: JobFamilyId,
+    projection: JobProjection,
+    spec: LogicalJobSpec,
+}
+
+/// Cancels one external job through its family; `None` means the alias names no family here, so
+/// the caller keeps its ordinary local cancellation. Every known active execution is asked to
+/// stop; a partitioned one may still finish and stays visible as a late completion.
+#[derive(Debug, PartialEq)]
+pub struct CancelFamilyOperation {
+    auth: AuthContext,
+    job_id: JobId,
+    token: Option<AuthToken>,
+    serving: ServingNode,
+    now_ms: u64,
+    step: CancelStep,
+}
+
+type CancelNext = Result<Next<Option<()>>, JobRouteError>;
+
+impl CancelFamilyOperation {
+    pub fn new(
+        auth: &AuthContext,
+        job_id: JobId,
+        token: Option<AuthToken>,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            auth: auth.clone(),
+            job_id,
+            token,
+            serving,
+            now_ms,
+            step: CancelStep::Alias,
+        }
+    }
+
+    fn projected(&mut self, family: JobFamilyId, read: Option<FamilyView>) -> CancelNext {
+        let Some((projected, spec)) = read else {
+            return Ok(Next::Done(None));
+        };
+        // Cancel authority is a decision: a truncated projection proves nothing.
+        decidable(&projected)?;
+        let projection = projected
+            .projection
+            .ok_or_else(|| unavailable("job family has no projection"))?;
+        let target = Box::new(CancelTarget {
+            family,
+            projection,
+            spec,
+        });
+        // The submitter is checked by every holder again; a group admin's permission is
+        // checked here and the signature is that statement.
+        if self.auth.user_id == target.spec.created_by {
+            return self.publish(target, CancelAuthority::Submitter);
+        }
+        let (local, _) = self.serving.ok_or(JobRouteError::Forbidden)?;
+        let check = GroupWriteOperation::new(&self.auth, target.spec.group_id, local);
+        self.step = CancelStep::Authority(target);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn publish(&mut self, target: Box<CancelTarget>, authority: CancelAuthority) -> CancelNext {
+        let publish = PublishCancelOperation::new(
+            target.spec.clone(),
+            &self.auth,
+            authority,
+            self.serving,
+            self.now_ms,
+        );
+        self.step = CancelStep::Publish(target);
+        Ok(Next::Call(IoCall::child(publish)))
+    }
+
+    fn stop_next(&mut self, mut executors: Vec<NodeId>) -> CancelNext {
+        let (Some(token), Some((local, realm_id))) = (self.token.clone(), self.serving) else {
+            return Ok(Next::Done(Some(())));
+        };
+        // A local execution has no network cancel: the local runs were flagged already.
+        let Some(executor) = executors.pop().filter(|executor| *executor != local) else {
+            return match executors.is_empty() {
+                true => Ok(Next::Done(Some(()))),
+                false => self.stop_next(executors),
+            };
+        };
+        let request = JobRequest::Cancel {
+            auth_token: token,
+            job_id: self.job_id,
+        };
+        let route = JobRouteOperation::new(realm_id, local, self.job_id, Some(request))
+            .with_responder(Some(executor));
+        self.step = CancelStep::Stop(executors);
+        Ok(Next::Call(IoCall::child(route)))
+    }
+}
+
+impl Operation for CancelFamilyOperation {
+    type Output = Option<()>;
+    type Error = JobRouteError;
+
+    fn first(&mut self) -> CancelNext {
+        Ok(Next::Call(IoCall::child(AliasFamilyOperation::new(
+            self.job_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> CancelNext {
+        match std::mem::replace(&mut self.step, CancelStep::Alias) {
+            CancelStep::Alias => {
+                let Some(family) = result.child::<Option<JobFamilyId>, JobRouteError>()?? else {
+                    return Ok(Next::Done(None));
+                };
+                self.step = CancelStep::Projection(family);
+                let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            CancelStep::Projection(family) => {
+                let read = result.child::<Option<FamilyView>, JobRouteError>()??;
+                self.projected(family, read)
+            }
+            CancelStep::Authority(target) => match result.child::<bool, IoError>()? {
+                Ok(true) => self.publish(target, CancelAuthority::GroupAdmin),
+                Ok(false) | Err(_) => Err(JobRouteError::Forbidden),
+            },
+            CancelStep::Publish(target) => {
+                result.child::<(), JobRouteError>()??;
+                let local = CancelLocalRunsOperation::new(target.family, self.serving, self.now_ms);
+                self.step = CancelStep::Local(Box::new(target.projection));
+                Ok(Next::Call(IoCall::child(local)))
+            }
+            CancelStep::Local(projection) => {
+                let _ = result.child::<(), IoError>()?;
+                let mut executors: Vec<NodeId> = projection
+                    .executions
+                    .iter()
+                    .filter(|execution| !execution.state.is_terminal())
+                    .map(|execution| execution.executor_node_id)
+                    .collect();
+                executors.reverse();
+                self.stop_next(executors)
+            }
+            CancelStep::Stop(executors) => {
+                if let Err(error) = result.child::<JobRouteOutcome, JobRouteError>()? {
+                    warn!(error = %error, "Cancel delivery to an executor failed");
+                }
+                self.stop_next(executors)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::records::{Family, REALM, node};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::job::JobRecord;
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn job() -> JobId {
+        JobId::from_bytes([3; 16])
+    }
+
+    fn serving() -> ServingNode {
+        Some((node(1), REALM))
+    }
+
+    fn flag() -> FlagLocalRunOperation {
+        FlagLocalRunOperation::new(job(), serving(), 5)
+    }
+
+    fn record(family: &Family) -> JobRecord {
+        let spec = family.spec();
+        JobRecord::new(
+            job(),
+            aruna_core::structs::execution::job::JobPayload::Execution(spec.payload),
+            spec.created_by,
+            node(1),
+            1,
+            1,
+            None,
+        )
+    }
+
+    // A row that is gone or settled needs no drain; a flagged one does.
+    #[test]
+    fn flag_outcomes() {
+        let family = Family::new([1; 32]);
+        let answer = |outcome| {
+            let mut operation = flag();
+            operation.first().expect("the request starts");
+            operation.next(child(outcome))
+        };
+        let missing = Err::<CancelRequestOutcome, _>(JobMutationError::NotFound);
+        assert_eq!(answer(missing), Ok(Next::Done(false)));
+        let done = CancelRequestOutcome::AlreadyTerminal(record(&family));
+        assert_eq!(
+            answer(Ok::<_, JobMutationError>(done)),
+            Ok(Next::Done(false))
+        );
+        let flagged = CancelRequestOutcome::Flagged(record(&family));
+        assert_eq!(
+            answer(Ok::<_, JobMutationError>(flagged)),
+            Ok(Next::Done(true))
+        );
+    }
+
+    // A terminal row is published, and a pending publication arms the settle timer.
+    #[test]
+    fn pending_publication_rearms() {
+        let family = Family::new([1; 32]);
+        let mut operation = flag();
+        operation.first().expect("the request starts");
+        let cancelled = CancelRequestOutcome::Cancelled(record(&family));
+        let next = operation.next(child(Ok::<_, JobMutationError>(cancelled)));
+        assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+        let pending = operation.next(child(Ok::<_, LifecycleError>(false)));
+        assert_eq!(
+            pending,
+            Ok(Next::Call(effect_call(schedule_terminal_settle(
+                SETTLE_RETRY_AFTER
+            ))))
+        );
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
+    }
+
+    // Only flagged rows wake the drain, after the last one was handled.
+    #[test]
+    fn drain_woken_once() {
+        let family = Family::new([1; 32]).family();
+        let mut runs = CancelLocalRunsOperation::new(family, serving(), 5);
+        runs.pending = Some(vec![job()]);
+        let next = runs.next(child(Ok::<_, IoError>(true)));
+        assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+        let done = runs.next(child(Ok::<_, IoError>(false)));
+        assert_eq!(
+            done,
+            Ok(Next::Then {
+                output: (),
+                calls: vec![effect_call(schedule_drain_effect())],
+            })
+        );
+    }
+
+    // Without a network there is no local executor to stop.
+    #[test]
+    fn offline_stops_nothing() {
+        let family = Family::new([1; 32]).family();
+        let mut runs = CancelLocalRunsOperation::new(family, None, 5);
+        assert_eq!(runs.first(), Ok(Next::Done(())));
+    }
+
+    fn publish(authority: CancelAuthority, local: NodeId) -> (Family, PublishCancelOperation) {
+        let family = Family::new([1; 32]);
+        let auth = AuthContext::anonymous(REALM);
+        let serving = Some((local, REALM));
+        let operation = PublishCancelOperation::new(family.spec(), &auth, authority, serving, 5);
+        (family, operation)
+    }
+
+    fn config(family: &Family) -> IoResult {
+        child(Ok::<_, GetConfigError>(family.config.clone()))
+    }
+
+    // A holder signs the record; a node outside the family cannot record a deletion.
+    #[test]
+    fn holder_signs_record() {
+        let (family, mut holder) = publish(CancelAuthority::Submitter, node(1));
+        holder.first().expect("the config is read");
+        let next = holder.next(config(&family));
+        assert!(
+            matches!(next, Ok(Next::Call(IoCall::Effect(_)))),
+            "{next:?}"
+        );
+        let (family, mut outsider) = publish(CancelAuthority::Deletion, node(9));
+        outsider.first().expect("the config is read");
+        assert!(matches!(
+            outsider.next(config(&family)),
+            Err(JobRouteError::Unavailable(_))
+        ));
+    }
+
+    // A forwarded cancel tries the next holder until one answers for the family.
+    #[test]
+    fn forward_tries_holders() {
+        let (family, mut outsider) = publish(CancelAuthority::Submitter, node(9));
+        outsider.first().expect("the config is read");
+        assert!(matches!(
+            outsider.next(config(&family)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let down = Err::<JobRouteOutcome, _>(JobRouteError::Unavailable("down".to_string()));
+        assert!(matches!(
+            outsider.next(child(down)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let refused = JobRouteOutcome::Remote(JobResponse::Forbidden);
+        assert_eq!(
+            outsider.next(child(Ok::<_, JobRouteError>(refused))),
+            Err(JobRouteError::Forbidden)
+        );
+    }
+
+    // No family means the caller's ordinary cancellation applies.
+    #[test]
+    fn no_family_answers_none() {
+        let auth = AuthContext::anonymous(REALM);
+        let mut cancel = CancelFamilyOperation::new(&auth, job(), None, serving(), 5);
+        cancel.first().expect("the alias is read");
+        let none = child(Ok::<Option<JobFamilyId>, JobRouteError>(None));
+        assert_eq!(cancel.next(none), Ok(Next::Done(None)));
+    }
+
+    // Only the submitter may delete the record of a run.
+    #[test]
+    fn deletion_needs_submitter() {
+        let family = Family::new([1; 32]);
+        let auth = AuthContext::anonymous(REALM);
+        let mut deletion = PublishDeletionOperation::new(&auth, job(), serving(), 5);
+        deletion.first().expect("the family is read");
+        let projected = crate::jobs::records::project::ProjectedFamily {
+            family: family.family(),
+            revision: 0,
+            projection: None,
+            truncated: false,
+            cached: false,
+        };
+        let read = Some((projected, family.spec()));
+        assert_eq!(
+            deletion.next(child(Ok::<_, JobRouteError>(read))),
+            Err(JobRouteError::NotFound)
+        );
     }
 }

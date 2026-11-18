@@ -798,7 +798,7 @@ mod tests {
         .unwrap();
         assert!(
             !crate::driver::drive(
-                crate::jobs::runtime_steps::KeyUnlockedOperation::new(key.key),
+                crate::jobs::key_locks::KeyUnlockedOperation::new(key.key),
                 &context
             )
             .await

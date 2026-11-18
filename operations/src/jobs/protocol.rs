@@ -496,13 +496,18 @@ async fn prepare_cancel(
     }
     // A forwarded cancel reaches a family holder here: it publishes the record
     // and then still stops its own local execution row if it has one.
-    match crate::jobs::lifecycle::cancel::cancel_family(
+    match drive(
+        crate::jobs::lifecycle::cancel::CancelFamilyOperation::new(
+            auth,
+            job_id,
+            Some(auth_token.clone()),
+            context.node_and_realm(),
+            aruna_core::time::unix_timestamp_millis(),
+        ),
         context,
-        auth,
-        job_id,
-        Some(auth_token.clone()),
     )
     .await
+    .transpose()
     {
         Some(Ok(())) => {
             let reservations = match drive(HeldReservations::all(), context).await {

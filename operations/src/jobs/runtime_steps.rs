@@ -7,8 +7,6 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
-use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
@@ -22,6 +20,7 @@ use ulid::Ulid;
 
 use super::DRAIN_BATCH_SIZE;
 use super::executor::JobRunOutcome;
+use super::key_locks::KeyUnlockedOperation;
 use super::store::JobMutationError;
 use super::store::job_calls::{
     ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, defer_job, exhaust_job,
@@ -34,40 +33,6 @@ use super::store::store_call::StoreCall;
 const WRITE_MAX_ATTEMPTS: u32 = 5;
 /// How long a deferred job waits before it may run again.
 pub(crate) const RETRY_AFTER_MS: u64 = 1_000;
-
-/// Answers whether this node holds an active unlock of `key`.
-#[derive(Debug, PartialEq)]
-pub struct KeyUnlockedOperation {
-    key: BucketKeyRef,
-}
-
-impl KeyUnlockedOperation {
-    pub fn new(key: BucketKeyRef) -> Self {
-        Self { key }
-    }
-}
-
-impl Operation for KeyUnlockedOperation {
-    type Output = bool;
-    type Error = IoError;
-
-    fn first(&mut self) -> Result<Next<bool>, IoError> {
-        let read = BlobEffect::ReadKeyStatus {
-            bucket_id: self.key.bucket_id,
-        };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(read)))))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
-        let unlocked = match result.event()? {
-            Event::Blob(BlobEvent::KeyStatus { generations }) => generations
-                .iter()
-                .any(|status| status.key == self.key && status.active),
-            _ => false,
-        };
-        Ok(Next::Done(unlocked))
-    }
-}
 
 /// The terminal state one write gives a job.
 #[derive(Debug, PartialEq)]

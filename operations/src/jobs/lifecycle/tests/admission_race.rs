@@ -18,13 +18,13 @@ use aruna_core::types::Key;
 use tokio::sync::Barrier;
 use ulid::Ulid;
 
+use super::settle;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::launch_admit::{
     CommitReceiptOperation, CommitVerdict, SettleLaunchOperation, classify, existing_receipt,
 };
 use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
-use crate::jobs::lifecycle::target::settle;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::store::state::read_job_record;
@@ -136,7 +136,7 @@ pub(super) async fn commit_receipt(
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
     let commit = CommitReceiptOperation::new(config, launch.clone());
     let answer = drive(commit, ctx.as_ref()).await.ok()?;
-    Some(settle(ctx, answer).await)
+    settle(ctx, answer).await
 }
 
 /// Commits one stored receipt with `reserve` answering every reservation attempt, the way the
@@ -162,7 +162,7 @@ where
     let mut waiting = Waiting::Reserve;
     loop {
         match turn {
-            Ok(Next::Done(answer)) => return Some(settle(ctx, answer).await),
+            Ok(Next::Done(answer)) => return settle(ctx, answer).await,
             Ok(Next::Call(IoCall::Child(_))) => {}
             Ok(other) => panic!("unexpected turn {other:?}"),
             Err(_) => return None,

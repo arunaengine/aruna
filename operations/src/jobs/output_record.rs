@@ -3,210 +3,348 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::JobRecordFrame;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
+use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    AttemptControl, ExecutionOutputRecord, JobError, JobFamilyRecord, JobId, JobRecord,
+    AttemptControl, ExecutionClaim, ExecutionOutputRecord, JobError, JobFamilyRecord, JobRecord,
     JobRecordEnvelope, LocalExecution, OutputObject, OutputSet, SubmissionId,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use tracing::{debug, warn};
 
-use super::lifecycle::chain::ExecutionChainOperation;
+use super::lifecycle::LifecycleError;
+use super::lifecycle::chain::{ExecutionChain, ExecutionChainOperation};
 use super::records::RecordStoreError;
 use super::records::admit::Admission;
-use super::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use super::records::append::{
+    AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
+};
+use super::records::pages::ServingNode;
 use super::store::JobMutationError;
-use super::store::state::{persist_output_record, read_output_record};
+use super::store::job_calls::persist_output_record;
+use super::store::row_calls::read_output_record;
 use crate::driver::{DriverContext, drive};
 
-/// Build, sign, and make durable this execution's exact output record, then
-/// return the digest terminal success must name. Success is refused when this
-/// fails, so an unpublishable or unsigned output set never becomes a result.
+#[derive(Debug, PartialEq)]
+enum OutputStep {
+    Chain,
+    Stored,
+    Signed,
+    Persisted(Box<JobRecordFrame>),
+    Appended,
+}
+
+/// Builds, signs and makes durable this execution's exact output record, then answers the
+/// digest terminal success must name. Success is refused when this fails, so an unpublishable
+/// or unsigned output set never becomes a result.
+#[derive(Debug, PartialEq)]
+pub struct StoreOutputsOperation {
+    record: JobRecord,
+    control: AttemptControl,
+    outputs: Vec<OutputObject>,
+    serving: ServingNode,
+    now_ms: u64,
+    set: Option<OutputSet>,
+    chain: Option<ExecutionChain>,
+    receipted: bool,
+    digest: [u8; 32],
+    step: OutputStep,
+}
+
+type OutputNext = Result<Next<[u8; 32]>, JobError>;
+
+impl StoreOutputsOperation {
+    pub fn new(
+        record: &JobRecord,
+        control: &AttemptControl,
+        outputs: &[OutputObject],
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            record: record.clone(),
+            control: control.clone(),
+            outputs: outputs.to_vec(),
+            serving,
+            now_ms,
+            set: None,
+            chain: None,
+            receipted: false,
+            digest: [0; 32],
+            step: OutputStep::Chain,
+        }
+    }
+
+    fn node(&self) -> Result<(NodeId, RealmId), JobError> {
+        self.serving
+            .ok_or_else(|| JobError::retryable("output record needs a net handle"))
+    }
+
+    fn output_set(&self) -> Result<&OutputSet, JobError> {
+        (self.set.as_ref()).ok_or_else(|| JobError::retryable("output set was lost"))
+    }
+
+    /// A replay re-appends an idempotent record and a previously unavailable family may resolve
+    /// now; a receipted execution binds the real chain, else locals.
+    fn chained(&mut self, chain: Option<ExecutionChain>) -> OutputNext {
+        self.receipted = chain.is_some();
+        self.chain = chain;
+        if self.control.output_record.is_none() {
+            return self.sign();
+        }
+        self.step = OutputStep::Stored;
+        let read = read_output_record(self.record.job_id, self.control.attempt_epoch);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    /// The record this execution already stored for the same exact output set; a replayed
+    /// finalize reuses it instead of re-signing a record that differs only by commit time.
+    /// Re-verified on read-back, so a bad row is stored again.
+    fn reusable(&self, envelope: JobRecordEnvelope) -> Result<Option<JobRecordEnvelope>, JobError> {
+        let (publisher, _) = self.node()?;
+        if envelope.published_by != publisher || envelope.verify_signature().is_err() {
+            warn!(
+                job_id = %self.record.job_id,
+                attempt_epoch = self.control.attempt_epoch,
+                "Stored output record does not authenticate; storing a new one"
+            );
+            return Ok(None);
+        }
+        let JobFamilyRecord::Output(stored) = &envelope.record else {
+            return Ok(None);
+        };
+        let same = stored.outputs == *self.output_set()?
+            && envelope.digest().ok() == self.control.output_record;
+        Ok(same.then_some(envelope))
+    }
+
+    fn stored(&mut self, envelope: Option<JobRecordEnvelope>) -> OutputNext {
+        let reused = match envelope {
+            Some(envelope) => self.reusable(envelope)?,
+            None => None,
+        };
+        let Some(envelope) = reused else {
+            return self.sign();
+        };
+        let frame = JobRecordFrame::new(envelope).map_err(|error| {
+            JobError::permanent(format!("stored record is unpublishable: {error}"))
+        })?;
+        self.digest = frame_digest(&frame)?;
+        self.append(frame)
+    }
+
+    fn sign(&mut self) -> OutputNext {
+        let (publisher, realm_id) = self.node()?;
+        let (record, control, chain) = (&self.record, &self.control, self.chain);
+        let request_digest = record
+            .plan_digest
+            .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
+        let output = ExecutionOutputRecord {
+            execution_id: control.execution_id,
+            submission_id: chain
+                .map(|chain| chain.family.submission_id)
+                .unwrap_or_else(|| SubmissionId::unkeyed(record.job_id.as_ulid())),
+            request_digest: chain
+                .map(|chain| chain.family.request_digest)
+                .unwrap_or(request_digest),
+            // The receipt names the logical job; the local physical id addresses
+            // nothing in the family and would fail the receipt evidence check.
+            job_id: chain.map_or(record.job_id, |chain| chain.job_id),
+            executor_node_id: publisher,
+            spec_digest: chain
+                .map(|chain| chain.spec_digest)
+                .unwrap_or(request_digest),
+            receipt_digest: chain
+                .map(|chain| chain.receipt_digest)
+                .unwrap_or_else(|| control.fence_digest(record.job_id)),
+            outputs: self.output_set()?.clone(),
+            committed_at_ms: self.now_ms,
+        };
+        let claim = ExecutionClaim {
+            realm_id,
+            record: JobFamilyRecord::Output(Box::new(output)),
+            publisher,
+        };
+        self.step = OutputStep::Signed;
+        let effect = Effect::Net(NetEffect::ExecutionSign(Box::new(claim)));
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+    }
+
+    /// Durable locally before success may name its digest.
+    fn signed(&mut self, result: IoResult) -> OutputNext {
+        let expected = "Event::Net(NetEvent::ExecutionSign)";
+        let IoResult::Event(event) = result else {
+            let got = result.label();
+            return Err(IoError::Unexpected { expected, got }.into());
+        };
+        let envelope = match *event {
+            Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Signed(envelope))) => *envelope,
+            Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Unavailable(error))) => {
+                return Err(JobError::retryable(format!(
+                    "output record signing failed: {error}"
+                )));
+            }
+            _ => {
+                let got = "another event";
+                return Err(IoError::Unexpected { expected, got }.into());
+            }
+        };
+        let frame = JobRecordFrame::new(envelope).map_err(|error| {
+            JobError::permanent(format!("output record is unpublishable: {error}"))
+        })?;
+        self.digest = frame_digest(&frame)?;
+        let bytes = postcard::to_allocvec(frame.envelope()).map_err(|error| {
+            JobError::permanent(format!("output record encoding failed: {error}"))
+        })?;
+        let job_id = self.record.job_id;
+        let persist = persist_output_record(job_id, &self.control, self.digest, bytes);
+        self.step = OutputStep::Persisted(Box::new(frame));
+        Ok(Next::Call(IoCall::child(persist)))
+    }
+
+    /// Appends the stored record to the family store; only the chain proves it for replication,
+    /// and the local fence is evidence while no receipt exists.
+    fn append(&mut self, frame: JobRecordFrame) -> OutputNext {
+        let (local_node_id, _) = self.node()?;
+        let envelope = frame.envelope();
+        let JobFamilyRecord::Output(output) = &envelope.record else {
+            return Err(JobError::permanent("stored record is not an output record"));
+        };
+        let config = AppendRecordConfig {
+            realm_id: envelope.realm_id,
+            local_node_id,
+            local: (!self.receipted).then(|| LocalExecution {
+                node_id: local_node_id,
+                execution_id: self.control.execution_id,
+                fence_digest: self.control.fence_digest(self.record.job_id),
+                spec_digest: output.spec_digest,
+            }),
+            record: frame.clone(),
+            origin: RecordOrigin::Local,
+            now_ms: self.now_ms,
+        };
+        self.step = OutputStep::Appended;
+        Ok(Next::Call(IoCall::child(AppendRecordOperation::new(
+            config,
+        ))))
+    }
+
+    /// A realm that cannot resolve the family view yet defers the record instead of failing the
+    /// execution: the record is already durable and the append is idempotent.
+    fn appended(&self, result: Result<AppendOutcome, RecordStoreError>) -> OutputNext {
+        let receipted = self.receipted;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(RecordStoreError::RealmConfigMissing) if !receipted => {
+                return Ok(Next::Done(self.digest));
+            }
+            Err(error) => {
+                return Err(JobError::retryable(format!(
+                    "output record append failed: {error}"
+                )));
+            }
+        };
+        match outcome.admission {
+            Admission::Authentic if receipted => {}
+            Admission::Local if !receipted => {}
+            Admission::Duplicate => {}
+            Admission::Pending(_) if outcome.deferred && !receipted => {
+                debug!(
+                    job_id = %self.record.job_id,
+                    "Output record deferred: the local job family view is unavailable"
+                );
+            }
+            Admission::Pending(_) | Admission::PendingFull => {
+                return Err(JobError::retryable(
+                    "output record admission is awaiting family evidence",
+                ));
+            }
+            Admission::Conflict | Admission::Rejected(_) => {
+                return Err(JobError::permanent(
+                    "output record admission rejected the stored record",
+                ));
+            }
+            admission => {
+                return Err(JobError::permanent(format!(
+                    "output record admission invalid for execution mode: {admission:?}"
+                )));
+            }
+        }
+        Ok(Next::Done(self.digest))
+    }
+}
+
+fn frame_digest(frame: &JobRecordFrame) -> Result<[u8; 32], JobError> {
+    frame
+        .envelope()
+        .digest()
+        .map_err(|error| JobError::permanent(format!("output record digest failed: {error}")))
+}
+
+impl Operation for StoreOutputsOperation {
+    type Output = [u8; 32];
+    type Error = JobError;
+
+    fn first(&mut self) -> OutputNext {
+        self.node()?;
+        if self.record.plan_digest.is_none() {
+            return Err(JobError::permanent("execution job carries no plan digest"));
+        }
+        let set = OutputSet::canonical(std::mem::take(&mut self.outputs)).map_err(|error| {
+            JobError::permanent(format!("output set is not canonical: {error}"))
+        })?;
+        self.set = Some(set);
+        let chain =
+            ExecutionChainOperation::of_attempt(self.record.job_id, self.control.execution_id);
+        Ok(Next::Call(IoCall::child(chain)))
+    }
+
+    fn next(&mut self, result: IoResult) -> OutputNext {
+        match std::mem::replace(&mut self.step, OutputStep::Appended) {
+            OutputStep::Chain => {
+                let chain = result.child::<Option<ExecutionChain>, LifecycleError>()?;
+                self.chained(chain.ok().flatten())
+            }
+            OutputStep::Stored => {
+                let read = result.child::<Option<JobRecordEnvelope>, JobMutationError>()?;
+                self.stored(read.map_err(|error| {
+                    JobError::retryable(format!("output record read failed: {error}"))
+                })?)
+            }
+            OutputStep::Signed => self.signed(result),
+            OutputStep::Persisted(frame) => {
+                result
+                    .child::<(), JobMutationError>()?
+                    .map_err(|error| match error {
+                        JobMutationError::OutputRecordConflict => {
+                            JobError::permanent("execution output record digest is already stored")
+                        }
+                        error => {
+                            JobError::retryable(format!("output record write failed: {error}"))
+                        }
+                    })?;
+                self.append(*frame)
+            }
+            OutputStep::Appended => {
+                self.appended(result.child::<AppendOutcome, RecordStoreError>()?)
+            }
+        }
+    }
+}
+
+/// See [`StoreOutputsOperation`].
 pub async fn store_outputs(
     context: &DriverContext,
     record: &JobRecord,
     control: &AttemptControl,
     outputs: &[OutputObject],
 ) -> Result<[u8; 32], JobError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| JobError::retryable("output record needs a net handle"))?;
-    let request_digest = record
-        .plan_digest
-        .ok_or_else(|| JobError::permanent("execution job carries no plan digest"))?;
-    let outputs = OutputSet::canonical(outputs.to_vec())
-        .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
-    // A replay re-appends an idempotent record and a previously unavailable family
-    // may resolve now; a receipted execution binds the real chain, else locals.
-    let chain = ExecutionChainOperation::of_attempt(record.job_id, control.execution_id);
-    let chain = drive(chain, context).await.ok().flatten();
-    let receipted = chain.is_some();
-    if let Some(frame) = stored_record(context, record.job_id, control, &outputs, net.node_id())
-        .await?
-        .map(JobRecordFrame::new)
-        .transpose()
-        .map_err(|error| JobError::permanent(format!("stored record is unpublishable: {error}")))?
-    {
-        let digest = frame.envelope().digest().map_err(|error| {
-            JobError::permanent(format!("output record digest failed: {error}"))
-        })?;
-        append_output_record(context, record.job_id, control, frame, receipted).await?;
-        return Ok(digest);
-    }
-    let output = ExecutionOutputRecord {
-        execution_id: control.execution_id,
-        submission_id: chain
-            .map(|chain| chain.family.submission_id)
-            .unwrap_or_else(|| SubmissionId::unkeyed(record.job_id.as_ulid())),
-        request_digest: chain
-            .map(|chain| chain.family.request_digest)
-            .unwrap_or(request_digest),
-        // The receipt names the logical job; the local physical id addresses
-        // nothing in the family and would fail the receipt evidence check.
-        job_id: chain.map_or(record.job_id, |chain| chain.job_id),
-        executor_node_id: net.node_id(),
-        spec_digest: chain
-            .map(|chain| chain.spec_digest)
-            .unwrap_or(request_digest),
-        receipt_digest: chain
-            .map(|chain| chain.receipt_digest)
-            .unwrap_or_else(|| control.fence_digest(record.job_id)),
-        outputs,
-        committed_at_ms: aruna_core::time::unix_timestamp_millis(),
-    };
-    let envelope = JobRecordEnvelope::signed_with(
-        context.serving_realm(record.created_by.realm_id),
-        JobFamilyRecord::Output(Box::new(output)),
-        net.node_id(),
-        |message| net.sign(message),
-    )
-    .map_err(|error| JobError::retryable(format!("output record signing failed: {error}")))?;
-    let frame = JobRecordFrame::new(envelope)
-        .map_err(|error| JobError::permanent(format!("output record is unpublishable: {error}")))?;
-    publish_output_record(context, record.job_id, control, frame, receipted).await
-}
-
-/// The record this execution already stored for the same exact output set; a
-/// replayed finalize reuses it instead of re-signing a record that differs only
-/// by commit timestamp. Re-verified on read-back, so a bad row is re-stored.
-async fn stored_record(
-    context: &DriverContext,
-    job_id: JobId,
-    control: &AttemptControl,
-    outputs: &OutputSet,
-    publisher: NodeId,
-) -> Result<Option<JobRecordEnvelope>, JobError> {
-    let Some(digest) = control.output_record else {
-        return Ok(None);
-    };
-    let envelope = read_output_record(context, job_id, control.attempt_epoch)
-        .await
-        .map_err(|error| JobError::retryable(format!("output record read failed: {error}")))?;
-    let Some(envelope) = envelope else {
-        return Ok(None);
-    };
-    if envelope.published_by != publisher || envelope.verify_signature().is_err() {
-        warn!(
-            job_id = %job_id,
-            attempt_epoch = control.attempt_epoch,
-            "Stored output record does not authenticate; storing a new one"
-        );
-        return Ok(None);
-    }
-    let JobFamilyRecord::Output(stored) = &envelope.record else {
-        return Ok(None);
-    };
-    let matches = stored.outputs == *outputs && envelope.digest().ok() == Some(digest);
-    Ok(matches.then_some(envelope))
-}
-
-/// The one place this execution's signed output record leaves the workflow:
-/// durable locally before success may name its digest, then appended to the
-/// family store, replicated only when the chain proves it (not the local fence).
-async fn publish_output_record(
-    context: &DriverContext,
-    job_id: JobId,
-    control: &AttemptControl,
-    frame: JobRecordFrame,
-    receipted: bool,
-) -> Result<[u8; 32], JobError> {
-    let digest = frame
-        .envelope()
-        .digest()
-        .map_err(|error| JobError::permanent(format!("output record digest failed: {error}")))?;
-    let bytes = postcard::to_allocvec(frame.envelope())
-        .map_err(|error| JobError::permanent(format!("output record encoding failed: {error}")))?;
-    persist_output_record(&context, job_id, control, digest, bytes)
-        .await
-        .map_err(|error| match error {
-            JobMutationError::OutputRecordConflict => {
-                JobError::permanent("execution output record digest is already stored")
-            }
-            error => JobError::retryable(format!("output record write failed: {error}")),
-        })?;
-    append_output_record(context, job_id, control, frame, receipted).await?;
-    Ok(digest)
-}
-
-/// Appends the stored record to the append-only store. A realm that cannot
-/// resolve the family view yet defers the record instead of failing the
-/// execution: the record is already durable and the append is idempotent.
-async fn append_output_record(
-    context: &DriverContext,
-    job_id: JobId,
-    control: &AttemptControl,
-    frame: JobRecordFrame,
-    receipted: bool,
-) -> Result<(), JobError> {
-    let Some(net) = context.net_handle.as_ref() else {
-        return Err(JobError::retryable("output record needs a net handle"));
-    };
-    let envelope = frame.envelope();
-    let JobFamilyRecord::Output(output) = &envelope.record else {
-        return Err(JobError::permanent("stored record is not an output record"));
-    };
-    let config = AppendRecordConfig {
-        realm_id: envelope.realm_id,
-        local_node_id: net.node_id(),
-        // A receipted record must verify against the replicated chain; the
-        // local fence is evidence only while no receipt exists.
-        local: (!receipted).then(|| LocalExecution {
-            node_id: net.node_id(),
-            execution_id: control.execution_id,
-            fence_digest: control.fence_digest(job_id),
-            spec_digest: output.spec_digest,
-        }),
-        record: frame.clone(),
-        origin: RecordOrigin::Local,
-        now_ms: aruna_core::time::unix_timestamp_millis(),
-    };
-    match drive(AppendRecordOperation::new(config), context).await {
-        Ok(outcome) => match outcome.admission {
-            Admission::Authentic if receipted => Ok(()),
-            Admission::Local if !receipted => Ok(()),
-            Admission::Duplicate => Ok(()),
-            Admission::Pending(_) if outcome.deferred && !receipted => {
-                debug!(
-                    job_id = %job_id,
-                    "Output record deferred: the local job family view is unavailable"
-                );
-                Ok(())
-            }
-            Admission::Pending(_) | Admission::PendingFull => Err(JobError::retryable(
-                "output record admission is awaiting family evidence",
-            )),
-            Admission::Conflict | Admission::Rejected(_) => Err(JobError::permanent(
-                "output record admission rejected the stored record",
-            )),
-            admission => Err(JobError::permanent(format!(
-                "output record admission invalid for execution mode: {admission:?}"
-            ))),
-        },
-        Err(RecordStoreError::RealmConfigMissing) if !receipted => Ok(()),
-        Err(error) => Err(JobError::retryable(format!(
-            "output record append failed: {error}"
-        ))),
-    }
+    let serving = context.node_and_realm();
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let store = StoreOutputsOperation::new(record, control, outputs, serving, now_ms);
+    drive(store, context).await
 }
 
 #[cfg(test)]
@@ -223,6 +361,8 @@ mod tests {
     use super::super::store::attempt::{read_attempt_control, reserve_output_commits};
     use super::*;
     use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::read_output_record as read_stored;
+    use aruna_core::structs::execution::job::JobId;
 
     const TOKEN: Ulid = Ulid(0x5EA1);
 
@@ -352,7 +492,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored.output_record, Some(digest));
 
-        let envelope = read_output_record(&context, record.job_id, control.attempt_epoch)
+        let envelope = read_stored(&context, record.job_id, control.attempt_epoch)
             .await
             .unwrap()
             .unwrap();

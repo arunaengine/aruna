@@ -261,7 +261,7 @@ async fn advance(
     if record.state == TransitionState::AwaitingKey
         && let Some(key) = record.source
         && crate::driver::drive(
-            crate::jobs::runtime_steps::KeyUnlockedOperation::new(key),
+            crate::jobs::key_locks::KeyUnlockedOperation::new(key),
             context,
         )
         .await

@@ -528,7 +528,7 @@ pub struct JobError {
     pub locked: bool,
 }
 
-/// A runner failure says nothing about the job, so the job may run again.
+/// A failed call says nothing about the job, so it may be tried again.
 impl From<crate::calls::IoError> for JobError {
     fn from(error: crate::calls::IoError) -> Self {
         Self::retryable(error.to_string())

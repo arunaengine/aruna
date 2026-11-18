@@ -31,9 +31,11 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
+use super::cancel::FlagLocalRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
 use super::ids::workspace_of;
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
+use super::outbox::schedule_outbox_drain;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::RecordStoreError;
@@ -42,10 +44,12 @@ use crate::jobs::records::append::{
     AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
-use crate::jobs::records::pages::{PageReadError, PlannedInputsOperation, SpecInputsOperation};
+use crate::jobs::records::pages::{
+    PageReadError, PlannedInputsOperation, ServingNode, SpecInputsOperation,
+};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::submit::mint_configured_job;
+use crate::jobs::submit::{mint_configured_job, schedule_drain_effect};
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -402,6 +406,64 @@ impl Operation for PullFamilyOperation {
     }
 }
 
+/// What an answered offer still owes: the cancel of a run whose family was cancelled meanwhile,
+/// and the wakeups that make the receipt replicate and the execution start.
+#[derive(Debug, PartialEq)]
+pub(crate) struct AcceptLaunchOperation {
+    decision: Option<LaunchDecision>,
+    cancel: Option<JobId>,
+    serving: ServingNode,
+    now_ms: u64,
+}
+
+impl AcceptLaunchOperation {
+    pub(crate) fn new(answer: LaunchAnswer, serving: ServingNode, now_ms: u64) -> Self {
+        Self {
+            decision: Some(answer.decision),
+            cancel: answer.cancel,
+            serving,
+            now_ms,
+        }
+    }
+
+    fn wake(&mut self) -> Result<Next<LaunchDecision>, LaunchUndecided> {
+        let output = self.decision.take().ok_or(LaunchUndecided)?;
+        if output.is_err() {
+            return Ok(Next::Done(output));
+        }
+        let wakes = [
+            schedule_outbox_drain(Duration::ZERO),
+            schedule_drain_effect(),
+        ];
+        let calls = wakes
+            .into_iter()
+            .map(|effect| IoCall::Effect(Box::new(effect)))
+            .collect();
+        Ok(Next::Then { output, calls })
+    }
+}
+
+impl Operation for AcceptLaunchOperation {
+    type Output = LaunchDecision;
+    type Error = LaunchUndecided;
+
+    fn first(&mut self) -> Result<Next<LaunchDecision>, LaunchUndecided> {
+        let admitted = matches!(self.decision, Some(Ok(_)));
+        match self.cancel.filter(|_| admitted) {
+            Some(job_id) => {
+                let flag = FlagLocalRunOperation::new(job_id, self.serving, self.now_ms);
+                Ok(Next::Call(IoCall::child(flag)))
+            }
+            None => self.wake(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<LaunchDecision>, LaunchUndecided> {
+        let _ = result.child::<bool, IoError>()?;
+        self.wake()
+    }
+}
+
 /// This node as a launch offer sees it. The limits are its advertisement for the offered
 /// executor kind; `None` means that kind is not offered here.
 #[derive(Clone, Debug, PartialEq)]
@@ -442,6 +504,7 @@ enum AdmitStep {
     Sign(Box<PreparedReceipt>),
     Commit,
     Replay,
+    Accept,
 }
 
 /// What the reservation needs besides the receipt being signed.
@@ -465,7 +528,7 @@ pub(crate) struct AdmitLaunchOperation {
     step: AdmitStep,
 }
 
-type AdmitNext = Result<Next<LaunchAnswer>, LaunchUndecided>;
+type AdmitNext = Result<Next<LaunchDecision>, LaunchUndecided>;
 
 impl AdmitLaunchOperation {
     pub(crate) fn new(launch: LaunchFrame, node: LaunchNode) -> Self {
@@ -478,6 +541,16 @@ impl AdmitLaunchOperation {
             planned: None,
             step: AdmitStep::Config,
         }
+    }
+
+    /// An admitted launch still owes its wakeups; a refusal is the answer.
+    fn accept(&mut self, answer: LaunchAnswer) -> AdmitNext {
+        if let Err(reason) = answer.decision {
+            return Ok(Next::Done(Err(reason)));
+        }
+        let serving = Some((self.node.local, self.node.realm_id));
+        let accept = AcceptLaunchOperation::new(answer, serving, self.node.now_ms);
+        self.call(AdmitStep::Accept, IoCall::child(accept))
     }
 
     fn family(&self) -> JobFamilyId {
@@ -511,21 +584,17 @@ impl AdmitLaunchOperation {
     fn configured(&mut self, config: RealmConfigDocument) -> AdmitNext {
         let envelope = self.launch.envelope();
         let JobFamilyRecord::Launch(intent) = &envelope.record else {
-            return Ok(Next::Done(LaunchAnswer::declined(
-                LaunchDecline::Unauthorized,
-            )));
+            return Ok(Next::Done(Err(LaunchDecline::Unauthorized)));
         };
         let intent = intent.as_ref().clone();
         if intent.target.node_id != self.node.local {
             // The offer names another node; this target has nothing to admit.
-            return Ok(Next::Done(LaunchAnswer::declined(
-                LaunchDecline::Unauthorized,
-            )));
+            return Ok(Next::Done(Err(LaunchDecline::Unauthorized)));
         }
         let view = FamilyView::resolve(&config, self.node.realm_id, envelope.family())
             .ok_or(LaunchUndecided)?;
         if !view.holds(intent.scheduler_node_id) {
-            return Ok(Next::Done(LaunchAnswer::declined(LaunchDecline::NotHolder)));
+            return Ok(Next::Done(Err(LaunchDecline::NotHolder)));
         }
         self.config = Some(config);
         self.intent = Some(intent);
@@ -560,12 +629,10 @@ impl AdmitLaunchOperation {
             return Ok(Next::Call(IoCall::child(settle)));
         }
         if cancelled(family, &records) {
-            return Ok(Next::Done(LaunchAnswer::declined(LaunchDecline::Cancelled)));
+            return Ok(Next::Done(Err(LaunchDecline::Cancelled)));
         }
         if already_running(family, &records, self.node.local) {
-            return Ok(Next::Done(LaunchAnswer::declined(
-                LaunchDecline::AlreadyRunning,
-            )));
+            return Ok(Next::Done(Err(LaunchDecline::AlreadyRunning)));
         }
         let check = LaunchCheck {
             config: self.config()?.clone(),
@@ -581,10 +648,10 @@ impl AdmitLaunchOperation {
     fn checked(&mut self, capability: ExecutorCapability) -> AdmitNext {
         let spec = self.spec.as_ref().ok_or(LaunchUndecided)?;
         let Some(limits) = self.node.limits else {
-            return Ok(Next::Done(LaunchAnswer::declined(LaunchDecline::Draining)));
+            return Ok(Next::Done(Err(LaunchDecline::Draining)));
         };
         if !limits.fits(&spec.resources) {
-            return Ok(Next::Done(LaunchAnswer::declined(LaunchDecline::Capacity)));
+            return Ok(Next::Done(Err(LaunchDecline::Capacity)));
         }
         let read = ReadInfoOperation::new(vec![self.node.local]);
         self.call(
@@ -600,7 +667,7 @@ impl AdmitLaunchOperation {
         let spec = self.spec.as_ref().ok_or(LaunchUndecided)?;
         let intent = self.intent()?;
         let planned = self.planned.as_ref().ok_or(LaunchUndecided)?;
-        let declined = |reason| Ok(Next::Done(LaunchAnswer::declined(reason)));
+        let declined = |reason| Ok(Next::Done(Err(reason)));
         let subject = node.execution_id.to_bytes();
         let Ok(job_id) = mint_configured_job(self.config()?, node.local, &subject) else {
             return declined(LaunchDecline::Draining);
@@ -655,9 +722,7 @@ impl AdmitLaunchOperation {
         let envelope = match *event {
             Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Signed(envelope))) => envelope,
             Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Unavailable(_))) => {
-                return Ok(Next::Done(LaunchAnswer::declined(
-                    LaunchDecline::Unauthorized,
-                )));
+                return Ok(Next::Done(Err(LaunchDecline::Unauthorized)));
             }
             _ => {
                 let got = "another event";
@@ -665,9 +730,7 @@ impl AdmitLaunchOperation {
             }
         };
         let Ok(frame) = JobRecordFrame::new(*envelope) else {
-            return Ok(Next::Done(LaunchAnswer::declined(
-                LaunchDecline::Unauthorized,
-            )));
+            return Ok(Next::Done(Err(LaunchDecline::Unauthorized)));
         };
         let node = &self.node;
         let spec = self.spec.as_ref().ok_or(LaunchUndecided)?;
@@ -693,7 +756,7 @@ impl AdmitLaunchOperation {
 }
 
 impl Operation for AdmitLaunchOperation {
-    type Output = LaunchAnswer;
+    type Output = LaunchDecision;
     type Error = LaunchUndecided;
 
     fn first(&mut self) -> AdmitNext {
@@ -760,7 +823,7 @@ impl Operation for AdmitLaunchOperation {
             AdmitStep::Decide => self.decide(family_read(result)?),
             AdmitStep::Checks => match result.child::<Verdict, CheckError>()? {
                 Ok(Ok(capability)) => self.checked(capability),
-                Ok(Err(reason)) => Ok(Next::Done(LaunchAnswer::declined(reason))),
+                Ok(Err(reason)) => Ok(Next::Done(Err(reason))),
                 Err(_) => Err(LaunchUndecided),
             },
             AdmitStep::Membership(capability) => {
@@ -782,11 +845,15 @@ impl Operation for AdmitLaunchOperation {
                         "Target admitted a launch and stored its receipt"
                     );
                 }
-                Ok(Next::Done(answer))
+                self.accept(answer)
             }
             AdmitStep::Replay => {
                 let answer = result.child::<LaunchAnswer, LaunchUndecided>()??;
-                Ok(Next::Done(answer))
+                self.accept(answer)
+            }
+            AdmitStep::Accept => {
+                let decision = result.child::<LaunchDecision, LaunchUndecided>()??;
+                Ok(Next::Done(decision))
             }
         }
     }
@@ -959,7 +1026,7 @@ mod tests {
     }
 
     fn declined(reason: LaunchDecline) -> AdmitNext {
-        Ok(Next::Done(LaunchAnswer::declined(reason)))
+        Ok(Next::Done(Err(reason)))
     }
 
     // A cancelled family is declined, and one this node already ran stays refused.

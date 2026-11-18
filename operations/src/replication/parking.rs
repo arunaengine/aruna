@@ -710,7 +710,7 @@ impl Operation for AwaitingJobsOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::runtime_steps::KeyUnlockedOperation;
+    use crate::jobs::key_locks::KeyUnlockedOperation;
     use crate::testing::test_context;
     use aruna_storage::StorageHandle;
 

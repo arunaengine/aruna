@@ -6,7 +6,6 @@ use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::execution::job::{JobPayload, lease_index_key};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::encryption::UnlockStatus;
 use aruna_core::types::Value;
 
 use super::*;
@@ -72,39 +71,9 @@ fn is_child<T>(next: &Result<Next<T>, JobMutationError>) -> bool {
     matches!(next, Ok(Next::Call(IoCall::Child(_))))
 }
 
-fn status(active: bool) -> UnlockStatus {
-    UnlockStatus {
-        key: key(),
-        session_id: Ulid::nil(),
-        sequence: Ulid::nil(),
-        deadline_ms: None,
-        active,
-        unlocked_at: std::time::SystemTime::UNIX_EPOCH,
-        remaining: None,
-        max_remaining: None,
-    }
-}
-
 fn settle(outcome: JobRunOutcome, checkpointed: bool) -> SettleRunOperation {
     let progress = JobProgress::new("steps");
     SettleRunOperation::new((job(), token()), outcome, (progress, checkpointed), NOW_MS)
-}
-
-// Only an active unlock of exactly this key counts.
-#[test]
-fn active_unlock_needed() {
-    let answer = |generations| {
-        let mut unlocked = KeyUnlockedOperation::new(key());
-        assert!(matches!(
-            unlocked.first(),
-            Ok(Next::Call(IoCall::Effect(_)))
-        ));
-        let event = Event::Blob(BlobEvent::KeyStatus { generations });
-        unlocked.next(IoResult::Event(Box::new(event)))
-    };
-    assert_eq!(answer(vec![status(true)]), Ok(Next::Done(true)));
-    assert_eq!(answer(vec![status(false)]), Ok(Next::Done(false)));
-    assert_eq!(answer(Vec::new()), Ok(Next::Done(false)));
 }
 
 // A storage failure pauses for a growing time and writes again, up to the limit.

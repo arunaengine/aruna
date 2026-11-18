@@ -15,9 +15,9 @@ use aruna_core::keyspaces::JOB_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{
-    ExecutionClaim, ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobRecord, JobRecordBody,
-    JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState, PhysicalExecutionResult,
-    PhysicalExecutionState, ResultMessage, job_record_key,
+    ExecutionClaim, ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId, JobRecord,
+    JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
+    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, job_record_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -46,6 +46,60 @@ pub fn schedule_terminal_settle(after: Duration) -> Effect {
         key: TaskKey::SettleJobTerminals,
         after,
     })
+}
+
+/// Publishes a non-terminal state of a receipted execution. A job with no receipt here is a
+/// purely local execution and publishes nothing; a failed publication is only logged.
+#[derive(Debug, PartialEq)]
+pub struct PublishProgressOperation {
+    job_id: JobId,
+    state: PhysicalExecutionState,
+    serving: Serving,
+    now_ms: u64,
+    publishing: bool,
+}
+
+impl PublishProgressOperation {
+    pub fn new(
+        job_id: JobId,
+        state: PhysicalExecutionState,
+        serving: Serving,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            job_id,
+            state,
+            serving,
+            now_ms,
+            publishing: false,
+        }
+    }
+}
+
+impl Operation for PublishProgressOperation {
+    type Output = ();
+    type Error = LifecycleError;
+
+    fn first(&mut self) -> Result<Next<()>, LifecycleError> {
+        let chain = ExecutionChainOperation::of_job(self.job_id);
+        Ok(Next::Call(IoCall::child(chain)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, LifecycleError> {
+        if self.publishing {
+            if let Err(error) = result.child::<bool, LifecycleError>()? {
+                warn!(error = %error, "Execution publication failed");
+            }
+            return Ok(Next::Done(()));
+        }
+        let Ok(Some(chain)) = result.child::<Option<ExecutionChain>, LifecycleError>()? else {
+            return Ok(Next::Done(()));
+        };
+        self.publishing = true;
+        let update = (self.state, None, self.now_ms);
+        let publish = PublishStateOperation::new(chain, update, self.serving, self.now_ms);
+        Ok(Next::Call(IoCall::child(publish)))
+    }
 }
 
 /// The next sequence and predecessor digest of a chain proven contiguous from
