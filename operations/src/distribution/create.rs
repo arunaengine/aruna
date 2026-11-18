@@ -6,36 +6,43 @@
 // The set activates once every coordinator and replica is admitted.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::distribution::capacity::{RangeSize, with_unopened};
 use aruna_core::structs::storage::distribution::presets::{
     Layout, add_edges, replica_layout, shard_layout,
 };
 use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionConfig, DistributionError, DistributionRequest, DistributionRevision,
-    DistributionSettings, DistributionSnapshot, DistributionView, SetPhase, SetRoot,
-    SignedSnapshot, SignedStatement,
+    DataStrategy, DistributionConfig, DistributionError, DistributionMember, DistributionRequest,
+    DistributionRevision, DistributionSettings, DistributionSnapshot, DistributionView, SetPhase,
+    SetRoot, SignedSnapshot, SignedStatement,
 };
 use aruna_core::types::GroupId;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::forward::{PublishRefusal, admit_member, publish_local};
-use super::status::{StatusError, read_view};
+use super::forward::{
+    AdmitMemberOperation, MemberRefusal, PublishRefusal, config_of, realm_config,
+};
+use super::here::{Here, here};
+use super::peer_call::{peer_answer, peer_call};
+use super::status_view::{ReadViewOperation, StatusError};
+use super::submit::{PublishLocalOperation, SendAdminOperation, SubmitOperation};
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::metadata::AuthToken;
 
 /// How often and how far apart admission rereads a record that lags the accepted revision.
 const RECORD_POLLS: u32 = 50;
-const RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+const RECORD_POLL: Duration = Duration::from_millis(200);
 
 /// How the key space is laid out over the chosen nodes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +85,16 @@ pub enum CreateError {
     /// An operation that needs an unreachable coordinator waits until it is reachable again.
     #[error("{0}")]
     Blocked(String),
+}
+
+impl From<IoError> for CreateError {
+    fn from(error: IoError) -> Self {
+        Self::Status(error.into())
+    }
+}
+
+fn no_transport() -> CreateError {
+    CreateError::Invalid("this node has no realm transport".to_string())
 }
 
 /// One member after an admission attempt.
@@ -124,176 +141,413 @@ pub fn plan_layout(set_id: Ulid, input: &CreateInput) -> Result<Layout, Distribu
     Ok(layout)
 }
 
+/// What the pending call of a set creation answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateStep {
+    Config,
+    Publish,
+    Admit,
+}
+
 /// Creates the set with this node as its publisher, then admits every member it can.
-pub async fn create_set(
-    context: &Arc<DriverContext>,
+#[derive(Debug, PartialEq)]
+pub struct CreateSetOperation {
+    here: Here,
+    auth: AuthContext,
+    bearer: Option<AuthToken>,
+    input: Option<CreateInput>,
+    set_id: Option<Ulid>,
+    step: CreateStep,
+}
+
+/// The creation of a set on this node; see [`CreateSetOperation`].
+pub fn create_set(
+    context: &DriverContext,
     auth: &AuthContext,
     bearer: Option<AuthToken>,
     input: CreateInput,
-) -> Result<CreationReport, CreateError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| CreateError::Invalid("this node has no realm transport".to_string()))?;
-    let (realm_id, publisher) = (*net.realm_id(), net.node_id());
-    let config = load_realm_config(context, realm_id).await.ok_or_else(|| {
-        PublishRefusal::Unavailable("the realm configuration is not available".to_string())
-    })?;
-    let nodes = input
-        .nodes
-        .iter()
-        .chain(input.edges.iter().map(|(node, _)| node));
-    if let Some(node) = nodes
-        .into_iter()
-        .find(|node| !is_sync_eligible(&config, **node))
-    {
-        return Err(CreateError::Invalid(format!(
-            "node {node} is not a realm infrastructure node and cannot hold a member"
-        )));
+) -> CreateSetOperation {
+    CreateSetOperation {
+        here: here(context),
+        auth: auth.clone(),
+        bearer,
+        input: Some(input),
+        set_id: None,
+        step: CreateStep::Config,
     }
-    let root = SetRoot {
-        publisher,
-        owner_group: input.owner_group,
-        nonce: rand::random(),
-    };
-    let set_id = root.set_id();
-    let layout = plan_layout(set_id, &input)?;
-    let request = DistributionRequest::Create {
-        root,
-        config: DistributionConfig {
-            bucket: input.bucket,
+}
+
+impl CreateSetOperation {
+    /// Publishes the create revision once every chosen node may hold a member.
+    fn publish(&mut self, config: Option<RealmConfigDocument>) -> Creating {
+        let config = config.ok_or_else(|| {
+            PublishRefusal::Unavailable("the realm configuration is not available".to_string())
+        })?;
+        let input = self.input.take().ok_or(IoError::Unfinished)?;
+        let (publisher, _) = self.here.ids.ok_or_else(no_transport)?;
+        let nodes = (input.nodes.iter()).chain(input.edges.iter().map(|(node, _)| node));
+        if let Some(node) = nodes.into_iter().find(|n| !is_sync_eligible(&config, **n)) {
+            return Err(CreateError::Invalid(format!(
+                "node {node} is not a realm infrastructure node and cannot hold a member"
+            )));
+        }
+        let root = SetRoot {
+            publisher,
             owner_group: input.owner_group,
-            node_set: None,
-            members: layout.members,
-            ranges: layout.ranges,
-            settings: input.settings,
-        },
-    };
-    publish_local(
-        context,
-        set_id,
-        Ulid::generate(),
-        request,
-        Some(auth.clone()),
-    )
-    .await?;
-    // The set exists from here on, so every later failure still names it.
-    // The ranges of a new set are empty.
-    match admit_pending(context, auth, bearer, (set_id, None), &[]).await {
-        Ok(report) => Ok(report),
-        Err(error) => Ok(CreationReport {
-            set_id,
-            active: false,
-            members: Vec::new(),
-            error: Some(error.to_string()),
-        }),
+            nonce: rand::random(),
+        };
+        let set_id = root.set_id();
+        let layout = plan_layout(set_id, &input)?;
+        let request = DistributionRequest::Create {
+            root,
+            config: DistributionConfig {
+                bucket: input.bucket,
+                owner_group: input.owner_group,
+                node_set: None,
+                members: layout.members,
+                ranges: layout.ranges,
+                settings: input.settings,
+            },
+        };
+        let ids = (set_id, Ulid::generate());
+        let auth = Some(self.auth.clone());
+        let publish = PublishLocalOperation::new(self.here.ids, ids, request, auth);
+        self.set_id = Some(set_id);
+        self.step = CreateStep::Publish;
+        Ok(Next::Call(IoCall::child(publish)))
     }
+}
+
+type Creating = Result<Next<CreationReport>, CreateError>;
+
+impl Operation for CreateSetOperation {
+    type Output = CreationReport;
+    type Error = CreateError;
+
+    fn first(&mut self) -> Creating {
+        let (_, realm_id) = self.here.ids.ok_or_else(no_transport)?;
+        Ok(Next::Call(realm_config(realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Creating {
+        let set_id = self.set_id;
+        match self.step {
+            CreateStep::Config => self.publish(config_of(result)?),
+            CreateStep::Publish => {
+                result.child::<DistributionRevision, PublishRefusal>()??;
+                let set_id = set_id.ok_or(IoError::Unfinished)?;
+                // The ranges of a new set are empty.
+                let admit = AdmitPendingOperation::new(
+                    self.here.clone(),
+                    (self.auth.clone(), self.bearer.take()),
+                    (set_id, None),
+                    Vec::new(),
+                );
+                self.step = CreateStep::Admit;
+                Ok(Next::Call(IoCall::child(admit)))
+            }
+            // The set exists from here on, so every later failure still names it.
+            CreateStep::Admit => match result.child::<CreationReport, CreateError>()? {
+                Ok(report) => Ok(Next::Done(report)),
+                Err(error) => Ok(Next::Done(CreationReport {
+                    set_id: set_id.ok_or(IoError::Unfinished)?,
+                    active: false,
+                    members: Vec::new(),
+                    error: Some(error.to_string()),
+                })),
+            },
+        }
+    }
+}
+
+/// What the pending call of an admission round answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmitStep {
+    View,
+    Wait,
+    Member,
+    Submit,
+    Activate,
 }
 
 /// Admits unadmitted members against `sizes`, where a range no admitted member holds is empty,
-/// and activates the set once all are in; a failure keeps it pending, a capacity refusal drops the
-/// empty bucket. A member with a new copy is admitted again; `accepted` must be reached first.
-pub async fn admit_pending(
-    context: &Arc<DriverContext>,
+/// and activates the set once all are in; a failure keeps it pending, a capacity refusal drops
+/// the empty bucket. A member with a new copy is admitted again; `accepted` must be reached
+/// first.
+#[derive(Debug, PartialEq)]
+pub struct AdmitPendingOperation {
+    here: Here,
+    auth: AuthContext,
+    bearer: Option<AuthToken>,
+    set_id: Ulid,
+    accepted: Option<DistributionRevision>,
+    sizes: Vec<RangeSize>,
+    polls: u32,
+    step: AdmitStep,
+    signed: Option<SignedSnapshot>,
+    next_member: usize,
+    /// The node of the member whose admission was sent to it.
+    asked: Option<NodeId>,
+    admitted: BTreeSet<Ulid>,
+    members: Vec<MemberOutcome>,
+}
+
+type Admitting = Result<Next<CreationReport>, CreateError>;
+
+/// The admission of a set's pending members; see [`AdmitPendingOperation`].
+pub fn admit_pending(
+    context: &DriverContext,
     auth: &AuthContext,
     bearer: Option<AuthToken>,
-    (set_id, accepted): (Ulid, Option<DistributionRevision>),
+    accepted: (Ulid, Option<DistributionRevision>),
     sizes: &[RangeSize],
-) -> Result<CreationReport, CreateError> {
-    let local = context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .ok_or_else(|| CreateError::Invalid("this node has no realm transport".to_string()))?;
-    let view = accepted_view(context, set_id, accepted).await?;
-    if view.conflicted() {
-        return Err(CreateError::Conflicted);
+) -> AdmitPendingOperation {
+    let caller = (auth.clone(), bearer);
+    AdmitPendingOperation::new(here(context), caller, accepted, sizes.to_vec())
+}
+
+impl AdmitPendingOperation {
+    pub(super) fn new(
+        here: Here,
+        (auth, bearer): (AuthContext, Option<AuthToken>),
+        (set_id, accepted): (Ulid, Option<DistributionRevision>),
+        sizes: Vec<RangeSize>,
+    ) -> Self {
+        Self {
+            here,
+            auth,
+            bearer,
+            set_id,
+            accepted,
+            sizes,
+            polls: 0,
+            step: AdmitStep::View,
+            signed: None,
+            next_member: 0,
+            asked: None,
+            admitted: BTreeSet::new(),
+            members: Vec::new(),
+        }
     }
-    let signed = view.head;
-    let snapshot = &signed.snapshot;
-    let publisher = snapshot.root.publisher;
-    let sizes = with_unopened(snapshot, sizes);
-    let sizes = sizes.as_slice();
-    let mut admitted = BTreeSet::new();
-    let mut members = Vec::with_capacity(snapshot.config.members.len());
-    let filling = |member_id| {
-        (snapshot.lifecycle.fills.iter()).any(|f| f.member_id == member_id && !f.admitted)
-    };
-    for member in &snapshot.config.members {
-        let outcome = match member.incarnation {
-            Some(_) if !filling(member.member_id) => Ok(()),
-            _ => {
-                let statement = match (member.node_id == local, bearer.clone()) {
-                    (true, _) => {
-                        admit_member(context, auth, &signed, (member.member_id, sizes)).await
-                    }
-                    (false, Some(token)) => {
-                        let member = (member.node_id, member.member_id, sizes);
-                        request_admission(context, member, token, &signed).await
-                    }
-                    (false, None) => Err(SyncRefusal::Unauthorized),
-                };
-                match statement {
-                    Ok(statement) => submit(context, publisher, local, statement)
-                        .await
-                        .map_err(|refusal| refusal.to_string()),
-                    Err(refusal) => Err(refusal_text(&refusal)),
+
+    fn local(&self) -> Result<NodeId, CreateError> {
+        self.here.ids.map(|(local, _)| local).ok_or_else(no_transport)
+    }
+
+    fn read_view(&mut self) -> Admitting {
+        self.step = AdmitStep::View;
+        let read = ReadViewOperation {
+            set_id: self.set_id,
+        };
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    /// Goes on with this node's record once it reached the accepted revision, waiting a
+    /// bounded time for it.
+    fn viewed(&mut self, view: Option<DistributionView>) -> Admitting {
+        match (view, &self.accepted) {
+            (Some(view), None) => return self.start(view),
+            (Some(view), Some(revision)) if reached(&view.head.snapshot, revision) => {
+                return self.start(view);
+            }
+            (None, None) => return Err(CreateError::UnknownSet(self.set_id)),
+            _ => {}
+        }
+        self.polls += 1;
+        if self.polls < RECORD_POLLS {
+            self.step = AdmitStep::Wait;
+            return Ok(Next::Call(IoCall::Delay(RECORD_POLL)));
+        }
+        let number = self.accepted.as_ref().map(|r| r.number).unwrap_or_default();
+        let set_id = self.set_id;
+        Err(CreateError::Blocked(format!(
+            "the publisher accepted the change as revision {number} of distributed bucket \
+             {set_id}, but this node has not received it yet; retry the admission shortly"
+        )))
+    }
+
+    fn start(&mut self, view: DistributionView) -> Admitting {
+        if view.conflicted() {
+            return Err(CreateError::Conflicted);
+        }
+        self.sizes = with_unopened(&view.head.snapshot, &self.sizes);
+        self.signed = Some(view.head);
+        self.admit_next()
+    }
+
+    fn snapshot(&self) -> Result<&DistributionSnapshot, IoError> {
+        let signed = self.signed.as_ref().ok_or(IoError::Unfinished)?;
+        Ok(&signed.snapshot)
+    }
+
+    /// The next member that needs an admission; members already in count as admitted.
+    fn admit_next(&mut self) -> Admitting {
+        let local = self.local()?;
+        loop {
+            let snapshot = self.snapshot()?;
+            let Some(member) = snapshot.config.members.get(self.next_member).cloned() else {
+                return self.finish();
+            };
+            let filling = (snapshot.lifecycle.fills.iter())
+                .any(|fill| fill.member_id == member.member_id && !fill.admitted);
+            if member.incarnation.is_some() && !filling {
+                self.record(Ok(()))?;
+                continue;
+            }
+            if member.node_id == local {
+                return self.admit_here(&member);
+            }
+            let Some(auth_token) = self.bearer.clone() else {
+                self.record(Err(refusal_text(&SyncRefusal::Unauthorized)))?;
+                continue;
+            };
+            let signed = self.signed.as_ref().ok_or(IoError::Unfinished)?;
+            let message = MetadataTransportMessage::ForwardAdmitMember {
+                auth_token,
+                snapshot: Box::new(signed.clone()),
+                member_id: member.member_id,
+                sizes: self.sizes.clone(),
+            };
+            match peer_call(member.node_id, &message) {
+                Ok(call) => {
+                    self.asked = Some(member.node_id);
+                    self.step = AdmitStep::Member;
+                    return Ok(Next::Call(call));
+                }
+                Err(error) => {
+                    let node_id = member.node_id;
+                    warn!(%node_id, %error, "A distributed bucket member node is unreachable");
+                    self.record(Err(refusal_text(&SyncRefusal::Unavailable)))?;
                 }
             }
-        };
-        if outcome.is_ok() {
-            admitted.insert(member.member_id);
         }
-        members.push(MemberOutcome {
-            member_id: member.member_id,
-            node_id: member.node_id,
+    }
+
+    fn admit_here(&mut self, member: &DistributionMember) -> Admitting {
+        let signed = self.signed.clone().ok_or(IoError::Unfinished)?;
+        let admit = AdmitMemberOperation::new(
+            (self.here.ids, self.here.capacity),
+            self.auth.clone(),
+            signed,
+            member.member_id,
+            self.sizes.clone(),
+        );
+        self.asked = None;
+        self.step = AdmitStep::Member;
+        Ok(Next::Call(IoCall::child(admit)))
+    }
+
+    /// The statement of the member just asked, from its node or from this one.
+    fn statement(&mut self, result: IoResult) -> Result<Result<SignedStatement, SyncRefusal>, IoError> {
+        let Some(node_id) = self.asked.take() else {
+            let admitted = result.child::<SignedStatement, MemberRefusal>()?;
+            return Ok(admitted.map_err(|refused| refused.0));
+        };
+        Ok(match peer_answer(result)? {
+            Ok(MetadataTransportMessage::AdmittedMember { result }) => {
+                result.map(|signed| *signed)
+            }
+            Ok(_) => Err(SyncRefusal::Invalid(
+                "unexpected admission answer".to_string(),
+            )),
+            Err(error) => {
+                warn!(%node_id, %error, "A distributed bucket member node is unreachable");
+                Err(SyncRefusal::Unavailable)
+            }
+        })
+    }
+
+    /// Records how the current member's admission ended and moves past it.
+    fn record(&mut self, outcome: Result<(), String>) -> Result<(), IoError> {
+        let snapshot = self.snapshot()?;
+        let member = (snapshot.config.members.get(self.next_member)).ok_or(IoError::Unfinished)?;
+        let (member_id, node_id) = (member.member_id, member.node_id);
+        if outcome.is_ok() {
+            self.admitted.insert(member_id);
+        }
+        self.members.push(MemberOutcome {
+            member_id,
+            node_id,
             admitted: outcome.is_ok(),
             error: outcome.err(),
         });
+        self.next_member += 1;
+        Ok(())
     }
-    let required = snapshot
-        .config
-        .ranges
-        .iter()
-        .flat_map(|range| std::iter::once(&range.coordinator).chain(&range.replicas));
-    let mut active = snapshot.phase == SetPhase::Active;
-    let mut error = None;
-    if !active && required.into_iter().all(|member| admitted.contains(member)) {
-        match activate(context, (publisher, local), set_id, auth, bearer).await {
-            Ok(()) => active = true,
-            Err(refusal) => error = Some(refusal.to_string()),
+
+    /// Activation is an admin request: the publisher checks the caller's group admin WRITE
+    /// again. It follows once every coordinator and replica is admitted.
+    fn finish(&mut self) -> Admitting {
+        let snapshot = self.snapshot()?;
+        let required = (snapshot.config.ranges.iter())
+            .flat_map(|range| std::iter::once(&range.coordinator).chain(&range.replicas));
+        let all_in = required.into_iter().all(|member| self.admitted.contains(member));
+        if snapshot.phase == SetPhase::Active || !all_in {
+            let active = snapshot.phase == SetPhase::Active;
+            return Ok(self.report(active, None));
         }
+        let publisher = snapshot.root.publisher;
+        let activate = SendAdminOperation::new(
+            (self.here.ids, publisher),
+            self.set_id,
+            (self.auth.clone(), self.bearer.clone()),
+            DistributionRequest::Activate,
+        );
+        self.step = AdmitStep::Activate;
+        Ok(Next::Call(IoCall::child(activate)))
     }
-    Ok(CreationReport {
-        set_id,
-        active,
-        members,
-        error,
-    })
+
+    fn report(&mut self, active: bool, error: Option<String>) -> Next<CreationReport> {
+        Next::Done(CreationReport {
+            set_id: self.set_id,
+            active,
+            members: std::mem::take(&mut self.members),
+            error,
+        })
+    }
 }
 
-/// This node's record of the set once it reached `accepted`, waiting a bounded time for it.
-async fn accepted_view(
-    context: &DriverContext,
-    set_id: Ulid,
-    accepted: Option<DistributionRevision>,
-) -> Result<DistributionView, CreateError> {
-    for _ in 0..RECORD_POLLS {
-        let view = read_view(context, set_id).await?;
-        match (view, &accepted) {
-            (Some(view), None) => return Ok(view),
-            (Some(view), Some(revision)) if reached(&view.head.snapshot, revision) => {
-                return Ok(view);
+impl Operation for AdmitPendingOperation {
+    type Output = CreationReport;
+    type Error = CreateError;
+
+    fn first(&mut self) -> Admitting {
+        self.local()?;
+        self.read_view()
+    }
+
+    fn next(&mut self, result: IoResult) -> Admitting {
+        match self.step {
+            AdmitStep::View => {
+                let view = result.child::<Option<DistributionView>, StatusError>()??;
+                self.viewed(view)
             }
-            (None, None) => return Err(CreateError::UnknownSet(set_id)),
-            _ => tokio::time::sleep(RECORD_POLL).await,
+            AdmitStep::Wait => self.read_view(),
+            AdmitStep::Member => match self.statement(result)? {
+                Ok(statement) => {
+                    let publisher = self.snapshot()?.root.publisher;
+                    let submit = SubmitOperation::new(self.here.ids, publisher, statement);
+                    self.step = AdmitStep::Submit;
+                    Ok(Next::Call(IoCall::child(submit)))
+                }
+                Err(refusal) => {
+                    self.record(Err(refusal_text(&refusal)))?;
+                    self.admit_next()
+                }
+            },
+            AdmitStep::Submit => {
+                let submitted = result.child::<(), PublishRefusal>()?;
+                self.record(submitted.map_err(|refusal| refusal.to_string()))?;
+                self.admit_next()
+            }
+            AdmitStep::Activate => {
+                Ok(match result.child::<DistributionRevision, PublishRefusal>()? {
+                    Ok(_) => self.report(true, None),
+                    Err(refusal) => self.report(false, Some(refusal.to_string())),
+                })
+            }
         }
     }
-    let number = accepted.map(|revision| revision.number).unwrap_or_default();
-    Err(CreateError::Blocked(format!(
-        "the publisher accepted the change as revision {number} of distributed bucket {set_id}, \
-         but this node has not received it yet; retry the admission shortly"
-    )))
 }
 
 /// Whether `head` is `revision` or a later revision.
@@ -302,130 +556,6 @@ fn reached(head: &DistributionSnapshot, revision: &DistributionRevision) -> bool
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => head.revision() == *revision,
         std::cmp::Ordering::Greater => true,
-    }
-}
-
-/// Hands a member's statement to the publisher; one it already embedded counts as done.
-pub(crate) async fn submit(
-    context: &Arc<DriverContext>,
-    publisher: NodeId,
-    local: NodeId,
-    statement: SignedStatement,
-) -> Result<(), PublishRefusal> {
-    let (set_id, id) = (statement.statement.set_id, statement.statement.statement_id);
-    let statement = Box::new(statement);
-    let result = match publisher == local {
-        true => {
-            publish_local(
-                context,
-                set_id,
-                id,
-                DistributionRequest::Statement(statement),
-                None,
-            )
-            .await
-        }
-        false => {
-            let message = MetadataTransportMessage::SubmitDistributionStatement { statement };
-            publish_remote(context, publisher, message).await
-        }
-    };
-    match result {
-        Ok(_) | Err(PublishRefusal::Replayed) => Ok(()),
-        Err(refusal) => Err(refusal),
-    }
-}
-
-/// Activation is an admin request: the publisher checks the caller's group admin WRITE again.
-async fn activate(
-    context: &Arc<DriverContext>,
-    nodes: (NodeId, NodeId),
-    set_id: Ulid,
-    auth: &AuthContext,
-    bearer: Option<AuthToken>,
-) -> Result<(), PublishRefusal> {
-    let request = DistributionRequest::Activate;
-    send_admin(context, nodes, set_id, (auth, bearer), request)
-        .await
-        .map(|_| ())
-}
-
-/// Sends an admin request to the set's publisher: accepted here when this node publishes,
-/// otherwise forwarded with the caller's bearer token, which the publisher checks again.
-pub(crate) async fn send_admin(
-    context: &Arc<DriverContext>,
-    (publisher, local): (NodeId, NodeId),
-    set_id: Ulid,
-    (auth, bearer): (&AuthContext, Option<AuthToken>),
-    request: DistributionRequest,
-) -> Result<DistributionRevision, PublishRefusal> {
-    let request_id = Ulid::generate();
-    if publisher == local {
-        return publish_local(context, set_id, request_id, request, Some(auth.clone())).await;
-    }
-    let auth_token = bearer.ok_or(PublishRefusal::Unauthorized)?;
-    let message = MetadataTransportMessage::ForwardDistributionRequest {
-        auth_token,
-        set_id,
-        request_id,
-        request: Box::new(request),
-    };
-    publish_remote(context, publisher, message).await
-}
-
-/// Sends one request to the set's publisher; an unreachable publisher means configuration
-/// changes are unavailable, never a queued request.
-async fn publish_remote(
-    context: &Arc<DriverContext>,
-    publisher: NodeId,
-    message: MetadataTransportMessage,
-) -> Result<DistributionRevision, PublishRefusal> {
-    let unavailable = |reason: String| PublishRefusal::Unavailable(reason);
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or_else(|| unavailable("no transport to the publisher".to_string()))?;
-    match metadata.request_forwarded_write(publisher, message).await {
-        Ok(MetadataTransportMessage::DistributionAccepted { result }) => result,
-        Ok(other) => Err(unavailable(format!(
-            "the publisher answered {}",
-            crate::metadata::transport_message_kind(&other)
-        ))),
-        Err(error) => {
-            warn!(%publisher, %error, "The distributed bucket publisher is unreachable");
-            Err(unavailable(format!(
-                "publisher node {publisher} is unreachable"
-            )))
-        }
-    }
-}
-
-/// Asks a member's node to create and admit its local bucket under the caller's bearer token.
-async fn request_admission(
-    context: &Arc<DriverContext>,
-    (node_id, member_id, sizes): (NodeId, Ulid, &[RangeSize]),
-    auth_token: AuthToken,
-    snapshot: &SignedSnapshot,
-) -> Result<SignedStatement, SyncRefusal> {
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(SyncRefusal::Unavailable)?;
-    let message = MetadataTransportMessage::ForwardAdmitMember {
-        auth_token,
-        snapshot: Box::new(snapshot.clone()),
-        member_id,
-        sizes: sizes.to_vec(),
-    };
-    match metadata.request_forwarded_write(node_id, message).await {
-        Ok(MetadataTransportMessage::AdmittedMember { result }) => result.map(|signed| *signed),
-        Ok(_) => Err(SyncRefusal::Invalid(
-            "unexpected admission answer".to_string(),
-        )),
-        Err(error) => {
-            warn!(%node_id, %error, "A distributed bucket member node is unreachable");
-            Err(SyncRefusal::Unavailable)
-        }
     }
 }
 

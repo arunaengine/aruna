@@ -208,7 +208,7 @@ enum HeldStep {
 /// Reads the local distributed bucket's binding, record and the charged rows of every range
 /// this member holds; `None` for an ordinary bucket or a member whose record has not arrived.
 #[derive(Debug, PartialEq)]
-pub(super) struct HeldRangesOperation {
+pub struct HeldRangesOperation {
     bucket: String,
     step: HeldStep,
     bound: Option<BoundRecord>,
@@ -216,7 +216,7 @@ pub(super) struct HeldRangesOperation {
 }
 
 impl HeldRangesOperation {
-    pub(super) fn new(bucket: &str) -> Self {
+    pub fn new(bucket: &str) -> Self {
         Self {
             bucket: bucket.to_string(),
             step: HeldStep::Record,

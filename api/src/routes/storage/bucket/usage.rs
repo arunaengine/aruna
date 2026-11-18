@@ -385,13 +385,13 @@ pub(crate) async fn range_sizes(
     set_id: Ulid,
 ) -> ServerResult<Vec<RangeSize>> {
     let internal = |error: String| ServerError::InternalError(error.into());
-    let view = read_view(&state.get_ctx(), set_id).await;
+    let view = drive(read_view(set_id), &state.get_ctx()).await;
     let Some(view) = view.map_err(|error| internal(error.to_string()))? else {
         return Ok(Vec::new());
     };
     let snapshot = &view.head.snapshot;
     let bucket = snapshot.config.bucket.as_str();
-    let local = held_ranges(&state.get_ctx(), bucket).await;
+    let local = drive(held_ranges(bucket), &state.get_ctx()).await;
     let local = local.map_err(|error| ServerError::InternalError(error.into()))?;
     let (member, held) = match local {
         Some((binding, _, held)) if binding.set_id == snapshot.set_id() => {
@@ -515,7 +515,7 @@ pub async fn get_bucket_usage(
         ));
     }
     crate::routes::storage::relay::relayed_set(&info, &headers)?;
-    let ranges = held_ranges(&state.get_ctx(), &bucket).await;
+    let ranges = drive(held_ranges(&bucket), &state.get_ctx()).await;
     match ranges.map_err(|error| ServerError::InternalError(error.into()))? {
         Some((_, _, ranges)) if held => {
             let usage = RangeUsage {

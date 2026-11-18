@@ -434,7 +434,7 @@ pub(crate) async fn authorize_pull(
 
 /// Only a real denial refuses the caller; an unreadable policy state or a
 /// failed check is this node's problem and stays retryable.
-fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
+pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
     match error {
         AuthorizeError::PermissionDenied
         | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => SyncRefusal::Forbidden,

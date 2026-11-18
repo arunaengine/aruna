@@ -24,6 +24,7 @@ use aruna_core::types::{GroupId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
+use super::here::Heard;
 use crate::distribution::feed_walks::{FeedError, IndexProgress, RangeProgressOperation};
 use crate::distribution::inventory::{StagedCall, outside_answer};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -326,8 +327,8 @@ fn decode_view(stored: Option<Value>) -> Result<Option<DistributionView>, Status
 
 /// This node's record of the set, if it holds one.
 #[derive(Debug, PartialEq)]
-pub(super) struct ReadViewOperation {
-    pub(super) set_id: Ulid,
+pub struct ReadViewOperation {
+    pub set_id: Ulid,
 }
 
 impl Operation for ReadViewOperation {
@@ -343,13 +344,6 @@ impl Operation for ReadViewOperation {
     }
 }
 
-/// Who this node hears from: itself, and each node's heartbeat age and wall receive time.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct Heard {
-    pub(super) local: Option<NodeId>,
-    pub(super) nodes: BTreeMap<NodeId, (u64, u64)>,
-}
-
 /// What the pending call of a status read answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StatusStep {
@@ -360,7 +354,7 @@ enum StatusStep {
 
 /// The status of a set this node holds the record of.
 #[derive(Debug, PartialEq)]
-pub(super) struct ReadStatusOperation {
+pub struct ReadStatusOperation {
     realm_id: RealmId,
     set_id: Ulid,
     heard: Heard,
@@ -458,7 +452,7 @@ struct FillSlot {
 /// Adds this node's search index progress and, for the ranges it coordinates, what it still
 /// owes each member. Both are hints, so a failed read leaves them out.
 #[derive(Debug, PartialEq)]
-pub(super) struct AddProgressOperation {
+pub struct AddProgressOperation {
     status: DistributionStatus,
     local: Option<NodeId>,
     has_indexes: bool,

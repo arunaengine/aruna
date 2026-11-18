@@ -10,7 +10,7 @@ use aruna_core::structs::storage::distribution::{
 };
 
 use super::*;
-use aruna_core::errors::StorageError;
+use crate::driver::drive;
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])
@@ -139,7 +139,8 @@ async fn refuses_unreadable_link() {
     };
     let token = || AuthToken::bearer("token").unwrap();
     let missing = change(Some(Ulid::from_bytes([7; 16])));
-    let refused = readable_link(&context, (&auth, token()), &missing).await;
+    let link = |request| ReadableLinkOperation::new(auth.clone(), token(), request);
+    let refused = drive(link(&missing), &context).await;
     assert!(
         matches!(refused, Err(PublishRefusal::Rejected(_))),
         "{refused:?}"
@@ -151,7 +152,7 @@ async fn refuses_unreadable_link() {
             expected: None,
         },
     ] {
-        let kept = readable_link(&context, (&auth, token()), &unlinked).await;
+        let kept = drive(link(&unlinked), &context).await;
         assert_eq!(kept, Ok(()));
     }
 }
@@ -164,11 +165,13 @@ async fn removes_refused_member() {
     let create = CreateBucketOperation::new("spire".to_string(), bucket(set_id, member_id, 0));
     drive(create.mapped(), &context).await.unwrap();
 
-    remove_member(&context, "spire", set_id, Ulid::from_bytes([5; 16])).await;
+    let other = RemoveMemberOperation::new("spire", set_id, Ulid::from_bytes([5; 16]));
+    drive(other, &context).await.unwrap();
     let kept = drive(GetBucketOperation::new("spire".to_string()), &context).await;
     assert!(kept.is_ok(), "another member's bucket stays");
 
-    remove_member(&context, "spire", set_id, member_id).await;
+    let own = RemoveMemberOperation::new("spire", set_id, member_id);
+    drive(own, &context).await.unwrap();
     let gone = drive(GetBucketOperation::new("spire".to_string()), &context).await;
     assert!(gone.is_err(), "the refused member's bucket is deleted");
 }

@@ -661,7 +661,7 @@ fn spawn_usage_rebuild(
     let token = shutdown.token();
     shutdown.spawn(async move {
         // Range counters of distributed buckets are confirmed again by their own rebuilds.
-        match begin_range_rebuilds(&context).await {
+        match drive(begin_range_rebuilds(), &context).await {
             Ok(begun) if begun > 0 => info!(ranges = begun, "Range counter rebuilds begun"),
             Ok(_) => {}
             Err(error) => warn!(%error, "Range counter rebuilds could not begin"),

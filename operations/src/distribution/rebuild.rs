@@ -509,7 +509,7 @@ pub(super) fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccou
 
 #[derive(Debug, Error, PartialEq)]
 #[error("{0}")]
-pub(super) struct BeginRebuildsError(String);
+pub struct BeginRebuildsError(String);
 
 impl From<IoError> for BeginRebuildsError {
     fn from(error: IoError) -> Self {
@@ -520,7 +520,7 @@ impl From<IoError> for BeginRebuildsError {
 /// Begins a counter rebuild of every active range account without one, a page at a time, and
 /// outputs how many began. A rebuild that does not begin is logged and skipped.
 #[derive(Debug, PartialEq)]
-pub(super) struct BeginRebuildsOperation {
+pub struct BeginRebuildsOperation {
     walk: (usize, usize),
     pages: PrefixPages,
     /// Accounts of the page still to begin, the next one last.

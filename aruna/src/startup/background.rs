@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_api::monitoring::Readiness;
 use aruna_core::document::DocumentTarget;
-use aruna_operations::distribution::index_feed::spawn_index_feed;
-use aruna_operations::driver::DriverContext;
+use aruna_operations::distribution::feed_walks::{FeedCursors, FeedLimits, FeedPassOperation};
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::drain::restore_drain_timer;
 use aruna_operations::jobs::lifecycle::outbox::timers::restore_lifecycle_timers;
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -25,6 +26,41 @@ use tracing::warn;
 use crate::application::{Service, ServiceExit};
 use crate::startup::realm::CoreAnnouncement;
 use crate::startup::test_hooks;
+
+const FEED_IDLE: Duration = Duration::from_secs(2);
+const FEED_BUSY: Duration = Duration::from_millis(50);
+
+/// Runs the range index feeder of this node until shutdown on the bulk storage lane; nodes
+/// without range indexes feed none.
+fn spawn_index_feed(context: Arc<DriverContext>, shutdown: &Shutdown) {
+    if context.storage_handle.range_indexes().is_none() {
+        return;
+    }
+    let mut bulk = (*context).clone();
+    bulk.storage_handle = context.storage_handle.bulk();
+    let limits = FeedLimits::default();
+    let mut cursors = FeedCursors::default();
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        loop {
+            let pass = FeedPassOperation::new(limits, std::mem::take(&mut cursors));
+            let wait = match drive(pass, &bulk).await {
+                Ok(pass) => {
+                    cursors = pass.cursors;
+                    if pass.busy { FEED_BUSY } else { FEED_IDLE }
+                }
+                Err(error) => {
+                    warn!(%error, "Range search index pass failed");
+                    FEED_IDLE
+                }
+            };
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    });
+}
 
 pub(crate) struct Background {
     pub(crate) realm_id: aruna_core::structs::identity::realm::RealmId,

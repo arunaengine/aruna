@@ -6,10 +6,10 @@
 // Redemption makes the same revocation check as a direct authenticated read, then the target
 // checks its own path.
 
-use std::sync::Arc;
-
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, SessionRef};
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::distribution::ticket::{
@@ -17,11 +17,11 @@ use aruna_core::structs::storage::distribution::ticket::{
 };
 use thiserror::Error;
 
-use crate::auth::bearer_token::grant_valid;
+use super::forward::{config_of, realm_config};
+use super::here::NodeRealm;
+use crate::auth::bearer_token::{ArunaBearerError, GrantValidOperation};
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
 
 /// Seconds a spent nonce outlives its ticket, for clocks that run behind the issuer's.
@@ -39,6 +39,12 @@ pub enum RedeemError {
     Replayed,
     #[error("download tickets need the realm transport and configuration")]
     Unavailable,
+}
+
+impl From<IoError> for RedeemError {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
 }
 
 /// What the choosing node verified about the caller of one private download.
@@ -75,45 +81,103 @@ pub fn issue_ticket(context: &DriverContext, input: TicketInput, now: u64) -> Op
     })
 }
 
+/// What the pending call of a redemption answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedeemStep {
+    Config,
+    Grant,
+    Nonce,
+}
+
 /// Redeems a ticket for `object_id` on this node once and returns the caller it names. The
 /// caller still checks the user's permission on this node's own path.
-pub async fn redeem_ticket(
-    context: &Arc<DriverContext>,
+#[derive(Debug, PartialEq)]
+pub struct RedeemTicketOperation {
+    ids: NodeRealm,
+    signed: SignedTicket,
+    object_id: String,
+    now: u64,
+    step: RedeemStep,
+    ticket: Option<Ticket>,
+}
+
+/// The redemption of `signed` on this node; see [`RedeemTicketOperation`].
+pub fn redeem_ticket(
+    context: &DriverContext,
     signed: &SignedTicket,
     object_id: &str,
     now: u64,
-) -> Result<AuthContext, RedeemError> {
-    let net = context
-        .net_handle
-        .as_ref()
-        .ok_or(RedeemError::Unavailable)?;
-    let realm_id = *net.realm_id();
-    let ticket = signed.verify(realm_id, net.node_id(), object_id, now)?;
-    let config = load_realm_config(context, realm_id)
-        .await
-        .ok_or(RedeemError::Unavailable)?;
-    if !is_sync_eligible(&config, ticket.issuer) {
-        return Err(RedeemError::Issuer);
+) -> RedeemTicketOperation {
+    RedeemTicketOperation {
+        ids: context.node_and_realm(),
+        signed: signed.clone(),
+        object_id: object_id.to_string(),
+        now,
+        step: RedeemStep::Config,
+        ticket: None,
     }
-    match grant_valid(&context.storage_handle, &ticket.grant, &ticket.user_id).await {
-        Ok(true) => {}
-        Ok(false) => return Err(RedeemError::Revoked),
-        Err(_) => return Err(RedeemError::Unavailable),
-    }
-    let expires = ticket.expires_at.saturating_add(SPENT_MARGIN_SECS);
-    drive(
-        SpendNonceOperation::new(ticket.nonce, expires, now),
-        context,
-    )
-    .await
-    .map_err(|error| match error {
-        NonceError::Replayed => RedeemError::Replayed,
-        _ => RedeemError::Unavailable,
-    })?;
-    Ok(AuthContext {
-        user_id: ticket.user_id,
-        realm_id,
-        path_restrictions: ticket.restrictions.clone(),
-        session: ticket.session.clone(),
-    })
 }
+
+type Redeeming = Result<Next<AuthContext>, RedeemError>;
+
+impl RedeemTicketOperation {
+    fn ticket(&self) -> Result<&Ticket, IoError> {
+        self.ticket.as_ref().ok_or(IoError::Unfinished)
+    }
+}
+
+impl Operation for RedeemTicketOperation {
+    type Output = AuthContext;
+    type Error = RedeemError;
+
+    fn first(&mut self) -> Redeeming {
+        let (node_id, realm_id) = self.ids.ok_or(RedeemError::Unavailable)?;
+        let ticket = (self.signed).verify(realm_id, node_id, &self.object_id, self.now)?;
+        self.ticket = Some(ticket.clone());
+        Ok(Next::Call(realm_config(realm_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Redeeming {
+        match self.step {
+            RedeemStep::Config => {
+                let config = config_of(result)?.ok_or(RedeemError::Unavailable)?;
+                let ticket = self.ticket()?;
+                if !is_sync_eligible(&config, ticket.issuer) {
+                    return Err(RedeemError::Issuer);
+                }
+                let check = GrantValidOperation::new(&ticket.grant, &ticket.user_id);
+                self.step = RedeemStep::Grant;
+                Ok(Next::Call(IoCall::child(check)))
+            }
+            RedeemStep::Grant => match result.child::<bool, ArunaBearerError>()? {
+                Ok(true) => {
+                    let ticket = self.ticket()?;
+                    let expires = ticket.expires_at.saturating_add(SPENT_MARGIN_SECS);
+                    let spend = SpendNonceOperation::new(ticket.nonce, expires, self.now);
+                    self.step = RedeemStep::Nonce;
+                    Ok(Next::Call(IoCall::child(spend)))
+                }
+                Ok(false) => Err(RedeemError::Revoked),
+                Err(_) => Err(RedeemError::Unavailable),
+            },
+            RedeemStep::Nonce => {
+                result.child::<(), NonceError>()?.map_err(|error| match error {
+                    NonceError::Replayed => RedeemError::Replayed,
+                    _ => RedeemError::Unavailable,
+                })?;
+                let ticket = self.ticket.take().ok_or(IoError::Unfinished)?;
+                let (_, realm_id) = self.ids.ok_or(RedeemError::Unavailable)?;
+                Ok(Next::Done(AuthContext {
+                    user_id: ticket.user_id,
+                    realm_id,
+                    path_restrictions: ticket.restrictions,
+                    session: ticket.session,
+                }))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "ticket_tests.rs"]
+mod tests;

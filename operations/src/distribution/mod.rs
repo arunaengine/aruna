@@ -16,17 +16,19 @@ mod fence_row;
 pub mod forward;
 pub mod guard;
 pub mod handoff;
+pub mod here;
 pub mod held;
 pub(crate) mod imports;
-pub mod index_feed;
+#[cfg(test)]
+mod index_feed_tests;
 pub mod inventory;
 pub mod keep;
 pub mod lifecycle;
 pub mod nonce;
+pub(crate) mod peer_call;
 pub mod publish;
 pub mod pull;
-pub mod purge;
-mod purge_steps;
+pub(crate) mod purge_steps;
 pub mod rebuild;
 pub mod refill;
 mod refresh;
@@ -41,6 +43,7 @@ pub mod source_plan;
 pub mod split;
 pub mod status;
 mod status_view;
+pub mod submit;
 #[cfg(test)]
 pub(crate) mod test_record;
 #[cfg(test)]

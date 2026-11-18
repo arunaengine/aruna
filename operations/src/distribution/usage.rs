@@ -3,35 +3,28 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use aruna_core::types::TxnId;
 
-use aruna_core::types::{GroupId, TxnId};
-
-pub use super::charged_ranges::{HeldRange, HeldRanges, RangeUsage, sum_held};
-use super::charged_ranges::{HeldRangesOperation, UsageError};
-use super::replica_shares::{GroupShare, ReplicaSharesOperation};
-use crate::driver::{DriverContext, drive};
+pub use super::charged_ranges::{
+    HeldRange, HeldRanges, HeldRangesOperation, RangeUsage, UsageError, sum_held,
+};
+pub use super::replica_shares::{GroupShare, ReplicaSharesOperation};
 
 /// The local distributed bucket's binding, record and the charged rows of every range this
 /// member holds; `None` for an ordinary bucket or a member whose record has not arrived.
-pub async fn held_ranges(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Option<HeldRanges>, UsageError> {
-    drive(HeldRangesOperation::new(bucket), context).await
+pub fn held_ranges(bucket: &str) -> HeldRangesOperation {
+    HeldRangesOperation::new(bucket)
 }
 
 /// Each group's replica share on this node; see [`ReplicaSharesOperation`].
-pub async fn replica_shares(
-    context: &DriverContext,
-    txn_id: TxnId,
-) -> Result<BTreeMap<GroupId, GroupShare>, UsageError> {
-    drive(ReplicaSharesOperation::new(txn_id), context).await
+pub fn replica_shares(txn_id: TxnId) -> ReplicaSharesOperation {
+    ReplicaSharesOperation::new(txn_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
     use crate::distribution::charged_ranges::{charged_rows, sum_rows};
     use crate::distribution::replica_shares::BindingShareOperation;
     use crate::replication::members::BoundRecordOperation;
@@ -190,7 +183,7 @@ mod tests {
             txn_id: None,
         };
         handle.send_storage_effect(write).await;
-        let (_, _, held) = held_ranges(&context, "spire").await.unwrap().unwrap();
+        let (_, _, held) = drive(held_ranges("spire"), &context).await.unwrap().unwrap();
         assert_eq!(held.len(), 1, "member 1 holds the lower shard only");
         assert_eq!(sum_held(&held).unwrap().objects, 4);
         assert!(held[0].complete);
@@ -299,7 +292,7 @@ mod tests {
             txn_id: None,
         };
         handle.send_storage_effect(purge).await;
-        let shares = replica_shares(&context, txn_id).await.unwrap();
+        let shares = drive(replica_shares(txn_id), &context).await.unwrap();
         let expected = UsageCounters {
             objects: 3,
             logical_bytes: 15,
@@ -362,7 +355,7 @@ mod tests {
         else {
             panic!("no read transaction");
         };
-        let shares = replica_shares(&context, txn_id).await.unwrap();
+        let shares = drive(replica_shares(txn_id), &context).await.unwrap();
         assert!(
             shares.values().all(|share| share.replicas.objects == 0),
             "a negative share reads as zero"

@@ -99,7 +99,7 @@ pub enum Purged {
 /// Why a purge step stopped.
 #[derive(Clone, Debug, Error, PartialEq)]
 #[error("{0}")]
-pub(super) struct PurgeError(pub(super) String);
+pub(crate) struct PurgeError(pub(crate) String);
 
 impl From<IoError> for PurgeError {
     fn from(error: IoError) -> Self {

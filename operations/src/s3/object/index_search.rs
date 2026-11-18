@@ -27,7 +27,7 @@ use super::{
 };
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::distribution::feed_walks::state_key;
-use crate::distribution::index_feed::range_progress;
+use crate::distribution::feed_walks::RangeProgressOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::replication::members::ReadRecordOperation;
@@ -72,7 +72,7 @@ pub(super) async fn search_ranges(
     if indexes.is_some() && !unready.is_empty() {
         let bucket = input.bucket.as_deref().unwrap_or_default();
         // Progress is a hint, so a failed read leaves it out.
-        let progress = (range_progress(context, bucket).await).unwrap_or_default();
+        let progress = (drive(RangeProgressOperation::new(bucket), context).await).unwrap_or_default();
         page.index_progress = (unready.into_iter())
             .filter_map(|(range_id, _)| Some((range_id, *progress.get(&range_id)?)))
             .collect();

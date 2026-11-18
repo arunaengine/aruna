@@ -4,12 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::ops::Bound;
+use std::sync::Arc;
 
-use super::*;
 use crate::distribution::feed_walks::{FeedLimits, state_key};
 use crate::distribution::test_record::{record, searched, store_record};
 use crate::distribution::test_store::{
-    apply, context, get, install, open, purge, range, send, write,
+    Feeder, apply, context, get, install, open, purge, range, send, write,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -24,6 +24,7 @@ use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_storage::StorageHandle;
 use aruna_storage::key_index::RangeIndexes;
 use tempfile::TempDir;
+use ulid::Ulid;
 
 /// The set of [`searched`], which keeps a search index.
 fn set() -> Ulid {

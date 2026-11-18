@@ -6,8 +6,6 @@
 // The target checks the issuer, the validity window and a single-use nonce, then runs its own
 // permission checks.
 
-use std::sync::Arc;
-
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
@@ -19,7 +17,6 @@ use ulid::Ulid;
 
 use super::accept_delegation::{AcceptDelegationOperation, DelegateError};
 use crate::driver::DriverContext;
-use crate::driver::drive;
 
 /// How long an issued delegation is valid.
 const DELEGATION_SECS: u64 = 15;
@@ -95,16 +92,20 @@ pub fn sign_body(
 }
 
 /// Accepts a delegation for this node once; see [`AcceptDelegationOperation`].
-pub async fn accept_delegation(
-    context: &Arc<DriverContext>,
+pub fn accept_delegation(
+    context: &DriverContext,
     signed: &SignedDelegation,
     now: u64,
-) -> Result<Delegation, DelegateError> {
+) -> Result<AcceptDelegationOperation, DelegateError> {
     let net = context
         .net_handle
         .as_ref()
         .ok_or(DelegateError::Unavailable)?;
-    let accept =
-        AcceptDelegationOperation::new(signed.clone(), *net.realm_id(), net.node_id(), now);
-    drive(accept, context).await
+    let realm_id = *net.realm_id();
+    Ok(AcceptDelegationOperation::new(
+        signed.clone(),
+        realm_id,
+        net.node_id(),
+        now,
+    ))
 }

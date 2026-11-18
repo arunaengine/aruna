@@ -1353,7 +1353,7 @@ enum ProgressStep {
 /// The search index progress of every range of a bucket this node holds, while its set keeps a
 /// search index; a range whose index is not opened yet has none indexed.
 #[derive(Debug, PartialEq)]
-pub(super) struct RangeProgressOperation {
+pub struct RangeProgressOperation {
     bucket: String,
     step: ProgressStep,
     set_id: Ulid,
@@ -1364,7 +1364,7 @@ pub(super) struct RangeProgressOperation {
 }
 
 impl RangeProgressOperation {
-    pub(super) fn new(bucket: &str) -> Self {
+    pub fn new(bucket: &str) -> Self {
         Self {
             bucket: bucket.to_string(),
             step: ProgressStep::Held,

@@ -252,7 +252,7 @@ async fn member_sets(state: &ServerState, named: NamedSets) -> Vec<MemberSet> {
     let context = state.get_ctx();
     let mut buckets = named.buckets;
     for set_id in named.sets {
-        if let Ok(Some(view)) = read_view(&context, set_id).await {
+        if let Ok(Some(view)) = drive(read_view(set_id), &context).await {
             buckets.insert(view.snapshot().config.bucket.clone());
         }
     }

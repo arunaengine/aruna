@@ -860,7 +860,7 @@ fn record_line(row: usize, meta: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_pages_resume() {
     use crate::distribution::feed_walks::FeedLimits;
-    use crate::distribution::index_feed::Feeder;
+    use crate::distribution::test_store::Feeder;
     use crate::staging::page::rows::MAX_PAGE_ENTRIES;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -1095,7 +1095,7 @@ async fn import_records(
     let mut woken = pages.subscribe();
     let feed = tokio::spawn(async move {
         use crate::distribution::feed_walks::FeedLimits;
-        use crate::distribution::index_feed::Feeder;
+        use crate::distribution::test_store::Feeder;
         use aruna_storage::key_index::RangeIndexes;
         feed.storage_handle
             .install_range_indexes(RangeIndexes::new(indexes));

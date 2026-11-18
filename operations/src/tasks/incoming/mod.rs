@@ -960,7 +960,22 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::MaintainRanges => Box::pin(async move {
-                let after = crate::distribution::sharding::maintain_ranges(&self.context).await;
+                use crate::distribution::sharding::{maintain_ranges, maintain_retry};
+                let context = &self.context;
+                let mut after = match crate::driver::drive(maintain_ranges(context), context).await
+                {
+                    Ok(pass) => pass.finish(),
+                    Err(error) => {
+                        warn!(%error, "Range maintenance could not finish a pass");
+                        maintain_retry()
+                    }
+                };
+                // Version links metadata could not verify in a set are retried a page per pass.
+                match crate::metadata::data_links::retry_unverified(context).await {
+                    Ok(true) => after = std::time::Duration::ZERO,
+                    Ok(false) => {}
+                    Err(error) => warn!(%error, "Unverified data links could not be retried"),
+                }
                 self.reschedule_timer(TaskKey::MaintainRanges, after).await;
             }),
             TaskKey::RunBackendImports => Box::pin(async move {

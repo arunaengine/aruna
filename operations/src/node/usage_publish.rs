@@ -191,7 +191,7 @@ async fn publish_retaining_markers(
     };
     let group_list: Vec<GroupId> = groups.into_iter().collect();
     let read = async {
-        let shares = replica_shares(ctx, txn_id)
+        let shares = drive(replica_shares(txn_id), ctx)
             .await
             .map_err(|e| e.to_string())?;
         let counters = if global {

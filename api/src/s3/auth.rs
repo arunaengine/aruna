@@ -722,7 +722,11 @@ impl AuthProvider {
             .and_then(|value| SignedDelegation::decode(value).ok())
             .ok_or_else(|| denied("malformed delegation"))?;
         let now = aruna_core::time::unix_timestamp_secs();
-        let delegation = match accept_delegation(&self.driver_ctx, &signed, now).await {
+        let accepted = match accept_delegation(&self.driver_ctx, &signed, now) {
+            Ok(accept) => drive(accept, &self.driver_ctx).await,
+            Err(error) => Err(error),
+        };
+        let delegation = match accepted {
             Ok(delegation) => delegation,
             Err(DelegateError::Unavailable) => {
                 return Err(s3_error!(
