@@ -421,6 +421,38 @@ mod pure_tests {
         .to_bytes()
     }
 
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn page(rows: Vec<Key>, next: Option<Key>) -> IoResult {
+        IoResult::Page {
+            rows: rows
+                .into_iter()
+                .map(|key| (key, Vec::<u8>::new().into()))
+                .collect(),
+            next,
+        }
+    }
+
+    fn put_done() -> IoResult {
+        event(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
+            key: DhtKeyId::from_bytes([1; 32]),
+            remote_attempt_count: 1,
+            remote_store_count: 1,
+        })))
+    }
+
+    fn is_put(turn: &RefreshTurn) -> bool {
+        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+            return false;
+        };
+        matches!(
+            effect.as_ref(),
+            Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))
+        )
+    }
+
     fn entry(node_id: NodeId, realm_id: RealmId) -> DhtEntry {
         DhtEntry {
             node_id,
@@ -474,150 +506,152 @@ mod pure_tests {
         };
         let mut operation = RefreshHoldersOperation::new(realm_id, limits);
 
-        let schedule = operation.start();
-        assert_eq!(
-            schedule.as_slice(),
-            [Effect::Task(TaskEffect::ResetTimer {
-                key: TaskKey::RefreshBlobHolders,
-                after: Duration::from_secs(30),
-            })]
-        );
-        let cursor_read = operation.step(Event::Task(TaskEvent::TimerScheduled {
+        let reset = Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::RefreshBlobHolders,
             after: Duration::from_secs(30),
-        }));
+        });
+        assert_eq!(operation.first(), Ok(Next::Call(reset.into())));
+        let cursor_read = operation.next(event(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::RefreshBlobHolders,
+            after: Duration::from_secs(30),
+        })));
+        assert_eq!(
+            cursor_read,
+            Ok(Next::Call(read_row(
+                NODE_STATE_KEYSPACE,
+                REFRESH_CURSOR_KEY.to_vec()
+            )))
+        );
+        let first = operation.next(IoResult::Values(vec![None]));
         assert!(matches!(
-            cursor_read.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == NODE_STATE_KEYSPACE
-        ));
-        let first = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: REFRESH_CURSOR_KEY.to_vec().into(),
-            value: None,
-        }));
-        assert!(matches!(
-            first.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                key_space,
+            &first,
+            Ok(Next::Call(IoCall::Page {
+                space,
                 limit: REFRESH_PAGE_SIZE,
-                start: None,
+                after: None,
                 ..
-            })] if key_space == BLOB_LOCATIONS_KEYSPACE
+            })) if space == BLOB_LOCATIONS_KEYSPACE
         ));
 
         let cursor: Key = location_key(1).into();
-        let owners = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
-                (location_key(1).into(), Vec::<u8>::new().into()),
-                (cold_key(1).into(), Vec::<u8>::new().into()),
-            ],
-            next_start_after: Some(cursor.clone()),
-        }));
+        let owners = operation.next(page(
+            vec![location_key(1).into(), cold_key(1).into()],
+            Some(cursor.clone()),
+        ));
         assert!(matches!(
-            owners.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == PATHS_INDEX_KEYSPACE
+            &owners,
+            Ok(Next::Call(IoCall::Page { space, .. })) if space == PATHS_INDEX_KEYSPACE
         ));
         // A hash without owner rows is announced, as before.
-        let publish = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
+        let publish = operation.next(page(Vec::new(), None));
+        assert!(is_put(&publish), "{publish:?}");
+
+        let save = operation.next(put_done());
+        assert_eq!(
+            save,
+            Ok(Next::Call(IoCall::Write(vec![(
+                NODE_STATE_KEYSPACE.to_string(),
+                REFRESH_CURSOR_KEY.to_vec().into(),
+                cursor.to_vec().into(),
+            )])))
+        );
+        let next_page = operation.next(IoResult::Done);
         assert!(matches!(
-            publish.as_slice(),
-            [Effect::Net(NetEffect::Dht(DhtEffect::Put {
-                ttl,
-                ..
-            }))] if *ttl == Duration::from_secs(90)
+            &next_page,
+            Ok(Next::Call(IoCall::Page { after: Some(after), .. })) if after == &cursor
         ));
 
-        let save = operation.step(Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
-            key: DhtKeyId::from_bytes([1; 32]),
-            remote_attempt_count: 1,
-            remote_store_count: 1,
-        })));
-        assert!(matches!(
-            save.as_slice(),
-            [Effect::Storage(StorageEffect::Write { key_space, value, .. })]
-                if key_space == NODE_STATE_KEYSPACE && value.as_ref() == cursor.as_ref()
-        ));
-        let next_page = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: REFRESH_CURSOR_KEY.to_vec().into(),
-        }));
-        assert!(matches!(
-            next_page.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(start)),
-                ..
-            })] if start == &cursor
-        ));
-
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(location_key(2).into(), Vec::<u8>::new().into())],
-            next_start_after: None,
-        }));
+        operation
+            .next(page(vec![location_key(2).into()], None))
+            .unwrap();
         operation.distributed.insert("shared".to_string(), true);
-        let clear = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(owner_row("shared", 2), Vec::<u8>::new().into())],
-            next_start_after: None,
-        }));
-        assert!(
-            matches!(
-                clear.as_slice(),
-                [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-                    if key_space == NODE_STATE_KEYSPACE
-            ),
+        let clear = operation.next(page(vec![owner_row("shared", 2)], None));
+        assert_eq!(
+            clear,
+            Ok(Next::Call(IoCall::Delete(vec![(
+                NODE_STATE_KEYSPACE.to_string(),
+                REFRESH_CURSOR_KEY.to_vec().into(),
+            )]))),
             "a hash held only by distributed buckets is not announced"
         );
-        let finish = operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: REFRESH_CURSOR_KEY.to_vec().into(),
-        }));
-        assert!(finish.is_empty());
-        assert_eq!(operation.finalize(), Ok(1));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(1)));
+    }
+
+    /// A refresh about to read the owners of one hash.
+    fn reading_owners(seed: u8) -> RefreshHoldersOperation {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        operation
+            .pending
+            .push_back(DhtKeyId::from_bytes([seed; 32]));
+        operation.next_call().unwrap();
+        operation
     }
 
     // Owners past the probe may be ordinary buckets, so a truncated probe keeps the hash.
     #[test]
     fn truncated_owners_announce() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        let mut operation = reading_owners(4);
         operation.distributed.insert("shared".to_string(), true);
-        operation.pending.push_back(DhtKeyId::from_bytes([4; 32]));
-        operation.next_effect();
-        let publish = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(owner_row("shared", 4), Vec::<u8>::new().into())],
-            next_start_after: Some(owner_row("shared", 4)),
-        }));
-        assert!(matches!(
-            publish.as_slice(),
-            [Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))]
+        let publish = operation.next(page(
+            vec![owner_row("shared", 4)],
+            Some(owner_row("shared", 4)),
         ));
+        assert!(is_put(&publish), "{publish:?}");
     }
 
     #[test]
     fn unknown_bucket_announces() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
-        operation.pending.push_back(DhtKeyId::from_bytes([4; 32]));
-        operation.next_effect();
-        let read = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(owner_row("gone", 4), Vec::<u8>::new().into())],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            read.as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { .. })]
-        ));
-        let publish = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(b"gone".to_vec().into(), None)],
-        }));
+        let mut operation = reading_owners(4);
+        let read = operation.next(page(vec![owner_row("gone", 4)], None));
+        assert_eq!(
+            read,
+            Ok(Next::Call(IoCall::Read(vec![(
+                S3_BUCKET_KEYSPACE.to_string(),
+                b"gone".to_vec().into()
+            )])))
+        );
+        let publish = operation.next(IoResult::Values(vec![None]));
         assert!(
-            matches!(
-                publish.as_slice(),
-                [Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))]
-            ),
+            is_put(&publish),
             "a bucket that cannot be read keeps its hash announced"
         );
+        assert_eq!(operation.distributed.get("gone"), Some(&false));
+    }
+
+    #[test]
+    fn failed_put_continues() {
+        // An announcement that fails is retried by the next refresh, so the run goes on.
+        let mut operation = reading_owners(4);
+        operation.next(page(Vec::new(), None)).unwrap();
+        let failed = event(Event::Net(NetEvent::Dht(DhtEvent::Error {
+            error: DhtError::Other("offline".to_string()),
+        })));
+        let turn = operation.next(failed);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+    }
+
+    #[test]
+    fn timer_failure_fails() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let mut operation = RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
+        operation.first().unwrap();
+        let turn = operation.next(event(Event::Task(TaskEvent::Error {
+            key: Some(TaskKey::RefreshBlobHolders),
+            message: "stopped".to_string(),
+        })));
+        assert_eq!(
+            turn,
+            Err(RefreshHoldersError::Schedule("stopped".to_string()))
+        );
+    }
+
+    fn get_result(values: Vec<DhtEntry>) -> IoResult {
+        event(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
+            key: DhtKeyId::from_bytes([4; 32]),
+            stale: false,
+            values,
+        })))
     }
 
     #[test]
@@ -627,18 +661,16 @@ mod pure_tests {
         let mut expected = vec![node(3), node(1), node(2)];
         expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         let mut operation = GetHoldersOperation::new([4; 32], realm_id, self_node);
-        operation.start();
-        operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
-            key: DhtKeyId::from_bytes([4; 32]),
-            stale: false,
-            values: vec![
-                entry(node(3), realm_id),
-                entry(node(1), realm_id),
-                entry(node(2), realm_id),
-            ],
-        })));
-
-        assert_eq!(operation.finalize(), Ok(expected));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        let values = vec![
+            entry(node(3), realm_id),
+            entry(node(1), realm_id),
+            entry(node(2), realm_id),
+        ];
+        assert_eq!(operation.next(get_result(values)), Ok(Next::Done(expected)));
     }
 
     #[test]
@@ -647,71 +679,34 @@ mod pure_tests {
         let self_node = node(9);
         let other = node(2);
         let mut operation = GetHoldersOperation::new([4; 32], realm_id, self_node);
-        operation.start();
-        operation.step(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
-            key: DhtKeyId::from_bytes([4; 32]),
-            stale: false,
-            values: vec![
-                entry(self_node, realm_id),
-                entry(other, realm_id),
-                entry(other, realm_id),
-            ],
-        })));
-
-        assert_eq!(operation.finalize(), Ok(vec![other]));
+        operation.first().unwrap();
+        let values = vec![
+            entry(self_node, realm_id),
+            entry(other, realm_id),
+            entry(other, realm_id),
+        ];
+        assert_eq!(
+            operation.next(get_result(values)),
+            Ok(Next::Done(vec![other]))
+        );
     }
 
-    // A state that expects no event must reject one instead of ignoring it.
     #[test]
-    fn terminal_rejects_event() {
+    fn lookup_failures_stay() {
+        // A deadline is not an empty holder set, and a foreign result is refused.
+        assert_eq!(
+            GetHoldersError::from(IoError::Aborted),
+            GetHoldersError::Aborted
+        );
         let realm_id = RealmId::from_bytes([1; 32]);
-        let refresh = || RefreshHoldersOperation::new(realm_id, RoCrateLimits::default());
-        let put = || {
-            Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
-                key: DhtKeyId::from_bytes([1; 32]),
-                remote_attempt_count: 1,
-                remote_store_count: 1,
-            }))
-        };
-        for (_, effects, error) in rejects_events(
-            refresh,
-            || {
-                let mut events = sample_events();
-                events.push(put());
-                events
-            },
-            |_| false,
-        ) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(
-                    error,
-                    RefreshHoldersError::UnexpectedEvent { .. } | RefreshHoldersError::Storage(_)
-                ),
-                "{error:?}"
-            );
-        }
-
-        let get = || GetHoldersOperation::new([4; 32], realm_id, node(9));
-        let offline = || {
-            Event::Net(NetEvent::Dht(DhtEvent::Error {
-                error: DhtError::Other("offline".to_string()),
-            }))
-        };
-        for (_, effects, error) in rejects_events(
-            get,
-            || {
-                let mut events = sample_events();
-                events.push(offline());
-                events
-            },
-            |_| false,
-        ) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(error, GetHoldersError::UnexpectedEvent { .. }),
-                "{error:?}"
-            );
-        }
+        let mut operation = GetHoldersOperation::new([4; 32], realm_id, node(9));
+        operation.first().unwrap();
+        let turn = operation.next(put_done());
+        assert!(matches!(turn, Err(GetHoldersError::UnexpectedEvent { .. })));
+        let offline = DhtError::Other("offline".to_string());
+        let failed = event(Event::Net(NetEvent::Dht(DhtEvent::Error {
+            error: DhtError::Other("offline".to_string()),
+        })));
+        assert_eq!(operation.next(failed), Err(GetHoldersError::Dht(offline)));
     }
 }
