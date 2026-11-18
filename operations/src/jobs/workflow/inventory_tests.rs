@@ -118,11 +118,12 @@ fn head(version_id: Option<Ulid>) -> IoResult {
             version_created_at: None,
             version_id,
             resolved_version_id: version_id,
-            checksum_type: Default::default(),
+            checksum_type:
+                aruna_core::structs::storage::multipart::MultipartChecksumType::FullObject,
             composite_hashes: HashMap::new(),
             part_count: None,
-        source_policies: Vec::new(),
-        source_binding: None,
+            source_policies: Vec::new(),
+            source_binding: None,
         },
     )))
 }

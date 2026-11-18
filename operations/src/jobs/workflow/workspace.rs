@@ -6,7 +6,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::types::GroupId;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use aruna_compute::ExecutorBackend;
 use aruna_core::compute::{
@@ -18,14 +18,13 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
     AttemptControl, CapturedInput, ExecutionSpec, InputSelection, InputSource, JobError, JobRecord,
     MAX_EXECUTION_OUTPUTS, OutputDestination, OutputObject, OutputSelection,
-    workspace_credential_id,
 };
-use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
-    BackendLocation, BucketInfo, CONTENT_TYPE_KEY, HashIndex, UserAccess, bucket_permission_path,
-    ensure_confined_path, group_permission_path, key_content_type, object_permission_path,
+    BackendLocation, BucketInfo, CONTENT_TYPE_KEY, HashIndex, ensure_confined_path,
+    key_content_type, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::encryption::BucketKeyError;
@@ -35,7 +34,6 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use super::DEFAULT_WALLTIME;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::document_repository::GetConfigOperation;
@@ -1402,8 +1400,10 @@ mod tests {
     use super::super::inventory::CollectOutputsOperation;
     use super::super::prepare::{input_mint, workspace_mint};
     use super::*;
+    use crate::s3::access::get::GetAccessOperation;
     use aruna_core::calls::Next;
     use aruna_core::operation::Operation;
+    use aruna_core::structs::storage::blob::bucket_permission_path;
 
     async fn mint_workspace(
         context: &DriverContext,

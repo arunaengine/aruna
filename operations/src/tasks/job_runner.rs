@@ -15,7 +15,6 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_storage::StorageHandle;
 use futures_util::future::FutureExt;
 use tokio::sync::RwLockReadGuard;
 use tokio::time::interval;
@@ -127,18 +126,7 @@ impl JobsRuntime {
     /// Stop claiming, signal the jobs in flight, and give them `grace` to wind down.
     /// Whatever is still running then has its lease handed back, so a restart costs a
     /// job no attempt. Storage must outlive this call: releasing a lease writes.
-    pub async fn shutdown(&self, storage: &StorageHandle, grace: Duration) -> JobShutdownReport {
-        // Releasing a lease writes storage only, so the node's other planes stay out.
-        let context = &DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
+    pub async fn shutdown(&self, context: &DriverContext, grace: Duration) -> JobShutdownReport {
         self.close_admission();
         let waiters = self.running_waiters();
         let deadline = Instant::now() + grace;

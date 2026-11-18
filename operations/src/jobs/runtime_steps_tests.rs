@@ -340,7 +340,7 @@ fn recovery_store_failures() {
     assert_eq!(gone.next(reply), Ok(Next::Done(Recovery::Untouched)));
 
     let (mut failed, _) = recover(Some(external()));
-    let error = JobMutationError::Storage("down".to_string());
-    let reply = child(Err::<RequeueOutcome, _>(error.clone()));
-    assert_eq!(failed.next(reply), Err(error));
+    let error = || JobMutationError::Storage("down".to_string());
+    let reply = child(Err::<RequeueOutcome, _>(error()));
+    assert_eq!(failed.next(reply), Err(error()));
 }

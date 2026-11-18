@@ -14,8 +14,8 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::tail_str;
 use aruna_core::structs::execution::job::{
-    AttemptControl, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, JobRecordError,
-    JobResultPayload, MAX_MESSAGE_BYTES, OutputObject,
+    AttemptControl, ExecutionSpec, JobError, JobId, JobRecord, JobRecordError, JobResultPayload,
+    MAX_MESSAGE_BYTES, OutputObject,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
@@ -24,12 +24,9 @@ use tracing::{info, warn};
 
 use super::super::output_record::store_outputs;
 use super::super::store::attempt::{
-    cancel_execution, fail_execution, read_attempt_control, record_attempt_started,
-    transition_to_cancelling,
+    read_attempt_control, record_attempt_started, transition_to_cancelling,
 };
-use super::super::store::state::{
-    ExecutionCompleteOutcome, complete_cancelled, complete_execution, read_job_record,
-};
+use super::super::store::state::{ExecutionCompleteOutcome, complete_execution, read_job_record};
 use super::super::submit::schedule_drain_effect;
 use super::inventory::CollectOutputsOperation;
 use super::prepare::job_bucket;

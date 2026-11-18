@@ -457,25 +457,31 @@ mod tests {
     use crate::jobs::runtime_steps::requeue_call;
     use crate::jobs::store::JobMutationError;
     use crate::jobs::store::attempt::{AdoptOutcome, adopt_external_attempt, set_cancel_requested};
-    use crate::jobs::store::job_calls::RequeueOutcome;
     use crate::jobs::store::query::{insert_job, list_job_entries};
     use crate::jobs::store::state::{ClaimOutcome, claim_job, complete_job, record_attempt_intent};
+    use crate::jobs::store::state::{
+        RequeueOutcome, cancel_running_job, read_job_record, requeue_job,
+    };
     use crate::jobs::store::{JobMutation, mutate_job};
     use crate::tasks::job_runner::{handle_panic, run_job};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::events::Event;
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
     use aruna_core::structs::execution::job::{
         AttemptIntent, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
         ImportRoCrateTarget, JobClaim, JobPayload, JobResultPayload, RoCrateLimits,
     };
-    use aruna_core::structs::execution::job::{JobError, JobPayload, JobState};
+    use aruna_core::structs::execution::job::{JobError, JobErrorKind, JobState};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_millis;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::TaskHandle;
+    use byteview::ByteView;
+    use futures_util::future::FutureExt;
+    use std::time::Duration;
     use tempfile::tempdir;
     use ulid::Ulid;
 
