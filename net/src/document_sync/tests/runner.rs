@@ -76,6 +76,9 @@ impl<'a> Backends<'a> {
                             start,
                             applied,
                         } => service.overflow_page_event(topic, start, applied),
+                        DocumentEffect::NoteGitRecord { document_id } => {
+                            service.note_git_record(document_id)
+                        }
                         other => panic!("unexpected document effect: {other:?}"),
                     }))
                 }

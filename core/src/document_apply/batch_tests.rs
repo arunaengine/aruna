@@ -11,6 +11,7 @@ use super::super::fixtures::{
 use super::*;
 use crate::calls::IoError;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+use crate::events::{Event, NetEvent};
 
 type Answer = Result<Next<BatchOutcome>, ApplyError>;
 
@@ -102,6 +103,56 @@ fn applies_document_event() {
     };
     let outcome = done(batch.next(child(applied)));
     assert_eq!(outcome.applied_targets, vec![config_target()]);
+}
+
+fn git_applied(document_id: Ulid) -> IoResult {
+    child(ApplyOutcome::Applied {
+        target: config_target(),
+        tombstone: None,
+        git_document: Some(document_id),
+    })
+}
+
+fn net_answer_of(event: DocumentNetEvent) -> IoResult {
+    IoResult::Event(Box::new(Event::Net(NetEvent::DocumentSync(event))))
+}
+
+#[test]
+fn notes_git_records() {
+    let document_id = Ulid::from_parts(5, 5);
+    let mut batch = operation(vec![upsert(config_target())]);
+    batch.first().unwrap();
+    let note = DocumentEffect::NoteGitRecord { document_id };
+    let note = Effect::Net(NetEffect::DocumentSync(note));
+    assert_eq!(
+        batch.next(git_applied(document_id)),
+        Ok(Next::Call(IoCall::Effect(Box::new(note))))
+    );
+    let noted = net_answer_of(DocumentNetEvent::GitRecordNoted);
+    let outcome = done(batch.next(noted));
+    assert_eq!(outcome.applied_targets, vec![config_target()]);
+}
+
+#[test]
+fn reports_note_failure() {
+    let document_id = Ulid::from_parts(5, 5);
+    let mut batch = operation(vec![upsert(config_target())]);
+    batch.first().unwrap();
+    batch.next(git_applied(document_id)).unwrap();
+    let failed = net_answer_of(DocumentNetEvent::Error {
+        target: None,
+        error: "offline".to_string(),
+    });
+    assert_eq!(
+        batch.next(failed),
+        Err(ApplyError::Failed("offline".to_string()))
+    );
+
+    let mut batch = operation(vec![upsert(config_target())]);
+    batch.first().unwrap();
+    batch.next(git_applied(document_id)).unwrap();
+    let other = net_answer_of(DocumentNetEvent::RealmPeersReloaded);
+    assert!(matches!(batch.next(other), Err(ApplyError::Failed(_))));
 }
 
 #[test]

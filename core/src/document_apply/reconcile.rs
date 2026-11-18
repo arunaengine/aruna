@@ -342,7 +342,10 @@ impl ReconcileTopicsOperation {
     }
 }
 
-fn net_answer(result: IoResult, expected: &'static str) -> Result<DocumentNetEvent, ApplyError> {
+pub(super) fn net_answer(
+    result: IoResult,
+    expected: &'static str,
+) -> Result<DocumentNetEvent, ApplyError> {
     match event(result)? {
         Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
             Err(ApplyError::Failed(error))

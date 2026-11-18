@@ -223,6 +223,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
                 start,
                 applied,
             } => NetEvent::DocumentSync(document_sync.overflow_page_event(topic, start, applied)),
+            aruna_core::DocumentEffect::NoteGitRecord { document_id } => {
+                NetEvent::DocumentSync(document_sync.note_git_record(document_id))
+            }
             aruna_core::DocumentEffect::ReloadRealmPeers => {
                 NetEvent::DocumentSync(aruna_core::document::DocumentNetEvent::Error {
                     target: None,
