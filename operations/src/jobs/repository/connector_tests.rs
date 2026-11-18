@@ -41,7 +41,7 @@ fn request(credential: Option<RepositoryCredential>) -> ConnectRequest {
 
 fn past_access(operation: &mut ConnectOperation) {
     operation.first().unwrap();
-    operation.next(child::<(), AccessError>(Ok(()))).unwrap();
+    operation.next(child::<(), AuthorizeError>(Ok(()))).unwrap();
 }
 
 fn invenio() -> IoResult {
@@ -81,10 +81,10 @@ fn denied_access_final() {
         operation.first(),
         Ok(Next::Call(IoCall::Child(_)))
     ));
-    let denied = child::<(), AccessError>(Err(AccessError::Denied("no".into())));
+    let denied = child::<(), AuthorizeError>(Err(AuthorizeError::PermissionDenied));
     assert_eq!(
         operation.next(denied),
-        Err(TransferError::Permanent("no".into()))
+        Err(TransferError::Permanent("permission denied".into()))
     );
 }
 
@@ -92,10 +92,12 @@ fn denied_access_final() {
 fn unavailable_access_retries() {
     let mut operation = ConnectOperation::new(request(None));
     operation.first().unwrap();
-    let failed = child::<(), AccessError>(Err(AccessError::Unavailable("later".into())));
+    let failed = child::<(), AuthorizeError>(Err(AuthorizeError::CheckFailed("later".into())));
     assert_eq!(
         operation.next(failed),
-        Err(TransferError::Retryable("later".into()))
+        Err(TransferError::Retryable(
+            "authorization check failed: later".into()
+        ))
     );
 }
 

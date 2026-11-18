@@ -22,7 +22,6 @@ use crate::harvest::read_connector::ConnectorView;
 
 use super::executor::{JobContext, ProgressReporter};
 
-pub mod access;
 pub mod check;
 pub mod connector;
 pub mod invenio;

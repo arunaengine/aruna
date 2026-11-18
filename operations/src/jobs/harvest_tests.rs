@@ -388,7 +388,7 @@ fn routed(answer: Result<(), HarvestWriteFailure>) -> IoResult {
 }
 
 fn allowed() -> IoResult {
-    child::<(), HarvestFailure>(Ok(()))
+    child::<(), AuthorizeError>(Ok(()))
 }
 
 fn stored_row() -> IoResult {
@@ -614,58 +614,53 @@ fn rejected_record_permanent() {
     );
 }
 
-fn access() -> HarvestAccessOperation {
-    HarvestAccessOperation::new(
-        AuthContext {
-            user_id: link().created_by,
-            realm_id: realm(),
-            path_restrictions: None,
-            session: None,
-        },
-        source().group_id,
-        "imported/doc".into(),
-        document(),
-    )
+/// An update of a live record, waiting for its access check.
+fn checking_access() -> ApplyRecordOperation {
+    let mut operation = apply(false);
+    let live = provenance(HarvestRecordState::Live, 50);
+    operation.next(read_answer(Some(&live))).unwrap();
+    operation
 }
 
 #[test]
-fn access_checks_paths() {
-    let mut operation = access();
-    assert!(matches!(
-        operation.first(),
-        Ok(Next::Call(IoCall::Child(_)))
-    ));
-    let group = child::<(), AccessError>(Ok(()));
-    assert!(matches!(
-        operation.next(group),
-        Ok(Next::Call(IoCall::Child(_)))
-    ));
+fn access_checks_create() {
+    let mut operation = apply(false);
+    let live = provenance(HarvestRecordState::Live, 50);
+    let path = harvest_document_path("imported", "oai:1").unwrap();
+    let expected = AuthorizeCreateOperation::new(
+        realm(),
+        &operation.owner(),
+        PolicyRequestExtras::default(),
+        source().group_id,
+        &path,
+        document(),
+        CreateScope::Group,
+    );
     assert_eq!(
-        operation.next(child::<(), AccessError>(Ok(()))),
-        Ok(Next::Done(()))
+        operation.next(read_answer(Some(&live))),
+        Ok(Next::Call(IoCall::child(expected)))
     );
 }
 
 #[test]
 fn denial_names_path() {
-    let mut operation = access();
-    operation.first().unwrap();
-    let denied = child::<(), AccessError>(Err(AccessError::Denied("no".into())));
+    let path = harvest_document_path("imported", "oai:1").unwrap();
+    let denied = child::<(), AuthorizeError>(Err(AuthorizeError::PermissionDenied));
     assert_eq!(
-        operation.next(denied),
-        Err(permanent(
-            "harvest write to [imported/doc] is not permitted"
-        ))
+        checking_access().next(denied),
+        Err(permanent(format!(
+            "harvest write to [{path}] is not permitted"
+        )))
     );
 }
 
 #[test]
 fn unavailable_access_retries() {
-    let mut operation = access();
-    operation.first().unwrap();
-    let failed = child::<(), AccessError>(Err(AccessError::Unavailable("later".into())));
+    let failed = child::<(), AuthorizeError>(Err(AuthorizeError::CheckFailed("later".into())));
     assert_eq!(
-        operation.next(failed),
-        Err(retryable("harvest permission check: later"))
+        checking_access().next(failed),
+        Err(retryable(
+            "harvest permission check: authorization check failed: later"
+        ))
     );
 }
