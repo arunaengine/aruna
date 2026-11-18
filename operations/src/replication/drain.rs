@@ -115,16 +115,16 @@ fn failed(error: impl std::fmt::Display) -> BlobQueueError {
 
 /// Sets the drain's timer from the queue when the node starts.
 #[derive(Debug, Default, PartialEq)]
-pub struct RestoreBlobTimerOperation {
+pub struct RestoreDrainOperation {
     setting: bool,
 }
 
-impl Operation for RestoreBlobTimerOperation {
+impl Operation for RestoreDrainOperation {
     type Output = ();
     type Error = IoError;
 
     fn first(&mut self) -> Result<Next<()>, IoError> {
-        Ok(Next::Call(IoCall::child(NextBlobTimerOperation::new())))
+        Ok(Next::Call(IoCall::child(NextTimerOperation::new())))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
@@ -162,12 +162,12 @@ enum TimerStep {
 
 /// When the drain must run next, from the obligations, bootstraps and due jobs.
 #[derive(Debug, PartialEq)]
-pub struct NextBlobTimerOperation {
+pub struct NextTimerOperation {
     now_ms: u64,
     step: TimerStep,
 }
 
-impl NextBlobTimerOperation {
+impl NextTimerOperation {
     pub fn new() -> Self {
         Self {
             now_ms: 0,
@@ -186,13 +186,13 @@ impl NextBlobTimerOperation {
     }
 }
 
-impl Default for NextBlobTimerOperation {
+impl Default for NextTimerOperation {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Operation for NextBlobTimerOperation {
+impl Operation for NextTimerOperation {
     type Output = Option<Duration>;
     type Error = BlobQueueError;
 
@@ -261,7 +261,7 @@ enum BatchStep {
 /// One drain: obligations become jobs, member jobs of reference records go out in pages, and
 /// a bounded number of other jobs is delivered one by one.
 #[derive(Debug, PartialEq)]
-pub struct ProcessBlobBatchOperation<T> {
+pub struct ProcessBatchOperation<T> {
     transport: T,
     routing: NodeRouting,
     serving: Serving,
@@ -284,7 +284,7 @@ pub struct ProcessBlobBatchOperation<T> {
 
 type BatchTurn = Turn<BlobDrainResult>;
 
-impl<T: PageTransport> ProcessBlobBatchOperation<T> {
+impl<T: PageTransport> ProcessBatchOperation<T> {
     pub fn new(transport: T, routing: NodeRouting, serving: Serving) -> Self {
         Self {
             transport,
@@ -455,7 +455,7 @@ impl<T: PageTransport> ProcessBlobBatchOperation<T> {
     }
 }
 
-impl<T: PageTransport> Operation for ProcessBlobBatchOperation<T> {
+impl<T: PageTransport> Operation for ProcessBatchOperation<T> {
     type Output = BlobDrainResult;
     type Error = BlobQueueError;
 
@@ -531,14 +531,14 @@ pub(super) type SourceRefusal = (SourceAuthorizationError, Option<GroupId>);
 
 /// Loads what the source node allows a job's caller, for the bucket's group.
 #[derive(Debug, PartialEq)]
-pub(super) struct LoadSourceAuthOperation {
+pub(super) struct LoadAuthOperation {
     auth_context: Option<AuthContext>,
     source_node_id: NodeId,
     bucket: String,
     group_id: Option<GroupId>,
 }
 
-impl LoadSourceAuthOperation {
+impl LoadAuthOperation {
     pub(super) fn new(auth_context: AuthContext, source_node_id: NodeId, bucket: &str) -> Self {
         Self {
             auth_context: Some(auth_context),
@@ -549,7 +549,7 @@ impl LoadSourceAuthOperation {
     }
 }
 
-impl Operation for LoadSourceAuthOperation {
+impl Operation for LoadAuthOperation {
     type Output = Result<SourceAuthorization, SourceRefusal>;
     type Error = BlobQueueError;
 
@@ -907,7 +907,7 @@ impl ProcessJobOperation {
         let source_auth = job_source_auth(&self.job, &creator).clone();
         let source_node = relationship.source.node_id;
         self.creator = Some(creator);
-        let load = LoadSourceAuthOperation::new(source_auth, source_node, &bucket);
+        let load = LoadAuthOperation::new(source_auth, source_node, &bucket);
         self.call(JobStep::RelationAuth, IoCall::child(load))
     }
 
@@ -923,7 +923,7 @@ impl ProcessJobOperation {
             Ok(local) => local,
             Err(error) => return self.finish(Err(error)),
         };
-        let load = LoadSourceAuthOperation::new(writer, local, &self.job.input.bucket);
+        let load = LoadAuthOperation::new(writer, local, &self.job.input.bucket);
         self.call(JobStep::WriterAuth, IoCall::child(load))
     }
 
@@ -1676,7 +1676,7 @@ mod step_tests {
     }
 
     #[test]
-    fn empty_queue_ends_pass() {
+    fn empty_queue_ends() {
         let mut scan = ScanJobsOperation::new(5, 1);
         assert!(matches!(scan.first(), Ok(Next::Call(IoCall::Read(_)))));
         let turn = scan.next(IoResult::Values(vec![None]));
@@ -1689,7 +1689,7 @@ mod step_tests {
     }
 
     #[test]
-    fn unchanged_cursor_not_written() {
+    fn unchanged_cursor_skipped() {
         let mut advance = AdvanceCursorOperation::new(ReplicationScanCursor::default());
         assert!(matches!(advance.first(), Ok(Next::Call(IoCall::Read(_)))));
         let answer = IoResult::Values(vec![None]);
@@ -1710,15 +1710,15 @@ mod step_tests {
     }
 
     #[test]
-    fn no_jobs_read_nothing() {
+    fn jobless_reads_nothing() {
         let mut read = JobRelationshipsOperation::new(&[]);
         assert_eq!(read.first(), Ok(Next::Done(HashMap::new())));
     }
 
     #[test]
-    fn batch_starts_with_obligations() {
+    fn batch_starts_obligations() {
         let routing = NodeRouting::default();
-        let mut batch = ProcessBlobBatchOperation::new(MetadataPages, routing, None);
+        let mut batch = ProcessBatchOperation::new(MetadataPages, routing, None);
         assert!(matches!(batch.first(), Ok(Next::Call(IoCall::Child(_)))));
     }
 }

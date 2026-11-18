@@ -148,7 +148,7 @@ use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
 use crate::replication::drain::{
-    ProcessBlobBatchOperation, REPLICATION_RETRY_AFTER, RestoreBlobTimerOperation,
+    ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
 };
 use crate::replication::page::deliver::MetadataPages;
 use crate::s3::bucket::key::lock::LockBucketOperation;

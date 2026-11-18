@@ -422,9 +422,9 @@ mod tests {
 
     use super::super::drain::{
         AdvanceCursorOperation, BlobDrainResult, BlobJobScan, JobRelationshipsOperation,
-        LoadSourceAuthOperation, ProcessBlobBatchOperation, REPLICATION_CURSOR_KEY,
-        ReplicationScanCursor, ScanJobsOperation, SourceRefusal, StoreRelationshipOperation,
-        job_source_auth, mark_failure, mark_progress, mark_success, reschedule_call,
+        LoadAuthOperation, ProcessBatchOperation, REPLICATION_CURSOR_KEY, ReplicationScanCursor,
+        ScanJobsOperation, SourceRefusal, StoreRelationshipOperation, job_source_auth,
+        mark_failure, mark_progress, mark_success, reschedule_call,
     };
     use super::super::page::deliver::MetadataPages;
     use super::super::retire::{BlobJobOutcome, RetireJobOperation};
@@ -461,7 +461,7 @@ mod tests {
         DeleteObligationOperation, LiveRepairResult, LiveRepairWrite, OBLIGATION_BATCH_SIZE,
         ProcessObligationsOperation, REPLICATION_JOB_LIMIT, REPLICATION_PAGE_SIZE,
         REPLICATION_RELATIONSHIP_LIMIT, ReadRelationshipsOperation, RelationshipPage,
-        RetireObligationsOperation, WriteLiveJobsOperation, WriteObligationOperation,
+        RetireObligationsOperation, WriteJobsOperation, WriteObligationOperation,
     };
     use super::super::version_replication::SourceAuthorization;
     use crate::testing::test_context;
@@ -469,7 +469,7 @@ mod tests {
     async fn process_blob_batch(
         context: &DriverContext,
     ) -> Result<BlobDrainResult, BlobQueueError> {
-        let drain = ProcessBlobBatchOperation::new(
+        let drain = ProcessBatchOperation::new(
             MetadataPages,
             crate::driver::node_routing(context),
             context.node_and_realm(),
@@ -498,7 +498,7 @@ mod tests {
         source_node: NodeId,
         bucket: &str,
     ) -> Result<SourceAuthorization, SourceRefusal> {
-        let load = LoadSourceAuthOperation::new(auth, source_node, bucket);
+        let load = LoadAuthOperation::new(auth, source_node, bucket);
         drive(load, context).await.expect("the check runs")
     }
 
@@ -614,7 +614,7 @@ mod tests {
         members: Vec<BlobJobRecord>,
     ) -> Result<LiveRepairWrite, BlobQueueError> {
         let context = test_context(storage.clone());
-        let write = WriteLiveJobsOperation::new(obligation, relationships, members);
+        let write = WriteJobsOperation::new(obligation, relationships, members);
         drive(write, &context).await
     }
 
@@ -1453,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn kept_job_records_consent() {
+    fn kept_job_consents() {
         // A preferred job stays, and only the granted request is written for it.
         let mut operation = QueueBlobOperation::new(on_demand_input(), None).with_plaintext(true);
         let turn = operation.keep_existing();
@@ -1467,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_timer_keeps_job() {
+    fn timer_failure_keeps() {
         // The job is durable, so a drain timer that cannot be set is reported, not an error.
         let mut operation = QueueBlobOperation::new(on_demand_input(), None);
         operation.state = QueueBlobState::ScheduleDrain;

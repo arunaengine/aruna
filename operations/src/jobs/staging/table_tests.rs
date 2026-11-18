@@ -1011,7 +1011,7 @@ async fn import_records(
         }
         loop {
             let drained = crate::driver::drive(
-                crate::replication::drain::ProcessBlobBatchOperation::new(
+                crate::replication::drain::ProcessBatchOperation::new(
                     crate::replication::page::deliver::MetadataPages,
                     crate::driver::node_routing(&drain),
                     (&drain).node_and_realm(),

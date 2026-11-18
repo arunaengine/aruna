@@ -30,7 +30,7 @@ use super::*;
 use crate::distribution::test_record::{binding, realm, replicated, secret, store_record};
 use crate::distribution::test_store::{context, install, open};
 use crate::driver::{DriverContext, drive};
-use crate::replication::drain::ProcessBlobBatchOperation;
+use crate::replication::drain::ProcessBatchOperation;
 use crate::replication::page::apply::tests::source;
 use aruna_core::structs::storage::replication_queue::{
     LiveObligationRecord, live_obligation_entry,
@@ -233,7 +233,7 @@ async fn drain_batch(
     context: &DriverContext,
     sender: &Member,
 ) -> Result<crate::replication::drain::BlobDrainResult, BlobQueueError> {
-    let drain = ProcessBlobBatchOperation::new(
+    let drain = ProcessBatchOperation::new(
         sender.clone(),
         crate::driver::node_routing(context),
         context.node_and_realm(),

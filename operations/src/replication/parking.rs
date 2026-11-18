@@ -716,7 +716,7 @@ mod tests {
 
     async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>, BlobQueueError> {
         let context = test_context(storage.clone());
-        drive(NextBlobTimerOperation::new(), &context).await
+        drive(NextTimerOperation::new(), &context).await
     }
 
     async fn process_transitions(
@@ -749,7 +749,7 @@ mod tests {
             _ => Ok(()),
         }
     }
-    use crate::replication::drain::NextBlobTimerOperation;
+    use crate::replication::drain::NextTimerOperation;
     use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};

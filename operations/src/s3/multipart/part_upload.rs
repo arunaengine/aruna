@@ -172,10 +172,9 @@ impl UploadPartOperation {
         Ok(Next::Call(call))
     }
 
-    /// Rejects an already-fenced destination before accepting the part body. The commit
-    /// transaction rechecks the same row after the bytes move. One round trip then answers
-    /// "does this upload exist", "does the subject that admitted it still hold" and "is this
-    /// part number already acknowledged".
+    /// Rejects an already-fenced destination before accepting the part body; the commit rechecks
+    /// the row after the bytes move. The same round trip reads the upload, the subject that
+    /// admitted it and whether this part number is already acknowledged.
     fn fence_checked(&mut self, value: Option<Value>) -> PartTurn {
         let input = &self.input;
         check_fence_row(value.as_deref(), &input.bucket, &input.key)?;
@@ -949,7 +948,7 @@ mod test {
     }
 
     #[test]
-    fn short_body_rolls_back() {
+    fn short_body_rollback() {
         let mut op = writing();
         op.input.content_length = Some(9);
         let written = BlobEvent::WriteFinished {
@@ -1129,7 +1128,7 @@ mod test {
     }
 
     #[test]
-    fn stale_fence_stops_part() {
+    fn stale_fence_stops() {
         let mut op = part_op();
         assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
         let invalid = IoResult::Values(vec![Some(Value::from(vec![0xFF]))]);

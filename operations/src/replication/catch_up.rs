@@ -940,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn no_network_no_bootstrap() {
+    fn offline_skips_bootstrap() {
         let mut process = ProcessBootstrapOperation::new(None);
         assert_eq!(process.first(), Ok(Next::Done(false)));
     }

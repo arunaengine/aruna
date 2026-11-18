@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn no_paths_no_scan() {
+    fn pathless_skips_scan() {
         let mut intents = PathIntentsOperation::new(Ulid::nil(), &[]);
         assert_eq!(intents.first(), Ok(Next::Done(PathIntents::new())));
         let mut taken = TakenPathsOperation::new(&[], &["a"]);
@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn intents_stop_past_range() {
+    fn intents_stop_early() {
         let id = Ulid::from_parts(2, 2);
         let version = Ulid::from_parts(3, 3);
         let inside = aruna_core::structs::storage::backend_import::intent_key(id, "a", version);

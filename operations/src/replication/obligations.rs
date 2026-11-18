@@ -280,7 +280,7 @@ impl ProcessObligationsOperation {
                 continue;
             }
             self.worked += 1;
-            let write = WriteLiveJobsOperation::new(&obligation, relationships, members);
+            let write = WriteJobsOperation::new(&obligation, relationships, members);
             let step = PassStep::Jobs(Box::new((key, obligation)));
             return self.call(step, IoCall::child(write));
         }
@@ -904,7 +904,7 @@ enum LiveStep {
 
 /// Queues the member and relationship jobs one obligation owes now.
 #[derive(Debug, PartialEq)]
-pub(super) struct WriteLiveJobsOperation {
+pub(super) struct WriteJobsOperation {
     obligation: LiveObligationRecord,
     page: Option<RelationshipPage>,
     members: Vec<BlobJobRecord>,
@@ -922,7 +922,7 @@ fn no_progress() -> LiveRepairWrite {
     }
 }
 
-impl WriteLiveJobsOperation {
+impl WriteJobsOperation {
     pub(super) fn new(
         obligation: &LiveObligationRecord,
         page: Option<&RelationshipPage>,
@@ -1002,7 +1002,7 @@ impl WriteLiveJobsOperation {
     }
 }
 
-impl Operation for WriteLiveJobsOperation {
+impl Operation for WriteJobsOperation {
     type Output = LiveRepairWrite;
     type Error = BlobQueueError;
 
@@ -1131,7 +1131,7 @@ mod step_tests {
     }
 
     #[test]
-    fn nothing_to_retire_ends() {
+    fn empty_retire_ends() {
         let mut retire = RetireObligationsOperation::new(Vec::new(), Vec::new(), (None, None));
         assert_eq!(retire.first(), Ok(Next::Done(())));
     }
@@ -1145,7 +1145,7 @@ mod step_tests {
     }
 
     #[test]
-    fn zero_limit_reads_nothing() {
+    fn zero_limit_skips() {
         let mut read = ReadRelationshipsOperation::new("b", None, 0);
         let expected = RelationshipPage {
             values: Vec::new(),
@@ -1163,7 +1163,7 @@ mod step_tests {
     }
 
     #[test]
-    fn empty_pass_moves_on() {
+    fn empty_pass_advances() {
         let mut pass = ProcessObligationsOperation::new();
         assert!(matches!(pass.first(), Ok(Next::Call(IoCall::Read(_)))));
         let turn = pass.next(IoResult::Values(vec![None]));

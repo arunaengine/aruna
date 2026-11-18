@@ -89,7 +89,7 @@ type StorageTurn = Result<Next<BucketStoragePage>, BucketStorageError>;
 /// One page of the group's buckets with their storage and job, and the next page's cursor. The
 /// group's routing inputs load once, as for one upload; each bucket resolves like an upload.
 #[derive(Debug, PartialEq)]
-pub struct ListBucketStorageOperation {
+pub struct BucketStorageOperation {
     group_id: GroupId,
     after: Option<String>,
     limit: usize,
@@ -107,7 +107,7 @@ pub struct ListBucketStorageOperation {
     found: Vec<BucketStorage>,
 }
 
-impl ListBucketStorageOperation {
+impl BucketStorageOperation {
     pub fn new(
         routing: NodeRouting,
         group_id: GroupId,
@@ -223,7 +223,7 @@ impl ListBucketStorageOperation {
     }
 }
 
-impl Operation for ListBucketStorageOperation {
+impl Operation for BucketStorageOperation {
     type Output = BucketStoragePage;
     type Error = BucketStorageError;
 
@@ -412,8 +412,7 @@ mod tests {
     fn empty_page_ends() {
         use aruna_core::calls::ChildOutcome;
         let group = Ulid::from_parts(1, 1);
-        let mut operation =
-            ListBucketStorageOperation::new(NodeRouting::default(), group, (None, 5));
+        let mut operation = BucketStorageOperation::new(NodeRouting::default(), group, (None, 5));
         assert!(matches!(
             operation.first(),
             Ok(Next::Call(IoCall::Child(_)))

@@ -35,9 +35,7 @@ async fn durable_rearm_loop(
             return;
         };
         ticks = ticks.saturating_add(1);
-        drive(RestoreBlobTimerOperation::default(), &context)
-            .await
-            .ok();
+        drive(RestoreDrainOperation::default(), &context).await.ok();
         let refresh = crate::s3::object::metadata_drain::RestoreRefreshTimer::new();
         if let Err(error) = drive(refresh, &context).await {
             warn!(?error, "Failed to scan reference metadata refresh jobs");
@@ -333,9 +331,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        drive(RestoreBlobTimerOperation::default(), &context)
-            .await
-            .ok();
+        drive(RestoreDrainOperation::default(), &context).await.ok();
         if stopped() {
             return;
         }
@@ -580,7 +576,7 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_replication_queue(&self) {
-        let drain = ProcessBlobBatchOperation::new(
+        let drain = ProcessBatchOperation::new(
             MetadataPages,
             node_routing(&self.context),
             self.context.node_and_realm(),

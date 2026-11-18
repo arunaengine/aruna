@@ -256,7 +256,7 @@ async fn sync_job_runs() {
     drive(queue, &fixture.ctx).await.unwrap();
 
     let drained = crate::driver::drive(
-        crate::replication::drain::ProcessBlobBatchOperation::new(
+        crate::replication::drain::ProcessBatchOperation::new(
             crate::replication::page::deliver::MetadataPages,
             crate::driver::node_routing(&fixture.ctx),
             (&fixture.ctx).node_and_realm(),
