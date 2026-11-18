@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use super::{Action, TransferError, ensure_supported, not_supported, remote_answer, remote_call};
 use crate::jobs::export::ExportCheckpoint;
-use crate::jobs::import::archive::{ArchiveCompression, ArchiveEntry, ArchiveInspection};
+use aruna_core::rocrate_archive::{ArchiveCompression, ArchiveEntry, ArchiveInspection};
 
 /// What a repository of `kind` needs from a crate: the requirement Profile findings, then the
 /// mapping rule findings, and what each crate entity becomes. Only the crate counts, so

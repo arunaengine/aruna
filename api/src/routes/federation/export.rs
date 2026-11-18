@@ -26,7 +26,7 @@ use aruna_operations::federation::grant::{
     RevokeGrantOperation, export_access,
 };
 use aruna_operations::federation::import::header_value;
-use aruna_operations::jobs::export::{crate_jsonld, unheld_bucket};
+use aruna_operations::jobs::export::{CrateJsonOperation, UnheldBucketOperation};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -371,13 +371,16 @@ async fn check_holder(
     node_id: aruna_core::NodeId,
 ) -> Result<(), GrantError> {
     let (auth, limit) = (&spec.auth_context, spec.limits.metadata_bytes);
-    let (jsonld, _) = crate_jsonld(context, auth, spec.document_id, limit)
+    let local = context.net_handle.as_ref().map(|net| net.node_id());
+    let read = CrateJsonOperation::new(local, auth.clone(), spec.document_id, limit);
+    let (jsonld, _) = drive(read, context)
         .await
         .map_err(|error| GrantError::Storage(error.to_string()))?;
-    match unheld_bucket(context, spec, node_id, &jsonld).await {
+    let check = UnheldBucketOperation::new(spec.clone(), node_id, jsonld);
+    match drive(check, context).await {
         Ok(None) => Ok(()),
         Ok(Some(bucket)) => Err(GrantError::NotHolder(bucket)),
-        Err(error) => Err(GrantError::Storage(error)),
+        Err(error) => Err(GrantError::Storage(error.0)),
     }
 }
 

@@ -15,7 +15,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::harvest::read_connector::{
     ConnectorView, GetRepositoryOperation, ReadConnectorError,
 };
-use aruna_operations::jobs::export::crate_jsonld;
+use aruna_operations::jobs::export::CrateJsonOperation;
 use aruna_operations::jobs::repository::check::{CrateCheck, RequirementCheck, profile_failure};
 use aruna_operations::jobs::repository::link_queue::OwnerHoldsOperation;
 use aruna_operations::jobs::repository::link_store::{
@@ -372,10 +372,10 @@ pub(crate) async fn requirements(
     let context = state.get_ctx();
     let metadata_bytes = state.rocrate_limits().metadata_bytes;
     let checked = async {
-        let (jsonld, _) =
-            Box::pin(crate_jsonld(&context, auth, document_id, metadata_bytes)).await?;
-        let check = CrateCheck::new(view.connector.kind, &view.connector.endpoint, &jsonld)?;
         let local = context.net_handle.as_ref().map(|net| net.node_id());
+        let read = CrateJsonOperation::new(local, auth.clone(), document_id, metadata_bytes);
+        let (jsonld, _) = Box::pin(drive(read, &context)).await?;
+        let check = CrateCheck::new(view.connector.kind, &view.connector.endpoint, &jsonld)?;
         let assess = ProfileAssessOperation::against(local, check.profile_iri, jsonld.clone());
         let status = Box::pin(drive(assess, &context))
             .await

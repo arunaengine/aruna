@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_blob::archive::zip_entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 
@@ -26,7 +27,6 @@ use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::route_read;
 use crate::driver::drive;
-use crate::jobs::export::archive::zip_entry;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
