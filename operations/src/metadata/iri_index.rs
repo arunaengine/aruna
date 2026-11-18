@@ -32,7 +32,7 @@ use crate::metadata::call_results::page_rows;
 use crate::metadata::live_records::LiveRecordsOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
 
-use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows, iter_page};
+use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows};
 use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
     start_write_transaction,

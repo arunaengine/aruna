@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::tests::{local_candidate, remote_candidate, selected_scope, source_scope};
+use super::super::tests::{remote_candidate, selected_scope, source_scope, stored_candidate};
 use super::*;
 use crate::jobs::repository::test_support::child;
 
@@ -15,7 +15,7 @@ fn event(event: Event) -> IoResult {
 }
 
 fn reading() -> OpenCandidateOperation {
-    let mut open = opening(local_candidate());
+    let mut open = opening(stored_candidate());
     open.step = OpenStep::Read {
         blake3: [1; 32],
         held: None,
@@ -37,7 +37,7 @@ fn selection_denies_remote() {
 // A local candidate starts with the caller's access.
 #[test]
 fn local_checks_access() {
-    let mut open = opening(local_candidate());
+    let mut open = opening(stored_candidate());
     assert!(matches!(open.first(), Ok(Next::Call(IoCall::Child(_)))));
     assert!(matches!(open.step, OpenStep::Access(_)));
 }
@@ -45,10 +45,10 @@ fn local_checks_access() {
 // A local candidate needs its hash, and without a version it is missing.
 #[test]
 fn local_needs_identity() {
-    let mut candidate = local_candidate();
+    let mut candidate = stored_candidate();
     candidate.resolved_version = None;
     assert_eq!(opening(candidate).first(), Ok(status(OpenStatus::Missing)));
-    let mut candidate = local_candidate();
+    let mut candidate = stored_candidate();
     candidate.expected_blake3 = None;
     assert!(matches!(
         opening(candidate).first(),
@@ -72,7 +72,7 @@ fn access_refusals_map() {
         (LocalOpen::Denied, OpenStatus::Denied),
         (LocalOpen::NotHolder, OpenStatus::NotHolder),
     ] {
-        let mut open = opening(local_candidate());
+        let mut open = opening(stored_candidate());
         open.first().unwrap();
         let answer = child(Ok::<_, ResolveError>(answer));
         assert_eq!(open.next(answer), Ok(status(expected)));
@@ -82,7 +82,7 @@ fn access_refusals_map() {
 // An admitted plain copy is read from its backend.
 #[test]
 fn admitted_reads_blob() {
-    let mut open = opening(local_candidate());
+    let mut open = opening(stored_candidate());
     open.first().unwrap();
     let answer = child(Ok::<_, ResolveError>(LocalOpen::Admitted(None)));
     assert!(matches!(

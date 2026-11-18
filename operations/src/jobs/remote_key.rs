@@ -34,7 +34,7 @@ use crate::jobs::key_locks::{
 };
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::remote_wait::{
     OwedPage, OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
 };
@@ -663,9 +663,9 @@ impl Operation for DeliverWakesOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::store::test_calls::park_job;
+    use crate::jobs::store::job_calls::ClaimOutcome;
     use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::state::ClaimOutcome;
+    use crate::jobs::store::test_calls::park_job;
     use crate::jobs::store::test_calls::{claim_job, read_job_record};
     use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn paging_reaches_later() {
-        use crate::jobs::store::key_wait::WAKE_PAGE;
+        use crate::jobs::store::row_calls::WAKE_PAGE;
 
         let dir = tempfile::tempdir().unwrap();
         let context = empty_context(&dir);

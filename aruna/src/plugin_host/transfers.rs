@@ -5,13 +5,11 @@
 
 use std::collections::HashMap;
 
-use aruna_core::errors::ConversionError;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::job::{JobError, JobResultPayload, PluginWorkSpec, UploadForm};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
-use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_outbound::{OutboundHandle, TransferError, UploadBody};
@@ -20,8 +18,9 @@ use ulid::Ulid;
 use super::plugin_work::{PROGRESS_TICK, key_wait, permanent, refused};
 use aruna_operations::driver::{drive, node_routing};
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::jobs::executor::{JobContext, JobRunOutcome};
+use aruna_operations::jobs::executor::JobRunOutcome;
 use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::plugins::copy_steps::read_locked;
 use aruna_operations::plugins::transfer_steps::{
     KeepReply, PrepareDownload, PrepareUpload, TransferEnd, TransferWork, UploadReply, account,
     check_answer, send_end, source_gone, write_failure,
@@ -29,6 +28,7 @@ use aruna_operations::plugins::transfer_steps::{
 use aruna_operations::plugins::work::{WorkChange, WorkRow, begin_send, update_work};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::tasks::job_context::JobContext;
 
 /// What a download writes: its target, the version minted once, expected digests and a bound.
 pub struct Download<'a> {
@@ -226,7 +226,7 @@ pub async fn upload_work(
     // The object is open before the boundary moves, so a parked attempt never looks sent.
     let source = match drive(read, &ctx.driver).await {
         Ok(source) => source,
-        Err(error) if locked(&error) => {
+        Err(error) if read_locked(&error) => {
             return key_wait(ctx, install, (bucket, key, Some(version))).await;
         }
         Err(GetObjectError::NoSuchKey | GetObjectError::NoSuchVersion) => {
@@ -287,13 +287,6 @@ pub async fn upload_work(
     match drive(keep, &ctx.driver).await {
         Ok(end) | Err(end) => outcome(end),
     }
-}
-
-fn locked(error: &GetObjectError) -> bool {
-    matches!(
-        error,
-        GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(_)))
-    )
 }
 
 fn retryable(message: impl Into<String>) -> JobRunOutcome {

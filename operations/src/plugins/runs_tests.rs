@@ -11,7 +11,7 @@ use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 #[allow(unused_imports)]
 pub(crate) use crate::plugins::test_support::queued;
-use aruna_core::plugin_runs::{RunState, RunTrigger};
+use aruna_core::plugin_runs::RunState;
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};
 

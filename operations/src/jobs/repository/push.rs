@@ -25,7 +25,8 @@ use super::links::{LinkChange, LinkError};
 use super::{JobScope, TransferError};
 use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::export::ExportCheckpoint;
-use crate::jobs::store::{JobMutationError, job_rows::PutRowsOperation};
+use crate::jobs::store::job_rows::PutRowsOperation;
+use crate::jobs::store::mutation_error::JobMutationError;
 
 /// The row of an export job's checkpoint.
 fn checkpoint_row(job_id: JobId) -> (String, aruna_core::types::Key) {

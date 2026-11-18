@@ -558,8 +558,11 @@ pub async fn lookup_identifier_distributed(
                 value,
                 endpoint,
             };
-            crate::driver::drive(IdentifierLookupOperation::new(realm_id, auth, query), &context)
-                .await
+            crate::driver::drive(
+                IdentifierLookupOperation::new(realm_id, auth, query),
+                &context,
+            )
+            .await
             .map_err(|_| MetadataReadError::Unavailable)
         },
     );

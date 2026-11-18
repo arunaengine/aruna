@@ -21,7 +21,7 @@ use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 
-use super::store::JobMutationError;
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{
     self, SchedulePage, artifact_tombstone_key, job_entry_deletes, preserve_artifact_tombstone,
     read_job_record, schedule_page, staging_row_deletes,
@@ -427,7 +427,7 @@ pub(crate) mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::JOB_RETENTION_MS;
-    use crate::jobs::store::state::ClaimOutcome;
+    use crate::jobs::store::job_calls::ClaimOutcome;
     use crate::jobs::store::test_calls::insert_job;
     use crate::jobs::store::test_calls::put_job_entry;
     use crate::jobs::store::test_calls::read_job_record;

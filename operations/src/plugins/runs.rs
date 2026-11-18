@@ -230,7 +230,9 @@ impl Operation for Unfinished {
 
 /// The rows that save a run: its record, and its queue row marked for attention or, once it
 /// ended, removed.
-pub fn saved_rows(run: &PluginRun) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
+pub(crate) fn saved_rows(
+    run: &PluginRun,
+) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
     let mut rows = vec![row(
         PLUGIN_RUNS_KEYSPACE,
         run_key(run.install_id, run.run_id),
@@ -354,7 +356,7 @@ impl Operation for ResolveRun {
 /// The runs that ended longer than `RUN_RETENTION_MS` ago and may go, as install and run ids.
 /// A run waiting for a person, for its job's end, or whose calls may have had effects or cannot
 /// be read stays.
-pub fn expired_runs(now_ms: u64) -> ExpiredRuns {
+pub(crate) fn expired_runs(now_ms: u64) -> ExpiredRuns {
     ExpiredRuns {
         now_ms,
         phase: ExpiredPhase::Runs(Scan::new(PLUGIN_RUNS_KEYSPACE, vec![RUN_ROW])),
@@ -458,7 +460,7 @@ impl Operation for ExpiredRuns {
 }
 
 /// Deletes one run record and every intent and stored reply of the run in one transaction.
-pub fn drop_run((install_id, run_id): (Ulid, Ulid)) -> DropRun {
+pub(crate) fn drop_run((install_id, run_id): (Ulid, Ulid)) -> DropRun {
     DropRun {
         key: run_key(install_id, run_id),
         intents: intent_scan(run_id),
@@ -519,7 +521,7 @@ impl Operation for DropRun {
 
 /// The runs a completion still waits on among the work `rows`: those of works not notified yet,
 /// which keep their record until the completion is delivered or dropped.
-pub fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
+pub(crate) fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
     let mut runs = Vec::new();
     for (_, value) in rows {
         let row: WorkRow = decode(&value)?;
@@ -633,7 +635,7 @@ pub struct TimerRow {
 }
 
 /// A queued run of the install's current revision, due at `due_ms`.
-pub fn new_run(
+pub(crate) fn new_run(
     install: &PluginInstall,
     handler: String,
     trigger: RunTrigger,
@@ -662,7 +664,7 @@ pub fn new_run(
 }
 
 /// Queues the due occurrence of an install's timer, or counts it as skipped over the queue bound.
-pub fn enqueue_timer(
+pub(crate) fn enqueue_timer(
     install: &PluginInstall,
     handler: String,
     interval_ms: u64,
@@ -819,7 +821,7 @@ impl Operation for PruneRuns {
 }
 
 /// The trigger of `kind` the install's pinned version declares.
-pub fn declared_trigger(
+pub(crate) fn declared_trigger(
     config: &RealmConfigDocument,
     install: &PluginInstall,
     kind: TriggerKind,

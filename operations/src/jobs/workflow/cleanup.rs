@@ -13,8 +13,8 @@ use aruna_core::structs::storage::blob::UserAccess;
 use ulid::Ulid;
 
 use super::super::executor::JobRunOutcome;
-use super::super::store::JobMutationError;
 use super::super::store::job_calls::{authorize_cleanup, record_attempt_tombstone};
+use super::super::store::mutation_error::JobMutationError;
 use super::compute::{attempt_call, compute_answer};
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 
@@ -301,11 +301,12 @@ mod tests {
 
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::executor::{JobContext, ProgressReporter};
+    use crate::jobs::executor::ProgressReporter;
     use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;
+    use crate::tasks::job_context::JobContext;
 
     async fn run_terminal_cleanup(
         ctx: &JobContext,

@@ -27,7 +27,8 @@ use thiserror::Error;
 use crate::device::sync::pull::ForwardPullOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::transport::{peer_answer, peer_call};
-use crate::jobs::store::{JobMutationError, row_calls};
+use crate::jobs::store::mutation_error::JobMutationError;
+use crate::jobs::store::row_calls;
 use crate::jobs::workflow::run_crate::RecordCrateOperation;
 use crate::metadata::protocol::MetadataTransportMessage;
 

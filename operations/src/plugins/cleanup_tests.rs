@@ -4,20 +4,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::drive;
-use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_runs::{GapReason, SourceKind, gap_key, reported_key};
-use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 #[allow(unused_imports)]
 pub(crate) use crate::plugins::flow_support::cleanup::count;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::matcher::tests::{config, journal};
+use crate::plugins::matcher::tests::config;
 use crate::plugins::rows::encode;
 use crate::plugins::rows::tests::page_result;
 use crate::plugins::store::Txn;
-use crate::plugins::test_support::{created, installed};
+use crate::plugins::test_support::installed;
 use aruna_core::calls::IoCall;
 
 #[tokio::test]

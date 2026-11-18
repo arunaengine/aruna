@@ -150,7 +150,11 @@ impl Operation for IntentWritten {
 }
 
 /// The intent row that records the call's reply, written with the call's effect where it has one.
-pub fn settled_row(run_id: Ulid, intent: &CallIntent, reply: String) -> Result<Row, StoreError> {
+pub(crate) fn settled_row(
+    run_id: Ulid,
+    intent: &CallIntent,
+    reply: String,
+) -> Result<Row, StoreError> {
     intent_row(run_id, intent, IntentState::Settled { reply })
 }
 
@@ -162,7 +166,7 @@ pub fn unknown_row(run_id: Ulid, intent: &CallIntent, reason: &str) -> Result<Ro
 
 /// The key of a call's intent, removed when the call ended without an effect so it may be made
 /// again.
-pub fn intent_row_key(run_id: Ulid, intent: &CallIntent) -> (&'static str, Vec<u8>) {
+pub(crate) fn intent_row_key(run_id: Ulid, intent: &CallIntent) -> (&'static str, Vec<u8>) {
     let key = intent_key(run_id, intent.ordinal);
     (PLUGIN_INTENTS_KEYSPACE, key)
 }
@@ -177,7 +181,7 @@ fn intent_row(run_id: Ulid, intent: &CallIntent, state: IntentState) -> Result<R
 }
 
 /// Reads every intent of a run.
-pub fn intent_scan(run_id: Ulid) -> Scan {
+pub(crate) fn intent_scan(run_id: Ulid) -> Scan {
     Scan::new(PLUGIN_INTENTS_KEYSPACE, run_id.to_bytes().to_vec())
 }
 
@@ -207,7 +211,7 @@ impl Operation for OpenIntent {
 }
 
 /// The reason of the first pending or unknown intent among `rows`.
-pub fn first_open(rows: &Rows) -> Result<Option<String>, StoreError> {
+pub(crate) fn first_open(rows: &Rows) -> Result<Option<String>, StoreError> {
     for (key, value) in rows {
         let ordinal = key.get(16..).map(<[u8]>::to_vec).unwrap_or_default();
         let ordinal = <[u8; 4]>::try_from(ordinal.as_slice()).map(u32::from_be_bytes);
@@ -228,7 +232,7 @@ pub fn first_open(rows: &Rows) -> Result<Option<String>, StoreError> {
 }
 
 /// A person's decision on every pending or unknown intent among a run's `rows`.
-pub fn resolved_rows(rows: Rows, done: bool) -> Result<Vec<Row>, StoreError> {
+pub(crate) fn resolved_rows(rows: Rows, done: bool) -> Result<Vec<Row>, StoreError> {
     let mut resolved = Vec::new();
     for (key, value) in rows {
         let mut record = decode::<IntentRecord>(&value)?;
@@ -245,7 +249,7 @@ pub fn resolved_rows(rows: Rows, done: bool) -> Result<Vec<Row>, StoreError> {
 
 /// The intents among a run's `rows` a person resolved as not done, removed so a retry makes
 /// those calls again; the other intents, settled replies among them, stay.
-pub fn undone_keys(rows: Rows) -> Result<Vec<(&'static str, Vec<u8>)>, StoreError> {
+pub(crate) fn undone_keys(rows: Rows) -> Result<Vec<(&'static str, Vec<u8>)>, StoreError> {
     let mut undone = Vec::new();
     for (key, value) in rows {
         let record = decode::<IntentRecord>(&value)?;
@@ -257,7 +261,7 @@ pub fn undone_keys(rows: Rows) -> Result<Vec<(&'static str, Vec<u8>)>, StoreErro
 }
 
 /// The keys of every intent among a run's `rows`.
-pub fn intent_keys(rows: Rows) -> Vec<(&'static str, Vec<u8>)> {
+pub(crate) fn intent_keys(rows: Rows) -> Vec<(&'static str, Vec<u8>)> {
     let keys = rows
         .into_iter()
         .map(|(key, _)| (PLUGIN_INTENTS_KEYSPACE, key));

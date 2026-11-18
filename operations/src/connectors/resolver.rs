@@ -26,8 +26,8 @@ use aruna_core::types::{GroupId, TxnId};
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    StorageReadError, iter_connectors_effect, parse_connector_iter, parse_secret_read,
-    read_secret_effect, source_connector_key,
+    iter_connectors_effect, parse_connector_iter, parse_secret_read, read_secret_effect,
+    source_connector_key,
 };
 use crate::connectors::root_record::{parse_root, read_root};
 use crate::harvest::create_connector::INVENIO_TOKEN;
@@ -68,15 +68,6 @@ enum ResolveBindingState {
     ReadOfferedDirectory,
     ReadRepository,
     ReadRepositorySecret,
-}
-
-impl From<StorageReadError> for SourceResolutionError {
-    fn from(value: StorageReadError) -> Self {
-        match value {
-            StorageReadError::Storage(error) => Self::StorageError(error),
-            StorageReadError::Conversion(error) => Self::ConversionError(error),
-        }
-    }
 }
 
 #[derive(Debug, PartialEq)]

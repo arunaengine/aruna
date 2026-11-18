@@ -27,7 +27,7 @@ type Pairs<'a> = &'a [(String, String)];
 
 /// The request a run asks for, with the connection's address resolved from the settings the run
 /// was admitted with; a work row keeps it, so its job needs no run. No credential header is kept.
-pub fn request_context(
+pub(crate) fn request_context(
     manifest: &Manifest,
     (connection, method): (&str, Method),
     settings: &str,

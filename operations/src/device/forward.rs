@@ -56,9 +56,9 @@ use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
+use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::load_config::config_unavailable;
 use crate::realm::node_name::{NodeDisplays, NodeNameError, ReadNamesOperation};
-use crate::metadata::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use aruna_core::errors::StorageReadError;
 
@@ -863,7 +863,8 @@ impl DeviceBatchOperation {
     fn update(&mut self) -> BatchTurn {
         let (node_id, realm_id) = node_ids(self.ids)?;
         let record = self.record()?;
-        let auth = self.auth.as_ref().ok_or(IoError::Unfinished)?;
+        let (group_id, public) = (record.group_id, record.public);
+        let user_id = self.auth.as_ref().ok_or(IoError::Unfinished)?.user_id;
         let placeholder = MetadataTransportMessage::Reject(String::new());
         let MetadataTransportMessage::ForwardApplyBatch {
             document_id,
@@ -877,12 +878,12 @@ impl DeviceBatchOperation {
         let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: Actor {
                 node_id,
-                user_id: auth.user_id,
+                user_id,
                 realm_id,
             },
-            group_id: record.group_id,
+            group_id,
             document_id,
-            public: record.public,
+            public,
             mutation: UpdateDocumentMutation::ApplyBatch { batch, authored },
             expected_revision: None,
         });

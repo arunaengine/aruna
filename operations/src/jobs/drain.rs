@@ -18,8 +18,8 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 
-use super::store::JobMutationError;
 use super::store::job_calls::{ClaimOutcome, RequeueOutcome, claim_job, requeue_job};
+use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{SchedulePage, first_schedule_entry, read_job_record, schedule_page};
 use super::store::store_call::RowBatch;
 use super::{DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};

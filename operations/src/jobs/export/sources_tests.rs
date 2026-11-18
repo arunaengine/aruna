@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::tests::{local_candidate, plain_entity, source_scope};
+use super::super::tests::{plain_entity, source_scope, stored_candidate};
 use super::*;
 use crate::jobs::import::job_call;
 use crate::jobs::repository::test_support::child;
@@ -24,7 +24,7 @@ fn resolved_state() -> AliasState {
     let mut state = AliasState::default();
     state
         .resolved
-        .insert([1; 32], (vec![local_candidate()], true));
+        .insert([1; 32], (vec![stored_candidate()], true));
     state
 }
 
@@ -46,7 +46,7 @@ fn stops_become_failures() {
 #[test]
 fn state_seeds_aliases() {
     let mut entity = plain_entity("a");
-    let mut candidate = local_candidate();
+    let mut candidate = stored_candidate();
     candidate.report_source = ExportReportSource::Hash;
     entity.candidates = vec![candidate];
     let state = AliasState::of(&[entity]);
@@ -58,7 +58,7 @@ fn state_seeds_aliases() {
 #[test]
 fn policies_load_once() {
     let mut entity = plain_entity("a");
-    entity.candidates = vec![local_candidate()];
+    entity.candidates = vec![stored_candidate()];
     let state = AliasState::default();
     assert_eq!(state.candidate_groups(&[entity]).len(), 1);
     assert!(state.candidate_groups(&[]).is_empty());
@@ -80,7 +80,7 @@ fn known_asks_holders() {
     assert!(matches!(lookup.first(), Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(lookup.step, HashStep::Holders);
     assert!(lookup.denied);
-    assert_eq!(lookup.candidates, vec![local_candidate()]);
+    assert_eq!(lookup.candidates, vec![stored_candidate()]);
 }
 
 // Failed holder discovery is reported, and it does not fail the export.

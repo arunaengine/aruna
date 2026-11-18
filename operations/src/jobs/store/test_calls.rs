@@ -2,10 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::KeyWait;
-use aruna_core::structs::storage::distribution::hint::SetHint;
-use aruna_core::structs::storage::encryption::BucketKeyRef;
-use std::collections::BTreeMap;
 use super::attempt_intent::AttemptCommit;
 use super::job_calls::AdoptOutcome;
 use super::job_calls::CancelRequestOutcome;
@@ -20,7 +16,13 @@ use super::list_jobs::ListJobsOperation;
 use super::park_wake::AwaitOutcome;
 use super::*;
 use super::{job_calls, row_calls};
+use crate::driver::DriverContext;
 use crate::driver::drive;
+use aruna_core::structs::execution::job::KeyWait;
+use aruna_core::structs::storage::distribution::hint::SetHint;
+use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_core::types::TxnId;
+use std::collections::BTreeMap;
 
 pub(crate) async fn adopt_external_attempt(
     context: &DriverContext,
@@ -604,4 +606,21 @@ pub(crate) async fn wake_key_waits(
     now_ms: u64,
 ) -> Result<usize, JobMutationError> {
     drive(row_calls::wake_key_waits(key, now_ms), context).await
+}
+
+pub(crate) async fn settle_attempt<T>(
+    result: Result<T, JobMutationError>,
+    attempt: u32,
+    exhausted: &str,
+) -> Option<Result<T, JobMutationError>> {
+    match result {
+        Err(JobMutationError::Conflict) if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
+            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+            None
+        }
+        Err(JobMutationError::Conflict) => {
+            Some(Err(JobMutationError::Storage(exhausted.to_string())))
+        }
+        other => Some(other),
+    }
 }

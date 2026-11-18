@@ -14,7 +14,7 @@ use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::rows::{read_row, value};
 use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::persistent_id::persistent_id_key;
+use aruna_core::structs::persistent_id_key;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use ulid::Ulid;
 

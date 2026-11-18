@@ -5,7 +5,7 @@
 use super::super::tests::{bucket, entry, run};
 use super::*;
 use crate::jobs::repository::test_support::child;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 
 fn validating(step: Step) -> ValidateSourceOperation {
     let mut validate = ValidateSourceOperation::new(run(), ImportCheckpoint::default());

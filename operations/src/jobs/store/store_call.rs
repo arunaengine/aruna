@@ -10,7 +10,7 @@ use aruna_core::operation::{ByCalls, Operation};
 use aruna_core::rows::{done, read_row, value};
 use aruna_core::types::{Key, KeySpace, Value};
 
-use super::JobMutationError;
+use super::mutation_error::JobMutationError;
 use crate::jobs::MUTATE_MAX_ATTEMPTS;
 
 type StartCall = Box<dyn FnMut() -> IoCall + Send>;

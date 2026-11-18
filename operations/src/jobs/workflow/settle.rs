@@ -21,11 +21,11 @@ use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::updates::{
     PublishTerminalOperation, SETTLE_RETRY_AFTER, schedule_terminal_settle,
 };
-use crate::jobs::store::JobMutationError;
 use crate::jobs::store::job_calls::{
     CancelRequestOutcome, ParkOutcome, RunSuccess, cancel_execution, complete_cancelled,
     fail_execution, mark_indeterminate, requeue_before_attempt, set_cancel_requested,
 };
+use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
 use crate::jobs::submit::schedule_drain_effect;
 

@@ -5,7 +5,6 @@
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::delete_document::DeleteDocumentError;
-use crate::metadata::message_kind::MetadataRequestDelivery;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::UpdateDocumentError;
@@ -92,19 +91,6 @@ pub(crate) fn read_error(error: MetadataApiError) -> MetadataReadError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RetryDisposition {
-    TryNext,
-    Stop,
-}
-
-pub(crate) fn retry_disposition(delivery: MetadataRequestDelivery) -> RetryDisposition {
-    match delivery {
-        MetadataRequestDelivery::DefinitelyNotSent => RetryDisposition::TryNext,
-        MetadataRequestDelivery::PossiblySent => RetryDisposition::Stop,
-    }
-}
-
 pub(crate) fn unexpected_response(response: MetadataTransportMessage) -> MetadataWriteError {
     MetadataWriteError::Undeliverable(format!(
         "unexpected forwarded metadata response: {}",
@@ -157,13 +143,16 @@ pub(crate) fn peer_call_within(
     message: &MetadataTransportMessage,
     timeout: std::time::Duration,
 ) -> Result<aruna_core::calls::IoCall, String> {
-    let frame = crate::metadata::protocol::encode_message(message).map_err(|error| error.to_string())?;
+    let frame =
+        crate::metadata::protocol::encode_message(message).map_err(|error| error.to_string())?;
     let request = aruna_core::effects::MetadataRequestEffect {
         peer,
         frame,
         timeout,
     };
-    let effect = aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(Box::new(request)));
+    let effect = aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(
+        Box::new(request),
+    ));
     Ok(aruna_core::calls::IoCall::from(effect))
 }
 
@@ -177,9 +166,17 @@ pub(crate) fn peer_answer(
 /// The peer's decoded answer and how long the request took.
 pub(crate) fn timed_answer(
     result: aruna_core::calls::IoResult,
-) -> Result<(Result<MetadataTransportMessage, String>, std::time::Duration), aruna_core::calls::IoError> {
+) -> Result<
+    (
+        Result<MetadataTransportMessage, String>,
+        std::time::Duration,
+    ),
+    aruna_core::calls::IoError,
+> {
     let answer = match result.event()? {
-        aruna_core::events::Event::Net(aruna_core::events::NetEvent::MetadataAnswer(answer)) => answer,
+        aruna_core::events::Event::Net(aruna_core::events::NetEvent::MetadataAnswer(answer)) => {
+            answer
+        }
         other => {
             return Err(aruna_core::calls::IoError::Unexpected {
                 expected: "Event::Net(NetEvent::MetadataAnswer)",
@@ -188,7 +185,9 @@ pub(crate) fn timed_answer(
         }
     };
     let decoded = match answer.result {
-        Ok(bytes) => crate::metadata::protocol::decode_message(&bytes).map_err(|error| error.to_string()),
+        Ok(bytes) => {
+            crate::metadata::protocol::decode_message(&bytes).map_err(|error| error.to_string())
+        }
         Err(error) => Err(format!("{error:?}")),
     };
     Ok((decoded, answer.elapsed))

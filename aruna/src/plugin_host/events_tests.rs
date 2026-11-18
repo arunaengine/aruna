@@ -38,13 +38,12 @@ use aruna_operations::plugins::flow_support::matcher::journal;
 use aruna_operations::plugins::runs::list_runs;
 use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::bare;
 use aruna_operations::plugins::test_support::created;
+use aruna_operations::plugins::test_support::drain_blob_batch;
 use aruna_operations::plugins::test_support::echoed_sync;
 use aruna_operations::plugins::test_support::install_artifact;
 use aruna_operations::plugins::test_support::installed;
 use aruna_operations::plugins::test_support::scoped;
-use aruna_operations::replication::drain::process_blob_batch;
 use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::sync::sync_relationship::StoreRelationshipOperation;
 use aruna_operations::sync::sync_relationship::SyncRelationshipDirection::Outgoing;
@@ -181,7 +180,7 @@ async fn sync_job_runs() {
     let queue = QueueBlobOperation::new_relationship(input, None, relationship.id);
     drive(queue, &fixture.ctx).await.unwrap();
 
-    let drained = process_blob_batch(&fixture.ctx).await.unwrap();
+    let drained = drain_blob_batch(&fixture.ctx).await;
     assert_eq!(drained.succeeded, 1);
     for _ in 0..2 {
         let worker = worker(&fixture);

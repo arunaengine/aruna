@@ -173,10 +173,9 @@ impl RoutedStatusOperation {
     }
 
     fn route(&mut self, config: RealmConfigDocument) -> StatusTurn {
-        let unavailable = |_| MetadataApiError::ServiceUnavailable;
-        let config_digest = config.digest().map_err(unavailable)?;
+        let config_digest = (config.digest()).map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let placement = resolve_metadata_id(&config, self.realm_id, None, self.request.document_id)
-            .map_err(unavailable)?;
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
         let holders = read_holder_sets(&config, &placement)
             .map_err(MetadataApiError::PlacementUnavailable)?;
         let message = MetadataTransportMessage::ForwardValidationStatus {

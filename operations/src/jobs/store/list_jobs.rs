@@ -6,6 +6,7 @@ use super::*;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
 use std::collections::VecDeque;
+use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ListJobsError {

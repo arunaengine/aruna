@@ -17,8 +17,8 @@ use serde::de::DeserializeOwned;
 use ulid::Ulid;
 
 use super::MUTATE_MAX_ATTEMPTS;
-use super::store::JobMutationError;
 use super::store::job_rows::{PutEntryOperation, PutRowsOperation};
+use super::store::mutation_error::JobMutationError;
 
 /// Why a job's stored state could not be read.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

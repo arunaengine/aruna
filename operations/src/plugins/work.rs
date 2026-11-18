@@ -22,7 +22,7 @@ use super::rows::{
 };
 
 /// The row of a work under its key.
-fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {
+pub(crate) fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {
     Ok(row(PLUGIN_WORK_KEYSPACE, key, encode(work)?))
 }
 
@@ -216,11 +216,11 @@ pub enum Reserve {
     Earlier,
 }
 
-pub fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreError> {
+pub(crate) fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreError> {
     Ok([&[WORK_ROW][..], &install_id.to_bytes(), &encode(identity)?].concat())
 }
 
-pub fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
+pub(crate) fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
     [
         &[WORK_INDEX][..],
         &install_id.to_bytes(),
@@ -634,7 +634,7 @@ pub fn retried(status: u16) -> bool {
 
 /// The summary of a finished job, or `None` while it may still run. A job record that is gone
 /// leaves the outcome unknown.
-pub fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
+pub(crate) fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
     let Some(record) = record else {
         let mut gone = Summary::of(FinalState::Unknown);
         gone.message = Some("the job record is gone".into());
@@ -675,7 +675,7 @@ impl Summary {
 }
 
 /// Reads every work row.
-pub fn work_scan() -> Scan {
+pub(crate) fn work_scan() -> Scan {
     Scan::new(PLUGIN_WORK_KEYSPACE, vec![WORK_ROW])
 }
 
@@ -869,7 +869,7 @@ pub fn dedup_key(work_id: Ulid) -> Vec<u8> {
     [&b"plugin-work/"[..], &work_id.to_bytes()].concat()
 }
 
-pub fn install_at(key: &[u8]) -> Option<Ulid> {
+pub(crate) fn install_at(key: &[u8]) -> Option<Ulid> {
     Some(Ulid::from_bytes(key.get(1..17)?.try_into().ok()?))
 }
 

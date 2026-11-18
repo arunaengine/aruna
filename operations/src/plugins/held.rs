@@ -168,7 +168,7 @@ pub struct PreparedRequest {
 /// The row's request checked against the install's current manifest, with the connection's secret
 /// released and added.
 #[derive(Debug, PartialEq)]
-pub struct PrepareRequest {
+pub(crate) struct PrepareRequest {
     config: Arc<RealmConfigDocument>,
     local: NodeId,
     install: PluginInstall,
@@ -177,7 +177,7 @@ pub struct PrepareRequest {
 }
 
 impl PrepareRequest {
-    pub fn new(
+    pub(crate) fn new(
         config: Arc<RealmConfigDocument>,
         local: NodeId,
         install: &PluginInstall,

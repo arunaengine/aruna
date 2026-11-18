@@ -28,7 +28,7 @@ use super::reads::{
 use super::*;
 use crate::jobs::page_intents::IntentReadError;
 use crate::jobs::run_rows::StateReadError;
-use crate::jobs::store::JobMutationError;
+use crate::jobs::store::mutation_error::JobMutationError;
 
 fn answer<T, E>(outcome: Result<T, E>) -> IoResult
 where

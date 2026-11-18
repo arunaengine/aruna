@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::super::tests::{local_candidate, op_spec, plain_entity, selected_spec};
+use super::super::tests::{op_spec, plain_entity, selected_spec, stored_candidate};
 use super::*;
 use crate::jobs::repository::test_support::{child, owner_node};
 
@@ -24,7 +24,7 @@ fn resolved(entities: Vec<ExportEntity>) -> IoResult {
 
 fn with_copy() -> ExportEntity {
     let mut entity = plain_entity("a");
-    entity.candidates = vec![local_candidate()];
+    entity.candidates = vec![stored_candidate()];
     entity
 }
 
