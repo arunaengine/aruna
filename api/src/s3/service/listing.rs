@@ -16,11 +16,11 @@ use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::multipart::parts::ListPartsResult;
 use aruna_operations::s3::multipart::uploads::ListUploadsResult;
 use aruna_operations::s3::object::list::ListedObject;
-use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListContinuationToken};
+use aruna_operations::s3::object::list::{
+    ListBucketInput as LOV2I, ListContinuationToken, decode_list_token, encode_list_token,
+};
 use aruna_operations::s3::object::versions::{ListVersionsItem, ListVersionsResult};
 use aruna_operations::s3::object::visible::{HiddenCursor, NextPage, VisibleError, visible_page};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{
     ChecksumType, CommonPrefix, DeleteMarkerEntry, ETag, EncodingType, Initiator,
@@ -96,11 +96,8 @@ impl ArunaS3Service {
     ) -> S3Result<Option<ListContinuationToken>> {
         token
             .map(|token| {
-                let decoded = STANDARD
-                    .decode(token)
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))?;
-                ListContinuationToken::from_bytes(&decoded)
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                decode_list_token(token)
+                    .ok_or_else(|| s3_error!(InvalidArgument, "Invalid continuation token"))
             })
             .transpose()
     }
@@ -110,9 +107,7 @@ impl ArunaS3Service {
     ) -> S3Result<Option<String>> {
         token
             .map(|token| {
-                token
-                    .to_bytes()
-                    .map(|bytes| STANDARD.encode(bytes))
+                encode_list_token(token)
                     .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))
             })
             .transpose()

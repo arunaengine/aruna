@@ -366,7 +366,7 @@ pub(crate) fn answers_timer(event: &TaskEvent, key: &TaskKey) -> bool {
         TaskEvent::Error { key: answered, .. } => {
             answered.as_ref().is_none_or(|answered| answered == key)
         }
-        TaskEvent::RunningHandlersAborted { .. } => false,
+        TaskEvent::RunningHandlersAborted { .. } | TaskEvent::BackgroundStarted { .. } => false,
     }
 }
 

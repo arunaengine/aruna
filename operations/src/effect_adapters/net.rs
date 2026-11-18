@@ -18,16 +18,43 @@ use aruna_core::native_reference::{
     DelegatedBody, DelegatedReadEffect, GrantedBody, GrantedReadEffect, NativeAuthority,
     NativeReferenceRequest, NativeReferenceResponse,
 };
-use aruna_core::structs::storage::distribution::delegation::SignedDelegation;
+use aruna_core::outbound::{OutboundEvent, RangeAnswer, RangeListing};
+use aruna_core::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
 use aruna_core::structs::storage::read_grant::SignedRequest;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use aruna_net::NetHandle;
+use aruna_outbound::ListingSigner;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tracing::warn;
 
 use crate::driver::DriverContext;
 use aruna_core::events::TopicPeerError;
+
+/// Signs the delegation of a range listing with this node's key.
+struct NodeSigner<'a>(Option<&'a NetHandle>);
+
+impl ListingSigner for NodeSigner<'_> {
+    fn sign(&self, delegation: Delegation) -> Option<SignedDelegation> {
+        let bytes = delegation.signing_bytes().ok()?;
+        Some(SignedDelegation {
+            signature: self.0?.sign(&bytes),
+            delegation,
+        })
+    }
+}
+
+/// Lists one key range through the outbound backend, signing with the net handle's key.
+pub(super) async fn dispatch_listing(listing: RangeListing, context: &DriverContext) -> Event {
+    let answer = match &context.outbound_handle {
+        Some(outbound) => {
+            let signer = NodeSigner(context.net_handle.as_ref());
+            outbound.list_range(listing, &signer).await
+        }
+        None => RangeAnswer::Silent,
+    };
+    Event::Outbound(OutboundEvent::RangeListed(Box::new(answer)))
+}
 
 /// Why signing fails on a node without a net handle, which holds the node key.
 const UNAVAILABLE: &str = "net transport unavailable";

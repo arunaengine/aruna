@@ -6,14 +6,18 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use serde::Deserialize;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::calls::IoError;
+use crate::compute::SharedSecret;
 use crate::injection::OutgoingRequest;
 use crate::structs::execution::email::SmtpTls;
 use crate::structs::execution::setting::SettingChannel;
+use crate::structs::storage::distribution::KeyRange;
+use crate::structs::storage::distribution::delegation::Delegation;
+use crate::{NodeId, UserId};
 
 /// Bytes of a connection answer a call reads at most, headers and body together.
 pub const MAX_CONNECTION_ANSWER: usize = 1024 * 1024;
@@ -31,6 +35,8 @@ pub enum OutboundEffect {
     Request(Box<HttpRequest>),
     /// Drops the cached mail sender unless it belongs to this profile revision.
     RefreshMail(Option<Ulid>),
+    /// Lists one key range at the member that holds it.
+    ListRange(Box<RangeListing>),
     /// Sends one request of a plugin connection and answers with what the service said.
     Connection(Box<ConnectionCall>),
 }
@@ -78,10 +84,93 @@ pub enum OutboundEvent {
         result: Result<u16, OutboundError>,
     },
     MailRefreshed,
+    /// The answer to an [`OutboundEffect::ListRange`].
+    RangeListed(Box<RangeAnswer>),
     /// The answer to an [`OutboundEffect::Connection`].
     ConnectionAnswered {
         result: Result<ConnectionAnswer, ConnectionError>,
     },
+}
+
+/// How a range listing proves its caller to the member. Never shown in a `Debug` print.
+#[derive(Clone, PartialEq)]
+pub enum RangeAccess {
+    /// The member's REST listing, with the caller's bearer token if there is one.
+    Bearer(Option<SharedSecret>),
+    /// The member's S3 listing under a delegation; the backend binds it to the request and has
+    /// this node sign it.
+    Delegated(Box<Delegation>),
+}
+
+impl std::fmt::Debug for RangeAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Bearer(_) => "RangeAccess::Bearer",
+            Self::Delegated(_) => "RangeAccess::Delegated",
+        })
+    }
+}
+
+/// One page of one key range, asked of the member at `node_id`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RangeListing {
+    /// The member's published endpoint for this kind of access.
+    pub base_url: String,
+    /// This node, which the member sees as the relay.
+    pub local_node: NodeId,
+    pub node_id: NodeId,
+    pub set_id: Ulid,
+    pub range: KeyRange,
+    /// Lists the member's copy while the range's coordinator cannot answer.
+    pub copy: bool,
+    pub bucket: String,
+    pub prefix: Option<String>,
+    pub delimiter: Option<String>,
+    pub limit: usize,
+    /// Where the page starts, in the form this kind of access uses.
+    pub position: Option<String>,
+    pub access: RangeAccess,
+}
+
+/// An object a member listed, with what its kind of listing tells.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct RangeEntry {
+    pub key: String,
+    pub version_id: String,
+    pub size: Option<u64>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_type: Option<String>,
+    pub referenced: bool,
+    pub content_id: Option<String>,
+}
+
+/// One page a member listed; `next` continues in the form of the listing's access.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RangePage {
+    pub objects: Vec<RangeEntry>,
+    pub prefixes: Vec<String>,
+    pub next: Option<String>,
+    pub stale_ranges: Vec<String>,
+}
+
+/// A member's refusal of a listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RangeRefusal {
+    pub node_id: NodeId,
+    pub status: u16,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+/// What listing one range came to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RangeAnswer {
+    Page(RangePage),
+    /// The member could not be asked or did not start answering in time.
+    Silent,
+    Refused(RangeRefusal),
 }
 
 /// One request of a plugin connection, with any secret already added.

@@ -194,6 +194,10 @@ pub enum BlobEvent {
     ReservationReleased {
         id: Ulid,
     },
+    /// The bytes of a collected stream, or why it broke off.
+    StreamCollected {
+        bytes: Result<Vec<u8>, String>,
+    },
     /// Whether the reservation is settled; `false` keeps it for a later pass.
     ReservationReconciled {
         done: bool,
@@ -493,7 +497,6 @@ pub enum NetEvent {
     SnapshotSign(SnapshotSignEvent),
     StatementSign(StatementSignEvent),
     ExecutionSign(ExecutionSignEvent),
-    Release(crate::structs::storage::release::ReleaseEvent),
     Error(NetError),
     /// Whether the node holds the complete artifact after the chunk, or why it was not stored.
     ArtifactStored(Result<bool, String>),
@@ -922,6 +925,7 @@ impl Event {
                     ReadFinished,
                     DeleteFinished,
                     ReservationReleased,
+                    StreamCollected,
                     ReservationReconciled,
                     HiddenSpooled,
                     HiddenRead,
@@ -1022,7 +1026,6 @@ impl Event {
                     SnapshotSign,
                     StatementSign,
                     ExecutionSign,
-                    Release,
                     Error,
                     ArtifactStored,
                     MetadataAnswer,

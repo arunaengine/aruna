@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_operations::s3::object::origin::{OriginError, SourceHealth, source_health};
+use aruna_operations::s3::object::origin::{OriginError, SourceHealth, SourceHealthOperation};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
@@ -140,11 +140,9 @@ pub async fn get_source_health(
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
     let context = state.get_ctx();
-    let sources = source_health(
+    let sources = aruna_operations::driver::drive(
+        SourceHealthOperation::new(info.group_id, (&bucket, &params.key), params.version_id),
         context.as_ref(),
-        info.group_id,
-        (&bucket, &params.key),
-        params.version_id,
     )
     .await
     .map_err(|error| match error {

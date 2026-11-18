@@ -17,11 +17,21 @@ mod task;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::key_index::{IndexError, IndexEvent};
-use aruna_core::outbound::{ConnectionError, OutboundEffect, OutboundError, OutboundEvent};
+use aruna_core::outbound::{
+    ConnectionError, OutboundEffect, OutboundError, OutboundEvent, RangeAnswer,
+};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
 use aruna_core::task::TaskEvent;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
+
+/// Children that run beside their caller at once; a caller finding no slot starts none.
+const BACKGROUND_CHILDREN: usize = 8;
+
+static BACKGROUND_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(BACKGROUND_CHILDREN)));
 
 #[tracing::instrument(
     name = "operation.effect",
@@ -83,13 +93,6 @@ async fn dispatch_unboxed(
         Effect::Net(NetEffect::Heartbeat(effect)) => {
             Box::pin(net::dispatch_heartbeat(*effect, context)).await
         }
-        // Release crate reads and holder requests need the runner's handles.
-        Effect::Net(NetEffect::Release(effect)) => Event::Net(NetEvent::Release(
-            Box::pin(crate::s3::bucket::release::publish::dispatch_release(
-                context, *effect,
-            ))
-            .await,
-        )),
         // A plugin artifact chunk travels over the metadata transport, which the runner holds.
         Effect::Net(NetEffect::ArtifactStore(store)) => {
             let stored = match context.metadata_handle.as_ref() {
@@ -146,6 +149,11 @@ async fn dispatch_unboxed(
             Event::Net(NetEvent::LocalNode(node))
         }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
+        Effect::Outbound(OutboundEffect::ListRange(listing))
+            if context.outbound_handle.is_some() =>
+        {
+            net::dispatch_listing(*listing, context).await
+        }
         Effect::Outbound(effect) => match context.outbound_handle.as_ref() {
             Some(outbound) => Event::Outbound(Box::pin(outbound.run(effect)).await),
             None => Event::Outbound(outbound_unavailable(&effect)),
@@ -164,7 +172,7 @@ async fn dispatch_unboxed(
             }
         }
         Effect::Background(child) => {
-            let slot = crate::distribution::pull::fill_slot();
+            let slot = BACKGROUND_SLOTS.clone().try_acquire_owned().ok();
             let started = slot.is_some();
             if let Some(slot) = slot {
                 let context = context.clone();
@@ -267,6 +275,7 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
         OutboundEffect::Request(_) => OutboundEvent::Answered { result: Err(error) },
         OutboundEffect::RefreshMail(_) => OutboundEvent::MailRefreshed,
+        OutboundEffect::ListRange(_) => OutboundEvent::RangeListed(Box::new(RangeAnswer::Silent)),
         OutboundEffect::Connection(_) => OutboundEvent::ConnectionAnswered {
             result: Err(ConnectionError::NotSent(
                 "this node sends no connection requests".to_string(),

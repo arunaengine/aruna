@@ -18,8 +18,8 @@ use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
 use aruna_core::structs::storage::format::{
     Compression, CompressionMigration, EncodingClass, StoredLayout,
 };
-use aruna_operations::blob::cleanup::process_cleanup_batch;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::blob::cleanup::{CleanupNode, ProcessCleanupOperation};
+use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::s3::bucket::compression::PutCompressionOperation;
 use aruna_operations::tasks::incoming::start_task_queues;
@@ -83,7 +83,15 @@ async fn migrates_bucket_copies() {
         assert_eq!(content(&context, &small).await, key.as_bytes());
     }
     // The second write that lost to the shared copy is removed by reconciliation.
-    let outcome = process_cleanup_batch(&context.driver).await.unwrap();
+    let outcome = drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome.failed, 0);
 
     // A run after completion has nothing left to do.

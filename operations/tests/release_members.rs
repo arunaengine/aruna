@@ -31,8 +31,8 @@ use aruna_operations::jobs::lifecycle::remote_inputs::{RemoteInputsOperation, Re
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::metadata::PutMetadataOperation;
-use aruna_operations::s3::bucket::release::publish::release_files;
-use aruna_operations::s3::bucket::release::read::{load_access, release_members};
+use aruna_operations::s3::bucket::release::access::{LoadAccessOperation, MembersCheckOperation};
+use aruna_operations::s3::bucket::release::publish::ReleaseFilesOperation;
 use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use serde_json::json;
@@ -89,9 +89,11 @@ async fn ask(
         auth: &auth,
         bearer: None,
     };
-    Ok(release_members(context, scope, caller, queries)
-        .await?
-        .answers)
+    Ok(
+        drive(MembersCheckOperation::new(scope, caller, queries), context)
+            .await?
+            .answers,
+    )
 }
 
 #[tokio::test]
@@ -462,12 +464,24 @@ async fn release_files_page() -> TestResult<()> {
         bucket: BUCKET,
         info: &info,
     };
-    let access = load_access(context, scope, &realm.auth_context()).await?;
+    let access = drive(
+        LoadAccessOperation::new(scope, &realm.auth_context()),
+        context,
+    )
+    .await?;
     let asked = ("db/", "db/release.json");
-    let (first, next) = release_files(context, scope, &access, asked, (None, None)).await?;
+    let (first, next) = drive(
+        ReleaseFilesOperation::new(scope, &access, asked, (None, None)),
+        context,
+    )
+    .await?;
     assert_eq!(first.len(), 256);
     assert_eq!(next.as_deref(), Some("db/0255.fasta"));
-    let (rest, next) = release_files(context, scope, &access, asked, (None, next)).await?;
+    let (rest, next) = drive(
+        ReleaseFilesOperation::new(scope, &access, asked, (None, next)),
+        context,
+    )
+    .await?;
     assert_eq!(rest.len(), count - 256);
     assert_eq!(rest[0].key, "db/0256.fasta");
     assert_eq!(next, None);
@@ -497,8 +511,12 @@ async fn release_files_page() -> TestResult<()> {
         }]),
         ..realm.auth_context()
     };
-    let access = load_access(context, scope, &restricted).await?;
-    let (files, next) = release_files(context, scope, &access, asked, (Some(&range), None)).await?;
+    let access = drive(LoadAccessOperation::new(scope, &restricted), context).await?;
+    let (files, next) = drive(
+        ReleaseFilesOperation::new(scope, &access, asked, (Some(&range), None)),
+        context,
+    )
+    .await?;
     let keys: Vec<_> = files.iter().map(|file| file.key.as_str()).collect();
     assert_eq!(keys.len(), 10);
     assert_eq!(keys[0], "db/0100.fasta");

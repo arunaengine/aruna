@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::{
     BUCKET_RELEASE_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE,
 };
@@ -27,8 +25,7 @@ use aruna_core::structs::storage::distribution::{DistributionView, KeyRange};
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::OriginVersion;
 use aruna_core::structs::storage::release::{
-    CrateBytes, CrateRead, CrateReadError, HolderAnswer, HolderAsk, HolderRequest, ReleaseEffect,
-    ReleaseEvent, ValidRelease,
+    CrateBytes, CrateRead, CrateReadError, HolderAnswer, HolderAsk, ValidRelease,
 };
 use aruna_core::structs::storage::release::{MembershipQuery, ReleaseMembers};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
@@ -37,6 +34,7 @@ use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
+use self::holder::{AskHolderError, AskHolderOperation, ReadCrateOperation};
 use crate::auth::request_authorization::BucketAccess;
 
 /// Rows read per storage page while looking for a bucket's releases.
@@ -83,6 +81,35 @@ impl BucketScope<'_> {
             key,
             version_id,
         )
+    }
+}
+
+/// A bucket's identity, kept by the operations that run after their caller's borrow ended.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OwnedScope {
+    pub(crate) realm_id: RealmId,
+    pub(crate) node_id: NodeId,
+    pub(crate) bucket: String,
+    pub(crate) info: BucketInfo,
+}
+
+impl OwnedScope {
+    pub(crate) fn of(scope: BucketScope<'_>) -> Self {
+        Self {
+            realm_id: scope.realm_id,
+            node_id: scope.node_id,
+            bucket: scope.bucket.to_string(),
+            info: scope.info.clone(),
+        }
+    }
+
+    pub(crate) fn scope(&self) -> BucketScope<'_> {
+        BucketScope {
+            realm_id: self.realm_id,
+            node_id: self.node_id,
+            bucket: &self.bucket,
+            info: &self.info,
+        }
     }
 }
 
@@ -304,7 +331,7 @@ impl ReleaseMembersOperation {
             realm_id: self.config.realm_id,
             node_id: self.config.node_id,
         };
-        release_call(ReleaseEffect::ReadCrate(Box::new(read)))
+        Next::Call(IoCall::child(ReadCrateOperation::new(read)))
     }
 
     fn on_crate(&mut self, read: Result<CrateBytes, CrateReadError>) -> Step {
@@ -411,19 +438,16 @@ impl ReleaseMembersOperation {
             return self.finish();
         };
         self.state = MembersState::Holder;
-        let request = HolderRequest {
-            node_id,
-            bearer,
-            bucket: self.config.bucket.clone(),
-            ask: HolderAsk::Members {
-                range_ids,
-                queries: self.config.queries.clone(),
-            },
+        let ask = HolderAsk::Members {
+            range_ids,
+            queries: self.config.queries.clone(),
         };
-        release_call(ReleaseEffect::Holder(request))
+        let holder = AskHolderOperation::new(node_id, &bearer, &self.config.bucket, ask)
+            .infrastructure_only(self.config.realm_id);
+        Next::Call(IoCall::child(holder))
     }
 
-    fn on_holder(&mut self, answer: Result<HolderAnswer, String>) -> Next<MembersOutput> {
+    fn on_holder(&mut self, answer: Result<HolderAnswer, AskHolderError>) -> Next<MembersOutput> {
         self.asked.pop();
         match answer {
             Ok(HolderAnswer::Members(members))
@@ -461,11 +485,6 @@ impl ReleaseMembersOperation {
     }
 }
 
-fn release_call(effect: ReleaseEffect) -> Next<MembersOutput> {
-    let effect = Effect::Net(NetEffect::Release(Box::new(effect)));
-    Next::Call(IoCall::Effect(Box::new(effect)))
-}
-
 impl Operation for ReleaseMembersOperation {
     type Output = MembersOutput;
     type Error = ReleaseError;
@@ -499,23 +518,14 @@ impl Operation for ReleaseMembersOperation {
                 let (values, next) = result.page()?;
                 self.on_rows(values, next)
             }
-            MembersState::Crate | MembersState::Holder => match result.event()? {
-                Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read)))
-                    if self.state == MembersState::Crate =>
-                {
-                    self.on_crate(read)
-                }
-                Event::Net(NetEvent::Release(ReleaseEvent::Holder(answer)))
-                    if self.state == MembersState::Holder =>
-                {
-                    Ok(self.on_holder(answer))
-                }
-                other => Err(IoError::Unexpected {
-                    expected: "the release answer of the current step",
-                    got: other.label(),
-                }
-                .into()),
-            },
+            MembersState::Crate => {
+                let read = result.child::<(CrateBytes, u64), CrateReadError>()?;
+                self.on_crate(read.map(|(found, _)| found))
+            }
+            MembersState::Holder => {
+                let answer = result.child::<HolderAnswer, AskHolderError>()?;
+                Ok(self.on_holder(answer))
+            }
         }
     }
 }
@@ -561,8 +571,8 @@ pub(crate) fn upstream_of(crate_json: &Value) -> Vec<Identifier> {
 }
 
 pub mod access;
+pub mod holder;
 pub mod publish;
-pub mod read;
 pub mod view;
 
 #[cfg(test)]

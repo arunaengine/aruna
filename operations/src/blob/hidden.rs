@@ -117,17 +117,12 @@ fn no_blob_handle() -> MigrationError {
 /// Deletes one hidden blob.
 #[derive(Debug, PartialEq)]
 pub struct DeleteHiddenOperation {
-    key: Result<HiddenBlobKey, String>,
+    key: HiddenBlobKey,
 }
 
 impl DeleteHiddenOperation {
-    pub fn new(location: &BackendLocation) -> Self {
-        let key = HiddenBlobKey::try_from(location).map_err(|error| error.to_string());
-        Self { key }
-    }
-
     fn of_key(key: HiddenBlobKey) -> Self {
-        Self { key: Ok(key) }
+        Self { key }
     }
 }
 
@@ -136,8 +131,7 @@ impl Operation for DeleteHiddenOperation {
     type Error = MigrationError;
 
     fn first(&mut self) -> Turn<()> {
-        let key = self.key.clone().map_err(MigrationError::Failed)?;
-        Ok(Next::Call(delete_call(key)))
+        Ok(Next::Call(delete_call(self.key.clone())))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<()> {

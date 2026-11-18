@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::{LazyLock, Mutex as StdMutex};
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -36,7 +36,6 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -53,19 +52,8 @@ use crate::s3::object::read::HolderFailures;
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
 
-/// Fills that run detached from their read at once; a read finding none free keeps nothing.
-const DETACHED_FILLS: usize = 8;
-
-static FILL_SLOTS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(DETACHED_FILLS)));
-
 /// Kept copies being read, by backend path, with their reader counts.
 static PINS: LazyLock<StdMutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
-
-/// A slot for one detached fill, or `None` when all run; nobody waits for one.
-pub(crate) fn fill_slot() -> Option<OwnedSemaphorePermit> {
-    FILL_SLOTS.clone().try_acquire_owned().ok()
-}
 
 /// One read's hold on a kept copy: eviction leaves the bytes of a held copy to the hidden
 /// sweep, which spares them too while a read holds them.

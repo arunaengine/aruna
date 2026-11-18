@@ -1258,7 +1258,7 @@ mod tests {
             value: value.into(),
             txn_id: None,
         };
-        let event = send(context, write).await;
+        let event = context.storage_handle.send_storage_effect(write).await;
         assert!(matches!(
             event,
             Event::Storage(StorageEvent::WriteResult { .. })

@@ -1,61 +1,65 @@
 //! Publishes database releases: lists current files at each range's coordinator, authorizes them
-//! and writes the tagged crate as one version. Also answers other members and runs its effects.
+//! and writes the tagged crate as one version. Also answers other members.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
-use std::pin::Pin;
+use std::collections::{HashMap, VecDeque};
 
 use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, BUCKET_RELEASE_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::identifier::Identifier;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::group_admin_path;
-use aruna_core::structs::storage::blob::{VersionKey, bucket_permission_path};
+use aruna_core::structs::storage::blob::{BucketInfo, VersionKey, bucket_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{
     RELEASE_PREFIX_TAG, RELEASE_TAG, ReleasePointer, curator_path, release_prefix,
 };
 use aruna_core::structs::storage::data::identity::content_id;
-use aruna_core::structs::storage::distribution::KeyRange;
+use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::{DistributionView, KeyRange};
 use aruna_core::structs::storage::origin::{OriginVersion, SourcePin};
 use aruna_core::structs::storage::release::{
-    CRATE_CHUNK, CrateBytes, CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
-    HolderRequest, RangeFiles, RangeMembers, ReleaseEffect, ReleaseEvent, ReleaseFile,
+    CrateBytes, CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk, RangeFiles,
+    RangeMembers, ReleaseFile,
 };
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::types::{Key, Value as Row};
 use bytes::Bytes;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::read::load_access;
-use super::{Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation};
+use super::access::LoadAccessOperation;
+use super::holder::{AskHolderError, AskHolderOperation, ReadCrateOperation};
+use super::{
+    Access, BucketScope, MembersConfig, MembersOutput, OwnedScope, ReleaseError,
+    ReleaseMembersOperation,
+};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
-use crate::distribution::status::read_view;
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive, node_routing};
-use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::distribution::status::{StatusError, read_view};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::metadata::protocol::MetadataReadError;
-use crate::placement::policy::GateOperation;
-use crate::realm::peer_trust::is_sync_eligible;
+use crate::placement::policy::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
-use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
-use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
-use crate::s3::object::origin::{OriginError, read_origin};
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::object::read::GetRoutedOperation;
-use aruna_core::metadata::AuthToken;
-use aruna_core::time::unix_timestamp_millis;
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::list::{
+    ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
+};
+use crate::s3::object::origin::{OriginError, OriginView, ReadOriginOperation};
+use crate::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
@@ -72,6 +76,18 @@ impl From<ReleaseError> for PublishError {
         Self::Unavailable(error.to_string())
     }
 }
+
+impl From<IoError> for PublishError {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+fn unavailable(error: impl std::fmt::Display) -> PublishError {
+    PublishError::Unavailable(error.to_string())
+}
+
+type PublishTurn<T> = Result<Next<T>, PublishError>;
 
 /// What a publisher declares about a release besides its files.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -181,111 +197,209 @@ pub fn release_crate(spec: &ReleaseSpec, files: &[ReleaseFile]) -> Vec<u8> {
 }
 
 const UNREADABLE: &str = "a file under the prefix is not readable";
+const CHANGED: &str = "a pinned file changed while the release was written; publish again";
 
 /// Keys listed for one page of release files, so a holder's reply stays far below the transport
 /// ceiling.
 const FILE_PAGE: usize = 256;
+/// Rows read per storage page while looking for a bucket's releases.
+const ROW_PAGE: usize = 256;
 
-/// Every current file under `prefix` in `range`, page by page.
-async fn all_files(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    access: &Access,
-    asked: (&str, &str),
-    range: Option<&KeyRange>,
-) -> Result<Vec<ReleaseFile>, PublishError> {
-    let (mut files, mut after) = (Vec::new(), None);
-    loop {
-        let (page, next) = release_files(context, scope, access, asked, (range, after)).await?;
-        files.extend(page);
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(files),
-        }
-    }
+/// One page of release files and the key the next page starts after.
+pub type FilesPage = (Vec<ReleaseFile>, Option<String>);
+
+/// One page of current versions under a prefix in a range (or the whole bucket) after a key, one
+/// key left out. Each file comes from one exact version, and the caller must be able to read
+/// every file, or nothing is published.
+#[derive(Debug, PartialEq)]
+pub struct ReleaseFilesOperation {
+    scope: OwnedScope,
+    access: Access,
+    prefix: String,
+    skip: String,
+    range: Option<KeyRange>,
+    after: Option<String>,
+    continuation: Option<ListContinuationToken>,
+    keys: VecDeque<String>,
+    files: Vec<ReleaseFile>,
+    more: Option<ListContinuationToken>,
+    last: Option<String>,
+    current: Option<String>,
 }
 
-/// One page of current versions under `prefix` in `range` (or the whole bucket) after `after`,
-/// `skip` left out, and the key the next page starts after. Each file comes from one exact
-/// version, and the caller must be able to read every file, or nothing is published.
-pub async fn release_files(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    access: &Access,
-    (prefix, skip): (&str, &str),
-    (range, after): (Option<&KeyRange>, Option<String>),
-) -> Result<(Vec<ReleaseFile>, Option<String>), PublishError> {
-    let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let mut files = Vec::new();
-    let (mut continuation, mut after) = (None, after);
-    loop {
+impl ReleaseFilesOperation {
+    pub fn new(
+        scope: BucketScope<'_>,
+        access: &Access,
+        (prefix, skip): (&str, &str),
+        (range, after): (Option<&KeyRange>, Option<String>),
+    ) -> Self {
+        Self {
+            scope: OwnedScope::of(scope),
+            access: access.clone(),
+            prefix: prefix.to_string(),
+            skip: skip.to_string(),
+            range: range.cloned(),
+            after,
+            continuation: None,
+            keys: VecDeque::new(),
+            files: Vec::new(),
+            more: None,
+            last: None,
+            current: None,
+        }
+    }
+
+    /// Only the range's keys are listed, so no key outside it decides the page or its end.
+    fn list(&mut self) -> PublishTurn<FilesPage> {
         let list = ListBucketOperation::new(ListBucketInput {
-            bucket: scope.bucket.to_string(),
-            group_id: scope.info.group_id,
-            continuation_token: continuation.take(),
+            bucket: self.scope.bucket.clone(),
+            group_id: self.scope.info.group_id,
+            continuation_token: self.continuation.take(),
             max_keys: Some(FILE_PAGE),
-            prefix: Some(prefix.to_string()),
+            prefix: Some(self.prefix.clone()),
             delimiter: None,
-            start_after: after.take(),
+            start_after: self.after.take(),
         });
-        // Only the range's keys are listed, so no key outside it decides the page or its end.
-        let list = match range {
+        let list = match &self.range {
             Some(range) => list.with_bounds(range.lower.clone(), range.upper.clone()),
             None => list,
         };
-        let listed = drive(list, context)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let last = (listed.objects.last()).map(|object| object.head.key.clone());
-        for object in listed.objects {
-            let key = object.head.key;
-            if key == skip || range.is_some_and(|range| !range.contains(&key)) {
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    fn next_key(&mut self) -> PublishTurn<FilesPage> {
+        while let Some(key) = self.keys.pop_front() {
+            let outside = (self.range.as_ref()).is_some_and(|range| !range.contains(&key));
+            if key == self.skip || outside {
                 continue;
             }
-            if !access.0.allows(Some(&key), &Permission::READ) {
+            if !self.access.0.allows(Some(&key), &Permission::READ) {
                 return Err(PublishError::Forbidden(UNREADABLE));
             }
-            let place = (scope.realm_id, scope.node_id);
-            let origin = read_origin(context, place, scope.bucket, &key, None)
-                .await
-                .map_err(|error| unavailable(&error))?;
-            let Some(version) = scope.exact(&key, origin.version_id) else {
-                continue;
-            };
-            // Every field comes from the one version the origin read pinned.
-            let pin = origin.source.map(|source| {
-                let pin = SourcePin {
-                    url: source.url,
-                    path: source.path,
-                    source_version: source.version,
-                };
-                (pin, source.etag)
-            });
-            files.push(ReleaseFile {
-                key,
-                version,
-                size: origin.size.unwrap_or_default(),
-                content: origin.content_hash.map(content_id),
-                pin,
-            });
+            let scope = &self.scope;
+            let origin = ReadOriginOperation::new(scope.realm_id, &scope.bucket, &key, None);
+            self.current = Some(key);
+            return Ok(Next::Call(IoCall::child(origin)));
         }
         // A page with no key goes on to the next; otherwise its last key is the position.
-        match (listed.continuation_token, last) {
-            (Some(token), None) => continuation = Some(token),
-            (Some(_), last) => return Ok((files, last)),
-            (None, _) => return Ok((files, None)),
+        let files = match (self.more.take(), self.last.take()) {
+            (Some(token), None) => {
+                self.continuation = Some(token);
+                return self.list();
+            }
+            (Some(_), last) => (std::mem::take(&mut self.files), last),
+            (None, _) => (std::mem::take(&mut self.files), None),
+        };
+        Ok(Next::Done(files))
+    }
+
+    /// Every field comes from the one version the origin read pinned.
+    fn add_file(&mut self, key: String, origin: OriginView) {
+        let Some(version) = self.scope.scope().exact(&key, origin.version_id) else {
+            return;
+        };
+        let pin = origin.source.map(|source| {
+            let pin = SourcePin {
+                url: source.url,
+                path: source.path,
+                source_version: source.version,
+            };
+            (pin, source.etag)
+        });
+        self.files.push(ReleaseFile {
+            key,
+            version,
+            size: origin.size.unwrap_or_default(),
+            content: origin.content_hash.map(content_id),
+            pin,
+        });
+    }
+}
+
+impl Operation for ReleaseFilesOperation {
+    type Output = FilesPage;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn<FilesPage> {
+        self.list()
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<FilesPage> {
+        if let Some(key) = self.current.take() {
+            let origin = result.child::<OriginView, OriginError>()?;
+            self.add_file(key, origin.map_err(unavailable)?);
+            return self.next_key();
+        }
+        let listed = result.child::<ListBucketResult, ListBucketError>()?;
+        let listed = listed.map_err(unavailable)?;
+        self.last = (listed.objects.last()).map(|object| object.head.key.clone());
+        self.more = listed.continuation_token;
+        self.keys = (listed.objects.into_iter())
+            .map(|object| object.head.key)
+            .collect();
+        self.next_key()
+    }
+}
+
+/// Every current file under a prefix in a range, page by page.
+#[derive(Debug, PartialEq)]
+struct AllFilesOperation {
+    scope: OwnedScope,
+    access: Access,
+    prefix: String,
+    skip: String,
+    range: Option<KeyRange>,
+    files: Vec<ReleaseFile>,
+}
+
+impl AllFilesOperation {
+    fn page(&self, after: Option<String>) -> IoCall {
+        let asked = (self.prefix.as_str(), self.skip.as_str());
+        let at = (self.range.as_ref(), after);
+        let page = ReleaseFilesOperation::new(self.scope.scope(), &self.access, asked, at);
+        IoCall::child(page)
+    }
+}
+
+impl Operation for AllFilesOperation {
+    type Output = Vec<ReleaseFile>;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn<Vec<ReleaseFile>> {
+        Ok(Next::Call(self.page(None)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<Vec<ReleaseFile>> {
+        let (page, next) = result.child::<FilesPage, PublishError>()??;
+        self.files.extend(page);
+        match next {
+            Some(next) => Ok(Next::Call(self.page(Some(next)))),
+            None => Ok(Next::Done(std::mem::take(&mut self.files))),
         }
     }
 }
 
-/// One release to publish.
-#[derive(Clone, Debug)]
+/// One release to publish. The bearer never shows in a `Debug` print.
+#[derive(Clone, PartialEq)]
 pub struct PublishInput {
     pub auth: AuthContext,
     /// Asks the coordinators of other ranges; required when the prefix spans them.
     pub bearer: Option<String>,
     pub key: String,
     pub spec: ReleaseSpec,
+}
+
+impl std::fmt::Debug for PublishInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublishInput")
+            .field("auth", &self.auth)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("key", &self.key)
+            .field("spec", &self.spec)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,552 +409,803 @@ pub struct Published {
     pub replayed: bool,
 }
 
-/// Publishes a release on the node that writes `key`: the caller needs bucket WRITE and admin
-/// or curator rights, may read every pinned file, and gets the existing version back when the
-/// identical release is already the key's head.
-pub async fn publish_release(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    input: PublishInput,
-) -> Result<Published, PublishError> {
-    let realm_id = scope.realm_id;
-    let bucket_path =
-        bucket_permission_path(realm_id, scope.info.group_id, scope.node_id, scope.bucket);
-    allowed(context, realm_id, &input.auth, &bucket_path)
-        .await?
-        .then_some(())
-        .ok_or(PublishError::Forbidden("no WRITE on the bucket"))?;
-    let admin = group_admin_path(realm_id, scope.info.group_id);
-    let curator = curator_path(realm_id);
-    if !allowed(context, realm_id, &input.auth, &admin).await?
-        && !allowed(context, realm_id, &input.auth, &curator).await?
-    {
-        return Err(PublishError::Forbidden("neither group admin nor curator"));
-    }
-    let access = load_access(context, scope, &input.auth).await?;
-    let files = coordinated_files(context, scope, &access, &input).await?;
-    let guards = file_guards(context, scope, &files).await?;
-    let bytes = release_crate(&input.spec, &files);
-    let hash = *blake3::hash(&bytes).as_bytes();
-    // A concurrent publish moves the head; the next pass then finds its release or conflicts.
-    for _ in 0..2 {
-        let place = (realm_id, scope.node_id);
-        let head = match read_origin(context, place, scope.bucket, &input.key, None).await {
-            Ok(current) if current.content_hash == Some(hash) => {
-                let rows = release_rows(context, scope.bucket).await?;
-                let same = rows.iter().any(|(version_id, pointer)| {
-                    *version_id == current.version_id
-                        && pointer.label == input.spec.label
-                        && pointer.prefix == input.spec.prefix
-                });
-                if same {
-                    return Ok(Published {
-                        version_id: current.version_id,
-                        files: files.len(),
-                        replayed: true,
-                    });
-                }
-                Some(current.version_id)
-            }
-            Ok(current) => Some(current.version_id),
-            Err(OriginError::VersionMissing) => None,
-            Err(error) => return Err(PublishError::Unavailable(error.to_string())),
-        };
-        let write = (bytes.clone(), head, guards.clone());
-        if let Some(version_id) = put_crate(context, scope, &input, write).await? {
-            return Ok(Published {
-                version_id,
-                files: files.len(),
-                replayed: false,
-            });
-        }
-    }
-    Err(PublishError::Conflict(
-        "the release key changed while the release was written; publish again".to_string(),
-    ))
+/// How one key range of a release is listed.
+#[derive(Debug, PartialEq)]
+enum RangePlan {
+    Here(KeyRange),
+    At(KeyRange, Option<NodeId>),
 }
 
-/// Rows read per storage page while looking for a bucket's releases.
-const ROW_PAGE: usize = 256;
-
-/// Every release row of `bucket` this node holds, in key order.
-async fn release_rows(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Vec<(Ulid, ReleasePointer)>, PublishError> {
-    let prefix = release_prefix(bucket);
-    let mut rows = Vec::new();
-    let mut start = None;
-    loop {
-        let iter = StorageEffect::Iter {
-            key_space: BUCKET_RELEASE_KEYSPACE.to_string(),
-            prefix: Some(prefix.clone().into()),
-            start: start.take().map(IterStart::After),
-            limit: ROW_PAGE,
-            txn_id: None,
-        };
-        let (values, next) = match context.storage_handle.send_storage_effect(iter).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            other => return Err(PublishError::Unavailable(other.label().to_string())),
-        };
-        for (key, value) in values {
-            let Some(bytes) = key.get(prefix.len()..) else {
-                continue;
-            };
-            let Ok(id) = <[u8; 16]>::try_from(bytes) else {
-                continue;
-            };
-            let pointer = ReleasePointer::from_bytes(value.as_ref())
-                .map_err(|error| PublishError::Unavailable(error.to_string()))?;
-            rows.push((Ulid::from_bytes(id), pointer));
-        }
-        match next {
-            Some(next) => start = Some(next),
-            None => return Ok(rows),
-        }
-    }
-}
-
-async fn allowed(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth: &AuthContext,
-    path: &str,
-) -> Result<bool, PublishError> {
-    let extras = PolicyRequestExtras::rest();
-    match drive(
-        AuthorizeOperation::new(realm_id, auth, path, &Permission::WRITE, extras),
-        context,
-    )
-    .await
-    {
-        Ok(()) => Ok(true),
-        Err(AuthorizeError::Storage(error)) => Err(PublishError::Unavailable(error.to_string())),
-        Err(_) => Ok(false),
-    }
+#[derive(Debug, PartialEq)]
+enum CoordinatedStep {
+    View,
+    Fence(Box<DistributionView>),
+    Local,
+    Remote(KeyRange, NodeId),
 }
 
 /// The current files under the prefix, each range listed by its own coordinator; a range no
 /// coordinator lists now refuses the publish, since a copy may be behind.
-async fn coordinated_files(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    access: &Access,
-    input: &PublishInput,
-) -> Result<Vec<ReleaseFile>, PublishError> {
-    let asked = (input.spec.prefix.as_str(), input.key.as_str());
-    let Some(binding) = &scope.info.distribution else {
-        return all_files(context, scope, access, asked, None).await;
-    };
-    let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let view = drive(read_view(binding.set_id), context)
-        .await
-        .map_err(|error| unavailable(&error))?
-        .ok_or_else(|| PublishError::Unavailable("this node holds no record of the set".into()))?;
-    let fence = drive(local_fence(binding.set_id), context)
-        .await
-        .map_err(|error| unavailable(&error))?;
-    let snapshot = view.snapshot();
-    let mut files = Vec::new();
-    for range in snapshot.listed_ranges(&input.spec.prefix) {
-        if snapshot.lists_locally(binding.member_id, range, &fence) {
-            files.extend(all_files(context, scope, access, asked, Some(range)).await?);
-            continue;
+#[derive(Debug, PartialEq)]
+struct CoordinatedFilesOperation {
+    scope: OwnedScope,
+    access: Access,
+    input: PublishInput,
+    plans: VecDeque<RangePlan>,
+    files: Vec<ReleaseFile>,
+    step: CoordinatedStep,
+}
+
+fn range_refused(range: &KeyRange) -> PublishError {
+    PublishError::Unavailable(format!(
+        "range {} could not be listed by its coordinator",
+        range.range_id
+    ))
+}
+
+impl CoordinatedFilesOperation {
+    fn new(scope: OwnedScope, access: Access, input: PublishInput) -> Self {
+        Self {
+            scope,
+            access,
+            input,
+            plans: VecDeque::new(),
+            files: Vec::new(),
+            step: CoordinatedStep::View,
         }
-        let refused = || {
-            PublishError::Unavailable(format!(
-                "range {} could not be listed by its coordinator",
-                range.range_id
-            ))
+    }
+
+    fn list_files(&mut self, range: Option<KeyRange>) -> PublishTurn<Vec<ReleaseFile>> {
+        self.step = CoordinatedStep::Local;
+        Ok(Next::Call(IoCall::child(AllFilesOperation {
+            scope: self.scope.clone(),
+            access: self.access.clone(),
+            prefix: self.input.spec.prefix.clone(),
+            skip: self.input.key.clone(),
+            range,
+            files: Vec::new(),
+        })))
+    }
+
+    fn ask(
+        &mut self,
+        range: KeyRange,
+        node_id: NodeId,
+        after: Option<String>,
+    ) -> PublishTurn<Vec<ReleaseFile>> {
+        let Some(bearer) = self.input.bearer.clone() else {
+            return Err(range_refused(&range));
         };
-        let (Some(coordinator), Some(bearer), Some(handle)) = (
-            snapshot.list_holder(range),
-            input.bearer.as_ref(),
-            context.metadata_handle.as_ref(),
-        ) else {
-            return Err(refused());
+        let ask = HolderAsk::Files {
+            range_id: range.range_id,
+            prefix: self.input.spec.prefix.clone(),
+            skip: self.input.key.clone(),
+            after,
         };
-        let token = AuthToken::bearer(bearer.clone()).map_err(|error| unavailable(&error))?;
-        let mut after = None;
-        loop {
-            let ask = HolderAsk::Files {
-                range_id: range.range_id,
-                prefix: input.spec.prefix.clone(),
-                skip: input.key.clone(),
-                after: after.take(),
-            };
-            let bucket = scope.bucket.to_string();
-            match handle
-                .request_release_holder(coordinator.node_id, Some(token.clone()), bucket, ask)
-                .await
-            {
-                Ok(HolderAnswer::Files(listed)) if !listed.refused => {
-                    files.extend(listed.files);
-                    match listed.next {
-                        Some(next) => after = Some(next),
-                        None => break,
-                    }
-                }
-                // The coordinator refused a file; the generic refusal names none.
-                Err(MetadataReadError::Forbidden) => {
-                    return Err(PublishError::Forbidden(UNREADABLE));
-                }
-                _ => return Err(refused()),
+        let holder = AskHolderOperation::new(node_id, &bearer, &self.scope.bucket, ask);
+        self.step = CoordinatedStep::Remote(range, node_id);
+        Ok(Next::Call(IoCall::child(holder)))
+    }
+
+    fn next_range(&mut self) -> PublishTurn<Vec<ReleaseFile>> {
+        match self.plans.pop_front() {
+            Some(RangePlan::Here(range)) => self.list_files(Some(range)),
+            Some(RangePlan::At(range, Some(node_id))) => self.ask(range, node_id, None),
+            Some(RangePlan::At(range, None)) => Err(range_refused(&range)),
+            None => {
+                let mut files = std::mem::take(&mut self.files);
+                files.sort_by(|left, right| left.key.cmp(&right.key));
+                Ok(Next::Done(files))
             }
         }
     }
-    files.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(files)
+}
+
+impl Operation for CoordinatedFilesOperation {
+    type Output = Vec<ReleaseFile>;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn<Vec<ReleaseFile>> {
+        let Some(binding) = &self.scope.info.distribution else {
+            return self.list_files(None);
+        };
+        Ok(Next::Call(IoCall::child(read_view(binding.set_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<Vec<ReleaseFile>> {
+        let binding = self.scope.info.distribution.clone();
+        match std::mem::replace(&mut self.step, CoordinatedStep::Local) {
+            CoordinatedStep::View => {
+                let binding = binding.ok_or(IoError::Unfinished)?;
+                let view = (result.child::<Option<DistributionView>, StatusError>()?)
+                    .map_err(unavailable)?
+                    .ok_or_else(|| unavailable("this node holds no record of the set"))?;
+                self.step = CoordinatedStep::Fence(Box::new(view));
+                Ok(Next::Call(IoCall::child(local_fence(binding.set_id))))
+            }
+            CoordinatedStep::Fence(view) => {
+                let binding = binding.ok_or(IoError::Unfinished)?;
+                let fence = result.child::<LocalFence, GuardError>()?;
+                let fence = fence.map_err(unavailable)?;
+                let snapshot = view.snapshot();
+                self.plans = (snapshot.listed_ranges(&self.input.spec.prefix).into_iter())
+                    .map(
+                        |range| match snapshot.lists_locally(binding.member_id, range, &fence) {
+                            true => RangePlan::Here(range.clone()),
+                            false => RangePlan::At(
+                                range.clone(),
+                                snapshot.list_holder(range).map(|member| member.node_id),
+                            ),
+                        },
+                    )
+                    .collect();
+                self.next_range()
+            }
+            CoordinatedStep::Local => {
+                let files = result.child::<Vec<ReleaseFile>, PublishError>()??;
+                if self.scope.info.distribution.is_none() {
+                    return Ok(Next::Done(files));
+                }
+                self.files.extend(files);
+                self.next_range()
+            }
+            CoordinatedStep::Remote(range, node_id) => {
+                match result.child::<HolderAnswer, AskHolderError>()? {
+                    Ok(HolderAnswer::Files(listed)) if !listed.refused => {
+                        self.files.extend(listed.files);
+                        match listed.next {
+                            Some(next) => self.ask(range, node_id, Some(next)),
+                            None => self.next_range(),
+                        }
+                    }
+                    // The coordinator refused a file; the generic refusal names none.
+                    Err(AskHolderError::Refused(MetadataReadError::Forbidden)) => {
+                        Err(PublishError::Forbidden(UNREADABLE))
+                    }
+                    _ => Err(range_refused(&range)),
+                }
+            }
+        }
+    }
+}
+
+/// Every release row of a bucket this node holds, in key order.
+#[derive(Debug, PartialEq)]
+struct ReleaseRowsOperation {
+    prefix: Vec<u8>,
+    pages: PrefixPages,
+    rows: Vec<(Ulid, ReleasePointer)>,
+}
+
+impl ReleaseRowsOperation {
+    fn new(bucket: &str) -> Self {
+        let prefix = release_prefix(bucket);
+        Self {
+            pages: PrefixPages::new(BUCKET_RELEASE_KEYSPACE, prefix.clone(), ROW_PAGE),
+            prefix,
+            rows: Vec::new(),
+        }
+    }
+}
+
+impl Operation for ReleaseRowsOperation {
+    type Output = Vec<(Ulid, ReleasePointer)>;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn<Vec<(Ulid, ReleasePointer)>> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<Vec<(Ulid, ReleasePointer)>> {
+        for (key, value) in self.pages.take(result)? {
+            let id = key.get(self.prefix.len()..).map(<[u8; 16]>::try_from);
+            let Some(Ok(id)) = id else {
+                continue;
+            };
+            let pointer = ReleasePointer::from_bytes(value.as_ref()).map_err(unavailable)?;
+            self.rows.push((Ulid::from_bytes(id), pointer));
+        }
+        match self.pages.done() {
+            true => Ok(Next::Done(std::mem::take(&mut self.rows))),
+            false => Ok(Next::Call(self.pages.call())),
+        }
+    }
 }
 
 /// A version row a write must still read as given: keyspace, key and row.
 type Guard = (String, Key, Option<Row>);
 
-/// The version rows of an ordinary bucket's pinned files as they are now. The crate's write
-/// keeps them, so a file deleted meanwhile fails the publish instead of breaking the release.
-async fn file_guards(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    files: &[ReleaseFile],
-) -> Result<Vec<Guard>, PublishError> {
-    if scope.info.distribution.is_some() {
-        return Ok(Vec::new());
-    }
-    let mut reads = Vec::with_capacity(files.len());
-    for file in files {
-        let OriginVersion::Node(arn) = &file.version else {
-            continue;
-        };
-        let key = VersionKey::new(scope.bucket, file.key.as_str(), arn.version)
-            .to_bytes()
-            .map_err(|error| PublishError::Unavailable(error.to_string()))?;
-        reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)));
-    }
-    if reads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    };
-    let values = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(PublishError::Unavailable(other.label().to_string())),
-    };
-    if values.iter().any(|(_, value)| value.is_none()) {
-        return Err(PublishError::Conflict(CHANGED.to_string()));
-    }
-    let space = || BLOB_VERSIONS_KEYSPACE.to_string();
-    Ok(values
-        .into_iter()
-        .map(|(key, value)| (space(), key, value))
-        .collect())
+#[derive(Debug, PartialEq)]
+enum PutStep {
+    Config,
+    Routing(Box<RealmConfigDocument>),
+    Gate(Box<RealmConfigDocument>, Box<RoutingSnapshot>),
+    Put,
+    Complete(Ulid),
 }
-
-const CHANGED: &str = "a pinned file changed while the release was written; publish again";
 
 /// Writes the release crate as one version tagged with its label and prefix; `None` when the
-/// key's head is no longer `head`, so nothing was written. Each guard must still read as given.
-async fn put_crate(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    input: &PublishInput,
-    (bytes, head, guards): (Vec<u8>, Option<Ulid>, Vec<Guard>),
-) -> Result<Option<Ulid>, PublishError> {
-    let failed = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let realm = drive(GetConfigOperation::new(scope.realm_id), context)
-        .await
-        .map_err(|error| failed(&error))?;
-    let routing = drive(
-        SnapshotOperation::new(
-            &node_routing(context),
-            (scope.info).group_id,
-            BucketRules::of(scope.info),
-        ),
-        context,
-    )
-    .await
-    .map_err(|error| failed(&error))?;
-    let gate = drive(
-        GateOperation::new(scope.realm_id, unix_timestamp_millis()),
-        context,
-    )
-    .await
-    .map_err(|error| failed(&error))?;
-    let size = bytes.len() as u64;
-    let body = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
-    let tags = HashMap::from([
-        (RELEASE_TAG.to_string(), input.spec.label.clone()),
-        (RELEASE_PREFIX_TAG.to_string(), input.spec.prefix.clone()),
-        (
-            aruna_core::structs::storage::blob::CONTENT_TYPE_KEY.to_string(),
-            "application/ld+json".to_string(),
-        ),
-    ]);
-    let mut operation = PutObjectOperation::new(PutObjectConfig {
-        user_id: input.auth.user_id,
-        group_id: scope.info.group_id,
-        realm_id: scope.realm_id,
-        node_id: scope.node_id,
-        request: PutObjectInput {
-            bucket: scope.bucket.to_string(),
-            key: input.key.clone(),
-            content_length: Some(size),
-            body: Some(BackendStream::new(body)),
-        },
-        expected_checksums: Vec::new(),
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling: realm.quota.effective_group_ceiling(&scope.info.group_id),
-        routing,
-    })
-    .with_metadata(tags)
-    .with_expected_head(head)
-    .with_restrictions(input.auth.path_restrictions.clone());
-    if let Some(gate) = gate {
-        operation = operation.with_gate(gate);
-    }
-    if !guards.is_empty() {
-        operation = operation.with_fence(guards, Vec::new());
-    }
-    let result = match drive(operation, context).await {
-        Ok(result) => result,
-        Err(PutObjectError::HeadChanged) => return Ok(None),
-        Err(PutObjectError::FenceTaken) => return Err(PublishError::Conflict(CHANGED.to_string())),
-        Err(error) => return Err(failed(&error)),
-    };
-    drive(
-        CompletePutOperation::new(CompletePutInput {
+/// key's head is no longer the given one, so nothing was written. Each guard must still read as
+/// given.
+#[derive(Debug, PartialEq)]
+struct PutCrateOperation {
+    scope: OwnedScope,
+    input: PublishInput,
+    routing: NodeRouting,
+    bytes: Vec<u8>,
+    head: Option<Ulid>,
+    guards: Vec<Guard>,
+    now_ms: u64,
+    step: PutStep,
+}
+
+impl PutCrateOperation {
+    fn put(
+        &mut self,
+        realm: &RealmConfigDocument,
+        routing: RoutingSnapshot,
+        gate: Option<GateContext>,
+    ) -> PublishTurn<Option<Ulid>> {
+        let scope = &self.scope;
+        let input = &self.input;
+        let group_id = scope.info.group_id;
+        let bytes = std::mem::take(&mut self.bytes);
+        let size = bytes.len() as u64;
+        let body = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+        let tags = HashMap::from([
+            (RELEASE_TAG.to_string(), input.spec.label.clone()),
+            (RELEASE_PREFIX_TAG.to_string(), input.spec.prefix.clone()),
+            (
+                aruna_core::structs::storage::blob::CONTENT_TYPE_KEY.to_string(),
+                "application/ld+json".to_string(),
+            ),
+        ]);
+        let mut operation = PutObjectOperation::new(PutObjectConfig {
+            user_id: input.auth.user_id,
+            group_id,
             realm_id: scope.realm_id,
             node_id: scope.node_id,
-            auth: input.auth.clone(),
-            group_id: scope.info.group_id,
-            bucket: scope.bucket.to_string(),
-            key: input.key.clone(),
-            version_id: result.version_id,
-            size_bytes: result.location.blob_size,
-        }),
-        context,
-    )
-    .await
-    .ok();
-    Ok(Some(result.version_id))
+            request: PutObjectInput {
+                bucket: scope.bucket.clone(),
+                key: input.key.clone(),
+                content_length: Some(size),
+                body: Some(BackendStream::new(body)),
+            },
+            expected_checksums: Vec::new(),
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: realm.quota.effective_group_ceiling(&group_id),
+            routing,
+        })
+        .with_metadata(tags)
+        .with_expected_head(self.head)
+        .with_restrictions(input.auth.path_restrictions.clone());
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
+        let guards = std::mem::take(&mut self.guards);
+        if !guards.is_empty() {
+            operation = operation.with_fence(guards, Vec::new());
+        }
+        self.step = PutStep::Put;
+        Ok(Next::Call(IoCall::child(operation)))
+    }
 }
 
-/// A holder's answer for its ranges, with the caller context it validated from the request's
-/// bearer itself. It answers only for ranges it coordinates now.
-pub async fn holder_answer(
-    context: &DriverContext,
-    (realm_id, node_id): (RealmId, NodeId),
-    auth: &AuthContext,
-    (bucket, ask): (&str, HolderAsk),
-) -> Result<HolderAnswer, PublishError> {
-    let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let info = drive(GetBucketOperation::new(bucket.to_string()), context)
-        .await
-        .map_err(|error| unavailable(&error))?;
-    let scope = BucketScope {
-        realm_id,
-        node_id,
-        bucket,
-        info: &info,
-    };
-    let access = load_access(context, scope, auth).await?;
-    match ask {
-        HolderAsk::Members { range_ids, queries } => {
-            let config = MembersConfig {
-                realm_id,
-                node_id,
-                bucket: bucket.to_string(),
-                info: info.clone(),
-                auth: auth.clone(),
-                access,
-                bearer: None,
-                queries,
-                ranges: Some(range_ids),
-                retention: false,
-            };
-            let output = drive(ReleaseMembersOperation::new(config), context).await?;
-            Ok(HolderAnswer::Members(RangeMembers {
-                answers: output.answers,
-                releases: output.releases,
-                complete: output.complete,
-                refused: output.refused,
-            }))
-        }
-        HolderAsk::Files {
-            range_id,
-            prefix,
-            skip,
-            after,
-        } => {
-            let refused = RangeFiles {
-                files: Vec::new(),
-                refused: true,
-                next: None,
-            };
-            let Some(binding) = &info.distribution else {
-                return Ok(HolderAnswer::Files(refused));
-            };
-            let view = drive(read_view(binding.set_id), context)
-                .await
-                .map_err(|error| unavailable(&error))?
-                .ok_or_else(|| PublishError::Unavailable("no record of the set".into()))?;
-            let fence = drive(local_fence(binding.set_id), context)
-                .await
-                .map_err(|error| unavailable(&error))?;
-            let snapshot = view.snapshot();
-            let range = (snapshot.config.ranges.iter()).find(|range| range.range_id == range_id);
-            let Some(range) =
-                range.filter(|range| snapshot.lists_locally(binding.member_id, range, &fence))
-            else {
-                return Ok(HolderAnswer::Files(refused));
-            };
-            let asked = (prefix.as_str(), skip.as_str());
-            let page = (Some(range), after);
-            let (files, next) = release_files(context, scope, &access, asked, page).await?;
-            Ok(HolderAnswer::Files(RangeFiles {
-                files,
-                refused: false,
-                next,
-            }))
-        }
-        HolderAsk::Crate {
-            key,
-            version_id,
-            offset,
-        } => {
-            if !access.0.allows(Some(&key), &Permission::READ) {
-                return Err(PublishError::Forbidden("the release crate is not readable"));
+impl Operation for PutCrateOperation {
+    type Output = Option<Ulid>;
+    type Error = PublishError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> PublishTurn<Option<Ulid>> {
+        let config = GetConfigOperation::new(self.scope.realm_id);
+        Ok(Next::Call(IoCall::child(config)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<Option<Ulid>> {
+        match std::mem::replace(&mut self.step, PutStep::Put) {
+            PutStep::Config => {
+                let realm = result.child::<RealmConfigDocument, GetConfigError>()?;
+                let realm = realm.map_err(unavailable)?;
+                let info = &self.scope.info;
+                let rules = BucketRules::of(info);
+                let snapshot = SnapshotOperation::new(&self.routing, info.group_id, rules);
+                self.step = PutStep::Routing(Box::new(realm));
+                Ok(Next::Call(IoCall::child(snapshot)))
             }
-            let read = CrateRead {
-                bucket: bucket.to_string(),
+            PutStep::Routing(realm) => {
+                let routing = result.child::<RoutingSnapshot, RoutingInputsError>()?;
+                let routing = routing.map_err(unavailable)?;
+                let gate = GateOperation::new(self.scope.realm_id, self.now_ms);
+                self.step = PutStep::Gate(realm, Box::new(routing));
+                Ok(Next::Call(IoCall::child(gate)))
+            }
+            PutStep::Gate(realm, routing) => {
+                let gate = result.child::<Option<GateContext>, GateContextError>()?;
+                self.put(&realm, *routing, gate.map_err(unavailable)?)
+            }
+            PutStep::Put => {
+                let written = match result.child::<PutObjectResult, PutObjectError>()? {
+                    Ok(written) => written,
+                    Err(PutObjectError::HeadChanged) => return Ok(Next::Done(None)),
+                    Err(PutObjectError::FenceTaken) => {
+                        return Err(PublishError::Conflict(CHANGED.to_string()));
+                    }
+                    Err(error) => return Err(unavailable(error)),
+                };
+                let scope = &self.scope;
+                let complete = CompletePutOperation::new(CompletePutInput {
+                    realm_id: scope.realm_id,
+                    node_id: scope.node_id,
+                    auth: self.input.auth.clone(),
+                    group_id: scope.info.group_id,
+                    bucket: scope.bucket.clone(),
+                    key: self.input.key.clone(),
+                    version_id: written.version_id,
+                    size_bytes: written.location.blob_size,
+                });
+                self.step = PutStep::Complete(written.version_id);
+                Ok(Next::Call(IoCall::child(complete)))
+            }
+            PutStep::Complete(version_id) => Ok(Next::Done(Some(version_id))),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PublishStep {
+    BucketWrite,
+    Admin,
+    Curator,
+    Access,
+    Files,
+    Guards,
+    Head,
+    Rows(Ulid),
+    Put,
+}
+
+/// Publishes a release on the node that writes its key: the caller needs bucket WRITE and admin
+/// or curator rights, may read every pinned file, and gets the existing version back when the
+/// identical release is already the key's head.
+#[derive(Debug, PartialEq)]
+pub struct PublishReleaseOperation {
+    scope: OwnedScope,
+    input: PublishInput,
+    routing: NodeRouting,
+    files: usize,
+    bytes: Vec<u8>,
+    hash: [u8; 32],
+    guard_keys: Vec<Key>,
+    guards: Vec<Guard>,
+    attempts: usize,
+    step: PublishStep,
+}
+
+type ReleaseTurn = PublishTurn<Published>;
+
+impl PublishReleaseOperation {
+    pub fn new(scope: BucketScope<'_>, input: PublishInput, routing: NodeRouting) -> Self {
+        Self {
+            scope: OwnedScope::of(scope),
+            input,
+            routing,
+            files: 0,
+            bytes: Vec::new(),
+            hash: [0; 32],
+            guard_keys: Vec::new(),
+            guards: Vec::new(),
+            attempts: 0,
+            step: PublishStep::BucketWrite,
+        }
+    }
+
+    fn allowed_call(&mut self, path: &str, step: PublishStep) -> ReleaseTurn {
+        let extras = PolicyRequestExtras::rest();
+        let realm_id = self.scope.realm_id;
+        let check =
+            AuthorizeOperation::new(realm_id, &self.input.auth, path, &Permission::WRITE, extras);
+        self.step = step;
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn load_access(&mut self) -> ReleaseTurn {
+        let load = LoadAccessOperation::new(self.scope.scope(), &self.input.auth);
+        self.step = PublishStep::Access;
+        Ok(Next::Call(IoCall::child(load)))
+    }
+
+    /// The version rows of an ordinary bucket's pinned files as they are now. The crate's write
+    /// keeps them, so a file deleted meanwhile fails the publish instead of breaking the release.
+    fn read_guards(&mut self, files: Vec<ReleaseFile>) -> ReleaseTurn {
+        self.files = files.len();
+        self.bytes = release_crate(&self.input.spec, &files);
+        self.hash = *blake3::hash(&self.bytes).as_bytes();
+        let mut reads = Vec::new();
+        if self.scope.info.distribution.is_none() {
+            for file in &files {
+                let OriginVersion::Node(arn) = &file.version else {
+                    continue;
+                };
+                let key = VersionKey::new(&self.scope.bucket, file.key.as_str(), arn.version)
+                    .to_bytes()
+                    .map_err(unavailable)?;
+                reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)));
+            }
+        }
+        if reads.is_empty() {
+            return self.read_head();
+        }
+        self.step = PublishStep::Guards;
+        self.guard_keys = reads.iter().map(|(_, key)| key.clone()).collect();
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    /// A concurrent publish moves the head; the next pass finds its release or conflicts.
+    fn read_head(&mut self) -> ReleaseTurn {
+        if self.attempts == 2 {
+            return Err(PublishError::Conflict(
+                "the release key changed while the release was written; publish again".to_string(),
+            ));
+        }
+        self.attempts += 1;
+        let scope = &self.scope;
+        let head = ReadOriginOperation::new(scope.realm_id, &scope.bucket, &self.input.key, None);
+        self.step = PublishStep::Head;
+        Ok(Next::Call(IoCall::child(head)))
+    }
+
+    fn write(&mut self, head: Option<Ulid>) -> ReleaseTurn {
+        self.step = PublishStep::Put;
+        Ok(Next::Call(IoCall::child(PutCrateOperation {
+            scope: self.scope.clone(),
+            input: self.input.clone(),
+            routing: self.routing.clone(),
+            bytes: self.bytes.clone(),
+            head,
+            guards: self.guards.clone(),
+            now_ms: 0,
+            step: PutStep::Config,
+        })))
+    }
+
+    fn published(&self, version_id: Ulid, replayed: bool) -> ReleaseTurn {
+        Ok(Next::Done(Published {
+            version_id,
+            files: self.files,
+            replayed,
+        }))
+    }
+}
+
+fn write_allowed(result: IoResult) -> Result<bool, PublishError> {
+    match result.child::<(), AuthorizeError>()? {
+        Ok(()) => Ok(true),
+        Err(AuthorizeError::Storage(error)) => Err(unavailable(error)),
+        Err(_) => Ok(false),
+    }
+}
+
+impl Operation for PublishReleaseOperation {
+    type Output = Published;
+    type Error = PublishError;
+
+    fn first(&mut self) -> ReleaseTurn {
+        let scope = &self.scope;
+        let group_id = scope.info.group_id;
+        let path = bucket_permission_path(scope.realm_id, group_id, scope.node_id, &scope.bucket);
+        self.allowed_call(&path, PublishStep::BucketWrite)
+    }
+
+    fn next(&mut self, result: IoResult) -> ReleaseTurn {
+        let realm_id = self.scope.realm_id;
+        match std::mem::replace(&mut self.step, PublishStep::Put) {
+            PublishStep::BucketWrite => {
+                if !write_allowed(result)? {
+                    return Err(PublishError::Forbidden("no WRITE on the bucket"));
+                }
+                let admin = group_admin_path(realm_id, self.scope.info.group_id);
+                self.allowed_call(&admin, PublishStep::Admin)
+            }
+            PublishStep::Admin => match write_allowed(result)? {
+                true => self.load_access(),
+                false => self.allowed_call(&curator_path(realm_id), PublishStep::Curator),
+            },
+            PublishStep::Curator => match write_allowed(result)? {
+                true => self.load_access(),
+                false => Err(PublishError::Forbidden("neither group admin nor curator")),
+            },
+            PublishStep::Access => {
+                let access = result.child::<Access, ReleaseError>()??;
+                let files =
+                    CoordinatedFilesOperation::new(self.scope.clone(), access, self.input.clone());
+                self.step = PublishStep::Files;
+                Ok(Next::Call(IoCall::child(files)))
+            }
+            PublishStep::Files => {
+                self.read_guards(result.child::<Vec<ReleaseFile>, PublishError>()??)
+            }
+            PublishStep::Guards => {
+                let values = result.values()?;
+                if values.iter().any(Option::is_none) {
+                    return Err(PublishError::Conflict(CHANGED.to_string()));
+                }
+                let keys = std::mem::take(&mut self.guard_keys);
+                self.guards = (keys.into_iter().zip(values))
+                    .map(|(key, value)| (BLOB_VERSIONS_KEYSPACE.to_string(), key, value))
+                    .collect();
+                self.read_head()
+            }
+            PublishStep::Head => match result.child::<OriginView, OriginError>()? {
+                Ok(current) if current.content_hash == Some(self.hash) => {
+                    let rows = ReleaseRowsOperation::new(&self.scope.bucket);
+                    self.step = PublishStep::Rows(current.version_id);
+                    Ok(Next::Call(IoCall::child(rows)))
+                }
+                Ok(current) => self.write(Some(current.version_id)),
+                Err(OriginError::VersionMissing) => self.write(None),
+                Err(error) => Err(unavailable(error)),
+            },
+            PublishStep::Rows(version_id) => {
+                let rows = result.child::<Vec<(Ulid, ReleasePointer)>, PublishError>()??;
+                let spec = &self.input.spec;
+                let same = rows.iter().any(|(row, pointer)| {
+                    *row == version_id
+                        && pointer.label == spec.label
+                        && pointer.prefix == spec.prefix
+                });
+                match same {
+                    true => self.published(version_id, true),
+                    false => self.write(Some(version_id)),
+                }
+            }
+            PublishStep::Put => match result.child::<Option<Ulid>, PublishError>()?? {
+                Some(version_id) => self.published(version_id, false),
+                None => self.read_head(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum HolderStep {
+    Bucket,
+    Access,
+    Members,
+    View(Box<AskedFiles>),
+    Fence(Box<AskedFiles>, Box<DistributionView>),
+    Files,
+    Chunk,
+}
+
+/// The files of one range another member asks for.
+#[derive(Debug, PartialEq)]
+struct AskedFiles {
+    range_id: Ulid,
+    prefix: String,
+    skip: String,
+    after: Option<String>,
+}
+
+/// A holder's answer for its ranges, for the caller it validated from the request's bearer
+/// itself. It answers only for ranges it coordinates now.
+#[derive(Debug, PartialEq)]
+pub struct HolderAnswerOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    auth: AuthContext,
+    bucket: String,
+    ask: Option<HolderAsk>,
+    scope: Option<OwnedScope>,
+    access: Option<Access>,
+    step: HolderStep,
+}
+
+type HolderTurn = PublishTurn<HolderAnswer>;
+
+fn no_files() -> HolderTurn {
+    Ok(Next::Done(HolderAnswer::Files(RangeFiles {
+        files: Vec::new(),
+        refused: true,
+        next: None,
+    })))
+}
+
+impl HolderAnswerOperation {
+    pub fn new(
+        (realm_id, node_id): (RealmId, NodeId),
+        auth: &AuthContext,
+        (bucket, ask): (&str, HolderAsk),
+    ) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            auth: auth.clone(),
+            bucket: bucket.to_string(),
+            ask: Some(ask),
+            scope: None,
+            access: None,
+            step: HolderStep::Bucket,
+        }
+    }
+
+    fn scope(&self) -> Result<&OwnedScope, IoError> {
+        self.scope.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn access(&self) -> Result<&Access, IoError> {
+        self.access.as_ref().ok_or(IoError::Unfinished)
+    }
+
+    fn answer(&mut self) -> HolderTurn {
+        let scope = self.scope()?.clone();
+        let access = self.access()?.clone();
+        match self.ask.take().ok_or(IoError::Unfinished)? {
+            HolderAsk::Members { range_ids, queries } => {
+                let members = ReleaseMembersOperation::new(MembersConfig {
+                    realm_id: self.realm_id,
+                    node_id: self.node_id,
+                    bucket: self.bucket.clone(),
+                    info: scope.info,
+                    auth: self.auth.clone(),
+                    access,
+                    bearer: None,
+                    queries,
+                    ranges: Some(range_ids),
+                    retention: false,
+                });
+                self.step = HolderStep::Members;
+                Ok(Next::Call(IoCall::child(members)))
+            }
+            HolderAsk::Files {
+                range_id,
+                prefix,
+                skip,
+                after,
+            } => {
+                let Some(binding) = &scope.info.distribution else {
+                    return no_files();
+                };
+                self.step = HolderStep::View(Box::new(AskedFiles {
+                    range_id,
+                    prefix,
+                    skip,
+                    after,
+                }));
+                Ok(Next::Call(IoCall::child(read_view(binding.set_id))))
+            }
+            HolderAsk::Crate {
                 key,
                 version_id,
-                group_id: info.group_id,
-                auth: auth.clone(),
-                realm_id,
-                node_id,
-            };
-            let chunk = ObjectRangeRequest::StartEnd {
-                start: offset,
-                end: offset.saturating_add(CRATE_CHUNK - 1),
-            };
-            match read_part(context, read, Some(chunk)).await {
-                Ok((found, size)) if found.metadata.contains_key(RELEASE_TAG) => {
-                    let bytes = found.bytes;
-                    Ok(HolderAnswer::Crate(Some(CrateChunk { bytes, size })))
+                offset,
+            } => {
+                if !access.0.allows(Some(&key), &Permission::READ) {
+                    return Err(PublishError::Forbidden("the release crate is not readable"));
                 }
-                Ok(_) | Err(CrateReadError::Missing) => Ok(HolderAnswer::Crate(None)),
-                Err(CrateReadError::Failed(reason)) => Err(PublishError::Unavailable(reason)),
+                let read = CrateRead {
+                    bucket: self.bucket.clone(),
+                    key,
+                    version_id,
+                    group_id: scope.info.group_id,
+                    auth: self.auth.clone(),
+                    realm_id: self.realm_id,
+                    node_id: self.node_id,
+                };
+                let chunk = ReadCrateOperation::new(read).chunk_at(offset);
+                self.step = HolderStep::Chunk;
+                Ok(Next::Call(IoCall::child(chunk)))
             }
         }
     }
-}
 
-/// Runs one release effect: a crate read with the caller's identity, or a holder request.
-pub async fn dispatch_release(context: &DriverContext, effect: ReleaseEffect) -> ReleaseEvent {
-    match effect {
-        ReleaseEffect::ReadCrate(read) => ReleaseEvent::CrateRead(read_crate(context, *read).await),
-        ReleaseEffect::Holder(request) => ReleaseEvent::Holder(ask_holder(context, request).await),
+    fn list_range(&mut self, asked: AskedFiles, range: &KeyRange) -> HolderTurn {
+        let scope = self.scope()?;
+        let names = (asked.prefix.as_str(), asked.skip.as_str());
+        let page = (Some(range), asked.after);
+        let list = ReleaseFilesOperation::new(scope.scope(), self.access()?, names, page);
+        self.step = HolderStep::Files;
+        Ok(Next::Call(IoCall::child(list)))
     }
 }
 
-/// Reads one release crate version on this node with the caller's identity.
-pub async fn read_crate(
-    context: &DriverContext,
-    read: CrateRead,
-) -> Result<CrateBytes, CrateReadError> {
-    Ok(read_part(context, read, None).await?.0)
-}
+impl Operation for HolderAnswerOperation {
+    type Output = HolderAnswer;
+    type Error = PublishError;
 
-/// Reads an object, through a holder when this member keeps the record but not the bytes.
-/// Boxed, since a routed read drives operations that may read release crates again.
-fn routed_read(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-) -> Pin<Box<dyn Future<Output = Result<GetObjectResult, GetObjectError>> + Send + '_>> {
-    Box::pin(drive(
-        GetRoutedOperation::new(input, restrictions, None),
-        context,
-    ))
-}
-
-/// Reads `range` of a release crate version, or all of it, and the version's whole size.
-async fn read_part(
-    context: &DriverContext,
-    read: CrateRead,
-    range: Option<ObjectRangeRequest>,
-) -> Result<(CrateBytes, u64), CrateReadError> {
-    let input = GetObjectInput {
-        bucket: read.bucket,
-        key: read.key,
-        version_id: Some(read.version_id),
-        range,
-        group_id: read.group_id,
-        user_identity: read.auth.user_id,
-        realm_id: read.realm_id,
-        node_id: read.node_id,
-    };
-    let restrictions = read.auth.path_restrictions.clone();
-    let result = match routed_read(context, input, restrictions).await {
-        Ok(result) => result,
-        Err(
-            GetObjectError::NoSuchKey
-            | GetObjectError::NoSuchVersion
-            | GetObjectError::DeleteMarker,
-        ) => return Err(CrateReadError::Missing),
-        Err(error) => return Err(CrateReadError::Failed(error.to_string())),
-    };
-    let size = result.info.size;
-    let mut bytes = Vec::new();
-    let mut blob = result.blob;
-    while let Some(chunk) = blob.next().await {
-        let chunk = chunk.map_err(|error| CrateReadError::Failed(error.to_string()))?;
-        bytes.extend_from_slice(&chunk);
+    fn first(&mut self) -> HolderTurn {
+        let bucket = GetBucketOperation::new(self.bucket.clone());
+        Ok(Next::Call(IoCall::child(bucket)))
     }
-    let found = CrateBytes {
-        metadata: result.metadata,
-        bytes,
-    };
-    Ok((found, size))
-}
 
-/// Asks a holder with the caller's bearer, which goes only to a realm infrastructure node.
-async fn ask_holder(
-    context: &DriverContext,
-    request: HolderRequest,
-) -> Result<HolderAnswer, String> {
-    let handle = context
-        .metadata_handle
-        .as_ref()
-        .ok_or("no metadata handle")?;
-    let realm_id = (context.net_handle.as_ref())
-        .map(|net| *net.realm_id())
-        .ok_or("no realm")?;
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    if !is_sync_eligible(&config, request.node_id) {
-        return Err(format!("{} is no infrastructure node", request.node_id));
+    fn next(&mut self, result: IoResult) -> HolderTurn {
+        match std::mem::replace(&mut self.step, HolderStep::Files) {
+            HolderStep::Bucket => {
+                let info = result.child::<BucketInfo, GetBucketError>()?;
+                let scope = OwnedScope {
+                    realm_id: self.realm_id,
+                    node_id: self.node_id,
+                    bucket: self.bucket.clone(),
+                    info: info.map_err(unavailable)?,
+                };
+                let load = LoadAccessOperation::new(scope.scope(), &self.auth);
+                self.scope = Some(scope);
+                self.step = HolderStep::Access;
+                Ok(Next::Call(IoCall::child(load)))
+            }
+            HolderStep::Access => {
+                self.access = Some(result.child::<Access, ReleaseError>()??);
+                self.answer()
+            }
+            HolderStep::Members => {
+                let output = result.child::<MembersOutput, ReleaseError>()??;
+                Ok(Next::Done(HolderAnswer::Members(RangeMembers {
+                    answers: output.answers,
+                    releases: output.releases,
+                    complete: output.complete,
+                    refused: output.refused,
+                })))
+            }
+            HolderStep::View(asked) => {
+                let view = (result.child::<Option<DistributionView>, StatusError>()?)
+                    .map_err(unavailable)?
+                    .ok_or_else(|| unavailable("no record of the set"))?;
+                let binding =
+                    (self.scope()?.info.distribution.as_ref()).ok_or(IoError::Unfinished)?;
+                let fence = local_fence(binding.set_id);
+                self.step = HolderStep::Fence(asked, Box::new(view));
+                Ok(Next::Call(IoCall::child(fence)))
+            }
+            HolderStep::Fence(asked, view) => {
+                let fence = result.child::<LocalFence, GuardError>()?;
+                let fence = fence.map_err(unavailable)?;
+                let binding =
+                    (self.scope()?.info.distribution.as_ref()).ok_or(IoError::Unfinished)?;
+                let member_id = binding.member_id;
+                let snapshot = view.snapshot();
+                let range = (snapshot.config.ranges.iter())
+                    .find(|range| range.range_id == asked.range_id)
+                    .filter(|range| snapshot.lists_locally(member_id, range, &fence));
+                match range {
+                    Some(range) => self.list_range(*asked, range),
+                    None => no_files(),
+                }
+            }
+            HolderStep::Files => {
+                let (files, next) = result.child::<FilesPage, PublishError>()??;
+                Ok(Next::Done(HolderAnswer::Files(RangeFiles {
+                    files,
+                    refused: false,
+                    next,
+                })))
+            }
+            HolderStep::Chunk => {
+                let read = result.child::<(CrateBytes, u64), CrateReadError>()?;
+                match read {
+                    Ok((found, size)) if found.metadata.contains_key(RELEASE_TAG) => {
+                        let bytes = found.bytes;
+                        let chunk = CrateChunk { bytes, size };
+                        Ok(Next::Done(HolderAnswer::Crate(Some(chunk))))
+                    }
+                    Ok(_) | Err(CrateReadError::Missing) => {
+                        Ok(Next::Done(HolderAnswer::Crate(None)))
+                    }
+                    Err(CrateReadError::Failed(reason)) => Err(PublishError::Unavailable(reason)),
+                }
+            }
+        }
     }
-    let token = AuthToken::bearer(request.bearer).map_err(|error| format!("{error:?}"))?;
-    handle
-        .request_release_holder(request.node_id, Some(token), request.bucket, request.ask)
-        .await
-        .map_err(|error| format!("{error:?}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{pinned_ids, upstream_of};
     use super::*;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::identifier::IdentifierTarget;
     use aruna_core::structs::storage::global_id::GlobalId;
     use aruna_core::structs::storage::origin::OriginVersion;
@@ -920,5 +1285,74 @@ mod tests {
                 .find(|entity| entity["@id"] == id.as_str());
             assert_eq!(entity.unwrap()["value"], value);
         }
+    }
+
+    fn step_info(realm_id: RealmId) -> BucketInfo {
+        BucketInfo {
+            group_id: Ulid::from_bytes([2; 16]),
+            created_at: std::time::UNIX_EPOCH,
+            created_by: aruna_core::UserId::nil(realm_id),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: aruna_core::structs::storage::format::Compression::Off,
+            distribution: None,
+        }
+    }
+
+    fn step_input(realm_id: RealmId) -> PublishInput {
+        PublishInput {
+            auth: AuthContext::anonymous(realm_id),
+            bearer: Some("do-not-print".to_string()),
+            key: "db/release.json".to_string(),
+            spec: ReleaseSpec::default(),
+        }
+    }
+
+    #[test]
+    fn bearer_stays_hidden() {
+        let input = step_input(RealmId::from_bytes([1; 32]));
+        assert!(!format!("{input:?}").contains("do-not-print"));
+    }
+
+    #[test]
+    fn missing_write_refused() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let info = step_info(realm_id);
+        let scope = BucketScope {
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            bucket: "db",
+            info: &info,
+        };
+        let routing = NodeRouting::default();
+        let mut publish = PublishReleaseOperation::new(scope, step_input(realm_id), routing);
+        publish.first().unwrap();
+        let denied: Result<(), AuthorizeError> = Err(AuthorizeError::PermissionDenied);
+        let answer = publish.next(IoResult::Child(ChildOutcome::new(denied)));
+        assert_eq!(
+            answer,
+            Err(PublishError::Forbidden("no WRITE on the bucket"))
+        );
+    }
+
+    #[test]
+    fn missing_chunk_answers() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let auth = AuthContext::anonymous(realm_id);
+        let ask = HolderAsk::Crate {
+            key: "db/release.json".to_string(),
+            version_id: Ulid::from_bytes([4; 16]),
+            offset: 0,
+        };
+        let mut holder = HolderAnswerOperation::new((realm_id, node), &auth, ("db", ask));
+        holder.step = HolderStep::Chunk;
+        let read: Result<(CrateBytes, u64), CrateReadError> = Err(CrateReadError::Missing);
+        assert_eq!(
+            holder.next(IoResult::Child(ChildOutcome::new(read))),
+            Ok(Next::Done(HolderAnswer::Crate(None)))
+        );
     }
 }

@@ -109,10 +109,6 @@ fn cursor_read() -> IoCall {
     read_row(NODE_STATE_KEYSPACE, cursor_key())
 }
 
-fn failed(error: impl std::fmt::Display) -> BlobQueueError {
-    BlobQueueError::UnexpectedEvent(error.to_string())
-}
-
 /// Sets the drain's timer from the queue when the node starts.
 #[derive(Debug, Default, PartialEq)]
 pub struct RestoreDrainOperation {
@@ -1297,7 +1293,7 @@ impl Operation for JobRelationshipsOperation {
             };
             let key = sync_relationship_key(&bucket, relationship_id);
             let relationship = SyncRelationship::from_bytes(&value)?;
-            validate_sync_key(&bucket, &key, &relationship)?;
+            validate_sync_key(&bucket, &ByteView::from(key), &relationship)?;
             if relationship.id != relationship_id {
                 return Err(ConversionError::FromStrError(
                     "sync relationship id does not match requested id".to_string(),

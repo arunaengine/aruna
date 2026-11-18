@@ -6,11 +6,14 @@
 use std::sync::Arc;
 
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
+use aruna_operations::driver::{drive, node_routing};
+use aruna_operations::s3::bucket::release::access::MembersCheckOperation;
 use aruna_operations::s3::bucket::release::publish::{
     self as release_publish, PublishError, PublishInput, ReleaseSpec,
 };
-use aruna_operations::s3::bucket::release::read::{release_members, release_view};
-use aruna_operations::s3::bucket::release::view::{FilePage, MAX_PAGE, ViewError};
+use aruna_operations::s3::bucket::release::view::{
+    CheckedViewOperation, FilePage, MAX_PAGE, ViewError,
+};
 use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -157,13 +160,20 @@ pub async fn publish_release(
         key: request.key.clone(),
         spec,
     };
-    let published = release_publish::publish_release(state.get_ctx().as_ref(), scope, input)
-        .await
-        .map_err(|error| match error {
-            PublishError::Forbidden(_) => ServerError::Forbidden,
-            PublishError::Conflict(reason) => ServerError::Conflict(reason),
-            PublishError::Unavailable(reason) => ServerError::ServiceUnavailableReason(reason),
-        })?;
+    let published = drive(
+        release_publish::PublishReleaseOperation::new(
+            scope,
+            input,
+            node_routing(state.get_ctx().as_ref()),
+        ),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|error| match error {
+        PublishError::Forbidden(_) => ServerError::Forbidden,
+        PublishError::Conflict(reason) => ServerError::Conflict(reason),
+        PublishError::Unavailable(reason) => ServerError::ServiceUnavailableReason(reason),
+    })?;
     Ok(Json(PublishReleaseResponse {
         bucket,
         key: request.key,
@@ -239,9 +249,12 @@ pub async fn list_releases(
         auth: &auth,
         bearer: bearer.as_ref().map(ValidatedBearer::as_str),
     };
-    let found = release_members(state.get_ctx().as_ref(), scope, caller, &[])
-        .await
-        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+    let found = drive(
+        MembersCheckOperation::new(scope, caller, &[]),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
     let releases = (found.releases.into_iter())
         .map(|valid| ReleaseItem {
             key: valid.key,
@@ -413,7 +426,11 @@ pub async fn list_release_files(
         limit,
     };
     let context = state.get_ctx();
-    let found = release_view(context.as_ref(), scope, &auth, (&params.key, version), page).await;
+    let found = drive(
+        CheckedViewOperation::new(scope, &auth, (&params.key, version), page),
+        context.as_ref(),
+    )
+    .await;
     let view = match found {
         Ok(view) => view,
         // A copy may not have received the release yet; its coordinator decides.

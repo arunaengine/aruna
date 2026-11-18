@@ -41,10 +41,10 @@ use crate::metadata::message_kind::transport_message_kind;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::local_search::LocalBucketSearch;
-use crate::s3::bucket::release::publish::{PublishError, holder_answer};
+use crate::s3::bucket::release::publish::{HolderAnswerOperation, PublishError};
 use crate::s3::bucket::search::SearchBucketsInput;
 use crate::s3::object::search::SearchObjectsInput;
-use crate::s3::object::search_scan::search_local_objects;
+use crate::s3::object::search_scan::SearchObjectsOperation;
 use crate::staging::bucket_guard::BucketGuardOperation;
 use crate::staging::offered_directory::OfferedDirectoryError;
 use crate::sync::sync_relationship::{
@@ -554,19 +554,22 @@ impl MetadataHandle {
                     .await
                     {
                         Ok(auth) => match self.inner.net_handle.as_ref() {
-                            Some(net_handle) => match search_local_objects(
+                            Some(net_handle) => match crate::driver::drive(
+                                SearchObjectsOperation::new(
+                                    SearchObjectsInput {
+                                        auth,
+                                        realm_id: *net_handle.realm_id(),
+                                        node_id: net_handle.node_id(),
+                                        query,
+                                        key_match,
+                                        bucket,
+                                        limit,
+                                        start_after,
+                                        as_of,
+                                    },
+                                    context.storage_handle.range_indexes().is_some(),
+                                ),
                                 context.as_ref(),
-                                SearchObjectsInput {
-                                    auth,
-                                    realm_id: *net_handle.realm_id(),
-                                    node_id: net_handle.node_id(),
-                                    query,
-                                    key_match,
-                                    bucket,
-                                    limit,
-                                    start_after,
-                                    as_of,
-                                },
                             )
                             .await
                             {
@@ -602,7 +605,8 @@ impl MetadataHandle {
                     let net_handle =
                         (self.inner.net_handle.as_ref()).ok_or(MetadataReadError::Unavailable)?;
                     let scope = (*net_handle.realm_id(), net_handle.node_id());
-                    holder_answer(context.as_ref(), scope, &auth, (bucket.as_str(), ask))
+                    let answer = HolderAnswerOperation::new(scope, &auth, (bucket.as_str(), ask));
+                    crate::driver::drive(answer, context.as_ref())
                         .await
                         .map_err(|error| match error {
                             PublishError::Forbidden(_) => MetadataReadError::Forbidden,
@@ -1022,16 +1026,19 @@ impl MetadataHandle {
                 })
                 .await
             }
-            check @ MetadataTransportMessage::ForwardCheckBucket { .. } => {
-                Box::pin(async {
-                    crate::s3::bucket::forward::check_bucket_write(context, peer, check).await
-                })
-                .await
-            }
-            create @ (MetadataTransportMessage::ForwardCreateBucket { .. }
+            bucket @ (MetadataTransportMessage::ForwardCheckBucket { .. }
+            | MetadataTransportMessage::ForwardCreateBucket { .. }
             | MetadataTransportMessage::ForwardNewBucket { .. }) => {
                 Box::pin(async {
-                    crate::s3::bucket::forward::apply_bucket_create(context, peer, create).await
+                    let local = context.node_and_realm();
+                    let answer = crate::s3::bucket::forward::BucketForwardOperation::new(
+                        local, peer, bucket,
+                    );
+                    crate::driver::drive(answer, context)
+                        .await
+                        .unwrap_or_else(|error| {
+                            crate::forward::transport::reject(error.to_string())
+                        })
                 })
                 .await
             }

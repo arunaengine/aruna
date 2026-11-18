@@ -1,5 +1,5 @@
 //! Shapes of database release checks: which exact versions a release pins, what a range holder
-//! answers, and the effects that read a release crate or ask a holder.
+//! answers, and the crate reads and holder questions behind them.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::NodeId;
+use crate::calls::IoError;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::bucket_metadata::ReleaseRef;
@@ -156,23 +157,8 @@ pub enum CrateReadError {
     Failed(String),
 }
 
-/// Asks one holder with the caller's bearer, which the holder validates itself.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HolderRequest {
-    pub node_id: NodeId,
-    pub bearer: String,
-    pub bucket: String,
-    pub ask: HolderAsk,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReleaseEffect {
-    ReadCrate(Box<CrateRead>),
-    Holder(HolderRequest),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReleaseEvent {
-    CrateRead(Result<CrateBytes, CrateReadError>),
-    Holder(Result<HolderAnswer, String>),
+impl From<IoError> for CrateReadError {
+    fn from(error: IoError) -> Self {
+        Self::Failed(error.to_string())
+    }
 }

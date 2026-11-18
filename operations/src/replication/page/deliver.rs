@@ -16,8 +16,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::Publication;
 use tracing::{info, warn};
 
-use super::apply::{ApplyInput, PageApplyOperation, PageError, page_answer};
+use super::apply::{ApplyInput, PageApplyOperation, page_answer};
 use super::build::{BuildError, BuildInput, Built, PageBuildOperation};
+use super::plan::PageError;
 use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
 use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::replication::members::{

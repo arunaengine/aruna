@@ -39,9 +39,10 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
-use aruna_operations::blob::cleanup::process_cleanup_batch;
-use aruna_operations::blob::purge::{StorageFilesOperation, scope_totals};
-use aruna_operations::blob::unify::{Unified, preview_page, unify};
+use aruna_operations::blob::cleanup::{CleanupNode, ProcessCleanupOperation};
+use aruna_operations::blob::migration::misplaced::AnyKey;
+use aruna_operations::blob::purge::{ScopeTotalsOperation, StorageFilesOperation};
+use aruna_operations::blob::unify::{PreviewPageOperation, PreviewQuery, Unified, UnifyOperation};
 use aruna_operations::driver::{DriverContext, drive, node_routing};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
@@ -527,11 +528,21 @@ async fn s3_finds_copies() {
     let named = format!("old/{id}_sample.faa.gz");
     assert!(copy.backend_path.ends_with(&named));
     let bucket = (BUCKET, context.group_id);
-    let unified = unify(&context.driver, bucket, found, None).await.unwrap();
+    let unified = drive(UnifyOperation::new(bucket, found, None), &context.driver)
+        .await
+        .unwrap();
     assert_eq!(unified, Unified::Done);
     assert_eq!(duplicates(&context).await.keys, 0);
     // The storage keeps no versions; the file named by the id goes all the same.
-    process_cleanup_batch(&context.driver).await.unwrap();
+    drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert!(!exists(&context, &named).await);
     assert!(exists(&context, "old/sample.faa.gz").await);
     assert_eq!(
@@ -649,9 +660,15 @@ async fn duplicates(context: &TestContext) -> aruna_operations::blob::unify::Uni
     )
     .await
     .unwrap();
-    preview_page(&context.driver, (BUCKET, ""), &access, (None, None, 100))
-        .await
-        .unwrap()
+    let query = PreviewQuery {
+        prefix: String::new(),
+        filter: None,
+        after: None,
+        limit: 100,
+    };
+    let routing = node_routing(&context.driver);
+    let preview = PreviewPageOperation::new(routing, BUCKET, std::sync::Arc::new(access), query);
+    drive(preview, &context.driver).await.unwrap()
 }
 
 #[tokio::test]
@@ -676,7 +693,9 @@ async fn s3_replaces_copies() {
     assert_eq!((page.keys, page.entries.len()), (0, 0));
     // A cleanup found before the overwrite leaves the new version's file alone.
     let bucket = (BUCKET, context.group_id);
-    let unified = unify(&context.driver, bucket, found, None).await.unwrap();
+    let unified = drive(UnifyOperation::new(bucket, found, None), &context.driver)
+        .await
+        .unwrap();
     assert_eq!(unified, Unified::Changed);
     assert_eq!(run_import(&context, 0xE5).await, (0, 2, 0));
     assert_eq!(current(&context, "old/a.txt").await, replaced);
@@ -757,10 +776,20 @@ async fn s3_unifies_uploads() {
     let named = format!("x.txt~{upload}");
     assert!(found.copies[0].backend_path.ends_with(&named));
     let bucket = (BUCKET, context.group_id);
-    let unified = unify(&context.driver, bucket, found, None).await.unwrap();
+    let unified = drive(UnifyOperation::new(bucket, found, None), &context.driver)
+        .await
+        .unwrap();
     assert_eq!(unified, Unified::Done);
     assert_eq!(duplicates(&context).await.keys, 0);
-    process_cleanup_batch(&context.driver).await.unwrap();
+    drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert!(!exists(&context, &named).await);
     assert_eq!(content(&context, "x.txt", upload).await, b"abc");
 }
@@ -785,10 +814,8 @@ async fn s3_purges_named() {
         auth_context: context.auth.clone(),
         node_id: context.node_id,
     };
-    let readable = |_: &str| true;
-    let totals = scope_totals(&context.driver, &spec.scope, &readable)
-        .await
-        .unwrap();
+    let totals = ScopeTotalsOperation::new(node_routing(&context.driver), &spec.scope, AnyKey);
+    let totals = drive(totals, &context.driver).await.unwrap();
     assert_eq!((totals.storage_files, totals.storage_bytes), (2, 10));
     let versions = [
         ("old/a.txt", id),
@@ -831,7 +858,15 @@ async fn s3_purges_named() {
     )
     .await
     .unwrap();
-    process_cleanup_batch(&context.driver).await.unwrap();
+    drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert!(!exists(&context, &named).await);
     assert!(exists(&context, "old/b.txt").await);
 }
@@ -853,9 +888,19 @@ async fn s3_keeps_changed() {
     };
     place(&context, "old/a.txt", b"other byte").await;
     let bucket = (BUCKET, context.group_id);
-    let unified = unify(&context.driver, bucket, found, None).await.unwrap();
+    let unified = drive(UnifyOperation::new(bucket, found, None), &context.driver)
+        .await
+        .unwrap();
     assert_eq!(unified, Unified::Changed);
-    process_cleanup_batch(&context.driver).await.unwrap();
+    drive(
+        ProcessCleanupOperation::new(CleanupNode {
+            routing: node_routing(&context.driver),
+            has_blob: context.driver.blob_handle.is_some(),
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert!(exists(&context, &named).await);
     assert_eq!(content(&context, "old/a.txt", id).await, b"same bytes");
 }
