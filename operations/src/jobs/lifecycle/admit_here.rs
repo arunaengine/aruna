@@ -72,6 +72,16 @@ pub(super) fn admission_error(error: LifecycleError) -> SubmitJobError {
     }
 }
 
+/// A store failure while admitting leaves the holder unavailable, as any admission failure.
+pub(super) fn placement_failure(error: SubmitJobError) -> SubmitJobError {
+    match error {
+        error @ (SubmitJobError::Storage(_) | SubmitJobError::UnexpectedEvent(_)) => {
+            unavailable(error)
+        }
+        error => error,
+    }
+}
+
 fn unavailable(error: impl std::fmt::Display) -> SubmitJobError {
     SubmitJobError::PlacementUnavailable(error.to_string())
 }
@@ -601,22 +611,26 @@ mod tests {
         ));
     }
 
+    fn projection(family: JobFamilyId, state: LogicalJobState) -> JobProjection {
+        JobProjection {
+            submission_id: family.submission_id,
+            request_digest: family.request_digest,
+            canonical_job_id: JobId::from_bytes([7u8; 16]),
+            aliases: Vec::new(),
+            state,
+            canonical_execution_id: None,
+            executions: Vec::new(),
+            outputs: OutputSet::new(Vec::new()).expect("empty outputs"),
+            cancel_requested: false,
+        }
+    }
+
     fn cached(family: JobFamilyId, stale: bool) -> IoResult {
         let cache = ProjectionCache {
             version: PROJECTION_CACHE_VERSION,
             revision: 1,
             stale,
-            projection: Some(JobProjection {
-                submission_id: family.submission_id,
-                request_digest: family.request_digest,
-                canonical_job_id: JobId::from_bytes([7u8; 16]),
-                aliases: Vec::new(),
-                state: LogicalJobState::Succeeded,
-                canonical_execution_id: None,
-                executions: Vec::new(),
-                outputs: OutputSet::new(Vec::new()).expect("empty outputs"),
-                cancel_requested: false,
-            }),
+            projection: Some(projection(family, LogicalJobState::Succeeded)),
         };
         let value = Value::from(postcard::to_allocvec(&cache).expect("cache encodes"));
         claims(vec![(Key::from(vec![1u8]), value)])
@@ -645,5 +659,54 @@ mod tests {
             stale.next(IoResult::Child(ChildOutcome::new(failed))),
             Ok(Next::Done(LogicalJobState::Indeterminate))
         );
+    }
+
+    // A family without a usable cache row is reduced from its records, as a stale one is.
+    #[test]
+    fn missing_cache_rebuilds() {
+        let family = Family::new([5u8; 32]).family();
+        let unreadable = (Key::from(vec![1u8]), Value::from(vec![0xffu8]));
+        for rows in [Vec::new(), vec![unreadable]] {
+            let mut observed = ObservedStateOperation::new(family, 1);
+            observed.first().expect("cache page");
+            assert!(matches!(
+                observed.next(claims(rows)),
+                Ok(Next::Call(IoCall::Child(_)))
+            ));
+            let projected = Ok::<_, RecordStoreError>(ProjectedFamily {
+                family,
+                revision: 1,
+                projection: Some(projection(family, LogicalJobState::Running)),
+                truncated: false,
+                cached: false,
+            });
+            assert_eq!(
+                observed.next(IoResult::Child(ChildOutcome::new(projected))),
+                Ok(Next::Done(LogicalJobState::Running))
+            );
+        }
+    }
+
+    // Store and runner failures read as unavailable placement; a refusal keeps its meaning.
+    #[test]
+    fn store_failure_unavailable() {
+        let failures = [
+            SubmitJobError::from(IoError::Storage(StorageError::TransactionConflict)),
+            SubmitJobError::from(IoError::Conflict),
+            SubmitJobError::from(IoError::Unfinished),
+        ];
+        for failure in failures {
+            assert!(matches!(
+                placement_failure(failure),
+                SubmitJobError::PlacementUnavailable(_)
+            ));
+        }
+        let conflict = SubmitJobError::JobPlanConflict {
+            existing_job_id: JobId::from_bytes([7u8; 16]),
+        };
+        assert!(matches!(
+            placement_failure(conflict),
+            SubmitJobError::JobPlanConflict { .. }
+        ));
     }
 }
