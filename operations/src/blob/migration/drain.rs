@@ -114,7 +114,11 @@ pub async fn read_earlier(
 ) -> Result<Earlier, String> {
     let mut earlier = Earlier::new();
     for rule in &routing.imports {
-        let patterns = crate::s3::imports::read_earlier(context, rule.import_id).await;
+        let patterns = crate::driver::drive(
+            crate::s3::imports::ReadEarlierOperation::new(rule.import_id),
+            context,
+        )
+        .await;
         let patterns = patterns.map_err(|error| error.to_string())?;
         if !patterns.is_empty() {
             earlier.insert(rule.import_id, patterns);

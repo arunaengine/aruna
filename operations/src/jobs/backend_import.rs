@@ -52,9 +52,11 @@ use crate::placement::policy::GateOperation;
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::imports::discovery::read_discovery;
-use crate::s3::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
-use crate::s3::imports::{read_earlier, read_import};
+use crate::s3::imports::discovery::ReadDiscoveryOperation;
+use crate::s3::imports::shared::{
+    self, ReadSharedOperation, SharedRule, TakenPathsOperation, claim_file,
+};
+use crate::s3::imports::{ReadEarlierOperation, ReadImportOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, RuleScan, Trail,
@@ -220,10 +222,11 @@ pub async fn run_backend_import(ctx: &JobContext, spec: &BackendImportSpec) -> J
             Err(error) => return retryable(error.reason()),
         };
         let paths: Vec<&str> = objects.iter().map(|object| object.key.as_str()).collect();
-        run.page.taken = match taken_paths(&ctx.driver, &run.shared, &paths).await {
-            Ok(taken) => taken,
-            Err(error) => return retryable(error),
-        };
+        run.page.taken =
+            match drive(TakenPathsOperation::new(&run.shared, &paths), &ctx.driver).await {
+                Ok(taken) => taken,
+                Err(error) => return retryable(error),
+            };
         for object in objects {
             if ctx.cancel.is_cancelled() {
                 return JobRunOutcome::Cancelled;
@@ -296,12 +299,17 @@ fn tally(
 /// Rereads the rule and everything it depends on before each page, so a removed rule,
 /// a disabled backend or a lost permission stops the run.
 async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun, JobRunOutcome> {
-    let rule = match read_import(&ctx.driver, spec.group_id, spec.import_id).await {
+    let rule = match drive(
+        ReadImportOperation::new(spec.group_id, spec.import_id),
+        &ctx.driver,
+    )
+    .await
+    {
         Ok(Some(rule)) => rule,
         Ok(None) => return Err(permanent("the import rule was removed")),
         Err(error) => return Err(retryable(error)),
     };
-    let earlier = read_earlier(&ctx.driver, rule.import_id)
+    let earlier = drive(ReadEarlierOperation::new(rule.import_id), &ctx.driver)
         .await
         .map_err(retryable)?;
     let backend = match drive(GetBackendOperation::new(rule.backend_id), &ctx.driver).await {
@@ -359,10 +367,15 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
     )
     .await
     .map_err(retryable)?;
-    let discovery = read_discovery(&ctx.driver, rule.group_id, rule.import_id)
+    let discovery = drive(
+        ReadDiscoveryOperation::new(rule.group_id, rule.import_id),
+        &ctx.driver,
+    )
+    .await
+    .map_err(retryable)?;
+    let shared = drive(ReadSharedOperation::new(&rule), &ctx.driver)
         .await
         .map_err(retryable)?;
-    let shared = read_shared(&ctx.driver, &rule).await.map_err(retryable)?;
     Ok(ImportRun {
         rule,
         earlier,
@@ -1114,17 +1127,6 @@ async fn page_intents(
             None => return Ok(intents),
         }
     }
-}
-
-/// `page_intents` for a caller outside the run, such as a preview.
-pub(crate) async fn listed_intents(
-    context: &DriverContext,
-    rule: &BackendImport,
-    objects: &[ExternalObject],
-) -> Result<BTreeMap<String, Vec<(Key, WriteIntent)>>, String> {
-    page_intents(context, rule, objects)
-        .await
-        .map_err(ItemError::reason)
 }
 
 /// The path of an intent key: the import id, the path, a zero byte and the version id.

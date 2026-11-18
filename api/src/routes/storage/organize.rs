@@ -21,8 +21,8 @@ use aruna_operations::s3::bucket::linked::{
     ShownJobOperation,
 };
 use aruna_operations::s3::bucket::remap::{self, RemapScope};
-use aruna_operations::s3::imports::discovery::bucket_access;
-use aruna_operations::s3::imports::last_run;
+use aruna_operations::s3::imports::LastRunOperation;
+use aruna_operations::s3::imports::discovery::RuleAccessOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -254,9 +254,12 @@ async fn caller(
 ) -> ServerResult<(BackendImport, AuthContext, BucketAccess)> {
     let (group_id, auth) = admin_of_group(state, auth, group_id).await?;
     let rule = existing_rule(state, group_id, import_id).await?;
-    let access = bucket_access(&state.get_ctx(), &auth, state.get_node_id(), &rule)
-        .await
-        .map_err(map_error)?;
+    let access = drive(
+        RuleAccessOperation::new(&auth, state.get_node_id(), &rule),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok((rule, auth, access))
 }
 
@@ -770,7 +773,9 @@ pub async fn link_status(
 ) -> ServerResult<Json<LinkStatus>> {
     let (rule, _, access) = caller(&state, auth, (&group_id, &import_id)).await?;
     let context = state.get_ctx();
-    let run = last_run(&context, &rule).await.map_err(map_error)?;
+    let run = drive(LastRunOperation::new(&rule), &context)
+        .await
+        .map_err(map_error)?;
     let Some(run) = run else {
         return Ok(Json(LinkStatus {
             files: None,
@@ -778,16 +783,21 @@ pub async fn link_status(
             conflicts: Vec::new(),
         }));
     };
-    let rules = aruna_operations::s3::imports::discovery::read_discovery(
+    let rules = drive(
+        aruna_operations::s3::imports::discovery::ReadDiscoveryOperation::new(
+            rule.group_id,
+            rule.import_id,
+        ),
         &context,
-        rule.group_id,
-        rule.import_id,
     )
     .await
     .map_err(map_error)?;
-    let earlier = aruna_operations::s3::imports::read_earlier(&context, rule.import_id)
-        .await
-        .map_err(map_error)?;
+    let earlier = drive(
+        aruna_operations::s3::imports::ReadEarlierOperation::new(rule.import_id),
+        &context,
+    )
+    .await
+    .map_err(map_error)?;
     let mut conflicts = Vec::new();
     for failure in run.checkpoint.errors {
         let keys = file_keys(&context, (&rule, &earlier, &rules), &failure.key).await?;
