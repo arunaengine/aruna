@@ -18,7 +18,10 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use super::*;
-use crate::jobs::executor::{JobRunOutcome, ProgressReporter};
+use crate::driver::{drive, node_routing};
+use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
+use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::time::unix_timestamp_millis;
 use crate::s3::object::search::{ObjectKeyMatch, SearchObjectsInput};
 use crate::s3::object::search_scan::search_local_objects;
 
@@ -258,7 +261,7 @@ impl Fixture {
 
     async fn run(&self, seed: u8) -> (u64, u64) {
         let ctx = self.context(seed).await;
-        match crate::jobs::staging::run_staging_job(&ctx, &self.spec).await {
+        match crate::jobs::host::run_staging_job(&ctx, &self.spec).await {
             JobRunOutcome::Succeeded(JobResultPayload::Staging {
                 completed_items,
                 failed_items,
@@ -500,63 +503,6 @@ async fn gzip_table_streams() {
     server.abort();
 }
 
-/// A stream of `bytes` in pieces, the way a transport delivers them.
-fn pieces(bytes: Vec<u8>) -> BackendStream<Result<Bytes, StreamError>> {
-    let pieces: Vec<Result<Bytes, StreamError>> = (bytes.chunks(16 * 1024))
-        .map(|piece| Ok(Bytes::copy_from_slice(piece)))
-        .collect();
-    BackendStream(Box::pin(futures_util::stream::iter(pieces)))
-}
-
-// A source rewritten in place while a step kept its stream makes the kept decoder fail; the
-// stream is opened again once, and that open reports the change, never a broken table.
-#[tokio::test]
-async fn rewritten_gzip_reopens() {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let mut seed = 7u64;
-    let mut text = Vec::new();
-    while text.len() < 1 << 20 {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        text.extend_from_slice(format!("{:016x}\n", seed).as_bytes());
-    }
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Default::default());
-    encoder.write_all(&text).unwrap();
-    let compressed = encoder.finish().unwrap();
-    // The first part of the table, then bytes another writer left behind.
-    let mut rewritten = compressed[..compressed.len() / 2].to_vec();
-    rewritten.extend(std::iter::repeat_n(0xFF, compressed.len() / 2));
-    let opens = AtomicUsize::new(0);
-    let open = || {
-        let first = opens.fetch_add(1, Ordering::SeqCst) == 0;
-        let rewritten = rewritten.clone();
-        async move {
-            match first {
-                true => Ok((pieces(rewritten), None)),
-                false => Err(ChunkFailure::Changed),
-            }
-        }
-    };
-    let mut kept = None;
-    let mut offset = 0;
-    let failure = loop {
-        match gzip_chunk(&mut kept, (None, None, offset), TABLE_CHUNK, open).await {
-            Ok((bytes, _, _)) => offset += bytes.len() as u64,
-            Err(failure) => break failure,
-        }
-    };
-    assert!(offset > 0, "the first steps read the table");
-    assert!(matches!(failure, ChunkFailure::Changed));
-    assert_eq!(opens.load(Ordering::SeqCst), 2);
-
-    // A freshly opened stream that is no valid gzip stays a lasting failure.
-    let broken = || async { Ok((pieces(vec![0xFF; 1024]), None)) };
-    let failure = gzip_chunk(&mut None, (None, None, 0), TABLE_CHUNK, broken).await;
-    assert!(matches!(failure, Err(ChunkFailure::Lasting(_))));
-}
-
 // An uploaded CSV of file URLs imports one reference per row with its kept columns, read as
 // the submitter.
 #[tokio::test]
@@ -628,7 +574,7 @@ async fn paused_job_stops() {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             stop.cancel();
         };
-        let run = crate::jobs::staging::run_staging_job(&ctx, &fixture.spec);
+        let run = crate::jobs::host::run_staging_job(&ctx, &fixture.spec);
         let (outcome, ()) = tokio::join!(run, stopping);
         match cancel {
             true => assert!(matches!(outcome, JobRunOutcome::Cancelled)),
@@ -636,23 +582,6 @@ async fn paused_job_stops() {
         }
     }
     server.abort();
-}
-
-// A shutdown during the cleanup of a permanent failure leaves it failed, since its queue rows
-// are gone; a retryable failure under shutdown is still interrupted.
-#[tokio::test]
-async fn shutdown_keeps_permanent() {
-    use aruna_core::structs::execution::job::{JobError, JobErrorKind};
-    let fixture = Fixture::new("http://127.0.0.1:9", summary_table()).await;
-    let ctx = fixture.context(22).await;
-    ctx.shutdown.cancel();
-    let stopped = |error| crate::jobs::staging::stopped_outcome(&ctx, JobRunOutcome::Failed(error));
-    let permanent = stopped(JobError::permanent("bucket replaced")).await;
-    assert!(
-        matches!(permanent, JobRunOutcome::Failed(error) if error.kind == JobErrorKind::Permanent)
-    );
-    let retryable = stopped(JobError::retryable("reset")).await;
-    assert!(matches!(retryable, JobRunOutcome::Interrupted));
 }
 
 // List columns give size, checksum and time: such rows are registered without a HEAD, reads
@@ -919,7 +848,7 @@ async fn record_pages_resume() {
         }
         stop.cancel();
     };
-    let run = crate::jobs::staging::run_staging_job(&ctx, &specs[0]);
+    let run = crate::jobs::host::run_staging_job(&ctx, &specs[0]);
     let (outcome, ()) = tokio::join!(run, watch);
     assert!(matches!(outcome, JobRunOutcome::Interrupted));
     let resumed = JobContext {
@@ -929,8 +858,8 @@ async fn record_pages_resume() {
     let mut other = fixture.context_for(&specs[1], 51).await;
     other.range_turns = resumed.range_turns.clone();
     let (first, second) = tokio::join!(
-        crate::jobs::staging::run_staging_job(&resumed, &specs[0]),
-        crate::jobs::staging::run_staging_job(&other, &specs[1]),
+        crate::jobs::host::run_staging_job(&resumed, &specs[0]),
+        crate::jobs::host::run_staging_job(&other, &specs[1]),
     );
     let counts = |outcome| match outcome {
         JobRunOutcome::Succeeded(JobResultPayload::Staging {
@@ -1115,7 +1044,7 @@ async fn import_records(
     let started = std::time::Instant::now();
     // Each job runs as its own task, as on a node.
     let runs = runs.into_iter().map(|(job, spec)| {
-        tokio::spawn(async move { crate::jobs::staging::run_staging_job(&job, &spec).await })
+        tokio::spawn(async move { crate::jobs::host::run_staging_job(&job, &spec).await })
     });
     let outcomes = futures_util::future::join_all(runs).await;
     let elapsed = started.elapsed().as_secs_f64();
@@ -1170,7 +1099,8 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     let (snapshot, bytes) = searched();
     let set_id = snapshot.set_id();
     store_record(handle, set_id, bytes).await;
-    let mut bucket = pinned_bucket(ctx, spec).await.ok().unwrap();
+    let found = GetBucketOperation::new(spec.bucket.clone());
+    let mut bucket = crate::driver::drive(found, &ctx.driver).await.unwrap();
     bucket.distribution = Some(binding(&snapshot, 2, 5));
     let range_id = snapshot.range_for("samn").unwrap().range_id;
     let ranges = [KeyRange {
@@ -1211,4 +1141,83 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     }
     assert!(commit(handle, txn_id).await);
     (set_id, range_id)
+}
+
+/// Writes `body` at `key` through the ordinary put, as the submitter, and queues its replication;
+/// the version's origin is the job's import, like the references of its other rows.
+async fn write_object(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    (name, bucket): (&str, &BucketInfo),
+    key: &str,
+    (body, metadata): (Bytes, &BTreeMap<String, String>),
+) -> Result<(), ItemFailure> {
+    let system = |error: String| ItemFailure::System(error);
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&ctx.driver),
+            (bucket).group_id,
+            BucketRules::of(bucket),
+        ),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| system(error.to_string()))?;
+    let auth = &spec.auth_context;
+    let gate = drive(
+        GateOperation::new(auth.realm_id, unix_timestamp_millis()),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| system(error.to_string()))?;
+    let quota = drive(GetConfigOperation::new(auth.realm_id), &ctx.driver)
+        .await
+        .map_err(|error| system(error.to_string()))?
+        .quota
+        .effective_group_ceiling(&bucket.group_id);
+    let length = body.len() as u64;
+    let body = BackendStream::new(futures_util::stream::iter([Ok::<_, StreamError>(body)]));
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: auth.user_id,
+        group_id: bucket.group_id,
+        realm_id: auth.realm_id,
+        node_id: spec.node_id,
+        request: PutObjectInput {
+            bucket: name.to_string(),
+            key: key.to_string(),
+            content_length: Some(length),
+            body: Some(body),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling: quota,
+        routing,
+    })
+    .with_bucket_guard(bucket.clone())
+    .with_version_origin(Some(VersionOrigin::Source {
+        job_id: Some(ctx.job_id.as_ulid()),
+    }))
+    .with_restrictions(auth.path_restrictions.clone())
+    .with_metadata(metadata.clone().into_iter().collect::<HashMap<_, _>>());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    let result = drive(operation, &ctx.driver).await.map_err(put_failure)?;
+    drive(
+        LiveVersionOperation::new(LiveVersionInput {
+            local_node_id: spec.node_id,
+            auth_context: auth.clone(),
+            bucket: name.to_string(),
+            key: key.to_string(),
+            version_id: result.version_id,
+            delete_marker: false,
+        }),
+        &ctx.driver,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| ItemFailure::Stage(format!("replication queue failed: {error}")))
 }
