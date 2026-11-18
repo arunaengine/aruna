@@ -20,6 +20,7 @@ mod eviction;
 mod heartbeat;
 pub mod job_control;
 pub mod notification;
+pub mod shard_manifest;
 mod signing;
 pub mod streams;
 mod tasks;

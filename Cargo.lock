@@ -728,6 +728,7 @@ dependencies = [
  "aruna-core",
  "aruna-storage",
  "async-trait",
+ "blake3",
  "byteview",
  "crossfire",
  "fjall",
