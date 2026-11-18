@@ -51,7 +51,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
     mint_local_document,
 };
-use aruna_operations::metadata::forward::write::route_metadata_update;
+use crate::metadata_calls::route_metadata_update;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use aruna_operations::realm::set_policies::{

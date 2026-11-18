@@ -681,7 +681,7 @@ mod tests {
     // fails, while a plain edit of the same read copy still queues.
     #[tokio::test]
     async fn forwards_visibility_change() {
-        use crate::metadata::forward::write::route_metadata_update;
+        use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
         use aruna_core::document::DocumentTarget;
         use aruna_core::structs::identity::auth::Actor;
         use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -716,16 +716,22 @@ mod tests {
                 .is_ok()
         );
         let update = |public: Option<bool>| {
-            route_metadata_update(
+            crate::driver::drive(
+                RouteUpdateOperation::new(
+                    (
+                        actor.clone(),
+                        context.net_handle.as_ref().map(|net| net.node_id()),
+                    ),
+                    (None, record.document_id),
+                    DocumentUpdate {
+                        public,
+                        mutation: contact("ada"),
+                        expected_revision: None,
+                        commit_message: None,
+                    },
+                    None,
+                ),
                 &context,
-                actor.clone(),
-                None,
-                record.document_id,
-                public,
-                contact("ada"),
-                None,
-                None,
-                None,
             )
         };
 

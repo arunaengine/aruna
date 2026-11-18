@@ -5,8 +5,6 @@
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
-use crate::device::edit::accepts_edits;
-use crate::device::edit::apply_local_edit;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::VisibleRecordOperation;
@@ -25,14 +23,11 @@ use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
-use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
 use crate::metadata::update_entry::UpdateEntryOperation;
-use crate::realm::mutate_placement::node_kind;
 use aruna_core::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
-use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -43,7 +38,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::read::device_replica;
 use crate::document_repository::GetConfigOperation;
 use crate::forward::authorize::ForwardAuthError;
 use crate::forward::authorize::ForwardedCallerOperation;
@@ -51,10 +45,7 @@ use crate::forward::authorize::forward_auth_error;
 use crate::forward::authorize::write_check;
 use crate::forward::replay::HeldRecordError;
 use crate::forward::replay::HeldRecordOperation;
-use crate::forward::replay::routed_record_matches;
 use crate::forward::replay::{CreateRowsOperation, replay_answer};
-use crate::forward::routing::ForwardHoldersOperation;
-use crate::forward::routing::holder_intersection;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::MetadataWriteError;
 use crate::forward::transport::forwarded_unavailable;
@@ -86,150 +77,6 @@ pub enum CreateAuthorizedError {
 impl From<aruna_core::calls::IoError> for CreateAuthorizedError {
     fn from(error: aruna_core::calls::IoError) -> Self {
         Self::Write(error.into())
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn route_metadata_update(
-    context: &Arc<DriverContext>,
-    actor: Actor,
-    record: Option<&MetadataRegistryRecord>,
-    document_id: Ulid,
-    public: Option<bool>,
-    mutation: UpdateDocumentMutation,
-    expected_revision: Option<Ulid>,
-    auth_token: Option<AuthToken>,
-    commit_message: Option<String>,
-) -> Result<MetadataRegistryRecord, MetadataWriteError> {
-    let config = drive(GetConfigOperation::new(actor.realm_id), context)
-        .await
-        .inspect_err(config_unavailable)
-        .ok()
-        .ok_or_else(|| {
-            MetadataWriteError::Undeliverable("realm placement config is unavailable".to_string())
-        })?;
-    // On a device a selected or read document is edited locally and queued; a holder sees the
-    // change set when the intake drain forwards it. Only a holder can check an expected revision
-    // or change visibility, so those always go to a holder and fail while none answers.
-    let by_owner =
-        node_kind(&config, actor.node_id).and_then(|kind| kind.owner()) == Some(actor.user_id);
-    if expected_revision.is_none()
-        && public.is_none()
-        && let Some(replica) =
-            device_replica(context, &config, Some(actor.node_id), document_id).await
-        && accepts_edits(&replica, by_owner)
-    {
-        let issued_at = crate::device::publish_queue::token_issued_at(auth_token.as_ref());
-        let edit = apply_local_edit(actor.user_id, actor.node_id, &replica, mutation, issued_at);
-        return drive(edit, context).await.map_err(device_edit_error);
-    }
-    let placement = resolve_metadata_id(
-        &config,
-        actor.realm_id,
-        record.map(|record| record.group_id),
-        document_id,
-    )
-    .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    let config_digest = config
-        .digest()
-        .map_err(|error| MetadataWriteError::Undeliverable(error.to_string()))?;
-    if record.is_some_and(|record| {
-        !routed_record_matches(&config, actor.realm_id, document_id, &placement, record)
-    }) {
-        return Err(MetadataWriteError::Undeliverable(
-            "local metadata registry record does not match the routed document".to_string(),
-        ));
-    }
-    let local_node_id = actor.node_id;
-    let current_holders = resolve_shard_holders(&config, &placement);
-    let holders = record.map_or_else(
-        || current_holders.clone(),
-        |record| holder_intersection(&current_holders, &record.holder_node_ids),
-    );
-    if record.is_some() && holders.is_empty() {
-        return Err(MetadataWriteError::Undeliverable(
-            "metadata document has no active frozen holder with history capacity".to_string(),
-        ));
-    }
-    let local_holds = holders.contains(&local_node_id);
-    let mut local_capacity = false;
-    if local_holds && let Some(record) = record {
-        match drive(
-            UpdateEntryOperation::new(
-                UpdateDocumentOperation::new(UpdateDocumentConfig {
-                    actor: actor.clone(),
-                    group_id: record.group_id,
-                    document_id,
-                    public: public.unwrap_or(record.public),
-                    mutation: mutation.clone(),
-                    expected_revision,
-                })
-                .with_message(commit_message.clone()),
-                context
-                    .as_ref()
-                    .net_handle
-                    .as_ref()
-                    .map(|net| net.node_id()),
-            ),
-            context.as_ref(),
-        )
-        .await
-        {
-            Ok(record) => return Ok(record),
-            Err(UpdateDocumentError::RawLimit) => local_capacity = true,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let response = drive(
-        ForwardHoldersOperation::new(
-            context.node_and_realm().map(|(node_id, _)| node_id),
-            &holders,
-            &MetadataTransportMessage::ForwardUpdateDocument {
-                auth_token,
-                config_digest,
-                document_id,
-                public,
-                mutation,
-                expected_revision,
-                commit_message,
-            },
-            local_holds.then_some(local_node_id),
-            local_capacity,
-        ),
-        context,
-    )
-    .await
-    .map_err(MetadataWriteError::from)?;
-    match response {
-        MetadataTransportMessage::ForwardedRecord {
-            record: response_record,
-        } if routed_record_matches(
-            &config,
-            actor.realm_id,
-            document_id,
-            &placement,
-            &response_record,
-        ) && record.is_none_or(|record| record.same_identity(&response_record))
-            && public.is_none_or(|public| response_record.public == public) =>
-        {
-            Ok(*response_record)
-        }
-        MetadataTransportMessage::ForwardedRecord { .. } => Err(MetadataWriteError::Undeliverable(
-            "holder returned a metadata update record for another document".to_string(),
-        )),
-        MetadataTransportMessage::UpdateInvalidInput { message } => {
-            Err(UpdateDocumentError::MetadataError(MetadataError::InvalidInput(message)).into())
-        }
-        MetadataTransportMessage::ForwardedProfileValidation { findings } => Err(
-            UpdateDocumentError::MetadataError(MetadataError::ProfileValidation(findings)).into(),
-        ),
-        MetadataTransportMessage::ForwardedRevisionConflict { expected, current } => {
-            Err(UpdateDocumentError::RevisionConflict { expected, current }.into())
-        }
-        MetadataTransportMessage::ForwardedGraphPending { expected } => {
-            Err(UpdateDocumentError::GraphPending { expected }.into())
-        }
-        other => Err(unexpected_response(other)),
     }
 }
 

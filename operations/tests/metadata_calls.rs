@@ -176,3 +176,27 @@ pub async fn add_identifiers_routed(
     .await;
     outcome.and_then(outcome_mapping)
 }
+
+#[allow(clippy::too_many_arguments)]
+pub async fn route_metadata_update(
+    context: &Arc<DriverContext>,
+    actor: Actor,
+    record: Option<&MetadataRegistryRecord>,
+    document_id: Ulid,
+    public: Option<bool>,
+    mutation: aruna_operations::metadata::update_document::UpdateDocumentMutation,
+    expected_revision: Option<Ulid>,
+    token: Option<AuthToken>,
+    commit_message: Option<String>,
+) -> Result<MetadataRegistryRecord, MetadataWriteError> {
+    use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+    let update = DocumentUpdate {
+        public,
+        mutation,
+        expected_revision,
+        commit_message,
+    };
+    let node = (actor, local_node(context));
+    let route = RouteUpdateOperation::new(node, (record.cloned(), document_id), update, token);
+    drive(route, context).await
+}

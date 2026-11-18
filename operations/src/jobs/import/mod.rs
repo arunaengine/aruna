@@ -70,7 +70,7 @@ use crate::jobs::store::query::list_job_entries;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::write::route_metadata_update;
+use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::origin::EmitEventOperation;
 use crate::placement::policy::{GateContextError, GateOperation};
@@ -1280,16 +1280,22 @@ async fn update_document(
             .await
             .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
         // The holder refuses the update inside its transaction when an edit landed after `base`.
-        match Box::pin(route_metadata_update(
+        match Box::pin(crate::driver::drive(
+            RouteUpdateOperation::new(
+                (
+                    actor,
+                    ctx.driver.net_handle.as_ref().map(|net| net.node_id()),
+                ),
+                (record.clone(), spec.document_id),
+                DocumentUpdate {
+                    public: None,
+                    mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+                    expected_revision: Some(base),
+                    commit_message: None,
+                },
+                Some(AuthToken::internal(spec.auth_context.clone())),
+            ),
             &ctx.driver,
-            actor,
-            record.as_ref(),
-            spec.document_id,
-            None,
-            UpdateDocumentMutation::ReplaceRoCrate { jsonld },
-            Some(base),
-            Some(AuthToken::internal(spec.auth_context.clone())),
-            None,
         ))
         .await
         {

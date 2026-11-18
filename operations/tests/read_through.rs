@@ -18,7 +18,7 @@ use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, GetVisibleRequest, RoCrateExportView,
 };
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::metadata::forward::write::route_metadata_update;
+use crate::metadata_calls::route_metadata_update;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::testing::replay_event_log;

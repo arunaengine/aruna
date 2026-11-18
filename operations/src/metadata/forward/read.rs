@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::device::replica::ReplicaRecord;
-use crate::device::replica_store::read_replica;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::MetadataApiError;
@@ -31,28 +29,8 @@ use super::routed_export::{ExportWithinOperation, RoutedExportOperation, ensure_
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::read_error;
 use crate::realm::load_config::config_unavailable;
-use crate::realm::peer_trust::is_sync_eligible;
 
 pub(super) const METADATA_READ_DEADLINE: Duration = Duration::from_secs(12);
-
-/// The replica this device keeps of one document, when it can answer on its
-/// own. A node that holds buckets is never a device and always reads its own
-/// registry instead.
-pub(super) async fn device_replica(
-    context: &Arc<DriverContext>,
-    config: &RealmConfigDocument,
-    local_node: Option<NodeId>,
-    document_id: Ulid,
-) -> Option<ReplicaRecord> {
-    if local_node.is_none_or(|node| is_sync_eligible(config, node)) {
-        return None;
-    }
-    drive(read_replica(document_id), context)
-        .await
-        .ok()
-        .flatten()
-        .filter(ReplicaRecord::serves_reads)
-}
 
 pub(super) fn keep_status(
     current: &mut Option<ProfileValidationStatus>,

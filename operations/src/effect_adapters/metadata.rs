@@ -23,8 +23,8 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::forward::read::{summary_answer, summary_export};
 use crate::metadata::forward::route_create::RouteCreateOperation;
+use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::forward::routed_write::RouteDeleteOperation;
-use crate::metadata::forward::write::route_metadata_update;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::message_kind::MetadataRequestDelivery;
 use crate::metadata::update_document::UpdateDocumentMutation;
@@ -103,16 +103,19 @@ async fn routed_write(
             document_id,
             jsonld,
         } => {
-            Box::pin(route_metadata_update(
+            Box::pin(crate::driver::drive(
+                RouteUpdateOperation::new(
+                    (actor, context.net_handle.as_ref().map(|net| net.node_id())),
+                    (record.as_deref().cloned(), document_id),
+                    DocumentUpdate {
+                        public: None,
+                        mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+                        expected_revision: None,
+                        commit_message: None,
+                    },
+                    Some(AuthToken::internal(owner)),
+                ),
                 &context,
-                actor,
-                record.as_deref(),
-                document_id,
-                None,
-                UpdateDocumentMutation::ReplaceRoCrate { jsonld },
-                None,
-                Some(AuthToken::internal(owner)),
-                None,
             ))
             .await?;
         }

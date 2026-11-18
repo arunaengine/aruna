@@ -50,7 +50,8 @@ use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayloa
 use crate::metadata::forward::authorized_create::CreateWithIdOperation;
 use crate::metadata::forward::pinned::PinnedCreate;
 use crate::metadata::forward::routed_read::RoutedReadOperation;
-use crate::metadata::forward::write::{CreateAuthorizedError, route_metadata_update};
+use crate::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::write::CreateAuthorizedError;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::plugins::check::{Authorize, CallError, CheckCall, RunScope, matching};
 use crate::plugins::creates::{
@@ -247,16 +248,19 @@ impl RunBroker {
             "plugin {} install {} run {run_id}",
             install.plugin, install.install_id
         );
-        let update = route_metadata_update(
+        let update = crate::driver::drive(
+            RouteUpdateOperation::new(
+                (actor, self.ctx.net_handle.as_ref().map(|net| net.node_id())),
+                (Some(record.clone()), document_id),
+                DocumentUpdate {
+                    public: None,
+                    mutation,
+                    expected_revision: Some(expected),
+                    commit_message: Some(message),
+                },
+                Some(AuthToken::Internal(auth)),
+            ),
             &self.ctx,
-            actor,
-            Some(&record),
-            document_id,
-            None,
-            mutation,
-            Some(expected),
-            Some(AuthToken::Internal(auth)),
-            Some(message),
         );
         let outcome = update
             .await
@@ -710,16 +714,19 @@ impl Broker for RunBroker {
             install.plugin, install.install_id
         );
         let mutation = UpdateDocumentMutation::UpsertContextualEntity { jsonld: change };
-        let update = route_metadata_update(
+        let update = crate::driver::drive(
+            RouteUpdateOperation::new(
+                (actor, self.ctx.net_handle.as_ref().map(|net| net.node_id())),
+                (Some(record.clone()), document_id),
+                DocumentUpdate {
+                    public: None,
+                    mutation,
+                    expected_revision: Some(expected),
+                    commit_message: Some(message),
+                },
+                Some(AuthToken::Internal(auth)),
+            ),
             &self.ctx,
-            actor,
-            Some(&record),
-            document_id,
-            None,
-            mutation,
-            Some(expected),
-            Some(AuthToken::Internal(auth)),
-            Some(message),
         );
         let outcome = update
             .await

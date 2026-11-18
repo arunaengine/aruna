@@ -16,15 +16,15 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
 use aruna_operations::metadata::api::read::query_metadata;
-use aruna_operations::metadata::api::references::ReferencesOperation;
 use aruna_operations::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
 };
+use aruna_operations::metadata::api::references::ReferencesOperation;
 use aruna_operations::metadata::api::search::search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::routed_export::RoutedExportOperation;
-use aruna_operations::metadata::forward::write::route_metadata_update;
+use aruna_operations::metadata::forward::routed_update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use rmcp::Json;
@@ -436,16 +436,26 @@ impl McpServer {
         if record.is_none() {
             metadata_probe(self, &auth, "replace_dataset", extras).await?;
         }
-        let updated = route_metadata_update(
+        let updated = aruna_operations::driver::drive(
+            RouteUpdateOperation::new(
+                (
+                    actor(&self.state, &auth),
+                    (self.state.get_ctx())
+                        .net_handle
+                        .as_ref()
+                        .map(|net| net.node_id()),
+                ),
+                (record.clone(), document_id),
+                DocumentUpdate {
+                    public: input.public,
+                    mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+                    expected_revision: None,
+                    commit_message: None,
+                },
+                crate::metadata::forwarded_auth_token(request_bearer(&parts))
+                    .map_err(server_error)?,
+            ),
             &self.state.get_ctx(),
-            actor(&self.state, &auth),
-            record.as_ref(),
-            document_id,
-            input.public,
-            UpdateDocumentMutation::ReplaceRoCrate { jsonld },
-            None,
-            crate::metadata::forwarded_auth_token(request_bearer(&parts)).map_err(server_error)?,
-            None,
         )
         .await
         .map_err(crate::metadata::map_write_error)
@@ -547,14 +557,20 @@ impl McpServer {
             tool_extras("find_references", &input)?,
         )
         .await?;
-        let execution = drive(ReferencesOperation::new(self.state.get_realm_id(), MetadataReferencesRequest {
-                auth: Some(auth),
-                iri: input.iri,
-                predicate: input.predicate,
-                limit: input.limit,
-                resolve: false,
-                after: None,
-            }), self.state.get_ctx().as_ref())
+        let execution = drive(
+            ReferencesOperation::new(
+                self.state.get_realm_id(),
+                MetadataReferencesRequest {
+                    auth: Some(auth),
+                    iri: input.iri,
+                    predicate: input.predicate,
+                    limit: input.limit,
+                    resolve: false,
+                    after: None,
+                },
+            ),
+            self.state.get_ctx().as_ref(),
+        )
         .await
         .map_err(crate::metadata::map_api_error)
         .map_err(references_error)?;
