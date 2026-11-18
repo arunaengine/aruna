@@ -9,8 +9,11 @@ use aruna_core::time::unix_timestamp_millis;
 use tracing::warn;
 
 use super::LifecycleError;
-use super::chain::{ExecutionChain, ExecutionChainOperation};
-use super::updates::{PublishStateOperation, PublishTerminalOperation, SettleTerminalsOperation};
+use super::chain::ExecutionChain;
+use super::updates::{
+    PublishProgressOperation, PublishStateOperation, PublishTerminalOperation,
+    SettleTerminalsOperation,
+};
 use crate::driver::{DriverContext, drive};
 
 /// Publishes one state of the local execution; see [`PublishStateOperation`].
@@ -37,10 +40,11 @@ pub async fn publish_progress(
     job_id: JobId,
     state: PhysicalExecutionState,
 ) {
-    let Ok(Some(chain)) = drive(ExecutionChainOperation::of_job(job_id), context).await else {
-        return;
-    };
-    publish_state(context, &chain, state, None, unix_timestamp_millis()).await;
+    let node = context.node_and_realm();
+    let publish = PublishProgressOperation::new(job_id, state, node, unix_timestamp_millis());
+    if let Err(error) = drive(publish, context).await {
+        warn!(error = %error, "Execution publication failed");
+    }
 }
 
 /// Publishes the terminal state of a receipted execution and releases its reservation; see
