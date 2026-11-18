@@ -52,6 +52,7 @@ use aruna_core::node_state::ReadInfoOperation;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::forward::realm::ApplyRelayOperation;
 use crate::forward::token::ApplyRevokeOperation;
+use crate::forward::transport::reject;
 
 impl MetadataHandle {
     #[allow(clippy::too_many_arguments)]
@@ -1019,16 +1020,27 @@ impl MetadataHandle {
                 .await
             }
             forward @ MetadataTransportMessage::ForwardGroupCreate { .. } => {
-                Box::pin(async {
-                    crate::groups::forward::apply_group_create(context, peer, forward).await
-                })
-                .await
+                let apply = crate::groups::forward::ApplyGroupCreateOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    forward,
+                );
+                Box::pin(crate::driver::drive(apply, context.as_ref()))
+                    .await
+                    .unwrap_or_else(|error| {
+                        reject(format!("group create failed: {error}"))
+                    })
             }
             request @ MetadataTransportMessage::GroupDeletion { .. } => {
-                Box::pin(crate::groups::deletion::apply_request(
-                    context, peer, request,
-                ))
-                .await
+                let apply = crate::groups::deletion::ApplyRequestOperation::new(
+                    context.node_and_realm(),
+                    peer,
+                    request,
+                    ulid::Ulid::generate(),
+                );
+                MetadataTransportMessage::GroupDeletionResult {
+                    result: Box::pin(crate::driver::drive(apply, context.as_ref())).await,
+                }
             }
             _ => unreachable!("request family routed incorrectly"),
         }

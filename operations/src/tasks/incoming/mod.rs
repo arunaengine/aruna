@@ -64,7 +64,6 @@ use crate::device::sync::{
 use crate::device::sync_note::{NoteSyncOperation, SyncNote};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::groups::backends::drain::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
@@ -117,7 +116,9 @@ use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 use crate::forward::realm::RelayAdminOperation;
 
+mod drained;
 mod outbox;
+pub(crate) use drained::remove_drained_backends;
 mod restore;
 
 pub use outbox::drive_sync_drain;

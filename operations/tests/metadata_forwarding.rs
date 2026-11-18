@@ -45,7 +45,7 @@ use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
+use aruna_operations::groups::forward::{ForwardGroupCreateOperation, ForwardGroupError};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
@@ -372,13 +372,7 @@ async fn forwards_group_create() -> Result<(), Box<dyn std::error::Error>> {
     let (nodes, _config) = build_realm(&realm, 3, 1).await?;
     let user_node = nodes.last().expect("user node");
 
-    let (group, authorization) = forward_group_create(
-        &user_node.context,
-        realm.realm_id,
-        realm.bearer_token(),
-        "Device Group".to_string(),
-    )
-    .await?;
+    let (group, authorization) = drive(ForwardGroupCreateOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), realm.bearer_token(), "Device Group".to_string(), Ulid::generate()), &user_node.context).await?;
     assert_eq!(group.owner, realm.user_id);
     assert_eq!(group.realm_id, realm.realm_id);
     assert_eq!(authorization.group_id, group.group_id);
@@ -414,16 +408,10 @@ async fn foreign_token_refused() -> Result<(), Box<dyn std::error::Error>> {
     let user_node = nodes.last().expect("user node");
     let stranger = UserId::local(Ulid::generate(), realm.realm_id);
 
-    let error = forward_group_create(
-        &user_node.context,
-        realm.realm_id,
-        realm.token_for(stranger),
-        "Stranger Group".to_string(),
-    )
-    .await
+    let error = drive(ForwardGroupCreateOperation::new(realm.realm_id, user_node.context.node_and_realm().map(|(node_id, _)| node_id), realm.token_for(stranger), "Stranger Group".to_string(), Ulid::generate()), &user_node.context).await
     .expect_err("a device must not forward another user's write");
     assert!(
-        matches!(error, ForwardGroupError::Api(MetadataApiError::Forbidden)),
+        matches!(error, ForwardGroupError::Forbidden),
         "unexpected forwarded group create error: {error}"
     );
 
