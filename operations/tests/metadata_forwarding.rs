@@ -58,10 +58,10 @@ use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDoc
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
-use aruna_operations::sync::document_outbox::read_outbox_record;
 use aruna_operations::sync::outbox_record::outbox_key;
 use aruna_operations::sync::outbox_record::{new_outbox_record, write_outbox_effect};
 use aruna_operations::tasks::incoming::OutboxDrainer;
+use aruna_operations::testing::read_outbox_record;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;

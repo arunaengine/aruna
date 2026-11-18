@@ -1173,7 +1173,7 @@ async fn outbox_keys(node: &TestNode) -> Result<Vec<Vec<u8>>, BoxError> {
     let mut keys = Vec::new();
     let mut start: Option<Vec<u8>> = None;
     loop {
-        let batch = aruna_operations::sync::document_outbox::read_outbox_records(
+        let batch = aruna_operations::testing::read_outbox_records(
             &node.context.storage_handle,
             &[],
             start.take(),

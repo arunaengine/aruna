@@ -5,8 +5,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::document::DocumentEffect;
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
@@ -24,6 +23,7 @@ use aruna_core::{NodeId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::inbound::initialize_net_holder;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::notifications::client::{
     HolderRequestOperation, marked_read, unread_counted,
@@ -38,7 +38,6 @@ use aruna_operations::notifications::settings::{Delivery, DeliveryOperation};
 use aruna_operations::notifications::webhook::{
     WebhookOutcome, read_webhook, remove_webhook, set_webhook,
 };
-use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{drain_notification_outbox, start_task_queues};
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
@@ -706,13 +705,9 @@ impl SettingRealm {
 
     /// Pulls the realm settings topic on node `index` from node `from`.
     async fn pull(&self, index: usize, from: usize) {
-        let effect = DocumentEffect::SyncDocument {
-            topic: self.topic(),
-            peers: vec![self.id(from)],
-        };
-        let net = &self.nodes[index].net;
-        net.send_effect(Effect::Net(NetEffect::DocumentSync(effect)))
-            .await;
+        let peers = vec![self.id(from)];
+        let _ =
+            aruna_operations::testing::sync_topic(self.context(index), self.topic(), peers).await;
     }
 
     /// Pulls on node `index` from every node in `from` until its setting satisfies `done`.

@@ -25,6 +25,7 @@ use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
 use aruna_operations::driver::drive;
+use aruna_operations::testing::sync_topics;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
@@ -331,19 +332,8 @@ async fn seed_sync_topic(
         other => return Err(format!("unexpected config seed publish event: {other:?}").into()),
     }
 
-    match nodes[0]
-        .net
-        .send_effect(Effect::Net(NetEffect::DocumentSync(
-            DocumentEffect::SyncDocuments {
-                topics: vec![topic],
-                peers: Vec::new(),
-            },
-        )))
-        .await
-    {
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
-        other => Err(format!("unexpected config seed sync event: {other:?}").into()),
-    }
+    sync_topics(nodes[0].context.as_ref(), vec![topic], Vec::new()).await?;
+    Ok(())
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {
