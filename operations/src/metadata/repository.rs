@@ -56,18 +56,6 @@ pub(crate) fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id:
     ByteView::from(bytes)
 }
 
-pub(crate) fn read_registry_effect(
-    group_id: GroupId,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: METADATA_INDEX_KEYSPACE.to_string(),
-        key: metadata_registry_key(group_id, document_id),
-        txn_id,
-    })
-}
-
 pub(crate) fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: DOCUMENT_INDEX_KEYSPACE.to_string(),

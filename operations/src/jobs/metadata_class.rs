@@ -189,14 +189,10 @@ mod pure_tests {
             )),
             create(CreateDocumentError::StorageError(StorageError::KeyNotFound)),
             update(UpdateDocumentError::DocumentNotFound),
-            update(UpdateDocumentError::MissingTransaction),
-            update(UpdateDocumentError::NotFinished),
+            update(UpdateDocumentError::Io(
+                aruna_core::calls::IoError::Unfinished,
+            )),
             update(UpdateDocumentError::RawLimit),
-            update(UpdateDocumentError::UnexpectedEvent {
-                state: "s".to_string(),
-                expected: "e",
-                got: "g".to_string(),
-            }),
             delete(DeleteDocumentError::DocumentNotFound),
             delete(DeleteDocumentError::Io(
                 aruna_core::calls::IoError::Unfinished,
