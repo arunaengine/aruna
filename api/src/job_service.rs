@@ -27,6 +27,7 @@ pub use aruna_operations::jobs::job_reports::{JobReportLookup, ReportQuery};
 use aruna_operations::jobs::job_reports::{ReportRouteOperation, SessionReasonOperation};
 use aruna_operations::jobs::job_routes::{RecordRouteOperation, StatusRouteOperation};
 use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
+use aruna_operations::jobs::runs::{ReadRunOperation, RunReadError, RunView};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
 use aruna_operations::jobs::store::{JobMutationError, RunDelete};
@@ -314,4 +315,13 @@ pub async fn submit_export_job(
         unix_timestamp_millis(),
     );
     drive(submit, context).await
+}
+
+pub async fn read_run(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: &AuthContext,
+    run_id: JobId,
+) -> Result<RunView, RunReadError> {
+    drive(ReadRunOperation::new(realm_id, auth, run_id), context).await
 }
