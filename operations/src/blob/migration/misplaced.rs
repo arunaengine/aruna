@@ -388,78 +388,203 @@ enum PlanStep {
 /// Plans a rename of `rule`'s files from the rule's own index in one pass, without asking
 /// the provider, and lists up to `limit` of them in path order after the row `after`, each
 /// checked against its version. Keys `readable` refuses are left out.
-pub async fn rename_page(
-    context: &DriverContext,
-    rule: &BackendImport,
-    (readable, writable): (&KeyCheck<'_>, &KeyCheck<'_>),
-    (filter, after, limit): (Option<&str>, Option<Vec<u8>>, usize),
-) -> Result<RenamePage, String> {
-    let mut page = RenamePage::default();
-    page.plan.complete = true;
-    if encrypting(context, &rule.bucket.as_bytes().to_vec().into()).await? {
-        return Ok(page);
-    }
-    let Some(routing) = move_routing(context, &rule.bucket).await? else {
-        return Ok(page);
-    };
-    // The rule as the move reads it; a removed rule renames nothing.
-    let Some(rule) = routing
-        .imports
-        .iter()
-        .find(|r| r.import_id == rule.import_id)
-    else {
-        return Ok(page);
-    };
-    let earlier = read_earlier(context, &routing).await?;
-    let patterns = earlier.get(&rule.import_id).map_or(&[][..], Vec::as_slice);
-    // Only S3 copies inside the provider; other storages pass every file through the node.
-    let read = StorageEffect::Read {
-        key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-        key: crate::groups::backends::backend_key(rule.backend_id),
-        txn_id: None,
-    };
-    let event = context.storage_handle.send_storage_effect(read).await;
-    let storage = crate::groups::backends::parse_read(event, GroupStorage::from_bytes);
-    let storage = storage.map_err(|error| error.to_string())?;
-    let native = storage.is_some_and(|storage| storage.kind == GroupBackendKind::S3);
-    let shown = |key: &str| {
-        key.starts_with(&rule.key_prefix)
-            && filter.is_none_or(|filter| key.contains(filter))
-            && readable(key)
-    };
-    let prefix = object_prefix(rule.import_id);
-    let mut start = None::<Key>;
-    loop {
-        let (rows, next) = crate::storage_read::iter_prefix_page(
-            &context.storage_handle,
+#[derive(Debug, PartialEq)]
+pub struct RenamePageOperation<R, W> {
+    routing: NodeRouting,
+    rule: BackendImport,
+    readable: R,
+    writable: W,
+    query: RenameQuery,
+    step: PlanStep,
+    snapshot: Option<RoutingSnapshot>,
+    earlier: Earlier,
+    native: bool,
+    index: PrefixPages,
+    candidates: Vec<Candidate>,
+    keys: Vec<VersionKey>,
+    places: Vec<(usize, PlainTarget)>,
+    renames: Vec<(String, ImportedObject, String)>,
+    page: RenamePage,
+}
+
+impl<R: KeyRule, W: KeyRule> RenamePageOperation<R, W> {
+    pub fn new(
+        routing: NodeRouting,
+        rule: &BackendImport,
+        (readable, writable): (R, W),
+        query: RenameQuery,
+    ) -> Self {
+        let index = PrefixPages::new(
             IMPORTED_OBJECT_KEYSPACE,
-            Some(prefix.clone()),
-            start.take(),
+            object_prefix(rule.import_id),
             INDEX_PAGE,
-            None,
-        )
-        .await?;
+        );
+        let mut page = RenamePage::default();
+        page.plan.complete = true;
+        Self {
+            routing,
+            rule: rule.clone(),
+            readable,
+            writable,
+            query,
+            step: PlanStep::Encryption,
+            snapshot: None,
+            earlier: Earlier::new(),
+            native: false,
+            index,
+            candidates: Vec::new(),
+            keys: Vec::new(),
+            places: Vec::new(),
+            renames: Vec::new(),
+            page,
+        }
+    }
+
+    fn call(&mut self, step: PlanStep, call: IoCall) -> Turn<RenamePage> {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn finish(&mut self) -> Turn<RenamePage> {
+        Ok(Next::Done(std::mem::take(&mut self.page)))
+    }
+
+    /// The rule as the move reads it; a removed rule renames nothing.
+    fn routed(&mut self, snapshot: Option<RoutingSnapshot>) -> Turn<RenamePage> {
+        let Some(snapshot) = snapshot else {
+            return self.finish();
+        };
+        let import_id = self.rule.import_id;
+        let rule = snapshot.imports.iter().find(|r| r.import_id == import_id);
+        let Some(rule) = rule.cloned() else {
+            return self.finish();
+        };
+        self.rule = rule;
+        let earlier = EarlierPatternsOperation::new(&snapshot);
+        self.snapshot = Some(snapshot);
+        self.call(PlanStep::Earlier, IoCall::child(earlier))
+    }
+
+    fn shown(&self, key: &str) -> bool {
+        key.starts_with(&self.rule.key_prefix)
+            && (self.query.filter.as_deref()).is_none_or(|filter| key.contains(filter))
+            && self.readable.allows(key)
+    }
+
+    fn read_index(&mut self) -> Turn<RenamePage> {
+        let page = self.index.call();
+        self.call(PlanStep::Index, page)
+    }
+
+    fn index_read(&mut self, rows: Vec<(Key, Value)>) -> Turn<RenamePage> {
+        let Some(routing) = self.snapshot.as_ref() else {
+            return Err(no_routing());
+        };
+        let patterns = (self.earlier.get(&self.rule.import_id)).map_or(&[][..], Vec::as_slice);
         let mut candidates = Vec::new();
-        for (row_key, value) in &rows {
-            let (key, path, row) = row_parts(rule, (row_key, value))?;
-            let Some(key) = key.filter(|key| shown(key)) else {
+        for (row_key, value) in rows {
+            let (key, path, row) = row_parts(&self.rule, (&row_key, &value))?;
+            let Some(key) = key.filter(|key| self.shown(key)) else {
                 continue;
             };
             // A mapped key names its file by the storage side of the mapping.
-            let named = routing.storage_key(rule, &key);
-            match rule.rename_target(patterns, &path, &named, row.version_id) {
-                Some(to) => candidates.push((row_key.clone(), key, path, row, to)),
+            let named = routing.storage_key(&self.rule, &key);
+            match self
+                .rule
+                .rename_target(patterns, &path, &named, row.version_id)
+            {
+                Some(to) => candidates.push(Candidate {
+                    row_key,
+                    key,
+                    path,
+                    row,
+                    to,
+                }),
                 None => {
-                    page.plan.unchanged_files += 1;
-                    page.plan.unchanged_bytes += row.size;
+                    self.page.plan.unchanged_files += 1;
+                    self.page.plan.unchanged_bytes += row.size;
                 }
             }
         }
-        // Only a file its version still reads is work; any other record keeps its name.
-        let found = confirmed(context, (&routing, &earlier), &rule.bucket, &candidates).await?;
-        let mut renames = Vec::new();
-        for ((row_key, key, path, row, to), found) in candidates.into_iter().zip(found) {
-            let plan = &mut page.plan;
+        self.candidates = candidates;
+        self.read_versions()
+    }
+
+    /// Only a file its version still reads is work; any other record keeps its name.
+    fn read_versions(&mut self) -> Turn<RenamePage> {
+        if self.candidates.is_empty() {
+            return self.page_done();
+        }
+        let bucket = &self.rule.bucket;
+        self.keys = (self.candidates.iter())
+            .map(|found| VersionKey::new(bucket, &found.key, found.row.version_id))
+            .collect();
+        let mut reads = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), key.to_bytes()?.into()));
+        }
+        self.call(PlanStep::Versions, IoCall::Read(reads))
+    }
+
+    /// The copy each version reads, where a move would take it.
+    fn versions_read(&mut self, values: Vec<Option<Value>>) -> Turn<RenamePage> {
+        let Some(routing) = self.snapshot.as_ref() else {
+            return Err(no_routing());
+        };
+        let mut reads = Vec::new();
+        for (index, (key, value)) in self.keys.iter().zip(values).enumerate() {
+            let Some(value) = value else {
+                continue;
+            };
+            let version = BlobVersion::from_bytes(&value)?;
+            let Ok((resolved, Some(plain))) = place(routing, key) else {
+                continue;
+            };
+            let target = (resolved.backend.clone(), resolved.compression.into());
+            if let Some(source) = source_key(&version, |_: &_| target.clone(), true) {
+                reads.push((
+                    BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    source.to_bytes().into(),
+                ));
+                self.places.push((index, plain));
+            }
+        }
+        if reads.is_empty() {
+            return self.apply_found(vec![None; self.candidates.len()]);
+        }
+        self.call(PlanStep::Locations, IoCall::Read(reads))
+    }
+
+    fn locations_read(&mut self, values: Vec<Option<Value>>) -> Turn<RenamePage> {
+        let Some(routing) = self.snapshot.as_ref() else {
+            return Err(no_routing());
+        };
+        let mut found = vec![None; self.candidates.len()];
+        for ((index, plain), value) in std::mem::take(&mut self.places).into_iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            let location = BackendLocation::from_bytes(&value)?;
+            let candidate = &self.candidates[index];
+            let renamed = location.backend_path == candidate.path
+                && plain.path == candidate.to
+                && renames(routing, &self.earlier, &plain, &location, &self.keys[index]);
+            found[index] = renamed.then_some(location);
+        }
+        self.apply_found(found)
+    }
+
+    fn apply_found(&mut self, found: Vec<Option<BackendLocation>>) -> Turn<RenamePage> {
+        let candidates = std::mem::take(&mut self.candidates);
+        for (candidate, found) in candidates.into_iter().zip(found) {
+            let Candidate {
+                row_key,
+                key,
+                path,
+                row,
+                to,
+            } = candidate;
+            let plan = &mut self.page.plan;
             let Some(location) = found else {
                 plan.unchanged_files += 1;
                 plan.unchanged_bytes += row.size;
@@ -468,155 +593,122 @@ pub async fn rename_page(
             plan.files += 1;
             plan.bytes += row.size;
             // Like the copy: on S3 a recorded ETag or a one-part MD5 keeps it in the provider.
-            if !native || (row.etag.is_none() && !copy_provable(&location)) {
+            if !self.native || (row.etag.is_none() && !copy_provable(&location)) {
                 plan.streamed_files += 1;
                 plan.streamed_bytes += row.size;
             }
-            plan.withheld_files += u64::from(!writable(&key));
-            let listed = after
-                .as_deref()
-                .is_none_or(|after| row_key.as_ref() > after);
-            if listed && page.entries.len() < limit {
-                page.entries.push((path, to.clone(), writable(&key)));
-                page.next = Some(row_key.to_vec());
+            let writable = self.writable.allows(&key);
+            plan.withheld_files += u64::from(!writable);
+            let after = self.query.after.as_deref();
+            let listed = after.is_none_or(|after| row_key.as_ref() > after);
+            if listed && self.page.entries.len() < self.query.limit {
+                self.page.entries.push((path, to.clone(), writable));
+                self.page.next = Some(row_key.to_vec());
             }
-            renames.push((key, row, to));
+            self.renames.push((key, row, to));
         }
-        page.plan.taken_files += taken(context, rule, &renames).await?;
-        match next {
-            Some(next) => start = Some(next),
-            None => break,
+        if self.renames.is_empty() {
+            return self.page_done();
+        }
+        let import_id = self.rule.import_id;
+        let reads = (self.renames.iter())
+            .map(|(_, _, to)| {
+                let row = object_key(import_id, to);
+                (IMPORTED_OBJECT_KEYSPACE.to_string(), row)
+            })
+            .collect();
+        self.call(PlanStep::Taken, IoCall::Read(reads))
+    }
+
+    /// Counts renames whose new path a record of the rule keeps for another key or version.
+    fn taken_read(&mut self, values: Vec<Option<Value>>) -> Turn<RenamePage> {
+        let renames = std::mem::take(&mut self.renames);
+        for ((key, row, to), held) in renames.iter().zip(values) {
+            let Some(held) = held else {
+                continue;
+            };
+            let held = ImportedObject::from_bytes(&held)?;
+            let holder = held.key.clone().or_else(|| self.rule.aruna_key(to));
+            let other = holder.as_deref() != Some(key.as_str());
+            self.page.plan.taken_files += u64::from(other || held.version_id != row.version_id);
+        }
+        self.page_done()
+    }
+
+    fn page_done(&mut self) -> Turn<RenamePage> {
+        if !self.index.done() {
+            return self.read_index();
+        }
+        // A cursor only when more files may follow the last listed one.
+        if self.page.entries.len() < self.query.limit {
+            self.page.next = None;
+        }
+        self.finish()
+    }
+}
+
+impl<R: KeyRule, W: KeyRule> Operation for RenamePageOperation<R, W> {
+    type Output = RenamePage;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<RenamePage> {
+        Ok(Next::Call(encryption_read(&self.rule.bucket)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<RenamePage> {
+        match self.step {
+            PlanStep::Encryption => {
+                if is_encrypted(result.value()?)? {
+                    return self.finish();
+                }
+                let call = routing_call(self.routing.clone(), &self.rule.bucket);
+                self.call(PlanStep::Routing, call)
+            }
+            PlanStep::Routing => self.routed(routing_result(result)?),
+            PlanStep::Earlier => {
+                self.earlier = result.child::<Earlier, MigrationError>()??;
+                // Only S3 copies inside the provider; other storages pass files through the node.
+                let read = read_row(STORAGE_BACKEND_KEYSPACE, backend_key(self.rule.backend_id));
+                self.call(PlanStep::Backend, read)
+            }
+            PlanStep::Backend => {
+                let storage = result.value()?;
+                let storage = (storage.as_deref())
+                    .map(GroupStorage::from_bytes)
+                    .transpose()?;
+                self.native = storage.is_some_and(|storage| storage.kind == GroupBackendKind::S3);
+                self.read_index()
+            }
+            PlanStep::Index => {
+                let rows = self.index.take(result)?;
+                self.index_read(rows)
+            }
+            PlanStep::Versions => self.versions_read(result.values()?),
+            PlanStep::Locations => self.locations_read(result.values()?),
+            PlanStep::Taken => self.taken_read(result.values()?),
         }
     }
-    // A cursor only when more files may follow the last listed one.
-    if page.entries.len() < limit {
-        page.next = None;
-    }
-    Ok(page)
 }
 
 /// The key an index row keeps its file at, the file's path and the record.
 fn row_parts(
     rule: &BackendImport,
     (row_key, value): (&[u8], &[u8]),
-) -> Result<(Option<String>, String, ImportedObject), String> {
+) -> Result<(Option<String>, String, ImportedObject), MigrationError> {
     let path = row_key
         .get(object_prefix(rule.import_id).len()..)
         .unwrap_or_default();
-    let path = String::from_utf8(path.to_vec()).map_err(|error| error.to_string())?;
-    let row = ImportedObject::from_bytes(value).map_err(|error| error.to_string())?;
+    let path = String::from_utf8(path.to_vec()).map_err(MigrationError::failed)?;
+    let row = ImportedObject::from_bytes(value)?;
     // An older row without a key keeps the rule's own mapping.
     let key = row.key.clone().or_else(|| rule.aruna_key(&path));
     Ok((key, path, row))
 }
 
-/// The location of each candidate whose version still reads its file there and whose file a
-/// rename gives the candidate's new name; versions and locations are read in one batch each.
-async fn confirmed(
-    context: &DriverContext,
-    (routing, earlier): (&RoutingSnapshot, &super::Earlier),
-    bucket: &str,
-    candidates: &[(Key, String, String, ImportedObject, String)],
-) -> Result<Vec<Option<BackendLocation>>, String> {
-    let keys: Vec<VersionKey> = (candidates.iter())
-        .map(|(_, key, _, row, _)| VersionKey::new(bucket, key, row.version_id))
-        .collect();
-    let reads = keys.iter().map(|key| {
-        let key = key.to_bytes().map_err(|error| error.to_string())?;
-        Ok((BLOB_VERSIONS_KEYSPACE.to_string(), key.into()))
-    });
-    let versions = batch(context, reads.collect::<Result<_, String>>()?).await?;
-    // The copy each version reads, where a move would take it.
-    let mut places = Vec::new();
-    for (index, (key, value)) in keys.iter().zip(versions).enumerate() {
-        let Some(value) = value else {
-            continue;
-        };
-        let version = BlobVersion::from_bytes(&value).map_err(|error| error.to_string())?;
-        let Ok((resolved, Some(plain))) = place(routing, key) else {
-            continue;
-        };
-        let target = (resolved.backend.clone(), resolved.compression.into());
-        if let Some(source) = source_key(&version, |_: &_| target.clone(), true) {
-            places.push((index, plain, source));
-        }
-    }
-    let reads = (places.iter())
-        .map(|(_, _, source)| {
-            (
-                BLOB_LOCATIONS_KEYSPACE.to_string(),
-                source.to_bytes().into(),
-            )
-        })
-        .collect();
-    let locations = batch(context, reads).await?;
-    let mut found = vec![None; candidates.len()];
-    for ((index, plain, _), value) in places.into_iter().zip(locations) {
-        let Some(value) = value else {
-            continue;
-        };
-        let location = BackendLocation::from_bytes(&value).map_err(|error| error.to_string())?;
-        let (_, _, path, _, to) = &candidates[index];
-        let renamed = location.backend_path == *path
-            && plain.path == *to
-            && renames(routing, earlier, &plain, &location, &keys[index]);
-        found[index] = renamed.then_some(location);
-    }
-    Ok(found)
-}
-
-/// The values of `reads` in one storage call, in their order.
-async fn batch(
-    context: &DriverContext,
-    reads: Vec<(String, Key)>,
-) -> Result<Vec<Option<aruna_core::types::Value>>, String> {
-    if reads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            Ok(values.into_iter().map(|(_, value)| value).collect())
-        }
-        other => Err(format!(
-            "could not read the plan's records: {}",
-            other.label()
-        )),
-    }
-}
-
-/// Renames whose new path a record of the rule keeps for another key or version, read in
-/// one batch.
-async fn taken(
-    context: &DriverContext,
-    rule: &BackendImport,
-    renames: &[(String, ImportedObject, String)],
-) -> Result<u64, String> {
-    let reads = (renames.iter())
-        .map(|(_, _, to)| {
-            let row = object_key(rule.import_id, to);
-            (IMPORTED_OBJECT_KEYSPACE.to_string(), row)
-        })
-        .collect();
-    let mut taken = 0;
-    for ((key, row, to), held) in renames.iter().zip(batch(context, reads).await?) {
-        let Some(held) = held else {
-            continue;
-        };
-        let held = ImportedObject::from_bytes(&held).map_err(|error| error.to_string())?;
-        let holder = held.key.clone().or_else(|| rule.aruna_key(to));
-        taken +=
-            u64::from(holder.as_deref() != Some(key.as_str()) || held.version_id != row.version_id);
-    }
-    Ok(taken)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive, node_routing};
     use crate::s3::bucket::rename::tests::{BUCKET, group, put, rule, setup};
     use aruna_core::keyspaces::{
         BACKEND_INDEX_KEYSPACE, IMPORT_PATTERN_KEYSPACE, S3_BUCKET_KEYSPACE,
