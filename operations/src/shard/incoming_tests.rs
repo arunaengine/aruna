@@ -79,3 +79,49 @@ fn assembly_failure_rejected() {
     let turn = operation.next(IoResult::Child(ChildOutcome::new(failed)));
     assert_eq!(rejected(turn), "scan failed");
 }
+
+fn holder_config() -> RealmConfigDocument {
+    use aruna_core::structs::placement::record::PlacementStrategy;
+    let mut config = RealmConfigDocument::new(realm(), Vec::new(), 2);
+    config.strategies = vec![PlacementStrategy {
+        strategy_id: placement().strategy_id,
+        name: "default".to_string(),
+        replica_count: None,
+        distinct_locations: false,
+        affinity: Vec::new(),
+        shard_count: 1,
+    }];
+    config.default_strategy_id = Some(placement().strategy_id);
+    config.ensure_node(node(1), RealmNodeKind::Server);
+    config.ensure_node(node(2), RealmNodeKind::Server);
+    config.snapshot_candidate_map();
+    config
+}
+
+#[test]
+fn outside_holder_rejected() {
+    let mut operation = ServeManifestOperation::new((node(9), realm()), node(2), request(realm()));
+    operation.first().unwrap();
+    let turn = operation.next(config_answer(holder_config()));
+    assert!(rejected(turn).contains("does not hold"));
+}
+
+#[test]
+fn co_holder_served() {
+    let mut operation = asked(node(2));
+    let turn = operation.next(config_answer(holder_config()));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let manifest = ShardManifest {
+        placement: placement(),
+        holder: node(1),
+        entries: Vec::new(),
+        cursor: Vec::new(),
+        digest: [1; 32],
+        updated_at_ms: 0,
+    };
+    let answer = IoResult::Child(ChildOutcome::new(Ok::<_, ManifestError>(manifest.clone())));
+    assert_eq!(
+        operation.next(answer),
+        Ok(Next::Done(ManifestAnswer::Manifest(Box::new(manifest))))
+    );
+}
