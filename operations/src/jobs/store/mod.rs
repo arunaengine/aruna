@@ -179,22 +179,6 @@ pub enum RunDelete {
     Unrecorded(String),
 }
 
-/// Removes a finished run of `user_id` from this node in one transaction: its row, list index
-/// and every local row pruning removes. An execution run goes only once its deletion was
-/// `recorded` in its replicated family, whose records stay.
-pub async fn delete_finished_run(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-    recorded: bool,
-) -> Result<RunDelete, JobMutationError> {
-    drive(
-        job_calls::delete_finished_run(user_id, job_id, recorded),
-        context,
-    )
-    .await
-}
-
 /// Read and decode a state row, keeping a missing row distinct from a malformed one.
 pub(super) async fn read_state<T: DeserializeOwned + Send + std::fmt::Debug + 'static>(
     context: &DriverContext,
@@ -262,5 +246,8 @@ fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(value);
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod test_calls;
 #[cfg(test)]
 mod tests;

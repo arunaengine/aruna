@@ -79,7 +79,7 @@ use crate::jobs::prune::{
     JobPruneOutcome, PruneDueOperation, PruneJobsOperation, PruneTimerOperation,
 };
 use crate::jobs::runtime::JobsRuntime;
-use crate::jobs::store::state::release_job;
+use crate::jobs::store::job_calls;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, NEXT_BATCH_AFTER,

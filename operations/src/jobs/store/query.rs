@@ -6,24 +6,6 @@ use super::row_calls;
 use super::*;
 use crate::driver::drive;
 
-use super::list_jobs::ListJobsOperation;
-
-/// Owner-scoped listing, newest first, with an opaque cursor and record filter; see
-/// [`ListJobsOperation`].
-pub async fn list_user_jobs(
-    context: &DriverContext,
-    user_id: UserId,
-    cursor: Option<Vec<u8>>,
-    limit: usize,
-    filter: impl Fn(&JobRecord) -> bool + Send,
-) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
-    drive(
-        ListJobsOperation::new(user_id, cursor, limit, filter),
-        context,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
 
 pub async fn list_job_entries(
     context: &DriverContext,
@@ -37,38 +19,6 @@ pub async fn list_job_entries(
     )
     .await
     .map_err(|error| error.to_string())
-}
-
-pub async fn find_dedup_job(
-    context: &DriverContext,
-    created_by: UserId,
-    dedup_key: &[u8],
-    _txn_id: Option<TxnId>,
-) -> Result<Option<JobId>, String> {
-    drive(row_calls::find_dedup_job(created_by, dedup_key), context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-pub async fn find_dedup_plan(
-    context: &DriverContext,
-    created_by: UserId,
-    dedup_key: &[u8],
-    _txn_id: Option<TxnId>,
-) -> Result<Option<(JobId, [u8; 32])>, String> {
-    drive(row_calls::find_dedup_plan(created_by, dedup_key), context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// Earliest `(timestamp, job_id)` under a schedule-index prefix.
-pub async fn first_schedule_entry(
-    context: &DriverContext,
-    prefix: &[u8],
-) -> Result<Option<(u64, JobId)>, String> {
-    drive(row_calls::first_schedule_entry(prefix), context)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(), String> {

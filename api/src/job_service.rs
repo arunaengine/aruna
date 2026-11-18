@@ -30,6 +30,7 @@ use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
 use aruna_operations::jobs::runs::{ReadRunOperation, RunReadError, RunView};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
+use aruna_operations::jobs::store::row_calls;
 use aruna_operations::jobs::store::{JobMutationError, RunDelete};
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::jobs::submit_local::{DedupLookupOperation, SubmitLocalOperation};
@@ -58,6 +59,15 @@ pub async fn delete_owned_run(
     let serving = context.node_and_realm();
     let delete = DeleteOwnedOperation::new(auth, job_id, serving, unix_timestamp_millis());
     drive(delete, context).await
+}
+
+pub async fn read_job_record(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<JobRecord>, String> {
+    drive(row_calls::read_job_record(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 pub async fn read_owned_job(

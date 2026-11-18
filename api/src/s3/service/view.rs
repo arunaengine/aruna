@@ -5,7 +5,6 @@
 
 use aruna_core::structs::execution::job::{JobId, JobRecord};
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::jobs::workflow::input_view::{
     MAX_VIEW_KEYS, ReadManifestOperation, ViewEntry, ViewError, ViewFrom, ViewLister, creator,
     decode_token, encode_token, head_entry, names_manifest, read_entry, view_bucket, view_entries,
@@ -49,7 +48,7 @@ fn matches(condition: Option<&ETagCondition>, entry: &ViewEntry) -> bool {
 
 impl ArunaS3Service {
     async fn view_record(&self, view: InputView) -> S3Result<(JobRecord, Vec<ViewEntry>)> {
-        let record = read_job_record(&self.state, view.job_id, None)
+        let record = crate::job_service::read_job_record(&self.state, view.job_id)
             .await
             .map_err(|_| s3_error!(ServiceUnavailable, "The run could not be read"))?
             .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;

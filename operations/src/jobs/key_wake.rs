@@ -14,7 +14,7 @@ use crate::blob::unlocked::promote_unlocked;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::remote_key::RemoteWakesOperation;
 use crate::jobs::store::JobMutationError;
-use crate::jobs::store::key_wait::wake_key_waits;
+use crate::jobs::store::row_calls;
 
 #[derive(Debug, Error)]
 pub enum KeyWakeError {
@@ -39,7 +39,7 @@ pub async fn wake_unlocked(
     origin: (RealmId, NodeId),
     limits: &RoCrateLimits,
 ) -> Result<(usize, usize), KeyWakeError> {
-    let woken = wake_key_waits(context, key, now_ms).await;
+    let woken = drive(row_calls::wake_key_waits(key, now_ms), context).await;
     // Remote waiters get owed wakes before promotion, so a corrupt archive never holds them back.
     let queued = drive(RemoteWakesOperation::new(key), context).await;
     let mut resumed = resume_transitions(context, key).await;
@@ -63,9 +63,10 @@ pub async fn wake_unlocked(
 mod tests {
     use super::*;
     use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};
-    use crate::jobs::store::key_wait::park_job;
-    use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
+    use crate::jobs::store::test_calls::park_job;
+    use crate::jobs::store::test_calls::insert_job;
+    use crate::jobs::store::state::ClaimOutcome;
+    use crate::jobs::store::test_calls::{claim_job, read_job_record};
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
         BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
@@ -405,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
-        use crate::jobs::store::key_wait::read_key_waits;
+        use crate::jobs::store::test_calls::read_key_waits;
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
         use crate::replication::protocol::BaoReadRefusal;
