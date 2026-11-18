@@ -1052,104 +1052,31 @@ impl Operation for OwnsWriteOperation {
         if self.scanning {
             return Ok(Next::Done(Some(!result.page()?.0.is_empty())));
         }
-    }
-}
-
-/// Whether committed metadata still names this exact physical copy. `None`
-/// means the record could not be read or decoded, so nothing is proven.
-async fn owns_write(
-    context: &DriverContext,
-    owner: &WriteOwner,
-    location: &BackendLocation,
-) -> Option<bool> {
-    let (key_space, key): (&str, Key) = match owner {
-        WriteOwner::Blob { blake3, .. } => (
-            BLOB_LOCATIONS_KEYSPACE,
-            BlobLocationKey::new(
-                *blake3,
-                location.format.encoding(),
-                location.backend.clone(),
-            )
-            .to_bytes()
-            .into(),
-        ),
-        WriteOwner::UploadPart {
-            upload_id,
-            part_number,
-        } => (
-            UPLOAD_PART_KEYSPACE,
-            MultipartPartKey::new(*upload_id, *part_number)
-                .to_bytes()
-                .ok()?
-                .into(),
-        ),
-        WriteOwner::Upload { upload_id } | WriteOwner::CompletedUpload { upload_id, .. } => {
-            (UPLOAD_KEYSPACE, upload_id.to_bytes().to_vec().into())
+        if let Some(value) = result.value()? {
+            return Ok(Next::Done(self.owned(&value)));
         }
-        WriteOwner::Pending => (
-            PENDING_LOCATION_KEYSPACE,
-            ArchiveKey::of(location).to_bytes().into(),
-        ),
-    };
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id: None,
-        })
-        .await;
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-        warn!(?event, "Ambiguous write owner could not be read");
-        return None;
-    };
-    let Some(value) = value else {
         // A promoted archive has no pending row; its versions still own it.
-        if matches!(owner, WriteOwner::Pending) {
-            return archive_owned(context, location).await;
+        if !matches!(self.owner, WriteOwner::Pending) {
+            return Ok(Next::Done(Some(false)));
         }
-        return Some(false);
-    };
-    let owned = match owner {
-        WriteOwner::Blob { .. } | WriteOwner::Pending => {
-            BackendLocation::from_bytes(&value).ok()?
-        }
-        WriteOwner::UploadPart { .. } => MultipartPart::from_bytes(&value).ok()?.location,
-        WriteOwner::Upload { .. } | WriteOwner::CompletedUpload { .. } => {
-            // An aborting upload still owns its target: a failed abort reopens it for a
-            // completion, and the abort itself, also when resumed, removes the target.
-            let record = MultipartUpload::from_bytes(&value).ok()?;
-            match record.backend_upload {
-                Some(upload) => upload.location,
-                None => return Some(false),
-            }
-        }
-    };
-    Some(owned.same_object(location))
-}
-
-/// Whether any committed version owns the Pithos archive of `location`.
-async fn archive_owned(context: &DriverContext, location: &BackendLocation) -> Option<bool> {
-    let scan = StorageEffect::Iter {
-        key_space: COPY_OWNER_KEYSPACE.to_string(),
-        prefix: Some(CopyOwner::prefix(&ArchiveKey::of(location)).into()),
-        start: None,
-        limit: 1,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(scan).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Some(!values.is_empty()),
-        event => {
-            warn!(?event, "Archive owners could not be read");
-            None
-        }
+        self.scanning = true;
+        Ok(Next::Call(IoCall::Page {
+            space: COPY_OWNER_KEYSPACE.to_string(),
+            prefix: CopyOwner::prefix(&ArchiveKey::of(&self.location)).into(),
+            after: None,
+            limit: 1,
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CLEANUP_PAGE_SIZE, process_cleanup_batch};
-    use crate::driver::DriverContext;
+    use super::{
+        BlobCleanupOutcome, CLEANUP_PAGE_SIZE, CleanupNode, CleanupWorkOperation,
+        ProcessCleanupOperation, ReconcileTargetOperation, RowOutcome,
+    };
+    use crate::blob::migration::shared::MigrationError;
+    use crate::driver::{DriverContext, drive, node_routing};
     use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
@@ -1169,6 +1096,48 @@ mod tests {
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
+
+    fn node(context: &DriverContext) -> CleanupNode {
+        CleanupNode {
+            routing: node_routing(context),
+            has_blob: context.blob_handle.is_some(),
+        }
+    }
+
+    async fn process_cleanup_batch(
+        context: &DriverContext,
+    ) -> Result<BlobCleanupOutcome, MigrationError> {
+        drive(ProcessCleanupOperation::new(node(context)), context).await
+    }
+
+    async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> RowOutcome {
+        let run = CleanupWorkOperation::new(work, node(context));
+        drive(run, context).await.unwrap_or(RowOutcome::Failed)
+    }
+
+    #[test]
+    fn empty_queue_clears_cursor() {
+        use aruna_core::calls::{IoCall, IoResult, Next};
+        use aruna_core::operation::Operation;
+        let node = CleanupNode {
+            routing: Default::default(),
+            has_blob: false,
+        };
+        let mut drain = ProcessCleanupOperation::new(node);
+        assert!(matches!(drain.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let turn = drain.next(IoResult::Values(vec![None]));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert!(matches!(
+            drain.next(page),
+            Ok(Next::Call(IoCall::Delete(_)))
+        ));
+        let done = drain.next(IoResult::Done);
+        assert_eq!(done, Ok(Next::Done(BlobCleanupOutcome::default())));
+    }
 
     fn setup_context() -> (TempDir, StorageHandle, DriverContext) {
         let dir = tempdir().unwrap();
@@ -1495,11 +1464,11 @@ mod tests {
             since_ms,
         };
         let now = aruna_core::time::unix_timestamp_millis();
-        let fresh = super::run_cleanup_work(&context, settle(now)).await;
-        assert!(matches!(fresh, super::RowOutcome::Kept));
+        let fresh = run_cleanup_work(&context, settle(now)).await;
+        assert!(matches!(fresh, RowOutcome::Kept));
         // This context has no blob storage, so the abort cannot run and the row stays.
-        let stale = super::run_cleanup_work(&context, settle(0)).await;
-        assert!(matches!(stale, super::RowOutcome::Failed));
+        let stale = run_cleanup_work(&context, settle(0)).await;
+        assert!(matches!(stale, RowOutcome::Failed));
     }
 
     #[tokio::test]
@@ -1525,12 +1494,12 @@ mod tests {
             prefix: b"rule-a/".to_vec(),
         };
         assert!(matches!(
-            super::run_cleanup_work(&context, work()).await,
-            super::RowOutcome::Kept
+            run_cleanup_work(&context, work()).await,
+            RowOutcome::Kept
         ));
         assert!(matches!(
-            super::run_cleanup_work(&context, work()).await,
-            super::RowOutcome::Done
+            run_cleanup_work(&context, work()).await,
+            RowOutcome::Done
         ));
         let (left, _) = iter_prefix_page(&storage, RENAMED_ROW_KEYSPACE, None, None, 10, None)
             .await
@@ -1562,10 +1531,11 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
 
-        let outcome = super::reconcile_target(&context, Ulid::generate(), None, location).await;
+        let target = ReconcileTargetOperation::new(Ulid::generate(), None, location);
+        let outcome = drive(target, &context).await.unwrap();
 
         // Without the recheck the discard runs and fails here for want of a blob handle.
-        assert!(matches!(outcome, super::RowOutcome::Kept));
+        assert!(matches!(outcome, RowOutcome::Kept));
     }
 
     #[tokio::test]
