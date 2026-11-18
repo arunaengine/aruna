@@ -25,13 +25,14 @@ use aruna_core::structs::{
 use aruna_core::types::GroupId;
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
+use aruna_operations::device::sync::folder_gate;
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, FolderError, RealmBucketInput, bind_folder, create_realm_bucket, list_entries,
-    list_folders, list_transfers, read_bound, set_folder_state, unbind_folder,
+    BindFolderInput, FolderError, RealmBucketInput, bind_folder as reserve_folder,
+    create_realm_bucket, finish_binding, list_entries, list_folders, list_transfers, read_bound,
+    set_folder_state, unbind_folder,
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
-use aruna_operations::device::sync::{reconcile_folder, reconcile_folders};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::device_pull::{accept_pull, pull_status};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -43,10 +44,11 @@ use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::origin::read_origin;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
-use aruna_operations::staging::list_offers::ListOffersOperation;
+use aruna_operations::staging::offer::list::ListOffersOperation;
 use aruna_operations::staging::offered_directory::{
     OfferDirectoryInput, OfferedDirectoryError, offer_directory,
 };
+use aruna_operations::tasks::incoming::folder_pass::{reconcile_folder, reconcile_folders};
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, hang_cap, wait_for_convergence, wait_until};
 use ulid::Ulid;
@@ -55,6 +57,17 @@ const MANAGEMENT_NODES: usize = 2;
 const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 1;
 const REMOTE_BUCKET: &str = "lab-data";
+
+/// Binds a folder as the device API does: reserves it, then confirms its realm bucket under the
+/// folder's gate.
+async fn bind_folder(
+    context: &std::sync::Arc<DriverContext>,
+    input: BindFolderInput,
+) -> Result<aruna_core::structs::SyncedFolder, FolderError> {
+    let folder_id = drive(reserve_folder(input), context).await?.folder_id;
+    let _pass = folder_gate(folder_id).lock().await;
+    drive(finish_binding(folder_id), context).await
+}
 
 fn body(bytes: &'static [u8]) -> BackendStream<Result<bytes::Bytes, StreamError>> {
     BackendStream::new(tokio_util::io::ReaderStream::new(bytes))
@@ -676,7 +689,11 @@ async fn creates_realm_bucket() -> TestResult<()> {
         user_id: realm.user_id,
     };
 
-    create_realm_bucket(&device.context, input(group_id, server.node_id())).await?;
+    drive(
+        create_realm_bucket(input(group_id, server.node_id())),
+        &device.context,
+    )
+    .await?;
     let bucket = drive(
         GetBucketOperation::new(REMOTE_BUCKET.to_string()),
         &server.context,
@@ -686,7 +703,11 @@ async fn creates_realm_bucket() -> TestResult<()> {
 
     for group in [group_id, other_group] {
         assert_eq!(
-            create_realm_bucket(&device.context, input(group, server.node_id())).await,
+            drive(
+                create_realm_bucket(input(group, server.node_id())),
+                &device.context
+            )
+            .await,
             Err(FolderError::BucketExists {
                 node: server.node_id(),
                 bucket: REMOTE_BUCKET.to_string(),
@@ -694,7 +715,11 @@ async fn creates_realm_bucket() -> TestResult<()> {
         );
     }
     assert_eq!(
-        create_realm_bucket(&device.context, input(group_id, device.node_id())).await,
+        drive(
+            create_realm_bucket(input(group_id, device.node_id())),
+            &device.context
+        )
+        .await,
         Err(FolderError::NotRealmNode(device.node_id()))
     );
 
@@ -713,8 +738,8 @@ async fn creates_realm_bucket() -> TestResult<()> {
         ..input(group_id, server.node_id())
     };
     let (left, right) = tokio::join!(
-        create_realm_bucket(&device.context, fresh.clone()),
-        create_realm_bucket(&device.context, fresh)
+        drive(create_realm_bucket(fresh.clone()), &device.context),
+        drive(create_realm_bucket(fresh), &device.context)
     );
     let mut outcomes = [left, right];
     outcomes.sort_by_key(Result::is_err);
@@ -742,7 +767,11 @@ async fn skips_unbound_folder() -> TestResult<()> {
     std::fs::write(root.path().join("note.txt"), b"from the device")?;
     let listed = bind(&realm, root.path(), group_id).await?;
 
-    unbind_folder(&manual_context(&device.context), listed.folder_id).await?;
+    drive(
+        unbind_folder(listed.folder_id),
+        &manual_context(&device.context),
+    )
+    .await?;
     reconcile_folders(&manual_context(&device.context)).await;
     let plan = reconcile_folder(&device.context, &listed).await?;
     assert_eq!(plan.uploads, 0);
@@ -777,7 +806,11 @@ async fn finishes_cancelled_unbind() -> TestResult<()> {
             .any(|offer| offer.bucket == folder.local_bucket)
     );
 
-    set_folder_state(&device.context, folder.folder_id, FolderState::Deleting).await?;
+    drive(
+        set_folder_state(folder.folder_id, FolderState::Deleting),
+        &device.context,
+    )
+    .await?;
     reconcile_folders(&manual_context(&device.context)).await;
     assert_eq!(
         drive(read_bound(folder.folder_id), &device.context).await,
@@ -970,12 +1003,16 @@ async fn resolves_conflicts() -> TestResult<()> {
         expected: Some(expected),
         actor: realm.user_id,
     };
-    let applied = apply_action(&device.context, action.clone()).await?;
+    let applied = drive(
+        apply_action(&device.context, action.clone()),
+        &device.context,
+    )
+    .await?;
     assert_eq!(applied.outcome, ActionOutcome::Applied);
     assert_eq!(std::fs::read(&file)?, b"the realm's edit");
 
     // The same request twice must not replace the new bytes again.
-    let replayed = apply_action(&device.context, action).await?;
+    let replayed = drive(apply_action(&device.context, action), &device.context).await?;
     assert_eq!(replayed.outcome, ActionOutcome::Stale);
     assert_eq!(std::fs::read(&file)?, b"the realm's edit");
     Ok(())

@@ -613,7 +613,7 @@ async fn sync_skips_scan() {
     .unwrap();
     assert_eq!(view.counters.observed, 0);
     let offers = aruna_operations::driver::drive(
-        aruna_operations::staging::list_offers::ListOffersOperation::new(),
+        aruna_operations::staging::offer::list::ListOffersOperation::new(),
         &fixture.state.get_ctx(),
     )
     .await
