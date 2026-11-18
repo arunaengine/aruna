@@ -697,7 +697,60 @@ impl FinishTransitionOperation {
             step: FinishStep::Wake,
         }
     }
-    Ok(None)
+
+    fn forget(&mut self) -> Turn<Option<Duration>> {
+        self.step = FinishStep::Forget;
+        let forget = ForgetRetiredOperation::new(&self.record);
+        Ok(Next::Call(IoCall::child(forget)))
+    }
+}
+
+impl Operation for FinishTransitionOperation {
+    type Output = Option<Duration>;
+    type Error = MigrationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Turn<Option<Duration>> {
+        match retiring(&self.record) {
+            Some(source) => {
+                let wake = WakeParkedOperation::new(source, self.now_ms);
+                Ok(Next::Call(IoCall::child(wake)))
+            }
+            None => self.forget(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<Duration>> {
+        match self.step {
+            FinishStep::Wake => {
+                (result.child::<usize, BlobQueueError>()?).map_err(MigrationError::failed)?;
+                self.step = FinishStep::Drain;
+                Ok(Next::Call(schedule_blob_drain().into()))
+            }
+            FinishStep::Drain => {
+                timer_set(result)?;
+                self.forget()
+            }
+            FinishStep::Forget => {
+                // A failure only leaves the key until the next lock or restart.
+                if let Err(error) = result.child::<(), IoError>()? {
+                    tracing::warn!(%error, "Could not drop a retired key generation");
+                }
+                self.record.finished_at_ms = Some(self.now_ms);
+                self.step = FinishStep::Store;
+                let store = StoreTransitionOperation::new(&self.bucket, self.record.clone());
+                Ok(Next::Call(IoCall::child(store)))
+            }
+            FinishStep::Store => {
+                let stored = result.child::<StoredTransition, MigrationError>()??;
+                let again = stored.stored && stored.record.finished_at_ms.is_none();
+                Ok(Next::Done(again.then_some(RECHECK)))
+            }
+        }
+    }
 }
 
 /// The sessions of a retired source generation; admitted leases keep their own key handle.
@@ -718,58 +771,58 @@ fn retired_sessions(generations: &[UnlockStatus], record: &EncryptionTransition)
 }
 
 /// Drops a retired generation from the unlock registry, so it no longer takes a generation
-/// slot. A failure only leaves the key until the next lock or restart.
-async fn forget_retired(context: &DriverContext, record: &EncryptionTransition) {
-    let (Some(blob), Some(source)) = (context.blob_handle.as_ref(), record.source) else {
-        return;
-    };
-    let status = BlobEffect::ReadKeyStatus {
-        bucket_id: source.bucket_id,
-    };
-    let Event::Blob(BlobEvent::KeyStatus { generations }) = blob.send_blob_effect(status).await
-    else {
-        tracing::warn!("Could not read the unlock state of a retired key generation");
-        return;
-    };
-    for ticket in retired_sessions(&generations, record) {
-        blob.send_blob_effect(BlobEffect::DiscardKey { ticket })
-            .await;
+/// slot.
+#[derive(Debug, PartialEq)]
+struct ForgetRetiredOperation {
+    record: EncryptionTransition,
+    tickets: Option<VecDeque<KeyTicket>>,
+}
+
+impl ForgetRetiredOperation {
+    fn new(record: &EncryptionTransition) -> Self {
+        Self {
+            record: record.clone(),
+            tickets: None,
+        }
+    }
+
+    fn next_ticket(&mut self) -> ForgetTurn {
+        match self.tickets.as_mut().and_then(VecDeque::pop_front) {
+            Some(ticket) => {
+                let discard = Effect::Blob(BlobEffect::DiscardKey { ticket });
+                Ok(Next::Call(discard.into()))
+            }
+            None => Ok(Next::Done(())),
+        }
     }
 }
 
-/// Why a transition waits after every other copy moved.
-const PENDING_REASON: &str = "pending archives, envelopes or copies still use the source key";
+type ForgetTurn = Result<Next<()>, IoError>;
 
-/// Pending archives sealed to the transition's source generation, on every backend.
-async fn pending_on_source(
-    storage: &StorageHandle,
-    record: &EncryptionTransition,
-    txn_id: TxnId,
-) -> Result<u64, String> {
-    let Some(source) = record.source else {
-        return Ok(0);
-    };
-    let (mut after, mut count) = (None, 0u64);
-    loop {
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            PENDING_LOCATION_KEYSPACE,
-            None,
-            after,
-            PAGE,
-            Some(txn_id),
-        )
-        .await?;
-        let locations = rows
-            .iter()
-            .map(|(_, value)| BackendLocation::from_bytes(value.as_ref()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        count += uses_key(&locations, source, record);
-        match cursor {
-            Some(cursor) => after = Some(cursor),
-            None => return Ok(count),
+impl Operation for ForgetRetiredOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> ForgetTurn {
+        let Some(source) = self.record.source else {
+            return Ok(Next::Done(()));
+        };
+        let status = Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: source.bucket_id,
+        });
+        Ok(Next::Call(status.into()))
+    }
+
+    fn next(&mut self, result: IoResult) -> ForgetTurn {
+        if self.tickets.is_some() {
+            return self.next_ticket();
         }
+        let Event::Blob(BlobEvent::KeyStatus { generations }) = result.event()? else {
+            tracing::warn!("Could not read the unlock state of a retired key generation");
+            return Ok(Next::Done(()));
+        };
+        self.tickets = Some(retired_sessions(&generations, &self.record).into());
+        self.next_ticket()
     }
 }
 
@@ -785,101 +838,107 @@ fn uses_key(
     sealed.count() as u64
 }
 
-/// Forgets deleted copies in one transaction; concurrent reclaim is in its snapshot or fails commit.
-/// Returns the count still present, including copies awaiting deletion or retry.
-async fn forget_removed(
-    storage: &StorageHandle,
-    prefix_len: usize,
-    keys: Vec<Key>,
-) -> Result<u64, String> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => {
-            return Err(format!(
-                "could not start a cleanup transaction: {}",
-                other.label()
-            ));
-        }
-    };
-    let staged = stage_forget(storage, txn_id, prefix_len, keys).await;
-    let Ok(left) = staged else {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return staged;
-    };
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(left),
-        other => Err(format!(
-            "removed copies were not forgotten: {}",
-            other.label()
-        )),
-    }
+#[derive(Debug, PartialEq)]
+enum ForgetStep {
+    Queued,
+    Locations(Vec<Key>),
+    Deleted,
 }
 
-/// Checks the location row and the queued delete work of each old copy in `txn_id`. Reclaim
-/// drops the row before the backend delete, so only finished delete work proves removal.
-async fn stage_forget(
-    storage: &StorageHandle,
-    txn_id: TxnId,
+/// Forgets deleted copies in one transaction; concurrent reclaim is in its snapshot or fails
+/// commit. Reclaim drops the location row before the backend delete, so only finished delete
+/// work proves removal. Outputs the count still present, with copies awaiting deletion or retry.
+#[derive(Debug, PartialEq)]
+struct ForgetRemovedOperation {
     prefix_len: usize,
     keys: Vec<Key>,
-) -> Result<u64, String> {
-    let queued = queued_deletes(storage, txn_id).await?;
-    let mut left = 0;
-    for key in keys {
-        let location = key[prefix_len..].to_vec();
-        if queued.contains(&location)
-            || exists(storage, BLOB_LOCATIONS_KEYSPACE, location, Some(txn_id)).await?
-        {
-            left += 1;
-            continue;
+    pages: PrefixPages,
+    queued: HashSet<Vec<u8>>,
+    left: u64,
+    step: ForgetStep,
+}
+
+impl ForgetRemovedOperation {
+    fn new(prefix_len: usize, keys: Vec<Key>) -> Self {
+        Self {
+            prefix_len,
+            keys,
+            pages: PrefixPages::new(BLOB_CLEANUP_KEYSPACE, empty_prefix(), PAGE),
+            queued: HashSet::new(),
+            left: 0,
+            step: ForgetStep::Queued,
         }
-        let delete = StorageEffect::Delete {
-            key_space: TRANSITION_CLEANUP_KEYSPACE.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        };
-        match storage.send_storage_effect(delete).await {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-            other => {
-                return Err(format!(
-                    "could not forget a removed copy: {}",
-                    other.label()
-                ));
+    }
+
+    fn check_locations(&mut self) -> Turn<u64> {
+        let mut checked = Vec::new();
+        let mut reads = Vec::new();
+        for key in std::mem::take(&mut self.keys) {
+            let location = key[self.prefix_len..].to_vec();
+            if self.queued.contains(&location) {
+                self.left += 1;
+                continue;
+            }
+            reads.push((BLOB_LOCATIONS_KEYSPACE.to_string(), location.into()));
+            checked.push(key);
+        }
+        if reads.is_empty() {
+            return Ok(Next::Done(self.left));
+        }
+        self.step = ForgetStep::Locations(checked);
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn locations_read(&mut self, keys: Vec<Key>, values: Vec<Option<Value>>) -> Turn<u64> {
+        let mut deletes = Vec::new();
+        for (key, value) in keys.into_iter().zip(values) {
+            match value {
+                Some(_) => self.left += 1,
+                None => deletes.push((TRANSITION_CLEANUP_KEYSPACE.to_string(), key)),
             }
         }
+        if deletes.is_empty() {
+            return Ok(Next::Done(self.left));
+        }
+        self.step = ForgetStep::Deleted;
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
-    Ok(left)
 }
 
-/// Location keys of copies whose physical deletion is still queued or failed and waits for
-/// a retry.
-async fn queued_deletes(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-) -> Result<HashSet<Vec<u8>>, String> {
-    let (mut after, mut queued) = (None, HashSet::new());
-    loop {
-        let (rows, cursor) = crate::storage_read::iter_prefix_page(
-            storage,
-            BLOB_CLEANUP_KEYSPACE,
-            None,
-            after,
-            PAGE,
-            Some(txn_id),
-        )
-        .await?;
-        for (_, value) in rows {
-            let work = BlobCleanupWork::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
-            if let Some(Ok(key)) = work.location().map(BackendLocation::location_key) {
-                queued.insert(key.to_bytes());
+impl Operation for ForgetRemovedOperation {
+    type Output = u64;
+    type Error = MigrationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Turn<u64> {
+        if self.keys.is_empty() {
+            return Ok(Next::Done(0));
+        }
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<u64> {
+        match std::mem::replace(&mut self.step, ForgetStep::Deleted) {
+            ForgetStep::Queued => {
+                self.step = ForgetStep::Queued;
+                for (_, value) in self.pages.take(result)? {
+                    let work = BlobCleanupWork::from_bytes(value.as_ref())?;
+                    if let Some(Ok(key)) = work.location().map(BackendLocation::location_key) {
+                        self.queued.insert(key.to_bytes());
+                    }
+                }
+                if self.pages.done() {
+                    return self.check_locations();
+                }
+                Ok(Next::Call(self.pages.call()))
+            }
+            ForgetStep::Locations(keys) => self.locations_read(keys, result.values()?),
+            ForgetStep::Deleted => {
+                result.done()?;
+                Ok(Next::Done(self.left))
             }
         }
         match cursor {
