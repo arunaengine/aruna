@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::git_node;
 use super::versions::{
     BranchList, BranchView, MergeConflictView, MergeView, NamedView, TagList, VersionView,
     expected, failure, named_view, version_view,
@@ -9,6 +10,7 @@ use super::versions::{
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_operations::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::git::merge::{self, Merged};
 use aruna_operations::git::versions::{self, Named, WriteOptions};
@@ -72,7 +74,8 @@ pub async fn branches(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let result = versions::branches(&state.get_ctx(), &auth, id).await;
+    let branches = versions::branches(&git_node(&state), &auth, id);
+    let result = drive(branches, &state.get_ctx()).await;
     Ok(match result {
         Ok(heads) => Json(BranchList {
             branches: heads
@@ -107,8 +110,15 @@ pub async fn create_branch(
     Json(request): Json<CreateBranch>,
 ) -> ServerResult<Response> {
     let name = format!("refs/heads/{}", request.name);
-    let result =
-        versions::change_ref(&state.get_ctx(), &auth, id, name, Some(&request.from), None).await;
+    let change = versions::change_ref(
+        &git_node(&state),
+        &auth,
+        id,
+        name,
+        Some(&request.from),
+        None,
+    );
+    let result = drive(change, &state.get_ctx()).await;
     Ok(created(result, &request.name))
 }
 
@@ -150,15 +160,15 @@ pub async fn delete_branch(
     Path((id, name)): Path<(Ulid, String)>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let result = versions::change_ref(
-        &state.get_ctx(),
+    let change = versions::change_ref(
+        &git_node(&state),
         &auth,
         id,
         format!("refs/heads/{name}"),
         None,
         expected(&headers).as_deref(),
-    )
-    .await;
+    );
+    let result = drive(change, &state.get_ctx()).await;
     Ok(deleted(result))
 }
 
@@ -188,18 +198,18 @@ pub async fn edit(
         ));
     }
     let jsonld = serde_json::to_string(&request.rocrate).map_err(|_| ServerError::BadRequest)?;
-    let result = merge::edit(
-        &state.get_ctx(),
+    let edit = merge::edit(
+        &git_node(&state),
         &auth,
         id,
         &name,
         jsonld,
         WriteOptions {
             message: request.message,
-            expected: expected(&headers).as_deref(),
+            expected: expected(&headers),
         },
-    )
-    .await;
+    );
+    let result = drive(edit, &state.get_ctx()).await;
     Ok(match result {
         Ok(version) => Json(version_view(version)).into_response(),
         Err(error) => failure(error),
@@ -226,18 +236,18 @@ pub async fn merge(
     headers: HeaderMap,
     Json(request): Json<MergeBranch>,
 ) -> ServerResult<Response> {
-    let result = merge::merge(
-        &state.get_ctx(),
+    let merge = merge::merge(
+        &git_node(&state),
         &auth,
         id,
         &format!("refs/heads/{name}"),
         &request.into,
         WriteOptions {
             message: request.message,
-            expected: expected(&headers).as_deref(),
+            expected: expected(&headers),
         },
-    )
-    .await;
+    );
+    let result = drive(merge, &state.get_ctx()).await;
     Ok(match result {
         Ok(merged) => Json(merge_view(merged)).into_response(),
         Err(error) => failure(error),
@@ -256,7 +266,8 @@ pub async fn tags(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let result = versions::tags(&state.get_ctx(), &auth, id).await;
+    let tags = versions::tags(&git_node(&state), &auth, id);
+    let result = drive(tags, &state.get_ctx()).await;
     Ok(match result {
         Ok(names) => Json(TagList {
             tags: names.into_iter().map(named_view).collect(),
@@ -282,15 +293,15 @@ pub async fn create_tag(
     Path(id): Path<Ulid>,
     Json(request): Json<CreateTag>,
 ) -> ServerResult<Response> {
-    let result = versions::change_ref(
-        &state.get_ctx(),
+    let change = versions::change_ref(
+        &git_node(&state),
         &auth,
         id,
         format!("refs/tags/{}", request.name),
         Some(&request.version),
         None,
-    )
-    .await;
+    );
+    let result = drive(change, &state.get_ctx()).await;
     Ok(created(result, &request.name))
 }
 
@@ -310,15 +321,15 @@ pub async fn delete_tag(
     Path((id, name)): Path<(Ulid, String)>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let result = versions::change_ref(
-        &state.get_ctx(),
+    let change = versions::change_ref(
+        &git_node(&state),
         &auth,
         id,
         format!("refs/tags/{name}"),
         None,
         expected(&headers).as_deref(),
-    )
-    .await;
+    );
+    let result = drive(change, &state.get_ctx()).await;
     Ok(deleted(result))
 }
 
@@ -340,9 +351,9 @@ pub async fn merge_conflict(
     Path((id, conflict)): Path<(Ulid, Ulid)>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let expected = expected(&headers);
-    let result =
-        merge::resolve_conflict(&state.get_ctx(), &auth, (id, conflict), expected.as_deref()).await;
+    let resolve =
+        merge::resolve_conflict(&git_node(&state), &auth, (id, conflict), expected(&headers));
+    let result = drive(resolve, &state.get_ctx()).await;
     Ok(match result {
         Ok(merged) => Json(merge_view(merged)).into_response(),
         Err(error) => failure(error),
@@ -363,8 +374,12 @@ pub async fn discard_conflict(
     Path((id, conflict)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Response> {
     let context = state.get_ctx();
-    let result = match versions::conflict_ref(&context, &auth, id, conflict).await {
-        Ok(name) => versions::change_ref(&context, &auth, id, name, None, None).await,
+    let node = git_node(&state);
+    let result = match drive(versions::conflict_ref(&node, &auth, id, conflict), &context).await {
+        Ok(name) => {
+            let change = versions::change_ref(&node, &auth, id, name, None, None);
+            drive(change, &context).await
+        }
         Err(error) => Err(error),
     };
     Ok(deleted(result))

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::git_node;
 use super::location::StorageLocation;
 use super::{base_url, map_error};
 use crate::auth::RealmAuth;
@@ -9,6 +10,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::repo_layout::Layout;
 use aruna_core::structs::storage::dataset_location::default_bucket;
+use aruna_operations::driver::drive;
 use aruna_operations::git;
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -69,10 +71,9 @@ pub async fn repository_status(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<RepositoryStatus>> {
+    let read = git::snapshot::status(&git_node(&state), &auth, id);
     let (status, projection, layout, document, pending) =
-        git::snapshot::status(&state.get_ctx(), &auth, id)
-            .await
-            .map_err(map_error)?;
+        drive(read, &state.get_ctx()).await.map_err(map_error)?;
     let storage_location = git::location::chosen(&document, projection.state.location.clone());
     let clone_url = base_url(&state, id).await?;
     Ok(Json(RepositoryStatus {
@@ -122,9 +123,8 @@ pub async fn export_revision(
     Path(id): Path<Ulid>,
     Query(query): Query<RevisionQuery>,
 ) -> ServerResult<Json<Value>> {
-    let bytes = git::snapshot::export(&state.get_ctx(), &auth, id, query.revision)
-        .await
-        .map_err(map_error)?;
+    let export = git::snapshot::export(&git_node(&state), &auth, id, query.revision);
+    let bytes = drive(export, &state.get_ctx()).await.map_err(map_error)?;
     let result: Value =
         serde_json::from_slice(&bytes).map_err(|_| ServerError::ServiceUnavailable)?;
     Ok(Json(result))

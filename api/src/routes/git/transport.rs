@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::git_node;
 use super::{api_url, base_url, map_error, repository_id};
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
@@ -179,9 +180,8 @@ async fn serve(
         metadata_url: format!("{}/metadata/{id}", api_url(&state).await?),
         push_key: String::new(),
     };
-    let result = git::transport(&state.get_ctx(), &auth, request)
-        .await
-        .map_err(map_error)?;
+    let serve = git::transport(&git_node(&state), &auth, request);
+    let result = drive(serve, &state.get_ctx()).await.map_err(map_error)?;
     let GitEvent::Response {
         status,
         headers,
