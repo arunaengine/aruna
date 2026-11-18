@@ -314,8 +314,232 @@ enum LocalStep {
     Visible,
 }
 
-    async fn list(&self, input: &ListBucketInput) -> Result<Listed<R::Object>, Self::Error> {
-        let (set_id, node_id, copy) = self.call;
+/// One page of a bucket's objects from this node's records, inside bounds when given. A caller
+/// sees only the keys and link targets it may read, and a prefix once an entry below it shows;
+/// a page that stopped among hidden entries carries a sealed cursor.
+#[derive(Debug, PartialEq)]
+struct LocalPartOperation<O> {
+    node: PageNode,
+    group_id: Ulid,
+    caller: Option<OwnedCaller>,
+    input: Option<ListBucketInput>,
+    hidden: Option<HiddenCursor>,
+    bounds: Option<(String, Option<String>)>,
+    step: LocalStep,
+    object: PhantomData<O>,
+}
+
+impl<O: PageObject> LocalPartOperation<O> {
+    fn new(
+        node: PageNode,
+        (group_id, caller): (Ulid, Option<OwnedCaller>),
+        input: ListBucketInput,
+        (hidden, bounds): (Option<HiddenCursor>, Option<(String, Option<String>)>),
+    ) -> Self {
+        Self {
+            node,
+            group_id,
+            caller,
+            input: Some(input),
+            hidden,
+            bounds,
+            step: LocalStep::Listed,
+            object: PhantomData,
+        }
+    }
+
+    fn input(&mut self) -> Result<ListBucketInput, IoError> {
+        self.input.take().ok_or(IoError::Unfinished)
+    }
+
+    fn list_all(&mut self) -> PageTurn<O> {
+        let list = ListBucketOperation::new(self.input()?);
+        let list = match self.bounds.take() {
+            Some((lower, upper)) => list.with_bounds(lower, upper),
+            None => list,
+        };
+        self.step = LocalStep::Listed;
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    fn list_visible(&mut self, access: BucketAccess) -> PageTurn<O> {
+        let (auth, expiry) = self.caller.take().ok_or(IoError::Unfinished)?;
+        let node = self.node;
+        // The bearer's expiry bounds a delegated HEAD of a target on another node.
+        let rule = LinkShows {
+            keys: AccessKeys(Arc::new(access)),
+            caller: LinkCaller {
+                auth,
+                credential: (String::new(), self.group_id, expiry),
+            },
+            realm_id: node.realm_id,
+            node: LinkNode {
+                local: node.node_id,
+                ids: node.ids,
+            },
+        };
+        let source = RecordSource {
+            bounds: self.bounds.take(),
+        };
+        let page = VisiblePageOperation::new(source, rule, self.input()?, self.hidden.take());
+        self.step = LocalStep::Visible;
+        Ok(Next::Call(IoCall::child(page)))
+    }
+}
+
+impl<O: PageObject> Operation for LocalPartOperation<O> {
+    type Output = ObjectPage<O>;
+    type Error = PageError;
+
+    fn first(&mut self) -> PageTurn<O> {
+        let Some((auth, _)) = &self.caller else {
+            return self.list_all();
+        };
+        let node = self.node;
+        let ids = (node.realm_id, self.group_id, node.node_id);
+        let bucket = &self.input.as_ref().ok_or(IoError::Unfinished)?.bucket;
+        let access = BucketAccessOperation::new(auth, ids, bucket);
+        self.step = LocalStep::Access;
+        Ok(Next::Call(IoCall::child(access)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PageTurn<O> {
+        match self.step {
+            LocalStep::Access => {
+                let access = result.child::<BucketAccess, AuthorizeError>()?;
+                self.list_visible(access.map_err(PageError::internal)?)
+            }
+            LocalStep::Listed => {
+                let listed = result.child::<ListBucketResult, ListBucketError>()?;
+                let listed = listed.map_err(PageError::internal)?;
+                let next_cursor = listed.continuation_token.map(after_cursor).transpose()?;
+                Ok(Next::Done(ObjectPage {
+                    objects: listed.objects.iter().map(O::from).collect(),
+                    prefixes: listed.common_prefixes,
+                    next_cursor,
+                    ..ObjectPage::default()
+                }))
+            }
+            LocalStep::Visible => {
+                let page = result
+                    .child::<VisiblePage<ListedObject>, VisibleError<LinkError, ListBucketError>>(
+                    )?;
+                let page = page.map_err(visible_failure)?;
+                Ok(Next::Done(shown_page(page, |object| O::from(&object))?))
+            }
+        }
+    }
+}
+
+fn range_page_of<O: PageObject>(page: RangePage) -> ObjectPage<O> {
+    ObjectPage {
+        objects: page.objects.into_iter().map(O::from).collect(),
+        prefixes: page.prefixes,
+        next_cursor: page.next,
+        stale_ranges: page.stale_ranges,
+        unavailable_ranges: Vec::new(),
+    }
+}
+
+/// One range at one member, for a listing this node checks again.
+#[derive(Clone, Debug, PartialEq)]
+struct MemberCall {
+    local: (NodeId, RealmId),
+    target: RangeTarget,
+    access: MemberAccess,
+}
+
+/// The position after the last entry of a page in key order.
+fn last_entry<O: PageObject>(bucket: &str, page: &ObjectPage<O>) -> Option<ListContinuationToken> {
+    let objects = page.objects.iter().map(|object| (object.key(), false));
+    let groups = page.prefixes.iter().map(|group| (group.as_str(), true));
+    let (name, group) = objects.chain(groups).max()?;
+    Some(after_entry(bucket, name, group))
+}
+
+/// One page from one member as a listing source sees it. A member that hid its whole page goes
+/// on from its own sealed cursor.
+#[derive(Debug, PartialEq)]
+struct MemberPageOperation<O> {
+    member: MemberCall,
+    request: ListRequest,
+    position: Option<ListContinuationToken>,
+    object: PhantomData<O>,
+}
+
+impl<O: PageObject> MemberPageOperation<O> {
+    fn call(&self) -> IoCall {
+        let request = &self.request;
+        let query = RangeQuery {
+            bucket: request.bucket.clone(),
+            prefix: request.prefix.clone(),
+            delimiter: request.delimiter.clone(),
+            limit: request.limit,
+            cursor: request.cursor.clone(),
+        };
+        let member = self.member.clone();
+        IoCall::child(RangeListOperation::new(
+            member.local,
+            member.target,
+            query,
+            member.access,
+        ))
+    }
+}
+
+impl<O: PageObject> Operation for MemberPageOperation<O> {
+    type Output = Listed<O>;
+    type Error = PageError;
+
+    fn first(&mut self) -> Result<Next<Listed<O>>, PageError> {
+        if let Some(position) = self.position.take() {
+            self.request.cursor = Some(after_cursor(position)?);
+        }
+        Ok(Next::Call(self.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Listed<O>>, PageError> {
+        let target = &self.member.target;
+        let unanswered = PageError::Unanswered {
+            range_id: target.range.range_id,
+            set_id: target.set_id,
+        };
+        let page = result.child::<Option<RangePage>, RangeListError>()??;
+        let page = range_page_of::<O>(page.ok_or(unanswered)?);
+        let shown = !page.objects.is_empty() || !page.prefixes.is_empty();
+        let bucket = &self.request.bucket;
+        let next = match page.next_cursor.clone() {
+            Some(next) if is_sealed(&next) && !shown => {
+                self.request.cursor = Some(next);
+                return Ok(Next::Call(self.call()));
+            }
+            Some(next) if is_sealed(&next) => last_entry(bucket, &page),
+            Some(next) => match decode_resume(&next)? {
+                Resume::After { key, group } => Some(resume_token(bucket, &key, group.as_deref())?),
+                Resume::From(_) | Resume::Hidden { .. } => return Err(PageError::Cursor),
+            },
+            None => None,
+        };
+        Ok(Next::Done(Listed {
+            objects: page.objects,
+            prefixes: page.prefixes,
+            next,
+        }))
+    }
+}
+
+/// One member as a source of the pages this node checks again.
+#[derive(Debug, PartialEq)]
+struct MemberSource<O> {
+    member: MemberCall,
+    object: PhantomData<O>,
+}
+
+impl<O: PageObject> ListSource for MemberSource<O> {
+    type Object = O;
+    type Error = PageError;
+
+    fn call(&self, input: &ListBucketInput) -> IoCall {
         let request = ListRequest {
             bucket: input.bucket.clone(),
             prefix: input.prefix.clone(),
@@ -324,174 +548,45 @@ enum LocalStep {
             limit: (input.max_keys).unwrap_or(ListBucketOperation::DEFAULT_MAX_KEYS),
             partial: false,
         };
-        let mut cursor = input
-            .continuation_token
-            .clone()
-            .map(after_cursor)
-            .transpose()?;
-        loop {
-            let call = RangeCall {
-                set_id,
-                node_id,
-                range: self.range,
-                request: &request,
-                cursor: cursor.as_deref(),
-                copy,
-            };
-            let unanswered = PageError::Unanswered {
-                range_id: self.range.range_id,
-                set_id,
-            };
-            let page = self
-                .relay
-                .list_range(call)
-                .await
-                .map_err(PageError::Relay)?;
-            let page = page.ok_or(unanswered)?;
-            let shown = !page.objects.is_empty() || !page.prefixes.is_empty();
-            // A member that hid its whole page goes on from its own sealed cursor.
-            let next = match page.next_cursor.clone() {
-                Some(next) if is_sealed(&next) && !shown => {
-                    cursor = Some(next);
-                    continue;
-                }
-                Some(next) if is_sealed(&next) => last_entry(&request.bucket, &page),
-                Some(next) => match decode_resume(&next)? {
-                    Resume::After { key, group } => {
-                        Some(resume_token(&request.bucket, &key, group.as_deref())?)
-                    }
-                    Resume::From(_) | Resume::Hidden { .. } => return Err(PageError::Cursor),
-                },
-                None => None,
-            };
-            return Ok(Listed {
-                objects: page.objects,
-                prefixes: page.prefixes,
-                next,
-            });
-        }
+        IoCall::child(MemberPageOperation::<O> {
+            member: self.member.clone(),
+            request,
+            position: input.continuation_token.clone(),
+            object: PhantomData,
+        })
     }
 
-    fn key(object: &R::Object) -> &str {
+    fn take(&self, result: IoResult) -> Result<Listed<O>, ListFailure<PageError>> {
+        let page = result.child::<Listed<O>, PageError>()?;
+        page.map_err(ListFailure::Source)
+    }
+
+    fn key(object: &O) -> &str {
         object.key()
     }
 }
 
-/// The position after the last entry of `page` in key order.
-fn last_entry<O: PageObject>(bucket: &str, page: &ObjectPage<O>) -> Option<ListContinuationToken> {
-    let objects = page.objects.iter().map(|object| (object.key(), false));
-    let groups = page.prefixes.iter().map(|group| (group.as_str(), true));
-    let (name, group) = objects.chain(groups).max()?;
-    Some(after_entry(bucket, name, group))
+/// Shows the keys this node's own rules allow the caller, whatever a member listed.
+#[derive(Debug, PartialEq)]
+struct CheckedKeys<O> {
+    keys: AccessKeys,
+    object: PhantomData<O>,
 }
 
-/// One range's page as this node's own rules show it to the caller, read from `node_id`:
-/// a key shows when `access` allows it, a common prefix once a key below it does, and a page
-/// that stops among hidden entries ends with this node's sealed cursor.
-async fn checked_part<R: RangeRelay>(
-    relay: &R,
-    (access, group_id): (&BucketAccess, Ulid),
-    (set_id, node_id, range, copy): (Ulid, NodeId, &KeyRange, bool),
-    (request, cursor): (&ListRequest, Option<&str>),
-) -> Result<ObjectPage<R::Object>, PageError<R::Error>> {
-    let (token, hidden) = match cursor {
-        Some(cursor) if is_sealed(cursor) => (
-            None,
-            Some(open_cursor::<HiddenCursor>(cursor).ok_or(PageError::Cursor)?),
-        ),
-        Some(cursor) => match decode_resume(cursor)? {
-            Resume::After { key, group } => (
-                Some(resume_token(&request.bucket, &key, group.as_deref())?),
-                None,
-            ),
-            Resume::From(_) | Resume::Hidden { .. } => return Err(PageError::Cursor),
-        },
-        None => (None, None),
-    };
-    let input = ListBucketInput {
-        bucket: request.bucket.clone(),
-        group_id,
-        continuation_token: token,
-        max_keys: Some(request.limit),
-        prefix: request.prefix.clone().filter(|prefix| !prefix.is_empty()),
-        delimiter: (request.delimiter.clone()).filter(|delimiter| !delimiter.is_empty()),
-        start_after: None,
-    };
-    let lister = MemberRange {
-        relay,
-        call: (set_id, node_id, copy),
-        range,
-    };
-    let shows = |object: &R::Object| {
-        let shown = access.allows(Some(object.key()), &Permission::READ);
-        Box::pin(async move { Ok::<bool, std::convert::Infallible>(shown) })
-            as futures_util::future::BoxFuture<'static, _>
-    };
-    let groups = |prefix: &str| access.allows(Some(prefix), &Permission::READ);
-    let page = visible_from(&lister, input, hidden, shows, groups).await;
-    let page = page.map_err(|error| match error {
-        VisibleError::List(error) => error,
-        VisibleError::Shows(never) => match never {},
-        VisibleError::Cursor => PageError::Internal("listing cursor not sealed".into()),
-    })?;
-    let next_cursor = match page.next {
-        Some(NextPage::After(token)) => Some(after_cursor(token)?),
-        Some(NextPage::Sealed(sealed)) => Some(sealed),
-        None => None,
-    };
-    Ok(ObjectPage {
-        objects: page.objects,
-        prefixes: page.prefixes,
-        next_cursor,
-        ..ObjectPage::default()
-    })
-}
+impl<O: PageObject> ShowRule for CheckedKeys<O> {
+    type Object = O;
+    type Error = IoError;
 
-/// One range's page from a holder of the range, with the holder that answered; only a range
-/// nobody answers ends the page. With `checks`, this node checks the caller on each entry too.
-async fn remote_part<R: RangeRelay>(
-    relay: &R,
-    (binding, holders, checks): (
-        &DistributionBinding,
-        Vec<NodeId>,
-        Option<(&BucketAccess, Ulid)>,
-    ),
-    (range, copy): (&KeyRange, bool),
-    (request, cursor): (&ListRequest, Option<String>),
-) -> Result<(ObjectPage<R::Object>, NodeId), PageError<R::Error>> {
-    for node_id in holders {
-        if let Some(checks) = checks {
-            let call = (binding.set_id, node_id, range, copy);
-            match checked_part(relay, checks, call, (request, cursor.as_deref())).await {
-                Ok(page) => return Ok((page, node_id)),
-                Err(PageError::Unanswered { .. }) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        let call = RangeCall {
-            set_id: binding.set_id,
-            node_id,
-            range,
-            request,
-            cursor: cursor.as_deref(),
-            copy,
-        };
-        if let Some(page) = relay.list_range(call).await.map_err(PageError::Relay)? {
-            return Ok((page, node_id));
-        }
+    fn shows(&self, object: &O) -> Shown {
+        Shown::Decided(self.keys.allows(object.key()))
     }
-    Err(PageError::Unanswered {
-        range_id: range.range_id,
-        set_id: binding.set_id,
-    })
-}
 
-/// Whether a failed range listing is the holders' fault, so a copy may list instead.
-fn holder_fault<R: RangeRelay>(error: &PageError<R::Error>) -> bool {
-    match error {
-        PageError::Unanswered { .. } => true,
-        PageError::Relay(error) => R::is_fault(error),
-        _ => false,
+    fn answered(&self, _: IoResult) -> Result<Result<bool, IoError>, IoError> {
+        Err(IoError::Unfinished)
+    }
+
+    fn groups(&self, prefix: &str) -> bool {
+        self.keys.groups(prefix)
     }
 }
 
