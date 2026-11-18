@@ -243,3 +243,389 @@ impl Operation for ReadableDatabaseOperation {
         }
     }
 }
+
+/// What the version head settled about an input.
+#[derive(Debug, PartialEq)]
+struct Located {
+    version: Ulid,
+    content: InputContent,
+    source_pin: Option<SourcePin>,
+    bytes: u64,
+    policies: Vec<PlacementPolicyRef>,
+}
+
+/// An input the caller may read, with whether everyone may.
+#[derive(Debug, PartialEq)]
+struct Readable {
+    located: Located,
+    group_id: GroupId,
+    public: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum CaptureStep {
+    Head,
+    Hash(Box<HeadObjectResult>, Ulid),
+    Access(Located),
+    Public(Located, GroupId),
+    Bucket(Readable),
+    Database(Readable, Box<BucketInfo>),
+    Releases(Readable, Option<CapturedDatabase>),
+    Grant(Readable, Option<CapturedDatabase>, Vec<ReleaseRef>, bool),
+    Finished,
+}
+
+/// Captures one input held here. `known` is its bucket's metadata when an earlier input of the
+/// same bucket already read it.
+#[derive(Debug, PartialEq)]
+struct CaptureInputOperation {
+    caller: CaptureCaller,
+    input: InputSelection,
+    reference: String,
+    known: Option<Option<CapturedDatabase>>,
+    step: CaptureStep,
+}
+
+type CaptureNext = Result<Next<CapturedInput>, SubmitJobError>;
+
+impl CaptureInputOperation {
+    fn new(
+        caller: CaptureCaller,
+        input: InputSelection,
+        known: Option<Option<CapturedDatabase>>,
+    ) -> Self {
+        Self {
+            reference: reference_of(&input),
+            caller,
+            input,
+            known,
+            step: CaptureStep::Head,
+        }
+    }
+
+    fn unavailable(&self, error: impl std::fmt::Display) -> SubmitJobError {
+        SubmitJobError::PlacementUnavailable(format!("{}: {error}", self.reference))
+    }
+
+    fn invalid(&self, error: impl std::fmt::Display) -> SubmitJobError {
+        SubmitJobError::InvalidWorkspace(format!("{}: {error}", self.reference))
+    }
+
+    /// A definitive miss is the submitter's error, never a retryable 503.
+    fn head_failure(&self, error: HeadObjectError) -> SubmitJobError {
+        match error {
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker => self.invalid("input object not found"),
+            other => self.unavailable(other),
+        }
+    }
+
+    fn headed(&mut self, head: HeadObjectResult) -> CaptureNext {
+        let version = head.resolved_version_id.or(head.version_id);
+        let version = version.ok_or_else(|| self.invalid("input has no version"))?;
+        let hash = (head.location.as_ref())
+            .and_then(|location| location.hashes.get(HASH_BLAKE3))
+            .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok());
+        if hash.is_some() {
+            return self.located(&head, version, hash);
+        }
+        let (bucket, key, _) = source_parts(&self.input);
+        let read = VersionHashOperation::new(bucket, key, version);
+        self.step = CaptureStep::Hash(Box::new(head), version);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn located(
+        &mut self,
+        head: &HeadObjectResult,
+        version: Ulid,
+        hash: Option<[u8; 32]>,
+    ) -> CaptureNext {
+        let (content, source_pin) = match hash {
+            Some(hash) => (InputContent::Blake3(hash), None),
+            None => reference_content(&self.reference, head)?,
+        };
+        let stored = head.location.as_ref().map(|location| location.blob_size);
+        let described = head.source_metadata.as_ref();
+        let bytes = stored
+            .or_else(|| described.map(|metadata| metadata.content_length))
+            .unwrap_or_default();
+        let policies = PlacementPolicyRef::canonical_set(&head.source_policies)
+            .map_err(|error| self.invalid(error))?;
+        // The caller must read the input like an S3 GET of it, in whatever group it lives.
+        let (bucket, key, _) = source_parts(&self.input);
+        let check = self.caller.input.read_check(bucket, key);
+        self.step = CaptureStep::Access(Located {
+            version,
+            content,
+            source_pin,
+            bytes,
+            policies,
+        });
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn public_check(&self, group_id: GroupId) -> SourceReadOperation {
+        let (bucket, key, _) = source_parts(&self.input);
+        let object = SourceObject {
+            node_id: self.caller.input.local,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            operation: READ_OPERATION.to_string(),
+        };
+        let anonymous = AuthContext::anonymous(self.caller.input.realm_id);
+        SourceReadOperation::in_group(anonymous, object, group_id)
+    }
+
+    fn release_check(&self, version: Ulid, info: &BucketInfo) -> MembersCheckOperation {
+        let (bucket, key, _) = source_parts(&self.input);
+        let scope = BucketScope {
+            realm_id: self.caller.input.realm_id,
+            node_id: self.caller.input.local,
+            bucket,
+            info,
+        };
+        let auth = self.caller.input.auth();
+        let caller = MembershipCaller {
+            auth: &auth,
+            bearer: self.caller.bearer.as_deref(),
+        };
+        let query = MembershipQuery {
+            key: key.to_string(),
+            version_id: version,
+        };
+        MembersCheckOperation::new(scope, caller, &[query])
+    }
+
+    fn with_database(
+        &mut self,
+        readable: Readable,
+        info: &BucketInfo,
+        database: Option<CapturedDatabase>,
+    ) -> CaptureNext {
+        let check = self.release_check(readable.located.version, info);
+        self.step = CaptureStep::Releases(readable, database);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn with_bucket(&mut self, readable: Readable, info: BucketInfo) -> CaptureNext {
+        if let Some(database) = self.known.take() {
+            return self.with_database(readable, &info, database);
+        }
+        let (bucket, _, _) = source_parts(&self.input);
+        let read = ReadableDatabaseOperation::new(&self.caller, bucket, &info);
+        self.step = CaptureStep::Database(readable, Box::new(info));
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    /// This node validated the caller itself, so its grant vouches for exact reads later.
+    fn grant(&self, version: Ulid) -> ReadGrant {
+        let (bucket, key, _) = source_parts(&self.input);
+        let caller = &self.caller.input;
+        ReadGrant {
+            realm_id: caller.realm_id,
+            issuer: caller.local,
+            submission_id: self.caller.submission_id,
+            user_id: caller.created_by,
+            restrictions: None,
+            scope: GrantScope::Version(VersionedObjectArn {
+                realm_id: caller.realm_id,
+                node_id: caller.local,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version,
+            }),
+            operations: vec![READ_OPERATION.to_string(), HEAD_OPERATION.to_string()],
+            expires_at: self.caller.expires_at,
+        }
+    }
+
+    fn finish(
+        &self,
+        readable: Readable,
+        database: Option<CapturedDatabase>,
+        (releases, releases_complete): (Vec<ReleaseRef>, bool),
+        grant: Option<SignedGrant>,
+    ) -> CapturedInput {
+        let Readable {
+            located,
+            group_id,
+            public,
+        } = readable;
+        CapturedInput {
+            destination_key: self.input.dest_key.clone(),
+            source_node_id: self.caller.input.local,
+            version_id: located.version,
+            content: located.content,
+            bytes: located.bytes,
+            policies: located.policies,
+            source_group_id: group_id,
+            public,
+            link: None,
+            source_pin: located.source_pin,
+            database,
+            releases,
+            releases_complete,
+            grant,
+            served_by: None,
+        }
+    }
+}
+
+/// The signed grant an answer carries; a node that cannot sign gives none.
+fn signed_grant(result: IoResult) -> Result<Option<SignedGrant>, IoError> {
+    let expected = "Event::Net(NetEvent::GrantSign)";
+    let IoResult::Event(event) = result else {
+        let got = result.label();
+        return Err(IoError::Unexpected { expected, got });
+    };
+    let Event::Net(NetEvent::GrantSign(grant)) = *event else {
+        let got = "another event";
+        return Err(IoError::Unexpected { expected, got });
+    };
+    Ok(grant.map(|grant| *grant))
+}
+
+impl Operation for CaptureInputOperation {
+    type Output = CapturedInput;
+    type Error = SubmitJobError;
+
+    fn first(&mut self) -> CaptureNext {
+        let (bucket, key, version_id) = source_parts(&self.input);
+        // Every refusal names the input it is about: the object store's own
+        // message says only that some key is missing.
+        let version_id = version_id
+            .map(Ulid::from_string)
+            .transpose()
+            .map_err(|error| self.invalid(error))?;
+        let head = HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id,
+        });
+        Ok(Next::Call(IoCall::child(head)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CaptureNext {
+        match std::mem::replace(&mut self.step, CaptureStep::Finished) {
+            CaptureStep::Head => {
+                let head = result.child::<HeadObjectResult, HeadObjectError>()?;
+                self.headed(head.map_err(|error| self.head_failure(error))?)
+            }
+            // A version record that cannot be read gives no hash, like one without any.
+            CaptureStep::Hash(head, version) => {
+                let hash = result.child::<Option<[u8; 32]>, IoError>()?;
+                self.located(&head, version, hash.ok().flatten())
+            }
+            CaptureStep::Access(located) => {
+                let read = result.child::<GroupId, SourceReadError>()?;
+                let group_id = read.map_err(|error| source_error(&self.reference, error))?;
+                self.step = CaptureStep::Public(located, group_id);
+                Ok(Next::Call(IoCall::child(self.public_check(group_id))))
+            }
+            CaptureStep::Public(located, group_id) => {
+                let public = match result.child::<GroupId, SourceReadError>()? {
+                    Ok(_) => true,
+                    Err(SourceReadError::Denied) => false,
+                    Err(error) => return Err(source_error(&self.reference, error)),
+                };
+                self.step = CaptureStep::Bucket(Readable {
+                    located,
+                    group_id,
+                    public,
+                });
+                let (bucket, _, _) = source_parts(&self.input);
+                let read = GetBucketOperation::new(bucket.to_string());
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            CaptureStep::Bucket(readable) => {
+                let info = result.child::<BucketInfo, GetBucketError>()?;
+                let info = info.map_err(|error| self.unavailable(error))?;
+                self.with_bucket(readable, info)
+            }
+            CaptureStep::Database(readable, info) => {
+                let read = result.child::<Option<CapturedDatabase>, DatabaseError>()?;
+                let database = read.map_err(|error| self.unavailable(error))?;
+                self.with_database(readable, &info, database)
+            }
+            // A check that fails leaves the releases unproven rather than refusing the run.
+            CaptureStep::Releases(readable, database) => {
+                let found = result.child::<MembersOutput, ReleaseError>()?;
+                let answer = found
+                    .ok()
+                    .and_then(|found| found.answers.into_iter().next());
+                let (releases, complete) = answer.map_or((Vec::new(), false), |answer| {
+                    (answer.releases, answer.complete)
+                });
+                let grant = self.grant(readable.located.version);
+                self.step = CaptureStep::Grant(readable, database, releases, complete);
+                let effect = Effect::Net(NetEffect::GrantSign(Box::new(grant)));
+                Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+            }
+            CaptureStep::Grant(readable, database, releases, complete) => {
+                let grant = signed_grant(result)?;
+                let releases = (releases, complete);
+                Ok(Next::Done(self.finish(readable, database, releases, grant)))
+            }
+            CaptureStep::Finished => Err(IoError::Unfinished.into()),
+        }
+    }
+}
+
+/// Captures inputs held here in order. Inputs of one bucket share its metadata and its
+/// dataset's description, read once.
+#[derive(Debug, PartialEq)]
+pub(super) struct CaptureInputsOperation {
+    caller: CaptureCaller,
+    inputs: Vec<InputSelection>,
+    captured: Vec<CapturedInput>,
+    databases: BTreeMap<String, Option<CapturedDatabase>>,
+}
+
+type InputsNext = Result<Next<Vec<CapturedInput>>, SubmitJobError>;
+
+impl CaptureInputsOperation {
+    pub(super) fn new(caller: CaptureCaller, inputs: Vec<InputSelection>) -> Self {
+        Self {
+            caller,
+            captured: Vec::with_capacity(inputs.len()),
+            inputs,
+            databases: BTreeMap::new(),
+        }
+    }
+
+    fn bucket_of(input: &InputSelection) -> &str {
+        source_parts(input).0
+    }
+
+    fn capture_next(&mut self) -> InputsNext {
+        let Some(input) = self.inputs.get(self.captured.len()) else {
+            return Ok(Next::Done(std::mem::take(&mut self.captured)));
+        };
+        let known = self.databases.get(Self::bucket_of(input)).cloned();
+        let capture = CaptureInputOperation::new(self.caller.clone(), input.clone(), known);
+        Ok(Next::Call(IoCall::child(capture)))
+    }
+}
+
+impl Operation for CaptureInputsOperation {
+    type Output = Vec<CapturedInput>;
+    type Error = SubmitJobError;
+
+    fn first(&mut self) -> InputsNext {
+        self.capture_next()
+    }
+
+    fn next(&mut self, result: IoResult) -> InputsNext {
+        let captured = result.child::<CapturedInput, SubmitJobError>()??;
+        if let Some(input) = self.inputs.get(self.captured.len()) {
+            let bucket = Self::bucket_of(input).to_string();
+            self.databases
+                .entry(bucket)
+                .or_insert_with(|| captured.database.clone());
+        }
+        self.captured.push(captured);
+        self.capture_next()
+    }
+}
