@@ -435,7 +435,7 @@ async fn coordinated_files(
         .await
         .map_err(|error| unavailable(&error))?
         .ok_or_else(|| PublishError::Unavailable("this node holds no record of the set".into()))?;
-    let fence = local_fence(context, binding.set_id)
+    let fence = drive(local_fence(binding.set_id), context)
         .await
         .map_err(|error| unavailable(&error))?;
     let snapshot = view.snapshot();
@@ -683,7 +683,7 @@ pub async fn holder_answer(
                 .await
                 .map_err(|error| unavailable(&error))?
                 .ok_or_else(|| PublishError::Unavailable("no record of the set".into()))?;
-            let fence = local_fence(context, binding.set_id)
+            let fence = drive(local_fence(binding.set_id), context)
                 .await
                 .map_err(|error| unavailable(&error))?;
             let snapshot = view.snapshot();

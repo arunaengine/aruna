@@ -458,7 +458,7 @@ async fn origin_answer(
         let context = state.get_ctx();
         if params.version_id.is_none() {
             let path = origin_path(&bucket, &params);
-            let coordinator = read_coordinator(context.as_ref(), binding, &params.key).await;
+            let coordinator = drive(read_coordinator(binding, &params.key), context.as_ref()).await;
             let asked = match coordinator.map_err(map_guard_error) {
                 Ok(None) => None,
                 Ok(Some((range_id, node_id))) => {
@@ -470,7 +470,7 @@ async fn origin_answer(
             };
             match asked {
                 Some(Err(error)) if error.status_code().is_server_error() => {
-                    let readers = copy_readers(context.as_ref(), binding, &params.key).await;
+                    let readers = drive(copy_readers(binding, &params.key), context.as_ref()).await;
                     let (range_id, here, copies) = readers.map_err(map_guard_error)?;
                     if !here && copies.is_empty() {
                         return Err(error);
@@ -485,7 +485,7 @@ async fn origin_answer(
                 None => {}
             }
         }
-        let route = route_read(context.as_ref(), binding, &params.key, false).await;
+        let route = drive(route_read(binding, &params.key, false), context.as_ref()).await;
         if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
             let mut holders = key_holders(context.as_ref(), binding.set_id, &params.key).await;
             holders.retain(|holder| *holder != state.get_node_id());
@@ -501,7 +501,7 @@ async fn origin_answer(
         && headers.contains_key(RELAY_HOP_HEADER)
         && !headers.contains_key(COPY_READ_HEADER)
     {
-        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        let coordinator = drive(read_coordinator(binding, &params.key), state.get_ctx().as_ref()).await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
             return Err(map_guard_error(GuardError::NotCoordinator {
                 set_id: binding.set_id,
@@ -523,7 +523,7 @@ async fn origin_answer(
     if let (Err(OriginError::VersionMissing), Some(binding), None) =
         (&view, info.distribution.as_ref(), stale)
     {
-        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        let coordinator = drive(read_coordinator(binding, &params.key), state.get_ctx().as_ref()).await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
             && !headers.contains_key(RELAY_HOP_HEADER)
         {

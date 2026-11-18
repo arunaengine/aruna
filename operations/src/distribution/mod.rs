@@ -33,7 +33,7 @@ mod refresh;
 pub mod replica_shares;
 pub mod resolve;
 pub mod roots;
-pub(crate) mod route_query;
+mod route_query;
 pub mod routing;
 pub mod sharding;
 pub mod source_keep;

@@ -264,7 +264,7 @@ async fn member_sets(state: &ServerState, named: NamedSets) -> Vec<MemberSet> {
         let Some(binding) = info.distribution.as_ref() else {
             continue;
         };
-        if let Ok(view) = bound_view(&context, binding).await {
+        if let Ok(view) = drive(bound_view(binding), &context).await {
             let members = &view.snapshot().config.members;
             sets.push(MemberSet {
                 set_id: binding.set_id,
@@ -314,7 +314,7 @@ async fn bound_here(state: &ServerState, set_id: Ulid, bucket: &str) -> bool {
     };
     let binding = info.distribution.as_ref();
     match binding.filter(|binding| binding.set_id == set_id) {
-        Some(binding) => bound_view(&state.get_ctx(), binding).await.is_ok(),
+        Some(binding) => drive(bound_view(binding), &state.get_ctx()).await.is_ok(),
         None => false,
     }
 }

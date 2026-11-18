@@ -17,15 +17,13 @@ use aruna_core::structs::storage::distribution::{
 use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
-use crate::distribution::guard::{
-    GuardError, authority_reads, bound_record, read_target, target_for,
-};
+use crate::distribution::guard::{GuardError, bound_record, read_target, target_for};
 
 /// Decides a routing question from its arguments and the rows read for it.
-pub(super) type Decide<A, T> = fn(&A, &[Option<Value>]) -> Result<T, GuardError>;
+pub type Decide<A, T> = fn(&A, &[Option<Value>]) -> Result<T, GuardError>;
 
 /// Reads the rows of one routing question, then decides it without further I/O.
-pub(crate) struct RouteOperation<A, T> {
+pub struct RouteOperation<A, T> {
     pub(super) reads: Vec<(KeySpace, Key)>,
     pub(super) args: A,
     pub(super) decide: Decide<A, T>,
@@ -82,7 +80,7 @@ pub(super) fn bound(
     bound_record(binding, row(values, 0))
 }
 
-pub(crate) type Bound<A> = (DistributionBinding, A);
+pub type Bound<A> = (DistributionBinding, A);
 
 pub(super) fn read_route(
     (binding, (key, listing)): &Bound<(String, bool)>,
@@ -109,20 +107,7 @@ pub(super) fn fence_row(_: &(), rows: &[Option<Value>]) -> Result<LocalFence, Gu
     Ok(LocalFence::decode(row(rows, 0))?)
 }
 
-/// The range id and node of the coordinator of `key`'s range, or `None` when this member
-/// coordinates it and has not fenced it for a transfer.
-pub(crate) fn coordinator_read(
-    binding: DistributionBinding,
-    key: String,
-) -> RouteOperation<Bound<String>, Option<(Ulid, NodeId)>> {
-    RouteOperation {
-        reads: authority_reads(binding.set_id),
-        args: (binding, key),
-        decide: coordinator_of,
-    }
-}
-
-fn coordinator_of(
+pub(super) fn coordinator_of(
     (binding, key): &Bound<String>,
     rows: &[Option<Value>],
 ) -> Result<Option<(Ulid, NodeId)>, GuardError> {
@@ -208,7 +193,7 @@ pub(super) fn range_kept(
     }
 }
 
-pub(super) type Interval = (String, Option<String>);
+pub type Interval = (String, Option<String>);
 
 pub(super) fn listed_interval(
     (binding, (lower, upper)): &Bound<Interval>,
@@ -264,14 +249,14 @@ pub(super) fn range_holders(
 }
 
 /// The tag of a new upload of a key this member coordinates.
-pub(super) fn tag_of(
-    binding: &DistributionBinding,
-    upload_id: Ulid,
-    route: WriteRoute,
+pub(super) fn new_tag(
+    (binding, (key, upload_id)): &Bound<(String, Ulid)>,
+    rows: &[Option<Value>],
 ) -> Result<UploadTag, GuardError> {
-    match route {
+    let records = (row(rows, 0), row(rows, 1));
+    match target_for(binding, key, records, false)? {
         WriteRoute::Local { range_id, epoch } => Ok(UploadTag {
-            upload_id,
+            upload_id: *upload_id,
             set_id: binding.set_id,
             range_id,
             epoch: epoch.0,
@@ -293,6 +278,8 @@ pub(super) fn interval(lower: &str, upper: Option<&str>) -> Interval {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distribution::guard::authority_reads;
+    use crate::distribution::routing::read_coordinator;
     use crate::distribution::test_record::{binding, record};
     use aruna_core::calls::IoError;
     use aruna_core::errors::StorageError;
@@ -340,7 +327,7 @@ mod tests {
     fn finds_read_coordinator() {
         let (snapshot, bytes) = record(true);
         let own = binding(&snapshot, 1, 5);
-        let ask = |key: &str| coordinator_read(own.clone(), key.to_string());
+        let ask = |key: &str| read_coordinator(&own, key);
         let rows = || IoResult::Values(vec![Some(Value::from(bytes.clone())), None]);
         let mut remote = ask("x");
         let reads = IoCall::Read(authority_reads(own.set_id));
@@ -358,7 +345,7 @@ mod tests {
     #[test]
     fn coordinator_needs_record() {
         let (snapshot, _) = record(true);
-        let mut read = coordinator_read(binding(&snapshot, 1, 5), "a".to_string());
+        let mut read = read_coordinator(&binding(&snapshot, 1, 5), "a");
         read.first().unwrap();
         assert_eq!(
             read.next(IoResult::Values(vec![None, None])),

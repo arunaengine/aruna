@@ -145,7 +145,7 @@ impl McpServer {
         // A member that keeps no records of the key's range sends the call to one that does.
         let mut routed = None;
         if let Some(binding) = info.as_ref().and_then(|info| info.distribution.as_ref()) {
-            let route = route_read(&context, binding, key, false).await;
+            let route = drive(route_read(binding, key, false), &context).await;
             if let ReadRoute::Holder { node_id, .. } = route.map_err(guard_error)? {
                 routed = Some(node_id);
             }

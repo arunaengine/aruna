@@ -774,8 +774,8 @@ impl AuthProvider {
         if let Some(binding) = bucket_info.distribution.as_ref().filter(|_| !listing) {
             let context = self.driver_ctx.as_ref();
             let routed = match matches!(operation, "GetObject" | "HeadObject") {
-                true => delegated_read(context, binding, delegation.range_id, &key).await,
-                false => delegated_range(context, binding, delegation.range_id, &key).await,
+                true => drive(delegated_read(binding, delegation.range_id, &key), context).await,
+                false => drive(delegated_range(binding, delegation.range_id, &key), context).await,
             };
             routed.map_err(|error| crate::s3::error::guard_error(&error))?;
         }
