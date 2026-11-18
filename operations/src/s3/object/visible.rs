@@ -515,170 +515,106 @@ where
         if shown {
             return self.probe_end(ProbeEnd::Shown);
         }
-        probe.max_keys = None;
-    }
-}
-
-enum Entry<O> {
-    Object(O),
-    Group(String),
-}
-
-/// The entries of one listed page in key order.
-fn in_order<L: Lister>(objects: Vec<L::Object>, prefixes: Vec<String>) -> Vec<Entry<L::Object>> {
-    let mut entries: Vec<Entry<L::Object>> = (objects.into_iter().map(Entry::Object))
-        .chain(prefixes.into_iter().map(Entry::Group))
-        .collect();
-    entries.sort_by(|left, right| name::<L>(left).cmp(name::<L>(right)));
-    entries
-}
-
-fn name<L: Lister>(entry: &Entry<L::Object>) -> &str {
-    match entry {
-        Entry::Object(object) => L::key(object),
-        Entry::Group(group) => group,
-    }
-}
-
-/// One page of the entries `shows` admits, from `input`'s position or a `hidden` one. A common
-/// prefix shows once an entry below it does, and `groups` refuses prefixes outright. A page
-/// that met hidden entries ends after its last shown one, or sealed when it showed none.
-pub async fn visible_page<'s, E, F>(
-    context: &DriverContext,
-    input: ListBucketInput,
-    (hidden, bounds): (Option<HiddenCursor>, Option<(String, Option<String>)>),
-    shows: F,
-    groups: impl Fn(&str) -> bool,
-) -> Result<VisiblePage, VisibleError<E>>
-where
-    F: FnMut(&ListedObject) -> BoxFuture<'s, Result<bool, E>>,
-{
-    let records = Records { context, bounds };
-    visible_from(&records, input, hidden, shows, groups).await
-}
-
-/// `visible_page` over the pages of `lister`.
-pub async fn visible_from<'s, L: Lister, E, F>(
-    lister: &L,
-    mut input: ListBucketInput,
-    hidden: Option<HiddenCursor>,
-    mut shows: F,
-    groups: impl Fn(&str) -> bool,
-) -> Result<VisiblePage<L::Object>, VisibleError<E, L::Error>>
-where
-    F: FnMut(&L::Object) -> BoxFuture<'s, Result<bool, E>>,
-{
-    let max = (input.max_keys).unwrap_or(ListBucketOperation::DEFAULT_MAX_KEYS);
-    let bucket = input.bucket.clone();
-    let mut page = VisiblePage::default();
-    if max == 0 {
-        return Ok(page);
-    }
-    let mut budget = SCAN_BUDGET;
-    let mut last: Option<(String, bool)> = None;
-    let sealed = |hidden: &HiddenCursor| {
-        seal_cursor(hidden)
-            .map(NextPage::Sealed)
-            .ok_or(VisibleError::Cursor)
-    };
-    if let Some(hidden) = hidden {
-        input.continuation_token = hidden.position.clone();
-        input.start_after = None;
-        if let Some((group, at)) = hidden.pending.clone() {
-            let probed = probe(lister, &input, (&group, at), &mut budget, &mut shows);
-            match probed.await? {
-                Probe::Shown => {
-                    page.prefixes.push(group.clone());
-                    last = Some((group.clone(), true));
-                    // A page the prefix fills ends here, and the next one starts past it.
-                    if page.prefixes.len() >= max {
-                        page.next = Some(NextPage::After(after_entry(&bucket, &group, true)));
-                        return Ok(page);
-                    }
-                }
-                Probe::Empty => {}
-                Probe::Stopped(at) => {
-                    let pending = Some((group, Some(at)));
-                    page.next = Some(sealed(&HiddenCursor { pending, ..hidden })?);
-                    return Ok(page);
-                }
-            }
-            input.continuation_token = Some(after_entry(&bucket, &group, true));
+        self.budget = self.budget.saturating_sub(1);
+        if self.budget == 0 {
+            let at = after_entry(&self.bucket, S::key(&object), false).last_key;
+            return self.probe_end(ProbeEnd::Stopped(at));
         }
+        self.probe_next()
     }
-    loop {
-        let list = lister.list(&input).await.map_err(VisibleError::List)?;
-        let more = list.next.clone();
-        let entries = in_order::<L>(list.objects, list.prefixes);
-        let count = entries.len();
-        for (index, entry) in entries.into_iter().enumerate() {
-            let (entry_name, group) = match &entry {
-                Entry::Object(object) => (L::key(object).to_string(), false),
-                Entry::Group(group) => (group.clone(), true),
-            };
-            let position = Some(after_entry(&bucket, &entry_name, group));
-            // A hidden entry costs one; a prefix pays for the hidden entries its probe met.
-            let (shown, cost) = match entry {
-                Entry::Object(object) => match shows(&object).await.map_err(VisibleError::Shows)? {
-                    true => {
-                        page.objects.push(object);
-                        (true, 0)
-                    }
-                    false => (false, 1),
-                },
-                Entry::Group(group) if groups(&group) => {
-                    let probed = probe(lister, &input, (&group, None), &mut budget, &mut shows);
-                    match probed.await? {
-                        Probe::Shown => {
-                            page.prefixes.push(group);
-                            (true, 0)
-                        }
-                        Probe::Empty => (false, 0),
-                        Probe::Stopped(at) => {
-                            page.next = Some(match &last {
-                                Some((key, group)) => {
-                                    NextPage::After(after_entry(&bucket, key, *group))
-                                }
-                                None => sealed(&HiddenCursor {
-                                    position: input.continuation_token.clone(),
-                                    pending: Some((group, Some(at))),
-                                })?,
-                            });
-                            return Ok(page);
+
+    fn probe_end(&mut self, end: ProbeEnd) -> VisibleTurn<S, R> {
+        let probe = self.probe.take().ok_or(IoError::Unfinished)?;
+        let group = probe.group;
+        match probe.purpose {
+            ProbeFor::Hidden(hidden) => {
+                match end {
+                    ProbeEnd::Shown => {
+                        self.page.prefixes.push(group.clone());
+                        self.last = Some((group.clone(), true));
+                        // A page the prefix fills ends here, and the next one starts past it.
+                        if self.page.prefixes.len() >= self.max {
+                            let next = after_entry(&self.bucket, &group, true);
+                            return self.end_at(NextPage::After(next));
                         }
                     }
+                    ProbeEnd::Empty => {}
+                    ProbeEnd::Stopped(at) => {
+                        let pending = Some((group, Some(at)));
+                        let next = self.sealed(&HiddenCursor { pending, ..hidden })?;
+                        return self.end_at(next);
+                    }
                 }
-                Entry::Group(_) => (false, 1),
-            };
-            budget = budget.saturating_sub(cost);
-            if shown {
-                last = Some((entry_name, group));
+                self.input.continuation_token = Some(after_entry(&self.bucket, &group, true));
+                self.list_page()
             }
-            let rest = index + 1 < count || more.is_some();
-            let full = page.objects.len() + page.prefixes.len() >= max;
-            if (full || budget == 0) && rest {
-                page.next = Some(match &last {
-                    Some((key, group)) => NextPage::After(after_entry(&bucket, key, *group)),
-                    None => sealed(&HiddenCursor {
-                        position,
-                        pending: None,
-                    })?,
-                });
-                return Ok(page);
-            }
-            if !shown {
-                input.continuation_token = position;
-            }
+            ProbeFor::Entry(place) => match end {
+                ProbeEnd::Shown => {
+                    self.page.prefixes.push(group);
+                    self.entry_done(place, true, 0)
+                }
+                ProbeEnd::Empty => self.entry_done(place, false, 0),
+                ProbeEnd::Stopped(at) => {
+                    let next = match self.after_last() {
+                        Some(next) => next,
+                        None => self.sealed(&HiddenCursor {
+                            position: self.input.continuation_token.clone(),
+                            pending: Some((group, Some(at))),
+                        })?,
+                    };
+                    self.end_at(next)
+                }
+            },
         }
-        match (more, &last) {
-            (None, _) => return Ok(page),
-            (Some(_), Some((key, group))) => {
-                page.next = Some(NextPage::After(after_entry(&bucket, key, *group)));
-                return Ok(page);
+    }
+}
+
+impl<S, R> Operation for VisiblePageOperation<S, R>
+where
+    S: ListSource,
+    R: ShowRule<Object = S::Object>,
+{
+    type Output = VisiblePage<S::Object>;
+    type Error = VisibleError<R::Error, S::Error>;
+
+    fn first(&mut self) -> VisibleTurn<S, R> {
+        if self.max == 0 {
+            return self.done();
+        }
+        let Some(hidden) = self.hidden.take() else {
+            return self.list_page();
+        };
+        self.input.continuation_token = hidden.position.clone();
+        self.input.start_after = None;
+        match hidden.pending.clone() {
+            Some((group, at)) => self.start_probe(group, at, ProbeFor::Hidden(hidden)),
+            None => self.list_page(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> VisibleTurn<S, R> {
+        match std::mem::replace(&mut self.step, VisibleStep::Page) {
+            VisibleStep::Page => {
+                let list = self.source.take(result)?;
+                self.page_read(list)
             }
-            (Some(token), None) => {
-                input.continuation_token = Some(token);
-                input.start_after = None;
+            VisibleStep::Object(object, place) => {
+                let shown = self.rule.answered(result)?;
+                self.object_decided(object, place, shown.map_err(VisibleError::Shows)?)
+            }
+            VisibleStep::ProbePage => {
+                let list = self.source.take(result)?;
+                let probe = self.probe.as_mut().ok_or(IoError::Unfinished)?;
+                probe.objects = list.objects.into();
+                probe.next = list.next;
+                self.probe_next()
+            }
+            VisibleStep::ProbeObject => {
+                let shown = self.rule.answered(result)?;
+                let shown = shown.map_err(VisibleError::Shows)?;
+                let probe = self.probe.as_mut().ok_or(IoError::Unfinished)?;
+                let object = probe.current.take().ok_or(IoError::Unfinished)?;
+                self.probe_decided(object, shown)
             }
         }
     }
@@ -687,6 +623,112 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use ulid::Ulid;
+
+    /// Pages handed to the operation as child outcomes.
+    #[derive(Debug, PartialEq)]
+    struct Pages;
+
+    impl ListSource for Pages {
+        type Object = String;
+        type Error = IoError;
+
+        fn call(&self, _: &ListBucketInput) -> IoCall {
+            IoCall::Sync
+        }
+
+        fn take(&self, result: IoResult) -> Result<Listed<String>, ListFailure<IoError>> {
+            let listed = result.child::<Listed<String>, IoError>()?;
+            listed.map_err(ListFailure::Source)
+        }
+
+        fn key(object: &String) -> &str {
+            object
+        }
+    }
+
+    /// Shows keys that start with `shown/`, and no prefix named `closed/`.
+    #[derive(Debug, PartialEq)]
+    struct Keys;
+
+    impl ShowRule for Keys {
+        type Object = String;
+        type Error = IoError;
+
+        fn shows(&self, object: &String) -> Shown {
+            Shown::Decided(object.starts_with("shown/"))
+        }
+
+        fn answered(&self, result: IoResult) -> Result<Result<bool, IoError>, IoError> {
+            result.child::<bool, IoError>()
+        }
+
+        fn groups(&self, prefix: &str) -> bool {
+            prefix != "closed/"
+        }
+    }
+
+    fn input(max_keys: usize) -> ListBucketInput {
+        ListBucketInput {
+            bucket: "b".to_string(),
+            group_id: Ulid::from_bytes([1; 16]),
+            continuation_token: None,
+            max_keys: Some(max_keys),
+            prefix: None,
+            delimiter: Some("/".to_string()),
+            start_after: None,
+        }
+    }
+
+    fn page(objects: &[&str], prefixes: &[&str], more: bool) -> IoResult {
+        let listed: Result<Listed<String>, IoError> = Ok(Listed {
+            objects: objects.iter().map(ToString::to_string).collect(),
+            prefixes: prefixes.iter().map(ToString::to_string).collect(),
+            next: more.then(|| after_entry("b", "more", false)),
+        });
+        IoResult::Child(ChildOutcome::new(listed))
+    }
+
+    #[test]
+    fn hidden_keys_skipped() {
+        let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        list.first().unwrap();
+        let Ok(Next::Done(found)) = list.next(page(&["a", "shown/b"], &[], false)) else {
+            panic!("the page ends");
+        };
+        assert_eq!(found.objects, ["shown/b"]);
+        assert_eq!(found.next, None);
+    }
+
+    #[test]
+    fn group_needs_entry() {
+        let mut list = VisiblePageOperation::new(Pages, Keys, input(5), None);
+        list.first().unwrap();
+        let probing = list.next(page(&[], &["closed/", "shown/"], false)).unwrap();
+        assert!(matches!(probing, Next::Call(IoCall::Sync)));
+        let Ok(Next::Done(found)) = list.next(page(&["shown/x"], &[], false)) else {
+            panic!("the page ends");
+        };
+        assert_eq!(found.prefixes, ["shown/"]);
+    }
+
+    #[test]
+    fn full_page_continues() {
+        let mut list = VisiblePageOperation::new(Pages, Keys, input(1), None);
+        list.first().unwrap();
+        let Ok(Next::Done(found)) = list.next(page(&["shown/a", "shown/b"], &[], false)) else {
+            panic!("the page ends");
+        };
+        let expected = after_entry("b", "shown/a", false);
+        assert_eq!(found.next, Some(NextPage::After(expected)));
+    }
+
+    #[test]
+    fn zero_limit_empty() {
+        let mut list = VisiblePageOperation::new(Pages, Keys, input(0), None);
+        assert_eq!(list.first(), Ok(Next::Done(VisiblePage::default())));
+    }
 
     #[test]
     fn tells_sealed_markers() {
