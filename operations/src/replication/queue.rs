@@ -360,7 +360,6 @@ pub struct JobStatsOperation {
     relationship_id: Ulid,
     pending: usize,
     oldest: Option<u64>,
-    output: Option<Result<(usize, Option<u64>), BlobQueueError>>,
 }
 
 impl JobStatsOperation {
@@ -369,86 +368,41 @@ impl JobStatsOperation {
             relationship_id,
             pending: 0,
             oldest: None,
-            output: None,
         }
     }
 
-    fn read_page(start: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(IterStart::After),
+    fn read_page(after: Option<Key>) -> IoCall {
+        IoCall::Page {
+            space: REPLICATION_JOB_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
             limit: STATS_PAGE_SIZE,
-            txn_id: None,
-        })]
+        }
+    }
+}
+
+impl Operation for JobStatsOperation {
+    type Output = (usize, Option<u64>);
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, BlobQueueError> {
+        Ok(Next::Call(Self::read_page(None)))
     }
 
-    fn page_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, BlobQueueError> {
+        let (values, next) = result.page()?;
         for (_, value) in values {
-            let record = match BlobJobRecord::from_bytes(value.as_ref()) {
-                Ok(record) => record,
-                Err(error) => {
-                    self.output = Some(Err(error.into()));
-                    return smallvec![];
-                }
-            };
+            let record = BlobJobRecord::from_bytes(value.as_ref())?;
             if record.relationship_id == Some(self.relationship_id) {
                 self.pending = self.pending.saturating_add(1);
                 let enqueued = record.enqueued_at_ms;
                 self.oldest = Some(self.oldest.map_or(enqueued, |oldest| oldest.min(enqueued)));
             }
         }
-        match next {
-            Some(next) => Self::read_page(Some(next)),
-            None => {
-                self.output = Some(Ok((self.pending, self.oldest)));
-                smallvec![]
-            }
-        }
-    }
-}
-
-impl EffectOperation for JobStatsOperation {
-    type Output = (usize, Option<u64>);
-    type Error = BlobQueueError;
-
-    fn start(&mut self) -> Effects {
-        Self::read_page(None)
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.output, event) {
-            (
-                None,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.page_read(values, next_start_after),
-            (None, Event::Storage(StorageEvent::Error { error })) => {
-                self.output = Some(Err(error.into()));
-                smallvec![]
-            }
-            (_, event) => {
-                self.output = Some(Err(BlobQueueError::UnexpectedEvent(
-                    event.label().to_string(),
-                )));
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, BlobQueueError> {
-        self.output
-            .unwrap_or_else(|| Err(BlobQueueError::UnexpectedEvent("not finished".into())))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(match next {
+            Some(next) => Next::Call(Self::read_page(Some(next))),
+            None => Next::Done((self.pending, self.oldest)),
+        })
     }
 }
 
@@ -456,6 +410,9 @@ impl EffectOperation for JobStatsOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{
         NODE_STATE_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
     };
@@ -633,8 +590,8 @@ mod tests {
         match storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: key_space.to_string(),
-                key: ByteView::from(key),
-                value: ByteView::from(value),
+                key: aruna_core::types::Value::from(key),
+                value: aruna_core::types::Value::from(value),
                 txn_id: None,
             })
             .await
@@ -1248,19 +1205,177 @@ mod tests {
         assert_eq!(events[0].path, path);
     }
 
+    fn timer_set() -> IoResult {
+        IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainReplicationQueue,
+            after: Duration::ZERO,
+        })))
+    }
+
+    fn is_drain(turn: &QueueTurn) -> bool {
+        matches!(turn, Ok(Next::Call(call)) if *call == IoCall::from(schedule_blob_drain()))
+    }
+
     #[test]
     fn queue_rejects_event() {
         let mut operation = QueueBlobOperation::new(on_demand_input(), None);
-        operation.start();
+        operation.first().unwrap();
 
-        let effects = operation.step(Event::Search());
+        let turn = operation.next(IoResult::Event(Box::new(Event::Search())));
 
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
+        assert!(matches!(turn, Err(BlobQueueError::Io(_))));
+    }
+
+    #[test]
+    fn job_carries_consent() {
+        // A granted request commits with the job, in one write.
+        let mut operation = QueueBlobOperation::new(on_demand_input(), None).with_plaintext(true);
+        let turn = operation.first();
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        let turn = operation.next(IoResult::Values(vec![None]));
+        let Ok(Next::Call(IoCall::Write(rows))) = &turn else {
+            panic!("expected the job write, got {turn:?}")
+        };
+        let spaces: Vec<_> = rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(
+            spaces,
+            [
+                REPLICATION_JOB_KEYSPACE,
+                aruna_core::keyspaces::PLAINTEXT_COPY_KEYSPACE
+            ]
+        );
+        assert!(is_drain(&operation.next(IoResult::Done)));
+        assert_eq!(
+            operation.next(timer_set()),
+            Ok(Next::Done(QueueBlobResult {
+                queued: 1,
+                scheduled: true
+            }))
+        );
+    }
+
+    #[test]
+    fn withdrawn_consent_first() {
+        // A withdrawn request is deleted before the job is looked at.
+        let mut operation = QueueBlobOperation::new(on_demand_input(), None).with_plaintext(false);
+        let turn = operation.first();
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+        let turn = operation.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    }
+
+    #[test]
+    fn kept_job_records_consent() {
+        // A preferred job stays, and only the granted request is written for it.
+        let mut operation = QueueBlobOperation::new(on_demand_input(), None).with_plaintext(true);
+        let turn = operation.keep_existing();
+        let Ok(Next::Call(IoCall::Write(rows))) = &turn else {
+            panic!("expected the request write, got {turn:?}")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, aruna_core::keyspaces::PLAINTEXT_COPY_KEYSPACE);
+        let mut plain = QueueBlobOperation::new(on_demand_input(), None);
+        assert!(is_drain(&plain.keep_existing()));
+    }
+
+    #[test]
+    fn failed_timer_keeps_job() {
+        // The job is durable, so a drain timer that cannot be set is reported, not an error.
+        let mut operation = QueueBlobOperation::new(on_demand_input(), None);
+        operation.state = QueueBlobState::ScheduleDrain;
+        let failed = IoResult::Event(Box::new(Event::Task(TaskEvent::Error {
+            key: Some(TaskKey::DrainReplicationQueue),
+            message: "stopped".to_string(),
+        })));
+        assert_eq!(
+            operation.next(failed),
+            Ok(Next::Done(QueueBlobResult {
+                queued: 1,
+                scheduled: false
+            }))
+        );
+    }
+
+    fn live_operation() -> LiveVersionOperation {
+        LiveVersionOperation::new(LiveVersionInput {
+            local_node_id: node(1),
+            auth_context: auth_context(),
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::from_parts(3, 3),
+            delete_marker: false,
+        })
+    }
+
+    fn live_written(result: Result<(), BlobQueueError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    #[test]
+    fn obligation_write_once() {
+        // The obligation is written in one transaction, only when no readable one exists.
+        let record = live_operation().seed_record();
+        let (space, key, value) = live_obligation_entry(&record).unwrap();
+        let write = || ObligationWrite {
+            key: key.clone(),
+            value: value.clone(),
+            writing: false,
+        };
+        let mut missing = write();
+        assert_eq!(missing.transaction(), TransactionMode::Write);
+        assert_eq!(
+            missing.first(),
+            Ok(Next::Call(read_row(&space, key.clone())))
+        );
+        assert_eq!(
+            missing.next(IoResult::Values(vec![None])),
+            Ok(Next::Call(IoCall::Write(vec![(
+                space.clone(),
+                key.clone(),
+                value.clone()
+            )])))
+        );
+        assert_eq!(missing.next(IoResult::Done), Ok(Next::Done(())));
+
+        let mut stored = write();
+        stored.first().unwrap();
+        let row = IoResult::Values(vec![Some(value.clone())]);
+        assert_eq!(stored.next(row), Ok(Next::Done(())));
+
+        let mut unreadable = write();
+        unreadable.first().unwrap();
+        let row = IoResult::Values(vec![Some(vec![0xff].into())]);
         assert!(matches!(
-            operation.finalize(),
-            Err(BlobQueueError::UnexpectedEvent(_))
+            unreadable.next(row),
+            Ok(Next::Call(IoCall::Write(_)))
         ));
+    }
+
+    #[test]
+    fn live_conflict_drains() {
+        // A conflict means another writer stored the obligation; other failures end the run.
+        let mut operation = live_operation();
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let conflict = Err(BlobQueueError::from(IoError::Conflict));
+        assert!(is_drain(&operation.next(live_written(conflict))));
+        assert_eq!(
+            operation.next(timer_set()),
+            Ok(Next::Done(QueueBlobResult {
+                queued: 0,
+                scheduled: true
+            }))
+        );
+
+        let mut failing = live_operation();
+        failing.first().unwrap();
+        let error = BlobQueueError::Storage(StorageError::Timeout);
+        let failed = failing.next(live_written(Err(BlobQueueError::Storage(
+            StorageError::Timeout,
+        ))));
+        assert_eq!(failed, Err(error));
     }
 
     #[tokio::test]
@@ -3212,9 +3327,6 @@ mod tests {
 
     #[test]
     fn job_stats_pages() {
-        use aruna_core::operation_check::{
-            check_abort, rejects_events, rejects_finalize, sample_events,
-        };
         let relationship = Ulid::from_parts(7, 7);
         let row = |relationship_id, enqueued_at_ms| {
             let mut record = BlobJobRecord::new(on_demand_input(), None, enqueued_at_ms);
@@ -3225,29 +3337,26 @@ mod tests {
             )
         };
         let mut operation = JobStatsOperation::new(relationship);
-        assert_eq!(operation.start().len(), 1);
-        let first = Event::Storage(StorageEvent::IterResult {
-            values: vec![row(Some(relationship), 30), row(None, 5)],
-            next_start_after: Some(b"row".to_vec().into()),
-        });
-        assert_eq!(operation.step(first).len(), 1);
-        let last = Event::Storage(StorageEvent::IterResult {
-            values: vec![row(Some(relationship), 20)],
-            next_start_after: None,
-        });
-        assert!(operation.step(last).is_empty());
-        assert_eq!(operation.finalize(), Ok((2, Some(20))));
-        let reading = || {
-            let mut operation = JobStatsOperation::new(relationship);
-            operation.start();
-            operation
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { after: None, .. }))
+        ));
+        let first = IoResult::Page {
+            rows: vec![row(Some(relationship), 30), row(None, 5)],
+            next: Some(b"row".to_vec().into()),
         };
-        let refused = rejects_events(reading, sample_events, |event| {
-            matches!(event, Event::Storage(StorageEvent::IterResult { .. }))
-        });
-        assert_eq!(refused.len(), sample_events().len() - 1);
-        let mut open = reading();
-        check_abort(&mut open, &[]);
-        rejects_finalize(open);
+        assert!(matches!(
+            operation.next(first),
+            Ok(Next::Call(IoCall::Page { after: Some(_), .. }))
+        ));
+        let last = IoResult::Page {
+            rows: vec![row(Some(relationship), 20)],
+            next: None,
+        };
+        assert_eq!(operation.next(last), Ok(Next::Done((2, Some(20)))));
+        let mut wrong = JobStatsOperation::new(relationship);
+        wrong.first().unwrap();
+        assert!(wrong.next(IoResult::Done).is_err());
+        assert!(wrong.abort().is_empty());
     }
 }
