@@ -648,3 +648,7 @@ mod pure_tests {
         assert!(!manifests_converged(&local, &remote));
     }
 }
+
+#[cfg(test)]
+#[path = "converge_tests.rs"]
+mod call_tests;

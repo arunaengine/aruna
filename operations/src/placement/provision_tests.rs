@@ -5,12 +5,14 @@
 use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::placement::provision::AllocateBindingOperation;
+use crate::tests::calls::{child, runs_child};
 use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HandleRange};
+use aruna_core::structured_id::PlacementHandle;
 use tempfile::tempdir;
 
 fn node(seed: u8) -> NodeId {
@@ -225,4 +227,158 @@ async fn no_range_exhausted() {
         drive(DrawHandleOperation::new(realm_id, actor.node_id), &context).await,
         Err(HandleAllocationError::PlacementHandleExhausted { .. })
     ));
+}
+
+fn test_realm() -> RealmId {
+    RealmId::from_bytes([31; 32])
+}
+
+fn seeded_config() -> RealmConfigDocument {
+    let mut config = RealmConfigDocument::new(test_realm(), Vec::new(), 3);
+    config.seed_default_placement();
+    config
+}
+
+fn seeded_strategy(config: &RealmConfigDocument) -> Ulid {
+    config.default_strategy_id.expect("a default strategy")
+}
+
+fn config_read(config: RealmConfigDocument) -> IoResult {
+    child(Ok::<_, GetConfigError>(config))
+}
+
+fn drawn() -> AllocatedHandle {
+    AllocatedHandle {
+        handle: PlacementHandle::new(FIRST_GRANTABLE_HANDLE + 1).unwrap(),
+        allocator_range_id: Ulid::from_bytes([9; 16]),
+        allocated_by: node(1),
+        allocated_at_ms: 5,
+    }
+}
+
+fn binding(scope: PlacementScope, strategy_id: Ulid) -> PlacementBinding {
+    PlacementBinding {
+        handle: drawn().handle,
+        scope,
+        document_class: DocumentClass::Metadata,
+        strategy_id,
+        allocator_range_id: Some(drawn().allocator_range_id),
+        allocated_by: Some(drawn().allocated_by),
+        allocated_at_ms: Some(drawn().allocated_at_ms),
+    }
+}
+
+#[test]
+fn allocations_share_hold() {
+    let realm_id = test_realm();
+    let strategy = Ulid::from_bytes([2; 16]);
+    let scope = PlacementScope::Realm(realm_id);
+    let draw = DrawHandleOperation::new(realm_id, node(1));
+    let allocate =
+        AllocateBindingOperation::new(actor(realm_id), scope, DocumentClass::Metadata, strategy);
+    let provision = ProvisionBindingOperation::new(actor(realm_id), scope, strategy);
+    assert_eq!(draw.hold_scope(), Some(HoldScope::PlacementHandles));
+    assert_eq!(allocate.hold_scope(), Some(HoldScope::PlacementHandles));
+    assert_eq!(provision.hold_scope(), Some(HoldScope::PlacementHandles));
+}
+
+#[test]
+fn draw_uses_ranges() {
+    let mut operation = DrawHandleOperation::new(test_realm(), node(1));
+    operation.stamp(5);
+    assert!(runs_child(operation.first()));
+    assert!(runs_child(operation.next(config_read(seeded_config()))));
+    let answer = child(Ok::<_, HandleAllocationError>(drawn()));
+    assert_eq!(operation.next(answer), Ok(Next::Done(drawn())));
+}
+
+#[test]
+fn draw_needs_config() {
+    let mut operation = DrawHandleOperation::new(test_realm(), node(1));
+    operation.first().unwrap();
+    let missing = child(Err::<RealmConfigDocument, _>(
+        GetConfigError::DocumentNotFound,
+    ));
+    assert_eq!(
+        operation.next(missing),
+        Err(HandleAllocationError::ReadConfig(
+            GetConfigError::DocumentNotFound
+        ))
+    );
+}
+
+fn allocating(scope: PlacementScope, strategy: Ulid) -> AllocateBindingOperation {
+    let class = DocumentClass::Metadata;
+    let mut operation = AllocateBindingOperation::new(actor(test_realm()), scope, class, strategy);
+    assert!(runs_child(operation.first()));
+    let answer = child(Ok::<_, HandleAllocationError>(drawn()));
+    assert!(runs_child(operation.next(answer)));
+    operation
+}
+
+#[test]
+fn appended_binding_returned() {
+    let scope = PlacementScope::Realm(test_realm());
+    let strategy = Ulid::from_bytes([2; 16]);
+    let appended = child(Ok::<_, MutatePlacementError>(seeded_config()));
+    assert_eq!(
+        allocating(scope, strategy).next(appended),
+        Ok(Next::Done(binding(scope, strategy)))
+    );
+}
+
+#[test]
+fn failed_append_reported() {
+    let scope = PlacementScope::Realm(test_realm());
+    let failed = child(Err::<RealmConfigDocument, _>(
+        MutatePlacementError::ConfigMissing,
+    ));
+    assert_eq!(
+        allocating(scope, Ulid::from_bytes([2; 16])).next(failed),
+        Err(HandleAllocationError::Append(
+            MutatePlacementError::ConfigMissing
+        ))
+    );
+}
+
+fn provisioning(scope: PlacementScope, strategy: Ulid) -> ProvisionBindingOperation {
+    let mut operation = ProvisionBindingOperation::new(actor(test_realm()), scope, strategy);
+    assert!(runs_child(operation.first()));
+    operation
+}
+
+#[test]
+fn unknown_strategy_refused() {
+    let strategy = Ulid::from_bytes([2; 16]);
+    let scope = PlacementScope::Realm(test_realm());
+    assert_eq!(
+        provisioning(scope, strategy).next(config_read(seeded_config())),
+        Err(HandleAllocationError::StrategyNotFound(strategy))
+    );
+}
+
+#[test]
+fn existing_binding_reused() {
+    let mut config = seeded_config();
+    let strategy = seeded_strategy(&config);
+    let scope = PlacementScope::Group(Ulid::from_bytes([3; 16]));
+    config.placement_bindings.push(binding(scope, strategy));
+    assert_eq!(
+        provisioning(scope, strategy).next(config_read(config)),
+        Ok(Next::Done(binding(scope, strategy)))
+    );
+}
+
+#[test]
+fn missing_binding_allocated() {
+    let config = seeded_config();
+    let strategy = seeded_strategy(&config);
+    let scope = PlacementScope::Group(Ulid::from_bytes([3; 16]));
+    let mut operation = provisioning(scope, strategy);
+    assert!(runs_child(operation.next(config_read(config))));
+    let answer = child(Ok::<_, HandleAllocationError>(binding(scope, strategy)));
+    assert_eq!(
+        operation.next(answer),
+        Ok(Next::Done(binding(scope, strategy)))
+    );
 }

@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::tests::calls::caller_of;
+use crate::tests::peers::peer_answer;
 use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
-use aruna_core::events::MetadataAnswer;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use std::collections::BTreeSet;
 
@@ -143,17 +144,6 @@ fn request_stays_local() {
     assert_eq!(operation.next(reply), Ok(Next::Done(None)));
 }
 
-fn peer_says(peer: NodeId, message: &MetadataTransportMessage) -> IoResult {
-    let answer = MetadataAnswer {
-        peer,
-        result: Ok(encode_message(message).unwrap()),
-        elapsed: Duration::ZERO,
-    };
-    IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
-        answer,
-    )))))
-}
-
 #[test]
 fn remote_refusal_named() {
     let mut operation = RequestNodeOperation::new(local(), node(2), None, abort(plan(node(1))));
@@ -161,7 +151,10 @@ fn remote_refusal_named() {
         operation.first(),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
-    let turn = operation.next(peer_says(node(2), &MetadataTransportMessage::WriteNotFound));
+    let turn = operation.next(peer_answer(
+        node(2),
+        &MetadataTransportMessage::WriteNotFound,
+    ));
     assert_eq!(
         turn,
         Err(GroupDeletionError::Unavailable(format!(
@@ -202,4 +195,94 @@ fn failed_fanout_marked() {
         turn,
         Ok(Next::Done(replies)) if matches!(replies[0].1, Err(GroupDeletionError::Unavailable(_)))
     ));
+}
+
+fn start_message() -> MetadataTransportMessage {
+    MetadataTransportMessage::GroupDeletion {
+        auth_token: None,
+        action: GroupDeleteAction::Start {
+            group_id: Ulid::from_bytes([3; 16]),
+        },
+    }
+}
+
+fn starting() -> ApplyRequestOperation {
+    let request = Ulid::from_bytes([6; 16]);
+    let mut operation = ApplyRequestOperation::new(local(), node(2), start_message(), request);
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    operation
+}
+
+fn caller_refused(error: ForwardAuthError) -> IoResult {
+    IoResult::Child(ChildOutcome::new(Err::<AuthContext, _>(error)))
+}
+
+#[test]
+fn request_needs_network() {
+    let request = Ulid::from_bytes([6; 16]);
+    let mut operation = ApplyRequestOperation::new(None, node(2), start_message(), request);
+    assert_eq!(operation.first(), Err(network_missing()));
+}
+
+#[test]
+fn other_message_invalid() {
+    let message = MetadataTransportMessage::WriteNotFound;
+    let request = Ulid::from_bytes([6; 16]);
+    let mut operation = ApplyRequestOperation::new(local(), node(2), message, request);
+    assert!(matches!(
+        operation.first(),
+        Err(GroupDeletionError::Invalid(_))
+    ));
+}
+
+#[test]
+fn start_runs_deletion() {
+    let mut operation = starting();
+    let accepted = IoResult::Child(ChildOutcome::new(Ok::<_, ForwardAuthError>(caller_of(
+        realm(),
+    ))));
+    assert!(matches!(
+        operation.next(accepted),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(operation.stage, RequestStage::Run);
+    assert_eq!(operation.next(done()), Ok(Next::Done(None)));
+}
+
+#[test]
+fn refused_start_unauthorized() {
+    assert_eq!(
+        starting().next(caller_refused(ForwardAuthError::Forbidden)),
+        Err(GroupDeletionError::Unauthorized)
+    );
+}
+
+#[test]
+fn unavailable_start_kept() {
+    let error = ForwardAuthError::Unavailable("down".to_string());
+    assert_eq!(
+        starting().next(caller_refused(error)),
+        Err(GroupDeletionError::Unavailable("down".to_string()))
+    );
+}
+
+#[test]
+fn control_request_answers() {
+    let message = MetadataTransportMessage::GroupDeletion {
+        auth_token: None,
+        action: abort(plan(node(2))),
+    };
+    let request = Ulid::from_bytes([6; 16]);
+    let mut operation = ApplyRequestOperation::new(local(), node(2), message, request);
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let reply = IoResult::Child(ChildOutcome::new(Ok::<_, GroupDeletionError>(
+        None::<GroupDeleteProof>,
+    )));
+    assert_eq!(operation.next(reply), Ok(Next::Done(None)));
 }

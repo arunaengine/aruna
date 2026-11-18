@@ -2099,3 +2099,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "transition_tests.rs"]
+mod call_tests;

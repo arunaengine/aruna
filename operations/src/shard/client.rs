@@ -54,3 +54,7 @@ impl Operation for FetchManifestOperation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;
