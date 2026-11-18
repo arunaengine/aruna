@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::effects::MetadataRequestEffect;
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError, WritePeerRefusal};
-use aruna_core::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataEffect, MetadataError, MetadataEvent};
 use std::future::{Future, ready};
 use std::pin::Pin;
@@ -87,10 +87,7 @@ pub(super) async fn dispatch_peer_check(
 }
 
 /// Verifies a token named for revocation; it may already be revoked.
-pub(super) async fn dispatch_revocation_claims(
-    token: AuthToken,
-    context: &DriverContext,
-) -> Event {
+pub(super) async fn dispatch_revocation_claims(token: AuthToken, context: &DriverContext) -> Event {
     let result = match (&context.metadata_handle, token) {
         (Some(handle), AuthToken::Bearer(token)) => (handle.claims_for_revocation(token.as_str()))
             .await

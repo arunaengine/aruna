@@ -236,10 +236,7 @@ impl Operation for BlockedOperation {
         }
     }
 
-    fn next(
-        &mut self,
-        result: IoResult,
-    ) -> Result<Next<GroupDeletionError>, GroupDeletionError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<GroupDeletionError>, GroupDeletionError> {
         let names = result.child::<Vec<String>, GroupDeletionError>()??;
         let Some(GroupDeletionError::NotEmpty {
             kinds,

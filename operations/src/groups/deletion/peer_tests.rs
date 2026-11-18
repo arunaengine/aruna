@@ -94,16 +94,15 @@ fn abort_applies() {
 
 #[test]
 fn prepare_signs_plan() {
-    let action = GroupDeleteAction::Prepare { plan: plan(node(1)) };
+    let action = GroupDeleteAction::Prepare {
+        plan: plan(node(1)),
+    };
     let mut operation = control(node(1), action);
     operation.next(config_answer(config())).unwrap();
     let Ok(Next::Call(IoCall::Effect(effect))) = operation.next(done()) else {
         panic!("expected the signing effect");
     };
-    assert!(matches!(
-        *effect,
-        Effect::Net(NetEffect::SignDeletePlan(_))
-    ));
+    assert!(matches!(*effect, Effect::Net(NetEffect::SignDeletePlan(_))));
     let proof = GroupDeleteProof {
         node_id: node(1),
         signature: iroh::SecretKey::from_bytes(&[1; 32]).sign(b"plan"),
@@ -134,7 +133,10 @@ fn start_needs_request() {
 #[test]
 fn request_stays_local() {
     let mut operation = RequestNodeOperation::new(local(), node(1), None, abort(plan(node(1))));
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let reply = IoResult::Child(ChildOutcome::new(Ok::<_, GroupDeletionError>(
         None::<GroupDeleteProof>,
     )));
@@ -155,7 +157,10 @@ fn peer_says(peer: NodeId, message: &MetadataTransportMessage) -> IoResult {
 #[test]
 fn remote_refusal_named() {
     let mut operation = RequestNodeOperation::new(local(), node(2), None, abort(plan(node(1))));
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     let turn = operation.next(peer_says(node(2), &MetadataTransportMessage::WriteNotFound));
     assert_eq!(
         turn,
@@ -170,7 +175,10 @@ fn remote_refusal_named() {
 fn only_local_finishes() {
     let action = abort(plan(node(1)));
     let mut operation = RequestNodesOperation::new(local(), vec![node(1)], action);
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let reply = IoResult::Child(ChildOutcome::new(Ok::<_, GroupDeletionError>(
         None::<GroupDeleteProof>,
     )));
@@ -181,10 +189,13 @@ fn only_local_finishes() {
 }
 
 #[test]
-fn failed_fanout_marks_remote() {
+fn failed_fanout_marked() {
     let action = abort(plan(node(1)));
     let mut operation = RequestNodesOperation::new(None, vec![node(2)], action);
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     let failed = Err::<Vec<PeerAnswer>, _>(FetchError::Unfinished);
     let turn = operation.next(IoResult::Child(ChildOutcome::new(failed)));
     assert!(matches!(

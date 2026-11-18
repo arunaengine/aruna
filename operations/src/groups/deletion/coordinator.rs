@@ -240,9 +240,8 @@ impl DeleteGroupOperation {
         let stale = !plan.matches_config(&config) || plan.requested_by != self.auth.user_id;
         self.plan = Some(plan);
         if aborting || stale {
-            let retry = GroupDeletionError::Conflict(
-                "previous attempt cancelled; retry deletion".into(),
-            );
+            let retry =
+                GroupDeletionError::Conflict("previous attempt cancelled; retry deletion".into());
             return self.cancel(DeleteStage::Cancel(retry));
         }
         self.stage = DeleteStage::Prepare;
@@ -303,9 +302,8 @@ impl DeleteGroupOperation {
             proofs: std::mem::take(&mut self.proofs),
         };
         if !certificate.verify() {
-            let invalid = GroupDeletionError::Unavailable(
-                "a node supplied an invalid confirmation".into(),
-            );
+            let invalid =
+                GroupDeletionError::Unavailable("a node supplied an invalid confirmation".into());
             return self.cancel(DeleteStage::Cancel(invalid));
         }
         let actor = Actor {
@@ -391,19 +389,21 @@ impl Operation for DeleteGroupOperation {
                 Ok(()) => self.commit(),
                 Err(error) => self.cancel(DeleteStage::Cancel(error)),
             },
-            DeleteStage::Commit => match result.child::<AdminDocumentEvent, GroupDeletionError>()? {
-                Ok(event) => {
-                    let plan = self.current_plan()?.clone();
-                    self.publish(plan, event)
+            DeleteStage::Commit => {
+                match result.child::<AdminDocumentEvent, GroupDeletionError>()? {
+                    Ok(event) => {
+                        let plan = self.current_plan()?.clone();
+                        self.publish(plan, event)
+                    }
+                    Err(
+                        error @ (GroupDeletionError::Unauthorized
+                        | GroupDeletionError::NotFound
+                        | GroupDeletionError::Invalid(_)
+                        | GroupDeletionError::Conflict(_)),
+                    ) => self.cancel(DeleteStage::Cancel(error)),
+                    Err(error) => Err(error),
                 }
-                Err(
-                    error @ (GroupDeletionError::Unauthorized
-                    | GroupDeletionError::NotFound
-                    | GroupDeletionError::Invalid(_)
-                    | GroupDeletionError::Conflict(_)),
-                ) => self.cancel(DeleteStage::Cancel(error)),
-                Err(error) => Err(error),
-            },
+            }
             DeleteStage::Cancel(error) => {
                 finished(result)?;
                 Err(error)
@@ -413,9 +413,7 @@ impl Operation for DeleteGroupOperation {
                 self.stage = DeleteStage::Refuse;
                 Ok(Next::Call(self.blocked_call(node, error)))
             }
-            DeleteStage::Refuse => {
-                Err(result.child::<GroupDeletionError, GroupDeletionError>()??)
-            }
+            DeleteStage::Refuse => Err(result.child::<GroupDeletionError, GroupDeletionError>()??),
         }
     }
 }
@@ -641,7 +639,10 @@ fn ticket_records(
         .verify(node_id, &target, now)
         .map_err(|error| GroupDeletionError::Invalid(error.to_string()))?;
     let records = &ticket.payload.group_deletions;
-    if records.iter().any(|record| record.plan.realm_id != realm_id) {
+    if records
+        .iter()
+        .any(|record| record.plan.realm_id != realm_id)
+    {
         return Err(GroupDeletionError::Invalid(
             "deletion realm mismatch".into(),
         ));

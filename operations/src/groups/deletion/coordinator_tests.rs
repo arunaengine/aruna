@@ -56,7 +56,11 @@ fn group() -> Group {
     }
 }
 
-fn answer<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+fn answer<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
     IoResult::Child(ChildOutcome::new(result))
 }
 
@@ -129,7 +133,10 @@ fn failed_prepare_cancels() {
         operation.next(failed),
         Ok(Next::Call(IoCall::Child(_)))
     ));
-    assert_eq!(operation.stage, DeleteStage::CancelBlocked(low, conflict.clone()));
+    assert_eq!(
+        operation.stage,
+        DeleteStage::CancelBlocked(low, conflict.clone())
+    );
     assert!(matches!(
         operation.next(ok()),
         Ok(Next::Call(IoCall::Child(_)))

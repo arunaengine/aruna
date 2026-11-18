@@ -17,13 +17,13 @@ use aruna_core::structs::storage::distribution::ticket::{
 };
 use thiserror::Error;
 
+use crate::auth::bearer_token::GrantValidOperation;
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::realm::peer_trust::is_sync_eligible;
-use crate::auth::bearer_token::GrantValidOperation;
-use crate::document_repository::GetConfigOperation;
 use crate::realm::load_config::config_unavailable;
+use crate::realm::peer_trust::is_sync_eligible;
 
 /// Seconds a spent nonce outlives its ticket, for clocks that run behind the issuer's.
 const SPENT_MARGIN_SECS: u64 = 60;
@@ -90,12 +90,20 @@ pub async fn redeem_ticket(
         .ok_or(RedeemError::Unavailable)?;
     let realm_id = *net.realm_id();
     let ticket = signed.verify(realm_id, net.node_id(), object_id, now)?;
-    let config = drive(GetConfigOperation::new(realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(RedeemError::Unavailable)?;
     if !is_sync_eligible(&config, ticket.issuer) {
         return Err(RedeemError::Issuer);
     }
-    match drive(GrantValidOperation::new(&ticket.grant, &ticket.user_id), &context).await {
+    match drive(
+        GrantValidOperation::new(&ticket.grant, &ticket.user_id),
+        &context,
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => return Err(RedeemError::Revoked),
         Err(_) => return Err(RedeemError::Unavailable),

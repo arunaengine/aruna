@@ -23,6 +23,7 @@ use serde::Serialize;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::drive_retry;
@@ -35,7 +36,6 @@ use crate::jobs::store::state::read_job_record;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::execution::job::dedup_index_key;
 use aruna_core::structs::execution::job::upload_stale;
-use crate::auth::request_authorization::AuthorizeOperation;
 
 const IMPORT_OPERATION: &str = "federation.import";
 
@@ -167,9 +167,12 @@ pub async fn authorize_import(
                 .unwrap_or_default(),
             ..Default::default()
         };
-        drive(AuthorizeOperation::new(realm_id, auth, &path, &Permission::WRITE, extras), context)
-            .await
-            .map_err(|_| ImportError::Denied)?;
+        drive(
+            AuthorizeOperation::new(realm_id, auth, &path, &Permission::WRITE, extras),
+            context,
+        )
+        .await
+        .map_err(|_| ImportError::Denied)?;
     }
     Ok(())
 }
@@ -345,13 +348,9 @@ pub async fn read_import(
     context: &DriverContext,
     upload_id: Ulid,
 ) -> Result<Option<ImportRecord>, ImportError> {
-    let row = read_row(
-        context,
-        FEDERATION_KEYSPACE,
-        record_key(upload_id),
-    )
-    .await
-    .map_err(ImportError::Storage)?;
+    let row = read_row(context, FEDERATION_KEYSPACE, record_key(upload_id))
+        .await
+        .map_err(ImportError::Storage)?;
     row.map(|row| postcard::from_bytes(&row).map_err(|e| ImportError::Storage(e.to_string())))
         .transpose()
 }

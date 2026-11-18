@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{GitError, records};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::DriverContext;
+use crate::driver::drive;
+use crate::realm::load_config::config_unavailable;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -18,9 +21,6 @@ use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
-use crate::driver::drive;
-use crate::document_repository::GetConfigOperation;
-use crate::realm::load_config::config_unavailable;
 
 /// The document's current holders when this node is one of them.
 pub async fn holders(
@@ -32,7 +32,10 @@ pub async fn holders(
         .as_ref()
         .map(|net| net.node_id())
         .ok_or(GitError::Unavailable)?;
-    let config = drive(GetConfigOperation::new(document.realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(document.realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(GitError::Unavailable)?;
     holders_in(&config, node, document)
 }
@@ -60,7 +63,10 @@ pub async fn publish_pack(
     if stored(context, &pack).await? {
         return Ok(());
     }
-    let config = drive(GetConfigOperation::new(document.realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(document.realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(GitError::Unavailable)?;
     let node_id = context
         .net_handle
@@ -159,7 +165,10 @@ pub async fn publish_with(
     change: GitChange,
     (pack, extra): (Option<bytes::Bytes>, Vec<Row>),
 ) -> Result<GitRecord, GitError> {
-    let config = drive(GetConfigOperation::new(document.realm_id), context).await.inspect_err(config_unavailable).ok()
+    let config = drive(GetConfigOperation::new(document.realm_id), context)
+        .await
+        .inspect_err(config_unavailable)
+        .ok()
         .ok_or(GitError::Unavailable)?;
     let node_id = context
         .net_handle

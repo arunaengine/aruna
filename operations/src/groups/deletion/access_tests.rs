@@ -68,16 +68,19 @@ fn restricted_caller_refused() {
 }
 
 #[test]
-fn requester_sees_finished_deletion() {
+fn requester_sees_deletion() {
     let record = deleted_record(auth().user_id);
     let mut operation = AuthorizeDeleteOperation::new(&auth(), group(), Some(&record), false);
     assert_eq!(operation.first(), Ok(Next::Done(())));
 }
 
 #[test]
-fn group_admin_second_chance() {
+fn group_admin_checked() {
     let mut operation = AuthorizeDeleteOperation::new(&auth(), group(), None, true);
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert!(matches!(
         operation.next(denied()),
         Ok(Next::Call(IoCall::Child(_)))

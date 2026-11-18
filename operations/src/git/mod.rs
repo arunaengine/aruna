@@ -22,8 +22,10 @@ pub mod versions;
 
 use self::changes::PropertyConflict;
 use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
 use aruna_blob::git::GitStore;
@@ -36,8 +38,6 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use thiserror::Error;
 use ulid::Ulid;
-use crate::driver::drive;
-use crate::auth::request_authorization::AuthorizeOperation;
 
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -89,7 +89,16 @@ pub async fn document(
         .await
         .map_err(|_| GitError::Unavailable)?
         .ok_or(GitError::NotFound)?;
-    drive(AuthorizeOperation::new(record.realm_id, auth, &record.permission_path, &permission, PolicyRequestExtras::rest()), context)
+    drive(
+        AuthorizeOperation::new(
+            record.realm_id,
+            auth,
+            &record.permission_path,
+            &permission,
+            PolicyRequestExtras::rest(),
+        ),
+        context,
+    )
     .await?;
     let lifecycle = parse_lifecycle_read(
         context

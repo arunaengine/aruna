@@ -20,10 +20,11 @@ use aruna_core::types::Key;
 use tempfile::tempdir;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::tasks::incoming::remove_drained_backends;
+use crate::driver::DriverContext;
 use crate::groups::backends::remove::tests::record;
 use crate::groups::backends::{backend_key, index_key};
+use crate::tasks::incoming::remove_drained_backends;
+use aruna_core::structs::storage::blob::BackendRef;
 
 fn context(root: &str) -> DriverContext {
     let storage_handle = aruna_storage::FjallStorage::open(root).unwrap();
@@ -58,7 +59,7 @@ async fn write(context: &DriverContext, key_space: &str, key: Key, value: Vec<u8
 
 async fn seed(context: &DriverContext, backend_id: Ulid, disabled: bool) {
     let stored = record(backend_id, disabled);
-    for (key_space, key, value) in super::super::record_writes(&stored).unwrap() {
+    for (key_space, key, value) in super::record_writes(&stored).unwrap() {
         write(context, &key_space, key, value.to_vec()).await;
     }
     let secret = GroupStorageSecret {

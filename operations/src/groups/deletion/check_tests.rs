@@ -75,7 +75,11 @@ async fn check_changes_nothing() {
     let group_id = fixture.plan.group_id;
     let before = keyspaces(&fixture);
     assert_eq!(
-        drive(ScanOperation::new(&fixture.auth, group_id, node(1)), &fixture.context).await,
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context
+        )
+        .await,
         Ok(())
     );
     assert_eq!(keyspaces(&fixture), before);
@@ -83,7 +87,11 @@ async fn check_changes_nothing() {
     let before = keyspaces(&fixture);
     // The denied name is dropped and counted as hidden.
     assert_eq!(
-        drive(ScanOperation::new(&fixture.auth, group_id, node(1)), &fixture.context).await,
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context
+        )
+        .await,
         blocked(&["shown"], false, 1)
     );
     let fence = MembershipFence::key(fixture.plan.realm_id).to_vec();
@@ -103,12 +111,20 @@ async fn check_names_buckets() {
     let group_id = fixture.plan.group_id;
     buckets(&fixture, 1, &["b-1", "b-2"]).await;
     assert_eq!(
-        drive(ScanOperation::new(&fixture.auth, group_id, node(1)), &fixture.context).await,
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context
+        )
+        .await,
         blocked(&["b-1", "b-2"], false, 0)
     );
     buckets(&fixture, 1, &["b-3", "b-4", "b-5", "b-6"]).await;
     assert_eq!(
-        drive(ScanOperation::new(&fixture.auth, group_id, node(1)), &fixture.context).await,
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context
+        )
+        .await,
         blocked(&["b-1", "b-2", "b-3", "b-4", "b-5"], true, 0)
     );
 }
@@ -122,11 +138,19 @@ async fn check_refuses_strangers() {
     let outsider = stranger(&fixture);
     let context = Arc::new(fixture.context);
     assert_eq!(
-        drive(CheckNodeOperation::new(&config, &outsider, group_id, node(1)), &context).await,
+        drive(
+            CheckNodeOperation::new(&config, &outsider, group_id, node(1)),
+            &context
+        )
+        .await,
         Err(GroupDeletionError::Unauthorized)
     );
     assert_eq!(
-        drive(CheckNodeOperation::new(&config, &auth, group_id, node(1)), &context).await,
+        drive(
+            CheckNodeOperation::new(&config, &auth, group_id, node(1)),
+            &context
+        )
+        .await,
         Ok(())
     );
 }
@@ -154,7 +178,11 @@ async fn check_scans_devices() {
     let context = Arc::new(fixture.context);
     // A server without the group row refuses, as Prepare does.
     assert!(matches!(
-        drive(CheckNodeOperation::new(&config, &auth, group_id, node(1)), &context).await,
+        drive(
+            CheckNodeOperation::new(&config, &auth, group_id, node(1)),
+            &context
+        )
+        .await,
         Err(GroupDeletionError::Unavailable(_))
     ));
     config.nodes[0].kind = RealmNodeKind::User {
@@ -162,7 +190,11 @@ async fn check_scans_devices() {
     };
     // A device without the row still scans; the stranger may not read the name.
     assert_eq!(
-        drive(CheckNodeOperation::new(&config, &auth, group_id, node(1)), &context).await,
+        drive(
+            CheckNodeOperation::new(&config, &auth, group_id, node(1)),
+            &context
+        )
+        .await,
         blocked(&[], false, 1)
     );
 }
@@ -241,7 +273,11 @@ async fn finished_jobs_pass() {
         )
         .await;
         assert_eq!(
-            drive(ScanOperation::new(&fixture.auth, group_id, node(1)), &fixture.context).await,
+            drive(
+                ScanOperation::new(&fixture.auth, group_id, node(1)),
+                &fixture.context
+            )
+            .await,
             expected
         );
     }

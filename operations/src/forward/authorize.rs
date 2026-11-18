@@ -71,7 +71,9 @@ pub(crate) fn peer_check(peer: NodeId, auth_token: Option<AuthToken>) -> IoCall 
     })))
 }
 
-pub(crate) fn peer_answer(result: IoResult) -> Result<Result<AuthContext, WritePeerRefusal>, IoError> {
+pub(crate) fn peer_answer(
+    result: IoResult,
+) -> Result<Result<AuthContext, WritePeerRefusal>, IoError> {
     match event(result)? {
         Event::Net(NetEvent::WritePeerChecked(checked)) => Ok(checked.map(|auth| *auth)),
         other => Err(IoError::Unexpected {
@@ -110,11 +112,7 @@ pub(crate) struct ForwardedCallerOperation {
 }
 
 impl ForwardedCallerOperation {
-    pub(crate) fn new(
-        peer: NodeId,
-        realm_id: RealmId,
-        message: &MetadataTransportMessage,
-    ) -> Self {
+    pub(crate) fn new(peer: NodeId, realm_id: RealmId, message: &MetadataTransportMessage) -> Self {
         Self {
             owner_bound: true,
             ..Self::for_token(peer, realm_id, caller_token(message))

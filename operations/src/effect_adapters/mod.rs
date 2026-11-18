@@ -6,8 +6,8 @@ mod audit;
 mod blob;
 mod metadata;
 mod net;
-pub(crate) mod shard;
 mod session;
+pub(crate) mod shard;
 mod storage;
 mod task;
 

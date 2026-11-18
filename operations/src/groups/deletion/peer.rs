@@ -129,7 +129,8 @@ impl Operation for ApplyRequestOperation {
                     Ok(Next::Done(None))
                 }
                 _ => {
-                    let reply = result.child::<Option<GroupDeleteProof>, GroupDeletionError>()??;
+                    let reply =
+                        result.child::<Option<GroupDeleteProof>, GroupDeletionError>()??;
                     Ok(Next::Done(reply))
                 }
             },
@@ -261,9 +262,9 @@ impl Operation for ApplyControlOperation {
                 Ok(Next::Call(IoCall::Effect(Box::new(sign))))
             }
             ControlStage::Signed => match event(result)? {
-                Event::Net(NetEvent::DeletePlanSigned(signed)) => {
-                    Ok(Next::Done(Some(signed.map_err(GroupDeletionError::Unavailable)?)))
-                }
+                Event::Net(NetEvent::DeletePlanSigned(signed)) => Ok(Next::Done(Some(
+                    signed.map_err(GroupDeletionError::Unavailable)?,
+                ))),
                 other => Err(GroupDeletionError::Unavailable(format!(
                     "unexpected signing answer {}",
                     other.label()

@@ -6,6 +6,7 @@ use super::changes::summary;
 use super::project::{Projection, author, forget, project, recent, remember};
 use super::versions::{copied, plain};
 use super::{GitError, document, objects, publish, records};
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::distribution::resolve::version_holders;
@@ -46,7 +47,6 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::{NodeId, UserId};
 use bytes::Bytes;
 use ulid::Ulid;
-use crate::auth::request_authorization::AuthorizeOperation;
 
 /// How long other holders leave a new revision to the first holder before generating it.
 const FAILOVER_MS: u64 = 60_000;
@@ -138,7 +138,16 @@ async fn resolve(
             &exact.bucket,
             &exact.key,
         );
-        drive(AuthorizeOperation::new(exact.realm_id, auth, &path, &Permission::READ, PolicyRequestExtras::rest()), context)
+        drive(
+            AuthorizeOperation::new(
+                exact.realm_id,
+                auth,
+                &path,
+                &Permission::READ,
+                PolicyRequestExtras::rest(),
+            ),
+            context,
+        )
         .await
         .map_err(|_| GitError::NotFound)?;
         let input = GetObjectInput {

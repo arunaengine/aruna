@@ -39,7 +39,6 @@ impl From<ForwardError> for MetadataApiError {
     }
 }
 
-
 #[derive(Debug, Error)]
 pub enum MetadataWriteError {
     #[error("metadata write requires authentication")]

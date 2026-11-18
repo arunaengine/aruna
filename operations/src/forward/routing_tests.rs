@@ -86,7 +86,7 @@ fn denial_ends_walk() {
 }
 
 #[test]
-fn every_miss_not_found() {
+fn every_holder_missed() {
     // A local miss counts as one of the holders that does not have the document.
     let holders = [node(9), node(1)];
     let message = delete();

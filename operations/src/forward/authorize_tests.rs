@@ -43,7 +43,10 @@ fn message() -> MetadataTransportMessage {
 
 fn caller() -> ForwardedCallerOperation {
     let mut operation = ForwardedCallerOperation::new(node(1), realm(), &message());
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Effect(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Effect(_)))
+    ));
     operation
 }
 
@@ -100,7 +103,7 @@ fn device_bound_owner() {
 }
 
 #[test]
-fn plain_token_skips_owner() {
+fn token_skips_owner() {
     let mut operation = ForwardedCallerOperation::for_token(node(1), realm(), None);
     operation.first().unwrap();
     assert_eq!(
@@ -126,9 +129,12 @@ fn passed() -> IoResult {
 }
 
 #[test]
-fn group_scope_checks_twice() {
+fn group_checks_twice() {
     let mut operation = create(CreateScope::Group);
-    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert!(matches!(
         operation.next(passed()),
         Ok(Next::Call(IoCall::Child(_)))
@@ -137,7 +143,7 @@ fn group_scope_checks_twice() {
 }
 
 #[test]
-fn document_scope_checks_once() {
+fn document_checks_once() {
     let mut operation = create(CreateScope::Document);
     operation.first().unwrap();
     assert_eq!(operation.next(passed()), Ok(Next::Done(())));

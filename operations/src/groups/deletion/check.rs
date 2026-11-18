@@ -267,7 +267,11 @@ impl CheckGroupOperation {
             ));
         }
         let nodes: BTreeSet<NodeId> = member_nodes(&config)?;
-        self.remote = nodes.iter().copied().filter(|node| *node != local).collect();
+        self.remote = nodes
+            .iter()
+            .copied()
+            .filter(|node| *node != local)
+            .collect();
         if !nodes.contains(&local) {
             return self.ask();
         }

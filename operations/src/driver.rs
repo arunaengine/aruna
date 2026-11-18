@@ -1199,7 +1199,12 @@ async fn take_hold(
         HoldScope::PlacementHandles => {
             static HOLD: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
                 std::sync::OnceLock::new();
-            Some(HOLD.get_or_init(Default::default).clone().lock_owned().await)
+            Some(
+                HOLD.get_or_init(Default::default)
+                    .clone()
+                    .lock_owned()
+                    .await,
+            )
         }
     }
 }

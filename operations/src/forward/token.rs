@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_needs_serving_node() {
+    fn apply_needs_server() {
         // A node that is no realm member takes no revocation.
         let realm_id = RealmId::from_bytes([1; 32]);
         let mut orphan = ApplyRevokeOperation::new(None, node(2), apply_message("target"));
@@ -604,9 +604,6 @@ mod tests {
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         let refused = Err::<AuthContext, _>(ForwardAuthError::Forbidden);
         let answer = IoResult::Child(aruna_core::calls::ChildOutcome::new(refused));
-        assert_eq!(
-            operation.next(answer),
-            denied(WriteAuthError::Forbidden)
-        );
+        assert_eq!(operation.next(answer), denied(WriteAuthError::Forbidden));
     }
 }

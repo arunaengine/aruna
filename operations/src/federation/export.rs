@@ -23,6 +23,8 @@ use aruna_core::transfer::{ExportGrant, GrantError, GrantRecord, PinnedSource, c
 use ulid::Ulid;
 use url::Url;
 
+use crate::auth::bearer_token::UserCutoffOperation;
+use crate::auth::request_authorization::AuthorizeOperation;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::federation::grant::{IssueGrantConfig, IssueGrantOperation, record_key};
@@ -30,8 +32,6 @@ use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::export::{crate_jsonld, unheld_bucket};
 use crate::jobs::key_wake::read_row;
 use crate::replication::plaintext::HolderCheckOperation;
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::bearer_token::UserCutoffOperation;
 
 const EXPORT_OPERATION: &str = "federation.export";
 
@@ -60,7 +60,16 @@ pub async fn authorize_export(
         ]),
         ..Default::default()
     };
-    drive(AuthorizeOperation::new(auth.realm_id, auth, document_path, &Permission::READ, extras), context)
+    drive(
+        AuthorizeOperation::new(
+            auth.realm_id,
+            auth,
+            document_path,
+            &Permission::READ,
+            extras,
+        ),
+        context,
+    )
     .await
     .map_err(|_| GrantError::Denied)
 }
@@ -137,9 +146,12 @@ async fn recheck(
     auth: &AuthContext,
     record: &GrantRecord,
 ) -> Result<(), GrantError> {
-    let cutoff = drive(UserCutoffOperation::new(auth.realm_id, &record.principal), &context)
-        .await
-        .map_err(|error| GrantError::Storage(error.to_string()))?;
+    let cutoff = drive(
+        UserCutoffOperation::new(auth.realm_id, &record.principal),
+        &context,
+    )
+    .await
+    .map_err(|error| GrantError::Storage(error.to_string()))?;
     // A credential cutoff of the consenting user also ends grants issued before it.
     if cutoff.is_some_and(|cutoff| record.grant.payload.issued_at < cutoff) {
         return Err(GrantError::Denied);
@@ -185,13 +197,9 @@ pub async fn read_record(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<GrantRecord>, GrantError> {
-    let row = read_row(
-        context,
-        FEDERATION_KEYSPACE,
-        record_key(job_id),
-    )
-    .await
-    .map_err(GrantError::Storage)?;
+    let row = read_row(context, FEDERATION_KEYSPACE, record_key(job_id))
+        .await
+        .map_err(GrantError::Storage)?;
     row.map(|row| postcard::from_bytes(&row).map_err(|e| GrantError::Storage(e.to_string())))
         .transpose()
 }
@@ -582,7 +590,10 @@ mod tests {
         };
         let mut operation = IssueGrantOperation::new(config);
         let revoked = postcard::to_allocvec(&revoked).unwrap();
-        assert_eq!(operation.next(read(Some(revoked))), Err(GrantError::Revoked));
+        assert_eq!(
+            operation.next(read(Some(revoked))),
+            Err(GrantError::Revoked)
+        );
     }
 
     #[tokio::test]
