@@ -4,6 +4,7 @@
 
 use super::*;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::data::link::{set_versions_key, truncated_key};
 use aruna_core::structs::storage::global_id::GlobalId;
 use tempfile::tempdir;
 
@@ -29,20 +30,6 @@ fn triple(subject: &str, predicate: &str, object: &str) -> (String, String, Stri
         predicate.to_string(),
         object.to_string(),
     )
-}
-
-fn scope() -> LinkScope {
-    LinkScope::Set {
-        realm_id: realm(),
-        set_id: Ulid::from_bytes([5; 16]),
-    }
-}
-
-fn budget() -> LinkBudget {
-    LinkBudget {
-        seeks: 64,
-        rows: 1024,
-    }
 }
 
 #[test]
@@ -114,6 +101,14 @@ pub(crate) async fn apply_rows(
     Ok(())
 }
 
+/// The rows of the data link keyspace below `prefix`.
+async fn rows_below(storage: &StorageHandle, prefix: Vec<u8>) -> Vec<(ByteView, ByteView)> {
+    let (rows, _) = iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix.into()), None, 64)
+        .await
+        .unwrap();
+    rows
+}
+
 async fn stored(rows: LinkRows, storage: &StorageHandle) {
     apply_rows(storage, rows).await.unwrap();
 }
@@ -147,121 +142,13 @@ async fn replaces_own_postings() {
     assert_eq!(rows.deletes.len(), 2);
     stored(rows, &storage).await;
 
-    let mut budget = budget();
     let a = DataLink::parse(&set_url("a/")).unwrap().key();
-    let (gone, _) = read_postings(&storage, &a, None, 10, &mut budget)
-        .await
-        .unwrap();
-    assert!(gone.is_empty());
+    assert!(rows_below(&storage, a).await.is_empty());
     let b = DataLink::parse(&set_url("b/")).unwrap().key();
-    let (kept, more) = read_postings(&storage, &b, None, 10, &mut budget)
-        .await
-        .unwrap();
+    let kept = rows_below(&storage, b).await;
     assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].1.cursor, Ulid::from_bytes([2; 16]));
-    assert!(!more);
-}
-
-#[tokio::test]
-async fn probes_used_lengths() {
-    let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    for (seed, prefix) in [(1u8, ""), (2, "raw/"), (3, "raw/2026/"), (4, "other/")] {
-        let links = project_links(
-            GRAPH,
-            Ulid::nil(),
-            &[triple(GRAPH, HAS_PART, &set_url(prefix))],
-        );
-        let rows = plan_link_rows(&storage, Ulid::from_bytes([seed; 16]), &links)
-            .await
-            .unwrap();
-        stored(rows, &storage).await;
-    }
-    let mut budget = budget();
-    let (links, complete) = key_prefixes(&storage, &scope(), "raw/2026/a.fastq", &mut budget)
-        .await
-        .unwrap();
-    assert!(complete);
-    let prefixes: Vec<_> = links
-        .iter()
-        .map(|link| link.scope().unwrap().1.to_string())
-        .collect();
-    // The length of `other/` is probed as `raw/20`; no key outside the used lengths is read.
-    assert_eq!(prefixes, vec!["", "raw/", "raw/20", "raw/2026/"]);
-    // One seek per used length plus the final miss.
-    assert_eq!(budget.seeks, 64 - 5);
-}
-
-#[tokio::test]
-async fn budget_marks_incomplete() {
-    let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    for (seed, prefix) in [(1u8, "a"), (2, "ab"), (3, "abc")] {
-        let links = project_links(
-            GRAPH,
-            Ulid::nil(),
-            &[triple(GRAPH, HAS_PART, &set_url(prefix))],
-        );
-        let rows = plan_link_rows(&storage, Ulid::from_bytes([seed; 16]), &links)
-            .await
-            .unwrap();
-        stored(rows, &storage).await;
-    }
-    let mut budget = LinkBudget { seeks: 2, rows: 10 };
-    let (links, complete) = key_prefixes(&storage, &scope(), "abcd", &mut budget)
-        .await
-        .unwrap();
-    assert!(!complete);
-    assert_eq!(links.len(), 2);
-}
-
-#[tokio::test]
-async fn pages_both_ranges() {
-    let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let set_id = Ulid::from_bytes([5; 16]);
-    let mut links = project_links(
-        GRAPH,
-        Ulid::nil(),
-        &[triple(GRAPH, HAS_PART, &set_url("a/"))],
-    );
-    links.insert(
-        DataLink::SetVersion {
-            realm_id: realm(),
-            set_id,
-            version_id: Ulid::from_bytes([8; 16]),
-        },
-        LinkPosting::default(),
-    );
-    links.insert(
-        DataLink::Unverified {
-            realm_id: realm(),
-            version_id: Ulid::from_bytes([6; 16]),
-        },
-        LinkPosting::default(),
-    );
-    let rows = plan_link_rows(&storage, Ulid::from_bytes([1; 16]), &links)
-        .await
-        .unwrap();
-    stored(rows, &storage).await;
-
-    // One row per page walks the prefix range first, then the verified versions.
-    let (first, next) = set_postings(&storage, &scope(), set_id, None, 1)
-        .await
-        .unwrap();
-    assert_eq!(first.len(), 1);
-    assert!(first[0].0.starts_with(&scope().key()));
-    let (second, next) = set_postings(&storage, &scope(), set_id, next, 1)
-        .await
-        .unwrap();
-    assert_eq!(second.len(), 1);
-    assert!(second[0].0.starts_with(&set_versions_key(set_id)));
-    let (rest, end) = set_postings(&storage, &scope(), set_id, next, 1)
-        .await
-        .unwrap();
-    assert!(rest.is_empty());
-    assert_eq!(end, None);
-    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 1);
+    let posting = LinkPosting::from_bytes(&kept[0].1).unwrap();
+    assert_eq!(posting.cursor, Ulid::from_bytes([2; 16]));
 }
 
 // A document over the link limit keeps a marker, so lookups never claim to be complete.
@@ -283,13 +170,13 @@ async fn truncation_is_marked() {
         &storage,
     )
     .await;
-    assert_eq!(truncated_documents(&storage, 10).await.unwrap(), 1);
+    assert_eq!(rows_below(&storage, truncated_key()).await.len(), 1);
     // A later projection within the limit drops the marker with the document's other rows.
     let rows = plan_link_rows(&storage, document, &BTreeMap::new())
         .await
         .unwrap();
     stored(rows, &storage).await;
-    assert_eq!(truncated_documents(&storage, 10).await.unwrap(), 0);
+    assert_eq!(rows_below(&storage, truncated_key()).await.len(), 0);
 }
 
 // A verified retry moves the posting to its set; a newer materialization's row is kept.
@@ -324,7 +211,7 @@ async fn retry_settles_unverified() {
     settle_unverified(&storage, (&key, &stale), document, None)
         .await
         .unwrap();
-    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 1);
+    assert_eq!(rows_below(&storage, unverified_key()).await.len(), 1);
 
     let verified = DataLink::SetVersion {
         realm_id: realm(),
@@ -335,11 +222,11 @@ async fn retry_settles_unverified() {
     settle_unverified(&storage, (&key, &value), document, Some(verified))
         .await
         .unwrap();
-    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 0);
-    let (rows, _) = set_postings(&storage, &scope(), set_id, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows_below(&storage, unverified_key()).await.len(), 0);
+    assert_eq!(
+        rows_below(&storage, set_versions_key(set_id)).await.len(),
+        1
+    );
     // The document's own rows name the set posting, so its next projection replaces it.
     let rows = document_rows(&storage, DOCUMENT_LINK_KEYSPACE, document)
         .await

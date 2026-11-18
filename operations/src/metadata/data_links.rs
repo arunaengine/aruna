@@ -19,14 +19,13 @@ use aruna_core::keyspaces::{
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::data::link::unverified_key;
 use aruna_core::structs::storage::data::link::{
-    DataLink, LinkPosting, LinkScope, MAX_DOCUMENT_LINKS, MAX_LINK_SUBJECTS, document_key,
-    posting_document, posting_key,
+    DataLink, LinkPosting, MAX_DOCUMENT_LINKS, MAX_LINK_SUBJECTS, document_key, posting_document,
+    posting_key,
 };
-use aruna_core::structs::storage::data::link::{set_versions_key, truncated_key, unverified_key};
 use aruna_core::structs::storage::distribution::inventory::index_key;
 use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
-use aruna_core::structs::storage::global_id::MAX_PREFIX_BYTES;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use thiserror::Error;
@@ -210,7 +209,7 @@ pub(crate) async fn iter_page(
 
 /// One lookup's shared allowance of storage seeks and posting rows; an exhausted budget
 /// makes the answer incomplete, never a scan.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LinkBudget {
     pub seeks: usize,
     pub rows: usize,
@@ -228,100 +227,6 @@ impl LinkBudget {
         self.seeks -= 1;
         true
     }
-}
-
-/// One page of the postings of one identifier after document `after`, and whether more
-/// postings may follow.
-pub(crate) async fn read_postings(
-    storage: &StorageHandle,
-    link_key: &[u8],
-    after: Option<Ulid>,
-    limit: usize,
-    budget: &mut LinkBudget,
-) -> Result<(Vec<(Ulid, LinkPosting)>, bool), DataLinkError> {
-    if !budget.take_seek() {
-        return Ok((Vec::new(), true));
-    }
-    let limit = limit.min(budget.rows).max(1);
-    let start =
-        after.map(|document_id| IterStart::After(posting_key(link_key, document_id).into()));
-    let (values, next) = iter_page(
-        storage,
-        DATA_LINK_KEYSPACE,
-        Some(ByteView::from(link_key.to_vec())),
-        start,
-        limit,
-    )
-    .await?;
-    budget.rows = budget.rows.saturating_sub(values.len());
-    let mut postings = Vec::with_capacity(values.len());
-    for (key, value) in values {
-        // A longer identifier sharing this one as a byte prefix is no match.
-        if key.len() != link_key.len() + 16 {
-            continue;
-        }
-        let Some(document_id) = posting_document(&key) else {
-            continue;
-        };
-        postings.push((document_id, LinkPosting::from_bytes(&value)?));
-    }
-    Ok((postings, next.is_some()))
-}
-
-/// The prefix lengths up to `max` the scope's postings use, ascending: one seek per length
-/// found. `false` when the budget ended the walk early.
-pub(crate) async fn prefix_lengths(
-    storage: &StorageHandle,
-    scope: &LinkScope,
-    max: usize,
-    budget: &mut LinkBudget,
-) -> Result<(Vec<u16>, bool), DataLinkError> {
-    let max = max.min(MAX_PREFIX_BYTES) as u16;
-    let scope_key = ByteView::from(scope.key());
-    let mut lengths = Vec::new();
-    let mut next_length = 0u16;
-    loop {
-        if !budget.take_seek() {
-            return Ok((lengths, false));
-        }
-        let start = IterStart::At(scope.length_start(next_length).into());
-        let (values, _) = iter_page(
-            storage,
-            DATA_LINK_KEYSPACE,
-            Some(scope_key.clone()),
-            Some(start),
-            1,
-        )
-        .await?;
-        let Some(length) = values.first().and_then(|(key, _)| scope.length_of(key)) else {
-            return Ok((lengths, true));
-        };
-        if length > max {
-            return Ok((lengths, true));
-        }
-        lengths.push(length);
-        let Some(after) = length.checked_add(1) else {
-            return Ok((lengths, true));
-        };
-        next_length = after;
-    }
-}
-
-/// The identifiers a lookup for `key` in `scope` reads: one exact prefix per length the
-/// scope uses, each a prefix of `key`. `false` when the budget cut the list short.
-pub(crate) async fn key_prefixes(
-    storage: &StorageHandle,
-    scope: &LinkScope,
-    key: &str,
-    budget: &mut LinkBudget,
-) -> Result<(Vec<DataLink>, bool), DataLinkError> {
-    let (lengths, complete) = prefix_lengths(storage, scope, key.len(), budget).await?;
-    let links = lengths
-        .into_iter()
-        .filter_map(|length| key.get(..usize::from(length)))
-        .map(|prefix| scope.link(prefix))
-        .collect();
-    Ok((links, complete))
 }
 
 /// At most this many distribution records are read to verify one document's versions.
@@ -610,71 +515,6 @@ async fn read_value(
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
     }
-}
-
-/// Version links on this node no member could verify yet, counted up to `cap`.
-pub(crate) async fn unverified_versions(
-    storage: &StorageHandle,
-    cap: usize,
-) -> Result<usize, DataLinkError> {
-    let prefix = ByteView::from(unverified_key());
-    let (rows, _) = iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix), None, cap).await?;
-    Ok(rows.len())
-}
-
-/// Documents on this node whose links were cut at the projection limit, counted up to `cap`.
-pub(crate) async fn truncated_documents(
-    storage: &StorageHandle,
-    cap: usize,
-) -> Result<usize, DataLinkError> {
-    let prefix = ByteView::from(truncated_key());
-    let (rows, _) = iter_page(storage, DATA_LINK_KEYSPACE, Some(prefix), None, cap).await?;
-    Ok(rows.len())
-}
-
-/// One page of the postings that name a set: its prefix links, then its verified versions,
-/// in key order after `after`. The next position is the last key read.
-pub(crate) async fn set_postings(
-    storage: &StorageHandle,
-    scope: &LinkScope,
-    set_id: Ulid,
-    after: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<(Vec<(Vec<u8>, Ulid, LinkPosting)>, Option<Vec<u8>>), DataLinkError> {
-    let mut rows = Vec::new();
-    let mut last = None;
-    for range in [scope.key(), set_versions_key(set_id)] {
-        if rows.len() >= limit {
-            return Ok((rows, last));
-        }
-        let start = match &after {
-            Some(after) if after.starts_with(&range) => {
-                Some(IterStart::After(after.clone().into()))
-            }
-            Some(after) if after.as_slice() > range.as_slice() => continue,
-            _ => None,
-        };
-        let (values, next) = iter_page(
-            storage,
-            DATA_LINK_KEYSPACE,
-            Some(range.into()),
-            start,
-            limit - rows.len(),
-        )
-        .await?;
-        for (key, value) in values {
-            last = Some(key.to_vec());
-            if let Some(document_id) = posting_document(&key) {
-                rows.push((key.to_vec(), document_id, LinkPosting::from_bytes(&value)?));
-            }
-        }
-        if next.is_some() {
-            return Ok((rows, last));
-        }
-    }
-    // A full page names its last key even at the end; the page after it is empty.
-    let next = (rows.len() >= limit).then_some(last).flatten();
-    Ok((rows, next))
 }
 
 /// Queued and parked materializations on this node, each counted up to `cap`: postings of
