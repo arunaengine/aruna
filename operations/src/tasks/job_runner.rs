@@ -46,15 +46,11 @@ use crate::jobs::store::row_calls::read_job_record;
 use crate::jobs::submit::schedule_drain_effect;
 use crate::jobs::workflow::ExecutionRunOperation;
 use crate::jobs::workflow::attempt::{AttemptScope, RunWiring};
-use crate::jobs::workflow::purge::{
-    PurgeRun, PurgeStop, PurgeTurn, PurgeTurnOperation, fence_error,
-};
 use crate::jobs::workflow::reconcile::{
     AdoptAttemptOperation, AdoptedEnd, Adoption, ResumeAttemptOperation, SettleAdoptedOperation,
 };
 use crate::jobs::workflow::supervise::AbandonSessionOperation;
 use crate::jobs::{FLUSH_INTERVAL_MS, JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
-use crate::s3::fence_store::AcquireFenceOperation;
 use crate::tasks::job_reconcile::ExternalReconciler;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
