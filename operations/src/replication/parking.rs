@@ -762,7 +762,7 @@ mod tests {
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
         let storage = aruna_storage::FjallStorage::open(root).unwrap();
-        let net = aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage.clone())
+        let net = aruna_net::NetHandle::new(crate::testing::local_net(), storage.clone())
             .await
             .unwrap();
         let config = BackendConfig {

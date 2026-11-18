@@ -488,7 +488,7 @@ mod tests {
     };
     use aruna_core::structs::storage::replication_queue::{ReplicationMode, SyncOrigin};
     use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
     use aruna_storage::FjallStorage;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -3190,17 +3190,9 @@ mod tests {
         write_auth_docs(&storage, group_id).await;
         write_group(&storage, group_id).await;
         write_materialized_version(&storage, "bucket", "key", Ulid::from_parts(5, 5)).await;
-        let net_handle = NetHandle::new(
-            NetConfig {
-                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
-                ..NetConfig::default()
-            },
-            storage.clone(),
-        )
-        .await
-        .expect("net handle starts");
+        let net_handle = NetHandle::new(crate::testing::local_net(), storage.clone())
+            .await
+            .expect("net handle starts");
         let path = object_permission_path(realm(), group_id, net_handle.node_id(), "bucket", "key");
         write_group_policy(&storage, group_id, &format!("path == '{path}'")).await;
         let context = DriverContext {
@@ -3285,17 +3277,9 @@ mod tests {
         write_bucket(&storage, "bucket").await;
         write_auth_docs(&storage, Ulid::from_parts(2, 2)).await;
         write_group(&storage, Ulid::from_parts(2, 2)).await;
-        let net_handle = NetHandle::new(
-            NetConfig {
-                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
-                ..NetConfig::default()
-            },
-            storage.clone(),
-        )
-        .await
-        .expect("net handle starts");
+        let net_handle = NetHandle::new(crate::testing::local_net(), storage.clone())
+            .await
+            .expect("net handle starts");
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: Some(net_handle),

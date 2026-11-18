@@ -80,7 +80,7 @@ mod test {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig};
     use aruna_core::structs::storage::routing::RoutingSnapshot;
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::{TempDir, tempdir};
@@ -92,7 +92,7 @@ mod test {
         std::fs::create_dir_all(&blob_root).unwrap();
 
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+        let net_handle = NetHandle::new(crate::testing::local_net(), storage_handle.clone())
             .await
             .unwrap();
         let blob_handle = BlobHandler::new(
