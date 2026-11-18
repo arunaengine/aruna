@@ -101,6 +101,19 @@ impl DriverContext {
             .map(|net| (net.node_id(), *net.realm_id()))
     }
 
+    /// What repository and harvest operations need to know about this node.
+    pub fn node_scope(&self) -> aruna_core::repository::remote::NodeScope {
+        aruna_core::repository::remote::NodeScope {
+            node: self.node_and_realm(),
+            credential_key: self
+                .net_handle
+                .as_ref()
+                .map(|net| net.credential_encryption_key()),
+            has_blob: self.blob_handle.is_some(),
+            has_tasks: self.task_handle.is_some(),
+        }
+    }
+
     /// This context with its storage effects on the bulk lane, so
     /// background work never delays request traffic.
     pub fn bulk(&self) -> Self {

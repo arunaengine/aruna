@@ -753,7 +753,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         secret: None,
     };
     let context = linked.test.state.get_ctx();
-    let operation = ApplyChangeOperation::new(NodeScope::of(&context), link, change);
+    let operation = ApplyChangeOperation::new(context.node_scope(), link, change);
     drive(operation, context.as_ref()).await.unwrap().unwrap()
 }
 

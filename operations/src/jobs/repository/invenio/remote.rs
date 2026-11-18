@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::repository::invenio::{record_id, validate_id};
-use aruna_core::repository::remote::InvenioError;
+use aruna_core::repository::remote::{InvenioError, NodeScope};
 use aruna_core::repository::{
     LinkFailure, LinkReview, LinkTarget, PullCheck, RemoteState, RepositoryDestination,
     RepositoryLink, RepositoryRecord,
@@ -22,7 +22,7 @@ use crate::jobs::repository::link_queue::{PushRevisionOperation, Revision};
 use crate::jobs::repository::link_store::{parse_secret, secret_row};
 use crate::jobs::repository::links::LinkError;
 use crate::jobs::repository::push::creator_auth;
-use crate::jobs::repository::{NodeScope, TransferError, not_supported};
+use crate::jobs::repository::{TransferError, not_supported};
 
 type Turn<T> = Result<Next<T>, TransferError>;
 

@@ -56,7 +56,6 @@ use crate::blob::hidden::delete_hidden;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::permission_paths::{MAX_HASH_ALIASES, ResolvePathsOperation};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::repository::NodeScope;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
@@ -302,7 +301,7 @@ pub async fn run_export_job(ctx: &JobContext, spec: &ExportRoCrateSpec) -> JobRu
         Some(link) => {
             use super::repository::push::{ExportEnd, SettlePushOperation, settled_outcome};
             let settle = SettlePushOperation::new(
-                NodeScope::of(&ctx.driver),
+                ctx.driver.node_scope(),
                 ctx.job_id,
                 spec.document_id,
                 link.clone(),
@@ -505,7 +504,7 @@ async fn repository_export(
     };
     use super::repository::connector::ConnectorViewOperation;
     use super::repository::invenio::export::{ExportRun, RepositoryExportOperation};
-    use super::repository::{Action, JobScope, TransferError, ensure_supported};
+    use super::repository::{Action, TransferError, ensure_supported};
     use crate::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
     use aruna_core::repository::LinkFailure;
     if !checkpoint.repository_complete && blocking_omissions(&checkpoint.report) > 0 {
@@ -550,7 +549,7 @@ async fn repository_export(
                         checkpoint,
                         artifact,
                         inspection,
-                        JobScope::of(ctx).stop,
+                        ctx.job_scope().stop,
                     )?;
                     let findings = drive(content, &ctx.driver).await?;
                     if !findings.is_empty() {
@@ -565,8 +564,8 @@ async fn repository_export(
             let export = RepositoryExportOperation::new(
                 kind,
                 ExportRun {
-                    scope: NodeScope::of(&ctx.driver),
-                    job: JobScope::of(ctx),
+                    scope: ctx.driver.node_scope(),
+                    job: ctx.job_scope(),
                     spec: spec.clone(),
                     destination: destination.clone(),
                 },

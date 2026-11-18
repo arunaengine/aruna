@@ -11,7 +11,8 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::repository::remote::{
-    HarvestWrite, HarvestWriteFailure, RemoteAnswer, RemoteCall, RemoteFailure, StopReason,
+    HarvestWrite, HarvestWriteFailure, NodeScope, RemoteAnswer, RemoteCall, RemoteFailure,
+    StopReason,
 };
 use aruna_core::rows::{event, page};
 use aruna_core::structs::execution::harvest::{
@@ -30,7 +31,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::repository::link_store::time_of;
-use super::repository::{JobScope, NodeScope, remote_answer, remote_call};
+use super::repository::{JobScope, remote_answer, remote_call};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};

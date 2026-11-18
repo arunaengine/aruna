@@ -15,14 +15,38 @@ use url::Url;
 
 use super::ImportMode;
 use crate::UserId;
+use crate::credential_encryption::CredentialEncryptionKey;
+use crate::id::NodeId;
 use crate::metadata::MetadataValidationViolation;
 use crate::structs::checksum::Hasher;
 use crate::structs::execution::job::{ArtifactRef, RoCrateLimits};
 use crate::structs::execution::source_access::SourceMetadata;
 use crate::structs::identity::auth::{Actor, AuthContext};
+use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::types::GroupId;
+
+/// What an operation needs to know about this node; the caller reads it before the run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeScope {
+    pub node: Option<(NodeId, RealmId)>,
+    pub credential_key: Option<CredentialEncryptionKey>,
+    pub has_blob: bool,
+    pub has_tasks: bool,
+}
+
+impl NodeScope {
+    /// This node, or `fallback` on a node without a net transport.
+    pub fn node_or(&self, fallback: NodeId) -> NodeId {
+        self.node.map_or(fallback, |(node, _)| node)
+    }
+
+    /// The realm this node serves, or `fallback` on a node without a net transport.
+    pub fn realm_or(&self, fallback: RealmId) -> RealmId {
+        self.node.map_or(fallback, |(_, realm)| realm)
+    }
+}
 
 /// Why a running job must stop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

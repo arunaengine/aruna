@@ -36,7 +36,6 @@ use aruna_operations::harvest::repository::{
 };
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
-use aruna_operations::jobs::repository::{JobScope, NodeScope};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::forward::write::route_metadata_delete;
@@ -492,7 +491,7 @@ async fn delete_document(fixture: &Fixture, document_id: Ulid) -> Result<(), Box
 
 async fn run_harvest_job(ctx: &JobContext, spec: &HarvestJobSpec) -> JobRunOutcome {
     let operation =
-        HarvestJobOperation::new(NodeScope::of(&ctx.driver), JobScope::of(ctx), spec.clone());
+        HarvestJobOperation::new(ctx.driver.node_scope(), ctx.job_scope(), spec.clone());
     harvest_outcome(drive(operation, &ctx.driver).await)
 }
 

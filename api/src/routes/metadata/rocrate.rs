@@ -424,7 +424,7 @@ pub async fn submit_rocrate_export(
         Box::pin(ensure_requirements(&state, &auth, document_id, &view)).await?;
         destination.credential = Some(
             seal_token(
-                &state.get_ctx(),
+                &state.get_ctx().node_scope(),
                 auth.user_id,
                 &view,
                 None,

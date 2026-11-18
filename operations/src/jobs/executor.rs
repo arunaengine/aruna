@@ -120,6 +120,19 @@ pub struct JobContext {
     pub handlers: Vec<Arc<dyn PayloadHandler>>,
 }
 
+impl JobContext {
+    /// This job as the repository and harvest operations see it.
+    pub fn job_scope(&self) -> crate::jobs::repository::JobScope {
+        crate::jobs::repository::JobScope {
+            job_id: self.job_id,
+            owner_node: self.owner_node_id,
+            claim_token: self.claim_token,
+            stop: aruna_blob::remote::job_stop(self.cancel.clone(), self.shutdown.clone()),
+            progress: self.progress.clone(),
+        }
+    }
+}
+
 /// Runs and keeps the jobs of a payload kind that `jobs` does not own. The node wiring
 /// registers one per owning domain.
 pub trait PayloadHandler: Send + Sync {
@@ -236,8 +249,8 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
         JobPayload::Harvest(spec) => crate::jobs::harvest::harvest_outcome(
             Box::pin(crate::driver::drive(
                 crate::jobs::harvest::HarvestJobOperation::new(
-                    crate::jobs::repository::NodeScope::of(&ctx.driver),
-                    crate::jobs::repository::JobScope::of(ctx),
+                    ctx.driver.node_scope(),
+                    ctx.job_scope(),
                     spec.clone(),
                 ),
                 &ctx.driver,

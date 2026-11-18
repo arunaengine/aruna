@@ -501,12 +501,7 @@ impl OperationsTaskHandler {
 
     pub(super) async fn drain_graph_queue(&self) {
         let bulk = self.context.bulk();
-        match drive(
-            PruneBatchOperation::new(crate::jobs::repository::NodeScope::of(&bulk)),
-            &bulk,
-        )
-        .await
-        {
+        match drive(PruneBatchOperation::new(bulk.node_scope()), &bulk).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
                     .await;
@@ -650,7 +645,7 @@ impl OperationsTaskHandler {
     /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
     pub(super) async fn drain_link_queue(&self) {
         let drain = crate::jobs::repository::link_queue::DrainLinksOperation::new(
-            crate::jobs::repository::NodeScope::of(&self.context),
+            self.context.node_scope(),
         );
         let after = match drive(drain, &self.context).await {
             Ok(after) => after,

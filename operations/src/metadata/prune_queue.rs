@@ -17,6 +17,7 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, GraphPruneRecord, MetadataEffect, MetadataError, MetadataEvent,
 };
 use aruna_core::operation::Operation;
+use aruna_core::repository::remote::NodeScope;
 use aruna_core::rows::{PrefixPages, done};
 use aruna_core::storage_entries::graph_prune_entry;
 use aruna_core::structs::storage::data::link::document_key;
@@ -27,7 +28,6 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::prune_jobs::{DuePrune, DuePruneOperation, RescheduleOperation};
-use crate::jobs::repository::NodeScope;
 use crate::jobs::repository::link_queue::QueueDeletedOperation;
 use crate::jobs::repository::links::LinkError;
 use crate::metadata::call_results::effect_event;
