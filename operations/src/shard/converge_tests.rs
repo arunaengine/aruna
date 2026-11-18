@@ -419,3 +419,55 @@ fn marker_row(placement: PlacementRef) -> (Key, Value) {
     let value = postcard::to_allocvec(&record).unwrap().into();
     (verification_key(realm(), &placement), value)
 }
+
+#[test]
+fn verified_topics_paged() {
+    let second = PlacementRef {
+        strategy_id: strategy_id(),
+        shard: 1,
+    };
+    let mut operation = VerifiedTopicsOperation::new(realm());
+    assert!(matches!(called(operation.first()), IoCall::Page { .. }));
+    let garbage = (Key::from(vec![1]), Value::from(vec![0xff]));
+    let first_page = IoResult::Page {
+        rows: vec![marker_row(placement()), garbage],
+        next: Some(Key::from(vec![2])),
+    };
+    assert!(matches!(
+        called(operation.next(first_page)),
+        IoCall::Page { .. }
+    ));
+    let last_page = IoResult::Page {
+        rows: vec![marker_row(second)],
+        next: None,
+    };
+    assert_eq!(
+        operation.next(last_page),
+        Ok(Next::Done(BTreeSet::from([
+            topic(),
+            shard_topic_id(realm(), &second),
+        ])))
+    );
+}
+
+#[test]
+fn marker_presence_answers() {
+    let mut operation = ShardVerifiedOperation::new(realm(), &placement());
+    assert!(matches!(called(operation.first()), IoCall::Read(_)));
+    assert_eq!(operation.next(marked()), Ok(Next::Done(true)));
+    assert_eq!(operation.next(no_marker()), Ok(Next::Done(false)));
+}
+
+#[test]
+fn forgetting_names_marker() {
+    let IoCall::Delete(rows) = forget_verification(realm(), &placement()) else {
+        panic!("expected a delete");
+    };
+    assert_eq!(
+        rows,
+        vec![(
+            SHARD_VERIFICATION_KEYSPACE.to_string(),
+            verification_key(realm(), &placement()),
+        )]
+    );
+}
