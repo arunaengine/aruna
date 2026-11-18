@@ -464,64 +464,161 @@ impl Operation for UploadPartOperation {
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, UploadPartState::Finish | UploadPartState::Error)
+    /// Rolls written bytes back, or leaves them to reconciliation when a commit may own them,
+    /// and releases their reservation, before the run ends.
+    fn abort(&mut self) -> Vec<IoCall> {
+        // The record transaction was cut off: its commit may have applied.
+        if self.step == PartStep::Publish
+            && let Some(location) = self.written_location.take()
+        {
+            self.release = Some(location.ulid);
+            self.reconcile = Some(location);
+        }
+        let mut calls = Vec::new();
+        if let Some(location) = self.reconcile.take() {
+            calls.extend(self.reconcile_row(location));
+        }
+        if let Some(location) = self.written_location.take() {
+            calls.push(IoCall::child(RollbackWrite::new(location)));
+        }
+        if let Some(id) = self.release.take() {
+            calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());
+        }
+        calls
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordStep {
+    Fence,
+    Backend,
+    Upload,
+    Existing,
+    Write,
+}
+
+type RecordTurn = Result<Next<()>, UploadPartError>;
+
+/// Records a written part in one transaction, with the row that reconciles its bytes and the
+/// cleanup of the part it replaces.
+#[derive(Debug, PartialEq)]
+struct PartRecordWrite {
+    bucket: String,
+    key: String,
+    upload_id: Ulid,
+    part_number: u16,
+    location: BackendLocation,
+    backend_etag: Option<String>,
+    piece: Option<PartPiece>,
+    step: RecordStep,
+}
+
+impl PartRecordWrite {
+    fn call(&mut self, step: RecordStep, call: IoCall) -> RecordTurn {
+        self.step = step;
+        Ok(Next::Call(call))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(UploadPartError::NotFinished),
+    /// The pin was taken at creation, so the part write must still prove the tenant backend
+    /// is enabled before its record joins the transaction.
+    fn fence_checked(&mut self, value: Option<Value>) -> RecordTurn {
+        check_fence_row(value.as_deref(), &self.bucket, &self.key)?;
+        match self.location.backend {
+            BackendRef::Group(backend_id) => {
+                let read = read_row(STORAGE_BACKEND_KEYSPACE, backend_key(backend_id));
+                self.call(RecordStep::Backend, read)
+            }
+            _ => self.read_upload(),
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        let mut effects = smallvec![];
-        if let Some(effect) = self.cleanup.retry(&StorageError::Timeout) {
-            if matches!(self.output, Some(Ok(_))) {
-                self.output = None;
-            }
-            self.state = UploadPartState::QueueCleanupRow;
-            effects.push(effect);
-        } else {
-            if self.rollback_location.is_none() {
-                self.rollback_location = self.written_location.take();
-            }
-            if let Some(location) = self.rollback_location.take() {
-                let work = BlobCleanupWork::DeleteBlob {
-                    location: location.clone(),
-                };
-                if let Some(effect) = self.cleanup.queue(work) {
-                    if matches!(self.output, Some(Ok(_))) {
-                        self.output = None;
-                    }
-                    if self.output.is_none() && !self.cleanup.error_pending() {
-                        self.cleanup.set_error(UploadPartError::UploadPartFailed);
-                    }
-                    self.state = UploadPartState::QueueCleanupRow;
-                    effects.push(effect);
-                } else {
-                    self.rollback_location = Some(location);
-                    self.state = UploadPartState::Error;
-                    if self.output.is_none() {
-                        self.output = Some(Err(UploadPartError::UploadPartFailed));
-                    }
-                }
-            } else if self.state != UploadPartState::Finish {
-                self.state = UploadPartState::Error;
-                if self.output.is_none() {
-                    self.output = Some(Err(UploadPartError::UploadPartFailed));
-                }
+    fn backend_read(&mut self, value: Option<Value>) -> RecordTurn {
+        let record = (value.as_deref())
+            .map(GroupStorage::from_bytes)
+            .transpose()
+            .map_err(|error| BackendFenceError::Read(RecordReadError::Conversion(error)))?;
+        match record {
+            Some(record) if !record.disabled => self.read_upload(),
+            _ => Err(BackendFenceError::Unavailable.into()),
+        }
+    }
+
+    fn read_upload(&mut self) -> RecordTurn {
+        let read = read_row(UPLOAD_KEYSPACE, self.upload_id.to_bytes().to_vec());
+        self.call(RecordStep::Upload, read)
+    }
+
+    fn upload_read(&mut self, value: Option<Value>) -> RecordTurn {
+        let value = value.ok_or(UploadPartError::NoSuchUpload)?;
+        let record = MultipartUpload::from_bytes(value.as_ref())?;
+        validate_upload(&record, &self.bucket, &self.key, StatusCheck::Open)?;
+        let key = part_key(self.upload_id, self.part_number)?;
+        self.call(RecordStep::Existing, read_row(UPLOAD_PART_KEYSPACE, key))
+    }
+
+    /// The reconciliation row commits with the record, so the commit can never be ambiguous
+    /// about who settles the reservation; a replaced part's bytes go through the cleanup queue.
+    fn existing_read(&mut self, value: Option<Value>) -> RecordTurn {
+        let replaced = (value.as_deref())
+            .map(MultipartPart::from_bytes)
+            .transpose()?
+            .map(|existing| existing.location);
+        let record = MultipartPart {
+            part_number: self.part_number,
+            location: self.location.clone(),
+            created_at: SystemTime::now(),
+            backend_etag: self.backend_etag.clone(),
+            piece: self.piece.clone(),
+        };
+        let reconcile = reconcile_work(self.location.clone(), self.upload_id, self.part_number);
+        let mut writes = vec![
+            (
+                UPLOAD_PART_KEYSPACE.to_string(),
+                part_key(self.upload_id, self.part_number)?,
+                record.to_bytes()?.into(),
+            ),
+            (
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                self.location.ulid.to_bytes().to_vec().into(),
+                reconcile.to_bytes()?.into(),
+            ),
+        ];
+        if let Some(location) = replaced {
+            let work = BlobCleanupWork::DeleteBlob { location };
+            writes.push((
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                Ulid::generate().to_bytes().to_vec().into(),
+                work.to_bytes()?.into(),
+            ));
+        }
+        self.call(RecordStep::Write, IoCall::Write(writes))
+    }
+}
+
+impl Operation for PartRecordWrite {
+    type Output = ();
+    type Error = UploadPartError;
+
+    fn first(&mut self) -> RecordTurn {
+        let fence = read_row(PURGE_FENCE_KEYSPACE, fence_key(&self.bucket));
+        self.call(RecordStep::Fence, fence)
+    }
+
+    fn next(&mut self, result: IoResult) -> RecordTurn {
+        match self.step {
+            RecordStep::Fence => self.fence_checked(result.value()?),
+            RecordStep::Backend => self.backend_read(result.value()?),
+            RecordStep::Upload => self.upload_read(result.value()?),
+            RecordStep::Existing => self.existing_read(result.value()?),
+            RecordStep::Write => {
+                result.done()?;
+                Ok(Next::Done(()))
             }
         }
-        if let Some(id) = self.cleanup.take_release() {
-            effects.push(Effect::Blob(BlobEffect::ReleaseReservation { id }));
-        }
-        if let Some(txn_id) = self.txn_id.take() {
-            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
-        }
-        effects
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -529,7 +626,7 @@ impl Operation for UploadPartOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{BackendUpload, MultipartUploadStatus};
@@ -540,170 +637,29 @@ mod test {
         UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
     }
 
-    /// Answers a purge fence read with no fence held.
-    fn fence_clear() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: crate::s3::purge_fence::fence_key("mybucket"),
-            value: None,
-        })
+    fn body() -> Option<BackendStream<Result<Bytes, StreamError>>> {
+        Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+            &b"part"[..],
+        )))
     }
 
-    #[test]
-    fn part_follows_pin() {
-        // The pinned backend on the upload record reaches WritePart unchanged.
-        let upload_id = Ulid::generate();
-        let mut op = UploadPartOperation::new(UploadPartInput {
-            bucket: "mybucket".to_string(),
-            key: "object.txt".to_string(),
-            upload_id,
-            part_number: 2,
-            content_length: None,
-            body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
-                &b"part"[..],
-            ))),
-            created_by: test_user_id(),
-            expected_checksums: Vec::new(),
-        });
-        op.state = UploadPartState::ReadUpload;
-        let record = MultipartUpload {
-            upload_id,
-            backend: aruna_core::structs::storage::blob::BackendRef::Node("cold".to_string()),
-            storage_class: Some("cold".to_string()),
-            bucket: "mybucket".to_string(),
-            key: "object.txt".to_string(),
-            group_id: Ulid::generate(),
-            created_by: test_user_id(),
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            status: MultipartUploadStatus::Open,
-            checksum_hint: None,
-            metadata: std::collections::HashMap::new(),
-            placement_policies: Vec::new(),
-            subject_generation: 0,
-            completing_since_ms: None,
-            backend_upload: None,
-            encryption: None,
-        };
-
-        let effects = op.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    upload_id.to_bytes().to_vec().into(),
-                    Some(record.to_bytes().unwrap().into()),
-                ),
-                (NODE_SUBJECT_KEY.to_vec().into(), None),
-                (b"part".to_vec().into(), None),
-                (upload_id.to_bytes().to_vec().into(), None),
-            ],
-        }));
-
-        let [Effect::Blob(BlobEffect::WritePart { resolved, .. })] = effects.as_slice() else {
-            panic!("expected one part write, got {effects:?}")
-        };
-        assert_eq!(resolved.backend, record.backend);
-        assert_eq!(resolved.storage_class, record.storage_class);
+    fn blob(event: BlobEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(event)))
     }
 
-    fn saved_part(
-        upload_id: Ulid,
-        part_number: u16,
-        blob_size: u64,
-    ) -> (Key, aruna_core::types::Value) {
-        let mut location = part_location(Ulid::from_bytes([5u8; 16]));
-        location.blob_size = blob_size;
-        let part = MultipartPart {
-            part_number,
-            location,
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            backend_etag: None,
-            piece: None,
-        };
-        let key = MultipartPartKey::new(upload_id, part_number)
-            .to_bytes()
-            .unwrap();
-        (key.into(), part.to_bytes().unwrap().into())
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
     }
 
-    #[test]
-    fn sealed_part_offset() {
-        // A sealed part takes its tree offset from the saved parts and keeps its piece record.
-        use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
-        use aruna_core::structs::storage::multipart::UploadEncryption;
-        const MIB: u64 = 1 << 20;
-        let mut op = upload_part_op(Ulid::from_bytes([5u8; 16]));
-        let upload_id = op.input.upload_id;
-        op.input.part_number = 3;
-        op.input.content_length = Some(5 * MIB);
-        op.input.body = Some(BackendStream::new(tokio_util::io::ReaderStream::new(
-            &b"x"[..],
-        )));
-        op.written_location = None;
-        op.state = UploadPartState::ReadUpload;
-        let plan = SealPlan {
-            key: BucketKeyRef::new(Ulid::from_bytes([7u8; 16]), 1),
-            public_key: [3; 32],
-            cipher: Default::default(),
-            block_keys: Default::default(),
-            storage_generation: 1,
-        };
-        let mut record = in_place_op(None).1;
-        record.upload_id = upload_id;
-        record.backend_upload = None;
-        record.encryption = Some(UploadEncryption {
-            plan,
-            compression: aruna_core::structs::storage::format::Compression::Off,
-        });
-        let effects = op.step(read_record(&record, None));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, .. })] if key_space == UPLOAD_PART_KEYSPACE
-        ));
-
-        let values = vec![
-            saved_part(upload_id, 1, 8 * MIB),
-            saved_part(upload_id, 2, 8 * MIB),
-            saved_part(upload_id, 3, 2 * MIB),
-        ];
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: None,
-        }));
-        let [
-            Effect::Blob(BlobEffect::WritePiece {
-                resolved,
-                content_offset,
-                part_number: 3,
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected one piece write, got {effects:?}")
-        };
-        assert_eq!(*content_offset, Some(16 * MIB));
-        assert_eq!(resolved.encryption, Some(plan));
-
-        let mut location = part_location(Ulid::from_bytes([5u8; 16]));
-        location.blob_size = 5 * MIB;
-        let piece = PartPiece {
-            record: vec![1, 2, 3],
-            stored_len: 5 * MIB + 64,
-            content_offset: Some(16 * MIB),
-        };
-        let event = BlobEvent::PieceWritten {
-            location,
-            piece: piece.clone(),
-        };
-        op.step(Event::Blob(event));
-        op.txn_id = Some(Ulid::from_bytes([3u8; 16]));
-        op.state = UploadPartState::ReadExistingPart;
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"part".to_vec().into(),
-            value: None,
-        }));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected the part record, got {effects:?}")
-        };
-        let stored = MultipartPart::from_bytes(value.as_ref()).unwrap();
-        assert_eq!(stored.piece, Some(piece));
+    fn effect_of(turn: &PartTurn) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
+            other => panic!("expected an effect call, got {other:?}"),
+        }
     }
 
     /// An operation about to read the record of an in-place upload, with that record.
