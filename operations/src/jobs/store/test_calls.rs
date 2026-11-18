@@ -13,6 +13,7 @@ use super::job_calls::RenewOutcome;
 use super::job_calls::RequeueOutcome;
 use super::job_calls::RunSuccess;
 use super::list_jobs::ListJobsOperation;
+use super::mutation::{MutateJobOperation, NoGuard};
 use super::park_wake::AwaitOutcome;
 use super::*;
 use super::{job_calls, row_calls};
