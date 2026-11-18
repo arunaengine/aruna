@@ -5,12 +5,13 @@
 
 // Entries of ordinary buckets and of other nodes stay as they are.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data::identity::{CONTENT_URL, ObjectLocation, text_values};
@@ -18,7 +19,9 @@ use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position
 use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
+use aruna_core::types::{Key, Value as RowValue};
 use serde_json::Value;
+use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -149,37 +152,61 @@ fn rewrite(value: &mut Value, rewrites: &BTreeMap<String, String>, identifier: b
 /// At most this many distribution records are read to find a version's candidate sets.
 const MAX_SETS: usize = 4096;
 
+#[derive(Debug, Error, PartialEq)]
+pub enum LocalVersionError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error("{0}")]
+    Failed(String),
+}
+
+#[derive(Debug, PartialEq)]
+enum VersionStep {
+    Page,
+    Bucket(Ulid, String),
+    Entry(String),
+}
+
 /// The local member bucket and key of a distributed version: a set whose hint the id carries,
 /// whose local member bucket is bound here, and whose version id index holds it. `None` on a
 /// node that holds no member of such a set.
-pub async fn local_version(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct LocalVersionOperation {
     version_id: Ulid,
-) -> Result<Option<(String, String)>, String> {
-    let hint = SetHint::of_version(version_id);
-    let mut start = None;
-    let mut seen = 0usize;
-    loop {
-        let (values, next) = match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: DISTRIBUTION_KEYSPACE.to_string(),
-                prefix: None,
-                start: start.take().map(IterStart::After),
-                limit: 256,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected storage answer {}", other.label())),
-        };
-        for (_, value) in values {
-            seen += 1;
+    rows: VecDeque<RowValue>,
+    after: Option<Key>,
+    seen: usize,
+    step: VersionStep,
+}
+
+type VersionTurn = Result<Next<Option<(String, String)>>, LocalVersionError>;
+
+impl LocalVersionOperation {
+    pub fn new(version_id: Ulid) -> Self {
+        Self {
+            version_id,
+            rows: VecDeque::new(),
+            after: None,
+            seen: 0,
+            step: VersionStep::Page,
+        }
+    }
+
+    fn page(&mut self) -> VersionTurn {
+        self.step = VersionStep::Page;
+        Ok(Next::Call(IoCall::Page {
+            space: DISTRIBUTION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::<u8>::new()),
+            after: self.after.take(),
+            limit: 256,
+        }))
+    }
+
+    /// The next record of a set the id's hint names, or the next page while sets remain.
+    fn advance(&mut self) -> VersionTurn {
+        let hint = SetHint::of_version(self.version_id);
+        while let Some(value) = self.rows.pop_front() {
+            self.seen += 1;
             let Ok(view) = DistributionView::from_bytes(&value) else {
                 continue;
             };
@@ -188,71 +215,63 @@ pub async fn local_version(
             if SetHint::of_set(set_id) != hint {
                 continue;
             }
-            if let Some(found) =
-                member_version(context, set_id, &snapshot.config.bucket, version_id).await?
-            {
-                return Ok(Some(found));
+            let bucket = snapshot.config.bucket.to_string();
+            self.step = VersionStep::Bucket(set_id, bucket.clone());
+            return Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))));
+        }
+        match self.after.is_some() && self.seen < MAX_SETS {
+            true => self.page(),
+            false => Ok(Next::Done(None)),
+        }
+    }
+}
+
+impl Operation for LocalVersionOperation {
+    type Output = Option<(String, String)>;
+    type Error = LocalVersionError;
+
+    fn first(&mut self) -> VersionTurn {
+        self.page()
+    }
+
+    fn next(&mut self, result: IoResult) -> VersionTurn {
+        match std::mem::replace(&mut self.step, VersionStep::Page) {
+            VersionStep::Page => {
+                let (rows, next) = result.page()?;
+                self.rows = rows.into_iter().map(|(_, value)| value).collect();
+                self.after = next;
+                self.advance()
+            }
+            VersionStep::Bucket(set_id, bucket) => {
+                let info = match result.child::<BucketInfo, GetBucketError>()? {
+                    Ok(info) => info,
+                    Err(GetBucketError::NotFound) => return self.advance(),
+                    Err(error) => return Err(LocalVersionError::Failed(error.to_string())),
+                };
+                if info.distribution.as_ref().map(|binding| binding.set_id) != Some(set_id) {
+                    return self.advance();
+                }
+                self.step = VersionStep::Entry(bucket);
+                let key = index_key(set_id, self.version_id);
+                Ok(Next::Call(read_row(VERSION_INDEX_KEYSPACE, key)))
+            }
+            VersionStep::Entry(bucket) => {
+                let Some(entry) = result.value()? else {
+                    return self.advance();
+                };
+                let failed = |error: String| LocalVersionError::Failed(error);
+                let entry = IndexEntry::from_bytes(&entry).map_err(|e| failed(e.to_string()))?;
+                let position =
+                    Position::decode(&entry.position).map_err(|e| failed(e.to_string()))?;
+                Ok(Next::Done(Some((bucket, position.key))))
             }
         }
-        match next {
-            Some(next) if seen < MAX_SETS => start = Some(next),
-            _ => return Ok(None),
-        }
-    }
-}
-
-async fn member_version(
-    context: &DriverContext,
-    set_id: Ulid,
-    bucket: &str,
-    version_id: Ulid,
-) -> Result<Option<(String, String)>, String> {
-    let info = match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(info) => info,
-        Err(GetBucketError::NotFound) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    if info.distribution.as_ref().map(|binding| binding.set_id) != Some(set_id) {
-        return Ok(None);
-    }
-    let Some(entry) = read_row(
-        context,
-        VERSION_INDEX_KEYSPACE,
-        index_key(set_id, version_id),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let entry = IndexEntry::from_bytes(&entry).map_err(|error| error.to_string())?;
-    let position = Position::decode(&entry.position).map_err(|error| error.to_string())?;
-    Ok(Some((bucket.to_string(), position.key)))
-}
-
-async fn read_row(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<Vec<u8>>, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            Ok(value.map(|value| value.to_vec()))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage answer {}", other.label())),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{IoCall, IoResult, LocalVersionOperation, Next, Operation};
     use super::{local_object, rewrite};
     use aruna_core::structs::identity::realm::RealmId;
     use serde_json::json;
@@ -412,5 +431,33 @@ mod tests {
         // Free text that happens to equal the location keeps its wording.
         assert_eq!(crate_value["@graph"][1]["description"], old);
         assert_eq!(crate_value["@graph"][1]["keywords"][0], old);
+    }
+
+    #[test]
+    fn no_sets_found() {
+        let mut lookup = LocalVersionOperation::new(Ulid::from_bytes([1; 16]));
+        assert!(matches!(
+            lookup.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(lookup.next(page), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn broken_record_skipped() {
+        let mut lookup = LocalVersionOperation::new(Ulid::from_bytes([1; 16]));
+        lookup.first().unwrap();
+        let page = IoResult::Page {
+            rows: vec![(vec![1u8].into(), vec![0xffu8].into())],
+            next: Some(vec![1u8].into()),
+        };
+        assert!(matches!(
+            lookup.next(page),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
     }
 }

@@ -20,7 +20,7 @@ use crate::replication::managed_read::ManagedReadOperation;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::GetObjectInput;
-use crate::s3::object::read::get_object_info;
+use crate::s3::object::read::ObjectInfoOperation;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,
@@ -162,7 +162,7 @@ async fn resolve(
             realm_id: auth.realm_id,
             node_id: node,
         };
-        let info = get_object_info(context, input, None)
+        let info = drive(ObjectInfoOperation::new(input, None), context)
             .await
             .map_err(|_| GitError::NotFound)?;
         let global = bucket.distribution.as_ref().map(|_| GlobalId::Version {
@@ -275,7 +275,12 @@ async fn located(
             .filter(|global| global.realm_id() == realm_id),
         node,
     ) {
-        match crate::metadata::global_entries::local_version(context, *version_id).await {
+        match drive(
+            crate::metadata::global_entries::LocalVersionOperation::new(*version_id),
+            context,
+        )
+        .await
+        {
             Ok(Some((bucket, key))) => {
                 found
                     .extend(VersionedObjectArn::new(realm_id, node, bucket, key, *version_id).ok());
