@@ -333,55 +333,27 @@ mod tests {
         assert_eq!(result.location, found(version_id).location);
     }
 
-        let mut location = location_with_hash();
-        location.hashes.remove(HASH_BLAKE3);
-        let layout = PithosLayout {
-            stored_size: 70,
-            metadata_digest: [3; 32],
-            storage_generation: 0,
-        };
-        location.format = StoredFormat::pithos(layout, BucketKeyRef::new(Ulid::generate(), 1));
-        let archive = ArchiveKey::of(&location);
-        let version_id = Ulid::generate();
-        let version = BlobVersion::pending(archive, location.created_at, location.created_by, None);
-        let read = |value: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::ReadResult {
-                key: Vec::<u8>::new().into(),
-                value: value.map(Into::into),
-            })
-        };
-        let looked_up = || {
-            let mut operation = HeadObjectOperation::new(HeadObjectInput {
-                bucket: "mybucket".to_string(),
-                key: "hello.txt".to_string(),
-                version_id: Some(version_id),
-            });
-            let txn_id = Ulid::generate();
-            operation.txn_id = Some(txn_id);
-            operation.read_version(version_id, version.clone(), true);
-            operation.step(read(Some(location.to_bytes().unwrap())));
-            let effects = operation.step(read(None));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit })]
-                    if *commit == txn_id
-            ));
-            (operation, txn_id)
-        };
-
-        let (early, _) = looked_up();
-        assert!(!early.is_complete());
-        assert!(matches!(
-            early.finalize(),
-            Err(HeadObjectError::NotFinished)
-        ));
-
-        let (mut operation, txn_id) = looked_up();
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap().location, Some(location));
+    #[test]
+    fn lookup_errors_map() {
+        for (from, to) in [
+            (VersionLookupError::NoSuchKey, HeadObjectError::NoSuchKey),
+            (
+                VersionLookupError::NoSuchVersion,
+                HeadObjectError::NoSuchVersion,
+            ),
+            (
+                VersionLookupError::DeleteMarker,
+                HeadObjectError::DeleteMarker,
+            ),
+            (
+                VersionLookupError::Failed,
+                HeadObjectError::HeadObjectFailed,
+            ),
+        ] {
+            let mut operation = head_operation(None);
+            operation.first().unwrap();
+            assert_eq!(operation.next(looked_up(Err(from))), Err(to));
+        }
     }
 
     #[tokio::test]
@@ -640,61 +612,43 @@ mod tests {
             connector_id: None,
             mirrors: Vec::new(),
         };
-        let version = BlobVersion::reference(
-            source,
-            cached_metadata,
-            SystemTime::UNIX_EPOCH,
-            Default::default(),
-            SystemTime::UNIX_EPOCH,
-        );
-        let txn_id = Ulid::generate();
         let mut operation = HeadObjectOperation::new(HeadObjectInput {
             bucket: "target-bucket".to_string(),
             key: "folder/file.txt".to_string(),
             version_id: Some(version_id),
         });
-
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(version.to_bytes().unwrap().into()),
-        }));
+        operation.first().unwrap();
+        let reference = FoundVersion {
+            source_metadata: Some(cached_metadata),
+            last_refresh: Some(SystemTime::UNIX_EPOCH),
+            version_id: Some(version_id),
+            source_binding: Some(source.clone()),
+            native_reference: Some(source),
+            ..FoundVersion::default()
+        };
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed })]
-                if *committed == txn_id
+            operation.next(looked_up(Ok(reference))),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
         let access = ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::ArunaNative,
             config: HashMap::new(),
             path: "source-bucket/folder/file.txt".to_string(),
             version: Some(version_id.to_string()),
         };
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::VersionAccessResolved {
-                result: Ok(access.clone()),
-            },
-        ));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Head { access: resolved })]
-                if resolved == &access
-        ));
+        let resolved = SubOperationEvent::VersionAccessResolved {
+            result: Ok(access.clone()),
+        };
+        let turn = operation.next(IoResult::Event(Box::new(Event::SubOperation(resolved))));
+        let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+        assert_eq!(turn, Ok(Next::Call(head.into())));
 
-        assert!(
-            operation
-                .step(Event::StagingSource(StagingSourceEvent::HeadResult {
-                    metadata: refreshed_metadata.clone(),
-                }))
-                .is_empty()
-        );
-        let result = operation.finalize().unwrap();
+        let answer = Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: refreshed_metadata.clone(),
+        });
+        let Ok(Next::Done(result)) = operation.next(IoResult::Event(Box::new(answer))) else {
+            panic!("the source's answer ends the head");
+        };
         assert_eq!(result.source_metadata, Some(refreshed_metadata));
         assert!(result.last_refresh.is_some());
         assert_eq!(result.version_id, Some(version_id));
