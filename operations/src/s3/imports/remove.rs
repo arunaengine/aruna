@@ -5,23 +5,25 @@
 
 use super::ImportRuleError;
 use crate::groups::backends::{backend_key, record_writes};
-use crate::groups::fence::{parse_group_record, read_group_record};
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use crate::groups::fence::group_fence_key;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     IMPORT_DISCOVERY_KEYSPACE, IMPORT_INTENT_KEYSPACE, IMPORT_PATTERN_KEYSPACE,
     IMPORT_REMOVAL_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{read_row, values};
+use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ProviderCleanup, RemovalMark, WriteIntent, import_key, object_prefix,
 };
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, VersionKey};
 use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
 const DELETE_PAGE: usize = 512;
@@ -34,16 +36,236 @@ pub const ONLY_STORAGE: &str =
 pub const LINKED_FILES: &str =
     "the bucket still holds files; delete or empty the bucket to end the link";
 
+fn mark_key(import_id: Ulid) -> Key {
+    import_id.to_bytes().to_vec().into()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RemoveState {
-    Init,
-    Start,
-    Read,
-    CheckStorage,
-    Check,
+enum DropStep {
+    Rule,
+    Storage,
+    Files,
     Delete,
     Mark,
-    Commit,
+}
+
+type DropTurn = Result<Next<String>, ImportRuleError>;
+
+/// Deletes the rule and stores its removal mark in one transaction. Outputs the rule's bucket.
+#[derive(Debug, PartialEq)]
+struct DropRule {
+    group_id: GroupId,
+    import_id: Ulid,
+    step: DropStep,
+    bucket: String,
+}
+
+impl DropRule {
+    fn new(group_id: GroupId, import_id: Ulid) -> Self {
+        Self {
+            group_id,
+            import_id,
+            step: DropStep::Rule,
+            bucket: String::new(),
+        }
+    }
+
+    fn call(&mut self, step: DropStep, call: IoCall) -> DropTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn rule_read(&mut self, [rule, fence]: [Option<Value>; 2]) -> DropTurn {
+        check_group_write(fence.as_deref())?;
+        let rule = rule.ok_or(ImportRuleError::NotFound)?;
+        let rule = BackendImport::from_bytes(&rule)?;
+        self.bucket = rule.bucket.clone();
+        if rule.mapped_bucket().is_none() {
+            return self.check_files();
+        }
+        // A 1:1 link may be the only storage its bucket has.
+        let reads = vec![
+            (
+                STORAGE_BACKEND_KEYSPACE.to_string(),
+                backend_key(rule.backend_id),
+            ),
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                rule.bucket.as_bytes().to_vec().into(),
+            ),
+        ];
+        self.call(DropStep::Storage, IoCall::Read(reads))
+    }
+
+    fn storage_read(&mut self, [storage, bucket]: [Option<Value>; 2]) -> DropTurn {
+        let storage = storage
+            .as_deref()
+            .map(GroupStorage::from_bytes)
+            .transpose()?;
+        let shared =
+            storage.is_none_or(|storage| !storage.splits() || storage.default_bucket().is_some());
+        if bucket.is_some() && !shared {
+            return Err(ImportRuleError::Conflict(ONLY_STORAGE.to_string()));
+        }
+        self.check_files()
+    }
+
+    /// A link ends with its bucket: one version row is enough to refuse.
+    fn check_files(&mut self) -> DropTurn {
+        let page = IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: VersionKey::bucket_prefix(&self.bucket)?.into(),
+            after: None,
+            limit: 1,
+        };
+        self.call(DropStep::Files, page)
+    }
+
+    fn files_read(&mut self, rows: Vec<(Key, Value)>) -> DropTurn {
+        if !rows.is_empty() {
+            return Err(ImportRuleError::Conflict(LINKED_FILES.to_string()));
+        }
+        let key = import_key(self.group_id, self.import_id);
+        // The discovery rules go with the rule.
+        let deletes = [BACKEND_IMPORT_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE]
+            .map(|key_space| (key_space.to_string(), key.clone()))
+            .to_vec();
+        self.call(DropStep::Delete, IoCall::Delete(deletes))
+    }
+
+    fn write_mark(&mut self) -> DropTurn {
+        let mark = RemovalMark {
+            bucket: self.bucket.clone(),
+            cleanup: None,
+        };
+        let row = (
+            IMPORT_REMOVAL_KEYSPACE.to_string(),
+            mark_key(self.import_id),
+            mark.to_bytes()?.into(),
+        );
+        self.call(DropStep::Mark, IoCall::Write(vec![row]))
+    }
+}
+
+impl Operation for DropRule {
+    type Output = String;
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> DropTurn {
+        let key = import_key(self.group_id, self.import_id);
+        let reads = vec![
+            (BACKEND_IMPORT_KEYSPACE.to_string(), key),
+            group_fence_key(self.group_id),
+        ];
+        self.call(DropStep::Rule, IoCall::Read(reads))
+    }
+
+    fn next(&mut self, result: IoResult) -> DropTurn {
+        match self.step {
+            DropStep::Rule => self.rule_read(values::<2>(result)?),
+            DropStep::Storage => self.storage_read(values::<2>(result)?),
+            DropStep::Files => self.files_read(result.page()?.0),
+            DropStep::Delete => {
+                result.done()?;
+                self.write_mark()
+            }
+            DropStep::Mark => {
+                result.done()?;
+                Ok(Next::Done(std::mem::take(&mut self.bucket)))
+            }
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettleStep {
+    Record,
+    Write,
+    Unmark,
+}
+
+type SettleTurn = Result<Next<()>, ImportRuleError>;
+
+/// Settles the storage record after its provider bucket was handled and drops the mark, in one
+/// transaction. A deleted bucket leaves the record; one that still holds objects is `created`
+/// again.
+#[derive(Debug, PartialEq)]
+struct SettleProvider {
+    import_id: Ulid,
+    cleanup: ProviderCleanup,
+    deleted: bool,
+    step: SettleStep,
+}
+
+impl SettleProvider {
+    fn call(&mut self, step: SettleStep, call: IoCall) -> SettleTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn delete_mark(&mut self) -> SettleTurn {
+        let mark = (
+            IMPORT_REMOVAL_KEYSPACE.to_string(),
+            mark_key(self.import_id),
+        );
+        self.call(SettleStep::Unmark, IoCall::Delete(vec![mark]))
+    }
+
+    fn record_read(&mut self, value: Option<Value>) -> SettleTurn {
+        let record = value
+            .map(|value| GroupStorage::from_bytes(&value))
+            .transpose()?;
+        let bucket = &self.cleanup.bucket;
+        let Some(mut record) =
+            record.filter(|record| record.bucket_state(bucket) == Some(BUCKET_DELETING))
+        else {
+            return self.delete_mark();
+        };
+        let state = format!("{BUCKET_STATE}{bucket}");
+        match self.deleted {
+            true => record.public_config.remove(&state),
+            false => record.public_config.insert(state, "created".to_string()),
+        };
+        let writes = record_writes(&record)?;
+        self.call(SettleStep::Write, IoCall::Write(writes))
+    }
+}
+
+impl Operation for SettleProvider {
+    type Output = ();
+    type Error = ImportRuleError;
+
+    fn first(&mut self) -> SettleTurn {
+        let key = backend_key(self.cleanup.backend_id);
+        self.call(SettleStep::Record, read_row(STORAGE_BACKEND_KEYSPACE, key))
+    }
+
+    fn next(&mut self, result: IoResult) -> SettleTurn {
+        match self.step {
+            SettleStep::Record => self.record_read(result.value()?),
+            SettleStep::Write => {
+                result.done()?;
+                self.delete_mark()
+            }
+            SettleStep::Unmark => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoveState {
+    DropRule,
     ReadMark,
     Scan,
     Purge,
@@ -51,13 +273,10 @@ enum RemoveState {
     QueueClaims,
     Unmark,
     DropProvider,
-    StartRecord,
-    ReadRecord,
-    WriteRecord,
-    DeleteMark,
-    CommitRecord,
-    Finish,
+    Settle,
 }
+
+type RemoveTurn = Result<Next<()>, ImportRuleError>;
 
 /// The rule goes in one transaction with a removal mark; its object rows follow in pages and
 /// the mark goes last, so an interrupted removal resumes from the mark. Imported versions
@@ -68,164 +287,145 @@ pub struct RemoveImportOperation {
     group_id: Option<GroupId>,
     import_id: Ulid,
     state: RemoveState,
-    txn_id: Option<TxnId>,
-    /// The provider bucket the mark deletes, and whether the storage deleted it.
+    /// The provider bucket the mark deletes.
     cleanup: Option<ProviderCleanup>,
     /// The rule's bucket, which the settlement of its unfinished moves names.
     bucket: Option<String>,
-    deleted: bool,
     /// The rows go first, then the write intents.
     space: &'static str,
     /// The intent rows that go once their settlements are queued.
     pending: Vec<(String, Key)>,
     claims_queued: bool,
-    output: Option<Result<(), ImportRuleError>>,
 }
 
 impl RemoveImportOperation {
     pub fn new(group_id: GroupId, import_id: Ulid) -> Self {
-        Self {
-            group_id: Some(group_id),
-            import_id,
-            state: RemoveState::Init,
-            txn_id: None,
-            cleanup: None,
-            bucket: None,
-            deleted: false,
-            space: IMPORTED_OBJECT_KEYSPACE,
-            pending: Vec::new(),
-            claims_queued: false,
-            output: None,
-        }
+        Self::with_group(Some(group_id), import_id)
     }
 
     /// Deletes the remaining object rows of a removal that was interrupted.
     pub fn resume(import_id: Ulid) -> Self {
+        Self::with_group(None, import_id)
+    }
+
+    fn with_group(group_id: Option<GroupId>, import_id: Ulid) -> Self {
         Self {
-            group_id: None,
+            group_id,
             import_id,
-            state: RemoveState::Init,
-            txn_id: None,
+            state: RemoveState::ReadMark,
             cleanup: None,
             bucket: None,
-            deleted: false,
             space: IMPORTED_OBJECT_KEYSPACE,
             pending: Vec::new(),
             claims_queued: false,
-            output: None,
         }
     }
 
-    fn mark_key(&self) -> Key {
-        self.import_id.to_bytes().to_vec().into()
+    fn call(&mut self, state: RemoveState, call: IoCall) -> RemoveTurn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn fail(&mut self, error: ImportRuleError) -> Effects {
-        self.state = RemoveState::Finish;
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    fn scan(&mut self) -> Effects {
-        self.state = RemoveState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: self.space.to_string(),
-            prefix: Some(object_prefix(self.import_id)),
-            start: None,
+    fn scan(&mut self) -> RemoveTurn {
+        let page = IoCall::Page {
+            space: self.space.to_string(),
+            prefix: object_prefix(self.import_id),
+            after: None,
             limit: DELETE_PAGE,
-            txn_id: None,
-        })]
+        };
+        self.call(RemoveState::Scan, page)
     }
 
-    fn purge(&mut self, values: Vec<(Key, Value)>) -> Effects {
-        if values.is_empty() && self.space == IMPORTED_OBJECT_KEYSPACE {
-            self.space = IMPORT_INTENT_KEYSPACE;
-            return self.scan();
+    fn mark_read(&mut self, value: Option<Value>) -> RemoveTurn {
+        if let Some(mark) = value.as_deref().map(RemovalMark::from_bytes).transpose()? {
+            self.cleanup = mark.cleanup;
+            self.bucket = Some(mark.bucket);
         }
-        if values.is_empty() && self.space == IMPORT_INTENT_KEYSPACE {
-            self.space = IMPORT_PATTERN_KEYSPACE;
-            return self.scan();
+        self.scan()
+    }
+
+    /// The rule's delete claims and moved-row records go with it, through the cleanup queue.
+    fn queue_claims(&mut self) -> RemoveTurn {
+        let id = self.import_id.to_bytes().to_vec();
+        let works = [
+            BlobCleanupWork::DropClaims {
+                import_id: self.import_id,
+            },
+            BlobCleanupWork::DropRows {
+                key_space: RENAMED_ROW_KEYSPACE.to_string(),
+                prefix: id.clone(),
+            },
+        ];
+        let mut writes = Vec::new();
+        for (tag, work) in works.into_iter().enumerate() {
+            let key = [&id[..], &[tag as u8]].concat().into();
+            writes.push((
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                key,
+                work.to_bytes()?.into(),
+            ));
         }
-        // The rule's delete claims and moved-row records go with it, through the cleanup queue.
-        if values.is_empty() && !self.claims_queued {
-            let id = self.import_id.to_bytes().to_vec();
-            let works = [
-                BlobCleanupWork::DropClaims {
-                    import_id: self.import_id,
-                },
-                BlobCleanupWork::DropRows {
-                    key_space: RENAMED_ROW_KEYSPACE.to_string(),
-                    prefix: id.clone(),
-                },
-            ];
-            let mut writes = Vec::new();
-            for (tag, work) in works.into_iter().enumerate() {
-                let value = match work.to_bytes() {
-                    Ok(value) => value,
-                    Err(error) => return self.fail(error.into()),
-                };
-                let key = [&id[..], &[tag as u8]].concat().into();
-                writes.push((BLOB_CLEANUP_KEYSPACE.to_string(), key, value.into()));
-            }
-            self.state = RemoveState::QueueClaims;
-            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })];
-        }
-        if let (true, Some(cleanup)) = (values.is_empty(), self.cleanup.as_ref()) {
-            self.state = RemoveState::DropProvider;
-            return smallvec![Effect::Blob(BlobEffect::DeleteEmptyBucket {
+        self.call(RemoveState::QueueClaims, IoCall::Write(writes))
+    }
+
+    /// All rows are gone: the provider bucket is next, or the mark when there is none.
+    fn rows_gone(&mut self) -> RemoveTurn {
+        if let Some(cleanup) = self.cleanup.as_ref() {
+            let drop = Effect::Blob(BlobEffect::DeleteEmptyBucket {
                 backend: BackendRef::Group(cleanup.backend_id),
                 bucket: cleanup.bucket.clone(),
-            })];
+            });
+            return self.call(RemoveState::DropProvider, drop.into());
         }
-        if values.is_empty() {
-            self.state = RemoveState::Unmark;
-            return smallvec![Effect::Storage(StorageEffect::Delete {
-                key_space: IMPORT_REMOVAL_KEYSPACE.to_string(),
-                key: self.mark_key(),
-                txn_id: None,
-            })];
+        let mark = (
+            IMPORT_REMOVAL_KEYSPACE.to_string(),
+            mark_key(self.import_id),
+        );
+        self.call(RemoveState::Unmark, IoCall::Delete(vec![mark]))
+    }
+
+    fn purge(&mut self, rows: Vec<(Key, Value)>) -> RemoveTurn {
+        if rows.is_empty() {
+            return match self.space {
+                IMPORTED_OBJECT_KEYSPACE => {
+                    self.space = IMPORT_INTENT_KEYSPACE;
+                    self.scan()
+                }
+                IMPORT_INTENT_KEYSPACE => {
+                    self.space = IMPORT_PATTERN_KEYSPACE;
+                    self.scan()
+                }
+                _ if !self.claims_queued => self.queue_claims(),
+                _ => self.rows_gone(),
+            };
         }
         // A move's own intents are settled through the cleanup queue, which keeps each one.
         let settle = match self.space == IMPORT_INTENT_KEYSPACE {
-            true => self.settlements(&values),
-            false => Ok(Vec::new()),
+            true => self.settlements(&rows)?,
+            false => Vec::new(),
         };
-        let deletes = values
+        let deletes: Vec<_> = rows
             .into_iter()
             .map(|(key, _)| (self.space.to_string(), key))
             .collect();
-        match settle {
-            Ok(writes) if !writes.is_empty() => {
-                self.state = RemoveState::QueueMoves;
-                self.pending = deletes;
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: None,
-                })]
-            }
-            Ok(_) => self.purge_rows(deletes),
-            Err(error) => self.fail(error),
+        if settle.is_empty() {
+            return self.purge_rows(deletes);
         }
+        self.pending = deletes;
+        self.call(RemoveState::QueueMoves, IoCall::Write(settle))
     }
 
-    fn purge_rows(&mut self, deletes: Vec<(String, Key)>) -> Effects {
-        self.state = RemoveState::Purge;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })]
+    fn purge_rows(&mut self, deletes: Vec<(String, Key)>) -> RemoveTurn {
+        self.call(RemoveState::Purge, IoCall::Delete(deletes))
     }
 
     /// One `SettleMove` work per intent a move owns, keyed by the intent like a hand-over.
     fn settlements(
         &self,
-        values: &[(Key, Value)],
+        rows: &[(Key, Value)],
     ) -> Result<Vec<(String, Key, Value)>, ImportRuleError> {
         let mut writes = Vec::new();
-        for (key, value) in values {
+        for (key, value) in rows {
             let intent = WriteIntent::from_bytes(value)?;
             let Some(bucket) = self.bucket.as_deref().filter(|_| intent.mover.is_some()) else {
                 continue;
@@ -242,15 +442,15 @@ impl RemoveImportOperation {
         }
         Ok(writes)
     }
-}
 
-impl RemoveImportOperation {
-    /// A link ends with its bucket: one version row is enough to refuse.
-    fn check_files(&mut self) -> Effects {
-        let bucket = self.bucket.clone().unwrap_or_default();
-        let prefix = match VersionKey::bucket_prefix(&bucket) {
-            Ok(prefix) => prefix,
-            Err(error) => return self.fail(error.into()),
+    fn provider_dropped(&mut self, event: Event) -> RemoveTurn {
+        let deleted = match event {
+            Event::Blob(BlobEvent::BucketDeleted { deleted }) => deleted,
+            // The mark stays, so the schedule tries the provider bucket again.
+            Event::Blob(BlobEvent::Error(error)) => {
+                return Err(ImportRuleError::Read(error.reason()));
+            }
+            _ => return Err(ImportRuleError::Unexpected("DropProvider")),
         };
         self.state = RemoveState::Check;
         smallvec![Effect::Storage(StorageEffect::Iter {
