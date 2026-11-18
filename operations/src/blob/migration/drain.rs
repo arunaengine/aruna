@@ -2,130 +2,53 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use aruna_core::NodeId;
 use aruna_core::backoff::capped_backoff;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, GroupEvent, GroupResult};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
-    IMPORT_INTENT_KEYSPACE, MIGRATION_AHEAD_KEYSPACE, MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE,
+    COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, IMPORT_INTENT_KEYSPACE,
+    MIGRATION_AHEAD_KEYSPACE, MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE,
 };
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::storage::backend_import::{RenameRequest, WriteIntent};
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::backend_import::{RenameRequest, WriteIntent, object_prefix};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, ResolvedBackend, VersionKey,
 };
-use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::{
     Compression, CompressionMigration, MigrationAhead, StoredLayout,
 };
-use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::types::{Key, TxnId};
+use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
+use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
-use super::batch::Stop;
+use super::batch::{Batch, Stop};
+use super::broken::ProcessChecksOperation;
+use super::check::{CheckOutcome, CheckVersionError, CheckVersionOperation};
+use super::queue::ProcessTransitionsOperation;
+use super::shared::{
+    EarlierPatternsOperation, MigrationError, encryption_read, is_encrypted, routing_call,
+    routing_result,
+};
 use super::{
     Earlier, MigrateOutcome, MigrateVersionError, MigrateVersionOperation, RULE_PAGE, place,
     same_bytes,
 };
-use super::{batch, broken, check};
-use crate::blob::records::blob_location_read;
-
-/// The rename request of the move `record` of `bucket`, if it was started to rename files.
-pub(super) async fn rename_request(
-    context: &crate::driver::DriverContext,
-    bucket: &str,
-    record: &CompressionMigration,
-) -> Result<Option<RenameRequest>, String> {
-    let read = StorageEffect::Read {
-        key_space: RENAME_MOVE_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    let value = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => {
-            return Err(format!(
-                "could not read the rename request: {}",
-                other.label()
-            ));
-        }
-    };
-    let request = value
-        .map(|value| RenameRequest::from_bytes(&value))
-        .transpose();
-    let request = request.map_err(|error| error.to_string())?;
-    Ok(request.filter(|request| record.moving && request.started_at_ms == record.started_at_ms))
-}
-
-/// The caller's WRITE on the bucket's keys, loaded once for a page of a rename; `None` when
-/// the caller's token no longer holds or the caller may not use the bucket any more. State
-/// that cannot be read is an error, so the page is retried rather than passed over.
-pub(super) async fn rename_access(
-    context: &crate::driver::DriverContext,
-    request: &RenameRequest,
-    routing: &RoutingSnapshot,
-    bucket: &str,
-) -> Result<Option<crate::auth::request_authorization::BucketAccess>, String> {
-    use crate::auth::request_authorization::BucketAccess;
-    let valid = crate::auth::bearer_token::grant_valid(
-        &context.storage_handle,
-        &request.grant,
-        &request.auth.user_id,
-    );
-    if !valid.await.map_err(|error| error.to_string())? {
-        return Ok(None);
-    }
-    let admin = crate::s3::bucket::job_pages::still_admin(context, &request.auth, routing.group_id);
-    if !admin.await? {
-        return Ok(None);
-    }
-    let scope = (request.auth.realm_id, routing.group_id, request.node_id);
-    let loaded = BucketAccess::load(context, &request.auth, scope, bucket).await;
-    let Some(access) = granted(loaded)? else {
-        return Ok(None);
-    };
-    let write = aruna_core::structs::identity::auth::Permission::WRITE;
-    Ok(access.allows(None, &write).then_some(access))
-}
-
-/// A denial ends the rename; policy state that cannot be read is an error to retry.
-pub(super) fn granted<T>(
-    loaded: Result<T, crate::auth::error::AuthorizeError>,
-) -> Result<Option<T>, String> {
-    use crate::auth::error::AuthorizeError;
-    use crate::auth::error::PolicyEnforcementError;
-    match loaded {
-        Ok(access) => Ok(Some(access)),
-        Err(AuthorizeError::PermissionDenied)
-        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// Reads the earlier patterns of the rules a move resolves against.
-pub async fn read_earlier(
-    context: &crate::driver::DriverContext,
-    routing: &RoutingSnapshot,
-) -> Result<Earlier, String> {
-    let mut earlier = Earlier::new();
-    for rule in &routing.imports {
-        let patterns = crate::driver::drive(
-            crate::s3::imports::ReadEarlierOperation::new(rule.import_id),
-            context,
-        )
-        .await;
-        let patterns = patterns.map_err(|error| error.to_string())?;
-        if !patterns.is_empty() {
-            earlier.insert(rule.import_id, patterns);
-        }
-    }
-    Ok(earlier)
-}
+use crate::auth::bearer_token::GrantValidOperation;
+use crate::auth::error::{ArunaBearerError, AuthorizeError, PolicyEnforcementError};
+use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
+use crate::s3::bucket::job_pages::{ProcessLinkedOperation, StillAdminOperation};
 
 /// Versions one task run handles per bucket before it yields to other timers.
 pub(super) const MIGRATION_PAGE: usize = 64;
@@ -158,6 +81,116 @@ pub(super) const RETRY_BASE: Duration = Duration::from_secs(60);
 
 pub(super) const RETRY_MAX: Duration = Duration::from_secs(3600);
 
+/// Intent pages one hand-over run writes at most before it stores its place.
+const HANDOVER_PAGES: usize = 16;
+
+type Turn<T> = Result<Next<T>, MigrationError>;
+/// This node and its realm, where it serves one.
+type Serving = Option<(NodeId, RealmId)>;
+
+fn bucket_key(bucket: &str) -> Key {
+    bucket.as_bytes().to_vec().into()
+}
+
+fn soonest(next: &mut Option<Duration>, after: Duration) {
+    *next = Some(next.map_or(after, |next| next.min(after)));
+}
+
+/// The rename request `value` holds, if the move `record` was started for it.
+pub(super) fn decode_request(
+    value: Option<Value>,
+    record: (bool, u64),
+) -> Result<Option<RenameRequest>, MigrationError> {
+    let request = value
+        .map(|value| RenameRequest::from_bytes(&value))
+        .transpose()
+        .map_err(MigrationError::failed)?;
+    let (moving, started_at_ms) = record;
+    Ok(request.filter(|request| moving && request.started_at_ms == started_at_ms))
+}
+
+/// A denial ends the rename; policy state that cannot be read is an error to retry.
+pub(super) fn granted<T>(loaded: Result<T, AuthorizeError>) -> Result<Option<T>, String> {
+    match loaded {
+        Ok(access) => Ok(Some(access)),
+        Err(AuthorizeError::PermissionDenied)
+        | Err(AuthorizeError::Policy(PolicyEnforcementError::Denied { .. })) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum AccessStep {
+    Grant,
+    Admin,
+    Bucket,
+}
+
+/// The caller's WRITE on the bucket's keys, loaded once for a page of a rename; `None` when
+/// the caller's token no longer holds or the caller may not use the bucket any more. State
+/// that cannot be read is an error, so the page is retried rather than passed over.
+#[derive(Debug, PartialEq)]
+pub(super) struct RenameAccessOperation {
+    request: RenameRequest,
+    group_id: ulid::Ulid,
+    bucket: String,
+    step: AccessStep,
+}
+
+impl RenameAccessOperation {
+    pub(super) fn new(request: &RenameRequest, group_id: ulid::Ulid, bucket: &str) -> Self {
+        Self {
+            request: request.clone(),
+            group_id,
+            bucket: bucket.to_string(),
+            step: AccessStep::Grant,
+        }
+    }
+}
+
+impl Operation for RenameAccessOperation {
+    type Output = Option<BucketAccess>;
+    type Error = MigrationError;
+
+    fn first(&mut self) -> Turn<Option<BucketAccess>> {
+        let request = &self.request;
+        let valid = GrantValidOperation::new(&request.grant, &request.auth.user_id);
+        Ok(Next::Call(IoCall::child(valid)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<Option<BucketAccess>> {
+        let request = &self.request;
+        match self.step {
+            AccessStep::Grant => {
+                let valid =
+                    (result.child::<bool, ArunaBearerError>()?).map_err(MigrationError::failed)?;
+                if !valid {
+                    return Ok(Next::Done(None));
+                }
+                let admin = StillAdminOperation::new(&request.auth, self.group_id);
+                self.step = AccessStep::Admin;
+                Ok(Next::Call(IoCall::child(admin)))
+            }
+            AccessStep::Admin => {
+                if !result.child::<bool, MigrationError>()?? {
+                    return Ok(Next::Done(None));
+                }
+                let scope = (request.auth.realm_id, self.group_id, request.node_id);
+                let load = BucketAccessOperation::new(&request.auth, scope, &self.bucket);
+                self.step = AccessStep::Bucket;
+                Ok(Next::Call(IoCall::child(load)))
+            }
+            AccessStep::Bucket => {
+                let loaded = result.child::<BucketAccess, AuthorizeError>()?;
+                let access = granted(loaded).map_err(MigrationError::Failed)?;
+                let write = Permission::WRITE;
+                let access = access.filter(|access| access.allows(None, &write));
+                Ok(Next::Done(access))
+            }
+        }
+    }
+}
+
 /// What one task run left behind.
 #[derive(Debug, PartialEq)]
 pub struct MigrationRun {
@@ -167,92 +200,115 @@ pub struct MigrationRun {
     pub cursor: Option<Key>,
 }
 
-/// Advances the unfinished migrations of one page of queued buckets by one page each.
-pub async fn process_migrations(
-    context: &crate::driver::DriverContext,
-    after: Option<Key>,
-) -> Result<MigrationRun, String> {
-    let resumed = after.is_some();
-    let (rows, cursor) = crate::storage_read::iter_prefix_page(
-        &context.storage_handle,
-        COMPRESSION_QUEUE_KEYSPACE,
-        None,
-        after,
-        BUCKET_PAGE,
-        None,
-    )
-    .await?;
-    let now = aruna_core::time::unix_timestamp_millis();
-    let mut next = None::<Duration>;
-    let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
-    for (key, _) in rows {
-        let Some(record) = read_progress(context, &key).await? else {
-            continue;
-        };
-        if record.finished_at_ms.is_some() {
-            continue;
-        }
-        if let Some(at) = record.retry_at_ms.filter(|at| *at > now) {
-            soon(Duration::from_millis(at - now));
-            continue;
-        }
-        let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
-        // Encryption replaced this work: its transition converts every version.
-        if encrypting(context, &key).await? {
-            if record.moving && !hand_over_moves(context, &bucket, record.started_at_ms).await? {
-                soon(MIGRATION_CONTINUE);
-                continue;
-            }
-            let mut retired = record;
-            retired.retry_at_ms = None;
-            retired.finished_at_ms = Some(now);
-            store_progress(context, &bucket, &retired, None).await?;
-            continue;
-        }
-        if let Some(after) = migrate_page(context, &bucket, record, MIGRATION_TIME).await? {
-            soon(after);
-        }
-    }
-    // Encryption transitions share this task; a run at the queue head advances them all.
-    if !resumed
-        && let Some(after) = crate::blob::migration::queue::process_transitions(context).await?
-    {
-        soon(after);
-    }
-    // Storage checks share this task too.
-    if !resumed && let Some(after) = broken::process_checks(context).await? {
-        soon(after);
-    }
-    // So do the re-mapping and duplicate cleanup jobs of buckets.
-    if !resumed && let Some(after) = crate::s3::bucket::job_pages::process_linked(context).await? {
-        soon(after);
-    }
-    // Queued buckets after this page, or before it when the run resumed mid-queue.
-    if cursor.is_some() || resumed {
-        soon(MIGRATION_CONTINUE);
-    }
-    Ok(MigrationRun { next, cursor })
+#[derive(Debug, PartialEq)]
+enum RunStep {
+    Queue,
+    Progress(Key),
+    Encryption(String, CompressionMigration),
+    Handover(String, CompressionMigration),
+    Retired,
+    Page,
+    Transitions,
+    Checks,
+    Linked,
 }
 
-pub(super) async fn encrypting(
-    context: &crate::driver::DriverContext,
-    bucket: &Key,
-) -> Result<bool, String> {
-    let read = StorageEffect::Read {
-        key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-        key: bucket.clone(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            BucketEncryption::from_row(value.as_deref())
-                .map(|settings| settings.is_encrypted())
-                .map_err(|error| error.to_string())
+/// Advances the unfinished migrations of one page of queued buckets by one page each.
+#[derive(Debug, PartialEq)]
+pub struct ProcessMigrationsOperation {
+    routing: NodeRouting,
+    serving: Serving,
+    after: Option<Key>,
+    resumed: bool,
+    now_ms: u64,
+    step: RunStep,
+    rows: VecDeque<Key>,
+    cursor: Option<Key>,
+    next: Option<Duration>,
+}
+
+type RunTurn = Turn<MigrationRun>;
+
+impl ProcessMigrationsOperation {
+    pub fn new(routing: NodeRouting, serving: Serving, after: Option<Key>) -> Self {
+        Self {
+            routing,
+            serving,
+            resumed: after.is_some(),
+            after,
+            now_ms: 0,
+            step: RunStep::Queue,
+            rows: VecDeque::new(),
+            cursor: None,
+            next: None,
         }
-        other => Err(format!(
-            "could not read encryption settings: {}",
-            other.label()
-        )),
+    }
+
+    fn call(&mut self, step: RunStep, call: IoCall) -> RunTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn next_bucket(&mut self) -> RunTurn {
+        match self.rows.pop_front() {
+            Some(key) => {
+                let read = read_row(COMPRESSION_MIGRATION_KEYSPACE, key.clone());
+                self.call(RunStep::Progress(key), read)
+            }
+            None => self.shared_work(),
+        }
+    }
+
+    fn progress_read(&mut self, key: Key, value: Option<Value>) -> RunTurn {
+        let Some(record) = decode_progress(value)? else {
+            return self.next_bucket();
+        };
+        if record.finished_at_ms.is_some() {
+            return self.next_bucket();
+        }
+        if let Some(at) = record.retry_at_ms.filter(|at| *at > self.now_ms) {
+            soonest(&mut self.next, Duration::from_millis(at - self.now_ms));
+            return self.next_bucket();
+        }
+        let bucket = String::from_utf8(key.to_vec()).map_err(MigrationError::failed)?;
+        let read = encryption_read(&bucket);
+        self.call(RunStep::Encryption(bucket, record), read)
+    }
+
+    /// Encryption replaced this work: its transition converts every version.
+    fn retire(&mut self, bucket: String, mut record: CompressionMigration) -> RunTurn {
+        record.retry_at_ms = None;
+        record.finished_at_ms = Some(self.now_ms);
+        let store = StoreMigrationOperation::new(&bucket, record, None);
+        self.call(RunStep::Retired, IoCall::child(store))
+    }
+
+    /// Encryption transitions, storage checks and the jobs of buckets share this task; a run at
+    /// the queue head advances them all.
+    fn shared_work(&mut self) -> RunTurn {
+        if self.resumed {
+            return self.finish();
+        }
+        let transitions = ProcessTransitionsOperation::new(self.serving);
+        self.call(RunStep::Transitions, IoCall::child(transitions))
+    }
+
+    fn take_wait(&mut self, result: IoResult) -> Result<(), MigrationError> {
+        if let Some(after) = result.child::<Option<Duration>, MigrationError>()?? {
+            soonest(&mut self.next, after);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> RunTurn {
+        // Queued buckets after this page, or before it when the run resumed mid-queue.
+        if self.cursor.is_some() || self.resumed {
+            soonest(&mut self.next, MIGRATION_CONTINUE);
+        }
+        Ok(Next::Done(MigrationRun {
+            next: self.next,
+            cursor: self.cursor.take(),
+        }))
     }
 }
 
