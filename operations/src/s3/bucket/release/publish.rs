@@ -478,262 +478,257 @@ fn range_refused(range: &KeyRange) -> PublishError {
     ))
 }
 
-/// Rows read per storage page while looking for a bucket's releases.
-const ROW_PAGE: usize = 256;
-
-/// Every release row of `bucket` this node holds, in key order.
-async fn release_rows(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Vec<(Ulid, ReleasePointer)>, PublishError> {
-    let prefix = release_prefix(bucket);
-    let mut rows = Vec::new();
-    let mut start = None;
-    loop {
-        let iter = StorageEffect::Iter {
-            key_space: BUCKET_RELEASE_KEYSPACE.to_string(),
-            prefix: Some(prefix.clone().into()),
-            start: start.take().map(IterStart::After),
-            limit: ROW_PAGE,
-            txn_id: None,
-        };
-        let (values, next) = match context.storage_handle.send_storage_effect(iter).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            other => return Err(PublishError::Unavailable(other.label().to_string())),
-        };
-        for (key, value) in values {
-            let Some(bytes) = key.get(prefix.len()..) else {
-                continue;
-            };
-            let Ok(id) = <[u8; 16]>::try_from(bytes) else {
-                continue;
-            };
-            let pointer = ReleasePointer::from_bytes(value.as_ref())
-                .map_err(|error| PublishError::Unavailable(error.to_string()))?;
-            rows.push((Ulid::from_bytes(id), pointer));
-        }
-        match next {
-            Some(next) => start = Some(next),
-            None => return Ok(rows),
-        }
-    }
-}
-
-async fn allowed(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth: &AuthContext,
-    path: &str,
-) -> Result<bool, PublishError> {
-    let extras = PolicyRequestExtras::rest();
-    match drive(
-        AuthorizeOperation::new(realm_id, auth, path, &Permission::WRITE, extras),
-        context,
-    )
-    .await
-    {
-        Ok(()) => Ok(true),
-        Err(AuthorizeError::Storage(error)) => Err(PublishError::Unavailable(error.to_string())),
-        Err(_) => Ok(false),
-    }
-}
-
-/// The current files under the prefix, each range listed by its own coordinator; a range no
-/// coordinator lists now refuses the publish, since a copy may be behind.
-async fn coordinated_files(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    access: &Access,
-    input: &PublishInput,
-) -> Result<Vec<ReleaseFile>, PublishError> {
-    let asked = (input.spec.prefix.as_str(), input.key.as_str());
-    let Some(binding) = &scope.info.distribution else {
-        return all_files(context, scope, access, asked, None).await;
+/// A release question to another member under the caller's token.
+fn holder_call(
+    node_id: NodeId,
+    auth_token: AuthToken,
+    bucket: String,
+    ask: HolderAsk,
+) -> Result<IoCall, PublishError> {
+    let frame = encode_message(&MetadataTransportMessage::ReleaseHolder {
+        auth_token: Some(auth_token),
+        bucket,
+        ask,
+    })
+    .map_err(PublishError::Unavailable)?;
+    let request = MetadataRequestEffect {
+        peer: node_id,
+        frame,
+        timeout: HOLDER_DEADLINE,
     };
-    let unavailable = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let view = drive(read_view(binding.set_id), context)
-        .await
-        .map_err(|error| unavailable(&error))?
-        .ok_or_else(|| PublishError::Unavailable("this node holds no record of the set".into()))?;
-    let fence = drive(local_fence(binding.set_id), context)
-        .await
-        .map_err(|error| unavailable(&error))?;
-    let snapshot = view.snapshot();
-    let mut files = Vec::new();
-    for range in snapshot.listed_ranges(&input.spec.prefix) {
-        if snapshot.lists_locally(binding.member_id, range, &fence) {
-            files.extend(all_files(context, scope, access, asked, Some(range)).await?);
-            continue;
+    Ok(Effect::Net(NetEffect::MetadataRequest(Box::new(request))).into())
+}
+
+/// A member's answer; a transport failure reads like an unavailable member.
+fn holder_reply(result: IoResult) -> Result<Result<HolderAnswer, MetadataReadError>, IoError> {
+    let Event::Net(NetEvent::MetadataAnswer(answer)) = result.event()? else {
+        return Ok(Err(MetadataReadError::Unavailable));
+    };
+    let MetadataAnswer { result, .. } = *answer;
+    let reply = result.ok().and_then(|bytes| decode_message(&bytes).ok());
+    Ok(match reply {
+        Some(MetadataTransportMessage::ReleaseHolderResults { result }) => result,
+        _ => Err(MetadataReadError::Unavailable),
+    })
+}
+
+impl CoordinatedFilesOperation {
+    fn new(scope: ReleaseScope, access: Access, input: PublishInput) -> Self {
+        Self {
+            scope,
+            access,
+            input,
+            plans: VecDeque::new(),
+            files: Vec::new(),
+            step: CoordinatedStep::View,
         }
-        let refused = || {
-            PublishError::Unavailable(format!(
-                "range {} could not be listed by its coordinator",
-                range.range_id
-            ))
+    }
+
+    fn list_files(&mut self, range: Option<KeyRange>) -> PublishTurn<Vec<ReleaseFile>> {
+        self.step = CoordinatedStep::Local;
+        Ok(Next::Call(IoCall::child(AllFilesOperation {
+            scope: self.scope.clone(),
+            access: self.access.clone(),
+            prefix: self.input.spec.prefix.clone(),
+            skip: self.input.key.clone(),
+            range,
+            files: Vec::new(),
+        })))
+    }
+
+    fn ask(
+        &mut self,
+        range: KeyRange,
+        node_id: NodeId,
+        after: Option<String>,
+    ) -> PublishTurn<Vec<ReleaseFile>> {
+        let Some(bearer) = self.input.bearer.clone() else {
+            return Err(range_refused(&range));
         };
-        let (Some(coordinator), Some(bearer), Some(handle)) = (
-            snapshot.list_holder(range),
-            input.bearer.as_ref(),
-            context.metadata_handle.as_ref(),
-        ) else {
-            return Err(refused());
+        let token = AuthToken::bearer(bearer).map_err(unavailable)?;
+        let ask = HolderAsk::Files {
+            range_id: range.range_id,
+            prefix: self.input.spec.prefix.clone(),
+            skip: self.input.key.clone(),
+            after,
         };
-        let token = AuthToken::bearer(bearer.clone()).map_err(|error| unavailable(&error))?;
-        let mut after = None;
-        loop {
-            let ask = HolderAsk::Files {
-                range_id: range.range_id,
-                prefix: input.spec.prefix.clone(),
-                skip: input.key.clone(),
-                after: after.take(),
-            };
-            let bucket = scope.bucket.to_string();
-            match handle
-                .request_release_holder(coordinator.node_id, Some(token.clone()), bucket, ask)
-                .await
-            {
-                Ok(HolderAnswer::Files(listed)) if !listed.refused => {
-                    files.extend(listed.files);
-                    match listed.next {
-                        Some(next) => after = Some(next),
-                        None => break,
-                    }
-                }
-                // The coordinator refused a file; the generic refusal names none.
-                Err(MetadataReadError::Forbidden) => {
-                    return Err(PublishError::Forbidden(UNREADABLE));
-                }
-                _ => return Err(refused()),
+        let call = holder_call(node_id, token, self.scope.bucket.clone(), ask)?;
+        self.step = CoordinatedStep::Remote(range, node_id);
+        Ok(Next::Call(call))
+    }
+
+    fn next_range(&mut self) -> PublishTurn<Vec<ReleaseFile>> {
+        match self.plans.pop_front() {
+            Some(RangePlan::Here(range)) => self.list_files(Some(range)),
+            Some(RangePlan::At(range, Some(node_id))) => self.ask(range, node_id, None),
+            Some(RangePlan::At(range, None)) => Err(range_refused(&range)),
+            None => {
+                let mut files = std::mem::take(&mut self.files);
+                files.sort_by(|left, right| left.key.cmp(&right.key));
+                Ok(Next::Done(files))
             }
         }
     }
-    files.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(files)
+}
+
+impl Operation for CoordinatedFilesOperation {
+    type Output = Vec<ReleaseFile>;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn<Vec<ReleaseFile>> {
+        let Some(binding) = &self.scope.info.distribution else {
+            return self.list_files(None);
+        };
+        Ok(Next::Call(IoCall::child(read_view(binding.set_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<Vec<ReleaseFile>> {
+        let binding = self.scope.info.distribution.clone();
+        match std::mem::replace(&mut self.step, CoordinatedStep::Local) {
+            CoordinatedStep::View => {
+                let binding = binding.ok_or(IoError::Unfinished)?;
+                let view = (result.child::<Option<DistributionView>, StatusError>()?)
+                    .map_err(unavailable)?
+                    .ok_or_else(|| unavailable("this node holds no record of the set"))?;
+                self.step = CoordinatedStep::Fence(Box::new(view));
+                Ok(Next::Call(IoCall::child(local_fence(binding.set_id))))
+            }
+            CoordinatedStep::Fence(view) => {
+                let binding = binding.ok_or(IoError::Unfinished)?;
+                let fence = result.child::<LocalFence, GuardError>()?;
+                let fence = fence.map_err(unavailable)?;
+                let snapshot = view.snapshot();
+                self.plans = (snapshot.listed_ranges(&self.input.spec.prefix).into_iter())
+                    .map(
+                        |range| match snapshot.lists_locally(binding.member_id, range, &fence) {
+                            true => RangePlan::Here(range.clone()),
+                            false => RangePlan::At(
+                                range.clone(),
+                                snapshot.list_holder(range).map(|member| member.node_id),
+                            ),
+                        },
+                    )
+                    .collect();
+                self.next_range()
+            }
+            CoordinatedStep::Local => {
+                let files = result.child::<Vec<ReleaseFile>, PublishError>()??;
+                if self.scope.info.distribution.is_none() {
+                    return Ok(Next::Done(files));
+                }
+                self.files.extend(files);
+                self.next_range()
+            }
+            CoordinatedStep::Remote(range, node_id) => match holder_reply(result)? {
+                Ok(HolderAnswer::Files(listed)) if !listed.refused => {
+                    self.files.extend(listed.files);
+                    match listed.next {
+                        Some(next) => self.ask(range, node_id, Some(next)),
+                        None => self.next_range(),
+                    }
+                }
+                // The coordinator refused a file; the generic refusal names none.
+                Err(MetadataReadError::Forbidden) => Err(PublishError::Forbidden(UNREADABLE)),
+                _ => Err(range_refused(&range)),
+            },
+        }
+    }
+}
+
+/// Every release row of a bucket this node holds, in key order.
+#[derive(Debug, PartialEq)]
+struct ReleaseRowsOperation {
+    prefix: Vec<u8>,
+    pages: PrefixPages,
+    rows: Vec<(Ulid, ReleasePointer)>,
+}
+
+impl ReleaseRowsOperation {
+    fn new(bucket: &str) -> Self {
+        let prefix = release_prefix(bucket);
+        Self {
+            pages: PrefixPages::new(BUCKET_RELEASE_KEYSPACE, prefix.clone(), ROW_PAGE),
+            prefix,
+            rows: Vec::new(),
+        }
+    }
+}
+
+impl Operation for ReleaseRowsOperation {
+    type Output = Vec<(Ulid, ReleasePointer)>;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn<Vec<(Ulid, ReleasePointer)>> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn<Vec<(Ulid, ReleasePointer)>> {
+        for (key, value) in self.pages.take(result)? {
+            let id = key.get(self.prefix.len()..).map(<[u8; 16]>::try_from);
+            let Some(Ok(id)) = id else {
+                continue;
+            };
+            let pointer = ReleasePointer::from_bytes(value.as_ref()).map_err(unavailable)?;
+            self.rows.push((Ulid::from_bytes(id), pointer));
+        }
+        match self.pages.done() {
+            true => Ok(Next::Done(std::mem::take(&mut self.rows))),
+            false => Ok(Next::Call(self.pages.call())),
+        }
+    }
 }
 
 /// A version row a write must still read as given: keyspace, key and row.
 type Guard = (String, Key, Option<Row>);
 
-/// The version rows of an ordinary bucket's pinned files as they are now. The crate's write
-/// keeps them, so a file deleted meanwhile fails the publish instead of breaking the release.
-async fn file_guards(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    files: &[ReleaseFile],
-) -> Result<Vec<Guard>, PublishError> {
-    if scope.info.distribution.is_some() {
-        return Ok(Vec::new());
-    }
-    let mut reads = Vec::with_capacity(files.len());
-    for file in files {
-        let OriginVersion::Node(arn) = &file.version else {
-            continue;
-        };
-        let key = VersionKey::new(scope.bucket, file.key.as_str(), arn.version)
-            .to_bytes()
-            .map_err(|error| PublishError::Unavailable(error.to_string()))?;
-        reads.push((BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(key)));
-    }
-    if reads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    };
-    let values = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(PublishError::Unavailable(other.label().to_string())),
-    };
-    if values.iter().any(|(_, value)| value.is_none()) {
-        return Err(PublishError::Conflict(CHANGED.to_string()));
-    }
-    let space = || BLOB_VERSIONS_KEYSPACE.to_string();
-    Ok(values
-        .into_iter()
-        .map(|(key, value)| (space(), key, value))
-        .collect())
+#[derive(Debug, PartialEq)]
+enum PutStep {
+    Config,
+    Routing(Box<RealmConfigDocument>),
+    Gate(Box<RealmConfigDocument>, Box<RoutingSnapshot>),
+    Put,
+    Complete(Ulid),
 }
 
-const CHANGED: &str = "a pinned file changed while the release was written; publish again";
-
 /// Writes the release crate as one version tagged with its label and prefix; `None` when the
-/// key's head is no longer `head`, so nothing was written. Each guard must still read as given.
-async fn put_crate(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    input: &PublishInput,
-    (bytes, head, guards): (Vec<u8>, Option<Ulid>, Vec<Guard>),
-) -> Result<Option<Ulid>, PublishError> {
-    let failed = |error: &dyn std::fmt::Display| PublishError::Unavailable(error.to_string());
-    let realm = drive(GetConfigOperation::new(scope.realm_id), context)
-        .await
-        .map_err(|error| failed(&error))?;
-    let routing = drive(
-        SnapshotOperation::new(
-            &node_routing(context),
-            (scope.info).group_id,
-            BucketRules::of(scope.info),
-        ),
-        context,
-    )
-    .await
-    .map_err(|error| failed(&error))?;
-    let gate = drive(
-        GateOperation::new(scope.realm_id, unix_timestamp_millis()),
-        context,
-    )
-    .await
-    .map_err(|error| failed(&error))?;
-    let size = bytes.len() as u64;
-    let body = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
-    let tags = HashMap::from([
-        (RELEASE_TAG.to_string(), input.spec.label.clone()),
-        (RELEASE_PREFIX_TAG.to_string(), input.spec.prefix.clone()),
-        (
-            aruna_core::structs::storage::blob::CONTENT_TYPE_KEY.to_string(),
-            "application/ld+json".to_string(),
-        ),
-    ]);
-    let mut operation = PutObjectOperation::new(PutObjectConfig {
-        user_id: input.auth.user_id,
-        group_id: scope.info.group_id,
-        realm_id: scope.realm_id,
-        node_id: scope.node_id,
-        request: PutObjectInput {
-            bucket: scope.bucket.to_string(),
-            key: input.key.clone(),
-            content_length: Some(size),
-            body: Some(BackendStream::new(body)),
-        },
-        expected_checksums: Vec::new(),
-        checksum_type: None,
-        exists: false,
-        version_source: None,
-        preassigned_version_id: None,
-        quota_ceiling: realm.quota.effective_group_ceiling(&scope.info.group_id),
-        routing,
-    })
-    .with_metadata(tags)
-    .with_expected_head(head)
-    .with_restrictions(input.auth.path_restrictions.clone());
-    if let Some(gate) = gate {
-        operation = operation.with_gate(gate);
-    }
-    if !guards.is_empty() {
-        operation = operation.with_fence(guards, Vec::new());
-    }
-    let result = match drive(operation, context).await {
-        Ok(result) => result,
-        Err(PutObjectError::HeadChanged) => return Ok(None),
-        Err(PutObjectError::FenceTaken) => return Err(PublishError::Conflict(CHANGED.to_string())),
-        Err(error) => return Err(failed(&error)),
-    };
-    drive(
-        CompletePutOperation::new(CompletePutInput {
+/// key's head is no longer the given one, so nothing was written. Each guard must still read as
+/// given.
+#[derive(Debug, PartialEq)]
+struct PutCrateOperation {
+    scope: ReleaseScope,
+    input: PublishInput,
+    routing: NodeRouting,
+    bytes: Vec<u8>,
+    head: Option<Ulid>,
+    guards: Vec<Guard>,
+    now_ms: u64,
+    step: PutStep,
+}
+
+impl PutCrateOperation {
+    fn put(
+        &mut self,
+        realm: &RealmConfigDocument,
+        routing: RoutingSnapshot,
+        gate: Option<GateContext>,
+    ) -> PublishTurn<Option<Ulid>> {
+        let scope = &self.scope;
+        let input = &self.input;
+        let group_id = scope.info.group_id;
+        let bytes = std::mem::take(&mut self.bytes);
+        let size = bytes.len() as u64;
+        let body = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+        let tags = HashMap::from([
+            (RELEASE_TAG.to_string(), input.spec.label.clone()),
+            (RELEASE_PREFIX_TAG.to_string(), input.spec.prefix.clone()),
+            (
+                aruna_core::structs::storage::blob::CONTENT_TYPE_KEY.to_string(),
+                "application/ld+json".to_string(),
+            ),
+        ]);
+        let mut operation = PutObjectOperation::new(PutObjectConfig {
+            user_id: input.auth.user_id,
+            group_id,
             realm_id: scope.realm_id,
             node_id: scope.node_id,
             auth: input.auth.clone(),
