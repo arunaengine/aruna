@@ -5,9 +5,9 @@
 
 use crate::auth::request_authorization::BucketAccess;
 use crate::blob::import_rows::{ImportRowsError, SecondCopiesOperation, SecondCopy};
+pub use crate::blob::merge_copies::Unified;
+use crate::blob::merge_copies::UnifyOperation;
 use crate::blob::migration::shared::{MigrationError, routing_call, routing_result};
-pub use crate::blob::unify_stage::Unified;
-use crate::blob::unify_stage::UnifyOperation;
 use crate::s3::bucket::job_progress::JobStep;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};

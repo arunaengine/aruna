@@ -713,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_keep_changes_nothing() {
+    fn missing_keep_refused() {
         let mut stage = stage();
         assert!(matches!(stage.first(), Ok(Next::Call(IoCall::Read(_)))));
         let answer = IoResult::Values(vec![None, None]);

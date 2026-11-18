@@ -1642,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn hand_over_first_reads_routing() {
+    fn handover_reads_routing() {
         let mut hand = HandOverOperation::new(Default::default(), "b", 1);
         assert!(matches!(hand.first(), Ok(Next::Call(IoCall::Child(_)))));
     }

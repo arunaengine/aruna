@@ -873,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_bucket_counts_nothing() {
+    fn gone_bucket_counts() {
         let mut count = CountMisplacedOperation::new(NodeRouting::default(), BUCKET, "");
         assert!(matches!(count.first(), Ok(Next::Call(IoCall::Read(_)))));
         let turn = count.next(plain_bucket());
@@ -889,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_bucket_plans_nothing() {
+    fn gone_bucket_plans() {
         let query = RenameQuery::default();
         let rules = (AnyKey, AnyKey);
         let mut plan = RenamePageOperation::new(NodeRouting::default(), &rule(), rules, query);

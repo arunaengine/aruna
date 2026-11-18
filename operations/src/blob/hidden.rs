@@ -1094,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_blob_handle_named() {
+    fn missing_handle_named() {
         let mut delete = DeleteHiddenOperation::of_key(
             HiddenBlobKey::new(
                 aruna_core::structs::storage::blob::BackendRef::node_default(),

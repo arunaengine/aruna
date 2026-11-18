@@ -1116,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_queue_clears_cursor() {
+    fn empty_queue_clears() {
         use aruna_core::calls::{IoCall, IoResult, Next};
         use aruna_core::operation::Operation;
         let node = CleanupNode {

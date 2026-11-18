@@ -1732,7 +1732,7 @@ mod step_tests {
     }
 
     #[test]
-    fn finished_record_leaves_queue() {
+    fn finished_record_leaves() {
         let mut finished = record();
         finished.finished_at_ms = Some(9);
         let stored = Value::from(record().to_bytes().unwrap());
@@ -1750,7 +1750,7 @@ mod step_tests {
     }
 
     #[test]
-    fn empty_bucket_finishes_pass() {
+    fn empty_bucket_finishes() {
         let mut page =
             MigratePageOperation::new(NodeRouting::default(), "b", record(), MIGRATION_TIME);
         page.stamp(7);
@@ -1767,7 +1767,7 @@ mod step_tests {
     }
 
     #[test]
-    fn gone_bucket_hands_over() {
+    fn gone_bucket_ends() {
         let mut hand = HandOverOperation::new(NodeRouting::default(), "b", 5);
         assert!(matches!(hand.first(), Ok(Next::Call(IoCall::Child(_)))));
         let routed: Result<Option<RoutingSnapshot>, crate::blob::import_rows::ImportRowsError> =
@@ -1778,7 +1778,7 @@ mod step_tests {
     }
 
     #[test]
-    fn empty_queue_ends_run() {
+    fn empty_queue_ends() {
         let routing = NodeRouting::default();
         let after = Some(Key::from(b"a".to_vec()));
         let mut run = ProcessMigrationsOperation::new(routing, None, after);

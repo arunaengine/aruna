@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_retries_then_warns() {
+    fn conflict_retries_end() {
         let mut store = store_step();
         store.first().unwrap();
         for _ in 0..StoreProgressOperation::conflict_retries() {

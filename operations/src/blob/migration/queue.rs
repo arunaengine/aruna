@@ -1613,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn no_retiring_key_reclaims_none() {
+    fn unretired_reclaims_none() {
         let mut record = transition();
         record.source = None;
         let mut reclaim = ReclaimUploadsOperation::new(&record);

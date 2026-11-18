@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_rules_with_patterns() {
+    fn keeps_pattern_rules() {
         let (first, second) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
         let mut operation = EarlierPatternsOperation {
             rules: VecDeque::from([first, second]),

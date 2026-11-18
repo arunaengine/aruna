@@ -726,14 +726,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_page_cleans_nothing() {
+    fn empty_page_ends() {
         let mut clean = cleaner(10, 5);
         assert!(matches!(clean.first(), Ok(Next::Call(IoCall::Page { .. }))));
         assert_eq!(clean.next(empty_page()), Ok(Next::Done(Cleaned::default())));
     }
 
     #[test]
-    fn missing_head_not_current() {
+    fn missing_head_stale() {
         let key = VersionKey::new("bucket", "key", Ulid::from_bytes([7; 16]));
         let mut current = IsCurrentOperation::new(&key);
         assert!(matches!(current.first(), Ok(Next::Call(IoCall::Read(_)))));

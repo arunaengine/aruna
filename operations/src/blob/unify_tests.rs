@@ -181,7 +181,7 @@ fn walk_groups_keys() {
 }
 
 #[test]
-fn capped_walk_cuts_key() {
+fn capped_walk_cuts() {
     let row = |id: u8| {
         let version = VersionKey::new("bucket", "a", Ulid::from_bytes([id; 16]));
         (
