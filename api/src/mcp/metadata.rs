@@ -510,19 +510,21 @@ impl McpServer {
             .await
         } else {
             metadata_probe(self, &auth, "sparql_query", extras).await?;
-            query_metadata(
+            drive(
+                query_metadata(
+                    self.state.get_realm_id(),
+                    self.state.get_node_id(),
+                    MetadataQueryRequest {
+                        auth: Some(auth),
+                        bearer_token: bearer,
+                        graph_iris: None,
+                        query: input.query,
+                        mode: None,
+                        target_nodes: None,
+                        allow_partial: true,
+                    },
+                ),
                 self.state.get_ctx().as_ref(),
-                self.state.get_realm_id(),
-                self.state.get_node_id(),
-                MetadataQueryRequest {
-                    auth: Some(auth),
-                    bearer_token: bearer,
-                    graph_iris: None,
-                    query: input.query,
-                    mode: None,
-                    target_nodes: None,
-                    allow_partial: true,
-                },
             )
             .await
         }

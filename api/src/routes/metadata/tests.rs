@@ -1983,19 +1983,22 @@ async fn query_forwards_token() {
     assert_excludes_name(&invalid_forwarded_token.names, "Remote Private Dataset");
 
     let ctx = test.coordinator.state.get_ctx();
-    let strict = run_query_metadata(
+    let strict = drive(
+        run_query_metadata(
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataQueryRequest {
+                auth: None,
+                bearer_token: Some("not-a-jwt".to_string()),
+                graph_iris: None,
+                query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }"
+                    .to_string(),
+                mode: Some(ApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+                allow_partial: false,
+            },
+        ),
         ctx.as_ref(),
-        test.coordinator.state.get_realm_id(),
-        test.coordinator.state.get_node_id(),
-        MetadataQueryRequest {
-            auth: None,
-            bearer_token: Some("not-a-jwt".to_string()),
-            graph_iris: None,
-            query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(vec![test.remote.net.node_id()]),
-            allow_partial: false,
-        },
     )
     .await;
     assert!(matches!(strict, Err(MetadataApiError::ServiceUnavailable)));
@@ -4172,19 +4175,22 @@ async fn query_remote_names(
     bearer_token: Option<ValidatedBearer>,
 ) -> QueryNamesResult {
     let ctx = test.coordinator.state.get_ctx();
-    let result = run_query_metadata(
+    let result = drive(
+        run_query_metadata(
+            test.coordinator.state.get_realm_id(),
+            test.coordinator.state.get_node_id(),
+            MetadataQueryRequest {
+                auth,
+                bearer_token: bearer_token_string(bearer_token),
+                graph_iris: None,
+                query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }"
+                    .to_string(),
+                mode: Some(ApiQueryMode::Distributed),
+                target_nodes: Some(vec![test.remote.net.node_id()]),
+                allow_partial: true,
+            },
+        ),
         ctx.as_ref(),
-        test.coordinator.state.get_realm_id(),
-        test.coordinator.state.get_node_id(),
-        MetadataQueryRequest {
-            auth,
-            bearer_token: bearer_token_string(bearer_token),
-            graph_iris: None,
-            query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(vec![test.remote.net.node_id()]),
-            allow_partial: true,
-        },
     )
     .await
     .unwrap();

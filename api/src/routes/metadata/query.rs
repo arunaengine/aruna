@@ -266,19 +266,21 @@ pub async fn query_all_metadata(
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     let ctx = state.get_ctx();
-    let result = run_query_metadata(
+    let result = drive(
+        run_query_metadata(
+            state.get_realm_id(),
+            state.get_node_id(),
+            MetadataQueryRequest {
+                auth,
+                bearer_token: bearer_token_string(bearer_token),
+                graph_iris: None,
+                query: request.query,
+                mode: map_query_mode(request.mode),
+                target_nodes: None,
+                allow_partial: request.allow_partial,
+            },
+        ),
         ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        MetadataQueryRequest {
-            auth,
-            bearer_token: bearer_token_string(bearer_token),
-            graph_iris: None,
-            query: request.query,
-            mode: map_query_mode(request.mode),
-            target_nodes: None,
-            allow_partial: request.allow_partial,
-        },
     )
     .await
     .map_err(map_api_error)?;

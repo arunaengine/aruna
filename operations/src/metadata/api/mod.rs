@@ -103,6 +103,7 @@ pub mod path_types;
 mod prefix_scan;
 pub mod preflight;
 pub mod preflight_types;
+pub mod query_fanout;
 pub mod read;
 pub(crate) mod read_access;
 pub mod read_types;
