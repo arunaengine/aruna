@@ -46,10 +46,11 @@ pub(crate) mod run_rows;
 pub mod runs;
 pub mod runtime;
 pub mod runtime_steps;
-pub mod service;
 pub mod session;
 pub mod staging;
 pub mod store;
+#[cfg(test)]
+mod submission_tests;
 pub mod submit;
 pub mod submit_execution;
 pub mod submit_local;

@@ -21,7 +21,6 @@ use aruna_core::structs::{
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::service::submit_mint_pid;
 use aruna_operations::jobs::store::query::find_dedup_job;
 use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
@@ -31,6 +30,7 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::metadata::forward::write::route_metadata_delete;
+use aruna_operations::metadata::persistent_id::forward::submit_mint_pid;
 use aruna_operations::metadata::persistent_id::forward::{
     mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };

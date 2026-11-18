@@ -16,9 +16,8 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
-use crate::jobs::lifecycle::publish::publish_terminal;
-use crate::jobs::lifecycle::updates::PublishStateOperation;
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
+use crate::jobs::lifecycle::updates::{PublishStateOperation, PublishTerminalOperation};
 use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
@@ -277,4 +276,16 @@ async fn bumps_dashboard_once() {
     );
     assert!(crate::driver::drive(publish, &ctx).await.unwrap());
     assert_eq!(*changes.borrow_and_update(), before + 1);
+}
+
+async fn publish_terminal(
+    ctx: &crate::driver::DriverContext,
+    record: &aruna_core::structs::execution::job::JobRecord,
+) -> bool {
+    let publish = PublishTerminalOperation::new(
+        record.clone(),
+        ctx.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    crate::driver::drive(publish, ctx).await.unwrap_or(false)
 }

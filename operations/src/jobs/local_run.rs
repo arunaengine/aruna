@@ -427,7 +427,6 @@ fn missing_input(bucket: &str, key: &str) -> LocalExecutionError {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::jobs::service::list_owned_jobs;
     use crate::jobs::submit::SubmitJobError;
     use crate::tests::records::payload;
     use aruna_core::calls::ChildOutcome;
@@ -925,7 +924,7 @@ mod tests {
             .expect("the owner's run is accepted");
 
         assert!(accepted.created);
-        let (records, _) = list_owned_jobs(&ctx, caller, None, 8, |_| true)
+        let (records, _) = drive(ListJobsOperation::new(caller, None, 8, |_| true), &ctx)
             .await
             .unwrap();
         assert_eq!(records.len(), 1);
@@ -1004,7 +1003,7 @@ mod tests {
             .await
             .expect("the owner's run is accepted");
 
-        let (records, _) = list_owned_jobs(&ctx, caller, None, 8, |_| true)
+        let (records, _) = drive(ListJobsOperation::new(caller, None, 8, |_| true), &ctx)
             .await
             .unwrap();
         let JobPayload::Execution(spec) = &records[0].payload else {
@@ -1111,7 +1110,7 @@ mod tests {
             .await
             .expect("the owner's run is accepted");
 
-        let (records, _) = list_owned_jobs(&ctx, caller, None, 8, |_| true)
+        let (records, _) = drive(ListJobsOperation::new(caller, None, 8, |_| true), &ctx)
             .await
             .unwrap();
         assert_eq!(records[0].workspace_mode, WorkspaceMode::None);
