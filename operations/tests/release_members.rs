@@ -8,6 +8,7 @@ use crate::topology;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
@@ -32,6 +33,7 @@ use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::metadata::PutMetadataOperation;
 use aruna_operations::s3::bucket::release::access::{LoadAccessOperation, MembersCheckOperation};
+use aruna_operations::s3::bucket::release::holder::{AskHolderError, AskHolderOperation};
 use aruna_operations::s3::bucket::release::publish::ReleaseFilesOperation;
 use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
@@ -94,6 +96,23 @@ async fn ask(
             .await?
             .answers,
     )
+}
+
+/// Asks `node` about this test's bucket from `context`, as a range's member does.
+async fn ask_holder(
+    context: &DriverContext,
+    node: NodeId,
+    token: &AuthToken,
+    ask: HolderAsk,
+) -> Result<HolderAnswer, MetadataReadError> {
+    let AuthToken::Bearer(bearer) = token else {
+        panic!("a bearer token asks");
+    };
+    let question = AskHolderOperation::new(node, bearer.as_str(), BUCKET, ask);
+    drive(question, context).await.map_err(|error| match error {
+        AskHolderError::Refused(error) => error,
+        AskHolderError::Failed(_) => MetadataReadError::Unavailable,
+    })
 }
 
 #[tokio::test]
@@ -220,24 +239,13 @@ async fn releases_pin_versions() -> TestResult<()> {
     );
 
     // Another node asks with a bearer the holder validates; a forged one or a device is refused.
-    let handle = realm
-        .node(1)
-        .context
-        .metadata_handle
-        .as_ref()
-        .ok_or("handle")?;
+    let peer = realm.node(1).context.as_ref();
     let ask = || HolderAsk::Members {
         range_ids: vec![Ulid::from(5u128)],
         queries: queries.to_vec(),
     };
-    let bucket = || BUCKET.to_string();
-    let answer = handle
-        .request_release_holder(
-            holder.node_id(),
-            Some(realm.bearer_token()),
-            bucket(),
-            ask(),
-        )
+    let token = realm.bearer_token();
+    let answer = ask_holder(peer, holder.node_id(), &token, ask())
         .await
         .map_err(|error| format!("{error:?}"))?;
     let HolderAnswer::Members(answer) = answer else {
@@ -348,13 +356,7 @@ async fn releases_pin_versions() -> TestResult<()> {
         ("db/release.json", crate_version, Some(whole)),
         ("db/a.fasta", pinned, None),
     ] {
-        let answer = handle
-            .request_release_holder(
-                holder.node_id(),
-                Some(realm.bearer_token()),
-                bucket(),
-                crate_ask(key, version_id),
-            )
+        let answer = ask_holder(peer, holder.node_id(), &token, crate_ask(key, version_id))
             .await
             .map_err(|error| format!("{error:?}"))?;
         assert_eq!(answer, HolderAnswer::Crate(expected));
@@ -364,14 +366,8 @@ async fn releases_pin_versions() -> TestResult<()> {
         Ulid::from(77u128),
         realm.realm_id,
     ));
-    let unreadable = handle
-        .request_release_holder(
-            holder.node_id(),
-            Some(stranger_token),
-            bucket(),
-            crate_ask("db/release.json", crate_version),
-        )
-        .await;
+    let unreadable = crate_ask("db/release.json", crate_version);
+    let unreadable = ask_holder(peer, holder.node_id(), &stranger_token, unreadable).await;
     assert_eq!(unreadable, Err(MetadataReadError::Forbidden));
     // A crate larger than one reply comes in chunks of the one exact version.
     let size = CRATE_CHUNK + 10;
@@ -387,8 +383,7 @@ async fn releases_pin_versions() -> TestResult<()> {
             version_id: large_version,
             offset,
         };
-        let answer = handle
-            .request_release_holder(holder.node_id(), Some(realm.bearer_token()), bucket(), ask)
+        let answer = ask_holder(peer, holder.node_id(), &token, ask)
             .await
             .map_err(|error| format!("{error:?}"))?;
         let HolderAnswer::Crate(Some(chunk)) = answer else {
@@ -397,28 +392,10 @@ async fn releases_pin_versions() -> TestResult<()> {
         assert_eq!((chunk.bytes.len() as u64, chunk.size), (length, size));
     }
     let forged = AuthToken::bearer("forged").map_err(|error| format!("{error:?}"))?;
-    let refused = handle
-        .request_release_holder(holder.node_id(), Some(forged), bucket(), ask())
-        .await;
+    let refused = ask_holder(peer, holder.node_id(), &forged, ask()).await;
     assert_eq!(refused, Err(MetadataReadError::Unauthorized));
-    let missing = handle
-        .request_release_holder(holder.node_id(), None, bucket(), ask())
-        .await;
-    assert_eq!(missing, Err(MetadataReadError::Unauthorized));
-    let device = realm
-        .user_node()
-        .context
-        .metadata_handle
-        .as_ref()
-        .ok_or("handle")?;
-    let from_device = device
-        .request_release_holder(
-            holder.node_id(),
-            Some(realm.bearer_token()),
-            bucket(),
-            ask(),
-        )
-        .await;
+    let device = realm.user_node().context.as_ref();
+    let from_device = ask_holder(device, holder.node_id(), &token, ask()).await;
     assert!(from_device.is_err(), "a device is no infrastructure peer");
     Ok(())
 }

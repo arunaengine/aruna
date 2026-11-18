@@ -13,7 +13,6 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
@@ -29,7 +28,9 @@ use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::metadata::provenance::{
     CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
 };
-use aruna_operations::s3::bucket::release::holder::ReadCrateOperation;
+use aruna_operations::s3::bucket::release::holder::{
+    AskHolderError, AskHolderOperation, ReadCrateOperation,
+};
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use axum::body::Body;
@@ -564,9 +565,6 @@ async fn remote_crate(
     bearer: &ValidatedBearer,
     (holder, bucket, key, version_id): (NodeId, String, String, Ulid),
 ) -> ServerResult<serde_json::Value> {
-    let context = state.get_ctx();
-    let handle = context.metadata_handle.as_ref().ok_or_else(holder_silent)?;
-    let token = AuthToken::bearer(bearer.as_str().to_string()).map_err(|_| holder_silent())?;
     let mut bytes = Vec::new();
     loop {
         let ask = HolderAsk::Crate {
@@ -574,10 +572,12 @@ async fn remote_crate(
             version_id,
             offset: bytes.len() as u64,
         };
-        let answer = handle
-            .request_release_holder(holder, Some(token.clone()), bucket.clone(), ask)
-            .await;
-        let chunk = holder_chunk(answer)?;
+        let question = AskHolderOperation::new(holder, bearer.as_str(), &bucket, ask);
+        let answer = drive(question, &state.get_ctx()).await;
+        let chunk = holder_chunk(answer.map_err(|error| match error {
+            AskHolderError::Refused(error) => error,
+            AskHolderError::Failed(_) => MetadataReadError::Unavailable,
+        }))?;
         // A chunk that adds nothing before the end would never finish.
         if chunk.bytes.is_empty() && (bytes.len() as u64) < chunk.size {
             return Err(holder_silent());
