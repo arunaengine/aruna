@@ -25,6 +25,7 @@ use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::TempDir;
 
 use crate::driver::DriverContext;
+use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;
 use crate::jobs::records::verify::FamilyView;
 
 pub const REALM: RealmId = RealmId([3u8; 32]);
@@ -387,4 +388,19 @@ pub async fn context(config: &RealmConfigDocument, publisher: NodeId) -> (TempDi
             outbound_handle: None,
         },
     )
+}
+
+/// This node's executor capability that runs `intent`; see [`LocalCapabilityOperation`].
+pub async fn local_capability(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    intent: &LaunchIntent,
+    spec: &LogicalJobSpec,
+) -> Result<aruna_core::compute::ExecutorCapability, aruna_core::events::LaunchDecline> {
+    let operation =
+        LocalCapabilityOperation::new(config.clone(), local, intent.clone(), spec.clone());
+    crate::driver::drive(operation, context)
+        .await
+        .unwrap_or(Err(aruna_core::events::LaunchDecline::Draining))
 }
