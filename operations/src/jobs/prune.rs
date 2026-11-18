@@ -2,37 +2,31 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
+use aruna_core::keyspaces::{ARTIFACT_TOMBSTONE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows::event;
 use aruna_core::structs::execution::job::{
-    JobId, JobPayload, JobRecord, JobResultPayload, PRUNE_INDEX_PREFIX, cleanup_job_id,
-    parse_schedule_key,
+    JobDeletes, JobId, JobPayload, JobRecord, JobResultPayload, PRUNE_INDEX_PREFIX, cleanup_job_id,
+    parse_schedule_key, prune_delete_entries,
 };
 use aruna_core::structs::storage::blob::HiddenBlobKey;
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, KeySpace};
-use aruna_tasks::TaskHandle;
-use byteview::ByteView;
+use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{Key, KeySpace, Value};
+use thiserror::Error;
 use tracing::warn;
 
-use super::JOB_PRUNE_PAGE;
-use super::executor::PayloadHandler;
-use super::store::query::{
-    batch_delete, first_schedule_entry, job_entry_deletes, staging_row_deletes,
+use super::store::JobMutationError;
+use super::store::row_calls::{
+    self, SchedulePage, artifact_tombstone_key, job_entry_deletes, preserve_artifact_tombstone,
+    read_job_record, schedule_page, staging_row_deletes,
 };
-use super::store::state::{artifact_tombstone_key, preserve_artifact_tombstone, read_job_record};
-use super::store::{JobMutationError, row_calls};
-use crate::driver::DriverContext;
-use crate::storage_read::iter_prefix_page;
-use aruna_core::structs::execution::job::prune_delete_entries;
+use super::store::store_call::RowBatch;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct JobPruneOutcome {
@@ -41,193 +35,347 @@ pub struct JobPruneOutcome {
     pub next_due_after: Option<Duration>,
 }
 
-pub async fn prune_job_batch(
-    context: &DriverContext,
-    handlers: &[Arc<dyn PayloadHandler>],
-) -> Result<JobPruneOutcome, String> {
-    prune_job_page(context, handlers, JOB_PRUNE_PAGE).await
+/// A prune step failed; the rows stay for the next pass.
+#[derive(Debug, Error, PartialEq)]
+#[error("{0}")]
+pub struct PruneError(pub String);
+
+impl From<IoError> for PruneError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
 }
 
-async fn prune_job_page(
-    context: &DriverContext,
-    handlers: &[Arc<dyn PayloadHandler>],
-    page_size: usize,
-) -> Result<JobPruneOutcome, String> {
-    let storage = &context.storage_handle;
-    let now_ms = unix_timestamp_millis();
-    let deletion_cap = page_size.saturating_mul(4);
-    let mut deletes: Vec<(KeySpace, Key)> = Vec::new();
-    let mut pruned = 0usize;
-    let mut processed = 0usize;
-    let mut has_more = false;
-    let mut next_due_after = None;
-    let mut start_after = None;
+impl From<JobMutationError> for PruneError {
+    fn from(error: JobMutationError) -> Self {
+        Self(error.to_string())
+    }
+}
 
-    'scan: loop {
-        let (values, next) = iter_prefix_page(
-            storage,
-            SCHEDULE_INDEX_KEYSPACE,
-            Some(ByteView::from(PRUNE_INDEX_PREFIX.to_vec())),
-            start_after.take(),
+/// The due jobs of the next prune pass, for the payload handlers that may keep one for now.
+#[derive(Debug, PartialEq)]
+pub struct PruneDueOperation {
+    now_ms: u64,
+    page_size: usize,
+    rows: Vec<(Key, Value)>,
+    next_page: Option<Key>,
+    due: Vec<(JobId, JobPayload)>,
+    reading: Option<JobId>,
+}
+
+type DueNext = Result<Next<Vec<(JobId, JobPayload)>>, PruneError>;
+
+impl PruneDueOperation {
+    pub fn new(now_ms: u64, page_size: usize) -> Self {
+        Self {
+            now_ms,
             page_size,
-            None,
-        )
-        .await?;
-        if values.is_empty() {
-            break;
+            rows: Vec::new(),
+            next_page: None,
+            due: Vec::new(),
+            reading: None,
         }
-        for (key, _) in values {
-            if deletes.len() >= deletion_cap {
-                has_more = true;
-                break 'scan;
+    }
+
+    fn page(&self, after: Option<Key>) -> IoCall {
+        IoCall::child(schedule_page(PRUNE_INDEX_PREFIX, after, self.page_size))
+    }
+
+    fn next_row(&mut self) -> DueNext {
+        while let Some((key, _)) = self.rows.pop() {
+            let Ok((expiry_ms, job_id)) = parse_schedule_key(key.as_ref()) else {
+                continue;
+            };
+            if expiry_ms > self.now_ms || self.due.len() >= self.page_size.saturating_mul(4) {
+                return Ok(Next::Done(std::mem::take(&mut self.due)));
+            }
+            self.reading = Some(job_id);
+            return Ok(Next::Call(IoCall::child(read_job_record(job_id))));
+        }
+        match self.next_page.take() {
+            Some(next) => Ok(Next::Call(self.page(Some(next)))),
+            None => Ok(Next::Done(std::mem::take(&mut self.due))),
+        }
+    }
+}
+
+impl Operation for PruneDueOperation {
+    type Output = Vec<(JobId, JobPayload)>;
+    type Error = PruneError;
+
+    fn first(&mut self) -> DueNext {
+        Ok(Next::Call(self.page(None)))
+    }
+
+    fn next(&mut self, result: IoResult) -> DueNext {
+        if let Some(job_id) = self.reading.take() {
+            let record = result.child::<Option<JobRecord>, JobMutationError>()??;
+            if let Some(record) = record {
+                self.due.push((job_id, record.payload));
+            }
+            return self.next_row();
+        }
+        let (mut rows, next) = result.child::<SchedulePage, JobMutationError>()??;
+        rows.reverse();
+        self.rows = rows;
+        self.next_page = next;
+        self.next_row()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PruneStep {
+    Page,
+    Record(Key),
+    Cleanup(Box<JobRecord>),
+    Entries(Box<JobRecord>),
+    Staging(Box<JobRecord>),
+    Tombstone(Box<JobRecord>),
+    Artifact(Box<JobRecord>),
+    Deletes,
+}
+
+/// Deletes one bounded batch of expired jobs and their rows. Jobs in `kept` stay for now, as
+/// does the fence state a queued cleanup still needs after the retention ended.
+#[derive(Debug, PartialEq)]
+pub struct PruneJobsOperation {
+    now_ms: u64,
+    page_size: usize,
+    deletion_cap: usize,
+    kept: BTreeSet<JobId>,
+    deletes: Vec<(KeySpace, Key)>,
+    outcome: JobPruneOutcome,
+    processed: usize,
+    rows: Vec<(Key, Value)>,
+    next_page: Option<Key>,
+    step: PruneStep,
+}
+
+type PruneNext = Result<Next<JobPruneOutcome>, PruneError>;
+
+/// The hidden blob of an export job's artifact, if it has one.
+fn artifact_key(record: &JobRecord) -> Result<Option<HiddenBlobKey>, PruneError> {
+    let Some(JobResultPayload::ExportRoCrate(result)) = &record.result else {
+        return Ok(None);
+    };
+    let Some(artifact) = &result.artifact else {
+        return Ok(None);
+    };
+    HiddenBlobKey::try_from(&artifact.location)
+        .map(Some)
+        .map_err(|error| PruneError(error.to_string()))
+}
+
+impl PruneJobsOperation {
+    pub fn new(now_ms: u64, page_size: usize, kept: BTreeSet<JobId>) -> Self {
+        Self {
+            now_ms,
+            page_size,
+            deletion_cap: page_size.saturating_mul(4),
+            kept,
+            deletes: Vec::new(),
+            outcome: JobPruneOutcome::default(),
+            processed: 0,
+            rows: Vec::new(),
+            next_page: None,
+            step: PruneStep::Page,
+        }
+    }
+
+    fn call(&mut self, step: PruneStep, call: IoCall) -> PruneNext {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn page(&mut self, after: Option<Key>) -> PruneNext {
+        let page = schedule_page(PRUNE_INDEX_PREFIX, after, self.page_size);
+        self.call(PruneStep::Page, IoCall::child(page))
+    }
+
+    fn remaining(&self) -> usize {
+        self.deletion_cap.saturating_sub(self.deletes.len()).max(1)
+    }
+
+    fn finish(&mut self) -> PruneNext {
+        let deletes = std::mem::take(&mut self.deletes);
+        self.call(PruneStep::Deletes, IoCall::child(RowBatch::delete(deletes)))
+    }
+
+    fn more_left(&mut self) -> PruneNext {
+        self.outcome.has_more = true;
+        self.finish()
+    }
+
+    fn next_row(&mut self) -> PruneNext {
+        while let Some((key, _)) = self.rows.pop() {
+            if self.deletes.len() >= self.deletion_cap {
+                return self.more_left();
             }
             let (expiry_ms, job_id) = match parse_schedule_key(key.as_ref()) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     warn!(error = %error, "Deleting malformed job prune index row");
-                    deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), key));
+                    self.deletes
+                        .push((SCHEDULE_INDEX_KEYSPACE.to_string(), key));
                     continue;
                 }
             };
-            if expiry_ms > now_ms {
-                next_due_after = Some(Duration::from_millis(expiry_ms.saturating_sub(now_ms)));
-                break 'scan;
+            if expiry_ms > self.now_ms {
+                let after = expiry_ms.saturating_sub(self.now_ms);
+                self.outcome.next_due_after = Some(Duration::from_millis(after));
+                return self.finish();
             }
-            match read_job_record(context, job_id, None).await? {
-                Some(record) => {
-                    // The fence state a queued cleanup needs outlives retention: deleting it now
-                    // fails the cleanup permanently and strands the backend attempt.
-                    if cleanup_pending(context, &record).await? {
-                        continue;
-                    }
-                    // The domain that owns the payload may keep its job longer.
-                    let mut keep = false;
-                    for handler in handlers {
-                        keep = keep || handler.keeps_job(context, &record.payload).await?;
-                    }
-                    if keep {
-                        continue;
-                    }
-                    let remaining = deletion_cap.saturating_sub(deletes.len()).max(1);
-                    let (entry_deletes, entries_more) =
-                        job_entry_deletes(context, job_id, remaining).await?;
-                    deletes.extend(entry_deletes);
-                    if entries_more {
-                        has_more = true;
-                        break 'scan;
-                    }
-                    // A staging job's queue and manifest rows go before its record, so a cleanup
-                    // the job itself could not finish is still completed here.
-                    let remaining = deletion_cap.saturating_sub(deletes.len()).max(1);
-                    let (staging_deletes, staging_more) =
-                        staging_row_deletes(context, job_id, remaining).await?;
-                    deletes.extend(staging_deletes);
-                    if staging_more {
-                        has_more = true;
-                        break 'scan;
-                    }
-                    if let Some(JobResultPayload::ExportRoCrate(result)) = &record.result
-                        && let Some(artifact) = &result.artifact
-                    {
-                        preserve_artifact_tombstone(
-                            context,
-                            record.job_id,
-                            record.created_by,
-                            artifact.expires_at_ms.saturating_add(record.retention_ms),
-                        )
-                        .await?;
-                    }
-                    delete_job_artifact(context, &record).await?;
-                    deletes.extend(prune_delete_entries(&record));
+            let read = IoCall::child(read_job_record(job_id));
+            return self.call(PruneStep::Record(key), read);
+        }
+        match self.next_page.take() {
+            Some(next) => self.page(Some(next)),
+            None => self.finish(),
+        }
+    }
+
+    fn counted(&mut self) -> PruneNext {
+        self.outcome.pruned = self.outcome.pruned.saturating_add(1);
+        self.processed = self.processed.saturating_add(1);
+        if self.processed >= self.deletion_cap {
+            return self.more_left();
+        }
+        self.next_row()
+    }
+
+    fn record_read(&mut self, key: Key, record: Option<JobRecord>) -> PruneNext {
+        let Some(record) = record else {
+            let job_id = parse_schedule_key(key.as_ref())
+                .map(|(_, job_id)| job_id)
+                .map_err(|error| PruneError(error.to_string()))?;
+            self.deletes
+                .push((SCHEDULE_INDEX_KEYSPACE.to_string(), key));
+            self.deletes.push((
+                ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
+                artifact_tombstone_key(job_id),
+            ));
+            return self.counted();
+        };
+        if !matches!(&record.payload, JobPayload::Execution(_)) {
+            return self.cleanup_clear(Box::new(record));
+        }
+        let cleanup = read_job_record(cleanup_job_id(record.job_id));
+        self.call(PruneStep::Cleanup(Box::new(record)), IoCall::child(cleanup))
+    }
+
+    /// No cleanup holds the job back any more, so only a payload handler still can.
+    fn cleanup_clear(&mut self, record: Box<JobRecord>) -> PruneNext {
+        if self.kept.contains(&record.job_id) {
+            return self.next_row();
+        }
+        let entries = job_entry_deletes(record.job_id, self.remaining());
+        self.call(PruneStep::Entries(record), IoCall::child(entries))
+    }
+
+    /// A staging job's rows go before its record, so a cleanup the job could not finish is
+    /// still completed here.
+    fn entries_gone(&mut self, record: Box<JobRecord>) -> PruneNext {
+        let staging = staging_row_deletes(record.job_id, self.remaining());
+        self.call(PruneStep::Staging(record), IoCall::child(staging))
+    }
+
+    fn staging_gone(&mut self, record: Box<JobRecord>) -> PruneNext {
+        if let Some(JobResultPayload::ExportRoCrate(result)) = &record.result
+            && let Some(artifact) = &result.artifact
+        {
+            let expires_at_ms = artifact.expires_at_ms.saturating_add(record.retention_ms);
+            let keep = preserve_artifact_tombstone(record.job_id, record.created_by, expires_at_ms);
+            return self.call(PruneStep::Tombstone(record), IoCall::child(keep));
+        }
+        self.delete_artifact(record)
+    }
+
+    fn delete_artifact(&mut self, record: Box<JobRecord>) -> PruneNext {
+        let Some(key) = artifact_key(&record)? else {
+            return self.record_gone(record);
+        };
+        let delete = Effect::Blob(BlobEffect::DeleteHidden { key });
+        self.call(
+            PruneStep::Artifact(record),
+            IoCall::Effect(Box::new(delete)),
+        )
+    }
+
+    fn record_gone(&mut self, record: Box<JobRecord>) -> PruneNext {
+        self.deletes.extend(prune_delete_entries(&record));
+        self.counted()
+    }
+
+    fn deletes_read(
+        &mut self,
+        (deletes, more): (JobDeletes, bool),
+        record: Box<JobRecord>,
+        then: fn(&mut Self, Box<JobRecord>) -> PruneNext,
+    ) -> PruneNext {
+        self.deletes.extend(deletes);
+        if more {
+            return self.more_left();
+        }
+        then(self, record)
+    }
+}
+
+impl Operation for PruneJobsOperation {
+    type Output = JobPruneOutcome;
+    type Error = PruneError;
+
+    fn first(&mut self) -> PruneNext {
+        self.page(None)
+    }
+
+    fn next(&mut self, result: IoResult) -> PruneNext {
+        match std::mem::replace(&mut self.step, PruneStep::Page) {
+            PruneStep::Page => {
+                let (mut rows, next) = result.child::<SchedulePage, JobMutationError>()??;
+                if rows.is_empty() {
+                    return self.finish();
                 }
-                None => {
-                    deletes.push((SCHEDULE_INDEX_KEYSPACE.to_string(), key));
-                    deletes.push((
-                        aruna_core::keyspaces::ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
-                        artifact_tombstone_key(job_id),
-                    ));
+                rows.reverse();
+                self.rows = rows;
+                self.next_page = next;
+                self.next_row()
+            }
+            PruneStep::Record(key) => {
+                let record = result.child::<Option<JobRecord>, JobMutationError>()??;
+                self.record_read(key, record)
+            }
+            PruneStep::Cleanup(record) => {
+                let cleanup = result.child::<Option<JobRecord>, JobMutationError>()??;
+                if cleanup.is_some_and(|cleanup| !cleanup.state.is_terminal()) {
+                    return self.next_row();
                 }
+                self.cleanup_clear(record)
             }
-            pruned = pruned.saturating_add(1);
-            processed = processed.saturating_add(1);
-            if processed >= deletion_cap {
-                has_more = true;
-                break 'scan;
+            PruneStep::Entries(record) => {
+                let deletes = result.child::<(JobDeletes, bool), JobMutationError>()??;
+                self.deletes_read(deletes, record, Self::entries_gone)
+            }
+            PruneStep::Staging(record) => {
+                let deletes = result.child::<(JobDeletes, bool), JobMutationError>()??;
+                self.deletes_read(deletes, record, Self::staging_gone)
+            }
+            PruneStep::Tombstone(record) => {
+                result.child::<(), JobMutationError>()??;
+                self.delete_artifact(record)
+            }
+            PruneStep::Artifact(record) => match event(result)? {
+                Event::Blob(BlobEvent::HiddenDeleted) => self.record_gone(record),
+                Event::Blob(BlobEvent::Error(error)) => Err(PruneError(error.to_string())),
+                other => Err(PruneError(format!(
+                    "unexpected hidden artifact delete event: {}",
+                    other.label()
+                ))),
+            },
+            PruneStep::Deletes => {
+                result.child::<(), JobMutationError>()??;
+                Ok(Next::Done(std::mem::take(&mut self.outcome)))
             }
         }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => break,
-        }
-    }
-
-    batch_delete(context, deletes, None).await?;
-    Ok(JobPruneOutcome {
-        pruned,
-        has_more,
-        next_due_after,
-    })
-}
-
-async fn delete_job_artifact(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
-    let Some(JobResultPayload::ExportRoCrate(result)) = &record.result else {
-        return Ok(());
-    };
-    let Some(artifact) = &result.artifact else {
-        return Ok(());
-    };
-    let key = HiddenBlobKey::try_from(&artifact.location).map_err(|error| error.to_string())?;
-    let blob_handle = context
-        .blob_handle
-        .as_ref()
-        .ok_or_else(|| "blob handle unavailable while pruning job artifact".to_string())?;
-    match blob_handle
-        .send_blob_effect(BlobEffect::DeleteHidden { key })
-        .await
-    {
-        Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
-        Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        event => Err(format!(
-            "unexpected hidden artifact delete event: {}",
-            event.label()
-        )),
-    }
-}
-
-/// Whether an execution job still owes a terminal cleanup. Only `Execution` takes a
-/// cleanup obligation, and cleanup retries are not capped, so it can outlive the
-/// retention window.
-async fn cleanup_pending(context: &DriverContext, record: &JobRecord) -> Result<bool, String> {
-    if !matches!(&record.payload, JobPayload::Execution(_)) {
-        return Ok(false);
-    }
-    Ok(
-        read_job_record(context, cleanup_job_id(record.job_id), None)
-            .await?
-            .is_some_and(|cleanup| !cleanup.state.is_terminal()),
-    )
-}
-
-/// ShortenTimer restore keyed off the earliest `prune/` entry.
-pub async fn restore_prune_timer(context: &DriverContext, task_handle: &TaskHandle) {
-    let after = match first_schedule_entry(context, PRUNE_INDEX_PREFIX).await {
-        Ok(Some((expiry_ms, _))) => {
-            Duration::from_millis(expiry_ms.saturating_sub(unix_timestamp_millis()))
-        }
-        Ok(None) => return,
-        Err(error) => {
-            warn!(error = %error, "Failed to scan job prune index");
-            return;
-        }
-    };
-    let event = task_handle
-        .send_effect(Effect::Task(TaskEffect::ShortenTimer {
-            key: TaskKey::PruneJobs,
-            after,
-        }))
-        .await;
-    if let Event::Task(TaskEvent::Error { message, .. }) = event {
-        warn!(message = %message, "Failed to restore job prune timer");
     }
 }
 
@@ -274,15 +422,20 @@ impl Operation for PruneTimerOperation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
+    use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::JOB_RETENTION_MS;
+    use crate::jobs::executor::PayloadHandler;
     use crate::jobs::store::put_job_entry;
     use crate::jobs::store::query::insert_job;
     use crate::jobs::store::state::{ClaimOutcome, claim_job, complete_job, transition_to_running};
+    use crate::jobs::store::state::{preserve_artifact_tombstone, read_job_record};
     use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::handle::Handle;
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
@@ -295,9 +448,119 @@ mod tests {
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::task::TaskEvent;
+    use aruna_core::time::unix_timestamp_millis;
     use aruna_storage::FjallStorage;
+    use std::sync::Arc;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    /// One prune pass with the keep decisions of `handlers`, as the prune task runs it.
+    pub(crate) async fn prune_job_batch(
+        context: &DriverContext,
+        handlers: &[Arc<dyn PayloadHandler>],
+    ) -> Result<JobPruneOutcome, String> {
+        let now_ms = unix_timestamp_millis();
+        let mut kept = BTreeSet::new();
+        if !handlers.is_empty() {
+            let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
+                .await
+                .map_err(|error| error.0)?;
+            for (job_id, payload) in due {
+                for handler in handlers {
+                    if handler.keeps_job(context, &payload).await? {
+                        kept.insert(job_id);
+                    }
+                }
+            }
+        }
+        let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
+        drive(prune, context).await.map_err(|error| error.0)
+    }
+
+    fn child<T: Send + 'static, E: Send + 'static>(result: Result<T, E>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn page_of(keys: Vec<Key>) -> IoResult {
+        let rows = keys
+            .into_iter()
+            .map(|key| (key, Value::from(Vec::new())))
+            .collect::<Vec<_>>();
+        child(Ok::<SchedulePage, JobMutationError>((rows, None)))
+    }
+
+    fn prune_key(expiry_ms: u64, job_id: JobId) -> Key {
+        aruna_core::structs::execution::job::job_prune_key(expiry_ms, job_id)
+    }
+
+    fn is_child(next: &PruneNext) -> bool {
+        matches!(next, Ok(Next::Call(IoCall::Child(_))))
+    }
+
+    // A row still ahead ends the batch and names when to look again.
+    #[test]
+    fn future_row_ends() {
+        let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new());
+        assert!(is_child(&prune.first()));
+        let page = page_of(vec![prune_key(25, JobId::from_bytes([1u8; 16]))]);
+        assert!(is_child(&prune.next(page)));
+        assert_eq!(prune.step, PruneStep::Deletes);
+        let deleted = child(Ok::<_, JobMutationError>(()));
+        let Next::Done(outcome) = prune.next(deleted).unwrap() else {
+            panic!("expected the outcome");
+        };
+        assert_eq!(outcome.next_due_after, Some(Duration::from_millis(15)));
+        assert_eq!(outcome.pruned, 0);
+    }
+
+    // A job its handler keeps stays, with its rows, for a later pass.
+    #[test]
+    fn kept_job_skipped() {
+        let job_id = JobId::from_bytes([2u8; 16]);
+        let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::from([job_id]));
+        let record = Box::new(JobRecord::new(
+            job_id,
+            JobPayload::Probe {
+                steps: 1,
+                step_sleep_ms: 0,
+                fail_at: None,
+                panic_at: None,
+                cleanup_marker: None,
+            },
+            UserId::new(Ulid::from_bytes([3u8; 16]), RealmId([1u8; 32])),
+            iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            1,
+            1,
+            None,
+        ));
+        assert!(is_child(&prune.cleanup_clear(record)));
+        assert_eq!(prune.step, PruneStep::Deletes);
+        assert_eq!(prune.outcome.pruned, 0);
+    }
+
+    // A missing record drops its index row and tombstone, and counts as pruned.
+    #[test]
+    fn orphan_row_dropped() {
+        let job_id = JobId::from_bytes([5u8; 16]);
+        let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new());
+        let key = prune_key(5, job_id);
+        assert!(is_child(&prune.record_read(key, None)));
+        assert_eq!(prune.deletes.len(), 2);
+        assert_eq!(prune.outcome.pruned, 1);
+    }
+
+    // The due list stops at the first row still ahead.
+    #[test]
+    fn due_list_stops() {
+        let (due, later) = (JobId::from_bytes([6u8; 16]), JobId::from_bytes([7u8; 16]));
+        let mut list = PruneDueOperation::new(10, 4);
+        assert!(matches!(list.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let page = page_of(vec![prune_key(5, due), prune_key(20, later)]);
+        assert!(matches!(list.next(page), Ok(Next::Call(IoCall::Child(_)))));
+        let missing = child(Ok::<Option<JobRecord>, JobMutationError>(None));
+        assert!(matches!(list.next(missing), Ok(Next::Done(found)) if found.is_empty()));
+    }
 
     fn node_id(seed: u8) -> NodeId {
         let mut seed_bytes = [0u8; 32];
@@ -680,9 +943,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let task_handle = TaskHandle::new();
+        let task_handle = aruna_tasks::TaskHandle::new();
+        let mut context = context;
+        context.task_handle = Some(task_handle.clone());
 
-        restore_prune_timer(&context, &task_handle).await;
+        drive(PruneTimerOperation::new(unix_timestamp_millis()), &context)
+            .await
+            .expect("timer scan");
 
         let Event::Task(TaskEvent::TimerScheduled { .. }) = task_handle
             .send_effect(Effect::Task(TaskEffect::ShortenTimer {
